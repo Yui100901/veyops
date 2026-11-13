@@ -13,9 +13,11 @@ import {
   Trash2,
   Wifi,
 } from 'lucide-react';
-import { api, formatTime, message, post, remove, useResource } from '../api';
+import { api, formatTime, message, navigate, post, remove, useResource } from '../api';
 import { ProjectDeploymentConfig } from './DeploymentConfig';
 import { RepositoryDetails } from './RepositoryBrowser';
+import { ServerGroups, ServerOverview } from './ServerResources';
+import { ProjectRelations } from './ProjectRelations';
 import {
   Confirm,
   Empty,
@@ -60,6 +62,7 @@ export function ServersPage({ user }: { user: User }) {
   const [search, setSearch] = useState('');
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<Server>();
+  const [inspecting, setInspecting] = useState<Server>();
   const [deleting, setDeleting] = useState<Server>();
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState('');
@@ -89,6 +92,7 @@ export function ServersPage({ user }: { user: User }) {
         credentialId: text(form, 'credentialId'),
         hostKeyFingerprint: text(form, 'hostKeyFingerprint'),
         tags: tags(text(form, 'tags')),
+        description: text(form, 'description'),
       };
       if (editing)
         await api(`/servers/${editing.id}`, { method: 'PATCH', body: JSON.stringify(payload) });
@@ -230,7 +234,13 @@ export function ServersPage({ user }: { user: User }) {
                           <ServerIcon size={18} />
                         </span>
                         <div>
-                          <strong>{server.name}</strong>
+                          <button
+                            className="text-button"
+                            type="button"
+                            onClick={() => setInspecting(server)}
+                          >
+                            {server.name}
+                          </button>
                           <small>{server.osType || '操作系统待检测'}</small>
                         </div>
                       </div>
@@ -302,6 +312,7 @@ export function ServersPage({ user }: { user: User }) {
           </div>
         )}
       </Section>
+      <ServerGroups servers={resource.data ?? []} canEdit={canEdit} />
       <div className="info-strip">
         <ShieldCheck size={18} />
         <p>
@@ -396,6 +407,14 @@ export function ServersPage({ user }: { user: User }) {
                 placeholder="production, web"
               />
             </Field>
+            <Field label="说明">
+              <textarea
+                name="description"
+                defaultValue={editing?.description}
+                maxLength={2000}
+                rows={2}
+              />
+            </Field>
           </Form>
         </Modal>
       )}
@@ -410,6 +429,9 @@ export function ServersPage({ user }: { user: User }) {
           destructive
           label="移除服务器"
         />
+      )}
+      {inspecting && (
+        <ServerOverview server={inspecting} onClose={() => setInspecting(undefined)} />
       )}
     </>
   );
@@ -787,31 +809,85 @@ export function CredentialsPage({ user }: { user: User }) {
   );
 }
 
-export function ProjectsPage({ user }: { user: User }) {
-  const resource = useResource<Project[]>('/projects');
-  const [search, setSearch] = useState('');
-  const [creating, setCreating] = useState(false);
+function ProjectEditor({
+  project,
+  onClose,
+  onSaved,
+}: {
+  project?: Project;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  async function create(event: FormEvent<HTMLFormElement>) {
+  const title = project ? '编辑项目' : '创建项目';
+  async function save(event: FormEvent<HTMLFormElement>) {
     const form = values(event);
     setBusy(true);
     setError('');
     try {
-      await post('/projects', {
+      const payload = {
         name: text(form, 'name'),
         slug: text(form, 'slug'),
         description: text(form, 'description'),
         tags: tags(text(form, 'tags')),
-      });
-      setCreating(false);
-      await resource.reload();
+      };
+      if (project)
+        await api(`/projects/${project.id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+      else await post('/projects', payload);
+      onSaved();
     } catch (err) {
       setError(message(err));
     } finally {
       setBusy(false);
     }
   }
+  return (
+    <Modal title={title} onClose={() => !busy && onClose()}>
+      <Form
+        onSubmit={save}
+        error={error}
+        busy={busy}
+        submit={project ? '保存项目' : title}
+        onCancel={onClose}
+      >
+        <Field label="项目名称" required>
+          <input name="name" required autoFocus maxLength={100} defaultValue={project?.name} />
+        </Field>
+        <Field label="唯一标识" required hint="使用小写字母、数字和连字符。">
+          <input
+            name="slug"
+            required
+            maxLength={63}
+            pattern={'[a-z0-9][a-z0-9\\-]{0,62}'}
+            defaultValue={project?.slug}
+            placeholder="core-platform"
+          />
+        </Field>
+        <Field label="项目描述">
+          <textarea
+            name="description"
+            rows={3}
+            maxLength={2000}
+            defaultValue={project?.description}
+          />
+        </Field>
+        <Field label="标签">
+          <input
+            name="tags"
+            defaultValue={project?.tags.join(', ')}
+            placeholder="多个标签使用逗号分隔"
+          />
+        </Field>
+      </Form>
+    </Modal>
+  );
+}
+
+export function ProjectsPage({ user }: { user: User }) {
+  const resource = useResource<Project[]>('/projects');
+  const [search, setSearch] = useState('');
+  const [creating, setCreating] = useState(false);
   const list = (resource.data ?? []).filter((project) =>
     `${project.name} ${project.slug}`.toLowerCase().includes(search.toLowerCase()),
   );
@@ -823,13 +899,7 @@ export function ProjectsPage({ user }: { user: User }) {
         description="以项目组织代码仓库、应用服务与运行环境。"
         action={
           user.role !== 'VIEWER' && (
-            <button
-              className="button primary"
-              onClick={() => {
-                setError('');
-                setCreating(true);
-              }}
-            >
+            <button className="button primary" onClick={() => setCreating(true)}>
               <Plus size={17} />
               创建项目
             </button>
@@ -902,43 +972,13 @@ export function ProjectsPage({ user }: { user: User }) {
         </div>
       )}
       {creating && (
-        <Modal
-          title="创建项目"
-          description="以项目关联仓库、服务、环境和部署配置。"
+        <ProjectEditor
           onClose={() => setCreating(false)}
-        >
-          <Form
-            onSubmit={create}
-            error={error}
-            busy={busy}
-            submit="创建项目"
-            onCancel={() => setCreating(false)}
-          >
-            <Field label="项目名称" required>
-              <input
-                name="name"
-                required
-                autoFocus
-                maxLength={100}
-                placeholder="例如 核心业务平台"
-              />
-            </Field>
-            <Field label="唯一标识" required hint="使用小写字母、数字和连字符。">
-              <input
-                name="slug"
-                required
-                pattern="[a-z0-9]+(?:-[a-z0-9]+)*"
-                placeholder="core-platform"
-              />
-            </Field>
-            <Field label="项目描述">
-              <textarea name="description" rows={3} placeholder="这个项目用来做什么？" />
-            </Field>
-            <Field label="标签">
-              <input name="tags" placeholder="多个标签使用逗号分隔" />
-            </Field>
-          </Form>
-        </Modal>
+          onSaved={() => {
+            setCreating(false);
+            void resource.reload();
+          }}
+        />
       )}
     </>
   );
@@ -947,7 +987,14 @@ export function ProjectsPage({ user }: { user: User }) {
 export function ProjectPage({ id, user }: { id: string; user: User }) {
   const resource = useResource<ProjectDetail>(`/projects/${id}`);
   const credentials = useResource<Credential[]>('/credentials');
+  const [editingProject, setEditingProject] = useState(false);
+  const [deletingProject, setDeletingProject] = useState(false);
   const [adding, setAdding] = useState<'repositories' | 'services' | 'environments'>();
+  const [editingResource, setEditingResource] = useState<Repository | Service | Environment>();
+  const [deletingResource, setDeletingResource] = useState<{
+    key: 'repositories' | 'services' | 'environments';
+    item: Repository | Service | Environment;
+  }>();
   const [inspectingRepository, setInspectingRepository] = useState<Repository>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -955,13 +1002,19 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
     const form = values(event);
     setBusy(true);
     setError('');
-    let payload: Record<string, string> = { name: text(form, 'name') };
+    let payload: Record<string, string | null> = {
+      name: text(form, 'name'),
+      description: text(form, 'description'),
+    };
     if (adding === 'repositories')
       payload = {
         ...payload,
         cloneUrl: text(form, 'cloneUrl'),
+        provider: text(form, 'provider'),
         defaultBranch: text(form, 'defaultBranch'),
-        ...(text(form, 'credentialId') ? { credentialId: text(form, 'credentialId') } : {}),
+        ...(user.role === 'ADMIN' && (editingResource || text(form, 'credentialId'))
+          ? { credentialId: text(form, 'credentialId') || null }
+          : {}),
       };
     if (adding === 'services')
       payload = { ...payload, slug: text(form, 'slug'), serviceType: text(form, 'serviceType') };
@@ -972,9 +1025,41 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
         environmentType: text(form, 'environmentType'),
       };
     try {
-      await post(`/projects/${id}/${adding}`, payload);
+      if (editingResource)
+        await api(`/projects/${id}/${adding}/${editingResource.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        });
+      else await post(`/projects/${id}/${adding}`, payload);
       setAdding(undefined);
+      setEditingResource(undefined);
       await resource.reload();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function deleteResource() {
+    if (!deletingResource) return;
+    setBusy(true);
+    setError('');
+    try {
+      await remove(`/projects/${id}/${deletingResource.key}/${deletingResource.item.id}`);
+      setDeletingResource(undefined);
+      await resource.reload();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function deleteProject() {
+    setBusy(true);
+    setError('');
+    try {
+      await remove(`/projects/${id}`);
+      navigate('/projects');
     } catch (err) {
       setError(message(err));
     } finally {
@@ -995,9 +1080,30 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
         eyebrow={project.slug.toUpperCase()}
         title={project.name}
         description={project.description || '统一组织这个项目的代码、服务与环境。'}
+        action={
+          user.role !== 'VIEWER' && (
+            <>
+              <button className="button secondary" onClick={() => setEditingProject(true)}>
+                <Pencil size={16} />
+                编辑项目
+              </button>
+              <button
+                className="button secondary"
+                onClick={() => {
+                  setError('');
+                  setDeletingProject(true);
+                }}
+              >
+                <Trash2 size={16} />
+                删除项目
+              </button>
+            </>
+          )
+        }
       />
       <ErrorBanner error={resource.error} retry={resource.reload} />
       <div className="detail-stats">
+        <Status value={project.status} />
         <span>
           <strong>{project.repositories?.length ?? 0}</strong>代码仓库
         </span>
@@ -1026,6 +1132,7 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
                   className="button secondary small"
                   onClick={() => {
                     setError('');
+                    setEditingResource(undefined);
                     setAdding(key);
                   }}
                 >
@@ -1070,6 +1177,31 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
                           ? (item as Service).serviceType
                           : (item as Environment).environmentType}
                     </span>
+                    {user.role !== 'VIEWER' && (
+                      <span className="row-actions">
+                        <button
+                          className="icon-button bare muted"
+                          aria-label={`编辑${labels[key]} ${item.name}`}
+                          onClick={() => {
+                            setError('');
+                            setEditingResource(item);
+                            setAdding(key);
+                          }}
+                        >
+                          <Pencil size={15} />
+                        </button>
+                        <button
+                          className="icon-button bare muted"
+                          aria-label={`删除${labels[key]} ${item.name}`}
+                          onClick={() => {
+                            setError('');
+                            setDeletingResource({ key, item });
+                          }}
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </span>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1077,11 +1209,34 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
           </Section>
         ))}
       </div>
+      <ProjectRelations project={project} user={user} reload={resource.reload} />
       <div className="info-strip">
         <FolderGit2 size={18} />
         <p>为服务绑定仓库，并在不同环境配置部署目标。构建与发布由 Pipeline 统一执行。</p>
       </div>
-      <ProjectDeploymentConfig project={project} user={user} />
+      <ProjectDeploymentConfig project={project} user={user} reloadProject={resource.reload} />
+      {editingProject && (
+        <ProjectEditor
+          project={project}
+          onClose={() => setEditingProject(false)}
+          onSaved={() => {
+            setEditingProject(false);
+            void resource.reload();
+          }}
+        />
+      )}
+      {deletingProject && (
+        <Confirm
+          title="删除项目"
+          description={`将「${project.name}」从项目列表移除，保留已有任务和部署记录。`}
+          onClose={() => !busy && setDeletingProject(false)}
+          onConfirm={deleteProject}
+          busy={busy}
+          error={error}
+          destructive
+          label="删除项目"
+        />
+      )}
       {inspectingRepository && (
         <RepositoryDetails
           projectId={id}
@@ -1092,16 +1247,25 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
         />
       )}
       {adding && (
-        <Modal title={`添加${labels[adding]}`} onClose={() => setAdding(undefined)}>
+        <Modal
+          title={`${editingResource ? '编辑' : '添加'}${labels[adding]}`}
+          onClose={() => !busy && setAdding(undefined)}
+        >
           <Form
             onSubmit={add}
             error={error}
             busy={busy}
-            submit={`添加${labels[adding]}`}
+            submit={editingResource ? '保存' : `添加${labels[adding]}`}
             onCancel={() => setAdding(undefined)}
           >
             <Field label="名称" required>
-              <input name="name" required autoFocus />
+              <input
+                name="name"
+                required
+                autoFocus
+                defaultValue={editingResource?.name}
+                maxLength={100}
+              />
             </Field>
             {adding === 'repositories' ? (
               <>
@@ -1111,13 +1275,27 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
                     placeholder="https://github.com/team/repository.git"
                     type="url"
                     pattern="https?://.+"
+                    defaultValue={(editingResource as Repository | undefined)?.cloneUrl}
                     required
                   />
                 </Field>
                 {user.role === 'ADMIN' && (
                   <Field label="Git 认证凭据（可选）">
-                    <select name="credentialId">
+                    <select
+                      name="credentialId"
+                      defaultValue={(editingResource as Repository | undefined)?.credentialId ?? ''}
+                    >
                       <option value="">公开仓库，无需认证</option>
+                      {(editingResource as Repository | undefined)?.credentialId &&
+                        !(credentials.data ?? []).some(
+                          (item) =>
+                            item.id === (editingResource as Repository).credentialId &&
+                            item.status === 'ACTIVE',
+                        ) && (
+                          <option value={(editingResource as Repository).credentialId!}>
+                            保留当前凭据
+                          </option>
+                        )}
                       {credentials.data
                         ?.filter(
                           (c) =>
@@ -1132,7 +1310,25 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
                   </Field>
                 )}
                 <Field label="默认分支" required>
-                  <input name="defaultBranch" defaultValue="main" required />
+                  <input
+                    name="defaultBranch"
+                    defaultValue={
+                      (editingResource as Repository | undefined)?.defaultBranch ?? 'main'
+                    }
+                    required
+                  />
+                </Field>
+                <Field label="代码托管平台">
+                  <select
+                    name="provider"
+                    defaultValue={(editingResource as Repository | undefined)?.provider ?? 'CUSTOM'}
+                  >
+                    <option value="CUSTOM">自建或其他</option>
+                    <option value="GITHUB">GitHub</option>
+                    <option value="GITLAB">GitLab</option>
+                    <option value="GITEA">Gitea</option>
+                    <option value="BITBUCKET">Bitbucket</option>
+                  </select>
                 </Field>
               </>
             ) : (
@@ -1140,6 +1336,7 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
                 <Field label="标识" required>
                   <input
                     name="slug"
+                    defaultValue={(editingResource as Service | Environment | undefined)?.slug}
                     required
                     pattern="[a-z0-9]+(?:-[a-z0-9]+)*"
                     placeholder={adding === 'services' ? 'web' : 'production'}
@@ -1147,10 +1344,14 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
                 </Field>
                 {adding === 'services' ? (
                   <Field label="服务类型">
-                    <select name="serviceType">
+                    <select
+                      name="serviceType"
+                      defaultValue={(editingResource as Service | undefined)?.serviceType ?? 'API'}
+                    >
                       <option value="WEB">Web</option>
                       <option value="API">API</option>
                       <option value="WORKER">Worker</option>
+                      <option value="SCHEDULED_JOB">定时任务</option>
                       <option value="STATIC_SITE">静态站点</option>
                       <option value="DOCKER_SERVICE">Docker 服务</option>
                       <option value="CUSTOM">自定义</option>
@@ -1158,7 +1359,13 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
                   </Field>
                 ) : (
                   <Field label="环境类型">
-                    <select name="environmentType">
+                    <select
+                      name="environmentType"
+                      defaultValue={
+                        (editingResource as Environment | undefined)?.environmentType ??
+                        'DEVELOPMENT'
+                      }
+                    >
                       <option value="DEVELOPMENT">开发环境</option>
                       <option value="TESTING">测试环境</option>
                       <option value="STAGING">预发布环境</option>
@@ -1169,8 +1376,32 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
                 )}
               </>
             )}
+            <Field label="说明">
+              <textarea
+                name="description"
+                defaultValue={editingResource?.description}
+                maxLength={2000}
+                rows={2}
+              />
+            </Field>
           </Form>
         </Modal>
+      )}
+      {deletingResource && (
+        <Confirm
+          title={`删除${labels[deletingResource.key]}`}
+          description={
+            deletingResource.key === 'repositories'
+              ? `删除「${deletingResource.item.name}」。请先解除服务与 Pipeline 的引用。`
+              : `删除「${deletingResource.item.name}」及其部署配置和变量。地址或历史记录引用此资源时，删除会被阻止。`
+          }
+          onClose={() => !busy && setDeletingResource(undefined)}
+          onConfirm={deleteResource}
+          busy={busy}
+          error={error}
+          destructive
+          label="删除"
+        />
       )}
     </>
   );

@@ -250,6 +250,121 @@ async function checkApi(databaseUrl?: string) {
     const variables = await api.get(`/api/v1/environments/${environmentId}/variables`).expect(200);
     assert.equal(JSON.stringify(variables.body).includes('server-secret-123'), false);
     await api.delete(`/api/v1/deployment-targets/${targetId}`).expect(409);
+    const retired = await api
+      .post('/api/v1/servers')
+      .send({
+        name: 'retired fixture',
+        host: '127.0.0.2',
+        username: 'ops',
+        credentialId,
+        hostKeyFingerprint: '0'.repeat(64),
+      })
+      .expect(201);
+    const group = await api
+      .post('/api/v1/server-groups')
+      .send({
+        name: 'active and retired',
+        serverIds: [serverId, retired.body.data.id],
+      })
+      .expect(201);
+    await api.delete(`/api/v1/servers/${retired.body.data.id}`).expect(200);
+    for (const isolatedSelection of [
+      { groupIds: [group.body.data.id] },
+      { projectIds: [projectId] },
+      { environmentIds: [environmentId] },
+    ]) {
+      const resolved = await api
+        .post('/api/v1/commands/preview')
+        .send(isolatedSelection)
+        .expect(201);
+      assert.deepEqual(
+        resolved.body.data.targets.map((row: { id: string }) => row.id),
+        [serverId],
+      );
+      if ('environmentIds' in isolatedSelection) {
+        const queued = await api
+          .post('/api/v1/commands/execute')
+          .send({
+            ...isolatedSelection,
+            confirmed: true,
+            command: 'true',
+            expectedTargetHash: resolved.body.data.targetHash,
+          })
+          .expect(201);
+        const scope = await db
+          .selectFrom('tasks')
+          .select(['project_id', 'environment_id'])
+          .where('id', '=', queued.body.data.id)
+          .executeTakeFirstOrThrow();
+        assert.deepEqual(scope, { project_id: projectId, environment_id: environmentId });
+      }
+    }
+    const selection = {
+      serverIds: [serverId],
+      projectIds: [projectId],
+      environmentIds: [environmentId],
+      deploymentTargetIds: [targetId],
+      tags: ['test'],
+    };
+    const preview = await api.post('/api/v1/commands/preview').send(selection).expect(201);
+    assert.deepEqual(preview.body.data.targets, [
+      { id: serverId, name: 'test', host: '127.0.0.1' },
+    ]);
+    assert.equal(preview.body.data.count, 1);
+    await api
+      .post('/api/v1/commands/execute')
+      .send({ ...selection, confirmed: true, command: 'true' })
+      .expect(400);
+    const execution = {
+      ...selection,
+      confirmed: true,
+      command: 'uname -a',
+      expectedTargetHash: preview.body.data.targetHash,
+    };
+    const retrySource = await api.post('/api/v1/commands/execute').send(execution).expect(201);
+    const originalTask = retrySource.body.data.id as string;
+    const originalTargets = await api.get(`/api/v1/tasks/${originalTask}/targets`).expect(200);
+    const originalTarget = originalTargets.body.data[0].id as string;
+    const retryUrl = `/api/v1/tasks/${originalTask}/targets/${originalTarget}/retry`;
+    await api.post(retryUrl).send({ confirmed: true }).expect(409);
+    await db
+      .updateTable('tasks')
+      .set({ status: 'FAILED' })
+      .where('id', '=', originalTask)
+      .execute();
+    await db
+      .updateTable('task_targets')
+      .set({ status: 'FAILED', exit_code: 7 })
+      .where('id', '=', originalTarget)
+      .execute();
+    const failure = await api.get(`/api/v1/tasks/${originalTask}/targets`).expect(200);
+    assert.equal(failure.body.data[0].canRetry, true);
+    const [firstRetry, duplicateRetry] = await Promise.all([
+      api.post(retryUrl).send({ confirmed: true }).expect(201),
+      api.post(retryUrl).send({ confirmed: true }).expect(201),
+    ]);
+    assert.equal(firstRetry.body.data.id, duplicateRetry.body.data.id);
+    assert.deepEqual(firstRetry.body.data.retryOf, {
+      taskId: originalTask,
+      targetId: originalTarget,
+    });
+    const retryRows = await api.get(`/api/v1/tasks/${firstRetry.body.data.id}/targets`).expect(200);
+    assert.deepEqual(
+      retryRows.body.data.map((row: { serverId: string }) => row.serverId),
+      [serverId],
+    );
+    await api
+      .patch(`/api/v1/credentials/${credentialId}`)
+      .send({ secret: { password: 'fixture-rotated-ssh' } })
+      .expect(200);
+    await api.post('/api/v1/commands/execute').send(execution).expect(409);
+    await api.post(retryUrl).send({ confirmed: true }).expect(409);
+    await db
+      .updateTable('tasks')
+      .set({ status: 'NEEDS_ATTENTION' })
+      .where('id', '=', originalTask)
+      .execute();
+    await api.post(retryUrl).send({ confirmed: true }).expect(409);
     const admin = await db
       .selectFrom('users')
       .selectAll()
@@ -272,6 +387,7 @@ async function checkApi(databaseUrl?: string) {
       .send({ username: 'viewer', password: newPassword })
       .expect(201);
     await viewer.get('/api/v1/servers').expect(200);
+    await viewer.post(retryUrl).send({ confirmed: true }).expect(403);
     await viewer
       .post('/api/v1/credentials')
       .send({ name: 'forbidden', type: 'SSH_PASSWORD', secret: { password: 'x' } })

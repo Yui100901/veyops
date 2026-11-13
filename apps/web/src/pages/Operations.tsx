@@ -1,15 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import {
   ArrowLeft,
-  ArrowRight,
-  Check,
-  CheckCheck,
-  ChevronRight,
   Clock3,
-  FileCode2,
   ListTodo,
-  LoaderCircle,
-  Play,
+  RotateCcw,
   Search,
   Server as ServerIcon,
   ShieldCheck,
@@ -21,300 +15,17 @@ import {
   Confirm,
   Empty,
   ErrorBanner,
-  Field,
   Loading,
-  Modal,
   PageHeader,
   RefreshButton,
   Section,
   Status,
 } from '../components';
-import type { Plan, Server, Task, TaskTarget, User } from '../models';
+import type { Task, TaskTarget, User } from '../models';
 import { TaskTable } from './Dashboard';
 import { RunArtifacts } from './Delivery';
 
-function ServerPicker({
-  servers,
-  selected,
-  setSelected,
-  disabled,
-}: {
-  servers: Server[];
-  selected: string[];
-  setSelected: (ids: string[]) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <div className="server-picker">
-      {servers.length ? (
-        servers.map((server) => (
-          <label
-            className={`server-option ${selected.includes(server.id) ? 'selected' : ''}`}
-            key={server.id}
-          >
-            <input
-              type="checkbox"
-              checked={selected.includes(server.id)}
-              disabled={disabled}
-              onChange={(event) =>
-                setSelected(
-                  event.target.checked
-                    ? [...selected, server.id]
-                    : selected.filter((id) => id !== server.id),
-                )
-              }
-            />
-            <ServerIcon size={17} />
-            <span>
-              <strong>{server.name}</strong>
-              <small>{server.host}</small>
-            </span>
-            <Status value={server.status} />
-          </label>
-        ))
-      ) : (
-        <div className="mini-empty">
-          还没有服务器。<a href="#/servers">接入服务器</a>
-        </div>
-      )}
-    </div>
-  );
-}
-
-export function CommandsPage({ user }: { user: User }) {
-  const servers = useResource<Server[]>('/servers');
-  const [selected, setSelected] = useState<string[]>([]);
-  const [command, setCommand] = useState('');
-  const [name, setName] = useState('');
-  const [timeout, setTimeoutValue] = useState(300);
-  const [strategy, setStrategy] = useState('PARALLEL');
-  const [maxParallel, setMaxParallel] = useState(3);
-  const [failurePolicy, setFailurePolicy] = useState('CONTINUE');
-  const [confirming, setConfirming] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const canEdit = user.role !== 'VIEWER';
-  async function execute() {
-    setBusy(true);
-    setError('');
-    try {
-      const task = await post<Task>('/commands/execute', {
-        name: name.trim() || '临时命令',
-        command,
-        serverIds: selected,
-        timeout,
-        strategy,
-        maxParallel: strategy === 'SEQUENTIAL' ? 1 : maxParallel,
-        failurePolicy,
-        confirmed: true,
-      });
-      navigate(`/tasks/${task.id}`);
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-  function preview() {
-    setError('');
-    if (!selected.length) {
-      setError('请选择至少一台目标服务器。');
-      return;
-    }
-    if (!command.trim()) {
-      setError('请输入需要执行的命令。');
-      return;
-    }
-    setConfirming(true);
-  }
-  return (
-    <>
-      <PageHeader
-        eyebrow="COMMAND CENTER"
-        title="命令中心"
-        description="一次输入，多台执行。每一个目标、每一行日志，都清晰可见。"
-        action={
-          <a href="#/plans" className="button secondary">
-            <FileCode2 size={16} />
-            运维方案
-            <ArrowRight size={15} />
-          </a>
-        }
-      />
-      <ErrorBanner
-        error={servers.error || (!confirming ? error : '')}
-        retry={servers.error ? servers.reload : undefined}
-      />
-      {!canEdit && (
-        <div className="info-strip">
-          <ShieldCheck size={18} />
-          <p>当前账号为只读角色，可查看执行记录，不能提交服务器命令。</p>
-        </div>
-      )}
-      <div className="command-layout">
-        <div>
-          <Section
-            title="目标服务器"
-            subtitle="明确选择执行目标，不会自动选中全部服务器。"
-            action={<span className="selected-count">已选择 {selected.length} 台</span>}
-          >
-            {servers.loading ? (
-              <Loading />
-            ) : (
-              <ServerPicker
-                servers={servers.data ?? []}
-                selected={selected}
-                setSelected={setSelected}
-                disabled={!canEdit}
-              />
-            )}
-          </Section>
-          <Section title="执行策略" subtitle="同一个父任务内，独立记录每台服务器的结果">
-            <div className="form-body">
-              <div className="form-grid">
-                <Field label="执行方式">
-                  <select
-                    value={strategy}
-                    onChange={(event) => setStrategy(event.target.value)}
-                    disabled={!canEdit}
-                  >
-                    <option value="PARALLEL">并行执行</option>
-                    <option value="SEQUENTIAL">顺序执行</option>
-                  </select>
-                </Field>
-                <Field label="最大并发">
-                  <input
-                    type="number"
-                    value={strategy === 'SEQUENTIAL' ? 1 : maxParallel}
-                    min={1}
-                    max={10}
-                    disabled={strategy === 'SEQUENTIAL' || !canEdit}
-                    onChange={(event) => setMaxParallel(Number(event.target.value))}
-                  />
-                </Field>
-              </div>
-              <div className="form-grid">
-                <Field label="单目标超时（秒）">
-                  <input
-                    type="number"
-                    value={timeout}
-                    min={1}
-                    max={3600}
-                    disabled={!canEdit}
-                    onChange={(event) => setTimeoutValue(Number(event.target.value))}
-                  />
-                </Field>
-                <Field label="目标失败后">
-                  <select
-                    value={failurePolicy}
-                    onChange={(event) => setFailurePolicy(event.target.value)}
-                    disabled={!canEdit}
-                  >
-                    <option value="CONTINUE">继续其他目标</option>
-                    <option value="STOP">停止剩余目标</option>
-                  </select>
-                </Field>
-              </div>
-            </div>
-          </Section>
-        </div>
-        <div>
-          <Section
-            title="Shell 命令"
-            subtitle="以服务器配置的 SSH 用户身份执行"
-            action={<span className="code-language">SHELL</span>}
-          >
-            <div className="command-editor">
-              <div className="editor-bar">
-                <span />
-                <span />
-                <span />
-                <span className="editor-title">远程命令 · SSH</span>
-              </div>
-              <textarea
-                aria-label="Shell 命令"
-                value={command}
-                onChange={(event) => setCommand(event.target.value)}
-                disabled={!canEdit}
-                placeholder={'# 输入单行命令或多行 Shell 脚本\n# 例如：uname -a && uptime'}
-                spellCheck={false}
-              />
-            </div>
-            <div className="command-options">
-              <Field label="任务名称（可选）">
-                <input
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  placeholder="例如 检查服务器运行状态"
-                  disabled={!canEdit}
-                  maxLength={100}
-                />
-              </Field>
-              <div className="command-submit">
-                <span>
-                  <ShieldCheck size={16} />
-                  执行前需确认命令和目标
-                </span>
-                <button
-                  className="button primary"
-                  disabled={!canEdit || !selected.length || !command.trim()}
-                  onClick={preview}
-                >
-                  <Play size={16} />
-                  预览并执行
-                </button>
-              </div>
-            </div>
-          </Section>
-          <div className="command-note">
-            <Terminal size={20} />
-            <div>
-              <strong>命令执行，不是交互式终端</strong>
-              <p>
-                支持多行 Shell、超时与任务取消。请使用无需交互输入的命令，并在执行前核对权限和目标。
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-      {confirming && (
-        <Confirm
-          title="确认执行远程命令"
-          description={`即将在明确选择的 ${selected.length} 台服务器上执行以下命令。请核对所有目标和命令内容。`}
-          onClose={() => {
-            if (!busy) setConfirming(false);
-          }}
-          onConfirm={execute}
-          label={busy ? '正在提交…' : `确认执行 · ${selected.length} 台服务器`}
-          busy={busy}
-          error={error}
-          detail={
-            <>
-              <div className="confirmation-targets">
-                {(servers.data ?? [])
-                  .filter((server) => selected.includes(server.id))
-                  .map((server) => (
-                    <span key={server.id}>
-                      <ServerIcon size={14} />
-                      {server.name}
-                      <small>{server.host}</small>
-                    </span>
-                  ))}
-              </div>
-              <pre className="code-preview">{command}</pre>
-              <div className="confirmation-meta">
-                <span>{strategy === 'PARALLEL' ? `${maxParallel} 台并发` : '顺序执行'}</span>
-                <span>超时 {timeout} 秒</span>
-                <span>{failurePolicy === 'CONTINUE' ? '失败继续' : '失败停止'}</span>
-              </div>
-            </>
-          }
-        />
-      )}
-    </>
-  );
-}
-
+export { CommandsPage, PlansPage } from './BatchOperations';
 export function TasksPage() {
   const resource = useResource<Task[]>('/tasks', 3000);
   const [filter, setFilter] = useState('ALL');
@@ -409,6 +120,7 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
     }[]
   >(`/tasks/${id}/steps`, 2000);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  const [retryTarget, setRetryTarget] = useState<TaskTarget>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   async function cancel() {
@@ -419,6 +131,21 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
       setConfirmCancel(false);
       await task.reload();
       await targets.reload();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function retry() {
+    if (!retryTarget) return;
+    setBusy(true);
+    setError('');
+    try {
+      const task = await post<Task>(`/tasks/${id}/targets/${retryTarget.id}/retry`, {
+        confirmed: true,
+      });
+      navigate(`/tasks/${task.id}`);
     } catch (err) {
       setError(message(err));
     } finally {
@@ -454,7 +181,10 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
             {activeTask(value.status) && user.role !== 'VIEWER' && (
               <button
                 className="button secondary"
-                onClick={() => setConfirmCancel(true)}
+                onClick={() => {
+                  setError('');
+                  setConfirmCancel(true);
+                }}
                 disabled={value.status === 'CANCEL_REQUESTED'}
               >
                 <Square size={14} />
@@ -546,6 +276,18 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
                     </p>
                   )}
                   {target.errorSummary && <p className="error-text">{target.errorSummary}</p>}
+                  {user.role !== 'VIEWER' && target.canRetry && (
+                    <button
+                      className="text-button"
+                      onClick={() => {
+                        setError('');
+                        setRetryTarget(target);
+                      }}
+                    >
+                      <RotateCcw size={14} />
+                      重试此目标
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
@@ -622,168 +364,16 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
           label="确认取消"
         />
       )}
-    </>
-  );
-}
-
-export function PlansPage({ user }: { user: User }) {
-  const plans = useResource<Plan[]>('/operation-plans');
-  const servers = useResource<Server[]>('/servers');
-  const [selectedPlan, setSelectedPlan] = useState<Plan>();
-  const [selected, setSelected] = useState<string[]>([]);
-  const [confirming, setConfirming] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  useEffect(() => {
-    setSelected([]);
-    setConfirming(false);
-    setError('');
-  }, [selectedPlan?.id]);
-  async function run() {
-    if (!selectedPlan) return;
-    setBusy(true);
-    setError('');
-    try {
-      const task = await post<Task>(`/operation-plans/${selectedPlan.id}/run`, {
-        serverIds: selected,
-        confirmed: true,
-      });
-      navigate(`/tasks/${task.id}`);
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <>
-      <PageHeader
-        eyebrow="REUSABLE OPERATIONS"
-        title="运维方案"
-        description="把重复操作沉淀为版本化步骤，通过统一任务引擎执行。"
-        action={
-          <a href="#/commands" className="button secondary">
-            <Terminal size={16} />
-            临时命令
-          </a>
-        }
-      />
-      <ErrorBanner error={plans.error} retry={plans.reload} />
-      {plans.loading ? (
-        <Loading />
-      ) : !plans.data?.length ? (
-        <div className="panel">
-          <Empty
-            icon={<FileCode2 size={25} />}
-            title="暂无运维方案"
-            description="系统初始化后会提供巡检模板，也可通过 API 创建自定义多步骤方案。"
-          />
-        </div>
-      ) : (
-        <div className="plans-grid">
-          {plans.data.map((plan) => (
-            <section className="plan-card" key={plan.id}>
-              <div className="plan-card-heading">
-                <span className="resource-avatar">
-                  <FileCode2 size={22} />
-                </span>
-                <span className="tag">v{plan.currentVersion ?? plan.version ?? 1}</span>
-              </div>
-              <h2>{plan.name}</h2>
-              <p>{plan.description || '可重复执行的多步骤运维方案。'}</p>
-              <ol>
-                {plan.steps?.slice(0, 4).map((step, index) => (
-                  <li key={index}>
-                    <span>{index + 1}</span>
-                    {step.name}
-                  </li>
-                ))}
-              </ol>
-              <div className="plan-card-footer">
-                <span>{plan.steps?.length ?? 0} 个步骤</span>
-                <button className="text-button" onClick={() => setSelectedPlan(plan)}>
-                  {user.role === 'VIEWER' ? '查看方案' : '查看并运行'}
-                  <ChevronRight size={15} />
-                </button>
-              </div>
-            </section>
-          ))}
-        </div>
-      )}
-      {selectedPlan && (
-        <Modal
-          title={selectedPlan.name}
-          description={`固定使用当前方案 v${selectedPlan.currentVersion ?? selectedPlan.version ?? 1}，按步骤执行。`}
-          onClose={() => {
-            if (!busy) setSelectedPlan(undefined);
-          }}
-          wide
-        >
-          <div className="form-body">
-            <ErrorBanner error={servers.error || error} />
-            <div className="plan-steps">
-              {selectedPlan.steps?.map((step, index) => (
-                <div key={index}>
-                  <h3>
-                    <span>{index + 1}</span>
-                    {step.name}
-                  </h3>
-                  <pre className="code-preview">{step.command}</pre>
-                </div>
-              ))}
-            </div>
-            {!confirming ? (
-              <>
-                <h3 className="field-title">选择执行目标</h3>
-                <ServerPicker
-                  servers={servers.data ?? []}
-                  selected={selected}
-                  setSelected={setSelected}
-                  disabled={user.role === 'VIEWER'}
-                />
-              </>
-            ) : (
-              <div className="confirmation-summary">
-                <CheckCheck size={22} />
-                <div>
-                  <strong>将对 {selected.length} 台服务器执行此方案</strong>
-                  <p>
-                    {(servers.data ?? [])
-                      .filter((server) => selected.includes(server.id))
-                      .map((server) => server.name)
-                      .join('、')}
-                  </p>
-                  <p>请核对以上全部步骤。执行操作可能会修改服务器环境。</p>
-                </div>
-              </div>
-            )}
-          </div>
-          <div className="modal-footer">
-            <button
-              className="button secondary"
-              onClick={() => (confirming ? setConfirming(false) : setSelectedPlan(undefined))}
-              disabled={busy}
-            >
-              {confirming ? '返回选择' : '关闭'}
-            </button>
-            {user.role !== 'VIEWER' && (
-              <button
-                className="button primary"
-                disabled={!selected.length || busy}
-                onClick={() => (confirming ? run() : setConfirming(true))}
-              >
-                {busy ? (
-                  <LoaderCircle className="spin" size={16} />
-                ) : confirming ? (
-                  <Check size={16} />
-                ) : (
-                  <Play size={16} />
-                )}
-                {confirming ? `确认执行 · ${selected.length} 台` : '预览执行目标'}
-              </button>
-            )}
-          </div>
-        </Modal>
+      {retryTarget && (
+        <Confirm
+          title="重试此目标"
+          description={`将在 ${retryTarget.serverName}（${retryTarget.host}）上使用原任务配置重新执行。请先检查该目标是否已产生需要保留的变更。`}
+          onClose={() => !busy && setRetryTarget(undefined)}
+          onConfirm={retry}
+          busy={busy}
+          error={error}
+          label="确认重试"
+        />
       )}
     </>
   );

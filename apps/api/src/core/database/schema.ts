@@ -385,6 +385,21 @@ export interface CommandTemplatesTable {
   variables_schema_json: Generated<string>;
   risk_level: Generated<string>;
   timeout_seconds: Generated<number>;
+  current_version: Generated<number>;
+  enabled: Generated<number>;
+  created_by: string;
+  created_at: number;
+}
+
+export interface CommandTemplateVersionsTable {
+  id: string;
+  template_id: string;
+  version: number;
+  name: string;
+  description: string;
+  command_text: string;
+  variables_schema_json: string;
+  timeout_seconds: number;
   created_by: string;
   created_at: number;
 }
@@ -536,6 +551,7 @@ export interface Database {
   artifacts: ArtifactsTable;
   deployment_records: DeploymentRecordsTable;
   command_templates: CommandTemplatesTable;
+  command_template_versions: CommandTemplateVersionsTable;
   operation_plans: OperationPlansTable;
   operation_plan_versions: OperationPlanVersionsTable;
   ai_providers: AiProvidersTable;

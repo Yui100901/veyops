@@ -7,6 +7,7 @@ import {
   IsOptional,
   IsString,
   Length,
+  Matches,
   Max,
   Min,
   Equals,
@@ -20,10 +21,13 @@ export class TargetSelectionDto {
   @ArrayMaxSize(100)
   @IsString({ each: true })
   deploymentTargetIds?: string[];
+  @IsOptional() @IsArray() @ArrayMaxSize(100) @IsString({ each: true }) projectIds?: string[];
+  @IsOptional() @IsArray() @ArrayMaxSize(100) @IsString({ each: true }) environmentIds?: string[];
   @IsOptional() @IsArray() @ArrayMaxSize(30) @IsString({ each: true }) tags?: string[];
 }
 export class ExecutionOptionsDto extends TargetSelectionDto {
   @IsBoolean() @Equals(true, { message: '必须确认目标及命令后才能执行' }) confirmed!: boolean;
+  @IsOptional() @IsString() @Matches(/^[a-f0-9]{64}$/) expectedTargetHash?: string;
   @IsOptional() @IsIn(['PARALLEL', 'SEQUENTIAL']) strategy: 'PARALLEL' | 'SEQUENTIAL' = 'PARALLEL';
   @IsOptional() @IsInt() @Min(1) @Max(10) maxParallel = 3;
   @IsOptional() @IsIn(['STOP', 'CONTINUE']) failurePolicy: 'STOP' | 'CONTINUE' = 'CONTINUE';

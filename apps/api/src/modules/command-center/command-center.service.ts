@@ -5,6 +5,9 @@ import { TargetResolver } from './target-resolver.service';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { MultiTargetExecutor } from '../../infrastructure/ssh/multi-target.executor';
 import { AuditService } from '../audit/audit.service';
+import type { Database } from '../../core/database/schema';
+import type { Transaction } from 'kysely';
+import type { TaskPayload } from '../tasks/tasks.types';
 
 @Injectable()
 export class CommandCenterService implements OnModuleInit {
@@ -21,31 +24,36 @@ export class CommandCenterService implements OnModuleInit {
       execute: (task, context) => this.executor.execute(task, context),
     });
   }
-  async preview(input: TargetSelectionDto) {
-    const targets = await this.targets.resolve(input);
-    return {
-      count: targets.length,
-      targets: targets.map((server) => ({ id: server.id, name: server.name, host: server.host })),
-    };
+  preview(input: TargetSelectionDto) {
+    return this.targets.preview(input);
   }
-  async execute(input: ExecuteCommandDto, userId: string) {
+  async execute(
+    input: ExecuteCommandDto,
+    userId: string,
+    template?: TaskPayload['commandTemplate'],
+    beforeInsert?: (tx: Transaction<Database>) => Promise<void>,
+  ) {
     const task = await this.tasks.create(
       {
         type: 'COMMAND',
         name: input.name ?? '临时命令',
+        scope: await this.targets.executionScope(input),
         payload: {
-          targets: await this.targets.resolve(input),
+          targets: await this.targets.resolveForExecution(input),
           steps: [{ name: '执行命令', command: input.command }],
           strategy: input.strategy,
           maxParallel: input.maxParallel,
           failurePolicy: input.failurePolicy,
           timeout: input.timeout,
+          commandTemplate: template,
         },
       },
       userId,
+      beforeInsert,
     );
     await this.audit.record(userId, 'command.execute', 'task', task.id, {
       targetCount: (await this.tasks.targets(task.id)).length,
+      ...(template ? { templateId: template.id, version: template.version } : {}),
     });
     return task;
   }

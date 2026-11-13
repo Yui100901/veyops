@@ -26,6 +26,8 @@ export interface TaskPayload {
   failurePolicy: 'STOP' | 'CONTINUE';
   timeout: number;
   pipeline?: PipelineSnapshot;
+  commandTemplate?: { id: string; version: number };
+  retryOf?: { taskId: string; targetId: string };
 }
 export interface TaskRecord {
   id: string;
@@ -69,7 +71,7 @@ export interface CreateTaskInput {
   payload: TaskPayload;
   operationPlanVersionId?: string;
   idempotencyKey?: string;
-  scope?: { projectId: string; serviceId: string; environmentId: string; targetId: string };
+  scope?: { projectId?: string; serviceId?: string; environmentId?: string; targetId?: string };
   pipelineRun?: {
     id: string;
     pipelineId: string;

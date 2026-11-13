@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  Body,
   Controller,
   Get,
   Headers,
@@ -11,9 +12,14 @@ import {
   Sse,
 } from '@nestjs/common';
 import { interval, Observable, startWith, concatMap, takeWhile } from 'rxjs';
-import { Roles } from '../auth/auth.decorators';
+import { Equals } from 'class-validator';
+import { Roles, type CurrentUser } from '../auth/auth.decorators';
 import { TasksService, isTerminalStatus } from './tasks.service';
 import { AuditService } from '../audit/audit.service';
+
+class RetryTargetDto {
+  @Equals(true) confirmed!: boolean;
+}
 
 @Controller('tasks')
 export class TasksController {
@@ -27,8 +33,22 @@ export class TasksController {
   @Get(':id') get(@Param('id') id: string) {
     return this.tasks.get(id);
   }
-  @Get(':id/targets') targets(@Param('id') id: string) {
-    return this.tasks.targets(id);
+  @Get(':id/targets') targets(@Param('id') id: string, @Req() req: { user: CurrentUser }) {
+    return this.tasks.targets(id, req.user);
+  }
+  @Post(':id/targets/:targetId/retry') @Roles('ADMIN', 'OPERATOR') async retryTarget(
+    @Param('id') id: string,
+    @Param('targetId') targetId: string,
+    @Body() input: RetryTargetDto,
+    @Req() req: { user: CurrentUser },
+  ) {
+    if (!input.confirmed) throw new BadRequestException('必须确认重试');
+    const task = await this.tasks.retryTarget(id, targetId, req.user);
+    await this.audit.record(req.user.id, 'task.target.retry', 'task', task.id, {
+      originalTaskId: id,
+      originalTargetId: targetId,
+    });
+    return task;
   }
   @Get(':id/steps') steps(@Param('id') id: string) {
     return this.tasks.steps(id);

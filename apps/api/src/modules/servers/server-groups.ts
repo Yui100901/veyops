@@ -6,6 +6,7 @@ import {
   Module,
   NotFoundException,
   Param,
+  Patch,
   Post,
   Req,
 } from '@nestjs/common';
@@ -38,7 +39,14 @@ class ServerGroupsController {
   ) {}
   @Get() async list() {
     const groups = await this.database.db.selectFrom('server_groups').selectAll().execute();
-    const members = await this.database.db.selectFrom('server_group_members').selectAll().execute();
+    const members = await this.database.db
+      .selectFrom('server_group_members')
+      .innerJoin('servers', 'servers.id', 'server_group_members.server_id')
+      .select(['group_id', 'server_id'])
+      .where('servers.is_active', '=', 1)
+      .orderBy('server_group_members.created_at')
+      .orderBy('server_id')
+      .execute();
     return groups.map((g) => ({
       id: g.id,
       name: g.name,
@@ -46,37 +54,64 @@ class ServerGroupsController {
       serverIds: members.filter((m) => m.group_id === g.id).map((m) => m.server_id),
     }));
   }
-  @Roles('ADMIN', 'OPERATOR') @Post() async create(@Body() dto: GroupDto, @Req() req: AuthRequest) {
+  @Roles('ADMIN', 'OPERATOR') @Post() create(@Body() dto: GroupDto, @Req() req: AuthRequest) {
+    return this.save(dto, req.user.id);
+  }
+  @Roles('ADMIN', 'OPERATOR') @Patch(':id') update(
+    @Param('id') id: string,
+    @Body() dto: GroupDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.save(dto, req.user.id, id);
+  }
+  private async save(dto: GroupDto, userId: string, groupId?: string) {
     if (dto.serverIds.length) await this.servers.snapshot(dto.serverIds);
-    const id = randomUUID();
+    const id = groupId ?? randomUUID();
     const now = Date.now();
+    const values = { name: dto.name, description: dto.description ?? '' };
+    const serverIds = [...new Set(dto.serverIds)];
     await this.database.db.transaction().execute(async (tx) => {
-      await tx
-        .insertInto('server_groups')
-        .values({ id, name: dto.name, description: dto.description || '', created_at: now })
-        .execute();
-      for (const serverId of new Set(dto.serverIds))
+      if (groupId) {
+        const updated = await tx
+          .updateTable('server_groups')
+          .set(values)
+          .where('id', '=', id)
+          .returning('id')
+          .executeTakeFirst();
+        if (!updated) throw new NotFoundException('分组不存在');
+        await tx.deleteFrom('server_group_members').where('group_id', '=', id).execute();
+      } else {
+        await tx
+          .insertInto('server_groups')
+          .values({ id, ...values, created_at: now })
+          .execute();
+      }
+      if (serverIds.length)
         await tx
           .insertInto('server_group_members')
-          .values({ group_id: id, server_id: serverId, created_at: now })
+          .values(
+            serverIds.map((serverId) => ({ group_id: id, server_id: serverId, created_at: now })),
+          )
           .execute();
     });
-    await this.audit.record(req.user.id, 'server-group.create', 'server-group', id);
-    return (await this.list()).find((g) => g.id === id);
+    await this.audit.record(
+      userId,
+      groupId ? 'server-group.update' : 'server-group.create',
+      'server-group',
+      id,
+    );
+    return { id, ...values, serverIds };
   }
   @Roles('ADMIN', 'OPERATOR') @Delete(':id') async remove(
     @Param('id') id: string,
     @Req() req: AuthRequest,
   ) {
-    if (
-      !(await this.database.db
-        .selectFrom('server_groups')
-        .select('id')
-        .where('id', '=', id)
-        .executeTakeFirst())
-    )
-      throw new NotFoundException('分组不存在');
-    await this.database.db.deleteFrom('server_groups').where('id', '=', id).execute();
+    const removed = await this.database.db
+      .deleteFrom('server_groups')
+      .where('id', '=', id)
+      .returning('id')
+      .executeTakeFirst();
+    if (!removed) throw new NotFoundException('分组不存在');
     await this.audit.record(req.user.id, 'server-group.delete', 'server-group', id);
     return { success: true };
   }

@@ -63,6 +63,16 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
       created_at: now,
     })
     .execute();
+  await db
+    .insertInto('command_templates')
+    .values({
+      id: 'existing-template',
+      name: 'Existing command template',
+      command_text: 'uname -a',
+      created_by: 'existing-user',
+      created_at: now,
+    })
+    .execute();
 
   const upgrade = await migrator.migrateToLatest();
   assert.ifError(upgrade.error);
@@ -85,6 +95,18 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
       .executeTakeFirstOrThrow(),
     { archive_key: null, storage_key: 'historical.tar.gz', size_bytes: artifactBytes },
   );
+  assert.deepEqual(
+    await db
+      .selectFrom('command_template_versions')
+      .select(['template_id', 'version', 'command_text', 'created_at'])
+      .executeTakeFirstOrThrow(),
+    {
+      template_id: 'existing-template',
+      version: 1,
+      command_text: 'uname -a',
+      created_at: now,
+    },
+  );
   await assert.rejects(
     db.updateTable('users').set({ must_change_password: 2 }).execute(),
     /check constraint/i,
@@ -98,6 +120,7 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
   await assert.rejects(db.selectFrom('pipeline_webhooks').select('pipeline_id').execute());
   await assert.rejects(db.selectFrom('users').select('must_change_password').execute());
   await assert.rejects(db.selectFrom('artifacts').select('archive_key').execute());
+  await assert.rejects(db.selectFrom('command_template_versions').select('id').execute());
   assert.deepEqual(
     await db
       .selectFrom('artifacts')

@@ -269,7 +269,15 @@ type EnvironmentConfig = {
   startCommand?: string;
   healthCheckCommand?: string;
 };
-export function ProjectDeploymentConfig({ project, user }: { project: ProjectDetail; user: User }) {
+export function ProjectDeploymentConfig({
+  project,
+  user,
+  reloadProject,
+}: {
+  project: ProjectDetail;
+  user: User;
+  reloadProject: () => Promise<void>;
+}) {
   const [selected, setSelected] = useState<{ serviceId: string; environmentId: string }>();
   const [binding, setBinding] = useState<string>();
   return (
@@ -323,6 +331,10 @@ export function ProjectDeploymentConfig({ project, user }: { project: ProjectDet
           environmentId={selected.environmentId}
           user={user}
           onClose={() => setSelected(undefined)}
+          onSaved={() => {
+            setSelected(undefined);
+            void reloadProject();
+          }}
         />
       )}
       {binding && (
@@ -341,12 +353,14 @@ function EnvironmentConfigEditor({
   environmentId,
   user,
   onClose,
+  onSaved,
 }: {
   project: ProjectDetail;
   serviceId: string;
   environmentId: string;
   user: User;
   onClose: () => void;
+  onSaved: () => void;
 }) {
   const config = useResource<EnvironmentConfig | null>(
     `/services/${serviceId}/environments/${environmentId}/config`,
@@ -380,7 +394,7 @@ function EnvironmentConfigEditor({
           healthCheckCommand: f.get('healthCheckCommand'),
         }),
       });
-      onClose();
+      onSaved();
     } catch (err) {
       setError(message(err));
     } finally {

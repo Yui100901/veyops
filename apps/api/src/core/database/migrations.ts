@@ -824,6 +824,57 @@ export const artifactArchiveMigration: Migration = {
   },
 };
 
+export const batchOperationsMigration: Migration = {
+  async up(db) {
+    await db.schema
+      .alterTable('command_templates')
+      .addColumn('current_version', 'integer', (c) =>
+        c
+          .notNull()
+          .defaultTo(1)
+          .check(sql`current_version >= 1`),
+      )
+      .execute();
+    await db.schema
+      .alterTable('command_templates')
+      .addColumn('enabled', 'integer', (c) =>
+        c
+          .notNull()
+          .defaultTo(1)
+          .check(sql`enabled in (0, 1)`),
+      )
+      .execute();
+    await db.schema
+      .createTable('command_template_versions')
+      .addColumn('id', 'text', (c) => c.primaryKey())
+      .addColumn('template_id', 'text', (c) => c.notNull().references('command_templates.id'))
+      .addColumn('version', 'integer', (c) => c.notNull().check(sql`version >= 1`))
+      .addColumn('name', 'text', (c) => c.notNull())
+      .addColumn('description', 'text', (c) => c.notNull())
+      .addColumn('command_text', 'text', (c) => c.notNull())
+      .addColumn('variables_schema_json', 'text', (c) => c.notNull())
+      .addColumn('timeout_seconds', 'integer', (c) => c.notNull())
+      .addColumn('created_by', 'text', (c) => c.notNull().references('users.id'))
+      .addColumn('created_at', 'bigint', (c) => c.notNull())
+      .addUniqueConstraint('command_template_version_unique', ['template_id', 'version'])
+      .execute();
+    await sql`
+      insert into command_template_versions (
+        id, template_id, version, name, description, command_text,
+        variables_schema_json, timeout_seconds, created_by, created_at
+      )
+      select id, id, 1, name, description, command_text,
+        variables_schema_json, timeout_seconds, created_by, created_at
+      from command_templates
+    `.execute(db);
+  },
+  async down(db) {
+    await db.schema.dropTable('command_template_versions').execute();
+    await db.schema.alterTable('command_templates').dropColumn('enabled').execute();
+    await db.schema.alterTable('command_templates').dropColumn('current_version').execute();
+  },
+};
+
 export const migrationProvider: MigrationProvider = {
   async getMigrations() {
     return {
@@ -831,6 +882,7 @@ export const migrationProvider: MigrationProvider = {
       '002_administrator_password': administratorPasswordMigration,
       '003_pipeline_webhooks': pipelineWebhookMigration,
       '004_artifact_archives': artifactArchiveMigration,
+      '005_batch_operations': batchOperationsMigration,
     };
   },
 };

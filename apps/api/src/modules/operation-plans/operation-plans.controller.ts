@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post, Req } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Req } from '@nestjs/common';
 import { Roles } from '../auth/auth.decorators';
 import { OperationPlansService } from './operation-plans.service';
 import { CreatePlanDto, RunPlanDto } from './operation-plan.dto';
@@ -24,6 +24,12 @@ export class OperationPlansController {
     @Req() req: { user: { id: string } },
   ) {
     return this.plans.update(id, input, req.user.id);
+  }
+  @Delete(':id') @Roles('ADMIN', 'OPERATOR') remove(
+    @Param('id') id: string,
+    @Req() req: { user: { id: string } },
+  ) {
+    return this.plans.remove(id, req.user.id);
   }
   @Post(':id/run') @Roles('ADMIN', 'OPERATOR') run(
     @Param('id') id: string,

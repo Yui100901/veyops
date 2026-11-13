@@ -54,7 +54,13 @@ export class MultiTargetExecutor {
             targetExitCode = exitCode;
             targetError = error;
             context.log(`步骤结束：${stepStatus} ${error ?? ''}\n`, target.id);
-            if (step.failurePolicy !== 'CONTINUE' || signal.aborted) break;
+            if (
+              stepStatus === 'NEEDS_ATTENTION' ||
+              stepStatus === 'TIMED_OUT' ||
+              step.failurePolicy !== 'CONTINUE' ||
+              signal.aborted
+            )
+              break;
           }
         }
         await context.finishTarget(targetId, targetStatus, targetExitCode, targetError);

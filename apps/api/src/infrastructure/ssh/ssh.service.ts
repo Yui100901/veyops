@@ -4,6 +4,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { CredentialsService } from '../../modules/credentials/credentials.service';
 import { redactText, SecretRedactor } from './secret-redactor';
+import { serverProbeCommand } from './server-probe';
 import type { SFTPWrapper } from 'ssh2';
 
 export interface SshTarget {
@@ -14,6 +15,7 @@ export interface SshTarget {
   username: string;
   credentialId: string | null;
   hostKeyFingerprint: string | null;
+  credentialNonce?: string;
 }
 export interface SshOptions {
   timeout: number;
@@ -57,7 +59,7 @@ export class SshService {
       throw new SshExecutionError('服务器尚未配置已确认的 SSH SHA256 主机指纹');
     if (options.signal?.aborted) throw new SshExecutionError('任务已取消', 'CANCELLED');
     if (!target.credentialId) throw new SshExecutionError('服务器尚未关联 SSH 凭据');
-    const secret = await this.credentials.decrypt(target.credentialId);
+    const secret = await this.credentials.decrypt(target.credentialId, target.credentialNonce);
     if (options.signal?.aborted) throw new SshExecutionError('任务已取消', 'CANCELLED');
     const secretValues = [...Object.values(secret), ...(options.secrets || [])];
     return new Promise((resolve, reject) => {
@@ -168,9 +170,17 @@ export class SshService {
           stream.on('error', (err: Error) =>
             finish(new SshExecutionError(redactText(err.message, secretValues), 'NEEDS_ATTENTION')),
           );
-          stream.on('close', (code: number | null, signal?: string) =>
-            finish(undefined, { exitCode: code ?? (signal ? 128 : 1), signal }),
-          );
+          stream.on('close', (code: number | null, signal?: string) => {
+            if (typeof code === 'number' || signal)
+              finish(undefined, { exitCode: code ?? 128, signal });
+            else
+              finish(
+                new SshExecutionError(
+                  'SSH 未返回命令退出状态，远程执行结果未知',
+                  'NEEDS_ATTENTION',
+                ),
+              );
+          });
         });
       });
       client.on('error', (error: Error) =>
@@ -258,7 +268,7 @@ export class SshService {
     if (!target.credentialId || !target.hostKeyFingerprint)
       throw new SshExecutionError('SFTP 需要 SSH 凭据和已确认的主机指纹');
     if (options.signal?.aborted) throw new SshExecutionError('传输已取消', 'CANCELLED');
-    const secret = await this.credentials.decrypt(target.credentialId);
+    const secret = await this.credentials.decrypt(target.credentialId, target.credentialNonce);
     if (options.signal?.aborted) throw new SshExecutionError('传输已取消', 'CANCELLED');
     return new Promise<void>((resolve, reject) => {
       const client = new Client();
@@ -322,16 +332,13 @@ export class SshService {
 
   async probe(target: SshTarget): Promise<{ exitCode: number; output: string }> {
     let output = '';
-    const result = await this.execute(
-      target,
-      'uname -srm; cat /etc/os-release 2>/dev/null | head -5; uptime',
-      {
-        timeout: 15,
-        onData: (text) => {
-          output += text;
-        },
+    const result = await this.execute(target, serverProbeCommand, {
+      timeout: 15,
+      onData: (text, stream) => {
+        if (stream === 'stdout' && output.length < 8192)
+          output += text.slice(0, 8192 - output.length);
       },
-    );
+    });
     return { ...result, output };
   }
 }

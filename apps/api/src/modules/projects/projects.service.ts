@@ -16,6 +16,8 @@ import {
   Req,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import type { Selectable } from 'kysely';
+import type { Database } from '../../core/database/schema';
 import {
   ArrayMaxSize,
   IsArray,
@@ -32,6 +34,13 @@ import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { CurrentUser } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
+import { recentDeployments } from '../deployments/deployment-history';
+import {
+  lockProjectGraph,
+  ProjectRelationsController,
+  ProjectRelationsService,
+  requireProject,
+} from './project-relations';
 import {
   httpCloneUrl,
   isGitCredentialType,
@@ -49,25 +58,59 @@ class RepositoryDto {
   @IsString() @MinLength(1) @MaxLength(100) name!: string;
   @IsString() @MaxLength(2048) cloneUrl!: string;
   @IsOptional() @IsString() @MaxLength(100) defaultBranch?: string;
-  @IsOptional() @IsUUID() credentialId?: string;
+  @IsOptional() @IsUUID() credentialId?: string | null;
+  @IsOptional() @IsIn(['GITHUB', 'GITLAB', 'GITEA', 'BITBUCKET', 'CUSTOM']) provider?: string;
+  @IsOptional() @IsString() @MaxLength(2000) description?: string;
 }
 class ServiceDto {
   @IsString() @MinLength(1) @MaxLength(100) name!: string;
   @IsString() @Matches(/^[a-z0-9][a-z0-9-]{0,62}$/) slug!: string;
   @IsIn(['WEB', 'API', 'WORKER', 'SCHEDULED_JOB', 'STATIC_SITE', 'DOCKER_SERVICE', 'CUSTOM'])
   serviceType = 'WEB';
+  @IsOptional() @IsString() @MaxLength(2000) description?: string;
 }
 class EnvironmentDto {
   @IsString() @MinLength(1) @MaxLength(100) name!: string;
   @IsString() @Matches(/^[a-z0-9][a-z0-9-]{0,62}$/) slug!: string;
   @IsIn(['DEVELOPMENT', 'TESTING', 'STAGING', 'PRODUCTION', 'CUSTOM']) environmentType =
     'DEVELOPMENT';
+  @IsOptional() @IsString() @MaxLength(2000) description?: string;
 }
+
+const repositoryDto = (row: Selectable<Database['repositories']>) => ({
+  id: row.id,
+  name: row.name,
+  cloneUrl: row.clone_url,
+  provider: row.provider,
+  defaultBranch: row.default_branch,
+  credentialId: row.credential_id,
+  description: row.description,
+});
+const serviceDto = (row: Selectable<Database['services']>) => ({
+  id: row.id,
+  name: row.name,
+  slug: row.slug,
+  serviceType: row.service_type,
+  description: row.description,
+});
+const environmentDto = (row: Selectable<Database['environments']>) => ({
+  id: row.id,
+  name: row.name,
+  slug: row.slug,
+  environmentType: row.environment_type,
+  description: row.description,
+});
+
+function hasConstraint(error: unknown, ...codes: string[]) {
+  return codes.includes((error as { code?: string } | null)?.code ?? '');
+}
+
 @Injectable()
 export class ProjectsService {
   constructor(
     private readonly database: DatabaseService,
     private readonly audit: AuditService,
+    private readonly relations: ProjectRelationsService,
   ) {}
   async list() {
     const rows = await this.database.db
@@ -91,45 +134,101 @@ export class ProjectsService {
     }));
   }
   async get(id: string) {
-    const project = (await this.list()).find((p) => p.id === id);
+    const db = this.database.db;
+    const project = await db
+      .selectFrom('projects')
+      .selectAll()
+      .where('id', '=', id)
+      .where('deleted_at', 'is', null)
+      .executeTakeFirst();
     if (!project) throw new NotFoundException('项目不存在');
-    const repositories = await this.database.db
-      .selectFrom('repositories')
-      .selectAll()
-      .where('project_id', '=', id)
-      .execute();
-    const services = await this.database.db
-      .selectFrom('services')
-      .selectAll()
-      .where('project_id', '=', id)
-      .execute();
-    const environments = await this.database.db
-      .selectFrom('environments')
-      .selectAll()
-      .where('project_id', '=', id)
-      .execute();
+    const [repositories, services, environments] = await Promise.all([
+      db
+        .selectFrom('repositories')
+        .selectAll()
+        .where('project_id', '=', id)
+        .orderBy('created_at')
+        .execute(),
+      db
+        .selectFrom('services')
+        .selectAll()
+        .where('project_id', '=', id)
+        .orderBy('created_at')
+        .execute(),
+      db
+        .selectFrom('environments')
+        .selectAll()
+        .where('project_id', '=', id)
+        .orderBy('created_at')
+        .execute(),
+    ]);
+    return {
+      id: project.id,
+      name: project.name,
+      slug: project.slug,
+      description: project.description,
+      tags: JSON.parse(project.tags_json) as string[],
+      status: project.status,
+      createdAt: project.created_at,
+      serviceCount: services.length,
+      environmentCount: environments.length,
+      repositories: repositories.map(repositoryDto),
+      services: services.map(serviceDto),
+      environments: environments.map(environmentDto),
+    };
+  }
+  async detail(id: string) {
+    const project = await this.get(id);
+    const db = this.database.db;
+    const [addresses, dependencies, deploymentRows, pipelines, deployments] = await Promise.all([
+      this.relations.addresses(id),
+      this.relations.dependencies(id),
+      db
+        .selectFrom('deployment_targets as targets')
+        .leftJoin('deployment_target_servers as members', 'members.target_id', 'targets.id')
+        .select([
+          'targets.id as id',
+          'targets.name as name',
+          'targets.description as description',
+          'members.server_id as serverId',
+        ])
+        .where(
+          'targets.id',
+          'in',
+          db
+            .selectFrom('service_environment_configs as configs')
+            .innerJoin('services', 'services.id', 'configs.service_id')
+            .select('configs.target_id')
+            .where('services.project_id', '=', id),
+        )
+        .orderBy('targets.name')
+        .orderBy('targets.id')
+        .orderBy('members.sort_order')
+        .execute(),
+      db
+        .selectFrom('pipelines')
+        .select(['id', 'name', 'service_id as serviceId', 'current_version as version', 'enabled'])
+        .where('project_id', '=', id)
+        .orderBy('created_at', 'desc')
+        .execute(),
+      recentDeployments(db, { projectId: id }),
+    ]);
+    const deploymentTargets = new Map<
+      string,
+      { id: string; name: string; description: string; serverIds: string[] }
+    >();
+    for (const { serverId, ...target } of deploymentRows) {
+      const entry = deploymentTargets.get(target.id) ?? { ...target, serverIds: [] };
+      if (serverId) entry.serverIds.push(serverId);
+      deploymentTargets.set(target.id, entry);
+    }
     return {
       ...project,
-      repositories: repositories.map((r) => ({
-        id: r.id,
-        name: r.name,
-        cloneUrl: r.clone_url,
-        provider: r.provider,
-        defaultBranch: r.default_branch,
-        credentialId: r.credential_id,
-      })),
-      services: services.map((s) => ({
-        id: s.id,
-        name: s.name,
-        slug: s.slug,
-        serviceType: s.service_type,
-      })),
-      environments: environments.map((e) => ({
-        id: e.id,
-        name: e.name,
-        slug: e.slug,
-        environmentType: e.environment_type,
-      })),
+      addresses,
+      dependencies,
+      deploymentTargets: [...deploymentTargets.values()],
+      pipelines: pipelines.map((pipeline) => ({ ...pipeline, enabled: Boolean(pipeline.enabled) })),
+      recentDeployments: deployments,
     };
   }
   async create(dto: ProjectDto, userId: string) {
@@ -157,7 +256,7 @@ export class ProjectsService {
     return this.get(id);
   }
   async update(id: string, dto: ProjectDto, userId: string) {
-    await this.get(id);
+    await requireProject(this.database.db, id);
     try {
       await this.database.db
         .updateTable('projects')
@@ -169,6 +268,7 @@ export class ProjectsService {
           updated_at: Date.now(),
         })
         .where('id', '=', id)
+        .where('deleted_at', 'is', null)
         .execute();
     } catch {
       throw new ConflictException('项目标识已存在');
@@ -177,27 +277,63 @@ export class ProjectsService {
     return this.get(id);
   }
   async remove(id: string, userId: string) {
-    await this.get(id);
-    await this.database.db
-      .updateTable('projects')
-      .set({ deleted_at: Date.now(), updated_at: Date.now() })
-      .where('id', '=', id)
-      .execute();
+    await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      await requireProject(tx, id);
+      const dependent = await tx
+        .selectFrom('project_dependencies as dependencies')
+        .innerJoin('projects', 'projects.id', 'dependencies.project_id')
+        .select('dependencies.id')
+        .where('dependencies.depends_on_project_id', '=', id)
+        .where('projects.deleted_at', 'is', null)
+        .executeTakeFirst();
+      if (dependent) throw new ConflictException('项目仍被其他项目依赖，请先移除依赖');
+      await tx
+        .updateTable('projects')
+        .set({ deleted_at: Date.now(), updated_at: Date.now() })
+        .where('id', '=', id)
+        .execute();
+    });
     await this.audit.record(userId, 'project.delete', 'project', id);
     return { success: true };
   }
-  async repository(projectId: string, dto: RepositoryDto, user: CurrentUser) {
-    await this.get(projectId);
+  async repository(
+    projectId: string,
+    dto: RepositoryDto,
+    user: CurrentUser,
+    repositoryId?: string,
+  ) {
+    const db = this.database.db;
+    await requireProject(db, projectId);
+    const current = repositoryId
+      ? await db
+          .selectFrom('repositories')
+          .selectAll()
+          .where('project_id', '=', projectId)
+          .where('id', '=', repositoryId)
+          .executeTakeFirst()
+      : undefined;
+    if (repositoryId && !current) throw new NotFoundException('仓库不存在');
     const isHttp = /^https?:\/\//i.test(dto.cloneUrl);
     const cloneUrl = isHttp ? httpCloneUrl(dto.cloneUrl) : dto.cloneUrl;
     if (!isHttp && !/^git@[a-zA-Z0-9_.-]+:[\w./-]+(?:\.git)?$/.test(cloneUrl))
       throw new BadRequestException('请使用 HTTPS URL 或 git@host:path 格式');
-    if (dto.credentialId) {
-      if (user.role !== 'ADMIN') throw new ForbiddenException('仅管理员可为仓库关联凭据');
-      const credential = await this.database.db
+    const credentialId =
+      dto.credentialId === undefined ? (current?.credential_id ?? null) : dto.credentialId;
+    if (
+      user.role !== 'ADMIN' &&
+      (credentialId !== (current?.credential_id ?? null) ||
+        (credentialId && cloneUrl !== current?.clone_url))
+    )
+      throw new ForbiddenException('仅管理员可修改仓库凭据或使用该凭据的地址');
+    if (
+      credentialId &&
+      (credentialId !== current?.credential_id || cloneUrl !== current?.clone_url)
+    ) {
+      const credential = await db
         .selectFrom('credentials')
         .select('type')
-        .where('id', '=', dto.credentialId)
+        .where('id', '=', credentialId)
         .where('status', '=', 'ACTIVE')
         .executeTakeFirst();
       if (
@@ -206,69 +342,215 @@ export class ProjectsService {
       )
         throw new BadRequestException('凭据无效或与仓库协议不匹配');
     }
+    const now = current ? Math.max(Date.now(), current.updated_at + 1) : Date.now();
+    const id = repositoryId ?? randomUUID();
+    const values = {
+      name: dto.name,
+      clone_url: cloneUrl,
+      credential_id: credentialId,
+      default_branch: dto.defaultBranch || current?.default_branch || 'main',
+      provider: dto.provider ?? current?.provider ?? 'CUSTOM',
+      description: dto.description ?? current?.description ?? '',
+      updated_at: now,
+    };
+    const row = current
+      ? await db
+          .updateTable('repositories')
+          .set(values)
+          .where('id', '=', id)
+          .where('project_id', '=', projectId)
+          .where('updated_at', '=', current.updated_at)
+          .returningAll()
+          .executeTakeFirst()
+      : await db
+          .insertInto('repositories')
+          .values({ id, project_id: projectId, created_at: now, ...values })
+          .returningAll()
+          .executeTakeFirstOrThrow();
+    if (!row) throw new ConflictException('仓库已变化，请刷新后重试');
+    await this.audit.record(
+      user.id,
+      current ? 'repository.update' : 'repository.create',
+      'project',
+      projectId,
+      { repositoryId: id },
+    );
+    return repositoryDto(row);
+  }
+  async service(projectId: string, dto: ServiceDto, userId: string, serviceId?: string) {
+    const db = this.database.db;
+    await requireProject(db, projectId);
     const now = Date.now();
-    const id = randomUUID();
-    await this.database.db
-      .insertInto('repositories')
-      .values({
-        id,
-        project_id: projectId,
-        name: dto.name,
-        clone_url: cloneUrl,
-        credential_id: dto.credentialId || null,
-        default_branch: dto.defaultBranch || 'main',
-        created_at: now,
-        updated_at: now,
+    const id = serviceId ?? randomUUID();
+    const values = {
+      name: dto.name,
+      slug: dto.slug,
+      service_type: dto.serviceType,
+      description: dto.description ?? undefined,
+      updated_at: now,
+    };
+    const row = await (
+      serviceId
+        ? db
+            .updateTable('services')
+            .set(values)
+            .where('id', '=', id)
+            .where('project_id', '=', projectId)
+        : db
+            .insertInto('services')
+            .values({ id, project_id: projectId, created_at: now, ...values })
+    )
+      .returningAll()
+      .executeTakeFirst()
+      .catch((error: unknown) => {
+        if (hasConstraint(error, 'SQLITE_CONSTRAINT_UNIQUE', '23505'))
+          throw new ConflictException('该项目中服务标识已存在');
+        throw error;
+      });
+    if (!row) throw new NotFoundException('服务不存在');
+    await this.audit.record(
+      userId,
+      serviceId ? 'service.update' : 'service.create',
+      'project',
+      projectId,
+      { serviceId: id },
+    );
+    return serviceDto(row);
+  }
+  async environment(
+    projectId: string,
+    dto: EnvironmentDto,
+    userId: string,
+    environmentId?: string,
+  ) {
+    const db = this.database.db;
+    await requireProject(db, projectId);
+    const now = Date.now();
+    const id = environmentId ?? randomUUID();
+    const values = {
+      name: dto.name,
+      slug: dto.slug,
+      environment_type: dto.environmentType,
+      description: dto.description ?? undefined,
+      updated_at: now,
+    };
+    const row = await (
+      environmentId
+        ? db
+            .updateTable('environments')
+            .set(values)
+            .where('id', '=', id)
+            .where('project_id', '=', projectId)
+        : db
+            .insertInto('environments')
+            .values({ id, project_id: projectId, created_at: now, ...values })
+    )
+      .returningAll()
+      .executeTakeFirst()
+      .catch((error: unknown) => {
+        if (hasConstraint(error, 'SQLITE_CONSTRAINT_UNIQUE', '23505'))
+          throw new ConflictException('该项目中环境标识已存在');
+        throw error;
+      });
+    if (!row) throw new NotFoundException('环境不存在');
+    await this.audit.record(
+      userId,
+      environmentId ? 'environment.update' : 'environment.create',
+      'project',
+      projectId,
+      { environmentId: id },
+    );
+    return environmentDto(row);
+  }
+
+  async removeResource(
+    projectId: string,
+    table: 'repositories' | 'services' | 'environments',
+    id: string,
+    userId: string,
+  ) {
+    const db = this.database.db;
+    const resourceType = {
+      repositories: 'repository',
+      services: 'service',
+      environments: 'environment',
+    }[table];
+    await db
+      .transaction()
+      .execute(async (tx) => {
+        await lockProjectGraph(tx);
+        await requireProject(tx, projectId);
+        if (table === 'repositories') {
+          // A write lock on the repository also serializes Pipeline version creation.
+          const repository = await tx
+            .updateTable('repositories')
+            .set((eb) => ({ updated_at: eb.ref('updated_at') }))
+            .where('id', '=', id)
+            .where('project_id', '=', projectId)
+            .returning('id')
+            .executeTakeFirst();
+          if (!repository) throw new NotFoundException('仓库不存在');
+          const association = await tx
+            .selectFrom('service_repositories')
+            .select('repository_id')
+            .where('repository_id', '=', id)
+            .executeTakeFirst();
+          const definitions = await tx
+            .selectFrom('pipeline_versions as versions')
+            .innerJoin('pipelines', 'pipelines.id', 'versions.pipeline_id')
+            .select('versions.definition_json')
+            .where('pipelines.project_id', '=', projectId)
+            .execute();
+          if (
+            association ||
+            definitions.some(
+              ({ definition_json }) =>
+                (JSON.parse(definition_json) as { repositoryId?: string }).repositoryId === id,
+            )
+          )
+            throw new ConflictException('仓库被服务或 Pipeline 版本引用，不能删除');
+        }
+        if (table !== 'repositories') {
+          const resource = tx
+            .selectFrom(table)
+            .select('id')
+            .where('id', '=', id)
+            .where('project_id', '=', projectId);
+          const scope = table === 'services' ? 'service_id' : 'environment_id';
+          const configs = tx
+            .selectFrom('service_environment_configs')
+            .select('id')
+            .where(scope, 'in', resource);
+          await tx
+            .deleteFrom('service_environment_variables')
+            .where('config_id', 'in', configs)
+            .execute();
+          await tx.deleteFrom('service_environment_configs').where(scope, 'in', resource).execute();
+          if (table === 'environments')
+            await tx
+              .deleteFrom('environment_variables')
+              .where('environment_id', 'in', resource)
+              .execute();
+        }
+        const row = await tx
+          .deleteFrom(table)
+          .where('id', '=', id)
+          .where('project_id', '=', projectId)
+          .returning('id')
+          .executeTakeFirst();
+        if (!row) throw new NotFoundException('项目资源不存在');
       })
-      .execute();
-    await this.audit.record(user.id, 'repository.create', 'project', projectId);
-    return (await this.get(projectId)).repositories.find((r) => r.id === id);
-  }
-  async service(projectId: string, dto: ServiceDto, userId: string) {
-    await this.get(projectId);
-    const now = Date.now();
-    const id = randomUUID();
-    try {
-      await this.database.db
-        .insertInto('services')
-        .values({
-          id,
-          project_id: projectId,
-          name: dto.name,
-          slug: dto.slug,
-          service_type: dto.serviceType,
-          created_at: now,
-          updated_at: now,
-        })
-        .execute();
-    } catch {
-      throw new ConflictException('该项目中服务标识已存在');
-    }
-    await this.audit.record(userId, 'service.create', 'project', projectId);
-    return (await this.get(projectId)).services.find((s) => s.id === id);
-  }
-  async environment(projectId: string, dto: EnvironmentDto, userId: string) {
-    await this.get(projectId);
-    const now = Date.now();
-    const id = randomUUID();
-    try {
-      await this.database.db
-        .insertInto('environments')
-        .values({
-          id,
-          project_id: projectId,
-          name: dto.name,
-          slug: dto.slug,
-          environment_type: dto.environmentType,
-          created_at: now,
-          updated_at: now,
-        })
-        .execute();
-    } catch {
-      throw new ConflictException('该项目中环境标识已存在');
-    }
-    await this.audit.record(userId, 'environment.create', 'project', projectId);
-    return (await this.get(projectId)).environments.find((e) => e.id === id);
+      .catch((error: unknown) => {
+        if (
+          hasConstraint(error, 'SQLITE_CONSTRAINT_FOREIGNKEY', 'SQLITE_CONSTRAINT_TRIGGER', '23503')
+        )
+          throw new ConflictException('资源被项目配置或历史记录引用，不能删除');
+        throw error;
+      });
+    await this.audit.record(userId, `${resourceType}.delete`, 'project', projectId, {
+      resourceId: id,
+    });
+    return { success: true };
   }
 }
 @Controller('projects')
@@ -278,7 +560,7 @@ class ProjectsController {
     return this.service.list();
   }
   @Get(':id') get(@Param('id') id: string) {
-    return this.service.get(id);
+    return this.service.detail(id);
   }
   @Roles('ADMIN', 'OPERATOR') @Post() create(@Body() dto: ProjectDto, @Req() req: AuthRequest) {
     return this.service.create(dto, req.user.id);
@@ -317,11 +599,56 @@ class ProjectsController {
   ) {
     return this.service.environment(id, dto, req.user.id);
   }
+  @Roles('ADMIN', 'OPERATOR') @Patch(':id/repositories/:resourceId') updateRepository(
+    @Param('id') id: string,
+    @Param('resourceId') resourceId: string,
+    @Body() dto: RepositoryDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.repository(id, dto, req.user, resourceId);
+  }
+  @Roles('ADMIN', 'OPERATOR') @Patch(':id/services/:resourceId') updateService(
+    @Param('id') id: string,
+    @Param('resourceId') resourceId: string,
+    @Body() dto: ServiceDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.service(id, dto, req.user.id, resourceId);
+  }
+  @Roles('ADMIN', 'OPERATOR') @Patch(':id/environments/:resourceId') updateEnvironment(
+    @Param('id') id: string,
+    @Param('resourceId') resourceId: string,
+    @Body() dto: EnvironmentDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.environment(id, dto, req.user.id, resourceId);
+  }
+  @Roles('ADMIN', 'OPERATOR') @Delete(':id/repositories/:resourceId') removeRepository(
+    @Param('id') id: string,
+    @Param('resourceId') resourceId: string,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.removeResource(id, 'repositories', resourceId, req.user.id);
+  }
+  @Roles('ADMIN', 'OPERATOR') @Delete(':id/services/:resourceId') removeService(
+    @Param('id') id: string,
+    @Param('resourceId') resourceId: string,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.removeResource(id, 'services', resourceId, req.user.id);
+  }
+  @Roles('ADMIN', 'OPERATOR') @Delete(':id/environments/:resourceId') removeEnvironment(
+    @Param('id') id: string,
+    @Param('resourceId') resourceId: string,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.removeResource(id, 'environments', resourceId, req.user.id);
+  }
 }
 @Global()
 @Module({
-  controllers: [ProjectsController, RepositoryMetadataController],
-  providers: [ProjectsService, RepositoryMetadataService],
+  controllers: [ProjectsController, RepositoryMetadataController, ProjectRelationsController],
+  providers: [ProjectsService, RepositoryMetadataService, ProjectRelationsService],
   exports: [ProjectsService, RepositoryMetadataService],
 })
 export class ProjectsModule {}

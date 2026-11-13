@@ -22,12 +22,12 @@
 | GET / POST           | /credentials               | 列表 / `{name,type,secret,metadata?}`                                                                        |
 | PATCH                | /credentials/:id           | `{name?,secret?,status?:'ACTIVE'\|'DISABLED'}`                                                               |
 | DELETE               | /credentials/:id           | 引用检查后删除                                                                                               |
-| GET / POST           | /servers                   | 列表 / `{name,host,port?:22,username,credentialId,hostKeyFingerprint,tags?}`                                 |
-| GET / PATCH          | /servers/:id               | 详情 / 完整服务器配置                                                                                        |
+| GET / POST           | /servers                   | 列表 / `{name,host,port?:22,username,credentialId,hostKeyFingerprint,tags?,description?}`                    |
+| GET / PATCH          | /servers/:id               | 详情含分组、所属项目、探测与执行历史 / 完整服务器配置                                                         |
 | DELETE               | /servers/:id               | 软移除，不删除历史                                                                                           |
 | POST                 | /servers/:id/test          | 只读连接检查，返回 `{success,server,result:{exitCode,output}}`                                               |
 | GET / POST           | /server-groups             | 列表 / `{name,description?,serverIds:[]}`                                                                    |
-| DELETE               | /server-groups/:id         | 删除分组关联                                                                                                 |
+| PATCH / DELETE       | /server-groups/:id         | 更新分组和成员 / 删除分组关联                                                                                |
 | GET / POST           | /projects                  | 列表 / `{name,slug,description?,tags?}`                                                                      |
 | GET / PATCH / DELETE | /projects/:id              | 详情 / 完整基本配置 / 软删除                                                                                 |
 | POST                 | /projects/:id/repositories | `{name,cloneUrl,defaultBranch?,credentialId?}`                                                               |
@@ -39,9 +39,13 @@
 
 凭据 `type` 包括 SSH_PASSWORD、SSH_KEY、GIT_TOKEN、GIT_PASSWORD、API_KEY、API_SECRET、DOCKER_REGISTRY、USERNAME_PASSWORD、CUSTOM_SECRET。SSH_PASSWORD 使用 `secret:{password}`；SSH_KEY 使用 `{privateKey,passphrase?}`；GIT_TOKEN 使用 `{token}`；API_KEY 使用 `{apiKey}`。GET 永不返回 secret、ciphertext、nonce、auth_tag。
 
+仓库、服务和环境可通过 `PATCH /projects/:id/{repositories,services,environments}/:resourceId` 更新，或通过同路径的 `DELETE` 删除。更新请求沿用创建字段。仓库凭据传 `null` 可解除关联。资源仍被部署、任务历史或其他资源引用时，删除返回 409。
+
+项目详情返回 `addresses`、`dependencies`、`deploymentTargets` 和 `recentDeployments`。通过 `POST /projects/:id/addresses` 或 `POST /projects/:id/dependencies` 新增记录，带记录 ID 的路径支持 `PATCH` 和 `DELETE`。地址可关联项目内的服务和环境，依赖提交时会检查循环引用。
+
 ## 命令
 
-`POST /commands/preview` 解析目标数量与摘要。
+`POST /commands/preview` 返回 `{count,targets,targetHash}`。目标可通过 `serverIds`、`groupIds`、`tags`、`projectIds`、`environmentIds` 和 `deploymentTargetIds` 选择。项目和环境通过已配置的服务环境部署目标关联服务器。同一标签选择内要求匹配所有标签，各选择的结果合并去重。
 
 `POST /commands/execute` 示例：
 
@@ -58,7 +62,9 @@
 }
 ```
 
-返回 Task，默认等待数据库 Worker 执行。未显式确认、空目标、无效目标均拒绝。也支持 `groupIds`、`deploymentTargetIds`、`tags` 目标选择（并集去重），部署目标管理 API 和项目环境选择尚待后续实现。具体 DTO 见源码。`strategy` 为 PARALLEL/SEQUENTIAL；`failurePolicy` 为 STOP/CONTINUE；超时单位秒。`GET /commands/executions` 返回命令历史。
+提交分组、标签、项目、环境或部署目标时，将预览返回的 `targetHash` 作为 `expectedTargetHash` 一并提交。目标或 SSH 配置发生变化时重新预览。执行返回排队的 Task，支持 `PARALLEL`、`SEQUENTIAL`、`STOP` 和 `CONTINUE`，超时单位为秒。`GET /commands/executions` 返回命令历史。
+
+`GET /command-templates` 查询命令模板，`POST /command-templates` 创建模板，`PATCH /command-templates/:id` 保存新版本，`DELETE /command-templates/:id` 归档。通过 `GET /command-templates/:id/versions` 读取版本，向 `POST /command-templates/:id/run` 提交版本、参数和执行目标。
 
 ## 任务与日志
 
@@ -66,7 +72,7 @@
 | ---- | ------------------------------- | ---------------------------------------------------------------------------------------- |
 | GET  | /tasks                          | 最近100条任务                                                                            |
 | GET  | /tasks/:id                      | `{id,type,name,status,createdBy,createdAt,startedAt,finishedAt,errorSummary,result,...}` |
-| GET  | /tasks/:id/targets              | 每目标名称、Host、状态、退出码、错误摘要                                                 |
+| GET  | /tasks/:id/targets              | 每目标名称、Host、状态、退出码、错误摘要及 `canRetry`                                  |
 | GET  | /tasks/:id/steps                | 每目标步骤记录                                                                           |
 | GET  | /tasks/:id/logs?offset=0        | `{content,nextOffset}`；偏移单位字节，单次最多256 KiB                                    |
 | GET  | /tasks/:id/logs/stream?offset=0 | SSE，事件 `{content,nextOffset,status}`，id为偏移；支持Last-Event-ID                     |
@@ -74,9 +80,11 @@
 
 终态为 SUCCESS、FAILED、PARTIAL_FAILED、CANCELLED、TIMED_OUT、NEEDS_ATTENTION。Worker 租约过期进入 NEEDS_ATTENTION，不隐式重试。
 
+`POST /tasks/:id/targets/:targetId/retry` 接收 `{confirmed:true}`。管理员或提交任务的运维人员可重试明确返回失败退出码的目标，以及执行前已跳过的目标。重试使用原任务的命令或方案版本，生成独立任务并返回 `retryOf`。同一来源目标的重复请求返回同一次重试，下一次重试可从该重试任务发起。
+
 ## 运维方案
 
-`GET /operation-plans`；`POST /operation-plans`；`PATCH /operation-plans/:id`；`GET /operation-plans/:id/versions`；`POST /operation-plans/:id/run`。
+`GET /operation-plans` 查询方案，`POST /operation-plans` 创建，`PATCH /operation-plans/:id` 保存新版本，`DELETE /operation-plans/:id` 归档。`GET /operation-plans/:id/versions` 查询历史版本，`POST /operation-plans/:id/run` 执行指定版本。
 
 创建与更新：
 
@@ -89,7 +97,7 @@
 }
 ```
 
-每次更新创建新版本。run使用命令同样的目标/执行策略字段，可传 `version` 固定版本；必须 `confirmed:true`。系统预置巡检与三个软件初始化模板，安装模板不会自动执行。参数定义、前后置检查独立模型、删除及单目标重试待完善。
+每次更新创建新版本。定义可包含 `preChecks`、`postChecks` 及 `parameters`。每项参数包含 `name`、`type`，可设置 `required`、`defaultValue` 和 `description`。命令中可用 `"$VEYOPS_PARAM_NODE_VERSION"` 读取参数。运行请求使用与命令相同的目标和执行策略字段，并可传入 `version` 和键值形式的 `parameters`。
 
 ## v0.2 交付接口
 

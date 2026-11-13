@@ -7,8 +7,64 @@ import { MultiTargetExecutor } from '../../infrastructure/ssh/multi-target.execu
 import { TargetResolver } from '../command-center/target-resolver.service';
 import { CreatePlanDto, RunPlanDto } from './operation-plan.dto';
 import { ExecutionStep } from '../tasks/tasks.types';
+import {
+  CommandParameterDto,
+  parameterEnvironment,
+  validateParameterDefinitions,
+} from '../command-center/command-parameters';
 import { seedPlanTemplates } from './plan-templates';
 import { AuditService } from '../audit/audit.service';
+import type { Selectable } from 'kysely';
+import type { OperationPlansTable } from '../../core/database/schema';
+
+interface PlanDefinition {
+  steps: ExecutionStep[];
+  preChecks?: ExecutionStep[];
+  postChecks?: ExecutionStep[];
+  parameters?: CommandParameterDto[];
+  name?: string;
+  description?: string;
+  category?: string;
+  osRequirements?: string;
+}
+
+function planDefinition(input: CreatePlanDto) {
+  return {
+    name: input.name,
+    description: input.description,
+    category: input.category,
+    osRequirements: input.osRequirements ?? '',
+    steps: input.steps,
+    preChecks: input.preChecks ?? [],
+    postChecks: input.postChecks ?? [],
+    parameters: validateParameterDefinitions(input.parameters ?? []),
+  };
+}
+
+function readPlanDefinition(json: string | null) {
+  const definition = (json ? JSON.parse(json) : { steps: [] }) as PlanDefinition;
+  return {
+    ...definition,
+    preChecks: definition.preChecks ?? [],
+    postChecks: definition.postChecks ?? [],
+    parameters: definition.parameters ?? [],
+    osRequirements: definition.osRequirements ?? '',
+  };
+}
+
+function presentPlan(plan: Selectable<OperationPlansTable>, definition: PlanDefinition) {
+  return {
+    ...definition,
+    id: plan.id,
+    name: plan.name,
+    description: plan.description,
+    category: plan.category,
+    currentVersion: plan.current_version,
+    version: plan.current_version,
+    enabled: plan.enabled === 1,
+    createdAt: plan.created_at,
+  };
+}
 
 @Injectable()
 export class OperationPlansService implements OnModuleInit {
@@ -36,38 +92,24 @@ export class OperationPlansService implements OnModuleInit {
   async list() {
     const plans = await this.database.db
       .selectFrom('operation_plans')
-      .selectAll()
-      .orderBy('created_at', 'desc')
+      .leftJoin('operation_plan_versions as version', (join) =>
+        join
+          .onRef('version.plan_id', '=', 'operation_plans.id')
+          .onRef('version.version', '=', 'operation_plans.current_version'),
+      )
+      .selectAll('operation_plans')
+      .select('version.definition_json')
+      .where('operation_plans.enabled', '=', 1)
+      .orderBy('operation_plans.created_at', 'desc')
       .execute();
-    return Promise.all(
-      plans.map(async (plan) => {
-        const version = await this.database.db
-          .selectFrom('operation_plan_versions')
-          .selectAll()
-          .where('plan_id', '=', plan.id)
-          .where('version', '=', plan.current_version)
-          .executeTakeFirst();
-        return {
-          id: plan.id,
-          name: plan.name,
-          description: plan.description,
-          category: plan.category,
-          currentVersion: plan.current_version,
-          version: plan.current_version,
-          enabled: plan.enabled === 1,
-          steps: version
-            ? (JSON.parse(version.definition_json) as { steps: ExecutionStep[] }).steps
-            : [],
-          createdAt: plan.created_at,
-        };
-      }),
-    );
+    return plans.map((plan) => presentPlan(plan, readPlanDefinition(plan.definition_json)));
   }
   async create(input: CreatePlanDto, userId: string) {
     const id = randomUUID();
     const now = Date.now();
-    await this.database.db.transaction().execute(async (tx) => {
-      await tx
+    const definition = planDefinition(input);
+    const plan = await this.database.db.transaction().execute(async (tx) => {
+      const created = await tx
         .insertInto('operation_plans')
         .values({
           id,
@@ -78,26 +120,30 @@ export class OperationPlansService implements OnModuleInit {
           created_at: now,
           updated_at: now,
         })
-        .execute();
+        .returningAll()
+        .executeTakeFirstOrThrow();
       await tx
         .insertInto('operation_plan_versions')
         .values({
           id: randomUUID(),
           plan_id: id,
           version: 1,
-          definition_json: JSON.stringify({ steps: input.steps }),
+          schema_version: 2,
+          definition_json: JSON.stringify(definition),
           created_by: userId,
           created_at: now,
         })
         .execute();
+      return created;
     });
     await this.audit.record(userId, 'operation_plan.create', 'operation_plan', id);
-    return (await this.list()).find((plan) => plan.id === id)!;
+    return presentPlan(plan, definition);
   }
   async update(id: string, input: CreatePlanDto, userId: string) {
     const now = Date.now();
-    await this.database.db.transaction().execute(async (tx) => {
-      const plan = await tx
+    const definition = planDefinition(input);
+    const plan = await this.database.db.transaction().execute(async (tx) => {
+      const updated = await tx
         .updateTable('operation_plans')
         .set((eb) => ({
           name: input.name,
@@ -107,23 +153,38 @@ export class OperationPlansService implements OnModuleInit {
           updated_at: now,
         }))
         .where('id', '=', id)
-        .returning('current_version')
+        .where('enabled', '=', 1)
+        .returningAll()
         .executeTakeFirst();
-      if (!plan) throw new NotFoundException('运维方案不存在');
+      if (!updated) throw new NotFoundException('运维方案不存在');
       await tx
         .insertInto('operation_plan_versions')
         .values({
           id: randomUUID(),
           plan_id: id,
-          version: plan.current_version,
-          definition_json: JSON.stringify({ steps: input.steps }),
+          version: updated.current_version,
+          schema_version: 2,
+          definition_json: JSON.stringify(definition),
           created_by: userId,
           created_at: now,
         })
         .execute();
+      return updated;
     });
     await this.audit.record(userId, 'operation_plan.update', 'operation_plan', id);
-    return (await this.list()).find((plan) => plan.id === id)!;
+    return presentPlan(plan, definition);
+  }
+  async remove(id: string, userId: string) {
+    const plan = await this.database.db
+      .updateTable('operation_plans')
+      .set({ enabled: 0, updated_at: Date.now() })
+      .where('id', '=', id)
+      .where('enabled', '=', 1)
+      .returning('id')
+      .executeTakeFirst();
+    if (!plan) throw new NotFoundException('运维方案不存在');
+    await this.audit.record(userId, 'operation_plan.archive', 'operation_plan', id);
+    return { id };
   }
   async versions(id: string) {
     const plan = await this.database.db
@@ -143,7 +204,7 @@ export class OperationPlansService implements OnModuleInit {
       id: row.id,
       version: row.version,
       createdAt: row.created_at,
-      steps: (JSON.parse(row.definition_json) as { steps: ExecutionStep[] }).steps,
+      ...readPlanDefinition(row.definition_json),
     }));
   }
   async run(id: string, input: RunPlanDto, userId: string) {
@@ -161,14 +222,29 @@ export class OperationPlansService implements OnModuleInit {
       .where('version', '=', input.version ?? plan.current_version)
       .executeTakeFirst();
     if (!version) throw new NotFoundException('方案版本不存在');
+    const definition = readPlanDefinition(version.definition_json);
+    const environment = parameterEnvironment(definition.parameters, input.parameters ?? {});
+    const checks = (items: ExecutionStep[], phase: 'precheck' | 'postcheck') =>
+      items.map((step, index) => ({
+        ...step,
+        key: `${phase}-${index + 1}`,
+        name: `${phase === 'precheck' ? '前置检查' : '执行后验证'} · ${step.name}`,
+        failurePolicy: 'STOP' as const,
+      }));
+    const steps = [
+      ...checks(definition.preChecks, 'precheck'),
+      ...definition.steps,
+      ...checks(definition.postChecks, 'postcheck'),
+    ].map((step) => ({ ...step, command: environment + step.command }));
     const task = await this.tasks.create(
       {
         type: 'OPERATION_PLAN',
-        name: `${plan.name} · v${version.version}`,
+        name: `${definition.name ?? plan.name} · v${version.version}`,
         operationPlanVersionId: version.id,
+        scope: await this.targets.executionScope(input),
         payload: {
-          targets: await this.targets.resolve(input),
-          steps: (JSON.parse(version.definition_json) as { steps: ExecutionStep[] }).steps,
+          targets: await this.targets.resolveForExecution(input),
+          steps,
           strategy: input.strategy,
           maxParallel: input.maxParallel,
           failurePolicy: input.failurePolicy,
@@ -176,6 +252,16 @@ export class OperationPlansService implements OnModuleInit {
         },
       },
       userId,
+      async (tx) => {
+        const active = await tx
+          .updateTable('operation_plans')
+          .set((eb) => ({ enabled: eb.ref('enabled') }))
+          .where('id', '=', id)
+          .where('enabled', '=', 1)
+          .returning('id')
+          .executeTakeFirst();
+        if (!active) throw new BadRequestException('运维方案已禁用');
+      },
     );
     await this.audit.record(userId, 'operation_plan.run', 'task', task.id, {
       planId: id,

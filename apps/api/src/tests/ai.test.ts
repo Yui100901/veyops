@@ -22,6 +22,7 @@ import {
   sanitizeAiText,
 } from '../infrastructure/ai-provider/openai-compatible.service';
 import { ProjectsService } from '../modules/projects/projects.service';
+import { ProjectRelationsService } from '../modules/projects/project-relations';
 import { ServersService } from '../modules/servers/servers.service';
 import { TasksService } from '../modules/tasks/tasks.service';
 import { CommandCenterService } from '../modules/command-center/command-center.service';
@@ -63,7 +64,11 @@ async function fixture() {
   const audit = new AuditService(database);
   const credentials = new CredentialsService(database, audit);
   const repository = new AiRepository(database);
-  const projects = new ProjectsService(database, audit);
+  const projects = new ProjectsService(
+    database,
+    audit,
+    new ProjectRelationsService(database, audit),
+  );
   const wire = new OpenAiCompatibleService();
   const providers = new AiProvidersService(repository, credentials, wire, audit);
   const policy = new AiPolicyService(repository, projects, audit);

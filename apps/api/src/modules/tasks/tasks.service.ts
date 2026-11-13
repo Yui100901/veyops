@@ -1,11 +1,18 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
-import { Database, TasksTable } from '../../core/database/schema';
+import { Database, TaskTargetsTable, TasksTable } from '../../core/database/schema';
 import { CreateTaskInput, TaskExecutionContext, TaskPayload } from './tasks.types';
 import { TaskLogService } from './task-log.service';
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
+import type { CurrentUser } from '../auth/auth.decorators';
 
 const terminal = new Set([
   'SUCCESS',
@@ -16,11 +23,20 @@ const terminal = new Set([
   'NEEDS_ATTENTION',
 ]);
 export const isTerminalStatus = (status: string) => terminal.has(status);
+function retryable(task: Selectable<TasksTable>, target: Selectable<TaskTargetsTable>) {
+  return (
+    (task.task_type === 'COMMAND' || task.task_type === 'OPERATION_PLAN') &&
+    isTerminalStatus(task.status) &&
+    task.status !== 'NEEDS_ATTENTION' &&
+    Boolean(target.server_id) &&
+    ((target.status === 'FAILED' && target.exit_code !== null) ||
+      (target.status === 'CANCELLED' && target.started_at === null))
+  );
+}
+
 export function taskDto(task: Selectable<TasksTable>) {
-  const pipeline =
-    task.task_type === 'PIPELINE'
-      ? (JSON.parse(task.payload_json) as TaskPayload).pipeline
-      : undefined;
+  const payload = JSON.parse(task.payload_json) as TaskPayload;
+  const pipeline = task.task_type === 'PIPELINE' ? payload.pipeline : undefined;
   return {
     id: task.id,
     type: task.task_type,
@@ -33,6 +49,8 @@ export function taskDto(task: Selectable<TasksTable>) {
     errorSummary: task.error_summary,
     result: task.result_json ? JSON.parse(task.result_json) : null,
     operationPlanVersionId: task.operation_plan_version_id,
+    commandTemplate: payload.commandTemplate ?? null,
+    retryOf: payload.retryOf ?? null,
     ...(task.task_type === 'PIPELINE'
       ? {
           executionMode: pipeline?.mode ?? 'DEPLOY',
@@ -114,7 +132,13 @@ export class TasksService {
           })),
         )
         .execute();
-      if (input.pipelineRun && input.scope) {
+      if (
+        input.pipelineRun &&
+        input.scope?.projectId &&
+        input.scope.serviceId &&
+        input.scope.environmentId &&
+        input.scope.targetId
+      ) {
         const run = input.pipelineRun;
         await tx
           .insertInto('pipeline_runs')
@@ -157,8 +181,12 @@ export class TasksService {
   async get(id: string) {
     return taskDto(await this.row(id));
   }
-  async targets(id: string) {
-    await this.row(id);
+  async targets(id: string, user?: CurrentUser) {
+    const task = await this.row(id);
+    const snapshot = JSON.parse(task.payload_json) as TaskPayload;
+    const versionedTargets = new Set(
+      snapshot.targets?.filter((target) => target.credentialNonce).map((target) => target.id),
+    );
     const rows = await this.database.db
       .selectFrom('task_targets')
       .selectAll()
@@ -175,7 +203,89 @@ export class TasksService {
       startedAt: row.started_at,
       finishedAt: row.finished_at,
       errorSummary: row.error_summary,
+      canRetry:
+        !!user &&
+        (user.role === 'ADMIN' || (user.role === 'OPERATOR' && task.created_by === user.id)) &&
+        retryable(task, row) &&
+        versionedTargets.has(row.server_id!),
     }));
+  }
+  async retryTarget(id: string, targetId: string, user: CurrentUser) {
+    const task = await this.row(id);
+    if (user.role !== 'ADMIN' && (user.role !== 'OPERATOR' || task.created_by !== user.id))
+      throw new ForbiddenException('只能重试本人提交的任务');
+    const target = await this.database.db
+      .selectFrom('task_targets')
+      .selectAll()
+      .where('task_id', '=', id)
+      .where('id', '=', targetId)
+      .executeTakeFirst();
+    if (!target) throw new NotFoundException('任务目标不存在');
+    if (!retryable(task, target)) throw new ConflictException('此目标的执行结果不允许重试');
+    const payload = JSON.parse(task.payload_json) as TaskPayload;
+    const previous = payload.targets.find((item) => item.id === target.server_id);
+    if (!previous?.credentialNonce)
+      throw new ConflictException('原任务缺少可核对的 SSH 快照，请重新提交');
+    return this.create(
+      {
+        type: task.task_type === 'OPERATION_PLAN' ? 'OPERATION_PLAN' : 'COMMAND',
+        name: task.name.startsWith('重试 · ') ? task.name : `重试 · ${task.name}`,
+        operationPlanVersionId: task.operation_plan_version_id ?? undefined,
+        idempotencyKey: `retry:${targetId}`,
+        scope: {
+          projectId: task.project_id ?? undefined,
+          serviceId: task.service_id ?? undefined,
+          environmentId: task.environment_id ?? undefined,
+          targetId: task.target_id ?? undefined,
+        },
+        payload: {
+          ...payload,
+          targets: [previous],
+          strategy: 'SEQUENTIAL',
+          maxParallel: 1,
+          retryOf: { taskId: id, targetId },
+        },
+      },
+      user.id,
+      async (tx) => {
+        const current = await tx
+          .selectFrom('servers as s')
+          .innerJoin('credentials as c', 'c.id', 's.credential_id')
+          .select([
+            's.host',
+            's.port',
+            's.username',
+            's.credential_id',
+            's.host_key_fingerprint',
+            'c.nonce',
+          ])
+          .where('s.id', '=', previous.id)
+          .where('s.is_active', '=', 1)
+          .where('c.status', '=', 'ACTIVE')
+          .where('c.type', 'in', ['SSH_PASSWORD', 'SSH_KEY'])
+          .executeTakeFirst();
+        if (
+          !current ||
+          current.host !== previous.host ||
+          current.port !== previous.port ||
+          current.username !== previous.username ||
+          current.credential_id !== previous.credentialId ||
+          current.host_key_fingerprint !== previous.hostKeyFingerprint ||
+          current.nonce !== previous.credentialNonce
+        )
+          throw new ConflictException('服务器或 SSH 凭据已变化，请重新选择目标提交任务');
+        if (
+          task.project_id &&
+          !(await tx
+            .selectFrom('projects')
+            .select('id')
+            .where('id', '=', task.project_id)
+            .where('deleted_at', 'is', null)
+            .executeTakeFirst())
+        )
+          throw new ConflictException('任务关联的项目已删除');
+      },
+    );
   }
   async steps(id: string) {
     await this.row(id);

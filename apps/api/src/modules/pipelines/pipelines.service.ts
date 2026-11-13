@@ -129,11 +129,23 @@ export class PipelinesService implements OnModuleInit {
         : undefined;
     return { repository, registry };
   }
+  private async lockRepository(tx: Transaction<Database>, projectId: string, repositoryId: string) {
+    const row = await tx
+      .updateTable('repositories')
+      .set((eb) => ({ updated_at: eb.ref('updated_at') }))
+      .where('id', '=', repositoryId)
+      .where('project_id', '=', projectId)
+      .returning('clone_url')
+      .executeTakeFirst();
+    if (!row) throw new BadRequestException('项目仓库不存在');
+    validateGitUrl(row.clone_url);
+  }
   async create(input: CreatePipelineDto, userId: string) {
     await this.resources(input.projectId, input.serviceId, input.definition);
     const id = randomUUID(),
       now = Date.now();
     await this.database.db.transaction().execute(async (tx) => {
+      await this.lockRepository(tx, input.projectId, input.definition.repositoryId);
       await tx
         .insertInto('pipelines')
         .values({
@@ -165,6 +177,7 @@ export class PipelinesService implements OnModuleInit {
     const current = await this.get(id);
     await this.resources(current.projectId, current.serviceId, input.definition);
     await this.database.db.transaction().execute(async (tx) => {
+      await this.lockRepository(tx, current.projectId, input.definition.repositoryId);
       const pipeline = await tx
         .updateTable('pipelines')
         .set((eb) => ({
