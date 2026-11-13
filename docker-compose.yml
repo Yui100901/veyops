@@ -1,0 +1,24 @@
+services:
+  veyops:
+    build: .
+    image: veyops:local
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:${PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      DATABASE_CLIENT: sqlite
+      DATABASE_PATH: /app/data/database/app.db
+      DATA_DIR: /app/data
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set a persistent 64-character hex ENCRYPTION_KEY in .env}
+      WORKER_ENABLED: "true"
+      WORKER_CONCURRENCY: "1"
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    volumes:
+      - veyops-data:/app/data
+
+volumes:
+  veyops-data:

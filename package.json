@@ -1,0 +1,28 @@
+{
+  "name": "veyops",
+  "version": "0.2.0",
+  "private": true,
+  "description": "轻量级 AI 智能服务器管理与服务部署平台",
+  "workspaces": [
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c cyan,green \"npm run dev -w apps/api\" \"npm run dev -w apps/web\"",
+    "build": "npm run build --workspaces",
+    "test": "npm run test -w apps/api",
+    "lint": "eslint apps --max-warnings 0",
+    "format": "prettier --write apps docs README.md",
+    "db:migrate": "npm run db:migrate -w apps/api",
+    "start": "npm run start -w apps/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "~5.9.3",
+    "eslint": "^9.39.0",
+    "typescript-eslint": "^8.46.0",
+    "prettier": "^3.6.2"
+  }
+}

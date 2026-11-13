@@ -1,0 +1,15 @@
+node_modules/
+dist/
+data/
+.env
+.env.*
+!.env.example
+coverage/
+*.log
+*.tsbuildinfo
+/artifacts/
+.DS_Store
+playwright-report/
+# Local validation evidence can include private infrastructure details.
+/docs/v0.2-evidence.json
+/docs/images/readonly-task.png

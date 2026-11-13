@@ -1,0 +1,13 @@
+services:
+  web:
+    image: ${VEYOPS_IMAGE:?Pipeline must supply its immutable image digest}
+    restart: "no"
+    network_mode: none
+    # No published ports: this example cannot occupy an existing service port.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
