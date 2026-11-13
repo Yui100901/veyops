@@ -49,7 +49,7 @@ Windows 下若 better-sqlite3 预编译下载失败，检查到 GitHub Releases 
 
 使用方法见 [Pipeline 与构建部署](docs/PIPELINES.md)、[AI 工具与权限](docs/AI工具与权限.md)，本轮结果见 [v0.2 验证报告](docs/v0.2验证报告.md)。
 
-**后续工作**：SSH Git 仓库可信注入、仓库源码分析、可视化方案编辑器与参数化、单目标重试、独立 Worker 入口、自动回滚、聚合视图、备份恢复等。本轮不声称已经完成全部 V1.0。
+**后续工作**：SSH Git 仓库可信注入、仓库源码分析、可视化方案编辑器与参数化、单目标重试、独立 Worker 入口、自动回滚、聚合视图等。
 
 ## Pipeline 与 AI
 
@@ -93,18 +93,20 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 docker compose up -d --build
 ```
 
-Compose 默认监听 `127.0.0.1:3000`，使用命名卷保存数据，不挂载 Docker Socket。若经 HTTPS 反向代理访问，设置 `COOKIE_SECURE=true`，并保留请求 Host；外部访问需由部署者配置 HTTPS 与网络访问控制。本机无 Docker，构建定义尚未实际运行验证。
+Compose 默认监听 `127.0.0.1:3000`，使用命名卷保存数据。可用 `PORT` 更换宿主机端口。若经 HTTPS 反向代理访问，设置 `COOKIE_SECURE=true` 并保留请求 Host。
 
 PostgreSQL 在 `.env` 中设置：
 
 ```dotenv
 DATABASE_CLIENT=postgres
-DATABASE_URL=postgresql://veyops:password@localhost:5432/veyops
+DATABASE_URL=postgresql://veyops:password@db.example.internal:5432/veyops
 ```
 
-数据访问使用 Kysely，SQLite 驱动为 `better-sqlite3`，PostgreSQL 驱动为 `pg`。两种数据库共享业务表和版本化迁移。默认 SQLite 使用单 Worker；PostgreSQL 已在 17.6 上验证迁移、登录、配置并发保存和任务领取、取消与恢复。Docker Compose 从 `.env` 读取相同的 `DATABASE_CLIENT` 和 `DATABASE_URL`。
+数据访问使用 Kysely，SQLite 驱动为 `better-sqlite3`，PostgreSQL 驱动为 `pg`。两种数据库共享业务表和版本化迁移。默认 SQLite 使用单 Worker。Docker Compose 从 `.env` 读取相同的 `DATABASE_CLIENT` 和 `DATABASE_URL`，其中数据库主机名必须能从容器访问。如果数据库在同一个 Compose 网络内，可用数据库服务名作为主机名。
 
 切换数据库只会切换连接，现有数据保留在原库。PostgreSQL 账号需对应用所在 schema 有建表权限。多进程共用 PostgreSQL 时还需共享 `DATA_DIR` 和 `ENCRYPTION_KEY`，并保持主机时钟同步。
+
+备份使用维护 CLI，保存数据库、任务日志、托管产物和数据目录中的配置。将主密钥与备份分开保存。恢复后可设置 `WORKER_ENABLED=false`，核对历史和待执行任务后再启动 Worker。原生安装和 Compose 的命令见[备份与恢复](docs/BACKUP.md)。
 
 ## 测试与验证
 
@@ -117,6 +119,8 @@ npm run build
 数据库、API、执行引擎和真实 SSH 协议测试使用独立临时数据库或本机临时 SSH Server，不会自动连接生产服务器。覆盖权限限制、凭据不回显、外键保护、事务回滚、重复领取、固定快照、并发/失败/取消/超时和租约异常。
 
 需要复测 PostgreSQL 时，先设置 `VEYOPS_TEST_POSTGRES_URL` 指向可创建临时 schema 的测试数据库，再运行 `npm test`。PostgreSQL 用例为每次运行创建隔离 schema，测试结束后清理。省略此变量时只运行默认的本地测试。
+
+已在 Linux 的隔离 Compose 项目中验证 SQLite 和 PostgreSQL 17 空库安装、首次改密、容器重建和备份恢复。恢复后检查了迁移记录、凭据解密、任务日志和产物 SHA-256。两个环境还用同一提交从不同子目录并发构建到同一 Registry 仓库，验证了各自的镜像标签、Digest 和实际运行内容。
 
 经用户授权，于 2026-11-11 完成了 v0.1 的 [只读 SSH 验证](docs/验证报告.md)，以及 v0.2 在专用 `/tmp` 目录和新建容器中的 [构建部署验证](docs/v0.2验证报告.md)。未停止或重启已有业务服务。临时数据库与默认首次初始化库分离；源码和文档不包含服务器密码或真实 API Key。
 
@@ -132,4 +136,4 @@ apps/web/src/            React 管理界面
 docs/                   需求梳理、API、验证与后续工作
 ```
 
-本迭代 API 与 Worker 同进程运行，遵守统一处理器注册机制；独立 Worker bootstrap、UI 用户管理、参数化方案、单目标重试、日志轮转与正式备份恢复仍需继续开发。手工离线备份建议：先停止平台进程，再整体备份 `data/` 和配置中的外部主密钥；恢复到独立环境检查。不要在数据库运行时仅复制 SQLite 主文件。
+API 与 Worker 同进程运行，遵守统一处理器注册机制。独立 Worker 入口、界面用户管理、参数化方案、单目标重试和日志轮转待开发。

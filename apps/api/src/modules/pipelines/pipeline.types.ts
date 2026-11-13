@@ -52,6 +52,7 @@ export interface PipelineArtifact {
   sizeBytes?: number;
   imageDigest?: string;
   imageReference?: string;
+  imageTag?: string;
   imageId?: string;
   serverId?: string;
 }
@@ -61,6 +62,7 @@ export interface BuildOutput {
   localCompose?: string;
   imageReference?: string;
   imageDigest?: string;
+  imageTag?: string;
   imageId?: string;
   checksum?: string;
   sizeBytes?: number;

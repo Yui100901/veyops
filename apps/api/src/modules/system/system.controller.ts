@@ -35,7 +35,7 @@ class SystemController {
         pipelines: true,
         deployments: true,
         ai: true,
-        backups: false,
+        backups: true,
       },
     };
   }

@@ -25,7 +25,7 @@ import {
 import { deploymentLock } from '../modules/deployments/deployment-lock';
 import { PipelineExecutor } from '../modules/pipelines/pipeline-executor.service';
 import { PipelineDefinitionDto } from '../modules/pipelines/pipeline.dto';
-import type { PipelineSnapshot } from '../modules/pipelines/pipeline.types';
+import type { PipelineArtifact, PipelineSnapshot } from '../modules/pipelines/pipeline.types';
 import type { TaskExecutionContext, TaskRecord, TaskStatus } from '../modules/tasks/tasks.types';
 
 const target: SshTarget = {
@@ -37,6 +37,13 @@ const target: SshTarget = {
   credentialId: randomUUID(),
   hostKeyFingerprint: 'a'.repeat(64),
 };
+
+function fixtureShell() {
+  if (process.platform === 'linux') return 'sh';
+  const gitBash = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'Git', 'bin', 'bash.exe');
+  if (process.platform === 'win32' && existsSync(gitBash)) return gitBash;
+  return undefined;
+}
 
 function snapshot(): PipelineSnapshot {
   return {
@@ -86,6 +93,7 @@ function fixture(
   const logs: string[] = [];
   const statuses: TaskStatus[] = [];
   const targetResults: { exitCode: number | null; error?: string }[] = [];
+  const artifacts: Omit<PipelineArtifact, 'id'>[] = [];
   const deployments: { status: string; health: DeploymentHealth }[] = [];
   const steps: { key?: string; status?: TaskStatus; exitCode?: number | null; error?: string }[] =
     [];
@@ -110,10 +118,10 @@ function fixture(
     uploadContent: async () => undefined,
   } as unknown as SshService;
   const artifactService = {
-    create: async (_: PipelineSnapshot, artifact: { storageKey: string }) => ({
-      ...artifact,
-      id: randomUUID(),
-    }),
+    create: async (_: PipelineSnapshot, artifact: Omit<PipelineArtifact, 'id'>) => {
+      artifacts.push(artifact);
+      return { ...artifact, id: randomUUID() };
+    },
   } as unknown as ArtifactsService;
   const deploymentService = {
     start: async () => {
@@ -159,6 +167,7 @@ function fixture(
       );
     },
     commands,
+    artifacts,
     logs,
     statuses,
     targetResults,
@@ -172,12 +181,7 @@ function fixture(
 
 test('the shell acquires both locks atomically and rejects release by a different owner token', async (t) => {
   const linux = process.platform === 'linux';
-  const gitBash = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'Git', 'bin', 'bash.exe');
-  const shell = linux
-    ? 'sh'
-    : process.platform === 'win32' && existsSync(gitBash)
-      ? gitBash
-      : undefined;
+  const shell = fixtureShell();
   if (!shell) {
     t.skip('requires Linux sh or Git Bash');
     return;
@@ -319,17 +323,143 @@ test('an unconfirmed activation keeps ownership and temporary files for investig
   assert.ok(environment.logs.some((line) => line.includes('发布锁可能仍在')));
 });
 
-test('a failed Compose activation retains its exit code and lock with a port conflict check', async () => {
+function imageSnapshot(): PipelineSnapshot {
   const config = snapshot();
-  const image = 'registry.example.invalid/test@sha256:' + 'd'.repeat(64);
   config.definition.artifactType = 'DOCKER_IMAGE';
   config.definition.imageRepository = 'test';
   config.registry = {
     registryUrl: 'registry.example.invalid',
     credentialId: null,
   };
+  return config;
+}
+
+test('same-commit deployments build in different subdirectories and push and use their own digests', async () => {
+  const testing = imageSnapshot();
+  const staging = imageSnapshot();
+  testing.definition.repoPath = 'apps/testing';
+  testing.definition.deployPath += '-testing';
+  staging.definition.repoPath = 'apps/staging';
+  staging.definition.deployPath += '-staging';
+  const first = task(testing);
+  const second = task(staging);
+  const tagOf = (command: string) => /:([^:']+)'(?: \.|$)/.exec(command)![1];
+  const digests = new Map<string, string>();
+  let buildCount = 0;
+  let finishBuilds!: () => void;
+  const buildsReady = new Promise<void>((resolve) => {
+    finishBuilds = resolve;
+  });
+  const imagePrefix = 'registry.example.invalid/test@';
   const environment = fixture(async (command, options) => {
-    if (command.includes('image inspect')) options?.onData?.(JSON.stringify([image]), 'stdout');
+    if (command.includes(' build -f ')) {
+      const tag = tagOf(command);
+      const marker = command.includes("'apps/testing'") ? 'a' : 'b';
+      digests.set(tag, 'sha256:' + marker.repeat(64));
+      if (++buildCount === 2) finishBuilds();
+      await buildsReady;
+    } else if (command.includes(' push ')) {
+      const tag = tagOf(command);
+      options?.onData?.(`another-tag: digest: sha256:${'c'.repeat(64)} size: 123\n`, 'stdout');
+      options?.onData?.(`${tag}: digest: ${digests.get(tag)} size: 123\n`, 'stdout');
+    } else if (command.includes('config --images')) {
+      const image = /VEYOPS_IMAGE='([^']+)'/.exec(command)![1];
+      options?.onData?.(image, 'stdout');
+    }
+  }, true);
+  await Promise.all([environment.run(first), environment.run(second)]);
+  assert.deepEqual(environment.statuses, ['SUCCESS', 'SUCCESS']);
+  assert.equal(digests.size, 2);
+  for (const [record, marker] of [
+    [first, 'a'],
+    [second, 'b'],
+  ] as const) {
+    const artifact = environment.artifacts.find((a) => a.imageTag?.includes(record.id));
+    const expected = 'sha256:' + marker.repeat(64);
+    assert.equal(artifact?.imageDigest, expected);
+    assert.equal(artifact.imageReference, imagePrefix + expected);
+    const activation = environment.commands.find(
+      (command) => command.includes('up -d --no-build') && command.includes(record.id),
+    );
+    assert.ok(activation?.includes(imagePrefix + expected));
+  }
+});
+
+test('a push response without the current tag digest never starts a Compose release', async () => {
+  const environment = fixture(async (command, options) => {
+    if (command.includes(' push '))
+      options?.onData?.(`another-tag: digest: sha256:${'c'.repeat(64)} size: 123\n`, 'stdout');
+  }, true);
+  await environment.run(task(imageSnapshot()));
+  assert.deepEqual(environment.statuses, ['FAILED']);
+  assert.match(environment.targetResults[0].error!, /本次标签的唯一镜像Digest/);
+  assert.equal(environment.artifacts.length, 0);
+  assert.ok(environment.commands.every((command) => !command.includes('up -d')));
+});
+
+test('Compose activation checks the actual image and supports successful short-lived services', async (t) => {
+  const shell = fixtureShell();
+  if (!shell) {
+    t.skip('requires Linux sh or Git Bash');
+    return;
+  }
+  const digest = 'sha256:' + 'd'.repeat(64);
+  const image = 'registry.example.invalid/test@' + digest;
+  const expectedId = 'sha256:' + 'a'.repeat(64);
+  const incorrectId = 'sha256:' + 'b'.repeat(64);
+  const environment = fixture(async (command, options) => {
+    if (command.includes(' push ')) {
+      const tag = /:([^:']+)'$/.exec(command)?.[1];
+      options?.onData?.(`${tag}: digest: ${digest} size: 123\n`, 'stdout');
+    }
+    if (command.includes('config --images')) options?.onData?.(image, 'stdout');
+  }, true);
+  await environment.run(task(imageSnapshot()));
+  assert.deepEqual(environment.statuses, ['SUCCESS']);
+  const activation = environment.commands.find((command) => command.includes('up -d --no-build'))!;
+  const script = `
+    docker() {
+      case "$*" in
+        *' compose '*' up '*) : ;;
+        *' compose '*' ps '*) printf '%s\\n' fixture-container ;;
+        *' image inspect '*) printf '%s\\n' '$EXPECTED_ID' ;;
+        *' container inspect '*) printf '%s\\n' "$ACTUAL_CONTAINER" ;;
+        *) exit 99 ;;
+      esac
+    }
+    ln() { :; }
+    mv() { printf '%s\\n' switched; }
+    ${activation}
+  `.replace('$EXPECTED_ID', expectedId);
+  const run = (actual: string) =>
+    spawnSync(shell, ['-c', script], {
+      encoding: 'utf8',
+      env: { ...process.env, ACTUAL_CONTAINER: actual },
+    });
+  for (const status of ['running:0', 'exited:0']) {
+    const result = run(`${image} ${expectedId} ${status} False`);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), 'switched');
+  }
+  for (const actual of [
+    `${image} ${expectedId} exited:1 False`,
+    `${image} ${incorrectId} running:0 False`,
+    `${image} ${expectedId} exited:0 True`,
+  ]) {
+    const result = run(actual);
+    assert.equal(result.status, 1, result.stderr);
+    assert.doesNotMatch(result.stdout, /switched/);
+  }
+});
+
+test('a failed Compose activation retains its exit code and lock with a port conflict check', async () => {
+  const config = imageSnapshot();
+  const image = 'registry.example.invalid/test@sha256:' + 'd'.repeat(64);
+  const environment = fixture(async (command, options) => {
+    if (command.includes(' push ')) {
+      const tag = /:([^:']+)'$/.exec(command)?.[1];
+      options?.onData?.(`${tag}: digest: sha256:${'d'.repeat(64)} size: 123\n`, 'stdout');
+    }
     if (command.includes('config --images')) options?.onData?.(image, 'stdout');
     if (command.includes('up -d --no-build')) {
       options?.onData?.('Bind for 127.0.0.1:18765 failed: port is already allocated', 'stderr');

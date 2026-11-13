@@ -245,8 +245,8 @@ export class PipelinesService implements OnModuleInit {
       PipelineDefinitionDto,
       JSON.parse(version.definition_json),
     ) as PipelineDefinition;
-    const config = env.config as Record<string, unknown> | null;
-    if (config)
+    const config = env.config;
+    if (config) {
       for (const name of [
         'buildLocation',
         'artifactType',
@@ -256,10 +256,12 @@ export class PipelinesService implements OnModuleInit {
         'composeFilePath',
         'startCommand',
         'healthCheckCommand',
-        'dockerfilePath',
-      ])
-        if (typeof config[name] === 'string' && config[name] !== '')
-          (definition as unknown as Record<string, unknown>)[name] = config[name];
+      ] as const) {
+        const value = config[name];
+        if (value) (definition as unknown as Record<string, string>)[name] = value;
+      }
+      if (config.workingDirectory) definition.repoPath = config.workingDirectory;
+    }
     const errors = await validate(plainToInstance(PipelineDefinitionDto, definition));
     if (errors.length) throw new BadRequestException('有效Pipeline配置不合法');
     if (

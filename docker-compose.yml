@@ -16,7 +16,7 @@ services:
       DATA_DIR: /app/data
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set a persistent 64-character hex ENCRYPTION_KEY in .env}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
-      WORKER_ENABLED: "true"
+      WORKER_ENABLED: ${WORKER_ENABLED:-true}
       WORKER_CONCURRENCY: "1"
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       AI_PIPELINE_ANALYSIS: ${AI_PIPELINE_ANALYSIS:-false}

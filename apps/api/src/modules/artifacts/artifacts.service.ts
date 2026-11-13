@@ -70,9 +70,7 @@ export class ArtifactsService {
           : (d.imageRepository ?? null),
         image_tag: localImage
           ? artifact.imageReference!.slice(imageTagPosition + 1)
-          : d.artifactType === 'DOCKER_IMAGE'
-            ? snapshot.commitSha
-            : null,
+          : (artifact.imageTag ?? null),
         image_digest: artifact.imageId ?? artifact.imageDigest ?? null,
         checksum: artifact.checksum ?? null,
         size_bytes: artifact.sizeBytes ?? null,

@@ -92,7 +92,15 @@ export const checkoutScript = (
   return `set -eu\ncommand -v git >/dev/null || { echo '构建环境缺少 Git CLI，请安装 Git 或选择包含 Git 的辅助镜像' >&2; exit 127; }\n${git} clone --no-checkout -- ${q(url)} ${q(workspace + '/repo')}\ncd ${q(workspace + '/repo')}\nif ! ${git} cat-file -e ${q(commit + '^{commit}')} 2>/dev/null; then ${git} fetch origin ${q(commit)}; fi\n${git} checkout --detach ${q(commit)}\ntest "$(${git} rev-parse HEAD)" = ${q(commit)}\n`;
 };
 export const packScript = (work: string, repoPath: string, outputPath: string, archive: string) =>
-  `set -eu\ncd ${q(work + '/repo/' + repoPath)}\noutput=$(realpath -- ${q(outputPath)})\ncase "$output" in ${q(work + '/repo/')}*) ;; *) echo '产物路径超出工作目录' >&2; exit 1;; esac\ntest -z "$(find "$output" -type l -print -quit)"\nif test -d "$output"; then tar -czf ${q(archive)} -C "$output" .; elif test -f "$output"; then tar -czf ${q(archive)} -C "$(dirname "$output")" "$(basename "$output")"; else echo '产物不存在或不是普通文件/目录' >&2; exit 1; fi\nprintf 'VEYOPS_ARTIFACT:%s:%s\\n' "$(sha256sum ${q(archive)} | cut -d' ' -f1)" "$(wc -c < ${q(archive)})"\n`;
+  `set -eu\n${enterRepositoryDirectory(work, repoPath)}\noutput=$(realpath -- ${q(outputPath)})\ncase "$output" in "$veyops_repo"/*) ;; *) echo '产物路径超出工作目录' >&2; exit 1;; esac\ntest -z "$(find "$output" -type l -print -quit)"\nif test -d "$output"; then tar -czf ${q(archive)} -C "$output" .; elif test -f "$output"; then tar -czf ${q(archive)} -C "$(dirname "$output")" "$(basename "$output")"; else echo '产物不存在或不是普通文件/目录' >&2; exit 1; fi\nprintf 'VEYOPS_ARTIFACT:%s:%s\\n' "$(sha256sum ${q(archive)} | cut -d' ' -f1)" "$(wc -c < ${q(archive)})"\n`;
+
+export function enterRepositoryDirectory(work: string, repoPath: string) {
+  return `cd -P ${q(work)}; veyops_repo=$PWD/repo; test ! -L "$veyops_repo"; cd -P "$veyops_repo"/${q(repoPath)}; case "$PWD" in "$veyops_repo"|"$veyops_repo"/*) ;; *) echo '构建工作目录超出仓库' >&2; exit 1 ;; esac`;
+}
+
+export function resolveRepositoryFile(path: string) {
+  return `veyops_file=$(realpath -- ${q('./' + path)}); case "$veyops_file" in "$veyops_repo"/*) test -f "$veyops_file" ;; *) echo '构建配置文件超出仓库' >&2; exit 1 ;; esac`;
+}
 
 const maxArchiveBytes = 1024 * 1024 * 1024;
 
@@ -105,6 +113,24 @@ export function archiveMetadata(output: string) {
 function localImageTag(session: BuildSession, targetId?: string): string {
   const repository = `veyops-build/${session.snapshot.pipelineId}${targetId ? `/${targetId}` : ''}`;
   return `${repository}:${session.snapshot.commitSha}-${session.taskId}`;
+}
+
+export function registryImageTag(session: BuildSession, targetId?: string) {
+  const tag = `${session.snapshot.commitSha.slice(0, 12)}-${session.taskId}${targetId ? `-${targetId}` : ''}`;
+  if (!/^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$/.test(tag)) throw new Error('无效的发布镜像标签');
+  return tag;
+}
+
+export function pushedImageDigest(output: string, tag: string) {
+  const digests = output.split(/\r?\n/).flatMap((line) => {
+    if (!line.startsWith(`${tag}: `)) return [];
+    const match = /^digest: (sha256:[a-f0-9]{64})\s+size: [0-9]+\s*$/.exec(
+      line.slice(tag.length + 2),
+    );
+    return match ? [match[1]] : [];
+  });
+  if (digests.length !== 1) throw new Error('Registry推送未返回本次标签的唯一镜像Digest');
+  return digests[0]!;
 }
 
 function inspectedImageId(output: string): string {
@@ -249,7 +275,7 @@ export class BuildsService {
         session.context.log(`${step.name}\n`, target.id);
         await this.remote(
           target,
-          `set -eu; . ${q(envFile)}; cd ${q(work + '/repo/' + d.repoPath)}; ${step.command}`,
+          `set -eu; . ${q(envFile)}; ${enterRepositoryDirectory(work, d.repoPath)}; ${step.command}`,
           session,
           step.timeout,
           `${step.name}失败。${step.check}`,
@@ -289,10 +315,9 @@ export class BuildsService {
   async remoteBuildOnlyImage(target: SshTarget, work: string, session: BuildSession) {
     const definition = session.snapshot.definition;
     const imageReference = localImageTag(session, target.id);
-    const cwd = work + '/repo/' + definition.repoPath;
     await this.remote(
       target,
-      `set -eu; cd ${q(cwd)}; DOCKER_BUILDKIT=1 docker build -f ${q(definition.dockerfilePath)} -t ${q(imageReference)} .`,
+      `set -eu; ${enterRepositoryDirectory(work, definition.repoPath)}; ${resolveRepositoryFile(definition.dockerfilePath)}; DOCKER_BUILDKIT=1 docker build -f "$veyops_file" -t ${q(imageReference)} .`,
       session,
       1200,
       'Docker 镜像构建失败。请检查 Dockerfile、基础镜像及依赖源的网络和权限',
@@ -410,7 +435,7 @@ export class BuildsService {
         await this.container(
           session,
           workspace,
-          `set -eu\ncd ${q('/workspace/repo/' + d.repoPath)}\n${step.command}\n`,
+          `set -eu\n${enterRepositoryDirectory('/workspace', d.repoPath)}\n${step.command}\n`,
           undefined,
           envPath,
           undefined,
@@ -485,7 +510,9 @@ export class BuildsService {
         };
       }
       const registry = session.snapshot.registry ?? (await this.registries.get(d.registryId!));
-      const image = `${registry.registryUrl}/${d.imageRepository}:${session.snapshot.commitSha}`;
+      const repository = `${registry.registryUrl}/${d.imageRepository}`;
+      const imageTag = registryImageTag(session);
+      const image = `${repository}:${imageTag}`;
       const dockerConfig = join(root, 'docker-config');
       await mkdir(dockerConfig, { mode: 0o700 });
       await this.localRegistryLogin(
@@ -500,35 +527,27 @@ export class BuildsService {
         1200,
         'Docker 镜像构建失败。请检查 Dockerfile、基础镜像及依赖源的网络和权限',
       );
-      await this.local(
+      const pushed = await this.local(
         session,
         ['--config', dockerConfig, 'push', image],
         1200,
         '镜像推送失败。请检查 Registry 的网络、认证和仓库写入权限',
       );
-      const inspected = await this.local(
-        session,
-        ['--config', dockerConfig, 'image', 'inspect', '--format', '{{json .RepoDigests}}', image],
-        30,
-      );
-      const refs = JSON.parse(inspected.stdout.trim()) as string[];
-      const reference = refs.find((r) =>
-        r.startsWith(`${registry.registryUrl}/${d.imageRepository}@sha256:`),
-      );
-      if (!reference) throw new Error('Registry推送后未获得不可变镜像Digest');
+      const imageDigest = pushedImageDigest(pushed.stdout, imageTag);
       const localCompose = join(workspace, 'compose.yaml');
       await this.container(
         session,
         workspace,
-        `set -eu; cp -- ${q('/workspace/repo/' + d.repoPath + '/' + d.composeFilePath)} /workspace/compose.yaml`,
+        `set -eu; ${enterRepositoryDirectory('/workspace', d.repoPath)}; ${resolveRepositoryFile(d.composeFilePath)}; cp -- "$veyops_file" /workspace/compose.yaml`,
         undefined,
         undefined,
         process.env.BUILD_HELPER_IMAGE || 'node:22-bookworm',
       );
       if ((await lstat(localCompose)).isSymbolicLink()) throw new Error('拒绝符号链接Compose文件');
       return {
-        imageReference: reference,
-        imageDigest: reference.split('@')[1],
+        imageReference: `${repository}@${imageDigest}`,
+        imageTag,
+        imageDigest,
         localCompose,
         cleanup,
       };

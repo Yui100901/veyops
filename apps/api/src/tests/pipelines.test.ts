@@ -541,7 +541,11 @@ test('Pipeline versions and commits are fixed atomically with task and run recor
     const servers = {
       snapshot: async (ids: string[]) => ids.map((id) => ({ ...target(id), credentialId: user })),
     } as unknown as ServersService;
-    const envSnapshot = { config: null, variables: { NODE_ENV: 'test' }, secretVariables: {} };
+    const envSnapshot = {
+      config: { workingDirectory: '' },
+      variables: { NODE_ENV: 'test' },
+      secretVariables: {},
+    };
     const configs = { readSnapshot: async () => envSnapshot } as unknown as ServiceConfigsService;
     const pipelines = new PipelinesService(
       database,
@@ -585,11 +589,19 @@ test('Pipeline versions and commits are fixed atomically with task and run recor
       pipelines.run(created.id, { ...input, expectedServerIds: [randomUUID()] }, user),
     );
     const preview = await pipelines.preview(created.id, input);
+    assert.equal(preview.definition.repoPath, d.repoPath);
+    envSnapshot.config.workingDirectory = 'packages/web';
+    const subdirectory = await pipelines.preview(created.id, input);
+    assert.equal(subdirectory.definition.repoPath, 'packages/web');
+    assert.notEqual(subdirectory.configurationHash, preview.configurationHash);
+    envSnapshot.config.workingDirectory = 'packages/../web';
+    await assert.rejects(() => pipelines.preview(created.id, input), /相对路径/);
+    envSnapshot.config.workingDirectory = 'packages/web';
     envSnapshot.variables.NODE_ENV = 'production';
     await assert.rejects(() =>
       pipelines.run(
         created.id,
-        { ...input, expectedConfigurationHash: preview.configurationHash },
+        { ...input, expectedConfigurationHash: subdirectory.configurationHash },
         user,
       ),
     );
@@ -599,6 +611,7 @@ test('Pipeline versions and commits are fixed atomically with task and run recor
     const snapshot = JSON.parse(row.payload_json).pipeline as PipelineSnapshot;
     assert.equal(snapshot.commitSha, input.commitSha);
     assert.equal(snapshot.variables.NODE_ENV, 'test');
+    assert.equal(snapshot.definition.repoPath, 'packages/web');
     await pipelines.update(
       created.id,
       { name: 'changed', enabled: true, definition: { ...d, buildCommand: 'echo changed' } },
@@ -700,6 +713,22 @@ test('Pipeline versions and commits are fixed atomically with task and run recor
     assert.equal(artifact.imageDigest, null);
     assert.equal(artifact.storageType, 'REMOTE_IMAGE');
     assert.equal(artifact.imageTag, `${input.commitSha}-${deliveries[0].id}`);
+
+    const publishedTag = `${input.commitSha.slice(0, 12)}-${task.id}-${server}`;
+    const published = await artifacts.create(buildSnapshot, {
+      storageKey: image,
+      storageType: 'REGISTRY_IMAGE',
+      imageReference: image,
+      imageDigest: digest,
+      imageTag: publishedTag,
+      serverId: server,
+    });
+    const registryArtifact = (await artifacts.list(project)).find(
+      (item) => item.id === published.id,
+    );
+    assert.equal(registryArtifact?.imageTag, publishedTag);
+    assert.equal(registryArtifact.sourceCommit, input.commitSha);
+    assert.equal(registryArtifact.storageKey, image);
   } finally {
     await database.onApplicationShutdown();
   }
@@ -724,9 +753,12 @@ for (const location of ['TARGET', 'MANAGER'] as const)
             calls.push({ command });
             if (command.includes("printf 'VEYOPS_ARTIFACT"))
               options.onData?.(`VEYOPS_ARTIFACT:${archiveChecksum}:${archiveContents.length}\n`);
-            else if (command.includes('image inspect'))
-              options.onData?.(buildOnly ? digest + '\n' : JSON.stringify([image]) + '\n');
-            else if (command.includes('config --images')) options.onData?.(image + '\n');
+            else if (command.includes('image inspect') && buildOnly)
+              options.onData?.(digest + '\n');
+            else if (command.includes(' push ')) {
+              const tag = /:([^:']+)'$/.exec(command)?.[1];
+              options.onData?.(`${tag}: digest: ${digest} size: 456\n`);
+            } else if (command.includes('config --images')) options.onData?.(image + '\n');
             return { exitCode: 0 };
           },
           uploadContent: async (_t: SshTarget, content: string, path: string) => {
@@ -763,15 +795,13 @@ for (const location of ['TARGET', 'MANAGER'] as const)
             }
             if (args[0] === 'image' && args[1] === 'save')
               await writeFile(opts.gzipOutput!.path, archiveContents);
-            return {
-              exitCode: 0,
-              stdout: args.includes('inspect')
-                ? buildOnly
-                  ? digest
-                  : JSON.stringify([image])
-                : '',
-              stderr: '',
-            };
+            const tag = args.at(-1)?.split(':').at(-1);
+            const stdout = args.includes('push')
+              ? `${tag}: digest: ${digest} size: 456\n`
+              : args.includes('inspect') && buildOnly
+                ? digest
+                : '';
+            return { exitCode: 0, stdout, stderr: '' };
           },
         } as unknown as ProcessRunnerService;
         const credentials = {
@@ -917,8 +947,22 @@ for (const location of ['TARGET', 'MANAGER'] as const)
             !buildOnly,
           );
         } else assert.equal(calls.filter((c) => c.command.includes('checkout --detach')).length, 2);
-        if (!buildOnly && artifactType === 'DOCKER_IMAGE')
+        if (!buildOnly && artifactType === 'DOCKER_IMAGE') {
           assert.ok(records.every((a) => a.imageDigest === digest));
+          assert.deepEqual(
+            records.map((record) => record.imageTag).sort(),
+            (location === 'MANAGER' ? [''] : task.payload.targets.map((t) => `-${t.id}`))
+              .map((suffix) => `${s.commitSha.slice(0, 12)}-${task.id}${suffix}`)
+              .sort(),
+          );
+          assert.equal(uploads.filter((u) => u.content?.includes(image)).length, 2);
+          assert.equal(
+            calls.filter(
+              (c) => c.command.includes('container inspect') && c.command.includes(image),
+            ).length,
+            2,
+          );
+        }
         if (!buildOnly && location === 'MANAGER' && artifactType === 'FILE')
           await rm(join(dataDirectory, 'artifacts', task.id + '.tar.gz'), { force: true });
       });

@@ -32,6 +32,7 @@ import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { DeploymentTargetsService } from '../deployment-targets/deployment-targets.service';
+import { relativePath } from '../pipelines/pipeline.validation';
 
 class ServiceConfigDto {
   @IsUUID() targetId!: string;
@@ -40,7 +41,7 @@ class ServiceConfigDto {
   @IsIn(['FILE', 'DOCKER_COMPOSE']) deployMethod = 'FILE';
   @IsOptional() @IsString() @MaxLength(1024) deployPath = '';
   @IsOptional() @IsString() @MaxLength(65536) buildCommand = '';
-  @IsOptional() @IsString() @MaxLength(1024) workingDirectory = '';
+  @IsOptional() @IsString() @MaxLength(300) workingDirectory = '';
   @IsOptional() @IsString() @MaxLength(1024) outputPath = '';
   @IsOptional() @IsString() @MaxLength(1024) composeFilePath = '';
   @IsOptional() @IsString() @MaxLength(65536) startCommand = '';
@@ -132,6 +133,7 @@ export class ServiceConfigsService {
     return r ? present(r) : null;
   }
   async save(serviceId: string, environmentId: string, input: ServiceConfigDto, userId: string) {
+    if (input.workingDirectory) relativePath(input.workingDirectory);
     await this.assertScope(serviceId, environmentId);
     await this.targets.get(input.targetId);
     if ((input.artifactType === 'FILE') !== (input.deployMethod === 'FILE'))

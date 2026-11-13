@@ -6,7 +6,7 @@
     "dev": "tsc-watch -p tsconfig.json --onSuccess \"node dist/main.js\"",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
-    "test": "npm run build && node --test --test-concurrency=1 dist/**/*.test.js",
+    "test": "npm run build && node --test --test-concurrency=1 \"dist/**/*.test.js\"",
     "db:migrate": "npm run build && node dist/core/database/migrate.js"
   },
   "dependencies": {

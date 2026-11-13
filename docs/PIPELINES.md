@@ -36,6 +36,8 @@ Pipeline是服务级的版本化交付配置。每次修改追加不可变版本
 
 `steps`为构建后、产物打包前的附加Shell步骤，结构为`{name,type:"SHELL",command,timeout?}`，按数组顺序执行。每步最大超时3600秒，默认900秒。`repoPath`、输出路径、Dockerfile和Compose路径必须位于仓库内部。文件产物支持普通目录和单文件，均打包为tar.gz；拒绝产物中的符号链接。
 
+服务环境配置中的工作目录以仓库根为基准，例如 `apps/web`。填写后覆盖 Pipeline 的 `repoPath`，留空时继承。安装、构建、文件产物、Dockerfile 和 Compose 路径均相对于有效工作目录。
+
 提交运行：`POST /api/v1/pipelines/:id/run`，请求`{environmentId,targetId,commitSha,version?,confirmed:true}`。省略version时固定当前版本。AI确认流程还校验目标和配置哈希，资源变化后要求重新确认。
 
 ## 仅构建
@@ -96,7 +98,7 @@ SSH Git URL暂不支持，因为仓库主机公钥配置和可信注入链路尚
 
 在Registry页面填写`host[:port]`，不要加HTTP协议或凭据。可引用DOCKER_REGISTRY/USERNAME_PASSWORD凭据。密码通过`docker login --password-stdin`提供，配置文件使用独立临时目录并在任务结束后清理。
 
-Docker Pipeline额外填写`registryId`、`imageRepository`、`dockerfilePath`和`composeFilePath`。镜像Tag使用完整Commit，部署必须使用Registry返回的不可变`sha256` Digest。Compose文件需引用平台设置的`VEYOPS_IMAGE`，例如：
+Docker Pipeline额外填写`registryId`、`imageRepository`、`dockerfilePath`和`composeFilePath`。发布镜像标签由 Commit 前 12 位和任务 ID 组成，目标端构建时追加目标服务器 ID。每次推送返回的不可变 `sha256` Digest 用于部署，产物记录保留实际推送的标签和完整 Commit。Compose 文件需引用平台设置的 `VEYOPS_IMAGE`，例如：
 
 ```yaml
 services:
@@ -106,7 +108,7 @@ services:
       - '127.0.0.1:8080:8080'
 ```
 
-平台会校验Compose实际渲染的镜像列表包含该Digest，再执行pull和`up -d --no-build`。Compose项目名由服务和环境ID派生，分别隔离。Registry TLS信任由部署环境管理；平台不会自动关闭TLS校验或修改Docker daemon信任配置。
+平台校验 Compose 渲染的镜像列表包含本次 Digest，再执行 pull 和 `up -d --no-build`。切换发布目录前，校验使用该 Digest 的容器的实际镜像 ID 与拉取的镜像一致，且容器正在运行或已成功退出。Compose项目名由服务和环境ID派生，分别隔离。Registry TLS信任由部署环境管理；平台不会自动关闭TLS校验或修改Docker daemon信任配置。
 
 ## 相关接口
 

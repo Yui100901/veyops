@@ -445,11 +445,11 @@ function EnvironmentConfigEditor({
                   <option value="DOCKER_COMPOSE">Docker Compose</option>
                 </select>
               </Field>
-              <Field label="工作目录">
+              <Field label="仓库工作目录">
                 <input
                   name="workingDirectory"
                   defaultValue={config.data?.workingDirectory}
-                  placeholder="继承 Pipeline"
+                  placeholder="如 apps/web，留空继承 Pipeline"
                 />
               </Field>
             </div>

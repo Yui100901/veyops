@@ -6,9 +6,10 @@ export function relativePath(value: string): string {
   if (
     !value ||
     value.startsWith('/') ||
+    /^[a-z]:/i.test(value) ||
     value.includes('\\') ||
     value.split('/').includes('..') ||
-    /[\x00-\x1f]/.test(value)
+    /[\x00-\x1f\x7f]/.test(value)
   )
     throw new BadRequestException('仓库和产物路径必须为不含..的相对路径');
   return value;

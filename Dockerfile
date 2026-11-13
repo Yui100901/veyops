@@ -1,4 +1,5 @@
-FROM node:24-bookworm-slim AS build
+ARG NODE_IMAGE=node:24-bookworm-slim
+FROM ${NODE_IMAGE} AS build
 WORKDIR /app
 
 # Native SQLite modules use prebuilt binaries where available and node-gyp otherwise.
@@ -11,7 +12,8 @@ RUN npm ci
 COPY . .
 RUN npm run build && npm prune --omit=dev
 
-FROM node:24-bookworm-slim AS runtime
+FROM ${NODE_IMAGE} AS runtime
+ARG POSTGRES_CLIENT_MAJOR=17
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000 \
@@ -21,7 +23,14 @@ ENV NODE_ENV=production \
     WORKER_ENABLED=true \
     WORKER_CONCURRENCY=1
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && printf '%s\n' 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main' \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends "postgresql-client-${POSTGRES_CLIENT_MAJOR}" \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /app/data/database /app/data/logs /app/data/artifacts /app/data/backups \
     && chown -R node:node /app

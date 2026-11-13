@@ -5,7 +5,11 @@ import {
   BuildsService,
   BuildSession,
   archiveMetadata,
+  enterRepositoryDirectory,
   packScript,
+  pushedImageDigest,
+  registryImageTag,
+  resolveRepositoryFile,
 } from '../builds/builds.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { DeploymentHealth, DeploymentsService } from '../deployments/deployments.service';
@@ -43,6 +47,23 @@ function commandExitCode(error: unknown) {
   return error instanceof BuildCommandError || error instanceof DeploymentActivationError
     ? error.exitCode
     : null;
+}
+
+function verifyComposeImage(compose: string, docker: string, image: string) {
+  return `expected_image=$(${docker} image inspect --format '{{.Id}}' ${q(image)})
+container_ids=$(${compose} ps --all --orphans=false --quiet)
+matched_image=
+for container_id in $container_ids; do
+  actual_image=$(${docker} container inspect --format '{{.Config.Image}} {{.Image}} {{.State.Status}}:{{.State.ExitCode}} {{index .Config.Labels "com.docker.compose.oneoff"}}' "$container_id")
+  case "$actual_image" in
+    *' True'|*' true') continue ;;
+    ${q(image + ' ')}"$expected_image "running:*|${q(image + ' ')}"$expected_image "'exited:0 '*)
+      matched_image=yes ;;
+    ${q(image)}' '*)
+      echo 'Compose容器未成功启动或实际镜像与本次发布Digest不一致' >&2; exit 1 ;;
+  esac
+done
+test -n "$matched_image" || { echo 'Compose没有成功启动使用本次发布Digest的容器' >&2; exit 1; }`;
 }
 
 @Injectable()
@@ -121,6 +142,7 @@ export class PipelineExecutor {
           sizeBytes: manager.sizeBytes,
           imageDigest: manager.imageDigest,
           imageReference: manager.imageReference,
+          imageTag: manager.imageTag,
           imageId: manager.imageId,
           storageType: manager.imageId ? 'LOCAL_IMAGE' : undefined,
         });
@@ -323,7 +345,6 @@ export class PipelineExecutor {
                 continue;
               }
               if (!manager) {
-                // The local commit tag and the live release share this host, so serialize both.
                 await beginDeployment();
                 const image = await step('IMAGE', '构建镜像、推送并固定Digest', () =>
                   this.targetImage(target, work, session),
@@ -332,11 +353,12 @@ export class PipelineExecutor {
                   storageKey: image.reference,
                   imageReference: image.reference,
                   imageDigest: image.digest,
+                  imageTag: image.tag,
                   serverId: target.id,
                 });
               }
               if (manager) await beginDeployment();
-              const compose = await step('DEPLOY', '校验Compose配置并拉取镜像', () =>
+              const { compose, docker } = await step('DEPLOY', '校验Compose配置并拉取镜像', () =>
                 this.prepareComposeRelease(
                   target,
                   work,
@@ -348,7 +370,7 @@ export class PipelineExecutor {
               await activate('启动Compose发布版本', () =>
                 this.builds.remote(
                   target,
-                  `set -eu; ${compose} up -d --no-build; ${this.switchRelease(session)}`,
+                  `set -eu\n${compose} up -d --no-build\n${verifyComposeImage(compose, docker, artifact!.imageReference!)}\n${this.switchRelease(session)}`,
                   session,
                   600,
                   'Compose 发布激活失败。请检查宿主机端口占用、Compose 容器状态和当前版本链接',
@@ -499,35 +521,25 @@ export class PipelineExecutor {
   private async targetImage(target: SshTarget, work: string, session: BuildSession) {
     const d = session.snapshot.definition;
     const { registry, config } = await this.builds.remoteRegistryLogin(target, work, session);
-    const image = `${registry.registryUrl}/${d.imageRepository}:${session.snapshot.commitSha}`;
-    const cwd = work + '/repo/' + d.repoPath;
+    const repository = `${registry.registryUrl}/${d.imageRepository}`;
+    const tag = registryImageTag(session, target.id);
+    const image = `${repository}:${tag}`;
     await this.builds.remote(
       target,
-      `set -eu; cd ${q(cwd)}; DOCKER_BUILDKIT=1 docker --config ${q(config)} build -f ${q(d.dockerfilePath)} -t ${q(image)} .`,
+      `set -eu; ${enterRepositoryDirectory(work, d.repoPath)}; ${resolveRepositoryFile(d.dockerfilePath)}; DOCKER_BUILDKIT=1 docker --config ${q(config)} build -f "$veyops_file" -t ${q(image)} .`,
       session,
       1200,
       'Docker 镜像构建失败。请检查 Dockerfile、基础镜像及依赖源的网络和权限',
     );
-    await this.builds.remote(
+    const output = await this.builds.remoteCapture(
       target,
       `docker --config ${q(config)} push ${q(image)}`,
       session,
       1200,
       '镜像推送失败。请检查 Registry 的网络、认证和仓库写入权限',
     );
-    const output = await this.builds.remoteCapture(
-      target,
-      `docker --config ${q(config)} image inspect --format '{{json .RepoDigests}}' ${q(image)}`,
-      session,
-      30,
-    );
-    const refs = JSON.parse(output.trim()) as string[];
-    const reference = refs.find((r) =>
-      r.startsWith(`${registry.registryUrl}/${d.imageRepository}@sha256:`),
-    );
-    if (!reference || !/@sha256:[a-f0-9]{64}$/.test(reference))
-      throw new Error('未获取Registry不可变镜像Digest');
-    return { reference, digest: reference.split('@')[1]! };
+    const digest = pushedImageDigest(output, tag);
+    return { reference: `${repository}@${digest}`, digest, tag };
   }
   private async prepareComposeRelease(
     target: SshTarget,
@@ -556,7 +568,7 @@ export class PipelineExecutor {
     else
       await this.builds.remote(
         target,
-        `cp -- ${q(work + '/repo/' + d.repoPath + '/' + d.composeFilePath)} ${q(release + '/compose.yaml')}`,
+        `set -eu; ${enterRepositoryDirectory(work, d.repoPath)}; ${resolveRepositoryFile(d.composeFilePath)}; cp -- "$veyops_file" ${q(release + '/compose.yaml')}`,
         session,
         30,
       );
@@ -568,7 +580,8 @@ export class PipelineExecutor {
     });
     const { config } = await this.builds.remoteRegistryLogin(target, work, session);
     const project = `veyops-${s.serviceId.slice(0, 8)}-${s.environmentId.slice(0, 8)}`;
-    const compose = `docker --config ${q(config)} compose --project-name ${q(project)} --env-file ${q(release + '/.env')} -f ${q(release + '/compose.yaml')}`;
+    const docker = `docker --config ${q(config)}`;
+    const compose = `VEYOPS_IMAGE=${q(image)} ${docker} compose --project-name ${q(project)} --env-file ${q(release + '/.env')} -f ${q(release + '/compose.yaml')}`;
     const images = await this.builds.remoteCapture(
       target,
       `${compose} config --images`,
@@ -585,7 +598,7 @@ export class PipelineExecutor {
       600,
       'Compose 镜像拉取失败。请检查目标主机到 Registry 的网络、凭据和镜像是否可用',
     );
-    return compose;
+    return { compose, docker };
   }
   private async inRelease(
     target: SshTarget,
