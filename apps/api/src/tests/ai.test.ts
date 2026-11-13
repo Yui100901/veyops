@@ -128,7 +128,7 @@ async function fixture() {
     ai,
     executeCount: () => executeCount,
     async close() {
-      await database.onModuleDestroy();
+      await database.onApplicationShutdown();
       await rm(dir, { recursive: true, force: true });
     },
   };

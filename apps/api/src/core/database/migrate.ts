@@ -7,7 +7,7 @@ async function main() {
     await database.onModuleInit();
     console.log('Database migrations completed');
   } finally {
-    await database.onModuleDestroy();
+    await database.onApplicationShutdown();
   }
 }
 void main().catch(() => {

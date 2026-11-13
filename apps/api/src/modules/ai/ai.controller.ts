@@ -1,11 +1,18 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Req } from '@nestjs/common';
 import { Roles } from '../auth/auth.decorators';
 import { AuthRequest } from '../auth/auth.guard';
-import { AiChatDto, AiPolicyDto, CreateAiProviderDto, UpdateAiProviderDto } from './ai.dto';
+import {
+  AiChatDto,
+  AiPolicyDto,
+  AiRepositoryAnalysisDto,
+  CreateAiProviderDto,
+  UpdateAiProviderDto,
+} from './ai.dto';
 import { AiProvidersService } from './ai-providers.service';
 import { AiService } from './ai.service';
 import { AiPolicyService } from './ai-policy.service';
 import { AiProposalsService } from './ai-proposals.service';
+import { AiRepositoryAnalysisService } from './ai-repository-analysis.service';
 
 @Controller('ai')
 export class AiController {
@@ -14,6 +21,7 @@ export class AiController {
     private readonly ai: AiService,
     private readonly policy: AiPolicyService,
     private readonly proposals: AiProposalsService,
+    private readonly repositoryAnalysis: AiRepositoryAnalysisService,
   ) {}
   @Get('providers') listProviders() {
     return this.providers.list();
@@ -54,6 +62,12 @@ export class AiController {
   }
   @Post('chat') chat(@Body() input: AiChatDto, @Req() req: AuthRequest) {
     return this.ai.chat(input, req.user);
+  }
+  @Roles('ADMIN', 'OPERATOR') @Post('repository-analysis') analyzeRepository(
+    @Body() input: AiRepositoryAnalysisDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.repositoryAnalysis.analyze(input, req.user.id);
   }
   @Get('conversations') conversations(@Req() req: AuthRequest) {
     return this.ai.conversations(req.user.id);

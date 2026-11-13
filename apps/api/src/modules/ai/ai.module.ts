@@ -8,6 +8,9 @@ import { AiToolsService } from './ai-tools.service';
 import { AiProposalsService } from './ai-proposals.service';
 import { AiService } from './ai.service';
 import { AiController } from './ai.controller';
+import { AiPipelineAnalyzer } from './ai-pipeline-analyzer.service';
+import { PipelineAnalysisService } from './pipeline-analysis.service';
+import { AiRepositoryAnalysisService } from './ai-repository-analysis.service';
 @Global()
 @Module({
   imports: [CommandCenterModule],
@@ -20,7 +23,10 @@ import { AiController } from './ai.controller';
     AiProposalsService,
     AiService,
     OpenAiCompatibleService,
+    AiPipelineAnalyzer,
+    PipelineAnalysisService,
+    AiRepositoryAnalysisService,
   ],
-  exports: [AiProvidersService, AiService],
+  exports: [AiProvidersService, AiService, PipelineAnalysisService],
 })
 export class AiModule {}

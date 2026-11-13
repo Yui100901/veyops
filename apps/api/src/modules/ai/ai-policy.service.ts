@@ -37,6 +37,7 @@ const validActions = new Set([
   'get_project',
   'query_pipeline',
   'draft_pipeline',
+  'analyze_repository_deployment',
   'draft_operation_plan',
 ]);
 @Injectable()

@@ -1,15 +1,17 @@
 import 'reflect-metadata';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { sql } from 'kysely';
 import { dataDirectory } from '../core/config';
 import { DatabaseService } from '../core/database/database.service';
 import { AuditService } from '../modules/audit/audit.service';
+import type { PipelineAnalysisService } from '../modules/ai/pipeline-analysis.service';
 import { TasksService } from '../modules/tasks/tasks.service';
 import { TaskLogService } from '../modules/tasks/task-log.service';
 import { TaskHandlerRegistry } from '../modules/tasks/task-handler.registry';
@@ -114,7 +116,8 @@ test('Git helper handles actual fill/approve/reject operations without exposing 
       '/tmp/veyops-test',
       '/tmp/git-credentials',
     );
-    assert.ok(script.includes('-c credential.helper= -c credential.helper='));
+    assert.match(script, /-c credential\.helper= .* -c credential\.helper=/);
+    assert.ok(script.includes('-c http.followRedirects=false'));
     assert.equal(script.includes('fixture-token-for-validation'), false);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -302,7 +305,7 @@ test('expired Pipeline leases reconcile running deployment history without chang
           finished_at: status === 'SUCCESS' ? now - 500 : null,
         })
         .execute();
-      return { task, deploymentId };
+      return { task, deploymentId, runId, targetId: taskTarget.id };
     };
     const previous = await makeTask('SUCCESS', null);
     const interrupted = await makeTask('RUNNING', now - 1000);
@@ -335,8 +338,119 @@ test('expired Pipeline leases reconcile running deployment history without chang
     await sql`drop trigger fail_deployment_recovery`.execute(database.db);
     await worker.recoverExpired();
     assert.equal((await tasks.get(atomic.task.id)).status, 'NEEDS_ATTENTION');
+
+    const deploymentService = new DeploymentsService(database);
+    const expiredSnapshot = {
+      runId: atomic.runId,
+      projectId: ids.project,
+      serviceId: ids.service,
+      environmentId: ids.environment,
+      definition: definition(),
+      commitSha: 'b'.repeat(40),
+    } as PipelineSnapshot;
+    await assert.rejects(
+      () =>
+        deploymentService.start(expiredSnapshot, ids.server, atomic.targetId, {
+          taskId: atomic.task.id,
+          owner: 'test-worker',
+        }),
+      /Worker 租约已失效/,
+    );
+    assert.equal(
+      await deploymentService.finish(atomic.deploymentId, 'SUCCESS', undefined, 'HEALTHY', {
+        taskId: atomic.task.id,
+        owner: 'test-worker',
+      }),
+      false,
+    );
+
+    const failed = await tasks.create(
+      {
+        type: 'PIPELINE',
+        name: 'failed deploy',
+        scope: {
+          projectId: ids.project,
+          serviceId: ids.service,
+          environmentId: ids.environment,
+          targetId: ids.target,
+        },
+        pipelineRun: {
+          id: randomUUID(),
+          pipelineId: ids.pipeline,
+          pipelineVersionId: ids.version,
+          gitRef: 'b'.repeat(40),
+          commitSha: 'b'.repeat(40),
+          buildLocation: 'TARGET',
+          artifactType: 'FILE',
+        },
+        payload: {
+          targets: [target(ids.server)],
+          steps: [],
+          strategy: 'SEQUENTIAL',
+          maxParallel: 1,
+          failurePolicy: 'CONTINUE',
+          timeout: 30,
+        },
+      },
+      ids.user,
+    );
+    const failedRun = await database.db
+      .selectFrom('pipeline_runs')
+      .select('id')
+      .where('task_id', '=', failed.id)
+      .executeTakeFirstOrThrow();
+    const handlers = new TaskHandlerRegistry();
+    const failedWorker = new TaskWorkerService(database, tasks, handlers, logs);
+    let failedDeploymentId: string | undefined;
+    handlers.register({
+      type: 'PIPELINE',
+      execute: async (record, context) => {
+        const targetId = await context.startTarget(ids.server);
+        await context.startStep(
+          targetId,
+          ids.server,
+          { key: 'DEPLOY', name: 'activate', command: '' },
+          0,
+        );
+        assert.ok(context.leaseOwner);
+        failedDeploymentId = await deploymentService.start(
+          { ...expiredSnapshot, runId: failedRun.id },
+          ids.server,
+          targetId,
+          { taskId: record.id, owner: context.leaseOwner },
+        );
+        throw new Error('simulated deploy finalization interruption');
+      },
+    });
+    // Complete the older synthetic active job so the SQLite worker may claim the failure fixture.
+    await database.db
+      .updateTable('tasks')
+      .set({ status: 'SUCCESS', lease_owner: null, lease_expires_at: null })
+      .where('id', '=', active.task.id)
+      .execute();
+    try {
+      await failedWorker.tick();
+      for (
+        let attempt = 0;
+        attempt < 50 && (await tasks.get(failed.id)).status !== 'NEEDS_ATTENTION';
+        attempt++
+      )
+        await delay(10);
+      assert.equal((await tasks.get(failed.id)).status, 'NEEDS_ATTENTION');
+    } finally {
+      await failedWorker.shutdown();
+    }
+    assert.ok(failedDeploymentId);
+    const failureRecord = await database.db
+      .selectFrom('deployment_records')
+      .select('status')
+      .where('id', '=', failedDeploymentId)
+      .executeTakeFirstOrThrow();
+    assert.equal(failureRecord.status, 'NEEDS_ATTENTION');
+    assert.equal((await tasks.targets(failed.id))[0].status, 'NEEDS_ATTENTION');
+    assert.equal((await tasks.steps(failed.id))[0].status, 'NEEDS_ATTENTION');
   } finally {
-    await database.onModuleDestroy();
+    await database.onApplicationShutdown();
   }
 });
 
@@ -438,6 +552,7 @@ test('Pipeline versions and commits are fixed atomically with task and run recor
       new AuditService(database),
       configs,
       {} as RegistriesService,
+      {} as PipelineAnalysisService,
     );
     const created = await pipelines.create(
       { name: 'release', projectId: project, serviceId: service, definition: d, enabled: true },
@@ -503,165 +618,310 @@ test('Pipeline versions and commits are fixed atomically with task and run recor
     assert.equal(run.commit_sha, input.commitSha);
     assert.equal(row.project_id, project);
     assert.equal((await pipelines.versions(created.id)).length, 2);
+
+    const buildDefinition = {
+      ...d,
+      artifactType: 'DOCKER_IMAGE' as const,
+      buildLocation: 'MANAGER' as const,
+      deployPath: '',
+    };
+    const buildPipeline = await pipelines.create(
+      {
+        name: 'build',
+        projectId: project,
+        serviceId: service,
+        definition: buildDefinition,
+        enabled: true,
+      },
+      user,
+    );
+    await assert.rejects(() => pipelines.preview(buildPipeline.id, input));
+    const buildInput = { ...input, mode: 'BUILD_ONLY' as const };
+    const buildPreview = await pipelines.preview(buildPipeline.id, buildInput);
+    assert.equal(buildPreview.mode, 'BUILD_ONLY');
+    const trigger = {
+      triggerType: 'WEBHOOK' as const,
+      idempotencyKey: 'gitea-test-delivery',
+      gitRef: 'refs/heads/main',
+    };
+    await assert.rejects(() => pipelines.run(created.id, input, user, trigger));
+    const confirmed = {
+      ...buildInput,
+      version: buildPreview.version,
+      expectedConfigurationHash: buildPreview.configurationHash,
+      expectedServerIds: buildPreview.serverIds,
+    };
+    const oldSocket = process.env.WEBHOOK_BUILD_DOCKER_SOCKET;
+    process.env.WEBHOOK_BUILD_DOCKER_SOCKET = '/run/user/1000/veyops-test.sock';
+    const deliveries = await Promise.all([
+      pipelines.run(buildPipeline.id, confirmed, user, trigger),
+      pipelines.run(buildPipeline.id, confirmed, user, trigger),
+    ]).finally(() => {
+      if (oldSocket === undefined) delete process.env.WEBHOOK_BUILD_DOCKER_SOCKET;
+      else process.env.WEBHOOK_BUILD_DOCKER_SOCKET = oldSocket;
+    });
+    assert.equal(deliveries[0].id, deliveries[1].id);
+    assert.equal(deliveries[0].executionMode, 'BUILD_ONLY');
+    assert.equal(deliveries[0].triggerType, 'WEBHOOK');
+    const buildRuns = await database.db
+      .selectFrom('pipeline_runs')
+      .selectAll()
+      .where('pipeline_id', '=', buildPipeline.id)
+      .execute();
+    assert.equal(buildRuns.length, 1);
+    assert.equal(buildRuns[0].git_ref, 'refs/heads/main');
+    assert.equal(buildRuns[0].trigger_type, 'WEBHOOK');
+    assert.equal((await tasks.targets(deliveries[0].id)).length, 1);
+    assert.equal(
+      (
+        await database.db
+          .selectFrom('audit_logs')
+          .select('id')
+          .where('resource_id', '=', deliveries[0].id)
+          .where('action', '=', 'pipeline.run')
+          .execute()
+      ).length,
+      1,
+    );
+
+    const buildSnapshot = JSON.parse((await tasks.row(deliveries[0].id)).payload_json)
+      .pipeline as PipelineSnapshot;
+    const imageTag = `veyops-build/${buildPipeline.id}:${input.commitSha}-${deliveries[0].id}`;
+    const artifacts = new ArtifactsService(database);
+    await artifacts.create(buildSnapshot, {
+      storageKey: imageTag,
+      storageType: 'REMOTE_IMAGE',
+      imageReference: imageTag,
+      imageId: digest,
+      serverId: server,
+    });
+    const [artifact] = await artifacts.list(project);
+    assert.equal(artifact.imageId, digest);
+    assert.equal(artifact.imageDigest, null);
+    assert.equal(artifact.storageType, 'REMOTE_IMAGE');
+    assert.equal(artifact.imageTag, `${input.commitSha}-${deliveries[0].id}`);
   } finally {
-    await database.onModuleDestroy();
+    await database.onApplicationShutdown();
   }
 });
 
 for (const location of ['TARGET', 'MANAGER'] as const)
   for (const artifactType of ['FILE', 'DOCKER_IMAGE'] as const) {
-    test(`Pipeline ${location} ${artifactType} builds and deploys with isolated manager or fixed remote commit`, async () => {
-      const calls: { command: string; args?: string[]; stdin?: string }[] = [];
-      let managers = 0;
-      const uploads: { path: string; content?: string }[] = [];
-      const ssh = {
-        execute: async (
-          _target: SshTarget,
-          command: string,
-          options: { onData?: (s: string) => void },
-        ) => {
-          calls.push({ command });
-          if (command.includes("printf 'VEYOPS_ARTIFACT"))
-            options.onData?.('VEYOPS_ARTIFACT:' + 'c'.repeat(64) + ':12\n');
-          else if (command.includes('image inspect'))
-            options.onData?.(JSON.stringify([image]) + '\n');
-          else if (command.includes('config --images')) options.onData?.(image + '\n');
-          return { exitCode: 0 };
-        },
-        uploadContent: async (_t: SshTarget, content: string, path: string) => {
-          uploads.push({ path, content });
-        },
-        upload: async (_t: SshTarget, _local: string, path: string) => {
-          uploads.push({ path });
-        },
-      } as unknown as SshService;
-      const runner = {
-        run: async (command: string, args: string[], opts: { stdin?: string }) => {
-          calls.push({ command, args, stdin: opts.stdin });
-          if (args[0] === 'run') {
-            const mount = args.find((a) => a.endsWith(',dst=/workspace'))!;
-            const workspace = mount.slice('type=bind,src='.length, -',dst=/workspace'.length);
-            const script = args.at(-1)!;
-            if (script.includes('clone --no-checkout')) {
-              managers++;
-              await mkdir(join(workspace, 'repo'), { recursive: true });
-              await writeFile(join(workspace, 'repo', 'Dockerfile'), 'FROM scratch');
-              await writeFile(join(workspace, 'repo', 'compose.yaml'), 'services: {}');
+    for (const mode of ['DEPLOY', 'BUILD_ONLY'] as const)
+      test(`Pipeline ${location} ${artifactType} ${mode} uses the expected build and deployment steps`, async () => {
+        const calls: { command: string; args?: string[]; stdin?: string }[] = [];
+        const buildOnly = mode === 'BUILD_ONLY';
+        const archiveContents = 'test archive';
+        const archiveChecksum = createHash('sha256').update(archiveContents).digest('hex');
+        let managers = 0;
+        const uploads: { path: string; content?: string }[] = [];
+        const ssh = {
+          execute: async (
+            _target: SshTarget,
+            command: string,
+            options: { onData?: (s: string) => void },
+          ) => {
+            calls.push({ command });
+            if (command.includes("printf 'VEYOPS_ARTIFACT"))
+              options.onData?.(`VEYOPS_ARTIFACT:${archiveChecksum}:${archiveContents.length}\n`);
+            else if (command.includes('image inspect'))
+              options.onData?.(buildOnly ? digest + '\n' : JSON.stringify([image]) + '\n');
+            else if (command.includes('config --images')) options.onData?.(image + '\n');
+            return { exitCode: 0 };
+          },
+          uploadContent: async (_t: SshTarget, content: string, path: string) => {
+            uploads.push({ path, content });
+          },
+          upload: async (_t: SshTarget, _local: string, path: string) => {
+            uploads.push({ path });
+          },
+          download: async (_t: SshTarget, _remote: string, path: string) => {
+            await writeFile(path, archiveContents);
+          },
+        } as unknown as SshService;
+        const runner = {
+          run: async (
+            command: string,
+            args: string[],
+            opts: { stdin?: string; gzipOutput?: { path: string } },
+          ) => {
+            calls.push({ command, args, stdin: opts.stdin });
+            if (args[0] === 'run') {
+              const mount = args.find((a) => a.endsWith(',dst=/workspace'))!;
+              const workspace = mount.slice('type=bind,src='.length, -',dst=/workspace'.length);
+              const script = args.at(-1)!;
+              if (script.includes('clone --no-checkout')) {
+                managers++;
+                await mkdir(join(workspace, 'repo'), { recursive: true });
+                await writeFile(join(workspace, 'repo', 'Dockerfile'), 'FROM scratch');
+                await writeFile(join(workspace, 'repo', 'compose.yaml'), 'services: {}');
+              }
+              if (script.includes("printf 'VEYOPS_ARTIFACT"))
+                await writeFile(join(workspace, 'artifact.tar.gz'), 'test archive');
+              if (script.includes('/workspace/compose.yaml'))
+                await writeFile(join(workspace, 'compose.yaml'), 'services: {}');
             }
-            if (script.includes("printf 'VEYOPS_ARTIFACT"))
-              await writeFile(join(workspace, 'artifact.tar.gz'), 'test archive');
-            if (script.includes('/workspace/compose.yaml'))
-              await writeFile(join(workspace, 'compose.yaml'), 'services: {}');
+            if (args[0] === 'image' && args[1] === 'save')
+              await writeFile(opts.gzipOutput!.path, archiveContents);
+            return {
+              exitCode: 0,
+              stdout: args.includes('inspect')
+                ? buildOnly
+                  ? digest
+                  : JSON.stringify([image])
+                : '',
+              stderr: '',
+            };
+          },
+        } as unknown as ProcessRunnerService;
+        const credentials = {
+          decrypt: async () => ({ username: 'user', password: 'private-token-for-git' }),
+        } as unknown as CredentialsService;
+        const registries = {
+          get: async () => {
+            assert.equal(buildOnly, false);
+            return { registryUrl: 'registry.example.com', credentialId: 'registry-credential' };
+          },
+        } as unknown as RegistriesService;
+        const builds = new BuildsService(ssh, runner, credentials, registries);
+        const records: PipelineArtifact[] = [];
+        const artifacts = {
+          create: async (_s: PipelineSnapshot, a: Omit<PipelineArtifact, 'id'>) => {
+            const artifact = { ...a, id: randomUUID() };
+            records.push(artifact);
+            return artifact;
+          },
+        } as unknown as ArtifactsService;
+        const deploymentStates: string[] = [];
+        const deployments = {
+          start: async () => {
+            assert.equal(buildOnly, false);
+            return randomUUID();
+          },
+          finish: async (_id: string, status: string) => {
+            deploymentStates.push(status);
+          },
+        } as unknown as DeploymentsService;
+        const d = {
+          ...definition(),
+          buildLocation: location,
+          artifactType,
+          registryId: randomUUID(),
+          imageRepository: 'team/web',
+          startCommand: 'echo START_SERVICE',
+          healthCheckCommand: 'echo CHECK_HEALTH',
+        };
+        const s: PipelineSnapshot = {
+          mode,
+          runId: randomUUID(),
+          pipelineId: randomUUID(),
+          pipelineVersionId: randomUUID(),
+          projectId: randomUUID(),
+          serviceId: randomUUID(),
+          environmentId: randomUUID(),
+          targetId: randomUUID(),
+          commitSha: 'b'.repeat(40),
+          repository: { url: 'https://example.com/app.git', credentialId: 'git-credential' },
+          definition: d,
+          variables: { NODE_ENV: 'production' },
+          secretVariables: {},
+        };
+        const task: TaskRecord = {
+          id: randomUUID(),
+          name: 'test',
+          type: 'PIPELINE',
+          payload: {
+            targets: [target(randomUUID()), target(randomUUID())],
+            steps: [],
+            strategy: 'PARALLEL',
+            maxParallel: 2,
+            failurePolicy: 'CONTINUE',
+            timeout: 900,
+            pipeline: s,
+          },
+        };
+        const states: TaskStatus[] = [];
+        const controller = new AbortController();
+        const context: TaskExecutionContext = {
+          signal: controller.signal,
+          log: () => undefined,
+          startTarget: async () => randomUUID(),
+          finishTarget: async (_id, status) => {
+            states.push(status);
+          },
+          startStep: async () => randomUUID(),
+          finishStep: async () => undefined,
+        };
+        await new PipelineExecutor(builds, ssh, artifacts, deployments).execute(task, context);
+        assert.deepEqual(states, ['SUCCESS', 'SUCCESS']);
+        assert.deepEqual(deploymentStates, buildOnly ? [] : ['SUCCESS', 'SUCCESS']);
+        assert.equal(records.length, location === 'MANAGER' ? 1 : 2);
+        const actualCommands = calls.map((c) => c.command).join('\n');
+        assert.equal(actualCommands.includes('private-token-for-git'), false);
+        assert.equal(
+          calls.some((c) => c.command.includes('mv -Tf')),
+          !buildOnly,
+        );
+        if (buildOnly) {
+          assert.doesNotMatch(
+            actualCommands,
+            /compose|START_SERVICE|CHECK_HEALTH|docker.+(?:push|login|run)\b/,
+          );
+          assert.ok(
+            calls.every((c) => !c.args?.some((arg) => ['push', 'login', 'compose'].includes(arg))),
+          );
+          if (location === 'MANAGER') assert.ok(calls.every((c) => c.command === 'docker'));
+          if (artifactType === 'DOCKER_IMAGE') {
+            assert.ok(
+              records.every(
+                (a) => a.imageId === digest && a.imageReference?.startsWith('veyops-build/'),
+              ),
+            );
+            assert.ok(
+              records.every(
+                (a) => a.storageType === (location === 'MANAGER' ? 'LOCAL_IMAGE' : 'REMOTE_IMAGE'),
+              ),
+            );
+            assert.equal(new Set(records.map((a) => a.imageReference)).size, records.length);
+            for (const record of records) {
+              assert.equal(record.checksum, archiveChecksum);
+              assert.ok(record.archiveKey?.endsWith('.tar.gz'));
+              const path = join(dataDirectory, 'artifacts', record.archiveKey!);
+              assert.equal(await readFile(path, 'utf8'), archiveContents);
+              await rm(path, { force: true });
+            }
+          } else {
+            for (const record of records) {
+              assert.equal(record.checksum, archiveChecksum);
+              assert.equal(await readFile(record.storageKey, 'utf8'), archiveContents);
+              await rm(record.storageKey, { force: true });
+            }
           }
-          return {
-            exitCode: 0,
-            stdout: args.includes('inspect') ? JSON.stringify([image]) : '',
-            stderr: '',
-          };
-        },
-      } as unknown as ProcessRunnerService;
-      const credentials = {
-        decrypt: async () => ({ username: 'user', password: 'private-token-for-git' }),
-      } as unknown as CredentialsService;
-      const registries = {
-        get: async () => ({
-          registryUrl: 'registry.example.com',
-          credentialId: 'registry-credential',
-        }),
-      } as unknown as RegistriesService;
-      const builds = new BuildsService(ssh, runner, credentials, registries);
-      const records: PipelineArtifact[] = [];
-      const artifacts = {
-        create: async (_s: PipelineSnapshot, a: Omit<PipelineArtifact, 'id'>) => {
-          const artifact = { ...a, id: randomUUID() };
-          records.push(artifact);
-          return artifact;
-        },
-      } as unknown as ArtifactsService;
-      const deploymentStates: string[] = [];
-      const deployments = {
-        start: async () => randomUUID(),
-        finish: async (_id: string, status: string) => {
-          deploymentStates.push(status);
-        },
-      } as unknown as DeploymentsService;
-      const d = {
-        ...definition(),
-        buildLocation: location,
-        artifactType,
-        registryId: randomUUID(),
-        imageRepository: 'team/web',
-      };
-      const s: PipelineSnapshot = {
-        runId: randomUUID(),
-        pipelineId: randomUUID(),
-        pipelineVersionId: randomUUID(),
-        projectId: randomUUID(),
-        serviceId: randomUUID(),
-        environmentId: randomUUID(),
-        targetId: randomUUID(),
-        commitSha: 'b'.repeat(40),
-        repository: { url: 'https://example.com/app.git', credentialId: 'git-credential' },
-        definition: d,
-        variables: { NODE_ENV: 'production' },
-        secretVariables: {},
-      };
-      const task: TaskRecord = {
-        id: randomUUID(),
-        name: 'test',
-        type: 'PIPELINE',
-        payload: {
-          targets: [target(randomUUID()), target(randomUUID())],
-          steps: [],
-          strategy: 'PARALLEL',
-          maxParallel: 2,
-          failurePolicy: 'CONTINUE',
-          timeout: 900,
-          pipeline: s,
-        },
-      };
-      const states: TaskStatus[] = [];
-      const controller = new AbortController();
-      const context: TaskExecutionContext = {
-        signal: controller.signal,
-        log: () => undefined,
-        startTarget: async () => randomUUID(),
-        finishTarget: async (_id, status) => {
-          states.push(status);
-        },
-        startStep: async () => randomUUID(),
-        finishStep: async () => undefined,
-      };
-      await new PipelineExecutor(builds, ssh, artifacts, deployments).execute(task, context);
-      assert.deepEqual(states, ['SUCCESS', 'SUCCESS']);
-      assert.deepEqual(deploymentStates, ['SUCCESS', 'SUCCESS']);
-      assert.equal(records.length, location === 'MANAGER' ? 1 : 2);
-      const actualCommands = calls.map((c) => c.command).join('\n');
-      assert.equal(actualCommands.includes('private-token-for-git'), false);
-      assert.ok(calls.some((c) => c.command.includes('mv -Tf')));
-      if (location === 'MANAGER') {
-        assert.equal(managers, 1);
-        assert.ok(
-          calls
-            .filter((c) => c.command === 'docker' && c.args?.[0] === 'run')
-            .every(
-              (c) =>
-                c.args?.includes('--cap-drop=ALL') &&
-                c.args.includes('--memory=1g') &&
-                !c.args.join(' ').includes('docker.sock'),
+        }
+        if (location === 'MANAGER') {
+          assert.equal(managers, 1);
+          assert.ok(
+            calls
+              .filter((c) => c.command === 'docker' && c.args?.[0] === 'run')
+              .every(
+                (c) =>
+                  c.args?.includes('--cap-drop=ALL') &&
+                  c.args.includes('--memory=1g') &&
+                  !c.args.join(' ').includes('docker.sock'),
+              ),
+          );
+          assert.equal(
+            uploads.some(
+              (u) => u.path.includes('artifact.tar.gz') || u.path.includes('compose.yaml'),
             ),
-        );
-        assert.ok(
-          uploads.some(
-            (u) => u.path.includes('artifact.tar.gz') || u.path.includes('compose.yaml'),
-          ),
-        );
-      } else assert.equal(calls.filter((c) => c.command.includes('checkout --detach')).length, 2);
-      if (artifactType === 'DOCKER_IMAGE')
-        assert.ok(records.every((a) => a.imageDigest === digest));
-      if (location === 'MANAGER' && artifactType === 'FILE')
-        await rm(join(dataDirectory, 'artifacts', task.id + '.tar.gz'), { force: true });
-    });
+            !buildOnly,
+          );
+        } else assert.equal(calls.filter((c) => c.command.includes('checkout --detach')).length, 2);
+        if (!buildOnly && artifactType === 'DOCKER_IMAGE')
+          assert.ok(records.every((a) => a.imageDigest === digest));
+        if (!buildOnly && location === 'MANAGER' && artifactType === 'FILE')
+          await rm(join(dataDirectory, 'artifacts', task.id + '.tar.gz'), { force: true });
+      });
   }
 
 test('known manager build errors finish targets without falsely claiming uncertain remote writes', async () => {

@@ -4,12 +4,12 @@ Pipeline是服务级的版本化交付配置。每次修改追加不可变版本
 
 ## 配置与运行
 
-1. 创建项目、HTTP(S) Git仓库、服务和环境。
+1. 创建项目、HTTP(S) Git 仓库、服务和环境。管理员可为私有仓库关联 Git Token 或用户名密码凭据。打开仓库详情测试连接、浏览分支和最近提交。
 2. 创建部署目标并明确服务器成员及执行顺序、并发和失败策略。
 3. 创建Pipeline，选择仓库、构建位置、产物类型、构建命令及专用部署目录。
 4. 可选地保存服务环境配置及环境变量。非空环境配置覆盖Pipeline的同名构建/部署字段，服务环境变量覆盖环境变量。
-5. 运行时填写40或64位完整Commit SHA，预览版本和目标后确认。
-6. 任务中心展示目标/步骤结果与日志，产物和部署历史分别记录每台服务器的结果。
+5. 在 Pipeline 运行对话框选版本，再从该版本的仓库选择分支和提交，也可直接输入 40 或 64 位完整 SHA。预览确认后，任务始终使用该 SHA。
+6. 在任务详情查看目标结果和日志，从「本次构建产物」下载平台保存的归档。可用列表或响应头 `X-Artifact-SHA256` 的值核对下载结果。目标端直接发布的文件保存在该目标的部署目录，可用「仅构建」生成平台下载包。
 
 最小文件Pipeline定义：
 
@@ -38,6 +38,23 @@ Pipeline是服务级的版本化交付配置。每次修改追加不可变版本
 
 提交运行：`POST /api/v1/pipelines/:id/run`，请求`{environmentId,targetId,commitSha,version?,confirmed:true}`。省略version时固定当前版本。AI确认流程还校验目标和配置哈希，资源变化后要求重新确认。
 
+## 仅构建
+
+在运行对话框选择「仅构建」。API 在原有运行参数中增加 `"mode":"BUILD_ONLY"`，省略 `mode` 时仍执行部署。仅构建使用固定 Commit、版本和环境变量快照，完成检出、安装依赖、构建与产物记录。文件产物和 Docker 镜像归档均以 `.tar.gz` 保存到管理端，目标端归档经 SFTP 回传并校验。归档下载须登录，单份归档上限为 1 GiB。旧任务只有镜像标签和镜像 ID 的，可重新运行以生成归档。
+
+镜像归档可用 `docker image load -i <归档路径>` 导入，归档内保留本次构建的独立标签。已经发布到 Registry 的镜像使用产物记录里的完整 Digest 引用拉取。仅构建无需 Registry 和部署目录。 [Docker 镜像导入说明](https://docs.docker.com/reference/cli/docker/image/load/)
+
+## Gitea 推送触发
+
+1. 在专用 Linux 构建主机准备 rootless Docker 和 Docker CLI。API/Worker 以该 daemon 的非 root 用户运行，设置 `WEBHOOK_BUILD_DOCKER_SOCKET=/run/user/<UID>/docker.sock`。daemon 须使用 systemd、cgroup v2，并支持 CPU、内存和 PID 限制。API 进程和 daemon 需要用相同路径访问构建工作目录。默认 Compose 适合启动平台，启用自动构建需要额外接入上述环境。
+2. 在凭据中心创建「自定义密钥」凭据，保存至少 32 字节的随机共享密钥。
+3. 将 Pipeline 的有效构建位置设为管理端，选择只含普通构建变量的环境。在 Pipeline 卡片打开「Webhook」，选择分支、环境、目标组和共享密钥。自动构建记录保留目标组关联，无需连接其部署主机。原有目标端 Webhook 需要切换到管理端后重新保存。
+4. 在 Gitea 添加 `application/json` 的 Push Webhook，填写可访问的接收地址与同一共享密钥。推送到绑定分支后，在任务中心核对提交、产物和日志。
+
+接收端通过原始请求体校验 `X-Gitea-Signature`，按绑定的仓库克隆地址与分支筛选。同一 Pipeline、分支和提交的重复投递返回同一个任务。Webhook 固定以仅构建方式执行。配置接口为 `GET/PUT /pipelines/:id/webhook`，接收接口为 `POST /webhooks/gitea/:pipelineId`。[Gitea Webhook 文档](https://docs.gitea.com/1.22/usage/webhooks/)
+
+Webhook 固定当前 Pipeline 版本及有效配置。环境、目标或仓库配置变化后需要重新保存。禁用绑定、换签名密钥与任务入队采用事务校验，已经入队的任务可在任务中心取消。自动构建始终使用显式指定的 Socket，不回退到系统 Docker。 [Docker rootless 设置](https://docs.docker.com/engine/security/rootless/) · [资源限制](https://docs.docker.com/engine/security/rootless/tips/#limiting-resources)
+
 ## 构建与部署矩阵
 
 | 构建位置 | 产物         | 行为                                                                                 |
@@ -47,7 +64,7 @@ Pipeline是服务级的版本化交付配置。每次修改追加不可变版本
 | TARGET   | DOCKER_IMAGE | 每台目标独立构建镜像、推送Registry、读取Digest，使用固定Digest执行Compose            |
 | MANAGER  | DOCKER_IMAGE | 隔离生成构建上下文，管理端Docker构建/推送一次，所有服务器部署同一Digest              |
 
-TARGET要求目标预装Git、tar、sha256sum及项目语言工具链；Docker模式另需Docker CLI/daemon、BuildKit和Compose。平台不会隐式安装这些依赖。管理端构建需要平台所在环境可使用Docker CLI/daemon；未配置时任务明确失败，不会退回主进程执行仓库脚本。
+TARGET 要求目标预装 Git、tar、sha256sum 及项目语言工具链。Docker 构建另需 Docker CLI、daemon 和 BuildKit，镜像归档另需 Bash 和 gzip，部署另需 Compose。管理端仓库浏览依赖 Git CLI，管理端构建依赖 Docker CLI 和 daemon。
 
 ## 管理端隔离
 
@@ -69,7 +86,11 @@ SSH Git URL暂不支持，因为仓库主机公钥配置和可信注入链路尚
 
 首次发布只允许空目录；后续发布必须匹配平台写入的项目/服务/环境归属标记。拒绝符号链接部署目录、跨归属目录和现有真实`current`目录，避免误覆盖已有服务目录。执行器只自动清理自己创建的唯一临时工作目录，不递归删除用户配置的部署目录。
 
-启动命令可留空；非空命令在新`current`中以SSH用户身份执行。健康检查同样运行在发布目录中。失败保留历史成功记录，并将本次记录标记FAILED；**当前不自动回滚current或Compose服务**，自动回滚属于后续版本。生产部署前应验证自己的启动、健康检查和回退流程。
+发布按目标主机、服务环境与部署路径加锁，覆盖候选版本准备、激活和健康检查。锁冲突会结束本次目标执行。文件归档校验及解压在切换 `current` 前完成，Compose 渲染镜像校验及拉取也在启动前完成。为生产 Docker 配置与宿主机路由不重叠的地址池或外部网络。
+
+启动命令和健康检查在新发布目录中运行。健康检查明确失败会标记 `FAILED`，并保留上一成功版本的历史记录。部署 API 的 `previousDeploymentId` 可用于定位该版本。当前需由人工确认运行状态并执行回退。
+
+激活结果不明或激活后连接中断时，目标进入 `NEEDS_ATTENTION`，发布锁继续保留。恢复前暂停同一服务环境的发布，通过任务日志找到 `/var/tmp/.veyops-deployment-locks` 下的锁路径及 Pipeline 运行 ID。用同一部署账号或主机管理员核查 `current`、实际运行的 Compose 服务或镜像以及残留进程，并对照两个锁目录内 `owner` 中的运行 ID。确认不存在仍在执行的发布后，只删除对应的 `owner` 文件并用 `rmdir` 删除这两个空锁目录。
 
 ## Docker与Registry
 

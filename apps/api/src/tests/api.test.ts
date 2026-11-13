@@ -9,13 +9,17 @@ import request from 'supertest';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 
-test('API: bootstrap, sessions, RBAC, encrypted credentials, resources and validation', async () => {
+async function checkApi(databaseUrl?: string) {
   const directory = await mkdtemp(join(tmpdir(), 'veyops-api-'));
-  process.env.DATABASE_CLIENT = 'sqlite';
+  process.env.DATABASE_CLIENT = databaseUrl ? 'postgres' : 'sqlite';
+  if (databaseUrl) process.env.DATABASE_URL = databaseUrl;
   process.env.DATABASE_PATH = join(directory, 'test.db');
   process.env.DATA_DIR = directory;
   process.env.ENCRYPTION_KEY = randomBytes(32).toString('hex');
   process.env.WORKER_ENABLED = 'false';
+  const initialPassword = 'fixture-initial-password';
+  const newPassword = 'fixture-changed-password';
+  process.env.ADMIN_PASSWORD = initialPassword;
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { DatabaseService } = await import('../core/database/database.service.js');
@@ -33,22 +37,60 @@ test('API: bootstrap, sessions, RBAC, encrypted credentials, resources and valid
     await app.init();
     const api = request.agent(app.getHttpServer());
     const viewer = request.agent(app.getHttpServer());
+    const initialSession = request.agent(app.getHttpServer());
     await api.get('/api/v1/servers').expect(401);
     const status = await api.get('/api/v1/auth/status').expect(200);
-    assert.equal(status.body.data.initialized, false);
-    await api.post('/api/v1/auth/setup').send({ username: 'admin', password: 'weak' }).expect(400);
-    const setup = await api
-      .post('/api/v1/auth/setup')
-      .send({ username: 'admin', password: 'test-password-1234' })
-      .expect(201);
-    assert.equal(setup.body.data.role, 'ADMIN');
-    assert.ok(setup.headers['set-cookie'][0].includes('HttpOnly'));
-    assert.ok(setup.headers['set-cookie'][0].includes('SameSite=Strict'));
-    assert.equal(JSON.stringify(setup.body).includes('token'), false);
+    assert.equal(status.body.data.initialized, true);
     await api
       .post('/api/v1/auth/setup')
-      .send({ username: 'second', password: 'test-password-1234' })
-      .expect(409);
+      .send({ username: 'attacker', password: initialPassword })
+      .expect(404);
+    const login = await api
+      .post('/api/v1/auth/login')
+      .send({ username: 'root', password: initialPassword })
+      .expect(201);
+    assert.equal(login.body.data.role, 'ADMIN');
+    assert.equal(login.body.data.mustChangePassword, true);
+    assert.ok(login.headers['set-cookie'][0].includes('HttpOnly'));
+    assert.ok(login.headers['set-cookie'][0].includes('SameSite=Strict'));
+    assert.equal(JSON.stringify(login.body).includes('token'), false);
+    const current = await api.get('/api/v1/auth/me').expect(200);
+    assert.equal(current.body.data.mustChangePassword, true);
+    await api.get('/api/v1/servers').expect(403);
+    await api.post('/api/v1/credentials').send({}).expect(403);
+    await initialSession
+      .post('/api/v1/auth/login')
+      .send({ username: 'root', password: initialPassword })
+      .expect(201);
+    await api
+      .post('/api/v1/auth/change-password')
+      .send({ currentPassword: initialPassword, newPassword: initialPassword })
+      .expect(400);
+    await api
+      .post('/api/v1/auth/change-password')
+      .send({ currentPassword: initialPassword, newPassword: 'short' })
+      .expect(400);
+    await api
+      .post('/api/v1/auth/change-password')
+      .send({ currentPassword: 'wrong', newPassword })
+      .expect(401);
+    const changed = await api
+      .post('/api/v1/auth/change-password')
+      .send({ currentPassword: initialPassword, newPassword })
+      .expect(200);
+    assert.deepEqual(changed.body.data, { success: true });
+    assert.ok(changed.headers['set-cookie'][0].startsWith('veyops_session=;'));
+    await api.get('/api/v1/auth/me').expect(401);
+    await initialSession.get('/api/v1/auth/me').expect(401);
+    await api
+      .post('/api/v1/auth/login')
+      .send({ username: 'root', password: initialPassword })
+      .expect(401);
+    const renewed = await api
+      .post('/api/v1/auth/login')
+      .send({ username: 'root', password: newPassword })
+      .expect(201);
+    assert.equal(renewed.body.data.mustChangePassword, false);
     await api
       .post('/api/v1/credentials')
       .set('Origin', 'https://evil.example')
@@ -211,7 +253,7 @@ test('API: bootstrap, sessions, RBAC, encrypted credentials, resources and valid
     const admin = await db
       .selectFrom('users')
       .selectAll()
-      .where('username', '=', 'admin')
+      .where('username', '=', 'root')
       .executeTakeFirstOrThrow();
     await db
       .insertInto('users')
@@ -227,7 +269,7 @@ test('API: bootstrap, sessions, RBAC, encrypted credentials, resources and valid
       .execute();
     await viewer
       .post('/api/v1/auth/login')
-      .send({ username: 'viewer', password: 'test-password-1234' })
+      .send({ username: 'viewer', password: newPassword })
       .expect(201);
     await viewer.get('/api/v1/servers').expect(200);
     await viewer
@@ -251,4 +293,16 @@ test('API: bootstrap, sessions, RBAC, encrypted credentials, resources and valid
     await app.close();
     await rm(directory, { recursive: true, force: true });
   }
-});
+}
+
+test('SQLite API: bootstrap, sessions, RBAC, encrypted credentials, resources and validation', () =>
+  checkApi());
+test(
+  'PostgreSQL API: bootstrap, sessions, RBAC, encrypted credentials, resources and validation',
+  { skip: !process.env.VEYOPS_TEST_POSTGRES_URL },
+  async () => {
+    const { postgresTestUrl, withIsolatedPostgres } =
+      await import('./helpers/isolated-postgres.js');
+    await withIsolatedPostgres(postgresTestUrl!, checkApi);
+  },
+);

@@ -2163,6 +2163,11 @@ tbody tr:hover {
 .auth-submit:has(.spin) {
   justify-content: center;
 }
+.auth-actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 18px;
+}
 .auth-trust {
   font-size: 10px;
   color: #9cafaa;
@@ -2887,10 +2892,106 @@ tbody tr:hover {
 .pipeline-card-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 17px;
   border-top: 1px solid #edf0f2;
   padding-top: 19px;
   margin-top: 20px;
+}
+.webhook-url {
+  margin-bottom: 24px;
+}
+.webhook-url .field {
+  margin-bottom: 10px;
+}
+.repository-name {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+.repository-url {
+  margin: 0 0 18px;
+  color: #566861;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.repository-detail-actions,
+.repository-run-picker,
+.repository-browser-controls,
+.repository-commits-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.repository-detail-actions,
+.repository-run-picker {
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.repository-run-picker .muted {
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.repository-browser {
+  min-width: 0;
+  margin-bottom: 18px;
+}
+.repository-browser-controls .field {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
+}
+.repository-browser-controls {
+  align-items: flex-end;
+  margin-bottom: 16px;
+}
+.repository-commits-heading {
+  justify-content: space-between;
+  font-size: 12px;
+}
+.repository-commit-list {
+  max-height: 320px;
+  overflow: auto;
+  padding: 0;
+  list-style: none;
+  border: 1px solid #e3eae6;
+  border-radius: 8px;
+  background: #fff;
+}
+.repository-commit-list > li {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px;
+  border-bottom: 1px solid #edf1ee;
+}
+.repository-commit-list > li:last-child {
+  border-bottom: 0;
+}
+.repository-commit-list > li > svg {
+  flex: 0 0 auto;
+  color: #278674;
+}
+.repository-commit-detail {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 5px;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.repository-commit-detail code {
+  color: #4d6961;
+  font-size: 10px;
+  user-select: text;
+}
+.repository-commit-detail small {
+  color: #63756d;
+}
+.repository-commit-list button[aria-pressed='true'] {
+  border-color: #77b8a6;
+  color: #247d69;
+  background: #eaf5ef;
 }
 .pipeline-card-actions .button {
   margin-left: auto;

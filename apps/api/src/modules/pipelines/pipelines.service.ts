@@ -8,7 +8,9 @@ import {
 import { createHash, randomUUID } from 'node:crypto';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
+import type { Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
+import type { Database } from '../../core/database/schema';
 import { ServersService } from '../servers/servers.service';
 import { TasksService } from '../tasks/tasks.service';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
@@ -16,13 +18,16 @@ import { AuditService } from '../audit/audit.service';
 import { ServiceConfigsService } from '../service-configs/service-configs.service';
 import { RegistriesService } from '../registries/registries.service';
 import { PipelineExecutor } from './pipeline-executor.service';
+import { webhookBuildSocket } from '../builds/builds.service';
+import { PipelineAnalysisService } from '../ai/pipeline-analysis.service';
 import {
+  ConfirmedPipelineRunDto,
   CreatePipelineDto,
   PipelineDefinitionDto,
   RunPipelineDto,
   UpdatePipelineDto,
 } from './pipeline.dto';
-import type { PipelineDefinition, PipelineSnapshot } from './pipeline.types';
+import type { PipelineDefinition, PipelineExecutionMode, PipelineSnapshot } from './pipeline.types';
 import { validateDefinition, validateGitUrl } from './pipeline.validation';
 
 @Injectable()
@@ -36,11 +41,13 @@ export class PipelinesService implements OnModuleInit {
     private readonly audit: AuditService,
     private readonly configs: ServiceConfigsService,
     private readonly registries: RegistriesService,
+    private readonly analysis: PipelineAnalysisService,
   ) {}
   onModuleInit() {
     this.handlers.register({
       type: 'PIPELINE',
       execute: (task, context) => this.executor.execute(task, context),
+      afterCompletion: (task, signal) => this.analysis.record(task, signal),
     });
   }
   async list(projectId?: string) {
@@ -90,8 +97,13 @@ export class PipelinesService implements OnModuleInit {
       createdAt: r.created_at,
     }));
   }
-  private async resources(projectId: string, serviceId: string, definition: PipelineDefinition) {
-    validateDefinition(definition);
+  private async resources(
+    projectId: string,
+    serviceId: string,
+    definition: PipelineDefinition,
+    mode?: PipelineExecutionMode,
+  ) {
+    validateDefinition(definition, mode === 'DEPLOY');
     const project = await this.database.db
       .selectFrom('projects')
       .select('id')
@@ -111,8 +123,11 @@ export class PipelinesService implements OnModuleInit {
     if (!project || service?.project_id !== projectId || repository?.project_id !== projectId)
       throw new BadRequestException('项目、服务和仓库必须存在且属于同一项目');
     validateGitUrl(repository.clone_url);
-    if (definition.registryId) await this.registries.get(definition.registryId);
-    return repository;
+    const registry =
+      mode !== 'BUILD_ONLY' && definition.registryId
+        ? await this.registries.get(definition.registryId)
+        : undefined;
+    return { repository, registry };
   }
   async create(input: CreatePipelineDto, userId: string) {
     await this.resources(input.projectId, input.serviceId, input.definition);
@@ -187,8 +202,11 @@ export class PipelinesService implements OnModuleInit {
     return { success: true };
   }
   private async prepare(id: string, input: RunPipelineDto) {
+    const mode = input.mode ?? 'DEPLOY';
+    if (mode !== 'BUILD_ONLY' && mode !== 'DEPLOY')
+      throw new BadRequestException('无效Pipeline执行模式');
     if (!/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(input.commitSha))
-      throw new BadRequestException('部署必须固定完整Git Commit SHA');
+      throw new BadRequestException('Pipeline必须固定完整Git Commit SHA');
     const pipeline = await this.get(id);
     if (!pipeline.enabled) throw new BadRequestException('Pipeline已禁用');
     const version = await this.database.db
@@ -210,7 +228,7 @@ export class PipelinesService implements OnModuleInit {
       .selectAll()
       .where('id', '=', input.targetId)
       .executeTakeFirst();
-    if (!target) throw new BadRequestException('部署目标不存在');
+    if (!target) throw new BadRequestException('执行目标不存在');
     const members = await this.database.db
       .selectFrom('deployment_target_servers')
       .select('server_id')
@@ -218,8 +236,6 @@ export class PipelinesService implements OnModuleInit {
       .orderBy('sort_order')
       .execute();
     const servers = await this.servers.snapshot(members.map((m) => m.server_id));
-    if (servers.some((s) => !s.credentialId || !s.hostKeyFingerprint))
-      throw new BadRequestException('所有部署目标必须配置凭据和已确认指纹');
     const env = await this.configs.readSnapshot(
       pipeline.serviceId,
       input.environmentId,
@@ -246,8 +262,29 @@ export class PipelinesService implements OnModuleInit {
           (definition as unknown as Record<string, unknown>)[name] = config[name];
     const errors = await validate(plainToInstance(PipelineDefinitionDto, definition));
     if (errors.length) throw new BadRequestException('有效Pipeline配置不合法');
-    const repository = await this.resources(pipeline.projectId, pipeline.serviceId, definition);
-    return { pipeline, version, environment, target, servers, definition, repository, env };
+    if (
+      (mode === 'DEPLOY' || definition.buildLocation === 'TARGET') &&
+      servers.some((s) => !s.credentialId || !s.hostKeyFingerprint)
+    )
+      throw new BadRequestException('执行目标必须配置SSH凭据和已确认指纹');
+    const { repository, registry } = await this.resources(
+      pipeline.projectId,
+      pipeline.serviceId,
+      definition,
+      mode,
+    );
+    return {
+      pipeline,
+      version,
+      environment,
+      target,
+      servers,
+      definition,
+      repository,
+      registry,
+      env,
+      mode,
+    };
   }
   private configurationHash(p: Awaited<ReturnType<PipelinesService['prepare']>>) {
     const canonical = (value: unknown): unknown =>
@@ -265,7 +302,15 @@ export class PipelinesService implements OnModuleInit {
         JSON.stringify(
           canonical({
             definition: p.definition,
+            // Preserve existing deploy confirmations made before execution modes were introduced.
+            ...(p.mode === 'BUILD_ONLY' ? { mode: p.mode } : {}),
             repository: { url: p.repository.clone_url, credentialId: p.repository.credential_id },
+            ...(p.registry && {
+              registry: {
+                registryUrl: p.registry.registryUrl,
+                credentialId: p.registry.credentialId,
+              },
+            }),
             variables: p.env.variables,
             secretVariables: p.env.secretVariables,
             servers: p.servers.map((s) => ({
@@ -294,33 +339,58 @@ export class PipelinesService implements OnModuleInit {
       environmentType: p.environment.environment_type,
       targetId: p.target.id,
       serverIds: p.servers.map((s) => s.id),
+      mode: p.mode,
       version: p.version.version,
       commitSha: input.commitSha.toLowerCase(),
       definition: p.definition,
       configurationHash: this.configurationHash(p),
+      hasSecretVariables: Object.keys(p.env.secretVariables).length > 0,
     };
+  }
+  assertAutomaticBuild(preview: { definition: PipelineDefinition; hasSecretVariables: boolean }) {
+    if (preview.definition.buildLocation !== 'MANAGER')
+      throw new BadRequestException('Webhook 仅支持管理端隔离构建，请修改有效构建位置');
+    if (preview.hasSecretVariables)
+      throw new BadRequestException('Webhook 自动构建不能使用环境中的敏感变量');
+    if (!webhookBuildSocket())
+      throw new BadRequestException('请先配置 Webhook 专用 rootless Docker 构建环境');
   }
   async run(
     id: string,
-    input: RunPipelineDto & { expectedServerIds?: string[]; expectedConfigurationHash?: string },
+    input: ConfirmedPipelineRunDto,
     userId: string,
+    options: {
+      triggerType?: 'WEBHOOK';
+      idempotencyKey?: string;
+      gitRef?: string;
+      beforeInsert?: (tx: Transaction<Database>) => Promise<void>;
+    } = {},
   ) {
-    if (input.confirmed !== true) throw new BadRequestException('必须确认执行部署');
+    if (input.confirmed !== true) throw new BadRequestException('必须确认执行Pipeline');
+    if (options.triggerType === 'WEBHOOK' && input.mode !== 'BUILD_ONLY')
+      throw new BadRequestException('Webhook只允许触发仅构建');
     const p = await this.prepare(id, input);
+    if (options.triggerType === 'WEBHOOK')
+      this.assertAutomaticBuild({
+        definition: p.definition,
+        hasSecretVariables: Object.keys(p.env.secretVariables).length > 0,
+      });
     if (
       input.expectedServerIds &&
       JSON.stringify([...input.expectedServerIds].sort()) !==
         JSON.stringify(p.servers.map((s) => s.id).sort())
     )
-      throw new ConflictException('部署目标已变化，请重新确认');
+      throw new ConflictException('执行目标已变化，请重新确认');
     if (
       input.expectedConfigurationHash &&
       input.expectedConfigurationHash !== this.configurationHash(p)
     )
-      throw new ConflictException('部署配置已变化，请重新确认');
+      throw new ConflictException('执行配置已变化，请重新确认');
     const runId = randomUUID();
     const commit = input.commitSha.toLowerCase();
     const snapshot: PipelineSnapshot = {
+      mode: p.mode,
+      triggerType: options.triggerType ?? 'MANUAL',
       runId,
       pipelineId: id,
       pipelineVersionId: p.version.id,
@@ -330,6 +400,9 @@ export class PipelinesService implements OnModuleInit {
       targetId: p.target.id,
       commitSha: commit,
       repository: { url: p.repository.clone_url, credentialId: p.repository.credential_id },
+      ...(p.registry && {
+        registry: { registryUrl: p.registry.registryUrl, credentialId: p.registry.credentialId },
+      }),
       definition: p.definition,
       variables: p.env.variables,
       secretVariables: p.env.secretVariables,
@@ -337,7 +410,8 @@ export class PipelinesService implements OnModuleInit {
     const task = await this.tasks.create(
       {
         type: 'PIPELINE',
-        name: `${p.pipeline.name} · v${p.version.version} · ${commit.slice(0, 8)}`,
+        idempotencyKey: options.idempotencyKey,
+        name: `${p.pipeline.name} · v${p.version.version} · ${commit.slice(0, 8)}${p.mode === 'BUILD_ONLY' ? ' · 仅构建' : ''}`,
         scope: {
           projectId: snapshot.projectId,
           serviceId: snapshot.serviceId,
@@ -348,10 +422,11 @@ export class PipelinesService implements OnModuleInit {
           id: runId,
           pipelineId: id,
           pipelineVersionId: p.version.id,
-          gitRef: commit,
+          gitRef: options.gitRef ?? commit,
           commitSha: commit,
           buildLocation: p.definition.buildLocation,
           artifactType: p.definition.artifactType,
+          triggerType: options.triggerType,
         },
         payload: {
           targets: p.servers,
@@ -364,13 +439,18 @@ export class PipelinesService implements OnModuleInit {
         },
       },
       userId,
+      options.beforeInsert,
     );
-    await this.audit.record(userId, 'pipeline.run', 'task', task.id, {
-      pipelineId: id,
-      version: p.version.version,
-      commit,
-      targetCount: p.servers.length,
-    });
+    if (task.pipelineRunId === runId) {
+      await this.audit.record(userId, 'pipeline.run', 'task', task.id, {
+        pipelineId: id,
+        version: p.version.version,
+        commit,
+        mode: p.mode,
+        triggerType: snapshot.triggerType,
+        targetCount: p.servers.length,
+      });
+    }
     return task;
   }
 }

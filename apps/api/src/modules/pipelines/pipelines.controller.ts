@@ -2,7 +2,12 @@ import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Req } from '@
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { PipelinesService } from './pipelines.service';
-import { CreatePipelineDto, RunPipelineDto, UpdatePipelineDto } from './pipeline.dto';
+import {
+  ConfirmedPipelineRunDto,
+  CreatePipelineDto,
+  RunPipelineDto,
+  UpdatePipelineDto,
+} from './pipeline.dto';
 @Controller('pipelines')
 export class PipelinesController {
   constructor(private readonly pipelines: PipelinesService) {}
@@ -42,7 +47,7 @@ export class PipelinesController {
   }
   @Post(':id/run') @Roles('ADMIN', 'OPERATOR') run(
     @Param('id') id: string,
-    @Body() input: RunPipelineDto,
+    @Body() input: ConfirmedPipelineRunDto,
     @Req() req: AuthRequest,
   ) {
     return this.pipelines.run(id, input, req.user.id);

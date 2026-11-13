@@ -8,8 +8,8 @@ import {
 import { Reflector } from '@nestjs/core';
 import type { Request } from 'express';
 import { AuthService } from './auth.service';
-import type { CurrentUser, Role } from './auth.decorators';
-export type AuthRequest = Request & { user: CurrentUser };
+import type { Role, SessionUser } from './auth.decorators';
+export type AuthRequest = Request & { user: SessionUser };
 @Injectable()
 export class AuthGuard implements CanActivate {
   private readonly attempts = new Map<string, { count: number; start: number }>();
@@ -35,24 +35,30 @@ export class AuthGuard implements CanActivate {
         if (host !== request.get('host')) throw new ForbiddenException('不允许跨站请求');
       }
     }
-    const isPublic = this.reflector.getAllAndOverride<boolean>('public', [
+    const publicAccess = this.reflector.getAllAndOverride<true | 'webhook'>('public', [
       context.getHandler(),
       context.getClass(),
     ]);
-    if (isPublic) {
+    if (publicAccess) {
       if (!readOnly) {
         const now = Date.now();
         for (const [key, entry] of this.attempts)
           if (now - entry.start > 60_000) this.attempts.delete(key);
-        const key = request.ip || 'unknown';
+        const key = `${publicAccess === 'webhook' ? 'webhook' : 'auth'}:${request.ip || 'unknown'}`;
         const entry = this.attempts.get(key) || { count: 0, start: now };
         entry.count++;
         this.attempts.set(key, entry);
-        if (entry.count > 15) throw new HttpException('请求过于频繁，请稍后重试', 429);
+        if (entry.count > (publicAccess === 'webhook' ? 120 : 15))
+          throw new HttpException('请求过于频繁，请稍后重试', 429);
       }
       return true;
     }
     request.user = await this.auth.resolve(request.cookies?.veyops_session as string | undefined);
+    if (
+      request.user.mustChangePassword &&
+      !this.reflector.get<boolean>('allowPasswordChangeRequired', context.getHandler())
+    )
+      throw new ForbiddenException('首次登录必须先修改密码');
     const roles = this.reflector.getAllAndOverride<Role[]>('roles', [
       context.getHandler(),
       context.getClass(),

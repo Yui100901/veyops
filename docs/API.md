@@ -4,16 +4,16 @@
 
 ## 认证
 
-| 方法 | 路径         | 请求 / 说明                                                                    |
-| ---- | ------------ | ------------------------------------------------------------------------------ |
-| GET  | /health      | 匿名服务健康状态                                                               |
-| GET  | /auth/status | 匿名 `{initialized:boolean}`                                                   |
-| POST | /auth/setup  | 首次初始化 `{username,password}`；用户名2–64位，密码12–256位；登录并设置Cookie |
-| POST | /auth/login  | `{username,password}`，返回用户基本信息并设置Cookie                            |
-| GET  | /auth/me     | 当前用户 `{id,username,role}`                                                  |
-| POST | /auth/logout | 撤销当前会话                                                                   |
+| 方法 | 路径                  | 请求 / 说明                                                                                   |
+| ---- | --------------------- | --------------------------------------------------------------------------------------------- |
+| GET  | /health               | 匿名服务健康状态                                                                              |
+| GET  | /auth/status          | 匿名 `{initialized:boolean}`                                                                  |
+| POST | /auth/login           | `{username,password}`，返回用户信息及 `mustChangePassword`，设置 Cookie                       |
+| GET  | /auth/me              | 当前用户 `{id,username,role,mustChangePassword}`                                              |
+| POST | /auth/change-password | `{currentPassword,newPassword}`；新密码 12–256 位且不同于原密码。成功后撤销账号会话，重新登录 |
+| POST | /auth/logout          | 撤销当前会话                                                                                  |
 
-角色 ADMIN、OPERATOR、VIEWER。用户管理 API 尚未开放；首次创建的用户为管理员。认证写入入口每 IP 每分钟最多15次请求。
+角色为 ADMIN、OPERATOR、VIEWER。空库启动时创建 `root`，使用 `ADMIN_PASSWORD` 或控制台中的随机初始密码。`mustChangePassword` 为 `true` 时，会话只可读取 `/auth/me`、改密或退出。登录入口按 IP 限速。
 
 ## 资源
 
@@ -93,24 +93,33 @@
 
 ## v0.2 交付接口
 
-| 方法             | 路径                                               | 说明                                                                              |
-| ---------------- | -------------------------------------------------- | --------------------------------------------------------------------------------- |
-| GET/POST         | /deployment-targets                                | 目标列表/创建：`{name,serverIds,strategy,maxParallel,failurePolicy,description?}` |
-| GET/PATCH/DELETE | /deployment-targets/:id                            | 查询/替换配置/无引用时删除                                                        |
-| GET/PUT          | /services/:serviceId/repositories                  | 查询/替换关联，`{repositories:[{repositoryId,repoPath,isPrimary}]}`               |
-| GET/PUT          | /services/:serviceId/environments/:envId/config    | 读取/保存服务环境配置                                                             |
-| GET/PUT          | /environments/:envId/variables                     | 环境变量列表/替换：`{variables:[{key,value?或credentialId?}]}`                    |
-| GET/PUT          | /services/:serviceId/environments/:envId/variables | 服务级变量覆盖同名环境变量                                                        |
-| GET/POST         | /pipelines                                         | 列表/创建服务级Pipeline                                                           |
-| GET/PATCH/DELETE | /pipelines/:id                                     | 查询/新增版本/禁用并保留历史                                                      |
-| GET              | /pipelines/:id/versions                            | 不可变历史版本                                                                    |
-| POST             | /pipelines/:id/preview                             | 固定版本、环境配置与目标的执行预览                                                |
-| POST             | /pipelines/:id/run                                 | `{environmentId,targetId,commitSha,version?,confirmed:true}`                      |
-| GET              | /artifacts                                         | 产物列表，支持projectId筛选                                                       |
-| GET              | /deployments                                       | 逐服务器交付记录，支持projectId筛选                                               |
-| GET/POST         | /registries                                        | Registry列表/创建（创建仅ADMIN）                                                  |
+| 方法             | 路径                                               | 说明                                                                                                     |
+| ---------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| GET/POST         | /deployment-targets                                | 目标列表/创建：`{name,serverIds,strategy,maxParallel,failurePolicy,description?}`                        |
+| GET/PATCH/DELETE | /deployment-targets/:id                            | 查询/替换配置/无引用时删除                                                                               |
+| GET/PUT          | /services/:serviceId/repositories                  | 查询/替换关联，`{repositories:[{repositoryId,repoPath,isPrimary}]}`                                      |
+| GET/PUT          | /services/:serviceId/environments/:envId/config    | 读取/保存服务环境配置                                                                                    |
+| GET/PUT          | /environments/:envId/variables                     | 环境变量列表/替换：`{variables:[{key,value?或credentialId?}]}`                                           |
+| GET/PUT          | /services/:serviceId/environments/:envId/variables | 服务级变量覆盖同名环境变量                                                                               |
+| GET/POST         | /pipelines                                         | 列表/创建服务级Pipeline                                                                                  |
+| GET/PATCH/DELETE | /pipelines/:id                                     | 查询/新增版本/禁用并保留历史                                                                             |
+| GET              | /pipelines/:id/versions                            | 不可变历史版本                                                                                           |
+| POST             | /pipelines/:id/preview                             | 固定版本、环境配置与目标的执行预览                                                                       |
+| POST             | /pipelines/:id/run                                 | `{environmentId,targetId,commitSha,version?,confirmed:true,mode?}`，`mode` 可选 `DEPLOY` 或 `BUILD_ONLY` |
+| GET/PUT          | /pipelines/:id/webhook                             | 管理员查询或保存 Gitea 触发配置 `{environmentId,targetId,branch,secretCredentialId,enabled}`             |
+| POST             | /webhooks/gitea/:pipelineId                        | 接收签名的 Gitea Push，按配置触发仅构建                                                                  |
+| GET              | /artifacts                                         | 产物列表，支持 `projectId` 和 `pipelineRunId` 筛选，返回 `downloadAvailable`                              |
+| GET              | /artifacts/:id/download                            | 登录后下载平台归档，响应头 `X-Artifact-SHA256` 提供校验和                                                 |
+| GET              | /deployments                                       | 逐服务器交付记录，支持projectId筛选                                                                      |
+| GET/POST         | /registries                                        | Registry列表/创建（创建仅ADMIN）                                                                         |
+| PATCH            | /registries/:id                                    | 管理员编辑 Registry，`credentialId:null` 可解除凭据关联                                                   |
+| POST             | /registries/:id/test                               | 管理员从管理端测试 HTTPS Registry V2 连通与认证，返回 `{success,authenticated,message}`                  |
+
+管理员和操作员可调用 `/projects/:projectId/repositories/:repositoryId/connection`、`/branches` 和 `/commits` 的 GET 接口检查仓库、读取分支和查询最近提交。`/commits` 接受 `branch` 和 `limit`，默认 20 条，最多 50 条。给仓库绑定凭据需要管理员角色。
 
 Pipeline 定义、四种组合、目录保护和环境覆盖规则见 [构建部署说明](PIPELINES.md)。环境配置字段包括 `targetId,buildLocation,artifactType,deployMethod,deployPath,buildCommand,workingDirectory,outputPath,composeFilePath,startCommand,healthCheckCommand`。敏感变量只接收凭据引用；普通值和引用二选一。
+
+`GET /deployments` 返回 `previousDeploymentId`，指向同一目标上一成功的部署记录。发布结果不确定时状态为 `NEEDS_ATTENTION`。启用 AI 分析后，`GET /tasks/:id` 的 `result.aiAnalysis` 异步附加 `{status:"SUCCESS",summary,failedPhase,nextActions}` 或 `{status:"UNAVAILABLE"}`。
 
 ## v0.2 AI 接口
 
@@ -121,6 +130,7 @@ Pipeline 定义、四种组合、目录保护和环境覆盖规则见 [构建部
 | POST         | /ai/providers/:id/test         | 管理员测试模型连接，安全摘要响应                                                                          |
 | GET/PATCH    | /ai/policies                   | 查询/管理员保存系统或项目策略                                                                             |
 | POST         | /ai/chat                       | `{message,conversationId?,projectId?,providerId?}`；返回`{conversationId,message,proposals,tasks,drafts}` |
+| POST         | /ai/repository-analysis        | 管理员或操作员按 `{projectId,repositoryId,serviceId,environmentId,commitSha,docPath?}` 读取部署文档并生成草稿 |
 | GET          | /ai/conversations              | 仅当前用户的会话                                                                                          |
 | GET          | /ai/conversations/:id/messages | 仅会话发起者可读                                                                                          |
 | GET          | /ai/proposals                  | 当前用户的执行提案                                                                                        |

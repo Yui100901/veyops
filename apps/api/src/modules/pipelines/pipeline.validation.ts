@@ -24,21 +24,22 @@ export function safeDeployPath(value: string): string {
     );
   return value.replace(/\/+$/, '');
 }
-export function validateDefinition(definition: PipelineDefinition) {
+export function validateDefinition(definition: PipelineDefinition, deploy: boolean) {
   relativePath(definition.repoPath);
   relativePath(definition.outputPath);
   relativePath(definition.dockerfilePath);
   relativePath(definition.composeFilePath);
-  safeDeployPath(definition.deployPath);
+  if (definition.deployPath || deploy) safeDeployPath(definition.deployPath);
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,199}$/.test(definition.buildImage))
     throw new BadRequestException('无效构建容器镜像');
   if (definition.artifactType === 'DOCKER_IMAGE') {
     if (
-      !definition.registryId ||
-      !definition.imageRepository ||
+      definition.imageRepository &&
       !/^[a-z0-9][a-z0-9._/-]{0,249}$/.test(definition.imageRepository)
     )
-      throw new BadRequestException('Docker Pipeline须配置Registry及有效镜像仓库名');
+      throw new BadRequestException('无效镜像仓库名');
+    if (deploy && (!definition.registryId || !definition.imageRepository))
+      throw new BadRequestException('部署Docker镜像须配置Registry和镜像仓库名');
   }
 }
 export function validateGitUrl(url: string) {

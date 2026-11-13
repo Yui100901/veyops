@@ -21,6 +21,11 @@ export interface AiConnection {
   apiKey: string;
   timeoutSeconds: number;
 }
+interface AiCompletionOptions {
+  signal?: AbortSignal;
+  maxTokens?: number;
+  maxResponseBytes?: number;
+}
 
 export function completionUrl(base: string): string {
   let url: URL;
@@ -54,14 +59,16 @@ export class OpenAiCompatibleService {
     connection: AiConnection,
     messages: AiWireMessage[],
     tools: unknown[] = [],
+    options: AiCompletionOptions = {},
   ): Promise<AiWireResponse> {
     const endpoint = completionUrl(connection.baseUrl);
-    const maxBytes = 2 * 1024 * 1024;
+    const maxBytes = options.maxResponseBytes ?? 2 * 1024 * 1024;
     try {
+      const timeout = AbortSignal.timeout(Math.ceil(connection.timeoutSeconds * 1000));
       const response = await fetch(endpoint, {
         method: 'POST',
         redirect: 'error',
-        signal: AbortSignal.timeout(connection.timeoutSeconds * 1000),
+        signal: options.signal ? AbortSignal.any([timeout, options.signal]) : timeout,
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${connection.apiKey}`,
@@ -70,7 +77,7 @@ export class OpenAiCompatibleService {
           model: connection.model,
           messages,
           stream: false,
-          max_tokens: 4096,
+          max_tokens: options.maxTokens ?? 4096,
           ...(new URL(connection.baseUrl).hostname === 'api.deepseek.com'
             ? { thinking: { type: 'disabled' } }
             : {}),

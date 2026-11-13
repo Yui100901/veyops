@@ -34,6 +34,7 @@ export interface TaskRecord {
   payload: TaskPayload;
 }
 export interface TaskExecutionContext {
+  readonly leaseOwner?: string;
   signal: AbortSignal;
   log(text: string, serverId?: string): void;
   startTarget(serverId: string): Promise<string>;
@@ -59,6 +60,7 @@ export interface TaskExecutionContext {
 export interface TaskHandler {
   type: string;
   execute(task: TaskRecord, context: TaskExecutionContext): Promise<void>;
+  afterCompletion?(task: TaskRecord, signal: AbortSignal): Promise<void>;
 }
 
 export interface CreateTaskInput {
@@ -66,6 +68,7 @@ export interface CreateTaskInput {
   name: string;
   payload: TaskPayload;
   operationPlanVersionId?: string;
+  idempotencyKey?: string;
   scope?: { projectId: string; serviceId: string; environmentId: string; targetId: string };
   pipelineRun?: {
     id: string;
@@ -75,5 +78,6 @@ export interface CreateTaskInput {
     commitSha: string;
     buildLocation: string;
     artifactType: string;
+    triggerType?: 'MANUAL' | 'WEBHOOK';
   };
 }

@@ -1,10 +1,11 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { Selectable } from 'kysely';
+import { Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
-import { TasksTable } from '../../core/database/schema';
-import { CreateTaskInput, TaskExecutionContext } from './tasks.types';
+import { Database, TasksTable } from '../../core/database/schema';
+import { CreateTaskInput, TaskExecutionContext, TaskPayload } from './tasks.types';
 import { TaskLogService } from './task-log.service';
+import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
 
 const terminal = new Set([
   'SUCCESS',
@@ -16,6 +17,10 @@ const terminal = new Set([
 ]);
 export const isTerminalStatus = (status: string) => terminal.has(status);
 export function taskDto(task: Selectable<TasksTable>) {
+  const pipeline =
+    task.task_type === 'PIPELINE'
+      ? (JSON.parse(task.payload_json) as TaskPayload).pipeline
+      : undefined;
   return {
     id: task.id,
     type: task.task_type,
@@ -28,6 +33,13 @@ export function taskDto(task: Selectable<TasksTable>) {
     errorSummary: task.error_summary,
     result: task.result_json ? JSON.parse(task.result_json) : null,
     operationPlanVersionId: task.operation_plan_version_id,
+    ...(task.task_type === 'PIPELINE'
+      ? {
+          executionMode: pipeline?.mode ?? 'DEPLOY',
+          pipelineRunId: pipeline?.runId ?? null,
+          triggerType: pipeline?.triggerType ?? 'MANUAL',
+        }
+      : {}),
   };
 }
 
@@ -44,14 +56,19 @@ export class TasksService {
       if (this.cancellations.get(id) === controller) this.cancellations.delete(id);
     };
   }
-  async create(input: CreateTaskInput, userId: string) {
+  async create(
+    input: CreateTaskInput,
+    userId: string,
+    beforeInsert?: (tx: Transaction<Database>) => Promise<void>,
+  ) {
     const targets = input.payload.targets;
     if (!targets.length || new Set(targets.map((target) => target.id)).size !== targets.length)
       throw new BadRequestException('任务目标必须明确指定且不能重复');
     const id = randomUUID();
     const now = Date.now();
-    await this.database.db.transaction().execute(async (tx) => {
-      await tx
+    const taskId = await this.database.db.transaction().execute(async (tx) => {
+      await beforeInsert?.(tx);
+      const inserted = await tx
         .insertInto('tasks')
         .values({
           id,
@@ -63,13 +80,24 @@ export class TasksService {
           service_id: input.scope?.serviceId ?? null,
           environment_id: input.scope?.environmentId ?? null,
           target_id: input.scope?.targetId ?? null,
+          idempotency_key: input.idempotencyKey ?? null,
           payload_json: JSON.stringify(input.payload),
           created_at: now,
           updated_at: now,
           available_at: now,
           log_file_key: this.logStore.key(id, now),
         })
-        .execute();
+        .onConflict((conflict) => conflict.column('idempotency_key').doNothing())
+        .returning('id')
+        .executeTakeFirst();
+      if (!inserted) {
+        const existing = await tx
+          .selectFrom('tasks')
+          .select('id')
+          .where('idempotency_key', '=', input.idempotencyKey!)
+          .executeTakeFirstOrThrow();
+        return existing.id;
+      }
       await tx
         .insertInto('task_targets')
         .values(
@@ -103,12 +131,14 @@ export class TasksService {
             commit_sha: run.commitSha,
             build_location_snapshot: run.buildLocation,
             artifact_type_snapshot: run.artifactType,
+            trigger_type: run.triggerType ?? 'MANUAL',
             created_at: now,
           })
           .execute();
       }
+      return id;
     });
-    return this.get(id);
+    return this.get(taskId);
   }
   async list(type?: string) {
     let query = this.database.db.selectFrom('tasks').selectAll();
@@ -160,7 +190,8 @@ export class TasksService {
       id: row.id,
       targetId: row.task_target_id,
       serverId: row.execution_target_key,
-      name: row.step_key,
+      key: row.step_key,
+      name: (JSON.parse(row.input_json) as { name?: string }).name ?? row.step_key,
       order: row.step_order,
       status: row.status,
       exitCode: row.exit_code,
@@ -202,8 +233,10 @@ export class TasksService {
     return this.get(id);
   }
   context(task: Selectable<TasksTable>, signal: AbortSignal): TaskExecutionContext {
+    const owner = task.lease_owner!;
     return {
       signal,
+      leaseOwner: owner,
       log: (text, serverId) => {
         this.logStore.append(
           task.id,
@@ -211,62 +244,74 @@ export class TasksService {
           serverId ? `[${serverId}] ${text}` : text,
         );
       },
-      startTarget: async (serverId) => {
-        const row = await this.database.db
-          .updateTable('task_targets')
-          .set({ status: 'RUNNING', started_at: Date.now() })
-          .where('task_id', '=', task.id)
-          .where('server_id', '=', serverId)
-          .where('status', '=', 'PENDING')
-          .returning('id')
-          .executeTakeFirstOrThrow();
-        return row.id;
-      },
-      finishTarget: async (targetId, status, exitCode, error) => {
-        await this.database.db
-          .updateTable('task_targets')
-          .set({
-            status,
-            exit_code: exitCode,
-            error_summary: error ?? null,
-            finished_at: Date.now(),
-          })
-          .where('id', '=', targetId)
-          .where('status', '=', 'RUNNING')
-          .execute();
-      },
-      startStep: async (targetId, serverId, step, index) => {
-        const id = randomUUID();
-        await this.database.db
-          .insertInto('task_steps')
-          .values({
-            id,
-            task_id: task.id,
-            task_target_id: targetId,
-            execution_target_key: serverId,
-            step_key: step.key ?? `${index + 1}:${step.name}`,
-            step_order: index,
-            step_type: 'SSH_COMMAND',
-            status: 'RUNNING',
-            input_json: JSON.stringify({ name: step.name, timeout: step.timeout }),
-            started_at: Date.now(),
-          })
-          .execute();
-        return id;
-      },
-      finishStep: async (stepId, status, exitCode, error) => {
-        await this.database.db
-          .updateTable('task_steps')
-          .set({
-            status,
-            exit_code: exitCode,
-            result_json: error ? JSON.stringify({ error }) : null,
-            finished_at: Date.now(),
-          })
-          .where('id', '=', stepId)
-          .where('status', '=', 'RUNNING')
-          .execute();
-      },
+      startTarget: (serverId) =>
+        this.database.db.transaction().execute(async (tx) => {
+          if (signal.aborted || !(await lockTaskLease(tx, task.id, owner)))
+            throw new TaskLeaseUnavailableError();
+          const row = await tx
+            .updateTable('task_targets')
+            .set({ status: 'RUNNING', started_at: Date.now() })
+            .where('task_id', '=', task.id)
+            .where('server_id', '=', serverId)
+            .where('status', '=', 'PENDING')
+            .returning('id')
+            .executeTakeFirstOrThrow();
+          return row.id;
+        }),
+      finishTarget: (targetId, status, exitCode, error) =>
+        this.database.db.transaction().execute(async (tx) => {
+          if (!(await lockTaskLease(tx, task.id, owner, true))) return;
+          await tx
+            .updateTable('task_targets')
+            .set({
+              status,
+              exit_code: exitCode,
+              error_summary: error ?? null,
+              finished_at: Date.now(),
+            })
+            .where('id', '=', targetId)
+            .where('task_id', '=', task.id)
+            .where('status', '=', 'RUNNING')
+            .execute();
+        }),
+      startStep: (targetId, serverId, step, index) =>
+        this.database.db.transaction().execute(async (tx) => {
+          if (signal.aborted || !(await lockTaskLease(tx, task.id, owner)))
+            throw new TaskLeaseUnavailableError();
+          const id = randomUUID();
+          await tx
+            .insertInto('task_steps')
+            .values({
+              id,
+              task_id: task.id,
+              task_target_id: targetId,
+              execution_target_key: serverId,
+              step_key: step.key ?? `${index + 1}:${step.name}`,
+              step_order: index,
+              step_type: 'SSH_COMMAND',
+              status: 'RUNNING',
+              input_json: JSON.stringify({ name: step.name, timeout: step.timeout }),
+              started_at: Date.now(),
+            })
+            .execute();
+          return id;
+        }),
+      finishStep: (stepId, status, exitCode, error) =>
+        this.database.db.transaction().execute(async (tx) => {
+          if (!(await lockTaskLease(tx, task.id, owner, true))) return;
+          await tx
+            .updateTable('task_steps')
+            .set({
+              status,
+              exit_code: exitCode,
+              result_json: error ? JSON.stringify({ error }) : null,
+              finished_at: Date.now(),
+            })
+            .where('id', '=', stepId)
+            .where('task_id', '=', task.id)
+            .where('status', '=', 'RUNNING')
+            .execute();
+        }),
     };
   }
 }

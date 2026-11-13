@@ -9,6 +9,7 @@ import {
   IsUUID,
   Max,
   MaxLength,
+  Matches,
   Min,
   MinLength,
 } from 'class-validator';
@@ -50,4 +51,13 @@ export class AiChatDto {
   @IsOptional() @IsUUID() conversationId?: string;
   @IsOptional() @IsUUID() projectId?: string;
   @IsOptional() @IsUUID() providerId?: string;
+}
+
+export class AiRepositoryAnalysisDto {
+  @IsUUID() projectId!: string;
+  @IsUUID() repositoryId!: string;
+  @IsUUID() serviceId!: string;
+  @IsUUID() environmentId!: string;
+  @IsString() @Matches(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i) commitSha!: string;
+  @IsOptional() @IsString() @MaxLength(300) docPath?: string;
 }

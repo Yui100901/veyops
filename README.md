@@ -14,7 +14,9 @@ Copy-Item .env.example .env
 npm run dev
 ```
 
-打开 <http://localhost:5173>，首次访问创建管理员，密码至少 12 位。无默认账号密码。API 运行于 `127.0.0.1:3000`，前端开发代理转发 `/api`。启动自动执行版本化 Migration。
+打开 <http://localhost:5173>。API 运行于 `127.0.0.1:3000`，前端开发代理转发 `/api`。启动时自动迁移数据库。空库会初始化管理员 `root`。可在 `.env` 中用 `ADMIN_PASSWORD` 提供 12–256 位的初始密码，留空则生成随机密码，并在初始化成功后打印到启动控制台。Docker Compose 部署可用 `docker compose logs veyops` 查看首次启动输出。
+
+使用初始密码登录后，先按提示修改密码，再用新密码登录。改密会撤销该账号的全部现有会话。已有数据库继续使用原账号，重启或修改 `ADMIN_PASSWORD` 不会重置密码。
 
 也可以构建后由 NestJS 同时提供前端和 API：
 
@@ -53,9 +55,15 @@ Windows 下若 better-sqlite3 预编译下载失败，检查到 GitHub Releases 
 
 创建项目、HTTP(S) 仓库、服务、环境和部署目标后，在 Pipeline 页面填写构建/部署配置。每次编辑追加版本，运行必须指定完整 Commit 和目标并确认。支持 `TARGET/MANAGER × FILE/DOCKER_IMAGE` 四种组合。文件部署使用专属目录和原子 `current` 切换；Docker 部署使用 Registry 不可变 Digest 和 `${VEYOPS_IMAGE}` Compose 模板。健康检查失败会保留历史结果，但不会自动回滚。
 
+选择「仅构建」可检出固定提交并生成文件产物或镜像。Gitea Webhook 在专用 rootless Docker 环境中自动构建指定分支提交。发布锁按主机、服务环境与部署路径限制并发，远端结果不确定时保留锁供核查。接入与恢复步骤见 [Pipeline 文档](docs/PIPELINES.md)。
+
+从项目的仓库详情测试 HTTP(S) Git 连接并浏览分支与提交。Pipeline 运行时选择完整 SHA，在任务详情下载文件包或镜像归档，下载响应和产物记录都提供 SHA-256。管理员也可在镜像仓库页面编辑地址、凭据并测试连通性。
+
 管理端构建必须能调用 Docker CLI/daemon，仓库脚本只在隔离容器中执行，不会退回平台主进程运行。可信检出/打包镜像默认 `node:22-bookworm`，可在服务端以 `BUILD_HELPER_IMAGE` 指定已审核镜像。平台的默认 Docker Compose 不暴露 Docker Socket；容器化平台若需管理端构建，还需管理员配置可用的构建运行环境和共享工作目录，或直接在具备 Docker 的 Linux 主机运行 API/Worker。
 
 AI 可以完全不配置；管理员在“系统设置 → AI 模型连接（可选）”中填写 Base URL、模型和 Key，亦可随时禁用。默认权限为 `CONFIRM`。自由 Shell 和部署即使在 FULL_CONTROL 下也仍按未知风险要求确认，固定只读巡检可在明确授权范围内自动提交。模型通过业务工具操作，不能直接读取凭据或数据库。
+
+设置 `AI_PIPELINE_ANALYSIS=true` 可启用 Pipeline 完成后的只读结果分析。任务详情显示模型摘要或不可用提示，执行状态由任务系统独立记录。详见 [AI 工具与权限](docs/AI工具与权限.md#pipeline-结果分析)。
 
 新安装默认不包含模型密钥。可在系统设置添加 DeepSeek 或其他 OpenAI 兼容服务。DeepSeek 可填写 `https://api.deepseek.com` 和 `deepseek-flash`，模型名称原样发送。
 
@@ -94,7 +102,9 @@ DATABASE_CLIENT=postgres
 DATABASE_URL=postgresql://veyops:password@localhost:5432/veyops
 ```
 
-迁移使用跨数据库字段规范；PostgreSQL DDL 已检查，尚未连接真实实例验收。切换连接不会迁移已有数据，SQLite/PostgreSQL 数据迁移工具待实现。
+数据访问使用 Kysely，SQLite 驱动为 `better-sqlite3`，PostgreSQL 驱动为 `pg`。两种数据库共享业务表和版本化迁移。默认 SQLite 使用单 Worker；PostgreSQL 已在 17.6 上验证迁移、登录、配置并发保存和任务领取、取消与恢复。Docker Compose 从 `.env` 读取相同的 `DATABASE_CLIENT` 和 `DATABASE_URL`。
+
+切换数据库只会切换连接，现有数据保留在原库。PostgreSQL 账号需对应用所在 schema 有建表权限。多进程共用 PostgreSQL 时还需共享 `DATA_DIR` 和 `ENCRYPTION_KEY`，并保持主机时钟同步。
 
 ## 测试与验证
 
@@ -105,6 +115,8 @@ npm run build
 ```
 
 数据库、API、执行引擎和真实 SSH 协议测试使用独立临时数据库或本机临时 SSH Server，不会自动连接生产服务器。覆盖权限限制、凭据不回显、外键保护、事务回滚、重复领取、固定快照、并发/失败/取消/超时和租约异常。
+
+需要复测 PostgreSQL 时，先设置 `VEYOPS_TEST_POSTGRES_URL` 指向可创建临时 schema 的测试数据库，再运行 `npm test`。PostgreSQL 用例为每次运行创建隔离 schema，测试结束后清理。省略此变量时只运行默认的本地测试。
 
 经用户授权，于 2026-11-11 完成了 v0.1 的 [只读 SSH 验证](docs/验证报告.md)，以及 v0.2 在专用 `/tmp` 目录和新建容器中的 [构建部署验证](docs/v0.2验证报告.md)。未停止或重启已有业务服务。临时数据库与默认首次初始化库分离；源码和文档不包含服务器密码或真实 API Key。
 

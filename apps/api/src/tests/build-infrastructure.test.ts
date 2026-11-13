@@ -1,6 +1,10 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import {
   ProcessRunnerService,
   ProcessExecutionError,
@@ -49,6 +53,29 @@ test('build processes do not inherit platform secrets and accept secret input on
     else process.env.ENCRYPTION_KEY = old;
   }
 });
+test('isolated Docker subprocess ignores a preconfigured production daemon and context', async () => {
+  const saved = [process.env.DOCKER_HOST, process.env.DOCKER_CONTEXT, process.env.DOCKER_CONFIG];
+  process.env.DOCKER_HOST = 'tcp://production.example.test:2376';
+  process.env.DOCKER_CONTEXT = 'production';
+  process.env.DOCKER_CONFIG = 'production-config';
+  try {
+    const result = await new ProcessRunnerService().run(
+      process.execPath,
+      [
+        '-e',
+        'console.log(JSON.stringify(Object.keys(process.env).filter(key => key.startsWith("DOCKER_"))))',
+      ],
+      { timeout: 5, isolatedDocker: true },
+    );
+    assert.deepEqual(JSON.parse(result.stdout), ['DOCKER_BUILDKIT']);
+  } finally {
+    for (const [index, key] of ['DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG'].entries()) {
+      const value = saved[index];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
 test('build runner handles exit codes, missing runtimes, cancellation and timeout', async () => {
   const runner = new ProcessRunnerService();
   assert.equal(
@@ -73,4 +100,29 @@ test('build runner handles exit codes, missing runtimes, cancellation and timeou
     runner.run(process.execPath, ['-e', 'setTimeout(()=>{},5000)'], { timeout: 1 }),
     (e: unknown) => e instanceof ProcessExecutionError && e.kind === 'TIMED_OUT',
   );
+});
+
+test('image export streams binary stdout to a bounded gzip archive without logging its contents', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'veyops-image-export-'));
+  try {
+    const runner = new ProcessRunnerService();
+    const path = join(directory, 'image.tar.gz');
+    const args = ['-e', 'process.stdout.write(Buffer.alloc(6 * 1024 * 1024, 255))'];
+    const result = await runner.run(process.execPath, args, {
+      timeout: 5,
+      gzipOutput: { path, maxBytes: 1024 * 1024 },
+      onData: (_data, stream) => assert.notEqual(stream, 'stdout'),
+    });
+    assert.equal(result.exitCode, 0);
+    assert.deepEqual(gunzipSync(await readFile(path)), Buffer.alloc(6 * 1024 * 1024, 255));
+    await assert.rejects(
+      runner.run(process.execPath, args, {
+        timeout: 5,
+        gzipOutput: { path: join(directory, 'oversized.tar.gz'), maxBytes: 16 },
+      }),
+      /镜像归档超过大小限制/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

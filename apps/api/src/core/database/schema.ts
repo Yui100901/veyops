@@ -5,6 +5,7 @@ export interface UsersTable {
   id: string;
   username: string;
   password_hash: string;
+  must_change_password: Generated<number>;
   role: Generated<string>;
   status: Generated<string>;
   created_at: number;
@@ -232,6 +233,21 @@ export interface PipelineVersionsTable {
   created_at: number;
 }
 
+export interface PipelineWebhooksTable {
+  pipeline_id: string;
+  pipeline_version: number;
+  configuration_hash: string;
+  environment_id: string;
+  target_id: string;
+  secret_credential_id: string;
+  created_by: string;
+  branch: string;
+  enabled: Generated<number>;
+  repository_key: string;
+  created_at: number;
+  updated_at: number;
+}
+
 export interface TasksTable {
   id: string;
   task_type: string;
@@ -331,6 +347,7 @@ export interface ArtifactsTable {
   artifact_type: string;
   storage_type: string;
   storage_key: string;
+  archive_key: Generated<string | null>;
   server_id: Generated<string | null>;
   registry_id: Generated<string | null>;
   image_repository: Generated<string | null>;
@@ -510,6 +527,7 @@ export interface Database {
   project_dependencies: ProjectDependenciesTable;
   pipelines: PipelinesTable;
   pipeline_versions: PipelineVersionsTable;
+  pipeline_webhooks: PipelineWebhooksTable;
   tasks: TasksTable;
   task_targets: TaskTargetsTable;
   task_steps: TaskStepsTable;

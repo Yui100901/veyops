@@ -31,6 +31,7 @@ import {
 } from '../components';
 import type { Plan, Server, Task, TaskTarget, User } from '../models';
 import { TaskTable } from './Dashboard';
+import { RunArtifacts } from './Delivery';
 
 function ServerPicker({
   servers,
@@ -400,6 +401,7 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
     {
       id: string;
       serverId: string;
+      key: string;
       name: string;
       order: number;
       status: string;
@@ -427,6 +429,15 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
   if (!task.data)
     return <ErrorBanner error={task.error || '找不到这个任务。'} retry={task.reload} />;
   const value = task.data;
+  const analysis = value.result?.aiAnalysis;
+  const failedPhase = analysis?.status === 'SUCCESS' && analysis.failedPhase;
+  const failedStep =
+    failedPhase &&
+    steps.data?.find(
+      (step) =>
+        step.key.split(':')[0] === failedPhase &&
+        ['FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION'].includes(step.status),
+    );
   return (
     <>
       <a href="#/tasks" className="back-link">
@@ -461,20 +472,54 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
         </span>
         <span>开始 {formatTime(value.startedAt)}</span>
         <span>完成 {formatTime(value.finishedAt)}</span>
-        <span className="tag">{value.type === 'PIPELINE' ? 'Pipeline' : value.type}</span>
+        <span className="tag">
+          {value.type === 'PIPELINE'
+            ? value.executionMode === 'BUILD_ONLY'
+              ? 'Pipeline · 仅构建'
+              : 'Pipeline · 构建并部署'
+            : value.type}
+        </span>
         {value.type === 'PIPELINE' && (
           <>
             <a className="text-link" href="#/artifacts">
               构建产物 →
             </a>
-            <a className="text-link" href="#/deployments">
-              部署记录 →
-            </a>
+            {value.executionMode !== 'BUILD_ONLY' && (
+              <a className="text-link" href="#/deployments">
+                部署记录 →
+              </a>
+            )}
           </>
         )}
       </div>
       {(value.errorSummary || value.errorMessage) && (
         <ErrorBanner error={value.errorSummary || value.errorMessage} />
+      )}
+      {value.pipelineRunId && (
+        <RunArtifacts
+          key={value.pipelineRunId}
+          runId={value.pipelineRunId}
+          polling={activeTask(value.status)}
+        />
+      )}
+      {analysis && (
+        <Section title="AI 构建分析" subtitle="根据任务状态、执行阶段和退出码生成">
+          {analysis.status === 'UNAVAILABLE' ? (
+            <p className="field-note">AI 分析暂不可用。可查看下方的执行结果和日志。</p>
+          ) : (
+            <>
+              <p>{analysis.summary}</p>
+              {failedStep && <p className="field-note">失败阶段 · {failedStep.name}</p>}
+              {analysis.nextActions.length > 0 && (
+                <ul>
+                  {analysis.nextActions.map((action, index) => (
+                    <li key={index}>{action}</li>
+                  ))}
+                </ul>
+              )}
+            </>
+          )}
+        </Section>
       )}
       <div className="task-layout">
         <Section title="目标执行结果" subtitle="每台服务器独立记录状态和退出码">

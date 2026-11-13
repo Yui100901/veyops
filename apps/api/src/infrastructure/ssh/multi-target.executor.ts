@@ -7,10 +7,12 @@ export class MultiTargetExecutor {
   constructor(private readonly ssh: SshService) {}
   async execute(task: TaskRecord, context: TaskExecutionContext): Promise<void> {
     const { targets, steps, strategy, maxParallel, failurePolicy, timeout } = task.payload;
+    const abortSiblings = new AbortController();
+    const signal = AbortSignal.any([context.signal, abortSiblings.signal]);
     let index = 0;
     let failed = false;
     const runner = async () => {
-      while (!context.signal.aborted && !(failed && failurePolicy === 'STOP')) {
+      while (!signal.aborted && !(failed && failurePolicy === 'STOP')) {
         const position = index++;
         const target = targets[position];
         if (!target) return;
@@ -20,7 +22,7 @@ export class MultiTargetExecutor {
         let targetError: string | undefined;
         context.log(`\n── ${target.name} (${target.host}) ──\n`, target.id);
         for (const [stepIndex, step] of steps.entries()) {
-          if (context.signal.aborted) {
+          if (signal.aborted) {
             targetStatus = 'CANCELLED';
             targetExitCode = null;
             targetError = '任务已取消';
@@ -34,7 +36,7 @@ export class MultiTargetExecutor {
           try {
             const result = await this.ssh.execute(target, step.command, {
               timeout: step.timeout ?? timeout,
-              signal: context.signal,
+              signal,
               onData: (text) => context.log(text, target.id),
             });
             exitCode = result.exitCode;
@@ -52,7 +54,7 @@ export class MultiTargetExecutor {
             targetExitCode = exitCode;
             targetError = error;
             context.log(`步骤结束：${stepStatus} ${error ?? ''}\n`, target.id);
-            if (step.failurePolicy !== 'CONTINUE' || context.signal.aborted) break;
+            if (step.failurePolicy !== 'CONTINUE' || signal.aborted) break;
           }
         }
         await context.finishTarget(targetId, targetStatus, targetExitCode, targetError);
@@ -60,6 +62,15 @@ export class MultiTargetExecutor {
       }
     };
     const count = strategy === 'SEQUENTIAL' ? 1 : Math.min(maxParallel, targets.length);
-    await Promise.all(Array.from({ length: count }, runner));
+    let firstFailure: { error: unknown } | undefined;
+    await Promise.all(
+      Array.from({ length: count }, () =>
+        runner().catch((error: unknown) => {
+          firstFailure ??= { error };
+          abortSiblings.abort();
+        }),
+      ),
+    );
+    if (firstFailure) throw firstFailure.error;
   }
 }

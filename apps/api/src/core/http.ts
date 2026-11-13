@@ -7,6 +7,7 @@ import {
   NestInterceptor,
   ExecutionContext,
   CallHandler,
+  StreamableFile,
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { map } from 'rxjs/operators';
@@ -16,7 +17,11 @@ export class ApiResponseInterceptor implements NestInterceptor {
   intercept(context: ExecutionContext, next: CallHandler) {
     // Nest SSE observables already carry MessageEvent envelopes.
     if (context.getHandler().name === 'stream') return next.handle();
-    return next.handle().pipe(map((data: unknown) => ({ data: data ?? null })));
+    return next
+      .handle()
+      .pipe(
+        map((data: unknown) => (data instanceof StreamableFile ? data : { data: data ?? null })),
+      );
   }
 }
 @Catch()

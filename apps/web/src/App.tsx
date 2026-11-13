@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { FormEvent } from 'react';
+import type { FormEvent, ReactNode } from 'react';
 import {
   ArrowRight,
   Command,
@@ -78,33 +78,7 @@ function Brand({ inverse = false }: { inverse?: boolean }) {
   );
 }
 
-function AuthPage({
-  initialized,
-  onAuthenticated,
-}: {
-  initialized: boolean;
-  onAuthenticated: (user: User) => void;
-}) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    setBusy(true);
-    setError('');
-    try {
-      await post(`/auth/${initialized ? 'login' : 'setup'}`, {
-        username: String(form.get('username')),
-        password: String(form.get('password')),
-      });
-      const user = await api<User>('/auth/me');
-      onAuthenticated(user);
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
+function AuthLayout({ children }: { children: ReactNode }) {
   return (
     <div className="auth-page">
       <aside className="auth-story">
@@ -153,53 +127,7 @@ function AuthPage({
           <Brand />
         </div>
         <div className="auth-form-wrap">
-          <span className="eyebrow">{initialized ? 'WELCOME BACK' : 'WELCOME TO VEYOPS'}</span>
-          <h2>{initialized ? '欢迎回来' : '创建你的工作空间'}</h2>
-          <p>
-            {initialized
-              ? '登录，继续管理你的基础设施。'
-              : '先创建管理员账号，开始接入你的第一台服务器。'}
-          </p>
-          <form onSubmit={submit}>
-            <label className="field">
-              <span>用户名</span>
-              <input
-                name="username"
-                required
-                autoFocus
-                autoComplete="username"
-                minLength={2}
-                maxLength={64}
-                placeholder="输入用户名"
-              />
-            </label>
-            <label className="field">
-              <span>{initialized ? '密码' : '设置管理员密码'}</span>
-              <input
-                name="password"
-                type="password"
-                required
-                autoComplete={initialized ? 'current-password' : 'new-password'}
-                minLength={initialized ? 1 : 12}
-                maxLength={256}
-                placeholder={initialized ? '输入密码' : '至少 12 个字符'}
-              />
-            </label>
-            {!initialized && (
-              <p className="auth-hint">管理员可管理凭据、服务器与系统配置。请妥善保存密码。</p>
-            )}
-            <ErrorBanner error={error} />
-            <button className="button primary auth-submit" type="submit" disabled={busy}>
-              {busy ? (
-                <LoaderCircle size={18} className="spin" />
-              ) : (
-                <>
-                  {initialized ? '登录工作空间' : '创建管理员并开始'}
-                  <ArrowRight size={17} />
-                </>
-              )}
-            </button>
-          </form>
+          {children}
           <div className="auth-trust">
             <ShieldCheck size={16} />
             本地部署 · 安全凭据 · 按角色授权
@@ -211,29 +139,213 @@ function AuthPage({
   );
 }
 
+function AuthPage({
+  updatedUsername,
+  onAuthenticated,
+}: {
+  updatedUsername?: string;
+  onAuthenticated: (user: User) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const values = new FormData(form);
+    setBusy(true);
+    setError('');
+    try {
+      const user = await post<User>('/auth/login', {
+        username: String(values.get('username')),
+        password: String(values.get('password')),
+      });
+      form.reset();
+      onAuthenticated(user);
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <AuthLayout>
+      <h2>登录工作空间</h2>
+      {updatedUsername && <p role="status">密码已更新，请使用新密码登录。</p>}
+      <form onSubmit={submit}>
+        <label className="field">
+          <span>用户名</span>
+          <input
+            name="username"
+            required
+            autoFocus={!updatedUsername}
+            autoComplete="username"
+            minLength={2}
+            maxLength={64}
+            defaultValue={updatedUsername}
+            placeholder="例如 root"
+          />
+        </label>
+        <label className="field">
+          <span>密码</span>
+          <input
+            name="password"
+            type="password"
+            required
+            autoFocus={!!updatedUsername}
+            autoComplete="current-password"
+            maxLength={256}
+          />
+        </label>
+        {!updatedUsername && (
+          <p className="auth-hint">
+            首次登录使用管理员账号 <code>root</code>
+            。使用启动时配置的密码，或在服务启动日志中查看自动生成的初始密码。
+          </p>
+        )}
+        <ErrorBanner error={error} />
+        <button className="button primary auth-submit" type="submit" disabled={busy}>
+          {busy ? (
+            <LoaderCircle size={18} className="spin" />
+          ) : (
+            <>
+              <span>登录</span>
+              <ArrowRight size={17} />
+            </>
+          )}
+        </button>
+      </form>
+    </AuthLayout>
+  );
+}
+
+function ChangePasswordPage({
+  user,
+  onChanged,
+  onLogout,
+  loggingOut,
+  logoutError,
+}: {
+  user: User;
+  onChanged: () => void;
+  onLogout: () => void;
+  loggingOut: boolean;
+  logoutError: string;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const values = new FormData(form);
+    const newPassword = String(values.get('newPassword'));
+    const currentPassword = String(values.get('currentPassword'));
+    if (newPassword !== values.get('confirmation')) {
+      setError('两次输入的新密码不一致。');
+      form.querySelector<HTMLInputElement>('[name="confirmation"]')?.focus();
+      return;
+    }
+    if (newPassword === currentPassword) {
+      setError('新密码必须与当前密码不同。');
+      form.querySelector<HTMLInputElement>('[name="newPassword"]')?.focus();
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      await post('/auth/change-password', { currentPassword, newPassword });
+      form.reset();
+      onChanged();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <AuthLayout>
+      <h2>更新初始密码</h2>
+      <p>账号 {user.username} 需要设置新密码才能进入工作空间。</p>
+      <form onSubmit={submit}>
+        <input name="username" value={user.username} autoComplete="username" type="hidden" />
+        <label className="field">
+          <span>当前密码</span>
+          <input
+            name="currentPassword"
+            type="password"
+            autoComplete="current-password"
+            autoFocus
+            required
+            maxLength={256}
+          />
+        </label>
+        <label className="field">
+          <span>新密码</span>
+          <input
+            name="newPassword"
+            type="password"
+            autoComplete="new-password"
+            required
+            minLength={12}
+            maxLength={256}
+            aria-describedby="new-password-hint"
+          />
+          <small id="new-password-hint">至少 12 个字符。</small>
+        </label>
+        <label className="field">
+          <span>确认新密码</span>
+          <input
+            name="confirmation"
+            type="password"
+            autoComplete="new-password"
+            required
+            minLength={12}
+            maxLength={256}
+          />
+        </label>
+        <ErrorBanner error={error || logoutError} />
+        <button className="button primary auth-submit" type="submit" disabled={busy || loggingOut}>
+          {busy ? (
+            <LoaderCircle size={18} className="spin" />
+          ) : (
+            <>
+              <span>更新密码</span>
+              <ArrowRight size={17} />
+            </>
+          )}
+        </button>
+      </form>
+      <div className="auth-actions">
+        <button
+          type="button"
+          className="text-button"
+          onClick={onLogout}
+          disabled={busy || loggingOut}
+        >
+          <LogOut size={15} />
+          退出登录
+        </button>
+      </div>
+    </AuthLayout>
+  );
+}
+
 export function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [initialized, setInitialized] = useState(true);
+  const [updatedUsername, setUpdatedUsername] = useState<string>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [menu, setMenu] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const route = useRoute();
+  const [routePath, routeSearch] = route.split('?', 2);
   async function boot() {
     setLoading(true);
     setError('');
     try {
-      const status = await api<{ initialized: boolean }>('/auth/status');
-      setInitialized(status.initialized);
-      if (status.initialized) {
-        try {
-          setUser(await api<User>('/auth/me'));
-        } catch (err) {
-          if (!(err instanceof ApiError) || err.status !== 401) throw err;
-        }
-      }
+      setUser(await api<User>('/auth/me'));
     } catch (err) {
-      setError(message(err));
+      if (err instanceof ApiError && err.status === 401) setUser(null);
+      else setError(message(err));
     } finally {
       setLoading(false);
     }
@@ -242,7 +354,6 @@ export function App() {
     void boot();
     const expire = () => {
       setUser(null);
-      setInitialized(true);
     };
     window.addEventListener('veyops:session-expired', expire);
     return () => window.removeEventListener('veyops:session-expired', expire);
@@ -258,7 +369,8 @@ export function App() {
       await post('/auth/logout');
       setUser(null);
     } catch (err) {
-      setError(message(err));
+      if (err instanceof ApiError && err.status === 401) setUser(null);
+      else setError(message(err));
     } finally {
       setLoggingOut(false);
     }
@@ -280,13 +392,28 @@ export function App() {
   if (!user)
     return (
       <AuthPage
-        initialized={initialized}
+        updatedUsername={updatedUsername}
         onAuthenticated={(value) => {
+          setUpdatedUsername(undefined);
           setUser(value);
-          setInitialized(true);
         }}
       />
     );
+  if (user.mustChangePassword) {
+    return (
+      <ChangePasswordPage
+        user={user}
+        onChanged={() => {
+          setUpdatedUsername(user.username);
+          setError('');
+          setUser(null);
+        }}
+        onLogout={() => void logout()}
+        loggingOut={loggingOut}
+        logoutError={error}
+      />
+    );
+  }
   const current = navigation
     .flatMap((group) => group.items)
     .find((item) => (item.path === '/' ? route === '/' : route.startsWith(item.path)));
@@ -297,7 +424,8 @@ export function App() {
   else if (route === '/projects') page = <ProjectsPage user={user} />;
   else if (route.startsWith('/projects/'))
     page = <ProjectPage key={route} id={route.slice(10)} user={user} />;
-  else if (route === '/pipelines') page = <PipelinesPage user={user} />;
+  else if (routePath === '/pipelines')
+    page = <PipelinesPage user={user} repositoryScope={routeSearch} />;
   else if (route === '/artifacts') page = <DeliveryRecordsPage type="artifacts" />;
   else if (route === '/deployments') page = <DeliveryRecordsPage type="deployments" />;
   else if (route === '/targets') page = <DeploymentTargetsPage user={user} />;

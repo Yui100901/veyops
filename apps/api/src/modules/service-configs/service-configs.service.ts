@@ -116,10 +116,13 @@ export class ServiceConfigsService {
     if (!r) throw new NotFoundException('环境不存在');
     return r;
   }
-  async get(serviceId: string, environmentId: string) {
+  private async assertScope(serviceId: string, environmentId: string) {
     const s = await this.service(serviceId),
       e = await this.environment(environmentId);
     if (s.project_id !== e.project_id) throw new BadRequestException('服务和环境必须属于同一项目');
+  }
+  async get(serviceId: string, environmentId: string) {
+    await this.assertScope(serviceId, environmentId);
     const r = await this.database.db
       .selectFrom('service_environment_configs')
       .selectAll()
@@ -129,7 +132,7 @@ export class ServiceConfigsService {
     return r ? present(r) : null;
   }
   async save(serviceId: string, environmentId: string, input: ServiceConfigDto, userId: string) {
-    const old = await this.get(serviceId, environmentId);
+    await this.assertScope(serviceId, environmentId);
     await this.targets.get(input.targetId);
     if ((input.artifactType === 'FILE') !== (input.deployMethod === 'FILE'))
       throw new BadRequestException('产物类型与部署方式不匹配');
@@ -155,27 +158,24 @@ export class ServiceConfigsService {
         health_check_json: JSON.stringify({ command: input.healthCheckCommand }),
         updated_at: now,
       };
-    if (old)
-      await this.database.db
-        .updateTable('service_environment_configs')
-        .set(values)
-        .where('id', '=', old.id)
-        .execute();
-    else
-      await this.database.db
-        .insertInto('service_environment_configs')
-        .values({
-          id: randomUUID(),
-          service_id: serviceId,
-          environment_id: environmentId,
-          ...values,
-          created_at: now,
-        })
-        .execute();
+    const config = await this.database.db
+      .insertInto('service_environment_configs')
+      .values({
+        id: randomUUID(),
+        service_id: serviceId,
+        environment_id: environmentId,
+        ...values,
+        created_at: now,
+      })
+      .onConflict((conflict) =>
+        conflict.columns(['service_id', 'environment_id']).doUpdateSet(values),
+      )
+      .returningAll()
+      .executeTakeFirstOrThrow();
     await this.audit.record(userId, 'service-environment.configure', 'service', serviceId, {
       environmentId,
     });
-    return this.get(serviceId, environmentId);
+    return present(config);
   }
   async readSnapshot(serviceId: string, environmentId: string, targetId?: string) {
     const config = await this.get(serviceId, environmentId);
@@ -258,16 +258,32 @@ export class ServiceConfigsService {
         throw new BadRequestException('敏感变量凭据不存在或已禁用');
     }
     await this.database.db.transaction().execute(async (tx) => {
-      if (config)
+      // Serialize replacements on the parent row even when the old set is empty.
+      if (config) {
+        const parent = await tx
+          .updateTable('service_environment_configs')
+          .set((eb) => ({ updated_at: eb.ref('updated_at') }))
+          .where('id', '=', config.id)
+          .returning('id')
+          .executeTakeFirst();
+        if (!parent) throw new NotFoundException('服务环境配置不存在');
         await tx
           .deleteFrom('service_environment_variables')
           .where('config_id', '=', config.id)
           .execute();
-      else
+      } else {
+        const parent = await tx
+          .updateTable('environments')
+          .set((eb) => ({ updated_at: eb.ref('updated_at') }))
+          .where('id', '=', environmentId)
+          .returning('id')
+          .executeTakeFirst();
+        if (!parent) throw new NotFoundException('环境不存在');
         await tx
           .deleteFrom('environment_variables')
           .where('environment_id', '=', environmentId)
           .execute();
+      }
       for (const v of input.variables) {
         const row = {
           id: randomUUID(),
@@ -329,6 +345,13 @@ export class ServiceConfigsService {
         throw new BadRequestException('仓库必须属于同一项目');
     }
     await this.database.db.transaction().execute(async (tx) => {
+      const parent = await tx
+        .updateTable('services')
+        .set((eb) => ({ updated_at: eb.ref('updated_at') }))
+        .where('id', '=', serviceId)
+        .returning('id')
+        .executeTakeFirst();
+      if (!parent) throw new NotFoundException('服务不存在');
       await tx.deleteFrom('service_repositories').where('service_id', '=', serviceId).execute();
       for (const r of input.repositories)
         await tx

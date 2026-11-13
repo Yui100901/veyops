@@ -1,4 +1,10 @@
-import { sql, type Kysely, type Migration, type CreateTableBuilder } from 'kysely';
+import {
+  sql,
+  type Kysely,
+  type Migration,
+  type MigrationProvider,
+  type CreateTableBuilder,
+} from 'kysely';
 
 interface ColumnOptions {
   nullable?: boolean;
@@ -761,3 +767,70 @@ async function down(db: Kysely<unknown>): Promise<void> {
 }
 
 export const initialMigration: Migration = { up, down };
+
+export const administratorPasswordMigration: Migration = {
+  async up(db) {
+    await db.schema
+      .alterTable('users')
+      .addColumn('must_change_password', 'integer', (column) =>
+        column
+          .notNull()
+          .defaultTo(0)
+          .check(sql`must_change_password in (0, 1)`),
+      )
+      .execute();
+  },
+  async down(db) {
+    await db.schema.alterTable('users').dropColumn('must_change_password').execute();
+  },
+};
+
+export const pipelineWebhookMigration: Migration = {
+  async up(db) {
+    await db.schema
+      .createTable('pipeline_webhooks')
+      .addColumn('pipeline_id', 'text', (c) =>
+        c.primaryKey().references('pipelines.id').onDelete('cascade'),
+      )
+      .addColumn('pipeline_version', 'integer', (c) => c.notNull())
+      .addColumn('configuration_hash', 'text', (c) => c.notNull())
+      .addColumn('environment_id', 'text', (c) => c.notNull().references('environments.id'))
+      .addColumn('target_id', 'text', (c) => c.notNull().references('deployment_targets.id'))
+      .addColumn('secret_credential_id', 'text', (c) => c.notNull().references('credentials.id'))
+      .addColumn('created_by', 'text', (c) => c.notNull().references('users.id'))
+      .addColumn('branch', 'text', (c) => c.notNull())
+      .addColumn('repository_key', 'text', (c) => c.notNull())
+      .addColumn('enabled', 'integer', (c) =>
+        c
+          .notNull()
+          .defaultTo(1)
+          .check(sql`enabled in (0, 1)`),
+      )
+      .addColumn('created_at', 'bigint', (c) => c.notNull())
+      .addColumn('updated_at', 'bigint', (c) => c.notNull())
+      .execute();
+  },
+  async down(db) {
+    await db.schema.dropTable('pipeline_webhooks').execute();
+  },
+};
+
+export const artifactArchiveMigration: Migration = {
+  async up(db) {
+    await db.schema.alterTable('artifacts').addColumn('archive_key', 'text').execute();
+  },
+  async down(db) {
+    await db.schema.alterTable('artifacts').dropColumn('archive_key').execute();
+  },
+};
+
+export const migrationProvider: MigrationProvider = {
+  async getMigrations() {
+    return {
+      '001_initial': initialMigration,
+      '002_administrator_password': administratorPasswordMigration,
+      '003_pipeline_webhooks': pipelineWebhookMigration,
+      '004_artifact_archives': artifactArchiveMigration,
+    };
+  },
+};

@@ -48,7 +48,8 @@ export function TaskTable({ tasks }: { tasks: Task[] }) {
                     {
                       COMMAND: '临时命令',
                       OPERATION_PLAN: '运维方案',
-                      PIPELINE: 'Pipeline',
+                      PIPELINE:
+                        task.executionMode === 'BUILD_ONLY' ? 'Pipeline · 仅构建' : 'Pipeline',
                     } as Record<string, string>
                   )[task.type] ?? task.type}
                 </span>

@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { api, formatTime, message, post, remove, useResource } from '../api';
 import { ProjectDeploymentConfig } from './DeploymentConfig';
+import { RepositoryDetails } from './RepositoryBrowser';
 import {
   Confirm,
   Empty,
@@ -422,6 +423,7 @@ const credentialLabels: Record<string, string> = {
   API_KEY: 'API Key',
   DOCKER_REGISTRY: 'Docker Registry 密码',
   GIT_PASSWORD: 'Git 账号密码',
+  CUSTOM_SECRET: '共享密钥',
 };
 export function CredentialsPage({ user }: { user: User }) {
   const resource = useResource<Credential[]>('/credentials');
@@ -442,6 +444,8 @@ export function CredentialsPage({ user }: { user: User }) {
     } else if (['DOCKER_REGISTRY', 'GIT_PASSWORD'].includes(type)) {
       secret.username = text(form, 'username');
       secret.password = String(form.get('secret') ?? '');
+    } else if (type === 'CUSTOM_SECRET') {
+      secret.value = String(form.get('secret') ?? '');
     } else
       secret[type === 'SSH_PASSWORD' ? 'password' : type === 'GIT_TOKEN' ? 'token' : 'apiKey'] =
         String(form.get('secret') ?? '');
@@ -486,6 +490,8 @@ export function CredentialsPage({ user }: { user: User }) {
         return;
       }
       payload.secret = { username: text(form, 'username'), password: replacement };
+    } else if (replacement && managing.type === 'CUSTOM_SECRET') {
+      payload.secret = { value: replacement };
     } else if (replacement) {
       const key =
         managing.type === 'SSH_KEY'
@@ -649,6 +655,7 @@ export function CredentialsPage({ user }: { user: User }) {
                 <option value="API_KEY">API Key</option>
                 <option value="DOCKER_REGISTRY">Docker Registry 账号密码</option>
                 <option value="GIT_PASSWORD">Git 账号密码</option>
+                <option value="CUSTOM_SECRET">共享密钥</option>
               </select>
             </Field>
             {['DOCKER_REGISTRY', 'GIT_PASSWORD'].includes(type) && (
@@ -656,7 +663,15 @@ export function CredentialsPage({ user }: { user: User }) {
                 <input name="username" required autoComplete="off" />
               </Field>
             )}
-            <Field label={type === 'SSH_KEY' ? '私钥内容' : credentialLabels[type]} required>
+            <Field
+              label={type === 'SSH_KEY' ? '私钥内容' : credentialLabels[type]}
+              hint={
+                type === 'CUSTOM_SECRET'
+                  ? '用于 Gitea Webhook 时，请使用至少 32 字节的随机密钥。'
+                  : undefined
+              }
+              required
+            >
               {type === 'SSH_KEY' ? (
                 <textarea
                   key={type}
@@ -716,6 +731,7 @@ export function CredentialsPage({ user }: { user: User }) {
               'API_KEY',
               'DOCKER_REGISTRY',
               'GIT_PASSWORD',
+              'CUSTOM_SECRET',
             ].includes(managing.type) && (
               <>
                 {['DOCKER_REGISTRY', 'GIT_PASSWORD'].includes(managing.type) && (
@@ -932,6 +948,7 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
   const resource = useResource<ProjectDetail>(`/projects/${id}`);
   const credentials = useResource<Credential[]>('/credentials');
   const [adding, setAdding] = useState<'repositories' | 'services' | 'environments'>();
+  const [inspectingRepository, setInspectingRepository] = useState<Repository>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   async function add(event: FormEvent<HTMLFormElement>) {
@@ -1028,7 +1045,18 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
                       <FolderGit2 size={17} />
                     </span>
                     <div>
-                      <strong>{item.name}</strong>
+                      {key === 'repositories' && user.role !== 'VIEWER' ? (
+                        <button
+                          className="text-button repository-name"
+                          type="button"
+                          onClick={() => setInspectingRepository(item as Repository)}
+                          aria-label={`查看仓库 ${item.name} 的分支与提交`}
+                        >
+                          {item.name}
+                        </button>
+                      ) : (
+                        <strong>{item.name}</strong>
+                      )}
                       <small>
                         {key === 'repositories'
                           ? (item as Repository).cloneUrl
@@ -1054,6 +1082,15 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
         <p>为服务绑定仓库，并在不同环境配置部署目标。构建与发布由 Pipeline 统一执行。</p>
       </div>
       <ProjectDeploymentConfig project={project} user={user} />
+      {inspectingRepository && (
+        <RepositoryDetails
+          projectId={id}
+          repository={inspectingRepository}
+          services={project.services}
+          environments={project.environments}
+          onClose={() => setInspectingRepository(undefined)}
+        />
+      )}
       {adding && (
         <Modal title={`添加${labels[adding]}`} onClose={() => setAdding(undefined)}>
           <Form
@@ -1068,28 +1105,32 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
             </Field>
             {adding === 'repositories' ? (
               <>
-                <Field label="Git 仓库地址" required>
+                <Field label="Git 仓库地址" required hint="使用仓库的 HTTP(S) 克隆地址。">
                   <input
                     name="cloneUrl"
                     placeholder="https://github.com/team/repository.git"
+                    type="url"
+                    pattern="https?://.+"
                     required
                   />
                 </Field>
-                <Field label="Git 认证凭据（可选）">
-                  <select name="credentialId">
-                    <option value="">公开仓库，无需认证</option>
-                    {credentials.data
-                      ?.filter(
-                        (c) =>
-                          ['GIT_TOKEN', 'GIT_PASSWORD'].includes(c.type) && c.status === 'ACTIVE',
-                      )
-                      .map((c) => (
-                        <option key={c.id} value={c.id}>
-                          {c.name}
-                        </option>
-                      ))}
-                  </select>
-                </Field>
+                {user.role === 'ADMIN' && (
+                  <Field label="Git 认证凭据（可选）">
+                    <select name="credentialId">
+                      <option value="">公开仓库，无需认证</option>
+                      {credentials.data
+                        ?.filter(
+                          (c) =>
+                            ['GIT_TOKEN', 'GIT_PASSWORD'].includes(c.type) && c.status === 'ACTIVE',
+                        )
+                        .map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.name}
+                          </option>
+                        ))}
+                    </select>
+                  </Field>
+                )}
                 <Field label="默认分支" required>
                   <input name="defaultBranch" defaultValue="main" required />
                 </Field>

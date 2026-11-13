@@ -4,6 +4,7 @@ import {
   ArrowDown,
   ArrowUp,
   Boxes,
+  Copy,
   GitBranch,
   History,
   Layers3,
@@ -12,9 +13,10 @@ import {
   Plus,
   ShieldCheck,
   Trash2,
+  Webhook,
   Workflow,
 } from 'lucide-react';
-import { api, formatTime, message, navigate, post, useResource } from '../api';
+import { ApiError, api, formatTime, message, navigate, post, useResource } from '../api';
 import {
   Empty,
   ErrorBanner,
@@ -27,7 +29,8 @@ import {
   Section,
   Status,
 } from '../components';
-import type { Credential, Project, ProjectDetail, Task, User } from '../models';
+import type { Credential, Project, ProjectDetail, Server, Task, User } from '../models';
+import { RepositoryBrowser } from './RepositoryBrowser';
 
 export interface DeploymentTarget {
   id: string;
@@ -70,7 +73,7 @@ interface Registry {
   id: string;
   name: string;
   registryUrl: string;
-  credentialId?: string;
+  credentialId: string | null;
 }
 const emptyDefinition: PipelineDefinition = {
   repositoryId: '',
@@ -90,12 +93,27 @@ const emptyDefinition: PipelineDefinition = {
 };
 const buildLabels = { TARGET: '目标服务器构建', MANAGER: '管理端隔离构建' };
 
-export function PipelinesPage({ user }: { user: User }) {
-  const pipelines = useResource<Pipeline[]>('/pipelines');
+export function PipelinesPage({ user, repositoryScope }: { user: User; repositoryScope?: string }) {
+  const scope = new URLSearchParams(repositoryScope);
+  const projectId = scope.get('projectId');
+  const repositoryId = scope.get('repositoryId');
+  const scopedProject = useResource<ProjectDetail>(
+    projectId ? `/projects/${encodeURIComponent(projectId)}` : null,
+  );
+  const scopedRepository = scopedProject.data?.repositories.find(
+    (repository) => repository.id === repositoryId,
+  );
+  const pipelines = useResource<Pipeline[]>(
+    projectId ? `/pipelines?projectId=${encodeURIComponent(projectId)}` : '/pipelines',
+  );
   const projects = useResource<Project[]>('/projects');
+  const visiblePipelines = (pipelines.data || []).filter(
+    (pipeline) => !repositoryId || pipeline.definition?.repositoryId === repositoryId,
+  );
   const [editing, setEditing] = useState<Partial<Pipeline>>();
   const [running, setRunning] = useState<Pipeline>();
   const [versions, setVersions] = useState<Pipeline>();
+  const [webhook, setWebhook] = useState<Pipeline>();
   useEffect(() => {
     const raw = sessionStorage.getItem('veyops:pipeline-draft');
     if (!raw || user.role === 'VIEWER') return;
@@ -117,7 +135,15 @@ export function PipelinesPage({ user }: { user: User }) {
           <>
             <RefreshButton onClick={pipelines.reload} />
             {user.role !== 'VIEWER' && (
-              <button className="button primary" onClick={() => setEditing({})}>
+              <button
+                className="button primary"
+                onClick={() =>
+                  setEditing({
+                    projectId: projectId || undefined,
+                    definition: repositoryId ? { ...emptyDefinition, repositoryId } : undefined,
+                  })
+                }
+              >
                 <Plus size={16} />
                 创建 Pipeline
               </button>
@@ -125,7 +151,22 @@ export function PipelinesPage({ user }: { user: User }) {
           </>
         }
       />
-      <ErrorBanner error={pipelines.error || projects.error} retry={pipelines.reload} />
+      <ErrorBanner
+        error={pipelines.error || projects.error || scopedProject.error}
+        retry={() => {
+          void pipelines.reload();
+          void projects.reload();
+          void scopedProject.reload();
+        }}
+      />
+      {repositoryId && (
+        <div className="repository-detail-actions">
+          <span className="tag">仓库 · {scopedRepository?.name || repositoryId}</span>
+          <a href="#/pipelines" className="text-link">
+            查看全部 Pipeline
+          </a>
+        </div>
+      )}
       <div className="delivery-banner">
         <span className="resource-avatar">
           <Workflow size={25} />
@@ -140,12 +181,16 @@ export function PipelinesPage({ user }: { user: User }) {
       </div>
       {pipelines.loading ? (
         <Loading />
-      ) : !pipelines.data?.length ? (
+      ) : !visiblePipelines.length ? (
         <div className="panel">
           <Empty
             icon={<GitBranch size={27} />}
-            title="建立第一条交付流程"
-            description="先创建项目、仓库、服务和部署目标，再定义构建与发布方式。"
+            title={repositoryId ? '此仓库暂无 Pipeline' : '建立第一条交付流程'}
+            description={
+              repositoryId
+                ? '创建 Pipeline 时会预填当前仓库，再选择服务和构建方式。'
+                : '先创建项目、仓库、服务和部署目标，再定义构建与发布方式。'
+            }
             action={
               <a href="#/projects" className="button secondary">
                 前往项目管理
@@ -155,7 +200,7 @@ export function PipelinesPage({ user }: { user: User }) {
         </div>
       ) : (
         <div className="pipeline-grid">
-          {pipelines.data.map((p) => (
+          {visiblePipelines.map((p) => (
             <section className="panel pipeline-card" key={p.id}>
               <div className="pipeline-card-top">
                 <span className="resource-avatar">
@@ -187,6 +232,17 @@ export function PipelinesPage({ user }: { user: User }) {
                   <History size={15} />
                   版本
                 </button>
+                {user.role === 'ADMIN' && (
+                  <button
+                    className="text-button"
+                    aria-label={`配置 ${p.name} 的 Gitea Webhook`}
+                    title="配置 Gitea Webhook"
+                    onClick={() => setWebhook(p)}
+                  >
+                    <Webhook size={15} />
+                    Webhook
+                  </button>
+                )}
                 {user.role !== 'VIEWER' && (
                   <>
                     <button className="text-button" onClick={() => setEditing(p)}>
@@ -221,7 +277,179 @@ export function PipelinesPage({ user }: { user: User }) {
       )}
       {running && <RunPipeline pipeline={running} onClose={() => setRunning(undefined)} />}
       {versions && <PipelineVersions pipeline={versions} onClose={() => setVersions(undefined)} />}
+      {webhook && <PipelineWebhook pipeline={webhook} onClose={() => setWebhook(undefined)} />}
     </>
+  );
+}
+
+type WebhookInput = {
+  environmentId: string;
+  targetId: string;
+  branch: string;
+  secretCredentialId: string;
+  enabled: boolean;
+};
+type WebhookConfig = WebhookInput & { endpoint: string; version?: number };
+
+function PipelineWebhook({ pipeline, onClose }: { pipeline: Pipeline; onClose: () => void }) {
+  const path = `/pipelines/${pipeline.id}/webhook`;
+  const configuration = useResource<WebhookConfig | null>(path);
+  const project = useResource<ProjectDetail>(`/projects/${pipeline.projectId}`);
+  const targets = useResource<DeploymentTarget[]>('/deployment-targets');
+  const credentials = useResource<Credential[]>('/credentials');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const loading =
+    configuration.loading || project.loading || targets.loading || credentials.loading;
+  const loadError = configuration.error || project.error || targets.error || credentials.error;
+  const config = configuration.data;
+  const sharedSecrets = credentials.data?.filter(
+    (c) => c.type === 'CUSTOM_SECRET' && c.status === 'ACTIVE',
+  );
+  const endpoint = config ? new URL(config.endpoint, window.location.origin).href : '';
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(endpoint);
+      setNotice('已复制 Webhook URL。');
+    } catch {
+      setNotice('请选中 URL 并手动复制。');
+    }
+  }
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy) return;
+    const values = new FormData(event.currentTarget);
+    const input: WebhookInput = {
+      environmentId: String(values.get('environmentId')),
+      targetId: String(values.get('targetId')),
+      branch: String(values.get('branch')).trim(),
+      secretCredentialId: String(values.get('secretCredentialId')),
+      enabled: values.get('enabled') === 'on',
+    };
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      await api(path, { method: 'PUT', body: JSON.stringify(input) });
+      await configuration.reload();
+      setNotice('Webhook 配置已保存。');
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <Modal
+      title="Gitea Webhook"
+      description={`匹配的 Push 事件会在专用构建环境中构建 ${pipeline.name}。生效的构建位置须为管理端，环境须适合自动构建且不含敏感变量。`}
+      onClose={() => {
+        if (!busy) onClose();
+      }}
+    >
+      {loading ? (
+        <Loading />
+      ) : loadError ? (
+        <div className="form-body">
+          <ErrorBanner
+            error={loadError}
+            retry={() => {
+              void configuration.reload();
+              void project.reload();
+              void targets.reload();
+              void credentials.reload();
+            }}
+          />
+        </div>
+      ) : (
+        <Form onSubmit={save} onCancel={onClose} submit="保存 Webhook" busy={busy} error={error}>
+          {endpoint && (
+            <div className="webhook-url">
+              <Field
+                label="Webhook URL"
+                hint="Gitea 中选择 Push Events，内容类型设为 application/json，并填写同一共享密钥。URL 需能从 Gitea 访问。"
+              >
+                <input
+                  value={endpoint}
+                  readOnly
+                  onFocus={(event) => event.currentTarget.select()}
+                />
+              </Field>
+              <button className="button secondary small" type="button" onClick={() => void copy()}>
+                <Copy size={14} />
+                复制 URL
+              </button>
+            </div>
+          )}
+          {notice && (
+            <p className="success-notice" role="status">
+              {notice}
+            </p>
+          )}
+          {config?.version && (
+            <p className="field-note">
+              已固定 Pipeline v{config.version}。如需切换到当前版本，请重新保存。
+            </p>
+          )}
+          <Field label="环境" required>
+            <select name="environmentId" required defaultValue={config?.environmentId || ''}>
+              <option value="">选择项目环境</option>
+              {project.data?.environments.map((environment) => (
+                <option key={environment.id} value={environment.id}>
+                  {environment.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="目标组" required>
+            <select name="targetId" required defaultValue={config?.targetId || ''}>
+              <option value="">选择目标组</option>
+              {targets.data?.map((target) => (
+                <option key={target.id} value={target.id}>
+                  {target.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="分支" required>
+            <input
+              name="branch"
+              required
+              defaultValue={config?.branch || 'main'}
+              placeholder="例如 main"
+            />
+          </Field>
+          <Field label="签名密钥" required hint="Gitea 使用共享密钥生成 SHA-256 签名。">
+            <select
+              name="secretCredentialId"
+              required
+              defaultValue={config?.secretCredentialId || ''}
+            >
+              <option value="">选择共享密钥凭据</option>
+              {sharedSecrets?.map((credential) => (
+                <option key={credential.id} value={credential.id}>
+                  {credential.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+          {!sharedSecrets?.length && (
+            <p className="field-note">
+              先在
+              <a className="text-link" href="#/credentials">
+                凭据中心
+              </a>
+              创建共享密钥。
+            </p>
+          )}
+          <label className="checkbox-row">
+            <input type="checkbox" name="enabled" defaultChecked={config?.enabled ?? false} />
+            启用 Push 触发
+          </label>
+        </Form>
+      )}
+    </Modal>
   );
 }
 
@@ -439,22 +667,23 @@ function PipelineEditor({
                   required
                 />
               </Field>
-              <Field label="镜像仓库名称" required>
+              <Field
+                label="镜像仓库名称"
+                hint="发布镜像时可指定仓库。仅构建可留空，由平台生成本地镜像标签。"
+              >
                 <input
                   value={definition.imageRepository}
                   placeholder="registry.example.com/team/service"
-                  required
                   onChange={(e) => field('imageRepository', e.target.value)}
                 />
               </Field>
             </div>
             <Field
               label="Registry"
-              hint="管理端构建镜像需要推送 Registry，目标端从 Registry 拉取。"
+              hint="管理端构建并部署镜像时需要 Registry。仅构建将镜像保留在构建端。"
             >
               <select
                 value={definition.registryId || ''}
-                required={definition.buildLocation === 'MANAGER'}
                 onChange={(e) => field('registryId', e.target.value)}
               >
                 <option value="">不使用 Registry</option>
@@ -473,13 +702,11 @@ function PipelineEditor({
         </div>
         <Field
           label="部署根目录"
-          required
-          hint="使用专属目录，例如 /opt/veyops/my-service；发布到版本目录后切换 current。"
+          hint="部署需要填写专属目录，例如 /opt/veyops/my-service。仅构建可留空。"
         >
           <input
             value={definition.deployPath}
             placeholder="/opt/veyops/my-service"
-            required
             onChange={(e) => field('deployPath', e.target.value)}
           />
         </Field>
@@ -629,9 +856,22 @@ function PipelineEditor({
   );
 }
 
+type ExecutionMode = 'BUILD_ONLY' | 'DEPLOY';
+type PipelinePreview = {
+  mode: ExecutionMode;
+  environmentId: string;
+  targetId: string;
+  version: number;
+  commitSha: string;
+  definition: PipelineDefinition;
+  serverIds: string[];
+  configurationHash: string;
+};
+
 function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () => void }) {
   const project = useResource<ProjectDetail>(`/projects/${pipeline.projectId}`);
   const targets = useResource<DeploymentTarget[]>('/deployment-targets');
+  const servers = useResource<Server[]>('/servers');
   const versions = useResource<{ version: number; definition: PipelineDefinition }[]>(
     `/pipelines/${pipeline.id}/versions`,
   );
@@ -639,76 +879,101 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
   const [targetId, setTargetId] = useState('');
   const [commitSha, setCommitSha] = useState('');
   const [version, setVersion] = useState(pipeline.currentVersion);
-  const [review, setReview] = useState(false);
+  const [browsing, setBrowsing] = useState(false);
+  const [commitOrigin, setCommitOrigin] = useState<{ branch: string; subject: string }>();
+  const [mode, setMode] = useState<ExecutionMode>('BUILD_ONLY');
+  const [preview, setPreview] = useState<PipelinePreview>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const config = useResource<Partial<PipelineDefinition> | null>(
-    environmentId ? `/services/${pipeline.serviceId}/environments/${environmentId}/config` : null,
-  );
-  const versionDefinition =
-    versions.data?.find((v) => v.version === version)?.definition || pipeline.definition;
-  const effectiveDefinition = { ...versionDefinition };
-  for (const key of [
-    'buildLocation',
-    'artifactType',
-    'buildCommand',
-    'outputPath',
-    'deployPath',
-    'composeFilePath',
-    'startCommand',
-    'healthCheckCommand',
-    'dockerfilePath',
-  ] as const) {
-    const value = config.data?.[key];
-    if (typeof value === 'string' && value)
-      (effectiveDefinition as unknown as Record<string, unknown>)[key] = value;
-  }
-  const target = targets.data?.find((t) => t.id === targetId);
+  const versionDefinition = versions.data?.find((entry) => entry.version === version)?.definition;
+  const repositoryId =
+    versionDefinition?.repositoryId ||
+    (version === pipeline.currentVersion ? pipeline.definition.repositoryId : undefined);
+  const repository = project.data?.repositories.find((entry) => entry.id === repositoryId);
   async function run(e: FormEvent) {
     e.preventDefault();
-    if (!review) {
-      setReview(true);
-      return;
-    }
+    if (busy) return;
     setBusy(true);
     setError('');
     try {
+      if (!preview) {
+        const result = await post<PipelinePreview>(`/pipelines/${pipeline.id}/preview`, {
+          environmentId,
+          targetId,
+          commitSha,
+          version,
+          mode,
+          confirmed: true,
+        });
+        setPreview(result);
+        return;
+      }
       const task = await post<Task>(`/pipelines/${pipeline.id}/run`, {
-        environmentId,
-        targetId,
-        commitSha,
-        version,
+        environmentId: preview.environmentId,
+        targetId: preview.targetId,
+        commitSha: preview.commitSha,
+        version: preview.version,
+        mode: preview.mode,
+        expectedConfigurationHash: preview.configurationHash,
+        expectedServerIds: preview.serverIds,
         confirmed: true,
       });
       navigate(`/tasks/${task.id}`);
     } catch (err) {
+      if (err instanceof ApiError && err.status === 409) setPreview(undefined);
       setError(message(err));
     } finally {
       setBusy(false);
     }
   }
+  const buildOnly = (preview?.mode ?? mode) === 'BUILD_ONLY';
+  const definition = preview?.definition;
+  const targetName = targets.data?.find((t) => t.id === preview?.targetId)?.name;
+  const environmentName = project.data?.environments.find(
+    (e) => e.id === preview?.environmentId,
+  )?.name;
   return (
     <Modal
       title={`运行 · ${pipeline.name}`}
       description="固定 Git Commit、Pipeline 版本和执行目标，再提交至统一任务队列。"
-      onClose={onClose}
+      onClose={() => {
+        if (!busy) onClose();
+      }}
     >
       <Form
         onSubmit={run}
-        onCancel={() => (review ? setReview(false) : onClose())}
-        submit={review ? '确认构建并部署' : '预览部署'}
-        busy={
-          busy ||
-          versions.loading ||
-          (!!environmentId && config.loading) ||
-          !!versions.error ||
-          !!config.error
+        onCancel={() => {
+          if (preview) {
+            setPreview(undefined);
+            setError('');
+          } else onClose();
+        }}
+        submit={
+          preview
+            ? buildOnly
+              ? '确认仅构建'
+              : '确认构建并部署'
+            : buildOnly
+              ? '预览构建'
+              : '预览部署'
         }
+        busy={busy}
         error={error}
       >
-        <ErrorBanner error={project.error || targets.error || versions.error || config.error} />
-        {!review ? (
-          <>
+        <ErrorBanner error={project.error || targets.error || versions.error} />
+        {!preview || !definition ? (
+          <fieldset disabled={busy}>
+            <Field label="运行模式" required>
+              <select value={mode} onChange={(e) => setMode(e.target.value as ExecutionMode)}>
+                <option value="DEPLOY">构建并部署</option>
+                <option value="BUILD_ONLY">仅构建</option>
+              </select>
+            </Field>
+            {buildOnly && (
+              <p className="field-note">
+                完成后保留构建产物。镜像保留在构建端，无需推送 Registry 或启动应用容器。
+              </p>
+            )}
             <Field label="环境" required>
               <select
                 value={environmentId}
@@ -723,7 +988,11 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 ))}
               </select>
             </Field>
-            <Field label="部署目标" required>
+            <Field
+              label={buildOnly ? '目标组' : '部署目标'}
+              required
+              hint={buildOnly ? '提供目标端构建所用的服务器和执行策略。' : undefined}
+            >
               <select value={targetId} required onChange={(e) => setTargetId(e.target.value)}>
                 <option value="">明确选择目标</option>
                 {targets.data?.map((t) => (
@@ -733,22 +1002,17 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 ))}
               </select>
             </Field>
-            <Field
-              label="Git Commit SHA"
-              required
-              hint="填写完整 40 或 64 位十六进制 Commit，不接受浮动分支。"
-            >
-              <input
-                className="mono"
-                value={commitSha}
-                onChange={(e) => setCommitSha(e.target.value.trim())}
-                required
-                pattern="(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})"
-                placeholder="完整 Commit SHA"
-              />
-            </Field>
             <Field label="Pipeline 版本">
-              <select required value={version} onChange={(e) => setVersion(Number(e.target.value))}>
+              <select
+                required
+                value={version}
+                onChange={(e) => {
+                  setVersion(Number(e.target.value));
+                  setCommitSha('');
+                  setCommitOrigin(undefined);
+                  setBrowsing(false);
+                }}
+              >
                 {versions.data?.map((v) => (
                   <option key={v.version} value={v.version}>
                     v{v.version}
@@ -757,43 +1021,116 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 ))}
               </select>
             </Field>
-          </>
+            {repository && (
+              <div className="repository-run-picker">
+                <button
+                  className="button secondary small"
+                  type="button"
+                  onClick={() => setBrowsing(!browsing)}
+                  aria-expanded={browsing}
+                >
+                  <GitBranch size={15} />
+                  {browsing ? '收起提交列表' : '从仓库选择提交'}
+                </button>
+                <span className="muted">{repository.name}</span>
+              </div>
+            )}
+            {browsing && repository && (
+              <RepositoryBrowser
+                key={repository.id}
+                projectId={pipeline.projectId}
+                repository={repository}
+                selectedSha={commitSha}
+                onSelect={(commit, branch) => {
+                  setCommitSha(commit.sha);
+                  setCommitOrigin({ branch, subject: commit.subject });
+                  setBrowsing(false);
+                }}
+              />
+            )}
+            <Field
+              label="Git Commit SHA"
+              required
+              hint={
+                commitOrigin
+                  ? `已选 ${commitOrigin.branch} 上的提交。`
+                  : '可手动输入完整的 40 或 64 位十六进制 SHA。'
+              }
+            >
+              <input
+                className="mono"
+                value={commitSha}
+                onChange={(e) => {
+                  setCommitSha(e.target.value.trim());
+                  setCommitOrigin(undefined);
+                }}
+                required
+                pattern="(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})"
+                placeholder="选择提交或输入完整 SHA"
+              />
+            </Field>
+          </fieldset>
         ) : (
           <>
             <div className="confirmation-summary">
               <ShieldCheck size={24} />
               <div>
-                <strong>将对 {target?.serverIds?.length || 0} 台服务器执行构建与部署</strong>
+                <strong>
+                  {buildOnly
+                    ? '仅构建并保留产物'
+                    : `将对 ${preview.serverIds.length} 台服务器执行构建与部署`}
+                </strong>
                 <p>
-                  {target?.name} ·{' '}
-                  {project.data?.environments.find((e) => e.id === environmentId)?.name} · Pipeline
-                  v{version}
+                  {targetName} · {environmentName} · Pipeline v{preview.version}
                 </p>
               </div>
             </div>
             <div className="deployment-review">
+              {repository && (
+                <>
+                  <span>仓库</span>
+                  <span>{repository.name}</span>
+                </>
+              )}
+              {commitOrigin && (
+                <>
+                  <span>所选提交</span>
+                  <span>
+                    {commitOrigin.branch} · {commitOrigin.subject || '无提交说明'}
+                  </span>
+                </>
+              )}
               <span>固定 Commit</span>
-              <code>{commitSha}</code>
+              <code>{preview.commitSha}</code>
               <span>构建方式</span>
-              <strong>{buildLabels[effectiveDefinition.buildLocation]}</strong>
+              <strong>{buildLabels[definition.buildLocation]}</strong>
               <span>产物类型</span>
-              <strong>
-                {effectiveDefinition.artifactType === 'FILE' ? '文件' : 'Docker 镜像'}
-              </strong>
-              <span>部署目录</span>
-              <code>{effectiveDefinition.deployPath}</code>
+              <strong>{definition.artifactType === 'FILE' ? '文件' : 'Docker 镜像'}</strong>
+              {(!buildOnly || definition.buildLocation === 'TARGET') && (
+                <>
+                  <span>目标服务器</span>
+                  <span>
+                    {preview.serverIds
+                      .map((id) => servers.data?.find((server) => server.id === id)?.name || id)
+                      .join('、')}
+                  </span>
+                </>
+              )}
+              {!buildOnly && (
+                <>
+                  <span>部署目录</span>
+                  <code>{definition.deployPath}</code>
+                </>
+              )}
             </div>
-            {config.data && (
-              <p className="field-note">以上预览已合并该服务在当前环境中的配置覆盖。</p>
-            )}
-            {effectiveDefinition.startCommand && (
+            {!buildOnly && definition.startCommand && (
               <>
                 <h3 className="field-title">启动命令</h3>
-                <pre className="code-preview">{effectiveDefinition.startCommand}</pre>
+                <pre className="code-preview">{definition.startCommand}</pre>
               </>
             )}
             <p className="muted">
-              执行将写入目标目录，并可能运行配置的启动命令。请确认该目录与命令属于此次部署的服务。
+              {buildOnly ? '构建完成后可在构建产物中查看结果。' : '请核对部署目录和启动命令。'}
             </p>
           </>
         )}
@@ -838,9 +1175,11 @@ type Artifact = {
   artifactType: string;
   storageType: string;
   storageKey: string;
+  downloadAvailable: boolean;
   sourceCommit?: string;
   checksum?: string;
   imageDigest?: string;
+  imageId?: string;
   imageRepository?: string;
   sizeBytes?: number;
   createdAt: number;
@@ -856,10 +1195,82 @@ type Deployment = {
   deployPath?: string;
   releaseVersion?: string;
   healthStatus?: string;
+  previousDeploymentId?: string | null;
   startedAt?: number;
   finishedAt?: number;
   taskId?: string;
 };
+const storageLabels: Record<string, string> = {
+  LOCAL_FILE: '平台文件',
+  REMOTE_FILE: '服务器文件',
+  LOCAL_IMAGE: '管理端镜像',
+  REMOTE_IMAGE: '目标端镜像',
+  REGISTRY_IMAGE: 'Registry 镜像',
+};
+
+export function RunArtifacts({ runId, polling }: { runId: string; polling: boolean }) {
+  const artifacts = useResource<Artifact[]>(
+    `/artifacts?pipelineRunId=${encodeURIComponent(runId)}`,
+    polling ? 2000 : 0,
+  );
+  return (
+    <Section title="本次构建产物" action={<RefreshButton onClick={artifacts.reload} />}>
+      <ErrorBanner error={artifacts.error} />
+      {artifacts.loading ? (
+        <Loading />
+      ) : artifacts.data?.length ? (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>产物</th>
+                <th>校验 / Digest</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {artifacts.data.map((artifact) => (
+                <tr key={artifact.id}>
+                  <td>
+                    <strong>{artifact.artifactType === 'FILE' ? '文件产物' : 'Docker 镜像'}</strong>
+                    {artifact.artifactType === 'DOCKER_IMAGE' && (
+                      <small className="cell-detail mono">{artifact.storageKey}</small>
+                    )}
+                  </td>
+                  <td className="mono">
+                    {artifact.checksum || artifact.imageDigest || artifact.imageId || '—'}
+                  </td>
+                  <td>
+                    <ArtifactDownload artifact={artifact} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="field-note">{polling ? '等待构建生成产物' : '本次运行暂无产物'}</p>
+      )}
+    </Section>
+  );
+}
+
+function ArtifactDownload({ artifact }: { artifact: Artifact }) {
+  if (artifact.downloadAvailable)
+    return (
+      <a
+        className="button secondary small"
+        href={`/api/v1/artifacts/${artifact.id}/download`}
+        download
+      >
+        下载
+      </a>
+    );
+  if (artifact.storageType === 'REGISTRY_IMAGE')
+    return <span className="muted">从 Registry 拉取</span>;
+  return <span className="muted">—</span>;
+}
+
 export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments' }) {
   const records = useResource<(Artifact & Deployment)[]>(`/${type}`);
   return (
@@ -914,6 +1325,7 @@ export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments
                       <th>固定 Commit</th>
                       <th>校验 / Digest</th>
                       <th>创建时间</th>
+                      <th>操作</th>
                     </>
                   ) : (
                     <>
@@ -941,7 +1353,9 @@ export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments
                           </small>
                         </td>
                         <td>
-                          <span className="tag">{r.storageType}</span>
+                          <span className="tag">
+                            {storageLabels[r.storageType] || r.storageType}
+                          </span>
                           {r.sizeBytes != null && (
                             <small className="cell-detail">
                               {(r.sizeBytes / 1024).toFixed(1)} KiB
@@ -951,14 +1365,27 @@ export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments
                         <td className="mono" title={r.sourceCommit}>
                           {r.sourceCommit?.slice(0, 12) || '—'}
                         </td>
-                        <td className="mono truncate" title={r.checksum || r.imageDigest}>
-                          {r.checksum || r.imageDigest || '—'}
+                        <td
+                          className="mono truncate"
+                          title={r.checksum || r.imageDigest || r.imageId}
+                        >
+                          {r.checksum || r.imageDigest || r.imageId || '—'}
                         </td>
                         <td className="nowrap muted">{formatTime(r.createdAt)}</td>
+                        <td>
+                          <ArtifactDownload artifact={r} />
+                        </td>
                       </>
                     ) : (
                       <>
-                        <td className="mono">{r.releaseVersion || r.id.slice(0, 8)}</td>
+                        <td className="mono">
+                          {r.releaseVersion || r.id.slice(0, 8)}
+                          {r.previousDeploymentId && (
+                            <small className="cell-detail" title={r.previousDeploymentId}>
+                              上一成功部署 {r.previousDeploymentId.slice(0, 8)}
+                            </small>
+                          )}
+                        </td>
                         <td className="mono truncate" title={r.serverId}>
                           {r.serverId || '—'}
                         </td>
@@ -985,22 +1412,51 @@ export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments
 
 export function RegistriesPage({ user }: { user: User }) {
   const registries = useResource<Registry[]>('/registries');
-  const credentials = useResource<Credential[]>('/credentials');
-  const [adding, setAdding] = useState(false);
+  const canManage = user.role === 'ADMIN';
+  const credentials = useResource<Credential[]>(canManage ? '/credentials' : null);
+  const [editing, setEditing] = useState<Registry | 'new' | null>(null);
+  const [address, setAddress] = useState('');
+  const [credentialId, setCredentialId] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [checking, setChecking] = useState<string | null>(null);
+  const [outcome, setOutcome] = useState<{
+    registry: Registry;
+    success: boolean;
+    message: string;
+  }>();
+  const current = editing && editing !== 'new' ? editing : undefined;
+  const availableCredentials = credentials.data?.filter(
+    (c) => ['DOCKER_REGISTRY', 'USERNAME_PASSWORD'].includes(c.type) && c.status === 'ACTIVE',
+  );
+
+  function open(registry: Registry | 'new') {
+    setError('');
+    setAddress(registry === 'new' ? '' : registry.registryUrl);
+    setCredentialId(registry === 'new' ? '' : (registry.credentialId ?? ''));
+    setEditing(registry);
+  }
+
   async function save(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setBusy(true);
     setError('');
     const f = new FormData(e.currentTarget);
+    const definition = {
+      name: String(f.get('name') ?? '').trim(),
+      registryUrl: String(f.get('registryUrl') ?? '').trim(),
+      credentialId: f.get('credentialId') || null,
+    };
     try {
-      await post('/registries', {
-        name: f.get('name'),
-        registryUrl: f.get('registryUrl'),
-        credentialId: f.get('credentialId') || undefined,
-      });
-      setAdding(false);
+      if (current) {
+        await api(`/registries/${current.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify(definition),
+        });
+      } else {
+        await post('/registries', definition);
+      }
+      setEditing(null);
       void registries.reload();
     } catch (err) {
       setError(message(err));
@@ -1008,6 +1464,23 @@ export function RegistriesPage({ user }: { user: User }) {
       setBusy(false);
     }
   }
+
+  async function check(registry: Registry) {
+    if (checking) return;
+    setChecking(registry.id);
+    setOutcome(undefined);
+    try {
+      const result = await post<{ success: boolean; message: string }>(
+        `/registries/${registry.id}/test`,
+      );
+      setOutcome({ registry, ...result });
+    } catch (err) {
+      setOutcome({ registry, success: false, message: message(err) });
+    } finally {
+      setChecking(null);
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -1015,8 +1488,8 @@ export function RegistriesPage({ user }: { user: User }) {
         title="镜像仓库"
         description="配置 Registry 地址与凭据引用，为管理端镜像构建和多服务器部署提供分发通道。"
         action={
-          user.role === 'ADMIN' && (
-            <button className="button primary" onClick={() => setAdding(true)}>
+          canManage && (
+            <button className="button primary" onClick={() => open('new')}>
               <Plus size={16} />
               添加 Registry
             </button>
@@ -1024,7 +1497,7 @@ export function RegistriesPage({ user }: { user: User }) {
         }
       />
       <ErrorBanner error={registries.error} />
-      <Section title="Registry" subtitle="凭据在凭据中心加密保存">
+      <Section title="Registry" subtitle="连接测试从管理端访问 Registry V2">
         {registries.loading ? (
           <Loading />
         ) : !registries.data?.length ? (
@@ -1044,16 +1517,51 @@ export function RegistriesPage({ user }: { user: User }) {
                   <small>{r.registryUrl}</small>
                 </div>
                 <span className="tag">{r.credentialId ? '已关联凭据' : '匿名访问'}</span>
+                {canManage && (
+                  <span className="row-actions">
+                    <button
+                      className="button compact"
+                      disabled={checking !== null}
+                      onClick={() => void check(r)}
+                    >
+                      <ShieldCheck size={14} /> {checking === r.id ? '测试中…' : '测试连接'}
+                    </button>
+                    <button
+                      className="button compact"
+                      disabled={checking !== null}
+                      onClick={() => open(r)}
+                    >
+                      <Pencil size={14} /> 编辑
+                    </button>
+                  </span>
+                )}
               </div>
             ))}
           </div>
         )}
       </Section>
-      {adding && (
-        <Modal title="添加镜像仓库" onClose={() => setAdding(false)}>
-          <Form onSubmit={save} onCancel={() => setAdding(false)} error={error} busy={busy}>
+      {outcome && (
+        <Modal title={`${outcome.registry.name} · 连接测试`} onClose={() => setOutcome(undefined)}>
+          {outcome.success ? (
+            <p role="status">{outcome.message}</p>
+          ) : (
+            <ErrorBanner error={outcome.message} />
+          )}
+        </Modal>
+      )}
+      {editing && (
+        <Modal
+          title={current ? '编辑镜像仓库' : '添加镜像仓库'}
+          onClose={() => !busy && setEditing(null)}
+        >
+          <Form
+            onSubmit={save}
+            onCancel={() => setEditing(null)}
+            error={error || credentials.error}
+            busy={busy || credentials.loading}
+          >
             <Field label="名称" required>
-              <input name="name" required maxLength={100} />
+              <input name="name" required maxLength={120} defaultValue={current?.name} />
             </Field>
             <Field
               label="Registry 地址"
@@ -1063,24 +1571,39 @@ export function RegistriesPage({ user }: { user: User }) {
               <input
                 name="registryUrl"
                 required
-                pattern="[a-zA-Z0-9.-]+(?::[0-9]+)?"
+                maxLength={259}
                 placeholder="registry.example.com"
+                value={address}
+                onChange={(event) => {
+                  if (current && address === current.registryUrl && event.target.value !== address)
+                    setCredentialId('');
+                  setAddress(event.target.value);
+                }}
               />
             </Field>
-            <Field label="Registry 凭据">
-              <select name="credentialId">
+            <Field
+              label="Registry 凭据"
+              hint={
+                current?.credentialId && address !== current.registryUrl
+                  ? '地址已变更，请确认新地址使用的凭据。'
+                  : undefined
+              }
+            >
+              <select
+                name="credentialId"
+                value={credentialId}
+                onChange={(event) => setCredentialId(event.target.value)}
+              >
                 <option value="">匿名访问</option>
-                {credentials.data
-                  ?.filter(
-                    (c) =>
-                      ['DOCKER_REGISTRY', 'USERNAME_PASSWORD'].includes(c.type) &&
-                      c.status === 'ACTIVE',
-                  )
-                  .map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
+                {current?.credentialId &&
+                  !availableCredentials?.some((c) => c.id === current.credentialId) && (
+                    <option value={current.credentialId}>原凭据不可用</option>
+                  )}
+                {availableCredentials?.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
               </select>
             </Field>
             <p className="muted">需要认证时，请先在凭据中心创建 Docker Registry 凭据。</p>

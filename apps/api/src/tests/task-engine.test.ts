@@ -217,7 +217,7 @@ test('database queue claims a task only once and keeps connection snapshots immu
     assert.equal((await tasks.targets(task.id))[0]?.host, 'old.example');
     assert.equal((await tasks.targets(task.id))[0]?.serverName, 'original');
   } finally {
-    await fixture.database.onModuleDestroy();
+    await fixture.database.onApplicationShutdown();
   }
 });
 test('expired leases require attention and never requeue uncertain writes', async () => {
@@ -252,7 +252,7 @@ test('expired leases require attention and never requeue uncertain writes', asyn
     assert.equal((await tasks.targets(task.id))[0]?.status, 'NEEDS_ATTENTION');
     assert.equal(await worker.claim(), undefined);
   } finally {
-    await fixture.database.onModuleDestroy();
+    await fixture.database.onApplicationShutdown();
   }
 });
 test('pending cancellation atomically cancels all targets without running', async () => {
@@ -283,7 +283,7 @@ test('pending cancellation atomically cancels all targets without running', asyn
       undefined,
     );
   } finally {
-    await fixture.database.onModuleDestroy();
+    await fixture.database.onApplicationShutdown();
   }
 });
 
@@ -363,12 +363,17 @@ test('lease recovery fences late target and step completions from the old worker
       .where('id', '=', task.id)
       .execute();
     await worker.recoverExpired();
+    await assert.rejects(
+      () => ctx.startStep(targetId, serverId, { name: 'late', command: 'write' }, 1),
+      /租约/,
+    );
     await ctx.finishStep(stepId, 'SUCCESS', 0);
     await ctx.finishTarget(targetId, 'SUCCESS', 0);
     assert.equal((await tasks.targets(task.id))[0]?.status, 'NEEDS_ATTENTION');
     assert.equal((await tasks.steps(task.id))[0]?.status, 'NEEDS_ATTENTION');
+    assert.equal((await tasks.steps(task.id)).length, 1);
   } finally {
-    await fixture.database.onModuleDestroy();
+    await fixture.database.onApplicationShutdown();
   }
 });
 
@@ -421,7 +426,7 @@ test('registered handlers execute through the queue and persist target and paren
     assert.ok(row.log_size_bytes > 0);
   } finally {
     await worker?.onModuleDestroy();
-    await fixture.database.onModuleDestroy();
+    await fixture.database.onApplicationShutdown();
   }
 });
 test('running cancellation signals the active handler and reaches CANCELLED', async () => {
@@ -466,6 +471,120 @@ test('running cancellation signals the active handler and reaches CANCELLED', as
     assert.equal((await tasks.targets(task.id))[0]?.status, 'CANCELLED');
   } finally {
     await worker?.onModuleDestroy();
-    await fixture.database.onModuleDestroy();
+    await fixture.database.onApplicationShutdown();
+  }
+});
+
+test('a thrown handler and unavailable log sink finalize active records before the completion hook', async () => {
+  const { database, tasks, userId, logs } = await databaseFixture();
+  const registry = new TaskHandlerRegistry();
+  const worker = new TaskWorkerService(database, tasks, registry, logs);
+  try {
+    const serverId = randomUUID();
+    const now = Date.now();
+    await database.db
+      .insertInto('servers')
+      .values({
+        id: serverId,
+        name: 'server',
+        host: 'host',
+        username: 'ops',
+        created_at: now,
+        updated_at: now,
+      })
+      .execute();
+    const task = await tasks.create(
+      { type: 'COMMAND', name: 'failed-storage', payload: payload([target(serverId)]) },
+      userId,
+    );
+    let observed: string[] | undefined;
+    registry.register({
+      type: 'COMMAND',
+      execute: async (_record, context) => {
+        const id = await context.startTarget(serverId);
+        await context.startStep(id, serverId, { name: 'publish', command: '' }, 0);
+        logs.append = () => {
+          throw new Error('disk unavailable');
+        };
+        context.log('write to unavailable log sink');
+      },
+      afterCompletion: async (record) => {
+        observed = [
+          (await tasks.row(record.id)).status,
+          (await tasks.targets(record.id))[0]!.status,
+          (await tasks.steps(record.id))[0]!.status,
+        ];
+        throw new Error('analysis failed');
+      },
+    });
+    await worker.tick();
+    await waitFor(async () => Boolean(observed));
+    assert.deepEqual(observed, ['NEEDS_ATTENTION', 'NEEDS_ATTENTION', 'NEEDS_ATTENTION']);
+    const row = await tasks.row(task.id);
+    assert.equal(row.lease_owner, null);
+    assert.equal(row.lease_expires_at, null);
+    assert.match(row.error_summary!, /日志存储失败/);
+    assert.equal(await worker.claim(), undefined);
+  } finally {
+    await worker.shutdown();
+    await database.onApplicationShutdown();
+  }
+});
+
+test('shutdown waits for active execution before releasing SQLite ownership', async () => {
+  const { database, tasks, userId, logs } = await databaseFixture();
+  const registry = new TaskHandlerRegistry();
+  const worker = new TaskWorkerService(database, tasks, registry, logs);
+  try {
+    const serverId = randomUUID();
+    const now = Date.now();
+    await database.db
+      .insertInto('servers')
+      .values({
+        id: serverId,
+        name: 'server',
+        host: 'host',
+        username: 'ops',
+        created_at: now,
+        updated_at: now,
+      })
+      .execute();
+    const task = await tasks.create(
+      { type: 'COMMAND', name: 'in-flight', payload: payload([target(serverId)]) },
+      userId,
+    );
+    let receivedShutdown = false;
+    registry.register({
+      type: 'COMMAND',
+      execute: async (_record, context) => {
+        const id = await context.startTarget(serverId);
+        const step = await context.startStep(id, serverId, { name: 'write', command: '' }, 0);
+        await new Promise<void>((resolve) => {
+          if (context.signal.aborted) resolve();
+          else context.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        receivedShutdown = true;
+        await context.finishStep(step, 'CANCELLED', null);
+        await context.finishTarget(id, 'CANCELLED', null);
+      },
+    });
+    await worker.tick();
+    await waitFor(async () => (await tasks.steps(task.id))[0]?.status === 'RUNNING');
+    await worker.shutdown();
+    assert.equal(receivedShutdown, true);
+    assert.equal((await tasks.row(task.id)).status, 'NEEDS_ATTENTION');
+    assert.equal((await tasks.targets(task.id))[0]?.status, 'NEEDS_ATTENTION');
+    assert.equal((await tasks.steps(task.id))[0]?.status, 'NEEDS_ATTENTION');
+    assert.equal(
+      await database.db
+        .selectFrom('system_settings')
+        .select('key')
+        .where('key', '=', 'worker:sqlite-owner')
+        .executeTakeFirst(),
+      undefined,
+    );
+  } finally {
+    await worker.shutdown();
+    await database.onApplicationShutdown();
   }
 });

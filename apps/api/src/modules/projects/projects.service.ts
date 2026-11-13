@@ -4,6 +4,7 @@ import {
   ConflictException,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   Global,
   Injectable,
@@ -29,7 +30,14 @@ import {
 import { DatabaseService } from '../../core/database/database.service';
 import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
+import type { CurrentUser } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
+import {
+  httpCloneUrl,
+  isGitCredentialType,
+  RepositoryMetadataController,
+  RepositoryMetadataService,
+} from './repository-metadata.service';
 
 class ProjectDto {
   @IsString() @MinLength(1) @MaxLength(100) name!: string;
@@ -178,24 +186,26 @@ export class ProjectsService {
     await this.audit.record(userId, 'project.delete', 'project', id);
     return { success: true };
   }
-  async repository(projectId: string, dto: RepositoryDto, userId: string) {
+  async repository(projectId: string, dto: RepositoryDto, user: CurrentUser) {
     await this.get(projectId);
-    if (/^https?:\/\//.test(dto.cloneUrl)) {
-      const url = new URL(dto.cloneUrl);
-      if (url.username || url.password || url.search || url.hash)
-        throw new BadRequestException('仓库地址不能包含凭据、查询或片段，请使用凭据引用');
-    } else if (!/^git@[a-zA-Z0-9_.-]+:[\w./-]+(?:\.git)?$/.test(dto.cloneUrl))
+    const isHttp = /^https?:\/\//i.test(dto.cloneUrl);
+    const cloneUrl = isHttp ? httpCloneUrl(dto.cloneUrl) : dto.cloneUrl;
+    if (!isHttp && !/^git@[a-zA-Z0-9_.-]+:[\w./-]+(?:\.git)?$/.test(cloneUrl))
       throw new BadRequestException('请使用 HTTPS URL 或 git@host:path 格式');
-    if (
-      dto.credentialId &&
-      !(await this.database.db
+    if (dto.credentialId) {
+      if (user.role !== 'ADMIN') throw new ForbiddenException('仅管理员可为仓库关联凭据');
+      const credential = await this.database.db
         .selectFrom('credentials')
-        .select('id')
+        .select('type')
         .where('id', '=', dto.credentialId)
         .where('status', '=', 'ACTIVE')
-        .executeTakeFirst())
-    )
-      throw new BadRequestException('凭据无效');
+        .executeTakeFirst();
+      if (
+        !credential ||
+        !(isHttp ? isGitCredentialType(credential.type) : credential.type === 'SSH_KEY')
+      )
+        throw new BadRequestException('凭据无效或与仓库协议不匹配');
+    }
     const now = Date.now();
     const id = randomUUID();
     await this.database.db
@@ -204,14 +214,14 @@ export class ProjectsService {
         id,
         project_id: projectId,
         name: dto.name,
-        clone_url: dto.cloneUrl,
+        clone_url: cloneUrl,
         credential_id: dto.credentialId || null,
         default_branch: dto.defaultBranch || 'main',
         created_at: now,
         updated_at: now,
       })
       .execute();
-    await this.audit.record(userId, 'repository.create', 'project', projectId);
+    await this.audit.record(user.id, 'repository.create', 'project', projectId);
     return (await this.get(projectId)).repositories.find((r) => r.id === id);
   }
   async service(projectId: string, dto: ServiceDto, userId: string) {
@@ -291,7 +301,7 @@ class ProjectsController {
     @Body() dto: RepositoryDto,
     @Req() req: AuthRequest,
   ) {
-    return this.service.repository(id, dto, req.user.id);
+    return this.service.repository(id, dto, req.user);
   }
   @Roles('ADMIN', 'OPERATOR') @Post(':id/services') serviceCreate(
     @Param('id') id: string,
@@ -310,8 +320,8 @@ class ProjectsController {
 }
 @Global()
 @Module({
-  controllers: [ProjectsController],
-  providers: [ProjectsService],
-  exports: [ProjectsService],
+  controllers: [ProjectsController, RepositoryMetadataController],
+  providers: [ProjectsService, RepositoryMetadataService],
+  exports: [ProjectsService, RepositoryMetadataService],
 })
 export class ProjectsModule {}

@@ -24,7 +24,7 @@ export function configureApp(app: NestExpressApplication) {
   app.useGlobalInterceptors(new ApiResponseInterceptor());
 }
 export async function createApp() {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bodyParser: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { rawBody: true });
   configureApp(app);
   // Swagger is available only during local development. No production auth bypass.
   if (process.env.NODE_ENV !== 'production') {

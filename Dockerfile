@@ -21,7 +21,7 @@ ENV NODE_ENV=production \
     WORKER_ENABLED=true \
     WORKER_CONCURRENCY=1
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /app/data/database /app/data/logs /app/data/artifacts /app/data/backups \
     && chown -R node:node /app

@@ -172,7 +172,7 @@ async function fixture(withAdmin = true) {
       return new Auth(database, new Audit(database), initial);
     },
     async close() {
-      await database.onModuleDestroy();
+      await database.onApplicationShutdown();
     },
   };
 }
@@ -276,15 +276,19 @@ test('tampered authentication tags, wrong master keys, malformed envelopes and m
     await f.close();
   }
 });
-test('failed optional provider creation does not block administrator setup or create a bootstrap session twice', async () => {
+test('failed optional provider creation does not block initial administrator login', async () => {
   const f = await fixture(false);
   try {
-    // Remove the synthetic VIEWER so the real first-user flow can run.
+    // Remove the synthetic VIEWER so startup can initialize a fresh database.
     await f.database.db.deleteFrom('users').where('id', '=', f.viewerId).execute();
     await f.write();
     f.fail();
-    const session = await f.auth().setup('first-admin', 'bootstrap-login-test-1234');
+    process.env.ADMIN_PASSWORD = 'bootstrap-login-test-1234';
+    const auth = f.auth();
+    await auth.onApplicationBootstrap();
+    const session = await auth.login('root', 'bootstrap-login-test-1234');
     assert.equal(session.user.role, 'ADMIN');
+    assert.equal(session.user.mustChangePassword, true);
     assert.equal(session.token.length, 64);
     assert.equal(f.created, 0);
     await access(f.file);
@@ -292,11 +296,77 @@ test('failed optional provider creation does not block administrator setup or cr
       f.diagnostics.some((m) => m.includes(fakeKey)),
       false,
     );
-    await assert.rejects(
-      f.auth().setup('second-admin', 'bootstrap-login-test-1234'),
-      /系统已初始化/,
-    );
+    process.env.ADMIN_PASSWORD = 'different-bootstrap-password';
+    await auth.onApplicationBootstrap();
+    await assert.rejects(auth.login('root', 'different-bootstrap-password'), /用户名或密码错误/);
   } finally {
+    delete process.env.ADMIN_PASSWORD;
+    await f.close();
+  }
+});
+
+test('concurrent fresh startups print one generated password after persistence and preserve it on restart', async (context) => {
+  const f = await fixture(false);
+  const { Database, Initial, Auth, Audit } = await classes();
+  const secondDatabase = new Database();
+  const secondInitial = new Initial(secondDatabase, {} as AiProvidersService);
+  const second = new Auth(secondDatabase, new Audit(secondDatabase), secondInitial);
+  const original = f.auth();
+  const output = context.mock.method(console, 'log', () => {});
+  try {
+    delete process.env.ADMIN_PASSWORD;
+    await f.database.db.deleteFrom('users').where('id', '=', f.viewerId).execute();
+    await Promise.all([original.onApplicationBootstrap(), second.onApplicationBootstrap()]);
+    assert.equal(output.mock.callCount(), 1);
+    const generated = String(output.mock.calls[0]?.arguments[0] || '').match(
+      /root: ([A-Za-z0-9_-]{32})$/,
+    )?.[1];
+    assert.ok(generated, 'startup must print a usable randomly generated password');
+    const users = await f.database.db
+      .selectFrom('users')
+      .select(['username', 'role', 'must_change_password'])
+      .execute();
+    assert.deepEqual(users, [{ username: 'root', role: 'ADMIN', must_change_password: 1 }]);
+    const session = await original.login('root', generated);
+    assert.equal(session.user.mustChangePassword, true);
+    process.env.ADMIN_PASSWORD = 'fixture-restart-ignored';
+    await second.onApplicationBootstrap();
+    assert.equal(output.mock.callCount(), 1);
+    await assert.rejects(second.login('root', 'fixture-restart-ignored'), /用户名或密码错误/);
+    assert.equal((await second.login('root', generated)).user.id, session.user.id);
+  } finally {
+    delete process.env.ADMIN_PASSWORD;
+    await secondDatabase.onApplicationShutdown();
+    await f.close();
+  }
+});
+
+test('password rotation fences sessions created concurrently with the initial password', async () => {
+  const f = await fixture(false);
+  try {
+    await f.database.db.deleteFrom('users').where('id', '=', f.viewerId).execute();
+    const oldPassword = 'fixture-race-initial-password';
+    const newPassword = 'fixture-race-changed-password';
+    process.env.ADMIN_PASSWORD = oldPassword;
+    const auth = f.auth();
+    await auth.onApplicationBootstrap();
+    const { token, user } = await auth.login('root', oldPassword);
+    const change = auth.changePassword(user.id, token, oldPassword, newPassword);
+    const logins = Promise.allSettled(
+      Array.from({ length: 8 }, () => auth.login('root', oldPassword)),
+    );
+    await change;
+    for (const result of await logins) {
+      if (result.status === 'fulfilled') {
+        assert.equal(result.value.user.mustChangePassword, true);
+        await assert.rejects(auth.resolve(result.value.token), /登录已过期/);
+      } else assert.match(String(result.reason), /用户名或密码错误/);
+    }
+    await assert.rejects(auth.resolve(token), /登录已过期/);
+    const next = await auth.login('root', newPassword);
+    assert.equal((await auth.resolve(next.token)).mustChangePassword, false);
+  } finally {
+    delete process.env.ADMIN_PASSWORD;
     await f.close();
   }
 });

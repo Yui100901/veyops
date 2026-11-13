@@ -1,0 +1,340 @@
+import 'reflect-metadata';
+import assert from 'node:assert/strict';
+import { execFile, spawn } from 'node:child_process';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { promisify } from 'node:util';
+import { Test } from '@nestjs/testing';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import request from 'supertest';
+
+const exec = promisify(execFile);
+
+async function gitHttpFixture(directory: string, token: string) {
+  const authorization = `Basic ${Buffer.from(`fixture-user:${token}`).toString('base64')}`;
+  let authenticatedRequests = 0;
+  const server = createServer((req, res) => {
+    if (req.headers.authorization !== authorization) {
+      res.writeHead(401, { 'www-authenticate': 'Basic realm="fixture"' }).end();
+      return;
+    }
+    authenticatedRequests++;
+    const url = new URL(req.url!, 'http://127.0.0.1');
+    if (url.pathname.startsWith('/redirect.git/')) {
+      res.writeHead(302, { location: req.url!.replace('/redirect.git/', '/source.git/') }).end();
+      return;
+    }
+    const backend = spawn('git', ['http-backend'], {
+      env: {
+        ...process.env,
+        GIT_PROJECT_ROOT: directory.replaceAll('\\', '/'),
+        GIT_HTTP_EXPORT_ALL: '1',
+        PATH_INFO: url.pathname,
+        QUERY_STRING: url.search.slice(1),
+        REQUEST_METHOD: req.method!,
+        CONTENT_TYPE: req.headers['content-type'] || '',
+        CONTENT_LENGTH: req.headers['content-length'] || '',
+        GIT_PROTOCOL: String(req.headers['git-protocol'] || ''),
+      },
+      windowsHide: true,
+    });
+    const chunks: Buffer[] = [];
+    backend.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+    backend.stderr.resume();
+    backend.on('error', () => res.writeHead(500).end());
+    backend.on('close', (code) => {
+      if (res.writableEnded) return;
+      const response = Buffer.concat(chunks);
+      const delimiter = Buffer.from('\r\n\r\n');
+      const split = response.indexOf(delimiter);
+      if (code !== 0 || split === -1) {
+        res.writeHead(500).end();
+        return;
+      }
+      let status = 200;
+      for (const line of response.subarray(0, split).toString('ascii').split('\r\n')) {
+        const colon = line.indexOf(':');
+        if (colon < 1) continue;
+        const name = line.slice(0, colon);
+        const value = line.slice(colon + 1).trim();
+        if (name.toLowerCase() === 'status') status = Number(value.slice(0, 3));
+        else res.setHeader(name, value);
+      }
+      res.writeHead(status).end(response.subarray(split + delimiter.length));
+    });
+    backend.stdin.on('error', () => undefined);
+    req.pipe(backend.stdin);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  return {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    authenticatedRequests: () => authenticatedRequests,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+test('repository metadata uses authenticated smart HTTP and returns exact commits on the selected branch', async (t) => {
+  try {
+    await exec('git', ['--version']);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    t.skip('Git executable unavailable');
+    return;
+  }
+  const directory = await mkdtemp(join(tmpdir(), 'veyops-git-metadata-test-'));
+  const resources: {
+    app?: NestExpressApplication;
+    fixture?: Awaited<ReturnType<typeof gitHttpFixture>>;
+  } = {};
+  t.after(async () => {
+    await resources.app?.close();
+    await resources.fixture?.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  });
+  const token = 'fixture-git-token-for-metadata-only';
+  const authorDate = '2024-03-12T08:10:00+08:00';
+  const source = join(directory, 'source');
+  const git = (...args: string[]) =>
+    exec(
+      'git',
+      [
+        '-c',
+        'user.name=Fixture Author',
+        '-c',
+        'user.email=fixture@example.invalid',
+        '-c',
+        'commit.gpgSign=false',
+        ...args,
+      ],
+      {
+        cwd: directory,
+        env: { ...process.env, GIT_AUTHOR_DATE: authorDate, GIT_COMMITTER_DATE: authorDate },
+        windowsHide: true,
+      },
+    );
+  await git('init', '--initial-branch=main', '--template=', source);
+  const docs = join(source, 'docs');
+  await mkdir(docs);
+  await writeFile(join(docs, 'DEPLOY.md'), `# First release\n使用凭据 ${token}\n`);
+  await writeFile(join(docs, 'deployment.md'), Buffer.alloc(12 * 1024 + 1, 65));
+  await writeFile(join(source, 'pointer.txt'), '../docs/DEPLOY.md');
+  await git('-C', source, 'add', 'docs');
+  const pointer = (await git('-C', source, 'hash-object', '-w', 'pointer.txt')).stdout.trim();
+  await git(
+    '-C',
+    source,
+    'update-index',
+    '--add',
+    '--cacheinfo',
+    `120000,${pointer},link/DEPLOY.md`,
+  );
+  const commit = async (subject: string) => {
+    await git('-C', source, 'commit', '--allow-empty', '-m', subject);
+    return (await git('-C', source, 'rev-parse', 'HEAD')).stdout.trim();
+  };
+  const first = await commit('First change');
+  await writeFile(join(docs, 'DEPLOY.md'), '# Second release\n');
+  await git('-C', source, 'add', 'docs/DEPLOY.md');
+  const second = await commit('Second change');
+  const main = await commit('Third change');
+  await git('-C', source, 'switch', '-c', 'feature/release', first);
+  const feature = await commit(`Branch change with ${token}`);
+  await git('-C', source, 'switch', 'main');
+  const bare = join(directory, 'source.git');
+  await git('clone', '--bare', '--template=', '--', source, bare);
+  await git('--git-dir', bare, 'config', 'uploadpack.allowFilter', 'true');
+  await git('--git-dir', bare, 'config', 'uploadpack.allowReachableSHA1InWant', 'true');
+  const fixture = await gitHttpFixture(directory, token);
+  resources.fixture = fixture;
+
+  const initialPassword = 'fixture-metadata-password';
+  const password = 'fixture-metadata-renewed-password';
+  Object.assign(process.env, {
+    DATABASE_CLIENT: 'sqlite',
+    DATABASE_PATH: join(directory, 'test.db'),
+    DATA_DIR: directory,
+    ENCRYPTION_KEY: randomBytes(32).toString('hex'),
+    WORKER_ENABLED: 'false',
+    ADMIN_PASSWORD: initialPassword,
+  });
+  const { AppModule } = await import('../app.module.js');
+  const { configureApp } = await import('../bootstrap.js');
+  const { DatabaseService } = await import('../core/database/database.service.js');
+  const { RepositoryMetadataService } =
+    await import('../modules/projects/repository-metadata.service.js');
+  const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+  const app = moduleRef.createNestApplication<NestExpressApplication>({ logger: false });
+  resources.app = app;
+  configureApp(app);
+  await app.init();
+  const admin = request.agent(app.getHttpServer());
+  await admin
+    .post('/api/v1/auth/login')
+    .send({ username: 'root', password: initialPassword })
+    .expect(201);
+  await admin
+    .post('/api/v1/auth/change-password')
+    .send({ currentPassword: initialPassword, newPassword: password })
+    .expect(200);
+  await admin.post('/api/v1/auth/login').send({ username: 'root', password }).expect(201);
+  const db = app.get(DatabaseService).db;
+  const root = await db
+    .selectFrom('users')
+    .select('password_hash')
+    .where('username', '=', 'root')
+    .executeTakeFirstOrThrow();
+  const sessions = new Map<'OPERATOR' | 'VIEWER', typeof admin>();
+  for (const role of ['OPERATOR', 'VIEWER'] as const) {
+    await db
+      .insertInto('users')
+      .values({
+        id: randomUUID(),
+        username: role.toLowerCase(),
+        password_hash: root.password_hash,
+        role,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      })
+      .execute();
+    const session = request.agent(app.getHttpServer());
+    await session
+      .post('/api/v1/auth/login')
+      .send({ username: role.toLowerCase(), password })
+      .expect(201);
+    sessions.set(role, session);
+  }
+  const operator = sessions.get('OPERATOR')!;
+  const viewer = sessions.get('VIEWER')!;
+  const project = (
+    await admin.post('/api/v1/projects').send({ name: 'Fixture', slug: 'fixture' }).expect(201)
+  ).body.data.id;
+  const other = (
+    await admin.post('/api/v1/projects').send({ name: 'Other', slug: 'other' }).expect(201)
+  ).body.data.id;
+  const credential = (
+    await admin
+      .post('/api/v1/credentials')
+      .send({
+        name: 'Git Fixture',
+        type: 'GIT_TOKEN',
+        secret: { username: 'fixture-user', token },
+      })
+      .expect(201)
+  ).body.data.id;
+  const repositoryPath = `/api/v1/projects/${project}/repositories`;
+  const create = {
+    name: 'Private fixture',
+    cloneUrl: `${fixture.url}/source.git`,
+    defaultBranch: 'old',
+  };
+  await operator
+    .post(repositoryPath)
+    .send({ ...create, credentialId: credential })
+    .expect(403);
+  await operator
+    .post(repositoryPath)
+    .send({ ...create, name: 'Public fixture' })
+    .expect(201);
+  const id = (
+    await admin
+      .post(repositoryPath)
+      .send({ ...create, credentialId: credential })
+      .expect(201)
+  ).body.data.id;
+  const metadataPath = `${repositoryPath}/${id}`;
+
+  await viewer.get(`${metadataPath}/connection`).expect(403);
+  await admin.get(`/api/v1/projects/${other}/repositories/${id}/branches`).expect(404);
+  assert.equal(fixture.authenticatedRequests(), 0);
+  const metadata = app.get(RepositoryMetadataService);
+  await assert.rejects(
+    metadata.readDeploymentDoc(other, id, first, 'docs/DEPLOY.md'),
+    /仓库不存在/,
+  );
+  await assert.rejects(metadata.readDeploymentDoc(project, id, first, '../DEPLOY.md'), /相对路径/);
+  await assert.rejects(
+    metadata.readDeploymentDoc(project, id, 'main', 'DEPLOY.md'),
+    /完整 Git Commit/,
+  );
+  assert.equal(fixture.authenticatedRequests(), 0);
+  const originalDoc = await metadata.readDeploymentDoc(project, id, first, 'docs/DEPLOY.md');
+  assert.equal(originalDoc.commitSha, first);
+  assert.equal(originalDoc.path, 'docs/DEPLOY.md');
+  assert.equal(
+    originalDoc.content.replaceAll('\r\n', '\n'),
+    '# First release\n使用凭据 [REDACTED]\n',
+  );
+  const latestDoc = await metadata.readDeploymentDoc(project, id, main, 'docs/DEPLOY.md');
+  assert.equal(latestDoc.content.replaceAll('\r\n', '\n'), '# Second release\n');
+  await assert.rejects(
+    metadata.readDeploymentDoc(project, id, first, 'DEPLOY.md'),
+    /不存在该部署文档/,
+  );
+  await assert.rejects(
+    metadata.readDeploymentDoc(project, id, first, 'link/DEPLOY.md'),
+    /普通文件/,
+  );
+  await assert.rejects(metadata.readDeploymentDoc(project, id, first, 'docs/deployment.md'));
+  assert.deepEqual((await operator.get(`${metadataPath}/connection`).expect(200)).body.data, {
+    ok: true,
+    defaultBranch: 'main',
+  });
+  assert.deepEqual((await operator.get(`${metadataPath}/branches`).expect(200)).body.data, {
+    defaultBranch: 'main',
+    branches: [
+      { name: 'feature/release', sha: feature },
+      { name: 'main', sha: main },
+    ],
+  });
+  const recent = await operator.get(`${metadataPath}/commits`).query({ limit: 2 }).expect(200);
+  assert.equal(recent.body.data.branch, 'main');
+  assert.deepEqual(
+    recent.body.data.commits.map((entry: { sha: string }) => entry.sha),
+    [main, second],
+  );
+  const selected = await operator
+    .get(`${metadataPath}/commits`)
+    .query({ branch: 'feature/release', limit: 1 })
+    .expect(200);
+  assert.equal(selected.body.data.branch, 'feature/release');
+  assert.deepEqual(selected.body.data.commits, [
+    {
+      sha: feature,
+      subject: 'Branch change with [REDACTED]',
+      authoredAt: '2024-03-12T00:10:00.000Z',
+      authorName: 'Fixture Author',
+    },
+  ]);
+  assert.ok(fixture.authenticatedRequests() > 0);
+  await operator
+    .get(`${metadataPath}/commits`)
+    .query({ branch: '--upload-pack=payload' })
+    .expect(400);
+  await operator.get(`${metadataPath}/commits`).query({ limit: 51 }).expect(400);
+  const failure = await operator
+    .get(`${metadataPath}/commits`)
+    .query({ branch: 'absent' })
+    .expect(502);
+  assert.doesNotMatch(JSON.stringify(failure.body), /fixture-git-token|127\.0\.0\.1|fatal:/);
+  const redirect = (
+    await admin
+      .post(repositoryPath)
+      .send({
+        name: 'Redirect fixture',
+        cloneUrl: `${fixture.url}/redirect.git`,
+        credentialId: credential,
+      })
+      .expect(201)
+  ).body.data.id;
+  await operator.get(`${repositoryPath}/${redirect}/connection`).expect(502);
+  await admin.delete(`/api/v1/projects/${project}`).expect(200);
+  await operator.get(`${metadataPath}/connection`).expect(404);
+});

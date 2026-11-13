@@ -1,0 +1,17 @@
+{
+  "name": "veyops-typescript-http",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "packageManager": "pnpm@10.20.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node copy-scripts.cjs"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.3",
+    "typescript": "5.9.3"
+  }
+}

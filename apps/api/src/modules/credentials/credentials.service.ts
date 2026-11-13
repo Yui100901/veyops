@@ -128,12 +128,10 @@ export class CredentialsService {
     await this.audit.record(userId, 'credential.create', 'credential', id);
     return (await this.list()).find((c) => c.id === id)!;
   }
-  async decrypt(id: string): Promise<Record<string, string>> {
-    const row = await this.database.db
-      .selectFrom('credentials')
-      .selectAll()
-      .where('id', '=', id)
-      .executeTakeFirst();
+  async decrypt(id: string, expectedNonce?: string): Promise<Record<string, string>> {
+    let query = this.database.db.selectFrom('credentials').selectAll().where('id', '=', id);
+    if (expectedNonce) query = query.where('nonce', '=', expectedNonce);
+    const row = await query.executeTakeFirst();
     if (!row || row.status !== 'ACTIVE') throw new BadRequestException('凭据不存在或已禁用');
     const decipher = createDecipheriv('aes-256-gcm', this.key, Buffer.from(row.nonce, 'base64'));
     decipher.setAuthTag(Buffer.from(row.auth_tag, 'base64'));

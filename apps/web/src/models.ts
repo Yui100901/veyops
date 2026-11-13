@@ -2,6 +2,7 @@ export interface User {
   id: string;
   username: string;
   role: 'ADMIN' | 'OPERATOR' | 'VIEWER';
+  mustChangePassword: boolean;
 }
 export interface Credential {
   id: string;
@@ -60,6 +61,13 @@ export interface ProjectDetail extends Project {
 export interface Task {
   id: string;
   type: string;
+  executionMode?: 'BUILD_ONLY' | 'DEPLOY' | null;
+  pipelineRunId?: string | null;
+  result?: {
+    aiAnalysis?:
+      | { status: 'SUCCESS'; summary: string; failedPhase: string | null; nextActions: string[] }
+      | { status: 'UNAVAILABLE' };
+  } | null;
   name: string;
   status: string;
   createdAt: number;
