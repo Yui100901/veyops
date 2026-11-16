@@ -26,7 +26,7 @@ esac
 ours() {
   [ -r "/proc/$pid/cmdline" ] &&
     [ "$(stat -c %u "/proc/$pid" 2>/dev/null)" = "$(id -u)" ] &&
-    [ "$(tr '\000' '\n' <"/proc/$pid/cmdline" 2>/dev/null | sed -n '2p')" = "$entrypoint" ]
+    [ "$( (tr '\000' '\n' <"/proc/$pid/cmdline") 2>/dev/null | sed -n '2p')" = "$entrypoint" ]
 }
 if ours; then
   kill -TERM "$pid" 2>/dev/null || true

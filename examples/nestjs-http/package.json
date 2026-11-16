@@ -1,0 +1,23 @@
+{
+  "name": "veyops-nestjs-http",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node prepare-dist.cjs && npm ci --prefix dist --omit=dev --ignore-scripts --no-bin-links --no-audit --no-fund"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.2.9",
+    "@nestjs/core": "11.2.9",
+    "@nestjs/platform-express": "11.2.9",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "5.9.3"
+  }
+}

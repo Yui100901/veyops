@@ -27,6 +27,8 @@
 
 管理端需配置本机可用的隔离 Docker 构建环境。构建容器需要访问 Git HTTP(S) 仓库和 npm Registry。仓库私有时通过凭据中心关联 Git 凭据。pnpm 由 `package.json` 固定为 `10.20.0`，Corepack 首次运行会下载它。在平台的只读构建容器内，Corepack 默认使用 `HOME=/tmp` 下的缓存，pnpm 的存储目录也设置在 `/tmp`。不需要在容器里执行 `corepack enable`。
 
+Testing 也支持 `TARGET`。在目标机安装 Node.js 22.12+、npm 和 Git，将目标机的 Node.js 工具目录加入安装和构建命令的 `PATH`，并检查 npm 实际使用的源和代理。若宿主机的用户级 npm 配置指向不可用代理，可以为该任务指定独立的 `NPM_CONFIG_USERCONFIG`、`NPM_CONFIG_GLOBALCONFIG` 和 `NPM_CONFIG_REGISTRY`。两个配置文件路径应不同。
+
 目标机使用 Linux，SSH 用户需要独占的发布目录、`nohup` 和 Node.js 22.12 或更新版本。若非交互 SSH 会话找不到 `node`，在两个环境中设置 `VEYOPS_NODE` 为目标机上 Node 的绝对路径。发布前确认 `38781`、`38782` 未被占用。首次运行的发布目录应为空或尚未创建。
 
 ## 运行并核对产物

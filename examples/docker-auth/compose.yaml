@@ -1,0 +1,10 @@
+services:
+  matrix:
+    image: ${VEYOPS_IMAGE:?required}
+    network_mode: host
+    restart: 'no'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      PORT: ${PORT:?required}
