@@ -9,6 +9,7 @@ import {
   Pencil,
   Server,
   Settings2,
+  Users,
   Workflow,
 } from 'lucide-react';
 import { api, formatTime, message, useResource } from '../api';
@@ -118,6 +119,13 @@ export function SystemPage({ user }: { user: User }) {
         eyebrow="WORKSPACE SETTINGS"
         title="系统设置"
         description="查看运行环境，管理执行默认值、日志保留和 AI 权限。"
+        action={
+          user.role === 'ADMIN' && (
+            <a className="button secondary" href="#/settings/users">
+              <Users size={16} /> 用户管理
+            </a>
+          )
+        }
       />
       <ErrorBanner error={resource.error} retry={resource.reload} />
       {resource.loading ? (

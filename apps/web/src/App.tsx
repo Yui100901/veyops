@@ -23,8 +23,8 @@ import {
   Terminal,
   X,
 } from 'lucide-react';
-import { ApiError, api, message, post, useRoute } from './api';
-import { ErrorBanner, Loading } from './components';
+import { ApiError, api, message, navigate, post, useRoute } from './api';
+import { ErrorBanner, Loading, PageHeader, Section } from './components';
 import { DashboardPage } from './pages/Dashboard';
 import { CredentialsPage, ProjectPage, ProjectsPage, ServersPage } from './pages/Resources';
 import { CommandsPage, PlansPage, TaskPage, TasksPage } from './pages/Operations';
@@ -33,6 +33,8 @@ import { AIPage } from './pages/AI';
 import { DeliveryRecordsPage, PipelinesPage, RegistriesPage } from './pages/Delivery';
 import { DeploymentTargetsPage } from './pages/DeploymentConfig';
 import { ProjectViewsPage } from './pages/ProjectViews';
+import { UsersPage } from './pages/Users';
+import { userRoleNames } from './models';
 import type { User } from './models';
 
 const navigation = [
@@ -236,6 +238,7 @@ function ChangePasswordPage({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const required = user.mustChangePassword;
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -264,59 +267,89 @@ function ChangePasswordPage({
       setBusy(false);
     }
   }
+  const form = (
+    <form onSubmit={submit} className={required ? undefined : 'form-body'}>
+      <input name="username" value={user.username} autoComplete="username" type="hidden" />
+      <label className="field">
+        <span>当前密码</span>
+        <input
+          name="currentPassword"
+          type="password"
+          autoComplete="current-password"
+          autoFocus
+          required
+          maxLength={256}
+        />
+      </label>
+      <label className="field">
+        <span>新密码</span>
+        <input
+          name="newPassword"
+          type="password"
+          autoComplete="new-password"
+          required
+          minLength={12}
+          maxLength={256}
+          aria-describedby="new-password-hint"
+        />
+        <small id="new-password-hint">至少 12 个字符。</small>
+      </label>
+      <label className="field">
+        <span>确认新密码</span>
+        <input
+          name="confirmation"
+          type="password"
+          autoComplete="new-password"
+          required
+          minLength={12}
+          maxLength={256}
+        />
+      </label>
+      <ErrorBanner error={error || (required ? logoutError : '')} />
+      <button
+        className={required ? 'button primary auth-submit' : 'button primary'}
+        type="submit"
+        disabled={busy || loggingOut}
+      >
+        {busy ? (
+          <LoaderCircle size={18} className="spin" />
+        ) : (
+          <>
+            <span>更新密码</span>
+            <ArrowRight size={17} />
+          </>
+        )}
+      </button>
+    </form>
+  );
+  if (!required) {
+    return (
+      <>
+        <PageHeader
+          title="修改密码"
+          description={`更新 ${user.username} 的登录密码。保存后，所有会话会退出登录。`}
+          action={
+            <button
+              className="button secondary"
+              type="button"
+              disabled={busy}
+              onClick={() => navigate('/')}
+            >
+              返回概览
+            </button>
+          }
+        />
+        <Section title="登录密码" className="account-password-panel">
+          {form}
+        </Section>
+      </>
+    );
+  }
   return (
     <AuthLayout>
       <h2>更新初始密码</h2>
       <p>账号 {user.username} 需要设置新密码才能进入工作空间。</p>
-      <form onSubmit={submit}>
-        <input name="username" value={user.username} autoComplete="username" type="hidden" />
-        <label className="field">
-          <span>当前密码</span>
-          <input
-            name="currentPassword"
-            type="password"
-            autoComplete="current-password"
-            autoFocus
-            required
-            maxLength={256}
-          />
-        </label>
-        <label className="field">
-          <span>新密码</span>
-          <input
-            name="newPassword"
-            type="password"
-            autoComplete="new-password"
-            required
-            minLength={12}
-            maxLength={256}
-            aria-describedby="new-password-hint"
-          />
-          <small id="new-password-hint">至少 12 个字符。</small>
-        </label>
-        <label className="field">
-          <span>确认新密码</span>
-          <input
-            name="confirmation"
-            type="password"
-            autoComplete="new-password"
-            required
-            minLength={12}
-            maxLength={256}
-          />
-        </label>
-        <ErrorBanner error={error || logoutError} />
-        <button className="button primary auth-submit" type="submit" disabled={busy || loggingOut}>
-          {busy ? (
-            <LoaderCircle size={18} className="spin" />
-          ) : (
-            <>
-              <span>更新密码</span>
-              <ArrowRight size={17} />
-            </>
-          )}
-        </button>
-      </form>
+      {form}
       <div className="auth-actions">
         <button
           type="button"
@@ -402,21 +435,21 @@ export function App() {
         }}
       />
     );
-  if (user.mustChangePassword) {
-    return (
-      <ChangePasswordPage
-        user={user}
-        onChanged={() => {
-          setUpdatedUsername(user.username);
-          setError('');
-          setUser(null);
-        }}
-        onLogout={() => void logout()}
-        loggingOut={loggingOut}
-        logoutError={error}
-      />
-    );
-  }
+  const changePassword = (
+    <ChangePasswordPage
+      user={user}
+      onChanged={() => {
+        if (routePath === '/account/password') navigate('/');
+        setUpdatedUsername(user.username);
+        setError('');
+        setUser(null);
+      }}
+      onLogout={() => void logout()}
+      loggingOut={loggingOut}
+      logoutError={error}
+    />
+  );
+  if (user.mustChangePassword) return changePassword;
   const current = navigation
     .flatMap((group) => group.items)
     .find((item) => (item.path === '/' ? route === '/' : route.startsWith(item.path)));
@@ -447,6 +480,8 @@ export function App() {
     page = <TaskPage key={route} id={route.slice(7)} user={user} />;
   else if (route === '/audit') page = <AuditPage />;
   else if (route === '/settings') page = <SystemPage user={user} />;
+  else if (routePath === '/settings/users') page = <UsersPage user={user} />;
+  else if (routePath === '/account/password') page = changePassword;
   else if (route === '/ai') page = <AIPage user={user} />;
   else
     page = (
@@ -508,14 +543,21 @@ export function App() {
             <span className="user-avatar">{user.username.slice(0, 1).toUpperCase()}</span>
             <div>
               <strong>{user.username}</strong>
-              <small>
-                {{ ADMIN: '管理员', OPERATOR: '操作员', VIEWER: '只读用户' }[user.role]}
-              </small>
+              <small>{userRoleNames[user.role]}</small>
             </div>
+            <a
+              className="account-action"
+              href="#/account/password"
+              aria-label="修改密码"
+              aria-current={routePath === '/account/password' ? 'page' : undefined}
+              title="修改密码"
+            >
+              <KeyRound size={16} />
+            </a>
             <button
               onClick={logout}
               disabled={loggingOut}
-              className="logout-button"
+              className="account-action"
               aria-label="退出登录"
               title="退出登录"
             >
@@ -536,7 +578,15 @@ export function App() {
             </button>
             <span className="topbar-workspace">工作空间</span>
             <span className="breadcrumb-slash">/</span>
-            <strong>{route === '/artifacts' ? '构建产物' : (current?.name ?? '页面')}</strong>
+            <strong>
+              {route === '/artifacts'
+                ? '构建产物'
+                : routePath === '/settings/users'
+                  ? '用户管理'
+                  : routePath === '/account/password'
+                    ? '修改密码'
+                    : (current?.name ?? '页面')}
+            </strong>
           </div>
           <div className="topbar-right">
             <span className="secure-indicator">

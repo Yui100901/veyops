@@ -536,14 +536,15 @@ pre {
   font-size: 9px;
   color: #6a8392;
 }
-.logout-button {
+.account-action {
   background: none;
   border: 0;
   color: #647d8c;
   display: flex;
   padding: 4px;
 }
-.logout-button:hover {
+.account-action:hover,
+.account-action[aria-current='page'] {
   color: #c3d5dc;
 }
 .main-shell {
@@ -784,6 +785,36 @@ tbody tr:hover {
   display: flex;
   align-items: center;
   gap: 14px;
+}
+.user-management-table {
+  table-layout: fixed;
+}
+.user-management-table th:first-child {
+  width: 30%;
+}
+.user-management-table th:last-child {
+  width: 30%;
+}
+.user-management-table td:first-child {
+  overflow-wrap: anywhere;
+}
+.user-management-table .row-actions {
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+.user-management-table .row-actions > * {
+  white-space: nowrap;
+}
+.account-password-panel {
+  max-width: 520px;
+}
+@media (max-width: 600px) {
+  .user-management-table :is(th, td) {
+    padding-inline: 9px;
+  }
+  .user-management-table .row-actions {
+    gap: 7px;
+  }
 }
 .search-input {
   display: flex;

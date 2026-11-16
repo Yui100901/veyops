@@ -5,38 +5,18 @@ import {
   OnApplicationBootstrap,
   UnauthorizedException,
 } from '@nestjs/common';
-import {
-  createHash,
-  randomBytes,
-  randomUUID,
-  scrypt as scryptCallback,
-  timingSafeEqual,
-} from 'node:crypto';
-import { promisify } from 'node:util';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { DatabaseService } from '../../core/database/database.service';
 import { AuditService } from '../audit/audit.service';
 import { InitialConfigurationService } from '../../core/initial-configuration';
 import type { Role, SessionUser } from './auth.decorators';
 import { seedPlanTemplates } from '../operation-plans/plan-templates';
-const scrypt = promisify(scryptCallback);
+import { dummyPasswordHash, hashPassword, matchesPassword } from './auth-password';
+import { lockActiveSession, revokeUserSessions, sessionHash } from './auth-sessions';
+
 const adminUsername = 'root';
 const bootstrapLock = 'bootstrap_lock';
 const sessionLifetime = 12 * 60 * 60 * 1000;
-const dummyHash = `${'0'.repeat(32)}:${'0'.repeat(128)}`;
-export const sessionHash = (token: string) => createHash('sha256').update(token).digest('hex');
-
-async function hashPassword(password: string) {
-  const salt = randomBytes(16).toString('hex');
-  const hash = (await scrypt(password, salt, 64)) as Buffer;
-  return `${salt}:${hash.toString('hex')}`;
-}
-
-async function matchesPassword(password: string, storedHash: string) {
-  const [salt, expected] = storedHash.split(':');
-  const actual = (await scrypt(password, salt || dummyHash.slice(0, 32), 64)) as Buffer;
-  const expectedBytes = Buffer.from(expected || '', 'hex');
-  return expectedBytes.length === actual.length && timingSafeEqual(actual, expectedBytes);
-}
 
 @Injectable()
 export class AuthService implements OnApplicationBootstrap {
@@ -100,7 +80,7 @@ export class AuthService implements OnApplicationBootstrap {
       .where('username', '=', username)
       .executeTakeFirst();
     // Perform a hash even for unknown users, avoiding an easy account enumeration timing signal.
-    const valid = await matchesPassword(password, row?.password_hash || dummyHash);
+    const valid = await matchesPassword(password, row?.password_hash || dummyPasswordHash);
     if (!row || row.status !== 'ACTIVE' || !valid)
       throw new UnauthorizedException('用户名或密码错误');
     const token = randomBytes(32).toString('hex');
@@ -148,7 +128,8 @@ export class AuthService implements OnApplicationBootstrap {
     };
   }
   async resolve(token?: string): Promise<SessionUser> {
-    if (!token || token.length !== 64) throw new UnauthorizedException('请先登录');
+    if (typeof token !== 'string' || token.length !== 64)
+      throw new UnauthorizedException('请先登录');
     const row = await this.database.db
       .selectFrom('auth_sessions')
       .innerJoin('users', 'users.id', 'auth_sessions.user_id')
@@ -167,7 +148,8 @@ export class AuthService implements OnApplicationBootstrap {
     currentPassword: string,
     newPassword: string,
   ) {
-    if (!token || token.length !== 64) throw new UnauthorizedException('请先登录');
+    if (typeof token !== 'string' || token.length !== 64)
+      throw new UnauthorizedException('请先登录');
     if (newPassword.length < 12 || newPassword.length > 256)
       throw new BadRequestException('新密码须为 12–256 个字符');
     if (newPassword === currentPassword) throw new BadRequestException('新密码不能与当前密码相同');
@@ -177,38 +159,31 @@ export class AuthService implements OnApplicationBootstrap {
       .where('id', '=', userId)
       .where('status', '=', 'ACTIVE')
       .executeTakeFirst();
-    if (!(await matchesPassword(currentPassword, row?.password_hash || dummyHash)) || !row)
+    if (!(await matchesPassword(currentPassword, row?.password_hash || dummyPasswordHash)) || !row)
       throw new UnauthorizedException('当前密码错误');
     const nextHash = await hashPassword(newPassword);
-    const now = Date.now();
     await this.database.db.transaction().execute(async (tx) => {
-      const changed = await tx
+      const locked = await tx
         .updateTable('users')
-        .set({ password_hash: nextHash, must_change_password: 0, updated_at: now })
+        .set((eb) => ({ password_hash: eb.ref('password_hash') }))
         .where('id', '=', userId)
         .where('status', '=', 'ACTIVE')
         .where('password_hash', '=', row.password_hash)
-        .where(({ exists, selectFrom }) =>
-          exists(
-            selectFrom('auth_sessions')
-              .select('id')
-              .where('user_id', '=', userId)
-              .where('token_hash', '=', sessionHash(token))
-              .where('revoked_at', 'is', null)
-              .where('expires_at', '>', now),
-          ),
-        )
         .returning('id')
         .executeTakeFirst();
-      if (!changed) throw new ConflictException('会话或密码已变化，请重新登录');
+      // Check the session after acquiring the user lock so concurrent role changes cannot
+      // leave a password update using a session read before it was revoked.
+      if (!locked || !(await lockActiveSession(tx, userId, token)))
+        throw new ConflictException('会话或密码已变化，请重新登录');
+      const now = Date.now();
       await tx
-        .updateTable('auth_sessions')
-        .set({ revoked_at: now })
-        .where('user_id', '=', userId)
-        .where('revoked_at', 'is', null)
+        .updateTable('users')
+        .set({ password_hash: nextHash, must_change_password: 0, updated_at: now })
+        .where('id', '=', userId)
         .execute();
+      await revokeUserSessions(tx, userId, now);
+      await this.audit.record(userId, 'auth.change_password', 'user', userId, {}, tx);
     });
-    await this.audit.record(userId, 'auth.change_password', 'user', userId);
     return { success: true };
   }
   async logout(token?: string) {

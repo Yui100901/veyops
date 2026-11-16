@@ -4,6 +4,17 @@ export interface User {
   role: 'ADMIN' | 'OPERATOR' | 'VIEWER';
   mustChangePassword: boolean;
 }
+export const userRoleNames = {
+  ADMIN: '管理员',
+  OPERATOR: '操作员',
+  VIEWER: '只读用户',
+} satisfies Record<User['role'], string>;
+
+export interface ManagedUser extends User {
+  status: 'ACTIVE' | 'DISABLED';
+  createdAt: number;
+  updatedAt: number;
+}
 export interface SystemRuntimeDefaults {
   defaultBuildLocation: 'TARGET' | 'MANAGER';
   defaultMaxParallelTargets: number;

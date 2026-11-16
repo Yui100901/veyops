@@ -15,6 +15,21 @@
 
 角色为 ADMIN、OPERATOR、VIEWER。空库启动时创建 `root`，使用 `ADMIN_PASSWORD` 或控制台中的随机初始密码。`mustChangePassword` 为 `true` 时，会话只可读取 `/auth/me`、改密或退出。登录入口按 IP 限速。
 
+## 用户管理
+
+下列接口要求已完成首次改密的管理员会话。用户信息包含 `id`、`username`、`role`、`status`、`mustChangePassword`、`createdAt` 和 `updatedAt`。
+
+| 方法 | 路径 | 请求 / 说明 |
+| ---- | ---- | ----------- |
+| GET | /users | 列出包括停用状态在内的账号 |
+| POST | /users | `{username,role,password}`，创建启用账号并要求首次改密 |
+| PATCH | /users/:id | `{role?,status?}`，更新角色或启停状态 |
+| POST | /users/:id/reset-password | `{password}`，设置临时密码并要求下次登录改密 |
+
+用户名区分大小写，长度为 2–64，首字符为英文字母或数字，其余字符还可使用点、下划线和短横线。创建后用户名固定。临时密码须为 12–256 个字符，仅通过请求提交。状态为 `ACTIVE` 或 `DISABLED`。
+
+修改角色、启停状态或重置密码时，服务撤销该账号的会话并记录审计，响应和审计均不包含密码或密码哈希。管理员通过 `/auth/change-password` 修改自己的密码。停用账号保留已有操作及资源归属记录。
+
 ## 资源
 
 | 方法                 | 路径                       | 请求 / 说明                                                                                                  |
@@ -172,4 +187,4 @@ API Key 不回显，更新时省略 Key 表示保留。AI 为空或禁用不会�
 
 完全控制策略可用 `approvedPipelineHashes` 授权 Pipeline 预览返回的 `aiApprovalHash`，它绑定版本、提交、执行模式、环境、目标和有效配置。源码写入使用 `repositoryIds` 授权仓库。评审分支和 PR 是两个写步骤。确认使用提案接口，源码步骤返回 `sourceChange`，任务步骤返回 `task`。
 
-备份恢复由[维护命令](BACKUP.md)提供。用户管理接口待开发。
+备份恢复由[维护命令](BACKUP.md)提供。

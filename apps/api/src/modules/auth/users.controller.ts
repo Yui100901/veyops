@@ -1,0 +1,36 @@
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Req } from '@nestjs/common';
+import { Roles } from './auth.decorators';
+import type { AuthRequest } from './auth.guard';
+import { CreateUserDto, TemporaryPasswordDto, UpdateUserDto } from './users.dto';
+import { UsersService } from './users.service';
+
+@Roles('ADMIN')
+@Controller('users')
+export class UsersController {
+  constructor(private readonly users: UsersService) {}
+
+  @Get()
+  list() {
+    return this.users.list();
+  }
+
+  @Post()
+  create(@Body() dto: CreateUserDto, @Req() req: AuthRequest) {
+    return this.users.create(dto, req.user.id, req.cookies?.veyops_session);
+  }
+
+  @Patch(':id')
+  update(@Param('id') id: string, @Body() dto: UpdateUserDto, @Req() req: AuthRequest) {
+    return this.users.update(id, dto, req.user.id, req.cookies?.veyops_session);
+  }
+
+  @Post(':id/reset-password')
+  @HttpCode(200)
+  resetPassword(
+    @Param('id') id: string,
+    @Body() dto: TemporaryPasswordDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.users.resetPassword(id, dto.password, req.user.id, req.cookies?.veyops_session);
+  }
+}
