@@ -68,7 +68,11 @@ export const planTemplates: PlanTemplate[] = [
     category: 'INITIALIZATION',
     osRequirements: 'Debian / Ubuntu，apt-get 和 root 权限',
     preChecks: [
-      { name: '检查 root 和 APT', command: 'test "$(id -u)" -eq 0 && command -v apt-get', timeout: 30 },
+      {
+        name: '检查 root 和 APT',
+        command: 'test "$(id -u)" -eq 0 && command -v apt-get',
+        timeout: 30,
+      },
     ],
     steps: [
       {
@@ -108,6 +112,40 @@ export const planTemplates: PlanTemplate[] = [
         timeout: 120,
       },
     ],
+  },
+  {
+    id: '41000000-0000-4000-8000-000000000005',
+    name: 'Docker Compose v2 初始化 · Debian / Ubuntu',
+    description: '从系统 APT 软件源安装 Compose v2，需要已有的 Docker CLI 和 root 权限。',
+    category: 'INITIALIZATION',
+    osRequirements: 'Debian / Ubuntu，Docker CLI、APT 和 root 权限',
+    preChecks: [
+      {
+        name: '检查 root、APT 和 Docker CLI',
+        command: 'test "$(id -u)" -eq 0 && command -v apt-get && command -v docker',
+        timeout: 30,
+      },
+    ],
+    steps: [
+      {
+        name: '安装支持的 Compose v2 软件包',
+        command: `set -eu
+export LC_ALL=C
+if docker compose version >/dev/null 2>&1; then exit 0; fi
+apt-get update
+for package in docker-compose-v2 docker-compose; do
+  candidate=$(apt-cache policy "$package" | awk '/Candidate:/ { print $2; exit }' | sed 's/^[0-9][0-9]*://')
+  if test -n "$candidate" && test "$candidate" != '(none)' && dpkg --compare-versions "$candidate" ge 2.0; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+    exit 0
+  fi
+done
+echo '当前 APT 源没有可用的 Docker Compose v2 软件包' >&2
+exit 1`,
+        timeout: 900,
+      },
+    ],
+    postChecks: [{ name: '验证 Compose v2', command: 'docker compose version', timeout: 30 }],
   },
 ];
 

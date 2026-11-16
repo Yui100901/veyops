@@ -43,6 +43,7 @@ export function taskDto(task: Selectable<TasksTable>) {
     name: task.name,
     status: task.status,
     createdBy: task.created_by,
+    projectId: task.project_id,
     createdAt: task.created_at,
     startedAt: task.started_at,
     finishedAt: task.finished_at,
@@ -311,6 +312,9 @@ export class TasksService {
   }
   async logs(id: string, offset = 0) {
     return this.logStore.read((await this.row(id)).log_file_key, offset);
+  }
+  async recentLog(id: string) {
+    return this.logStore.tail((await this.row(id)).log_file_key);
   }
   async cancel(id: string) {
     const row = await this.row(id);

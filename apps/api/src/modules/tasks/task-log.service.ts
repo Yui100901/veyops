@@ -63,4 +63,10 @@ export class TaskLogService {
     }
     return { content: buffer.subarray(0, end).toString('utf8'), nextOffset: start + end };
   }
+  tail(key: string | null): string {
+    if (!key) return '';
+    const file = this.path(key);
+    if (!existsSync(file)) return '';
+    return this.read(key, Math.max(0, statSync(file).size - 64 * 1024)).content;
+  }
 }

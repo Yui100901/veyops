@@ -38,6 +38,16 @@ export class AiPolicyDto {
   @IsOptional() @IsUUID() projectId?: string;
   @IsOptional() @IsArray() @ArrayMaxSize(100) @IsUUID('all', { each: true }) serverIds?: string[];
   @IsOptional() @IsArray() @ArrayMaxSize(100) @IsUUID('all', { each: true }) projectIds?: string[];
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsUUID('all', { each: true })
+  repositoryIds?: string[];
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @Matches(/^[a-f0-9]{64}$/, { each: true })
+  approvedPipelineHashes?: string[];
   @IsOptional() @IsArray() @ArrayMaxSize(20) @IsString({ each: true }) allowedActions?: string[];
   @IsOptional() @IsArray() @ArrayMaxSize(20) @IsString({ each: true }) deniedActions?: string[];
   @IsOptional()
@@ -56,8 +66,9 @@ export class AiChatDto {
 export class AiRepositoryAnalysisDto {
   @IsUUID() projectId!: string;
   @IsUUID() repositoryId!: string;
-  @IsUUID() serviceId!: string;
-  @IsUUID() environmentId!: string;
-  @IsString() @Matches(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i) commitSha!: string;
+  @IsOptional() @IsUUID() serviceId?: string;
+  @IsOptional() @IsUUID() environmentId?: string;
+  @IsOptional() @IsString() @Matches(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i) commitSha?: string;
   @IsOptional() @IsString() @MaxLength(300) docPath?: string;
+  @IsOptional() @IsString() @MaxLength(300) repoPath?: string;
 }

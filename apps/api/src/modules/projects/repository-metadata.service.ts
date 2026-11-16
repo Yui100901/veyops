@@ -24,6 +24,9 @@ const exec = promisify(execFile);
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const branchPrefix = 'refs/heads/';
 const deploymentDocMaxBytes = 12 * 1024;
+const analysisFileMaxBytes = 6 * 1024;
+const analysisTotalMaxBytes = 24 * 1024;
+const analysisTreeMaxBytes = 2 * 1024 * 1024;
 const gitEnvironmentKeys = new Set([
   'PATH',
   'SYSTEMROOT',
@@ -50,6 +53,62 @@ export function isDeploymentDocPath(path: string): boolean {
   return (
     path.length <= 300 && /^(?:[a-z0-9_-][a-z0-9_.-]*\/)*(?:deploy|deployment)\.md$/i.test(path)
   );
+}
+
+function isAnalysisPath(path: string): boolean {
+  return (
+    path.length <= 300 &&
+    /^(?:[a-z0-9_][a-z0-9_.-]*\/)*[a-z0-9_][a-z0-9_.-]*$/i.test(path) &&
+    !path
+      .split('/')
+      .some(
+        (segment) =>
+          /^(?:node_modules|vendor|dist|build|target|fixtures?|tests?)$/i.test(segment) ||
+          /(?:^|[._-])(?:secrets?|credentials?|privatekeys?|keys?|certs?)(?:$|[._-])/i.test(
+            segment,
+          ),
+      )
+  );
+}
+
+type AnalysisFileKind = 'deployment' | 'description' | 'configuration' | 'source' | 'lockfile';
+
+function analysisFileKind(path: string): AnalysisFileKind | undefined {
+  if (!isAnalysisPath(path)) return;
+  const name = path.split('/').at(-1)!.toLowerCase();
+  if (isDeploymentDocPath(path)) return 'deployment';
+  if (/^readme(?:\.(?:md|rst|txt|adoc))?$/.test(name)) return 'description';
+  if (
+    /^(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|cargo\.lock|go\.sum|poetry\.lock|uv\.lock|pipfile\.lock|composer\.lock)$/.test(
+      name,
+    )
+  )
+    return 'lockfile';
+  if (
+    /^(?:(?:dockerfile|containerfile)(?:\.[a-z0-9_-]+)?|(?:docker-compose|compose)(?:\.[a-z0-9_-]+)?\.ya?ml|package\.json|pnpm-workspace\.yaml|go\.mod|cargo\.toml|pyproject\.toml|requirements(?:-[a-z]+)?\.txt|pipfile|pom\.xml|(?:build|settings)\.gradle(?:\.kts)?|gemfile|composer\.json|makefile|procfile|tsconfig\.json|[a-z0-9_.-]+\.csproj)$/.test(
+      name,
+    )
+  )
+    return 'configuration';
+  if (
+    /^(?:main|index|app|server|application|__main__|asgi|wsgi|manage|program)\.(?:ts|tsx|js|mjs|cjs|py|go|rs|php|rb|cs)$/.test(
+      name,
+    ) ||
+    /^[a-z0-9_]*(?:main|application|server)\.(?:java|kt)$/.test(name)
+  )
+    return 'source';
+}
+
+interface AnalysisTreeEntry {
+  path: string;
+  object: string;
+}
+
+function parseAnalysisTree(value: string): AnalysisTreeEntry[] {
+  return value.split('\0').flatMap((entry) => {
+    const match = /^100(?:644|755) blob ([0-9a-f]{40}|[0-9a-f]{64})\t([^\t\r\n]+)$/.exec(entry);
+    return match ? [{ object: match[1], path: match[2] }] : [];
+  });
 }
 
 class RepositoryCommitsQuery {
@@ -179,33 +238,7 @@ export class RepositoryMetadataService {
       throw new BadRequestException('请指定仓库内的 DEPLOY.md 或 deployment.md 相对路径');
 
     return this.withRepository(projectId, repositoryId, async (repository) => {
-      const bare = join(repository.workspace, 'repository.git');
-      const gitDir = `--git-dir=${bare}`;
-      await repository.run([
-        'init',
-        '--bare',
-        '--template=',
-        `--object-format=${sha.length === 40 ? 'sha1' : 'sha256'}`,
-        bare,
-      ]);
-      await repository.run([
-        gitDir,
-        'fetch',
-        '--depth=1',
-        `--filter=blob:limit=${deploymentDocMaxBytes + 1}`,
-        '--no-tags',
-        '--no-recurse-submodules',
-        '--',
-        repository.url,
-        sha,
-      ]);
-      const fetched = await repository.run([
-        gitDir,
-        'rev-parse',
-        '--verify',
-        'FETCH_HEAD^{commit}',
-      ]);
-      if (fetched.trim() !== sha) throw new BadGatewayException('未取得指定 Git Commit');
+      const gitDir = await this.fetchPinnedCommit(repository, sha);
       const entry = await repository.run([
         gitDir,
         '--literal-pathspecs',
@@ -225,33 +258,156 @@ export class RepositoryMetadataService {
         !shaPattern.test(object)
       )
         throw new BadRequestException('部署文档必须是仓库中的普通文件');
-      const size = Number((await repository.run([gitDir, 'cat-file', '-s', object])).trim());
-      if (!Number.isSafeInteger(size) || size < 0 || size > deploymentDocMaxBytes)
-        throw new BadRequestException('部署文档大小超过 12 KiB');
-      const bytes = await repository.runBytes(
-        [gitDir, 'cat-file', 'blob', object],
+      const content = await this.readAnalysisBlob(
+        repository,
+        gitDir,
+        object,
         deploymentDocMaxBytes,
       );
-      let content: string;
-      try {
-        content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-      } catch {
-        throw new BadRequestException('部署文档必须是 UTF-8 文本');
-      }
-      if (
-        [...content].some((char) => {
-          const code = char.charCodeAt(0);
-          return (
-            (code < 32 && code !== 9 && code !== 10 && code !== 13) || (code >= 127 && code <= 159)
-          );
-        })
-      )
-        throw new BadRequestException('部署文档必须是 UTF-8 文本');
-      content = repository.redact(content);
-      if (Buffer.byteLength(content, 'utf8') > deploymentDocMaxBytes)
-        throw new BadRequestException('部署文档大小超过 12 KiB');
       return { path, commitSha: sha, content };
     });
+  }
+
+  async readAnalysisContext(
+    projectId: string,
+    repositoryId: string,
+    options: { commitSha?: string; docPath?: string; repoPath?: string } = {},
+  ) {
+    const docPath = options.docPath;
+    const repoPath = options.repoPath ?? '.';
+    const explicitSha = options.commitSha?.toLowerCase();
+    if (explicitSha !== undefined && !shaPattern.test(explicitSha))
+      throw new BadRequestException('仓库分析需要完整 Git Commit SHA');
+    if (docPath !== undefined && (!isDeploymentDocPath(docPath) || !isAnalysisPath(docPath)))
+      throw new BadRequestException('请指定仓库内的 DEPLOY.md 或 deployment.md 相对路径');
+    if (repoPath !== '.' && !isAnalysisPath(repoPath))
+      throw new BadRequestException('请指定有效的仓库相对子目录');
+
+    return this.withRepository(projectId, repositoryId, async (repository) => {
+      let commitSha = explicitSha;
+      if (commitSha === undefined) {
+        const { defaultBranch, branches } = await this.listBranches(repository);
+        commitSha = branches.find((branch) => branch.name === defaultBranch)?.sha;
+        if (!commitSha) throw new BadRequestException('仓库没有可用的默认分支，请指定完整提交');
+      }
+      const gitDir = await this.fetchPinnedCommit(repository, commitSha);
+      const scope = repoPath === '.' ? [] : [repoPath, ...(docPath ? [docPath] : [])];
+      const tree = await repository.runBytes(
+        [gitDir, '--literal-pathspecs', 'ls-tree', '-r', '-z', commitSha, '--', ...scope],
+        analysisTreeMaxBytes,
+      );
+      const entries = parseAnalysisTree(tree.toString('utf8'));
+      if (repoPath !== '.' && !entries.some(({ path }) => path.startsWith(repoPath + '/')))
+        throw new NotFoundException('指定提交中不存在该仓库子目录或目录中没有普通文件');
+      if (docPath && !entries.some((entry) => entry.path === docPath))
+        throw new NotFoundException('指定提交中不存在该部署文档或文档不是普通文件');
+
+      const preferred = docPath?.split('/').slice(0, -1).join('/');
+      // Prefer evidence alongside the selected deployment document before other services.
+      const rank = (path: string) =>
+        (preferred && !path.startsWith(preferred + '/') ? 20 : 0) + path.split('/').length;
+      const candidates = entries
+        .flatMap((entry) => {
+          const kind = analysisFileKind(entry.path);
+          return kind && repository.redact(entry.path) === entry.path ? [{ ...entry, kind }] : [];
+        })
+        .sort(
+          (left, right) =>
+            rank(left.path) - rank(right.path) || left.path.localeCompare(right.path, 'en'),
+        );
+      const files: {
+        path: string;
+        kind: Exclude<AnalysisFileKind, 'lockfile'>;
+        content: string;
+      }[] = [];
+      let remaining = analysisTotalMaxBytes;
+      const quotas = { deployment: 2, description: 2, configuration: 5, source: 4 } as const;
+      const selected = [
+        ...candidates.filter((entry) => entry.path === docPath),
+        ...Object.entries(quotas).flatMap(([kind, limit]) =>
+          candidates
+            .filter((entry) => entry.kind === kind && entry.path !== docPath)
+            .slice(0, limit),
+        ),
+      ];
+      for (const entry of selected) {
+        if (!remaining) break;
+        if (entry.kind === 'lockfile') continue;
+        const maxBytes = entry.kind === 'deployment' ? deploymentDocMaxBytes : analysisFileMaxBytes;
+        try {
+          const content = await this.readAnalysisBlob(
+            repository,
+            gitDir,
+            entry.object,
+            Math.min(remaining, maxBytes),
+          );
+          files.push({ path: entry.path, kind: entry.kind, content });
+          remaining -= Buffer.byteLength(content, 'utf8');
+        } catch (error) {
+          if (
+            entry.path === docPath ||
+            !(error instanceof BadRequestException || error instanceof BadGatewayException)
+          )
+            throw error;
+        }
+      }
+      const lockfiles = candidates
+        .filter((entry) => entry.kind === 'lockfile')
+        .slice(0, 16)
+        .map((entry) => entry.path);
+      if (!files.length)
+        throw new BadRequestException('未找到可分析的仓库文本，请选择包含部署文档或构建配置的目录');
+      return { commitSha, repoPath, files, lockfiles };
+    });
+  }
+
+  private async fetchPinnedCommit(repository: GitRepository, sha: string) {
+    const bare = join(repository.workspace, 'repository.git');
+    const gitDir = `--git-dir=${bare}`;
+    await repository.run([
+      'init',
+      '--bare',
+      '--template=',
+      `--object-format=${sha.length === 40 ? 'sha1' : 'sha256'}`,
+      bare,
+    ]);
+    await repository.run([
+      gitDir,
+      'fetch',
+      '--depth=1',
+      `--filter=blob:limit=${deploymentDocMaxBytes + 1}`,
+      '--no-tags',
+      '--no-recurse-submodules',
+      '--',
+      repository.url,
+      sha,
+    ]);
+    const fetched = await repository.run([gitDir, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}']);
+    if (fetched.trim() !== sha) throw new BadGatewayException('未取得指定 Git Commit');
+    return gitDir;
+  }
+
+  private async readAnalysisBlob(
+    repository: GitRepository,
+    gitDir: string,
+    object: string,
+    maxBytes: number,
+  ) {
+    const size = Number((await repository.run([gitDir, 'cat-file', '-s', object])).trim());
+    const oversized = () => new BadRequestException('仓库文本超过读取大小限制');
+    if (!Number.isSafeInteger(size) || size < 0 || size > maxBytes) throw oversized();
+    const bytes = await repository.runBytes([gitDir, 'cat-file', 'blob', object], maxBytes);
+    let content: string;
+    try {
+      content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+      throw new BadRequestException('仓库文件必须是 UTF-8 文本');
+    }
+    if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(content))
+      throw new BadRequestException('仓库文件必须是 UTF-8 文本');
+    const redacted = repository.redact(content);
+    if (Buffer.byteLength(redacted, 'utf8') > maxBytes) throw oversized();
+    return redacted;
   }
 
   private async listBranches(repository: GitRepository) {

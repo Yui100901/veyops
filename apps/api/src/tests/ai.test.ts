@@ -27,6 +27,13 @@ import { ServersService } from '../modules/servers/servers.service';
 import { TasksService } from '../modules/tasks/tasks.service';
 import { CommandCenterService } from '../modules/command-center/command-center.service';
 import { CurrentUser } from '../modules/auth/auth.decorators';
+import {
+  AiDeploymentToolsService,
+  diagnoseDeploymentFailure,
+  parseDeploymentProbe,
+} from '../modules/ai/ai-deployment-tools.service';
+import { AiRepositoryAnalysisService } from '../modules/ai/ai-repository-analysis.service';
+import { AiSourceChangeService } from '../modules/ai/ai-source-change.service';
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'veyops-ai-'));
@@ -114,8 +121,60 @@ async function fixture() {
       return [target];
     },
   } as unknown as ServersService;
-  const tasks = { list: async () => [], targets: async () => [] } as unknown as TasksService;
-  const tools = new AiToolsService(servers, projects, tasks, commands, policy, {} as ModuleRef);
+  const tasks = {
+    list: async () => [],
+    targets: async () => [],
+    get: async (id: string) =>
+      database.db
+        .selectFrom('tasks')
+        .select('status')
+        .where('id', '=', id)
+        .executeTakeFirstOrThrow(),
+  } as unknown as TasksService;
+  const deployment = {
+    inspect: async () => [{ serverId: target.id, status: 'OK', facts: { git: 'available' } }],
+    initialization: async (component: string) => ({
+      planId: component,
+      version: 1,
+      planVersionId: 'fixed',
+      targetHash: 'a'.repeat(64),
+      summary: 'Fixed initialization',
+      steps: [],
+    }),
+    initialize: async () => commands.execute({} as never, actor.id),
+  } as unknown as AiDeploymentToolsService;
+  const sourceWrites: string[] = [];
+  const source = {
+    async prepare(payload: Record<string, unknown>) {
+      return {
+        projectId,
+        repositoryId: payload.repositoryId,
+        payload,
+        preview: { ...payload },
+        bindingsHash: 'a'.repeat(64),
+      };
+    },
+    async execute(stage: string, payload: Record<string, unknown>) {
+      sourceWrites.push(stage);
+      return {
+        ...payload,
+        projectId,
+        id: randomUUID(),
+        kind: stage === 'BRANCH' ? 'SOURCE_BRANCH' : 'PULL_REQUEST',
+      };
+    },
+  } as unknown as AiSourceChangeService;
+  const tools = new AiToolsService(
+    servers,
+    projects,
+    tasks,
+    commands,
+    policy,
+    {} as ModuleRef,
+    deployment,
+    {} as AiRepositoryAnalysisService,
+    source,
+  );
   const proposals = new AiProposalsService(repository, policy, tools, audit);
   const ai = new AiService(repository, providers, wire, policy, tools, proposals, projects, audit);
   return {
@@ -132,6 +191,7 @@ async function fixture() {
     wire,
     ai,
     executeCount: () => executeCount,
+    sourceWrites,
     async close() {
       await database.onApplicationShutdown();
       await rm(dir, { recursive: true, force: true });
@@ -425,7 +485,7 @@ test('AI chat handles tool calls, saves only safe conversation content and never
   }
 });
 
-test('FULL_CONTROL runs only registered inspection automatically while READ_ONLY denies execution tool calls', async () => {
+test('all AI modes can inspect; READ_ONLY does not submit initialization, CONFIRM approves one step and FULL_CONTROL submits it directly', async () => {
   const f = await fixture();
   let stage = 0;
   const server = await upstream(() => {
@@ -446,6 +506,14 @@ test('FULL_CONTROL runs only registered inspection automatically while READ_ONLY
                         arguments: JSON.stringify({ serverIds: [f.target.id] }),
                       },
                     },
+                    ...['docker', 'node'].map((component) => ({
+                      id: `initialize-${stage}-${component}`,
+                      type: 'function',
+                      function: {
+                        name: 'initialize_component',
+                        arguments: JSON.stringify({ serverIds: [f.target.id], component }),
+                      },
+                    })),
                   ],
                 },
               },
@@ -466,18 +534,227 @@ test('FULL_CONTROL runs only registered inspection automatically while READ_ONLY
       },
       f.actor.id,
     );
-    await f.policy.update({ mode: 'FULL_CONTROL', serverIds: [f.target.id] }, f.actor);
-    const automatic = await f.ai.chat({ message: '巡检服务器' }, f.actor);
-    assert.equal(automatic.tasks.length, 1);
-    assert.equal(automatic.proposals.length, 0);
-    assert.equal(f.executeCount(), 1);
     await f.policy.update({ mode: 'READ_ONLY' }, f.actor);
     const denied = await f.ai.chat({ message: '巡检服务器' }, f.actor);
     assert.equal(denied.tasks.length, 0);
     assert.equal(denied.proposals.length, 0);
-    assert.equal(f.executeCount(), 1);
+    assert.equal(f.executeCount(), 0);
     const stored = await f.ai.messages(denied.conversationId, f.actor.id);
     assert.ok(stored.some((m) => m.role === 'TOOL' && m.content.includes('只读模式')));
+    assert.ok(stored.some((m) => m.role === 'TOOL' && m.content.includes('"git":"available"')));
+
+    await f.policy.update({ mode: 'CONFIRM' }, f.actor);
+    const interactive = await f.ai.chat({ message: '初始化一台服务器' }, f.actor);
+    assert.equal(interactive.tasks.length, 0);
+    assert.equal(interactive.proposals.length, 1);
+    assert.equal(interactive.proposals[0]!.actionType, 'initialize_component');
+    const blocked = await f.ai.chat(
+      { conversationId: interactive.conversationId, message: '下一步' },
+      f.actor,
+    );
+    assert.equal(blocked.proposals.length, 0);
+    assert.equal(f.executeCount(), 0);
+    await f.proposals.reject(interactive.proposals[0]!.id, f.actor);
+    assert.equal(f.executeCount(), 0);
+    const approved = await f.ai.chat(
+      { conversationId: interactive.conversationId, message: '重新准备第一步' },
+      f.actor,
+    );
+    await f.proposals.confirm(approved.proposals[0]!.id, f.actor);
+    assert.equal(f.executeCount(), 1);
+    const active = await f.ai.chat(
+      { conversationId: interactive.conversationId, message: '开始下一步' },
+      f.actor,
+    );
+    assert.equal(active.proposals.length, 0);
+    assert.equal(f.executeCount(), 1);
+
+    await f.policy.update({ mode: 'FULL_CONTROL', serverIds: [f.target.id] }, f.actor);
+    const automatic = await f.ai.chat({ message: '巡检并初始化服务器' }, f.actor);
+    assert.equal(automatic.tasks.length, 1);
+    assert.equal(automatic.proposals.length, 0);
+    assert.equal(f.executeCount(), 2);
+    await assert.rejects(
+      f.tools.read('inspect_servers', { serverIds: [randomUUID()] }, await f.policy.snapshot()),
+      /未授权/,
+    );
+  } finally {
+    await server.close();
+    await f.close();
+  }
+});
+
+test('FULL_CONTROL grants only the exact reviewed release or repository, with confirm and deny overrides', async () => {
+  const f = await fixture();
+  try {
+    const grant = 'a'.repeat(64);
+    const repo = randomUUID();
+    const scope = {
+      mode: 'FULL_CONTROL' as const,
+      serverIds: [f.target.id],
+      approvedPipelineHashes: [grant],
+      repositoryIds: [repo],
+    };
+    await f.policy.update(scope, f.actor);
+    const snapshot = await f.policy.snapshot();
+    const release = {
+      action: 'run_pipeline',
+      serverIds: [f.target.id],
+      projectId: f.projectId,
+      repositoryId: repo,
+    };
+    assert.equal(
+      f.policy.evaluate(f.actor, { ...release, aiApprovalHash: grant }, snapshot),
+      'ALLOW',
+    );
+    assert.equal(
+      f.policy.evaluate(f.actor, { ...release, aiApprovalHash: 'b'.repeat(64) }, snapshot),
+      'REQUIRE_CONFIRM',
+    );
+    assert.equal(
+      f.policy.evaluate(f.actor, { action: 'execute_command', serverIds: [f.target.id] }, snapshot),
+      'REQUIRE_CONFIRM',
+    );
+    assert.equal(
+      f.policy.evaluate(
+        f.actor,
+        { ...release, action: 'open_pull_request', serverIds: [] },
+        snapshot,
+      ),
+      'ALLOW',
+    );
+    assert.throws(
+      () => f.policy.evaluate(f.actor, { ...release, repositoryId: randomUUID() }, snapshot),
+      /仓库不在/,
+    );
+    await f.policy.update(
+      {
+        ...scope,
+        requireConfirmActions: ['open_pull_request'],
+        deniedActions: ['initialize_component'],
+      },
+      f.actor,
+    );
+    const overridden = await f.policy.snapshot();
+    assert.throws(
+      () =>
+        f.policy.evaluate(
+          f.actor,
+          { action: 'initialize_component', serverIds: [f.target.id] },
+          {
+            ...overridden,
+          },
+        ),
+      /禁止/,
+    );
+    assert.equal(
+      f.policy.evaluate(
+        f.actor,
+        { ...release, action: 'open_pull_request', serverIds: [] },
+        overridden,
+      ),
+      'REQUIRE_CONFIRM',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test('deployment diagnostics emit only allowlisted facts and fixed findings, never remote log text', () => {
+  assert.deepEqual(
+    parseDeploymentProbe('uid=0\nos=ubuntu\nnodeVersion=v24.2.0\nTOKEN=private\nos=bad output\n'),
+    {
+      uid: '0',
+      os: 'ubuntu',
+      nodeVersion: 'v24.2.0',
+    },
+  );
+  const findings = diagnoseDeploymentFailure(
+    'FAILED',
+    'manifest unknown\ncould not get lock\nerror while loading shared libraries: libsample.so\nother-output-should-not-appear',
+    127,
+  );
+  assert.deepEqual(
+    findings.map(({ code }) => code),
+    ['IMAGE_PULL', 'PACKAGE_BUSY', 'MISSING_LIBRARY', 'MISSING_TOOL'],
+  );
+  assert.doesNotMatch(JSON.stringify(findings), /libsample|other-output/);
+  assert.equal(
+    diagnoseDeploymentFailure('NEEDS_ATTENTION', 'command not found')[0]?.code,
+    'STATE_UNCERTAIN',
+  );
+});
+
+test('AI confirms the review branch and PR separately and never writes in READ_ONLY', async () => {
+  const f = await fixture();
+  const repositoryId = randomUUID();
+  let callNames = ['publish_source_branch', 'open_pull_request'];
+  const server = await upstream((body) => {
+    const messages = body.messages as { role: string }[];
+    return {
+      body: {
+        choices: [
+          {
+            message: messages.some(({ role }) => role === 'tool')
+              ? { content: '已检查代码变更步骤' }
+              : {
+                  content: null,
+                  tool_calls: callNames.map((name, index) => ({
+                    id: `source-change-${index}`,
+                    type: 'function',
+                    function: {
+                      name,
+                      arguments: JSON.stringify({ projectId: f.projectId, repositoryId }),
+                    },
+                  })),
+                },
+          },
+        ],
+      },
+    };
+  });
+  try {
+    await f.providers.create(
+      {
+        name: 'SourceMock',
+        baseUrl: server.url,
+        model: 'test',
+        apiKey: 'mock-key',
+        enabled: true,
+        timeoutSeconds: 5,
+      },
+      f.actor.id,
+    );
+    await f.policy.update({ mode: 'READ_ONLY' }, f.actor);
+    const read = await f.ai.chat({ message: '提出代码变更', projectId: f.projectId }, f.actor);
+    assert.deepEqual(read.sourceChanges, []);
+    assert.deepEqual(f.sourceWrites, []);
+    await f.policy.update({ mode: 'CONFIRM', repositoryIds: [repositoryId] }, f.actor);
+    const start = await f.ai.chat({ message: '建议修复', projectId: f.projectId }, f.actor);
+    assert.equal(start.proposals.length, 1);
+    assert.equal(start.proposals[0]!.actionType, 'publish_source_branch');
+    const branch = await f.proposals.confirm(start.proposals[0]!.id, f.actor);
+    assert.equal(branch.sourceChange?.kind, 'SOURCE_BRANCH');
+    assert.deepEqual(f.sourceWrites, ['BRANCH']);
+    callNames = ['open_pull_request'];
+    const next = await f.ai.chat(
+      { message: '提交 PR 待审', conversationId: start.conversationId },
+      f.actor,
+    );
+    assert.equal(next.proposals.length, 1);
+    await f.proposals.reject(next.proposals[0]!.id, f.actor);
+    assert.deepEqual(f.sourceWrites, ['BRANCH']);
+    await f.policy.update(
+      { mode: 'FULL_CONTROL', serverIds: [f.target.id], repositoryIds: [repositoryId] },
+      f.actor,
+    );
+    const full = await f.ai.chat(
+      { message: '提交授权仓库的 PR', conversationId: start.conversationId },
+      f.actor,
+    );
+    assert.equal(full.proposals.length, 0);
+    assert.equal(full.sourceChanges.length, 1);
+    assert.deepEqual(f.sourceWrites, ['BRANCH', 'PULL_REQUEST']);
   } finally {
     await server.close();
     await f.close();

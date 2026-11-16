@@ -50,6 +50,8 @@ interface AIPolicy {
   projectId?: string;
   serverIds?: string[];
   projectIds?: string[];
+  repositoryIds?: string[];
+  approvedPipelineHashes?: string[];
   allowedActions?: string[];
   deniedActions?: string[];
   requireConfirmActions?: string[];
@@ -82,30 +84,60 @@ interface AIMessage {
   content: unknown;
   createdAt: number;
 }
-interface Draft {
+interface DefinitionDraft {
   type: 'PIPELINE' | 'OPERATION_PLAN';
   definition: Record<string, unknown>;
 }
+interface RepositoryDraft {
+  source: { commitSha: string; path: string };
+  draft: { name: string; projectId: string; definition: Record<string, unknown> };
+  notes: string[];
+}
+interface SourceDraft {
+  draftOnly: true;
+  title: string;
+  notes: string;
+  baseBranch: string;
+  baseCommit: string;
+  files?: { path: string; content: string }[];
+}
+type Draft = DefinitionDraft | RepositoryDraft | SourceDraft;
+type SourceChange =
+  | { id: string; kind: 'SOURCE_BRANCH'; branch: string; commitSha: string }
+  | { id: string; kind: 'PULL_REQUEST'; number: number; url: string };
 interface ChatResponse {
   conversationId: string;
   message: string;
   proposals: Proposal[];
   tasks: Task[];
   drafts: Draft[];
+  sourceChanges?: SourceChange[];
 }
 const modes: { value: AIMode; name: string; description: string }[] = [
-  { value: 'READ_ONLY', name: '只读', description: '查询资源与状态、分析问题、生成配置草稿。' },
-  { value: 'CONFIRM', name: '确认执行', description: '写入和执行操作生成提案，经你确认后执行。' },
+  {
+    value: 'READ_ONLY',
+    name: '只读规划',
+    description: '巡检、排查并生成流程草稿，由你决定采用或放弃。',
+  },
+  { value: 'CONFIRM', name: '逐步审批', description: '可查询和巡检。安装、部署等变更需逐项批准。' },
   {
     value: 'FULL_CONTROL',
     name: '完全控制',
-    description: '只在明确授权范围内执行；未知与高风险操作仍需确认。',
+    description: '在明确授权范围内安装预置组件、运行获准的 Pipeline 或打开 PR。PR 由人工合并。',
   },
 ];
 const actionLabels: Record<string, string> = {
   execute_command: '执行远程命令',
   inspect_servers: '只读服务器巡检',
+  initialize_component: '初始化目标环境',
   run_pipeline: '构建并部署 Pipeline',
+  publish_source_branch: '推送代码审查分支',
+  open_pull_request: '创建 Pull Request',
+};
+const componentLabels: Record<string, string> = {
+  docker: 'Docker',
+  node: 'Node.js',
+  nginx: 'Nginx',
 };
 const riskLabels: Record<string, string> = {
   LOW: '低风险',
@@ -119,6 +151,17 @@ function textContent(value: unknown): string {
     return textContent((value as { content: unknown }).content);
   if (value == null) return '';
   return JSON.stringify(value, null, 2);
+}
+
+function externalHttpUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password
+      ? url.href
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function AISettings({ user }: { user: User }) {
@@ -426,6 +469,10 @@ function PolicyEditor({
   const [projectIds, setProjectIds] = useState<string[]>([]);
   const [restrictServers, setRestrictServers] = useState(false);
   const [restrictProjects, setRestrictProjects] = useState(false);
+  const [repositories, setRepositories] = useState('');
+  const [restrictRepositories, setRestrictRepositories] = useState(false);
+  const [pipelineHashes, setPipelineHashes] = useState('');
+  const [restrictPipelineHashes, setRestrictPipelineHashes] = useState(false);
   const [denied, setDenied] = useState('');
   const [allowed, setAllowed] = useState('');
   const [restrictActions, setRestrictActions] = useState(false);
@@ -440,6 +487,10 @@ function PolicyEditor({
     setProjectIds(p?.projectIds || []);
     setRestrictServers(p?.serverIds !== undefined);
     setRestrictProjects(p?.projectIds !== undefined);
+    setRepositories(p?.repositoryIds?.join('\n') || '');
+    setRestrictRepositories(p?.repositoryIds !== undefined);
+    setPipelineHashes(p?.approvedPipelineHashes?.join('\n') || '');
+    setRestrictPipelineHashes(p?.approvedPipelineHashes !== undefined);
     setDenied(p?.deniedActions?.join(', ') || '');
     setAllowed(p?.allowedActions?.join(', ') || '');
     setRestrictActions(p?.allowedActions !== undefined);
@@ -463,6 +514,18 @@ function PolicyEditor({
           projectId: scope || undefined,
           serverIds: restrictServers || mode === 'FULL_CONTROL' ? ids : undefined,
           projectIds: restrictProjects ? projectIds : undefined,
+          repositoryIds: restrictRepositories
+            ? repositories
+                .trim()
+                .split(/[\s,]+/)
+                .filter(Boolean)
+            : undefined,
+          approvedPipelineHashes: restrictPipelineHashes
+            ? pipelineHashes
+                .trim()
+                .split(/[\s,]+/)
+                .filter(Boolean)
+            : undefined,
           allowedActions: restrictActions
             ? allowed
                 .split(',')
@@ -605,7 +668,7 @@ function PolicyEditor({
                 <input
                   value={allowed}
                   onChange={(e) => setAllowed(e.target.value)}
-                  placeholder="inspect_servers, execute_command, run_pipeline"
+                  placeholder="initialize_component, run_pipeline, publish_source_branch, open_pull_request"
                 />
               </Field>
             )}
@@ -623,6 +686,45 @@ function PolicyEditor({
                 placeholder="例如 execute_command"
               />
             </Field>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={restrictRepositories}
+                onChange={(e) => setRestrictRepositories(e.target.checked)}
+              />
+              限制 AI 仓库范围
+            </label>
+            {restrictRepositories && (
+              <Field label="授权仓库 ID" hint="支持换行或逗号分隔。">
+                <textarea
+                  className="mono"
+                  rows={3}
+                  value={repositories}
+                  onChange={(e) => setRepositories(e.target.value)}
+                />
+              </Field>
+            )}
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={restrictPipelineHashes}
+                onChange={(e) => setRestrictPipelineHashes(e.target.checked)}
+              />
+              设置 Pipeline 自动执行授权
+            </label>
+            {restrictPipelineHashes && (
+              <Field
+                label="已审核的 Pipeline 执行指纹"
+                hint="从运行预览复制。指纹绑定版本、提交、环境、模式和目标。每行一个或用逗号分隔。"
+              >
+                <textarea
+                  className="mono"
+                  rows={3}
+                  value={pipelineHashes}
+                  onChange={(e) => setPipelineHashes(e.target.value)}
+                />
+              </Field>
+            )}
           </details>
         </fieldset>
         <p className="field-note">
@@ -663,6 +765,7 @@ export function AIPage({ user }: { user: User }) {
   const [optimistic, setOptimistic] = useState<AIMessage[]>([]);
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [sourceChanges, setSourceChanges] = useState<SourceChange[]>([]);
   const [proposal, setProposal] = useState<Proposal>();
   const [proposalBusy, setProposalBusy] = useState(false);
   const [proposalError, setProposalError] = useState('');
@@ -674,6 +777,10 @@ export function AIPage({ user }: { user: User }) {
   const currentPolicy = projectId
     ? policies.data?.projects.find((p) => p.projectId === projectId) || policies.data?.system
     : policies.data?.system;
+  const currentMode = modes.find(
+    (mode) =>
+      mode.value === (user.role === 'VIEWER' ? 'READ_ONLY' : currentPolicy?.mode || 'CONFIRM'),
+  );
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }, [messages.data, optimistic, busy]);
@@ -684,6 +791,7 @@ export function AIPage({ user }: { user: User }) {
     setOptimistic([]);
     setDrafts([]);
     setTasks([]);
+    setSourceChanges([]);
     setError('');
   }
   function newConversation() {
@@ -692,6 +800,7 @@ export function AIPage({ user }: { user: User }) {
     setOptimistic([]);
     setDrafts([]);
     setTasks([]);
+    setSourceChanges([]);
     setError('');
   }
   async function chat(e: FormEvent) {
@@ -712,6 +821,7 @@ export function AIPage({ user }: { user: User }) {
       setConversationId(result.conversationId);
       setDrafts(result.drafts || []);
       setTasks(result.tasks || []);
+      setSourceChanges(result.sourceChanges || []);
       setOptimistic([]);
       void conversations.reload();
       void proposals.reload();
@@ -729,10 +839,11 @@ export function AIPage({ user }: { user: User }) {
     setProposalBusy(true);
     setProposalError('');
     try {
-      const r = await post<{ proposal: Proposal; task?: Task }>(
+      const r = await post<{ proposal: Proposal; task?: Task; sourceChange?: SourceChange }>(
         `/ai/proposals/${proposal.id}/${approve ? 'confirm' : 'reject'}`,
       );
       if (r.task) setTasks((v) => [...v, r.task!]);
+      if (r.sourceChange) setSourceChanges((v) => [...v, r.sourceChange!]);
       setProposal(undefined);
       void proposals.reload();
       if (conversationId) void messages.reload();
@@ -796,14 +907,8 @@ export function AIPage({ user }: { user: User }) {
             <div className="ai-permission-chip">
               <ShieldCheck size={16} />
               <div>
-                <strong>
-                  {modes.find((m) => m.value === (currentPolicy?.mode || 'CONFIRM'))?.name}
-                </strong>
-                <small>
-                  {user.role === 'VIEWER'
-                    ? '当前用户仅可查看与分析'
-                    : '所有操作仍受资源范围与风险策略约束'}
-                </small>
+                <strong>{currentMode?.name}</strong>
+                <small>{currentMode?.description}</small>
               </div>
             </div>
           </aside>
@@ -902,50 +1007,15 @@ export function AIPage({ user }: { user: User }) {
                   正在分析并调用获准的工具…
                 </div>
               )}
-              {drafts.map((d, i) => (
-                <div className="ai-draft-card" key={i}>
-                  <div>
-                    <FileCode2 size={18} />
-                    <strong>{d.type === 'PIPELINE' ? 'Pipeline 草稿' : '运维方案草稿'}</strong>
-                  </div>
-                  <details>
-                    <summary>预览配置</summary>
-                    <pre className="code-preview">{JSON.stringify(d.definition, null, 2)}</pre>
-                  </details>
-                  {d.type === 'PIPELINE' ? (
-                    <button
-                      className="button secondary small"
-                      onClick={() => {
-                        sessionStorage.setItem(
-                          'veyops:pipeline-draft',
-                          JSON.stringify(
-                            'definition' in d.definition
-                              ? d.definition
-                              : {
-                                  name: 'AI Pipeline 草稿',
-                                  projectId: projectId || undefined,
-                                  definition: d.definition,
-                                },
-                          ),
-                        );
-                        navigate('/pipelines');
-                      }}
-                    >
-                      在 Pipeline 编辑器中完善
-                    </button>
-                  ) : (
-                    <button
-                      className="button secondary small"
-                      onClick={() => {
-                        void navigator.clipboard
-                          .writeText(JSON.stringify(d.definition, null, 2))
-                          .catch(() => setError('无法复制，请展开预览后手动复制。'));
-                      }}
-                    >
-                      复制方案草稿
-                    </button>
-                  )}
-                </div>
+              {drafts.map((draft, i) => (
+                <DraftCard
+                  key={i}
+                  draft={draft}
+                  projectId={projectId || undefined}
+                  canAdopt={user.role !== 'VIEWER'}
+                  onDismiss={() => setDrafts((items) => items.filter((item) => item !== draft))}
+                  onCopyError={() => setError('无法复制，请展开预览后手动复制。')}
+                />
               ))}
               {tasks.map((t) => (
                 <a className="ai-task-result" key={t.id} href={`#/tasks/${t.id}`}>
@@ -957,6 +1027,37 @@ export function AIPage({ user }: { user: User }) {
                   <ChevronRight size={16} />
                 </a>
               ))}
+              {sourceChanges.map((change) => {
+                if (change.kind === 'SOURCE_BRANCH')
+                  return (
+                    <div className="ai-task-result" key={change.id}>
+                      <Check size={16} />
+                      <span>
+                        已推送代码审查分支 {change.branch}
+                        <small>{change.commitSha}</small>
+                      </span>
+                    </div>
+                  );
+                const href = externalHttpUrl(change.url);
+                const label = `PR #${change.number} · 待人工审核`;
+                return href ? (
+                  <a
+                    className="ai-task-result"
+                    key={change.id}
+                    href={href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <Check size={16} />
+                    <span>{label}</span>
+                    <ChevronRight size={16} />
+                  </a>
+                ) : (
+                  <p className="field-note" key={change.id}>
+                    {label}
+                  </p>
+                );
+              })}
               <div ref={bottom} />
             </div>
             <form className="chat-composer" onSubmit={chat}>
@@ -972,7 +1073,7 @@ export function AIPage({ user }: { user: User }) {
                 disabled={busy}
               />
               <div>
-                <small>请勿在对话中粘贴密码或 API Key；需要执行的操作会按策略生成提案。</small>
+                <small>请勿在对话中粘贴密码或 API Key。变更请求按当前策略执行或等待审批。</small>
                 <button
                   className="button primary"
                   type="submit"
@@ -987,8 +1088,8 @@ export function AIPage({ user }: { user: User }) {
       )}
       {pending.length > 0 && (
         <Section
-          title={`等待确认的操作 · ${pending.length}`}
-          subtitle="核对目标、命令与风险后确认；拒绝或过期的提案不会执行。"
+          title={`等待审批的操作 · ${pending.length}`}
+          subtitle="逐项核对目标、变更和风险。你可批准或拒绝当前步骤。"
         >
           <div className="proposal-list">
             {pending.map((p) => (
@@ -1016,8 +1117,8 @@ export function AIPage({ user }: { user: User }) {
       )}
       {proposal && (
         <Modal
-          title="确认 AI 操作提案"
-          description="执行前服务端会重新检查当前用户、最新权限策略和资源范围。"
+          title="审批 AI 操作"
+          description="批准仅对当前步骤有效。执行前会重新核对用户、权限策略和资源范围。"
           onClose={() => {
             if (!proposalBusy) setProposal(undefined);
           }}
@@ -1051,12 +1152,100 @@ export function AIPage({ user }: { user: User }) {
               onClick={() => decide(true)}
             >
               {proposalBusy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
-              确认并执行
+              批准此步骤
             </button>
           </div>
         </Modal>
       )}
     </>
+  );
+}
+
+function DraftCard({
+  draft,
+  projectId,
+  canAdopt,
+  onDismiss,
+  onCopyError,
+}: {
+  draft: Draft;
+  projectId?: string;
+  canAdopt: boolean;
+  onDismiss: () => void;
+  onCopyError: () => void;
+}) {
+  let title: string;
+  let content: unknown;
+  let pipeline: unknown;
+  if ('source' in draft) {
+    title = draft.draft.name;
+    content = draft.draft;
+    pipeline = content;
+  } else if ('type' in draft) {
+    title = draft.type === 'PIPELINE' ? 'Pipeline 草稿' : '运维方案草稿';
+    content = draft.definition;
+    if (draft.type === 'PIPELINE')
+      pipeline =
+        'definition' in draft.definition
+          ? draft.definition
+          : { name: 'AI Pipeline 草稿', projectId, definition: draft.definition };
+  } else {
+    title = draft.title || '源代码修改建议';
+    content = draft;
+  }
+  return (
+    <div className="ai-draft-card">
+      <div>
+        <FileCode2 size={18} />
+        <strong>{title}</strong>
+      </div>
+      {'source' in draft && (
+        <p className="field-note">
+          固定提交 <code>{draft.source.commitSha}</code>
+        </p>
+      )}
+      {'baseCommit' in draft && (
+        <p className="field-note">
+          基线 <code>{draft.baseBranch}</code> · <code>{draft.baseCommit}</code>
+        </p>
+      )}
+      {'notes' in draft && !!draft.notes.length && (
+        <p className="field-note">
+          {Array.isArray(draft.notes) ? draft.notes.join(' ') : draft.notes}
+        </p>
+      )}
+      <details>
+        <summary>{'baseCommit' in draft ? '预览修改建议' : '预览配置'}</summary>
+        <pre className="code-preview">{JSON.stringify(content, null, 2)}</pre>
+      </details>
+      <div className="row-actions">
+        {Boolean(pipeline) && canAdopt ? (
+          <button
+            className="button primary small"
+            onClick={() => {
+              sessionStorage.setItem('veyops:pipeline-draft', JSON.stringify(pipeline));
+              navigate('/pipelines');
+            }}
+          >
+            采用草稿
+          </button>
+        ) : (
+          <button
+            className="button secondary small"
+            onClick={() => {
+              void navigator.clipboard
+                .writeText(JSON.stringify(content, null, 2))
+                .catch(onCopyError);
+            }}
+          >
+            复制草稿
+          </button>
+        )}
+        <button className="button secondary small" onClick={onDismiss}>
+          放弃草稿
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1102,6 +1291,51 @@ function ProposalPreview({ proposal, servers }: { proposal: Proposal; servers: S
           <span>部署目录</span>
           <code>{String(definition?.deployPath || '')}</code>
         </div>
+      )}
+      {proposal.actionType === 'initialize_component' && typeof preview.component === 'string' && (
+        <>
+          <div className="deployment-review">
+            <span>组件</span>
+            <strong>{componentLabels[preview.component] || preview.component}</strong>
+            <span>内置方案版本</span>
+            <strong>v{String(preview.version || '')}</strong>
+          </div>
+          {typeof preview.summary === 'string' && <p className="field-note">{preview.summary}</p>}
+        </>
+      )}
+      {(proposal.actionType === 'publish_source_branch' ||
+        proposal.actionType === 'open_pull_request') && (
+        <div className="deployment-review">
+          <span>标题</span>
+          <strong>{String(preview.title || '')}</strong>
+          <span>基线分支</span>
+          <code>{String(preview.baseBranch || '')}</code>
+          <span>固定基线提交</span>
+          <code>{String(preview.baseCommit || '')}</code>
+          {typeof preview.branch === 'string' && (
+            <>
+              <span>代码审查分支</span>
+              <code>{preview.branch}</code>
+            </>
+          )}
+          {Array.isArray(preview.files) && (
+            <>
+              <span>变更文件</span>
+              <span>{preview.files.join('、')}</span>
+            </>
+          )}
+        </div>
+      )}
+      {proposal.actionType === 'publish_source_branch' && Array.isArray(proposal.payload.files) && (
+        <details className="advanced-options">
+          <summary>审阅拟写入的文件</summary>
+          {proposal.payload.files.map((file: { path: string; content: string }) => (
+            <div key={file.path}>
+              <h3 className="field-title">{file.path}</h3>
+              <pre className="code-preview">{file.content}</pre>
+            </div>
+          ))}
+        </details>
       )}
       <details
         className="advanced-options"

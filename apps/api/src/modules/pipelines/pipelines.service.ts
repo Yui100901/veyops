@@ -346,6 +346,20 @@ export class PipelinesService implements OnModuleInit {
   }
   async preview(id: string, input: RunPipelineDto) {
     const p = await this.prepare(id, input);
+    const configurationHash = this.configurationHash(p);
+    const aiApprovalHash = createHash('sha256')
+      .update(
+        JSON.stringify([
+          id,
+          p.version.id,
+          p.environment.id,
+          p.target.id,
+          p.mode,
+          input.commitSha.toLowerCase(),
+          configurationHash,
+        ]),
+      )
+      .digest('hex');
     return {
       pipelineId: id,
       projectId: p.pipeline.projectId,
@@ -358,7 +372,8 @@ export class PipelinesService implements OnModuleInit {
       version: p.version.version,
       commitSha: input.commitSha.toLowerCase(),
       definition: p.definition,
-      configurationHash: this.configurationHash(p),
+      configurationHash,
+      aiApprovalHash,
       hasSecretVariables: Object.keys(p.env.secretVariables).length > 0,
     };
   }

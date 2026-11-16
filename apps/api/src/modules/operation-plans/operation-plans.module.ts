@@ -7,5 +7,6 @@ import { OperationPlansController } from './operation-plans.controller';
   imports: [CommandCenterModule],
   controllers: [OperationPlansController],
   providers: [OperationPlansService],
+  exports: [OperationPlansService],
 })
 export class OperationPlansModule {}

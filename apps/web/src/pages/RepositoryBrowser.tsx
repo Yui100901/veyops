@@ -9,7 +9,7 @@ import {
   RefreshCw,
   Wifi,
 } from 'lucide-react';
-import { api, message, post, useResource } from '../api';
+import { api, message, navigate, post, useResource } from '../api';
 import { Empty, ErrorBanner, Field, Loading, Modal } from '../components';
 import type { Environment, Repository, Service } from '../models';
 
@@ -241,12 +241,16 @@ export function RepositoryDetails({
   return (
     <Modal
       title={repository.name}
-      description="检查 Git 连接、浏览提交，或根据部署说明生成 Pipeline 草稿。"
+      description="检查 Git 连接、浏览提交，或分析仓库以生成 Pipeline 草稿。"
       onClose={onClose}
       wide
     >
       <div className="form-body">
         <p className="repository-url mono">{repository.cloneUrl}</p>
+        <details className="advanced-options">
+          <summary>仓库 ID</summary>
+          <code>{repository.id}</code>
+        </details>
         <div className="repository-detail-actions">
           <button
             className="button secondary"
@@ -273,7 +277,7 @@ export function RepositoryDetails({
             aria-expanded={section === 'analysis'}
           >
             <FileCode2 size={16} />
-            分析部署说明
+            AI 分析仓库
           </button>
           <a
             className="text-link"
@@ -308,9 +312,13 @@ export function RepositoryDetails({
 
 interface RepositoryAnalysisResult {
   source: { path: string; commitSha: string };
-  draft: { name: string; projectId: string; serviceId: string; definition: object };
-  environmentId: string;
+  draft: { name: string; projectId: string; serviceId?: string; definition: object };
+  environmentId?: string;
   notes: string[];
+  missingFields?: string[];
+  evidencePaths?: string[];
+  technologies?: string[];
+  detectedServices?: { name: string; path: string; technology?: string }[];
 }
 
 function RepositoryAnalysis({
@@ -325,6 +333,7 @@ function RepositoryAnalysis({
   environments: Environment[];
 }) {
   const [commit, setCommit] = useState<RepositoryCommit>();
+  const [choosingCommit, setChoosingCommit] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState<RepositoryAnalysisResult>();
@@ -332,9 +341,12 @@ function RepositoryAnalysis({
 
   async function analyze(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!commit || busy) return;
+    if (busy) return;
     const fields = new FormData(event.currentTarget);
     const docPath = String(fields.get('docPath') ?? '').trim();
+    const repoPath = String(fields.get('repoPath') ?? '').trim();
+    const environmentId = fields.get('environmentId');
+    const serviceId = fields.get('serviceId');
     setBusy(true);
     setError('');
     setResult(undefined);
@@ -343,10 +355,11 @@ function RepositoryAnalysis({
       const analysis = await post<RepositoryAnalysisResult>('/ai/repository-analysis', {
         projectId,
         repositoryId: repository.id,
-        commitSha: commit.sha,
-        environmentId: fields.get('environmentId'),
-        serviceId: fields.get('serviceId'),
+        ...(commit ? { commitSha: commit.sha } : {}),
+        ...(environmentId ? { environmentId } : {}),
+        ...(serviceId ? { serviceId } : {}),
         ...(docPath ? { docPath } : {}),
+        ...(repoPath ? { repoPath } : {}),
       });
       setResult(analysis);
     } catch (err) {
@@ -365,26 +378,54 @@ function RepositoryAnalysis({
     }
   }
 
-  if (!services.length || !environments.length) {
-    return <p className="field-note">请先在项目中添加服务和运行环境，再分析部署说明。</p>;
-  }
-
   const draftJson = result ? JSON.stringify(result.draft, null, 2) : '';
   return (
     <div className="repository-browser">
-      <p className="field-note">选择提交并读取该版本中的部署说明，生成供审阅的 Pipeline 草稿。</p>
-      <RepositoryBrowser
-        projectId={projectId}
-        repository={repository}
-        selectedSha={commit?.sha}
-        onSelect={(selected) => {
-          if (busy) return;
-          setCommit(selected);
-          setResult(undefined);
-          setError('');
-          setCopyStatus('');
-        }}
-      />
+      <p className="field-note">
+        可直接分析仓库默认分支，也可以指定提交和构建子目录。审核草稿后可在 Pipeline 编辑器中采用。
+      </p>
+      <div className="repository-detail-actions">
+        <button
+          className="button secondary small"
+          type="button"
+          disabled={busy}
+          aria-expanded={choosingCommit}
+          onClick={() => setChoosingCommit((open) => !open)}
+        >
+          <GitBranch size={15} />
+          {choosingCommit ? '收起提交列表' : '选择提交'}
+        </button>
+        {commit && (
+          <button
+            className="text-button"
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setCommit(undefined);
+              setResult(undefined);
+              setError('');
+              setCopyStatus('');
+            }}
+          >
+            改用默认分支
+          </button>
+        )}
+      </div>
+      {choosingCommit && (
+        <RepositoryBrowser
+          projectId={projectId}
+          repository={repository}
+          selectedSha={commit?.sha}
+          onSelect={(selected) => {
+            if (busy) return;
+            setCommit(selected);
+            setChoosingCommit(false);
+            setResult(undefined);
+            setError('');
+            setCopyStatus('');
+          }}
+        />
+      )}
       <form
         onSubmit={analyze}
         onChange={() => {
@@ -393,9 +434,9 @@ function RepositoryAnalysis({
         }}
       >
         <fieldset className="form-grid" disabled={busy}>
-          <Field label="服务" required>
-            <select name="serviceId" required>
-              <option value="">选择服务</option>
+          <Field label="服务" hint="可在采用草稿后关联服务。">
+            <select name="serviceId">
+              <option value="">自动选择</option>
               {services.map((service) => (
                 <option key={service.id} value={service.id}>
                   {service.name}
@@ -403,9 +444,9 @@ function RepositoryAnalysis({
               ))}
             </select>
           </Field>
-          <Field label="运行环境" required>
-            <select name="environmentId" required>
-              <option value="">选择环境</option>
+          <Field label="运行环境" hint="按环境区分构建方式时可手动选择。">
+            <select name="environmentId">
+              <option value="">自动选择</option>
               {environments.map((environment) => (
                 <option key={environment.id} value={environment.id}>
                   {environment.name}
@@ -413,7 +454,10 @@ function RepositoryAnalysis({
               ))}
             </select>
           </Field>
-          <Field label="部署说明路径" hint="相对于仓库根目录。留空使用 DEPLOY.md。">
+          <Field label="仓库子目录" hint="仅分析指定子目录时填写。">
+            <input name="repoPath" placeholder="例如 apps/api" maxLength={240} />
+          </Field>
+          <Field label="部署说明路径" hint="相对于仓库根目录，留空自动查找。">
             <input name="docPath" placeholder="DEPLOY.md" maxLength={240} />
           </Field>
         </fieldset>
@@ -423,7 +467,7 @@ function RepositoryAnalysis({
               已选提交 <code>{commit.sha.slice(0, 12)}</code>
             </span>
           )}
-          <button className="button primary" type="submit" disabled={!commit || busy}>
+          <button className="button primary" type="submit" disabled={busy}>
             {busy ? '正在分析…' : '生成 Pipeline 草稿'}
           </button>
         </div>
@@ -436,8 +480,36 @@ function RepositoryAnalysis({
             <strong>{result.draft.name}</strong>
           </div>
           <p className="field-note">
-            来源 <code>{result.source.path}</code> · <code>{result.source.commitSha}</code>
+            固定提交 <code>{result.source.commitSha}</code>
           </p>
+          {!!result.technologies?.length && (
+            <p className="field-note">技术栈 {result.technologies.join('、')}</p>
+          )}
+          {!!result.detectedServices?.length && (
+            <details>
+              <summary>识别到的服务</summary>
+              <ul>
+                {result.detectedServices.map((service, index) => (
+                  <li key={index}>
+                    {service.name} · <code>{service.path}</code>
+                    {service.technology ? ` · ${service.technology}` : ''}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+          <details>
+            <summary>分析依据</summary>
+            <ul>
+              {(result.evidencePaths?.length ? result.evidencePaths : [result.source.path]).map(
+                (path) => (
+                  <li key={path}>
+                    <code>{path}</code>
+                  </li>
+                ),
+              )}
+            </ul>
+          </details>
           {!!result.notes.length && (
             <ul>
               {result.notes.map((note, index) => (
@@ -445,18 +517,46 @@ function RepositoryAnalysis({
               ))}
             </ul>
           )}
+          {!!result.missingFields?.length && (
+            <p className="field-note">待审核补充 {result.missingFields.join('、')}</p>
+          )}
           <details open>
             <summary>Pipeline 草稿 JSON</summary>
             <pre className="code-preview">{draftJson}</pre>
           </details>
-          <button
-            className="button secondary small"
-            type="button"
-            onClick={() => void copyDraft(result.draft)}
-          >
-            <Copy size={14} />
-            复制草稿
-          </button>
+          <div className="repository-detail-actions">
+            <button
+              className="button primary small"
+              type="button"
+              onClick={() => {
+                sessionStorage.setItem('veyops:pipeline-draft', draftJson);
+                navigate(
+                  `/pipelines?${new URLSearchParams({ projectId, repositoryId: repository.id })}`,
+                );
+              }}
+            >
+              <Check size={14} />
+              采用草稿
+            </button>
+            <button
+              className="button secondary small"
+              type="button"
+              onClick={() => void copyDraft(result.draft)}
+            >
+              <Copy size={14} />
+              复制草稿
+            </button>
+            <button
+              className="button secondary small"
+              type="button"
+              onClick={() => {
+                setResult(undefined);
+                setCopyStatus('');
+              }}
+            >
+              放弃草稿
+            </button>
+          </div>
           {copyStatus && (
             <p className="field-note" role="status">
               {copyStatus}

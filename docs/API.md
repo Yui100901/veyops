@@ -23,7 +23,7 @@
 | PATCH                | /credentials/:id           | `{name?,secret?,status?:'ACTIVE'\|'DISABLED'}`                                                               |
 | DELETE               | /credentials/:id           | 引用检查后删除                                                                                               |
 | GET / POST           | /servers                   | 列表 / `{name,host,port?:22,username,credentialId,hostKeyFingerprint,tags?,description?}`                    |
-| GET / PATCH          | /servers/:id               | 详情含分组、所属项目、探测与执行历史 / 完整服务器配置                                                         |
+| GET / PATCH          | /servers/:id               | 详情含分组、所属项目、探测与执行历史 / 完整服务器配置                                                        |
 | DELETE               | /servers/:id               | 软移除，不删除历史                                                                                           |
 | POST                 | /servers/:id/test          | 只读连接检查，返回 `{success,server,result:{exitCode,output}}`                                               |
 | GET / POST           | /server-groups             | 列表 / `{name,description?,serverIds:[]}`                                                                    |
@@ -72,7 +72,7 @@
 | ---- | ------------------------------- | ---------------------------------------------------------------------------------------- |
 | GET  | /tasks                          | 最近100条任务                                                                            |
 | GET  | /tasks/:id                      | `{id,type,name,status,createdBy,createdAt,startedAt,finishedAt,errorSummary,result,...}` |
-| GET  | /tasks/:id/targets              | 每目标名称、Host、状态、退出码、错误摘要及 `canRetry`                                  |
+| GET  | /tasks/:id/targets              | 每目标名称、Host、状态、退出码、错误摘要及 `canRetry`                                    |
 | GET  | /tasks/:id/steps                | 每目标步骤记录                                                                           |
 | GET  | /tasks/:id/logs?offset=0        | `{content,nextOffset}`；偏移单位字节，单次最多256 KiB                                    |
 | GET  | /tasks/:id/logs/stream?offset=0 | SSE，事件 `{content,nextOffset,status}`，id为偏移；支持Last-Event-ID                     |
@@ -116,11 +116,11 @@
 | POST             | /pipelines/:id/run                                 | `{environmentId,targetId,commitSha,version?,confirmed:true,mode?}`，`mode` 可选 `DEPLOY` 或 `BUILD_ONLY` |
 | GET/PUT          | /pipelines/:id/webhook                             | 管理员查询或保存 Gitea 触发配置 `{environmentId,targetId,branch,secretCredentialId,enabled}`             |
 | POST             | /webhooks/gitea/:pipelineId                        | 接收签名的 Gitea Push，按配置触发仅构建                                                                  |
-| GET              | /artifacts                                         | 产物列表，支持 `projectId` 和 `pipelineRunId` 筛选，返回 `downloadAvailable`                              |
-| GET              | /artifacts/:id/download                            | 登录后下载平台归档，响应头 `X-Artifact-SHA256` 提供校验和                                                 |
+| GET              | /artifacts                                         | 产物列表，支持 `projectId` 和 `pipelineRunId` 筛选，返回 `downloadAvailable`                             |
+| GET              | /artifacts/:id/download                            | 登录后下载平台归档，响应头 `X-Artifact-SHA256` 提供校验和                                                |
 | GET              | /deployments                                       | 逐服务器交付记录，支持projectId筛选                                                                      |
 | GET/POST         | /registries                                        | Registry列表/创建（创建仅ADMIN）                                                                         |
-| PATCH            | /registries/:id                                    | 管理员编辑 Registry，`credentialId:null` 可解除凭据关联                                                   |
+| PATCH            | /registries/:id                                    | 管理员编辑 Registry，`credentialId:null` 可解除凭据关联                                                  |
 | POST             | /registries/:id/test                               | 管理员从管理端测试 HTTPS Registry V2 连通与认证，返回 `{success,authenticated,message}`                  |
 
 管理员和操作员可调用 `/projects/:projectId/repositories/:repositoryId/connection`、`/branches` 和 `/commits` 的 GET 接口检查仓库、读取分支和查询最近提交。`/commits` 接受 `branch` 和 `limit`，默认 20 条，最多 50 条。给仓库绑定凭据需要管理员角色。
@@ -131,20 +131,24 @@ Pipeline 定义、四种组合、目录保护和环境覆盖规则见 [构建部
 
 ## v0.2 AI 接口
 
-| 方法         | 路径                           | 说明                                                                                                      |
-| ------------ | ------------------------------ | --------------------------------------------------------------------------------------------------------- |
-| GET/POST     | /ai/providers                  | 列表/管理员创建：`{name,baseUrl,model,apiKey?或credentialId?,enabled?,timeoutSeconds?}`                   |
-| PATCH/DELETE | /ai/providers/:id              | 管理员更新/删除                                                                                           |
-| POST         | /ai/providers/:id/test         | 管理员测试模型连接，安全摘要响应                                                                          |
-| GET/PATCH    | /ai/policies                   | 查询/管理员保存系统或项目策略                                                                             |
-| POST         | /ai/chat                       | `{message,conversationId?,projectId?,providerId?}`；返回`{conversationId,message,proposals,tasks,drafts}` |
-| POST         | /ai/repository-analysis        | 管理员或操作员按 `{projectId,repositoryId,serviceId,environmentId,commitSha,docPath?}` 读取部署文档并生成草稿 |
-| GET          | /ai/conversations              | 仅当前用户的会话                                                                                          |
-| GET          | /ai/conversations/:id/messages | 仅会话发起者可读                                                                                          |
-| GET          | /ai/proposals                  | 当前用户的执行提案                                                                                        |
-| POST         | /ai/proposals/:id/confirm      | 重新校验权限、目标与配置后最多提交一次                                                                    |
-| POST         | /ai/proposals/:id/reject       | 拒绝提案，不执行                                                                                          |
+| 方法         | 路径                           | 说明                                                                                                                       |
+| ------------ | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| GET/POST     | /ai/providers                  | 列表/管理员创建：`{name,baseUrl,model,apiKey?或credentialId?,enabled?,timeoutSeconds?}`                                    |
+| PATCH/DELETE | /ai/providers/:id              | 管理员更新/删除                                                                                                            |
+| POST         | /ai/providers/:id/test         | 管理员测试模型连接，安全摘要响应                                                                                           |
+| GET/PATCH    | /ai/policies                   | 查询/管理员保存系统或项目策略                                                                                              |
+| POST         | /ai/chat                       | `{message,conversationId?,projectId?,providerId?}`；返回`{conversationId,message,proposals,tasks,drafts}`                  |
+| POST         | /ai/repository-analysis        | 管理员或操作员按 `{projectId,repositoryId,serviceId?,environmentId?,commitSha?,docPath?,repoPath?}` 读取仓库证据并生成草稿 |
+| GET          | /ai/conversations              | 仅当前用户的会话                                                                                                           |
+| GET          | /ai/conversations/:id/messages | 仅会话发起者可读                                                                                                           |
+| GET          | /ai/proposals                  | 当前用户的执行提案                                                                                                         |
+| POST         | /ai/proposals/:id/confirm      | 重新校验权限、目标与配置后最多提交一次                                                                                     |
+| POST         | /ai/proposals/:id/reject       | 拒绝提案，不执行                                                                                                           |
 
 API Key 不回显，更新时省略 Key 表示保留。AI 为空或禁用不会影响手工运维。策略与工具限制见 [AI 说明](AI工具与权限.md)。
+
+仓库分析省略 `commitSha` 时固定远端默认分支的完整提交，返回证据路径、技术栈、服务线索、草稿和缺失字段。巡检通过固定 SSH 查询采集目标环境，诊断只返回结构化故障分类与失败步骤。
+
+完全控制策略可用 `approvedPipelineHashes` 授权 Pipeline 预览返回的 `aiApprovalHash`，它绑定版本、提交、执行模式、环境、目标和有效配置。源码写入使用 `repositoryIds` 授权仓库。评审分支和 PR 是两个写步骤。确认使用提案接口，源码步骤返回 `sourceChange`，任务步骤返回 `task`。
 
 备份恢复由[维护命令](BACKUP.md)提供。聚合视图、用户管理和可编辑系统运行参数接口待开发。

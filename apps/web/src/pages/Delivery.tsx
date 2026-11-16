@@ -866,6 +866,7 @@ type PipelinePreview = {
   definition: PipelineDefinition;
   serverIds: string[];
   configurationHash: string;
+  aiApprovalHash?: string;
 };
 
 function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () => void }) {
@@ -883,6 +884,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
   const [commitOrigin, setCommitOrigin] = useState<{ branch: string; subject: string }>();
   const [mode, setMode] = useState<ExecutionMode>('BUILD_ONLY');
   const [preview, setPreview] = useState<PipelinePreview>();
+  const [approvalNotice, setApprovalNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const versionDefinition = versions.data?.find((entry) => entry.version === version)?.definition;
@@ -905,6 +907,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
           mode,
           confirmed: true,
         });
+        setApprovalNotice('');
         setPreview(result);
         return;
       }
@@ -1128,6 +1131,34 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 <h3 className="field-title">启动命令</h3>
                 <pre className="code-preview">{definition.startCommand}</pre>
               </>
+            )}
+            {preview.aiApprovalHash && (
+              <details className="advanced-options">
+                <summary>AI 执行指纹</summary>
+                <p className="field-note">
+                  管理员可将当前执行指纹填入 AI 权限策略，授权此版本和范围内的运行。
+                </p>
+                <pre className="code-preview">{preview.aiApprovalHash}</pre>
+                <button
+                  className="button secondary small"
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(preview.aiApprovalHash!);
+                      setApprovalNotice('已复制执行指纹。');
+                    } catch {
+                      setApprovalNotice('无法复制，请手动选择指纹。');
+                    }
+                  }}
+                >
+                  复制指纹
+                </button>
+                {!!approvalNotice && (
+                  <p className="field-note" role="status">
+                    {approvalNotice}
+                  </p>
+                )}
+              </details>
             )}
             <p className="muted">
               {buildOnly ? '构建完成后可在构建产物中查看结果。' : '请核对部署目录和启动命令。'}

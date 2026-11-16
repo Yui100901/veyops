@@ -11,9 +11,12 @@ import { AiController } from './ai.controller';
 import { AiPipelineAnalyzer } from './ai-pipeline-analyzer.service';
 import { PipelineAnalysisService } from './pipeline-analysis.service';
 import { AiRepositoryAnalysisService } from './ai-repository-analysis.service';
+import { AiDeploymentToolsService } from './ai-deployment-tools.service';
+import { AiSourceChangeService } from './ai-source-change.service';
+import { OperationPlansModule } from '../operation-plans/operation-plans.module';
 @Global()
 @Module({
-  imports: [CommandCenterModule],
+  imports: [CommandCenterModule, OperationPlansModule],
   controllers: [AiController],
   providers: [
     AiRepository,
@@ -26,6 +29,8 @@ import { AiRepositoryAnalysisService } from './ai-repository-analysis.service';
     AiPipelineAnalyzer,
     PipelineAnalysisService,
     AiRepositoryAnalysisService,
+    AiDeploymentToolsService,
+    AiSourceChangeService,
   ],
   exports: [AiProvidersService, AiService, PipelineAnalysisService],
 })

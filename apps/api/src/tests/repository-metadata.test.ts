@@ -93,10 +93,13 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
   const resources: {
     app?: NestExpressApplication;
     fixture?: Awaited<ReturnType<typeof gitHttpFixture>>;
+    provider?: ReturnType<typeof createServer>;
   } = {};
   t.after(async () => {
     await resources.app?.close();
     await resources.fixture?.close();
+    if (resources.provider?.listening)
+      await new Promise<void>((resolve) => resources.provider!.close(() => resolve()));
     await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   });
   const token = 'fixture-git-token-for-metadata-only';
@@ -123,10 +126,28 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
   await git('init', '--initial-branch=main', '--template=', source);
   const docs = join(source, 'docs');
   await mkdir(docs);
+  const web = join(source, 'services', 'web');
+  await mkdir(join(web, 'src'), { recursive: true });
+  await mkdir(join(web, 'secrets'));
+  await mkdir(join(source, 'services', 'api'), { recursive: true });
+  await writeFile(join(web, 'package.json'), JSON.stringify({ scripts: { build: 'tsc' } }));
+  await writeFile(join(web, 'README.md'), '# Browser application\nUse pnpm and Node.js.\n');
+  await writeFile(join(web, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nignored-lock-data\n');
+  await writeFile(join(web, 'src', 'index.ts'), 'export const version = "first-source-entry";\n');
+  await writeFile(
+    join(web, 'compose.yaml'),
+    'services:\n  web:\n    environment:\n      DB_PASSWORD: "sample-quoted-secret"\n',
+  );
+  await writeFile(join(web, '.env'), 'SHOULD_NOT_SEND=env-file-private');
+  await writeFile(join(web, 'secrets', 'README.md'), 'secrets-file-private');
+  await writeFile(
+    join(source, 'services', 'api', 'package.json'),
+    '{"name":"outside-selected-subdirectory"}',
+  );
   await writeFile(join(docs, 'DEPLOY.md'), `# First release\n使用凭据 ${token}\n`);
   await writeFile(join(docs, 'deployment.md'), Buffer.alloc(12 * 1024 + 1, 65));
   await writeFile(join(source, 'pointer.txt'), '../docs/DEPLOY.md');
-  await git('-C', source, 'add', 'docs');
+  await git('-C', source, 'add', 'docs', 'services');
   const pointer = (await git('-C', source, 'hash-object', '-w', 'pointer.txt')).stdout.trim();
   await git(
     '-C',
@@ -142,7 +163,8 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
   };
   const first = await commit('First change');
   await writeFile(join(docs, 'DEPLOY.md'), '# Second release\n');
-  await git('-C', source, 'add', 'docs/DEPLOY.md');
+  await writeFile(join(web, 'src', 'index.ts'), 'export const version = "current-source-entry";\n');
+  await git('-C', source, 'add', 'docs/DEPLOY.md', 'services/web/src/index.ts');
   const second = await commit('Second change');
   const main = await commit('Third change');
   await git('-C', source, 'switch', '-c', 'feature/release', first);
@@ -283,6 +305,137 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
     /普通文件/,
   );
   await assert.rejects(metadata.readDeploymentDoc(project, id, first, 'docs/deployment.md'));
+  const pinned = await metadata.readAnalysisContext(project, id, {
+    commitSha: first,
+    repoPath: 'services/web',
+  });
+  assert.equal(pinned.commitSha, first);
+  assert.deepEqual(pinned.lockfiles, ['services/web/pnpm-lock.yaml']);
+  assert.deepEqual(
+    pinned.files.map((entry) => entry.path),
+    [
+      'services/web/README.md',
+      'services/web/compose.yaml',
+      'services/web/package.json',
+      'services/web/src/index.ts',
+    ],
+  );
+  assert.match(pinned.files.at(-1)!.content, /first-source-entry/);
+  const defaultCommit = await metadata.readAnalysisContext(project, id, {
+    repoPath: 'services/web',
+  });
+  assert.equal(defaultCommit.commitSha, main);
+  assert.match(defaultCommit.files.at(-1)!.content, /current-source-entry/);
+  await assert.rejects(
+    metadata.readAnalysisContext(project, id, { repoPath: '../services' }),
+    /相对子目录/,
+  );
+  await assert.rejects(
+    metadata.readAnalysisContext(project, id, { docPath: 'link/DEPLOY.md' }),
+    /普通文件/,
+  );
+
+  const providerRequests: { messages: { content: string }[]; tools?: unknown }[] = [];
+  const provider = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    providerRequests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    res.writeHead(200, { 'content-type': 'application/json' }).end(
+      JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                name: 'Web build',
+                technologies: ['Node.js', 'TypeScript'],
+                detectedServices: [
+                  { name: 'Web', path: 'services/web', technology: 'TypeScript' },
+                  { name: 'Invented', path: 'outside' },
+                ],
+                definition: {
+                  buildCommand: 'corepack pnpm run build',
+                  installCommand: 'corepack pnpm install --frozen-lockfile',
+                  outputPath: 'dist',
+                  repoPath: 'invented/path',
+                  registryId: randomUUID(),
+                },
+              }),
+            },
+          },
+        ],
+      }),
+    );
+  });
+  resources.provider = provider;
+  await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  await admin
+    .post('/api/v1/ai/providers')
+    .send({
+      name: 'Repository analysis fixture',
+      baseUrl: `http://127.0.0.1:${(provider.address() as AddressInfo).port}`,
+      model: 'fixture-model',
+      apiKey: 'fixture-provider-key',
+    })
+    .expect(201);
+  await admin.patch('/api/v1/ai/policies').send({ mode: 'READ_ONLY' }).expect(200);
+  const analysisRequest = {
+    projectId: project,
+    repositoryId: id,
+    commitSha: first,
+    repoPath: 'services/web',
+  };
+  await viewer.post('/api/v1/ai/repository-analysis').send(analysisRequest).expect(403);
+  await admin
+    .patch('/api/v1/ai/policies')
+    .send({ mode: 'READ_ONLY', repositoryIds: [] })
+    .expect(200);
+  const requestsBeforeDenial = fixture.authenticatedRequests();
+  await operator.post('/api/v1/ai/repository-analysis').send(analysisRequest).expect(403);
+  assert.equal(fixture.authenticatedRequests(), requestsBeforeDenial);
+  assert.equal(providerRequests.length, 0);
+  await admin
+    .patch('/api/v1/ai/policies')
+    .send({ mode: 'READ_ONLY', repositoryIds: [id] })
+    .expect(200);
+  const { body } = await operator
+    .post('/api/v1/ai/repository-analysis')
+    .send(analysisRequest)
+    .expect(201);
+  assert.equal(body.data.source.commitSha, first);
+  assert.equal(body.data.source.path, 'services/web/README.md');
+  assert.deepEqual(body.data.technologies, ['Node.js', 'TypeScript']);
+  assert.deepEqual(body.data.detectedServices, [
+    { name: 'Web', path: 'services/web', technology: 'TypeScript' },
+  ]);
+  assert.equal(body.data.draft.definition.repositoryId, id);
+  assert.equal(body.data.draft.definition.repoPath, 'services/web');
+  assert.equal(body.data.draft.definition.buildCommand, 'corepack pnpm run build');
+  assert.equal(body.data.draft.definition.registryId, undefined);
+  assert.equal(body.data.draft.definition.deployPath, undefined);
+  assert.equal(body.data.draft.serviceId, undefined);
+  assert.ok(body.data.missingFields.includes('deployPath'));
+  assert.ok(body.data.evidencePaths.includes('services/web/pnpm-lock.yaml'));
+  const [providerRequest] = providerRequests;
+  assert.ok(providerRequest);
+  assert.equal(providerRequest.tools, undefined);
+  const evidenceRequest = providerRequest.messages[1].content;
+  assert.match(evidenceRequest, /first-source-entry/);
+  assert.match(evidenceRequest, /pnpm-lock.yaml/);
+  assert.match(evidenceRequest, /\[REDACTED\]/);
+  assert.doesNotMatch(
+    evidenceRequest,
+    /current-source-entry|sample-quoted-secret|env-file-private|secrets-file-private|ignored-lock-data|outside-selected-subdirectory/,
+  );
+  const { body: repositoryOnly } = await operator
+    .post('/api/v1/ai/repository-analysis')
+    .send({ projectId: project, repositoryId: id })
+    .expect(201);
+  assert.deepEqual(repositoryOnly.data.source, { path: 'docs/DEPLOY.md', commitSha: main });
+  assert.equal(repositoryOnly.data.draft.definition.repoPath, undefined);
+  assert.ok(repositoryOnly.data.missingFields.includes('repoPath'));
+  assert.match(providerRequests[1].messages[1].content, /Second release/);
+  assert.equal((await db.selectFrom('pipelines').select('id').execute()).length, 0);
+  assert.equal((await db.selectFrom('tasks').select('id').execute()).length, 0);
   assert.deepEqual((await operator.get(`${metadataPath}/connection`).expect(200)).body.data, {
     ok: true,
     defaultBranch: 'main',

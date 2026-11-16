@@ -117,8 +117,32 @@ export class AiRepository {
       .where('id', '=', conversationId)
       .execute();
   }
-  createProposal(row: Insertable<AiActionProposalsTable>) {
-    return this.database.db.insertInto('ai_action_proposals').values(row).execute();
+  async createProposal(row: Insertable<AiActionProposalsTable>, conversationId?: string) {
+    return this.database.db.transaction().execute(async (tx) => {
+      if (conversationId) {
+        await tx
+          .updateTable('ai_conversations')
+          .set((eb) => ({ updated_at: eb.ref('updated_at') }))
+          .where('id', '=', conversationId)
+          .where('user_id', '=', row.created_by)
+          .executeTakeFirst();
+        const pending = await tx
+          .selectFrom('ai_action_proposals')
+          .select('payload_json')
+          .where('created_by', '=', row.created_by)
+          .where('status', '=', 'PENDING')
+          .where('expires_at', '>', Date.now())
+          .execute();
+        if (
+          pending.some(
+            ({ payload_json }) => JSON.parse(payload_json).conversationId === conversationId,
+          )
+        )
+          return false;
+      }
+      await tx.insertInto('ai_action_proposals').values(row).execute();
+      return true;
+    });
   }
   async proposal(id: string, userId: string) {
     const row = await this.database.db
@@ -186,6 +210,14 @@ export class AiRepository {
     return this.database.db
       .updateTable('ai_action_proposals')
       .set({ task_id: taskId })
+      .where('id', '=', id)
+      .where('status', '=', 'APPROVED')
+      .execute();
+  }
+  recordSourceChange(id: string, preview: Record<string, unknown>) {
+    return this.database.db
+      .updateTable('ai_action_proposals')
+      .set({ preview_json: JSON.stringify(preview) })
       .where('id', '=', id)
       .where('status', '=', 'APPROVED')
       .execute();

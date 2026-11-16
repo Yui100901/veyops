@@ -20,6 +20,7 @@ export function proposalDto(row: Selectable<AiActionProposalsTable>) {
     expiresAt: row.expires_at,
     taskId: row.task_id,
     createdAt: row.created_at,
+    conversationId: stored.conversationId ?? null,
   };
 }
 @Injectable()
@@ -33,21 +34,30 @@ export class AiProposalsService {
   async list(userId: string) {
     return (await this.repository.proposals(userId)).map(proposalDto);
   }
+  async waiting(conversationId: string, userId: string) {
+    return (await this.list(userId)).some(
+      (proposal) => proposal.conversationId === conversationId && proposal.status === 'PENDING',
+    );
+  }
   async create(prepared: PreparedAiAction, snapshot: AiPolicySnapshot, user: CurrentUser) {
     const id = randomUUID();
     const now = Date.now();
-    await this.repository.createProposal({
-      id,
-      created_by: user.id,
-      action_type: prepared.action,
-      payload_json: JSON.stringify(prepared),
-      preview_json: JSON.stringify(prepared.preview),
-      risk_level: prepared.action === 'inspect_servers' ? 'LOW' : 'UNKNOWN',
-      policy_snapshot_json: JSON.stringify(snapshot),
-      status: 'PENDING',
-      expires_at: now + 15 * 60_000,
-      created_at: now,
-    });
+    const created = await this.repository.createProposal(
+      {
+        id,
+        created_by: user.id,
+        action_type: prepared.action,
+        payload_json: JSON.stringify(prepared),
+        preview_json: JSON.stringify(prepared.preview),
+        risk_level: prepared.action === 'inspect_servers' ? 'LOW' : 'UNKNOWN',
+        policy_snapshot_json: JSON.stringify(snapshot),
+        status: 'PENDING',
+        expires_at: now + 15 * 60_000,
+        created_at: now,
+      },
+      prepared.conversationId,
+    );
+    if (!created) throw new ConflictException('此对话已有待审核步骤，请先确认或拒绝');
     await this.audit.record(user.id, 'ai.proposal.create', 'ai_proposal', id, {
       action: prepared.action,
       targetCount: prepared.serverIds.length,
@@ -62,10 +72,12 @@ export class AiProposalsService {
     }
     if (row.status !== 'PENDING') throw new ConflictException('操作提案已处理，不能重复确认');
     const stored = JSON.parse(row.payload_json) as PreparedAiAction;
-    const prepared = await this.tools.prepare(stored.action, stored.payload);
+    const prepared = await this.tools.prepare(stored.action, stored.payload, user);
     prepared.projectId ??= stored.projectId;
     if (
       prepared.bindingsHash !== stored.bindingsHash ||
+      prepared.projectId !== stored.projectId ||
+      prepared.repositoryId !== stored.repositoryId ||
       JSON.stringify([...prepared.serverIds].sort()) !==
         JSON.stringify([...stored.serverIds].sort())
     )
@@ -77,7 +89,34 @@ export class AiProposalsService {
     try {
       // Consume first. If the process crashes here, a human must inspect rather than replay a write.
       const task = await this.tools.execute(prepared, user);
+      if ('sourceChange' in task) {
+        await this.repository.recordSourceChange(id, {
+          ...prepared.preview,
+          sourceChange: task.sourceChange,
+        });
+        await this.audit.record(user.id, 'ai.proposal.confirm', 'ai_proposal', id, {
+          sourceChangeId: task.sourceChange.id,
+        });
+        if (stored.conversationId)
+          await this.repository.addMessage(stored.conversationId, 'TOOL', {
+            text: JSON.stringify(task.sourceChange),
+            name: stored.action,
+          });
+        return {
+          proposal: proposalDto(await this.repository.proposal(id, user.id)),
+          sourceChange: task.sourceChange,
+        };
+      }
       await this.repository.attachTask(id, task.id);
+      if (stored.conversationId)
+        await this.repository.addMessage(stored.conversationId, 'TOOL', {
+          text: JSON.stringify({
+            status: 'TASK_CREATED',
+            taskId: task.id,
+            taskStatus: task.status,
+          }),
+          name: stored.action,
+        });
       await this.audit.record(user.id, 'ai.proposal.confirm', 'ai_proposal', id, {
         taskId: task.id,
       });

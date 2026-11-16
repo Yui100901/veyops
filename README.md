@@ -36,7 +36,7 @@ Windows 下若 better-sqlite3 预编译下载失败，检查到 GitHub Releases 
 | 基础     | npm workspaces、严格 TypeScript、ESLint、统一 API/错误/DTO 校验、40 表初始迁移                                       |
 | 认证     | 首次管理员初始化、scrypt 密码哈希、数据库会话、HttpOnly Cookie、ADMIN / OPERATOR / VIEWER 角色校验                   |
 | 凭据     | AES-256-GCM 加密、元数据列表、改名、轮换、禁用、引用保护、API 不返回密文或明文                                       |
-| 服务器   | 新增、编辑、软移除、标签筛选、分组成员管理、SSH 主机指纹验证、系统状态及执行历史                                    |
+| 服务器   | 新增、编辑、软移除、标签筛选、分组成员管理、SSH 主机指纹验证、系统状态及执行历史                                     |
 | 项目     | 项目、仓库、服务、环境、访问地址、依赖和部署目标管理，以及部署记录聚合                                               |
 | 命令     | 按服务器、分组、标签、项目、环境或部署目标选择，去重预览、确认执行、并行或顺序执行、失败策略、版本化命令模板         |
 | 任务     | 数据库队列、原子领取、SQLite 单 Worker 租约、心跳、异常 NEEDS_ATTENTION、每目标/步骤状态、取消                       |
@@ -49,7 +49,7 @@ Windows 下若 better-sqlite3 预编译下载失败，检查到 GitHub Releases 
 
 使用方法见 [Pipeline 与构建部署](docs/PIPELINES.md)、[AI 工具与权限](docs/AI工具与权限.md)，本轮结果见 [v0.2 验证报告](docs/v0.2验证报告.md)。
 
-**后续工作**：SSH Git 仓库可信注入、仓库源码分析、独立 Worker 入口、自动回滚等。
+**后续工作**：SSH Git 仓库可信注入、独立 Worker 入口、自动回滚等。
 
 ## Pipeline 与 AI
 
@@ -61,7 +61,7 @@ Windows 下若 better-sqlite3 预编译下载失败，检查到 GitHub Releases 
 
 管理端构建必须能调用 Docker CLI/daemon，仓库脚本只在隔离容器中执行，不会退回平台主进程运行。可信检出/打包镜像默认 `node:22-bookworm`，可在服务端以 `BUILD_HELPER_IMAGE` 指定已审核镜像。平台的默认 Docker Compose 不暴露 Docker Socket；容器化平台若需管理端构建，还需管理员配置可用的构建运行环境和共享工作目录，或直接在具备 Docker 的 Linux 主机运行 API/Worker。
 
-AI 可以完全不配置；管理员在“系统设置 → AI 模型连接（可选）”中填写 Base URL、模型和 Key，亦可随时禁用。默认权限为 `CONFIRM`。自由 Shell 和部署即使在 FULL_CONTROL 下也仍按未知风险要求确认，固定只读巡检可在明确授权范围内自动提交。模型通过业务工具操作，不能直接读取凭据或数据库。
+AI 可以完全不配置。管理员在“系统设置 → AI 模型连接（可选）”中填写 Base URL、模型和 Key，亦可随时禁用。默认权限为 `CONFIRM`。AI 可根据固定提交的仓库证据生成部署草稿、只读巡检目标并诊断任务。完全控制模式允许审核过的初始化方案、已授权的固定发布及授权仓库的评审分支和 PR。任意 Shell 仍需审批，PR 由人工合并。模型只能通过注册的业务工具操作资源。
 
 设置 `AI_PIPELINE_ANALYSIS=true` 可启用 Pipeline 完成后的只读结果分析。任务详情显示模型摘要或不可用提示，执行状态由任务系统独立记录。详见 [AI 工具与权限](docs/AI工具与权限.md#pipeline-结果分析)。
 
