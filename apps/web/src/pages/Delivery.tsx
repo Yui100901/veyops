@@ -16,8 +16,9 @@ import {
   Webhook,
   Workflow,
 } from 'lucide-react';
-import { ApiError, api, formatTime, message, navigate, post, useResource } from '../api';
+import { ApiError, api, formatTime, message, navigate, post, remove, useResource } from '../api';
 import {
+  Confirm,
   Empty,
   ErrorBanner,
   Field,
@@ -29,7 +30,15 @@ import {
   Section,
   Status,
 } from '../components';
-import type { Credential, Project, ProjectDetail, Server, Task, User } from '../models';
+import type {
+  Credential,
+  Project,
+  ProjectDetail,
+  Server,
+  SystemRuntimeDefaults,
+  Task,
+  User,
+} from '../models';
 import { RepositoryBrowser } from './RepositoryBrowser';
 
 export interface DeploymentTarget {
@@ -69,6 +78,9 @@ export interface Pipeline {
   definition: PipelineDefinition;
   createdAt?: number;
 }
+type PipelineDraft = Omit<Partial<Pipeline>, 'definition'> & {
+  definition?: Partial<PipelineDefinition>;
+};
 interface Registry {
   id: string;
   name: string;
@@ -110,7 +122,7 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
   const visiblePipelines = (pipelines.data || []).filter(
     (pipeline) => !repositoryId || pipeline.definition?.repositoryId === repositoryId,
   );
-  const [editing, setEditing] = useState<Partial<Pipeline>>();
+  const [editing, setEditing] = useState<PipelineDraft>();
   const [running, setRunning] = useState<Pipeline>();
   const [versions, setVersions] = useState<Pipeline>();
   const [webhook, setWebhook] = useState<Pipeline>();
@@ -119,7 +131,7 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
     if (!raw || user.role === 'VIEWER') return;
     sessionStorage.removeItem('veyops:pipeline-draft');
     try {
-      const value = JSON.parse(raw) as Partial<Pipeline>;
+      const value = JSON.parse(raw) as PipelineDraft;
       setEditing(value);
     } catch {
       /* draft is optional */
@@ -140,7 +152,7 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
                 onClick={() =>
                   setEditing({
                     projectId: projectId || undefined,
-                    definition: repositoryId ? { ...emptyDefinition, repositoryId } : undefined,
+                    definition: repositoryId ? { repositoryId } : undefined,
                   })
                 }
               >
@@ -459,7 +471,7 @@ function PipelineEditor({
   onClose,
   onSaved,
 }: {
-  pipeline: Partial<Pipeline>;
+  pipeline: PipelineDraft;
   projects: Project[];
   onClose: () => void;
   onSaved: () => void;
@@ -468,15 +480,21 @@ function PipelineEditor({
   const [name, setName] = useState(pipeline.name || '');
   const [serviceId, setServiceId] = useState(pipeline.serviceId || '');
   const [enabled, setEnabled] = useState(pipeline.enabled ?? true);
-  const [definition, setDefinition] = useState<PipelineDefinition>({
+  const [definition, setDefinition] = useState<
+    Omit<PipelineDefinition, 'buildLocation'> & Partial<Pick<PipelineDefinition, 'buildLocation'>>
+  >({
     ...emptyDefinition,
     ...pipeline.definition,
+    buildLocation: pipeline.definition?.buildLocation,
   });
+  const defaults = useResource<SystemRuntimeDefaults>(pipeline.id ? null : '/system');
+  const defaultBuildLocation = defaults.data?.defaultBuildLocation;
+  const buildLocation = definition.buildLocation ?? defaultBuildLocation ?? 'TARGET';
   const project = useResource<ProjectDetail>(projectId ? `/projects/${projectId}` : null);
   const registries = useResource<Registry[]>('/registries');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  function field<K extends keyof PipelineDefinition>(key: K, value: PipelineDefinition[K]) {
+  function field<K extends keyof typeof definition>(key: K, value: (typeof definition)[K]) {
     setDefinition((v) => ({ ...v, [key]: value }));
   }
   function changeProject(id: string) {
@@ -604,9 +622,23 @@ function PipelineEditor({
         <div className="form-grid">
           <Field label="构建位置">
             <select
-              value={definition.buildLocation}
-              onChange={(e) => field('buildLocation', e.target.value as 'TARGET' | 'MANAGER')}
+              value={definition.buildLocation ?? (pipeline.id ? 'TARGET' : '')}
+              onChange={(event) =>
+                field(
+                  'buildLocation',
+                  (event.target.value as 'TARGET' | 'MANAGER' | '') || undefined,
+                )
+              }
             >
+              {!pipeline.id && (
+                <option value="">
+                  {!defaultBuildLocation
+                    ? '使用系统默认'
+                    : defaultBuildLocation === 'MANAGER'
+                      ? '使用系统默认（管理端隔离构建）'
+                      : '使用系统默认（目标服务器构建）'}
+                </option>
+              )}
               <option value="TARGET">目标服务器构建</option>
               <option value="MANAGER">管理端隔离构建</option>
             </select>
@@ -621,7 +653,7 @@ function PipelineEditor({
             </select>
           </Field>
         </div>
-        {definition.buildLocation === 'MANAGER' && (
+        {buildLocation === 'MANAGER' && (
           <Field
             label="隔离构建镜像"
             hint="管理端需要配置可用的 Docker；不在平台进程执行仓库脚本。"
@@ -1451,6 +1483,7 @@ export function RegistriesPage({ user }: { user: User }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [checking, setChecking] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<Registry | null>(null);
   const [outcome, setOutcome] = useState<{
     registry: Registry;
     success: boolean;
@@ -1512,6 +1545,21 @@ export function RegistriesPage({ user }: { user: User }) {
     }
   }
 
+  async function deleteRegistry(registry: Registry) {
+    if (busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      await remove(`/registries/${registry.id}`);
+      setDeleting(null);
+      void registries.reload();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -1539,7 +1587,7 @@ export function RegistriesPage({ user }: { user: User }) {
         ) : (
           <div className="resource-list">
             {registries.data.map((r) => (
-              <div className="resource-row" key={r.id}>
+              <div className="resource-row registry-row" key={r.id}>
                 <span className="resource-avatar">
                   <Boxes size={20} />
                 </span>
@@ -1564,6 +1612,17 @@ export function RegistriesPage({ user }: { user: User }) {
                     >
                       <Pencil size={14} /> 编辑
                     </button>
+                    <button
+                      className="button compact"
+                      aria-label={`删除 ${r.name}`}
+                      disabled={checking !== null}
+                      onClick={() => {
+                        setError('');
+                        setDeleting(r);
+                      }}
+                    >
+                      <Trash2 size={14} /> 删除
+                    </button>
                   </span>
                 )}
               </div>
@@ -1571,6 +1630,18 @@ export function RegistriesPage({ user }: { user: User }) {
           </div>
         )}
       </Section>
+      {deleting && (
+        <Confirm
+          title="删除镜像仓库"
+          description={`从 VeyOps 移除 ${deleting.name} 的连接配置。`}
+          onClose={() => !busy && setDeleting(null)}
+          onConfirm={() => void deleteRegistry(deleting)}
+          busy={busy}
+          error={error}
+          label="删除仓库"
+          destructive
+        />
+      )}
       {outcome && (
         <Modal title={`${outcome.registry.name} · 连接测试`} onClose={() => setOutcome(undefined)}>
           {outcome.success ? (

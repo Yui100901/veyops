@@ -24,7 +24,7 @@ node apps/api/dist/core/database/backup-cli.js restore /srv/backups/veyops-2026-
 
 ## Docker Compose 安装
 
-平台镜像默认包含 PostgreSQL 17 客户端。数据库使用其他主版本时，可用 `docker compose build --build-arg POSTGRES_CLIENT_MAJOR=<主版本> veyops` 构建包含同版本客户端的镜像。备份前停止源项目的 VeyOps 容器，保持 PostgreSQL 可用。准备宿主机备份目录 `/srv/backups` 并允许镜像的 `node` 用户写入。将其挂载到一次性容器，容器从当前 Compose 项目挂载原数据卷并继承原实例配置。
+平台镜像默认包含 PostgreSQL 17 客户端。数据库使用其他主版本时，可用 `docker compose build --build-arg POSTGRES_CLIENT_MAJOR=<主版本> veyops` 构建包含同版本客户端的镜像。备份前停止源项目的 VeyOps 容器和同项目中运行的独立 Worker，保持 PostgreSQL 可用。准备宿主机备份目录 `/srv/backups` 并允许镜像的 `node` 用户写入。将其挂载到一次性容器，容器从当前 Compose 项目挂载原数据卷并继承原实例配置。
 
 ```sh
 docker compose stop veyops

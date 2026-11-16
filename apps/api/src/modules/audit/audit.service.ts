@@ -1,6 +1,8 @@
 import { Global, Injectable, Module, Controller, Get } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import type { Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
+import type { Database } from '../../core/database/schema';
 @Injectable()
 export class AuditService {
   constructor(private readonly database: DatabaseService) {}
@@ -10,8 +12,9 @@ export class AuditService {
     resourceType: string,
     resourceId: string | null,
     detail: Record<string, unknown> = {},
+    transaction?: Transaction<Database>,
   ) {
-    await this.database.db
+    await (transaction ?? this.database.db)
       .insertInto('audit_logs')
       .values({
         id: randomUUID(),

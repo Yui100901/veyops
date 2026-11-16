@@ -984,8 +984,9 @@ export function ProjectsPage({ user }: { user: User }) {
   );
 }
 
-export function ProjectPage({ id, user }: { id: string; user: User }) {
+export function ProjectPage({ id, user, viewId }: { id: string; user: User; viewId?: string }) {
   const resource = useResource<ProjectDetail>(`/projects/${id}`);
+  const backPath = viewId ? `/views/${viewId}` : '/projects';
   const credentials = useResource<Credential[]>('/credentials');
   const [editingProject, setEditingProject] = useState(false);
   const [deletingProject, setDeletingProject] = useState(false);
@@ -1059,7 +1060,7 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
     setError('');
     try {
       await remove(`/projects/${id}`);
-      navigate('/projects');
+      navigate(backPath);
     } catch (err) {
       setError(message(err));
     } finally {
@@ -1073,8 +1074,8 @@ export function ProjectPage({ id, user }: { id: string; user: User }) {
   const labels = { repositories: '仓库', services: '服务', environments: '环境' };
   return (
     <>
-      <a href="#/projects" className="back-link">
-        ← 返回项目列表
+      <a href={`#${backPath}`} className="back-link">
+        {viewId ? '← 返回项目视图' : '← 返回项目列表'}
       </a>
       <PageHeader
         eyebrow={project.slug.toUpperCase()}

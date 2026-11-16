@@ -11,6 +11,7 @@ import {
   FolderGit2,
   KeyRound,
   LayoutDashboard,
+  LayoutGrid,
   ListTodo,
   LoaderCircle,
   LogOut,
@@ -31,6 +32,7 @@ import { AuditPage, SystemPage } from './pages/System';
 import { AIPage } from './pages/AI';
 import { DeliveryRecordsPage, PipelinesPage, RegistriesPage } from './pages/Delivery';
 import { DeploymentTargetsPage } from './pages/DeploymentConfig';
+import { ProjectViewsPage } from './pages/ProjectViews';
 import type { User } from './models';
 
 const navigation = [
@@ -39,6 +41,7 @@ const navigation = [
     items: [
       { path: '/', name: '概览', icon: LayoutDashboard },
       { path: '/projects', name: '项目管理', icon: FolderGit2 },
+      { path: '/views', name: '项目视图', icon: LayoutGrid },
       { path: '/servers', name: '服务器', icon: Server },
     ],
   },
@@ -422,8 +425,15 @@ export function App() {
   else if (route === '/servers') page = <ServersPage user={user} />;
   else if (route === '/credentials') page = <CredentialsPage user={user} />;
   else if (route === '/projects') page = <ProjectsPage user={user} />;
-  else if (route.startsWith('/projects/'))
-    page = <ProjectPage key={route} id={route.slice(10)} user={user} />;
+  else if (routePath.startsWith('/projects/')) {
+    const fromView = new URLSearchParams(routeSearch).get('view');
+    const viewId =
+      fromView && /^(all|production|testing|abnormal|[a-f0-9-]{36})$/.test(fromView)
+        ? fromView
+        : undefined;
+    page = <ProjectPage key={route} id={routePath.slice(10)} user={user} viewId={viewId} />;
+  } else if (routePath === '/views' || routePath.startsWith('/views/'))
+    page = <ProjectViewsPage user={user} id={routePath.slice(7) || undefined} />;
   else if (routePath === '/pipelines')
     page = <PipelinesPage user={user} repositoryScope={routeSearch} />;
   else if (route === '/artifacts') page = <DeliveryRecordsPage type="artifacts" />;

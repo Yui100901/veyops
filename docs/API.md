@@ -35,13 +35,33 @@
 | POST                 | /projects/:id/environments | `{name,slug,environmentType:'DEVELOPMENT'\|'TESTING'\|'STAGING'\|'PRODUCTION'\|'CUSTOM'}`                    |
 | GET                  | /dashboard                 | 全量服务器/项目/任务计数、活跃任务计数、最近任务                                                             |
 | GET                  | /audit                     | 最近200条非敏感操作审计                                                                                      |
-| GET                  | /system                    | 当前版本、数据库、Worker与能力开关                                                                           |
+| GET / PATCH          | /system                    | 查看版本、数据库和当前 API 进程的 Worker / 管理员更新执行默认值和日志保留期                                  |
 
 凭据 `type` 包括 SSH_PASSWORD、SSH_KEY、GIT_TOKEN、GIT_PASSWORD、API_KEY、API_SECRET、DOCKER_REGISTRY、USERNAME_PASSWORD、CUSTOM_SECRET。SSH_PASSWORD 使用 `secret:{password}`；SSH_KEY 使用 `{privateKey,passphrase?}`；GIT_TOKEN 使用 `{token}`；API_KEY 使用 `{apiKey}`。GET 永不返回 secret、ciphertext、nonce、auth_tag。
 
 仓库、服务和环境可通过 `PATCH /projects/:id/{repositories,services,environments}/:resourceId` 更新，或通过同路径的 `DELETE` 删除。更新请求沿用创建字段。仓库凭据传 `null` 可解除关联。资源仍被部署、任务历史或其他资源引用时，删除返回 409。
 
 项目详情返回 `addresses`、`dependencies`、`deploymentTargets` 和 `recentDeployments`。通过 `POST /projects/:id/addresses` 或 `POST /projects/:id/dependencies` 新增记录，带记录 ID 的路径支持 `PATCH` 和 `DELETE`。地址可关联项目内的服务和环境，依赖提交时会检查循环引用。
+
+## 项目视图
+
+| 方法   | 路径       | 请求 / 说明                                                                |
+| ------ | ---------- | -------------------------------------------------------------------------- |
+| GET    | /views     | 返回 `{views,defaultViewId}`，包含四个预设和当前账号的自定义视图           |
+| GET    | /views/:id | 返回视图详情、排序后的项目和各项目的发布状态、近期发布与访问地址           |
+| POST   | /views     | `{name,description?,projectIds,isDefault?}`，`projectIds` 的顺序即显示顺序 |
+| PATCH  | /views/:id | 使用同一请求结构更新自定义视图与项目列表                                   |
+| DELETE | /views/:id | 删除当前账号的自定义视图                                                   |
+
+预设 ID 为 `all`、`production`、`testing` 和 `abnormal`。生产与测试视图按环境类型筛选项目，发布记录只覆盖所选环境。异常状态按每个服务、环境和目标服务器的最新部署判断。没有验证过的成功发布显示为待验证。
+
+所有登录角色均可读取预设。管理员或运维人员可保存和设置自己的自定义视图为默认。无自定义默认时打开「全部项目」。设为默认会替换当前账号的旧默认，删除视图只移除它和项目的关联。
+
+## 系统运行设置
+
+`PATCH /system` 接受 `{defaultBuildLocation?,defaultMaxParallelTargets?,logRetentionDays?}`。仅管理员可修改，省略的设置保留原值。构建位置为 `TARGET` 或 `MANAGER`，默认 `TARGET`。目标并发为 1–10，默认 3。新建配置或提交任务时省略对应字段可使用系统默认值，已经保存的版本和任务快照保留原配置。
+
+日志保留期为 0–3650 天，默认 0 表示长期保留。启用后 Worker 周期性清理已结束且超过保留期的任务日志，保留任务记录、子步骤、审计和产物。
 
 ## 命令
 
@@ -122,6 +142,7 @@
 | GET/POST         | /registries                                        | Registry列表/创建（创建仅ADMIN）                                                                         |
 | PATCH            | /registries/:id                                    | 管理员编辑 Registry，`credentialId:null` 可解除凭据关联                                                  |
 | POST             | /registries/:id/test                               | 管理员从管理端测试 HTTPS Registry V2 连通与认证，返回 `{success,authenticated,message}`                  |
+| DELETE           | /registries/:id                                    | 管理员删除未被 Pipeline 版本或镜像产物引用的 Registry。仍有引用时返回 409                                |
 
 管理员和操作员可调用 `/projects/:projectId/repositories/:repositoryId/connection`、`/branches` 和 `/commits` 的 GET 接口检查仓库、读取分支和查询最近提交。`/commits` 接受 `branch` 和 `limit`，默认 20 条，最多 50 条。给仓库绑定凭据需要管理员角色。
 
@@ -151,4 +172,4 @@ API Key 不回显，更新时省略 Key 表示保留。AI 为空或禁用不会�
 
 完全控制策略可用 `approvedPipelineHashes` 授权 Pipeline 预览返回的 `aiApprovalHash`，它绑定版本、提交、执行模式、环境、目标和有效配置。源码写入使用 `repositoryIds` 授权仓库。评审分支和 PR 是两个写步骤。确认使用提案接口，源码步骤返回 `sourceChange`，任务步骤返回 `task`。
 
-备份恢复由[维护命令](BACKUP.md)提供。聚合视图、用户管理和可编辑系统运行参数接口待开发。
+备份恢复由[维护命令](BACKUP.md)提供。用户管理接口待开发。

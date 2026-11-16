@@ -9,19 +9,17 @@ import { randomUUID } from 'node:crypto';
 import { Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import { Database, TaskTargetsTable, TasksTable } from '../../core/database/schema';
-import { CreateTaskInput, TaskExecutionContext, TaskPayload } from './tasks.types';
+import {
+  CreateTaskInput,
+  TaskExecutionContext,
+  TaskPayload,
+  terminalTaskStatuses,
+} from './tasks.types';
 import { TaskLogService } from './task-log.service';
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
 import type { CurrentUser } from '../auth/auth.decorators';
 
-const terminal = new Set([
-  'SUCCESS',
-  'FAILED',
-  'PARTIAL_FAILED',
-  'CANCELLED',
-  'TIMED_OUT',
-  'NEEDS_ATTENTION',
-]);
+const terminal = new Set<string>(terminalTaskStatuses);
 export const isTerminalStatus = (status: string) => terminal.has(status);
 function retryable(task: Selectable<TasksTable>, target: Selectable<TaskTargetsTable>) {
   return (

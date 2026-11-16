@@ -16,7 +16,8 @@
     "lint": "eslint apps --max-warnings 0",
     "format": "prettier --write apps docs README.md",
     "db:migrate": "npm run db:migrate -w apps/api",
-    "start": "npm run start -w apps/api"
+    "start": "npm run start -w apps/api",
+    "start:worker": "npm run start:worker -w apps/api"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

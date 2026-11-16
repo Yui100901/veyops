@@ -2,6 +2,12 @@ import 'reflect-metadata';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Test } from '@nestjs/testing';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import request from 'supertest';
 import { DatabaseService } from '../core/database/database.service';
 import { AuditService } from '../modules/audit/audit.service';
 import { CredentialsService } from '../modules/credentials/credentials.service';
@@ -10,6 +16,7 @@ import {
   checkRegistryConnection,
   registryAddress,
 } from '../modules/registries/registry-connection';
+import { postgresTestUrl, withIsolatedPostgres } from './helpers/isolated-postgres';
 
 const v2 = { 'Docker-Distribution-Api-Version': 'registry/2.0' };
 const fixtureLogin = { username: 'fixture-user', password: 'fixture-password' };
@@ -181,3 +188,214 @@ test('Registry edits require explicit credential selection on address changes an
     await database.onApplicationShutdown();
   }
 });
+
+async function checkRegistryRemoval(connectionString?: string) {
+  const directory = await mkdtemp(join(tmpdir(), 'veyops-registry-removal-'));
+  const initialPassword = 'registry-removal-initial-password';
+  const password = 'registry-removal-second-password';
+  process.env.DATABASE_CLIENT = connectionString ? 'postgres' : 'sqlite';
+  if (connectionString) process.env.DATABASE_URL = connectionString;
+  process.env.DATABASE_PATH = join(directory, 'registry.db');
+  process.env.DATA_DIR = directory;
+  process.env.ENCRYPTION_KEY = randomBytes(32).toString('hex');
+  process.env.WORKER_ENABLED = 'false';
+  process.env.ADMIN_PASSWORD = initialPassword;
+  const { AppModule } = await import('../app.module.js');
+  const { configureApp } = await import('../bootstrap.js');
+  const module = await Test.createTestingModule({ imports: [AppModule] }).compile();
+  const app = module.createNestApplication<NestExpressApplication>({ logger: false });
+  configureApp(app);
+  const base = '/api/v1';
+  try {
+    await app.init();
+    const database = app.get(DatabaseService).db;
+    const api = request.agent(app.getHttpServer());
+    const post = async (path: string, data: object) =>
+      (
+        await api
+          .post(base + path)
+          .send(data)
+          .expect(201)
+      ).body.data;
+    const login = (agent: typeof api, username: string, value: string) =>
+      agent
+        .post(base + '/auth/login')
+        .send({ username, password: value })
+        .expect(201);
+    await login(api, 'root', initialPassword);
+    await api
+      .post(base + '/auth/change-password')
+      .send({ currentPassword: initialPassword, newPassword: password })
+      .expect(200);
+    await login(api, 'root', password);
+    const admin = await database
+      .selectFrom('users')
+      .select('password_hash')
+      .where('username', '=', 'root')
+      .executeTakeFirstOrThrow();
+    await database
+      .insertInto('users')
+      .values({
+        id: randomUUID(),
+        username: 'registry-operator',
+        role: 'OPERATOR',
+        password_hash: admin.password_hash,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      })
+      .execute();
+    const operator = request.agent(app.getHttpServer());
+    await login(operator, 'registry-operator', password);
+    const credential = await post('/credentials', {
+      name: 'Registry login',
+      type: 'DOCKER_REGISTRY',
+      secret: fixtureLogin,
+    });
+    const createRegistry = (name: string) =>
+      post('/registries', {
+        name,
+        registryUrl: 'registry.example.test',
+        credentialId: credential.id,
+      });
+    const unreferenced = await createRegistry('Unreferenced');
+    const deletionPath = base + '/registries/' + unreferenced.id;
+    await request(app.getHttpServer()).delete(deletionPath).expect(401);
+    await operator.delete(deletionPath).expect(403);
+    await api.delete(deletionPath).expect(200);
+    await api.delete(deletionPath).expect(404);
+    assert.ok(
+      (
+        await database
+          .selectFrom('credentials')
+          .select('id')
+          .where('id', '=', credential.id)
+          .executeTakeFirst()
+      )?.id,
+    );
+
+    const historical = await createRegistry('Historical version');
+    const artifactRegistry = await createRegistry('Registry artifact');
+    const project = await post('/projects', { name: 'Registry fixture', slug: 'registry-fixture' });
+    const projectPath = '/projects/' + project.id;
+    const service = await post(projectPath + '/services', {
+      name: 'Fixture service',
+      slug: 'fixture',
+    });
+    const repository = await post(projectPath + '/repositories', {
+      name: 'Fixture Git',
+      cloneUrl: 'https://example.invalid/fixture.git',
+    });
+    const definition = {
+      name: 'Image build',
+      projectId: project.id,
+      serviceId: service.id,
+      definition: {
+        repositoryId: repository.id,
+        artifactType: 'DOCKER_IMAGE',
+        registryId: historical.id,
+      },
+    };
+    const pipeline = await post('/pipelines', definition);
+    await api
+      .patch(base + '/pipelines/' + pipeline.id)
+      .send({
+        name: definition.name,
+        enabled: false,
+        definition: { repositoryId: repository.id, artifactType: 'DOCKER_IMAGE' },
+      })
+      .expect(200);
+    await api.delete(base + '/registries/' + historical.id).expect(409);
+    const image = randomUUID();
+    await database
+      .insertInto('artifacts')
+      .values({
+        id: image,
+        project_id: project.id,
+        service_id: service.id,
+        artifact_type: 'DOCKER_IMAGE',
+        storage_type: 'REGISTRY_IMAGE',
+        storage_key: 'fixture/image:tag',
+        registry_id: artifactRegistry.id,
+        created_at: Date.now(),
+      })
+      .execute();
+    await api.delete(base + '/registries/' + artifactRegistry.id).expect(409);
+    assert.equal(
+      (
+        await database
+          .selectFrom('artifacts')
+          .select('registry_id')
+          .where('id', '=', image)
+          .executeTakeFirstOrThrow()
+      ).registry_id,
+      artifactRegistry.id,
+    );
+
+    const contended = await createRegistry('Referenced concurrently');
+    const registryService = app.get(RegistriesService);
+    const lookup = registryService.get.bind(registryService);
+    let markResourceLoaded!: () => void;
+    const resourceLoaded = new Promise<void>((resolve) => {
+      markResourceLoaded = resolve;
+    });
+    let resumeWriter!: () => void;
+    const writerPermission = new Promise<void>((resolve) => {
+      resumeWriter = resolve;
+    });
+    registryService.get = async (id) => {
+      const registry = await lookup(id);
+      if (id === contended.id) {
+        markResourceLoaded();
+        await writerPermission;
+      }
+      return registry;
+    };
+    const pendingWrite = api
+      .post(base + '/pipelines')
+      .send({
+        ...definition,
+        name: 'Contended Pipeline',
+        definition: { ...definition.definition, registryId: contended.id },
+      })
+      .then((response) => response);
+    try {
+      await Promise.race([
+        resourceLoaded,
+        pendingWrite.then(({ status }) => {
+          throw new Error(`Pipeline returned ${status} before Registry validation`);
+        }),
+      ]);
+      await api.delete(base + '/registries/' + contended.id).expect(200);
+    } finally {
+      resumeWriter();
+      registryService.get = lookup;
+    }
+    assert.equal((await pendingWrite).status, 404);
+    const pipelines = (await api.get(base + '/pipelines').expect(200)).body.data;
+    assert.deepEqual(
+      pipelines.map(({ id }: { id: string }) => id),
+      [pipeline.id],
+    );
+    const audits = await app.get(AuditService).list();
+    assert.deepEqual(
+      new Set(
+        audits
+          .filter(({ action }) => action === 'registry.delete')
+          .map(({ resourceId }) => resourceId),
+      ),
+      new Set([unreferenced.id, contended.id]),
+    );
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+test('SQLite Registry removal enforces authorization and protects history and concurrent references', () =>
+  checkRegistryRemoval());
+
+test(
+  'PostgreSQL Registry removal enforces authorization and protects history and concurrent references',
+  { skip: !postgresTestUrl && 'VEYOPS_TEST_POSTGRES_URL is unset' },
+  () => withIsolatedPostgres(postgresTestUrl!, (url) => checkRegistryRemoval(url)),
+);

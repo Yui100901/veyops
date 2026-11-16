@@ -1,16 +1,29 @@
+import { useState } from 'react';
+import type { FormEvent } from 'react';
 import {
   Check,
   Database,
   FileClock,
   HardDrive,
   LockKeyhole,
+  Pencil,
   Server,
   Settings2,
   Workflow,
 } from 'lucide-react';
-import { formatTime, useResource } from '../api';
-import { Empty, ErrorBanner, Loading, PageHeader, RefreshButton, Section } from '../components';
-import type { Audit, User } from '../models';
+import { api, formatTime, message, useResource } from '../api';
+import {
+  Empty,
+  ErrorBanner,
+  Field,
+  Form,
+  Loading,
+  Modal,
+  PageHeader,
+  RefreshButton,
+  Section,
+} from '../components';
+import type { Audit, SystemRuntimeDefaults, User } from '../models';
 import { AISettings } from './AI';
 
 export function AuditPage() {
@@ -80,20 +93,19 @@ export function AuditPage() {
   );
 }
 
-type SystemInfo = {
+type SystemInfo = Partial<SystemRuntimeDefaults> & {
   version?: string;
   database?: string | { client?: string; type?: string };
   databaseClient?: string;
   workerEnabled?: boolean;
   worker?: { enabled?: boolean; concurrency?: number };
-  defaultMaxParallelTargets?: number;
-  defaultBuildLocation?: string;
   defaultAiPermission?: string;
   dataDir?: string;
   [key: string]: unknown;
 };
 export function SystemPage({ user }: { user: User }) {
   const resource = useResource<SystemInfo>('/system');
+  const [editing, setEditing] = useState(false);
   const value = resource.data;
   const db =
     typeof value?.database === 'string'
@@ -105,7 +117,7 @@ export function SystemPage({ user }: { user: User }) {
       <PageHeader
         eyebrow="WORKSPACE SETTINGS"
         title="系统设置"
-        description="查看运行环境，按需连接 AI 模型并设置执行权限。"
+        description="查看运行环境，管理执行默认值、日志保留和 AI 权限。"
       />
       <ErrorBanner error={resource.error} retry={resource.reload} />
       {resource.loading ? (
@@ -130,10 +142,26 @@ export function SystemPage({ user }: { user: User }) {
             <div className="setting-row">
               <span>
                 <Workflow size={17} />
-                后台 Worker
+                当前 API 进程的 Worker
               </span>
               <strong>{worker == null ? '—' : worker ? '已启用' : '已关闭'}</strong>
             </div>
+          </Section>
+          <Section
+            title="执行与日志"
+            action={
+              user.role === 'ADMIN' &&
+              value && (
+                <button
+                  className="button secondary small"
+                  type="button"
+                  onClick={() => setEditing(true)}
+                >
+                  <Pencil size={14} /> 编辑运行设置
+                </button>
+              )
+            }
+          >
             <div className="setting-row">
               <span>
                 <Server size={17} />
@@ -149,7 +177,22 @@ export function SystemPage({ user }: { user: User }) {
               <strong>
                 {value?.defaultBuildLocation === 'TARGET'
                   ? '目标服务器'
-                  : (value?.defaultBuildLocation ?? '—')}
+                  : value?.defaultBuildLocation === 'MANAGER'
+                    ? '管理端隔离环境'
+                    : '—'}
+              </strong>
+            </div>
+            <div className="setting-row">
+              <span>
+                <FileClock size={17} />
+                任务日志保留
+              </span>
+              <strong>
+                {value?.logRetentionDays === 0
+                  ? '一直保留'
+                  : value?.logRetentionDays
+                    ? `${value.logRetentionDays} 天`
+                    : '—'}
               </strong>
             </div>
           </Section>
@@ -195,12 +238,96 @@ export function SystemPage({ user }: { user: User }) {
       )}
       <div className="info-strip">
         <LockKeyhole size={18} />
-        <p>
-          数据库连接、加密主密钥与 Worker 配置由服务端管理。下方 AI
-          连接与权限策略可由管理员在线调整。
-        </p>
+        <p>数据库连接、加密主密钥与 Worker 进程由服务端配置。</p>
       </div>
       <AISettings user={user} />
+      {editing && value && (
+        <RuntimeDefaultsEditor
+          settings={value}
+          onClose={() => setEditing(false)}
+          onSaved={() => {
+            setEditing(false);
+            void resource.reload();
+          }}
+        />
+      )}
     </>
+  );
+}
+
+function RuntimeDefaultsEditor({
+  settings,
+  onClose,
+  onSaved,
+}: {
+  settings: Partial<SystemRuntimeDefaults>;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const initialBuildLocation = settings.defaultBuildLocation ?? 'TARGET';
+  const initialParallel = settings.defaultMaxParallelTargets ?? 3;
+  const initialRetention = settings.logRetentionDays ?? 0;
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const fields = new FormData(event.currentTarget);
+    const defaultBuildLocation = fields.get('defaultBuildLocation');
+    const defaultMaxParallelTargets = Number(fields.get('defaultMaxParallelTargets'));
+    const logRetentionDays = Number(fields.get('logRetentionDays'));
+    setSaving(true);
+    setError('');
+    try {
+      await api('/system', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          ...(defaultBuildLocation !== initialBuildLocation && { defaultBuildLocation }),
+          ...(defaultMaxParallelTargets !== initialParallel && { defaultMaxParallelTargets }),
+          ...(logRetentionDays !== initialRetention && { logRetentionDays }),
+        }),
+      });
+      onSaved();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+  return (
+    <Modal
+      title="编辑运行设置"
+      onClose={() => {
+        if (!saving) onClose();
+      }}
+    >
+      <Form onSubmit={save} onCancel={onClose} busy={saving} error={error}>
+        <Field label="默认构建位置">
+          <select name="defaultBuildLocation" defaultValue={initialBuildLocation}>
+            <option value="TARGET">目标服务器</option>
+            <option value="MANAGER">管理端隔离环境</option>
+          </select>
+        </Field>
+        <Field label="默认目标并发" hint="适用于未指定并发数的任务和新部署目标。">
+          <input
+            name="defaultMaxParallelTargets"
+            type="number"
+            min={1}
+            max={10}
+            required
+            defaultValue={initialParallel}
+          />
+        </Field>
+        <Field label="任务日志保留天数" hint="超过期限的已结束任务日志会定期清理。填 0 一直保留。">
+          <input
+            name="logRetentionDays"
+            type="number"
+            min={0}
+            max={3650}
+            required
+            defaultValue={initialRetention}
+          />
+        </Field>
+      </Form>
+    </Modal>
   );
 }

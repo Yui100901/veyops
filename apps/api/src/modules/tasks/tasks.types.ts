@@ -11,6 +11,14 @@ export type TaskStatus =
   | 'CANCELLED'
   | 'TIMED_OUT'
   | 'NEEDS_ATTENTION';
+export const terminalTaskStatuses = [
+  'SUCCESS',
+  'FAILED',
+  'PARTIAL_FAILED',
+  'CANCELLED',
+  'TIMED_OUT',
+  'NEEDS_ATTENTION',
+] as const satisfies readonly TaskStatus[];
 export interface ExecutionStep {
   key?: string;
   name: string;

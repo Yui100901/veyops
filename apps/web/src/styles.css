@@ -1311,6 +1311,195 @@ tbody tr:hover {
   gap: 3px;
   color: #7aaa99;
 }
+.project-views-layout {
+  display: grid;
+  grid-template-columns: minmax(165px, 205px) minmax(0, 1fr);
+  align-items: start;
+  gap: 20px;
+}
+.project-views-nav {
+  display: grid;
+  gap: 18px;
+  padding: 14px;
+}
+.project-views-nav > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.project-views-nav h2 {
+  margin: 0 8px 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+.project-views-nav a {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+.project-views-nav a[aria-current='page'] {
+  background: #edf6f2;
+  color: var(--accent-dark);
+  font-weight: 600;
+}
+.project-views-nav a:hover:not([aria-current]) {
+  background: #f6f8fa;
+}
+.project-views-nav p {
+  margin: 3px 8px;
+  font-size: 12px;
+}
+.project-views-content {
+  min-width: 0;
+}
+.project-views-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(310px, 100%), 1fr));
+  align-items: start;
+  gap: 14px;
+  padding: 0 20px 20px;
+}
+.project-view-card {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 16px;
+}
+.project-view-card-header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+}
+.project-view-card-header .project-avatar {
+  width: 37px;
+  height: 37px;
+}
+.project-view-card-header h3 {
+  margin: 0 0 2px;
+  font-size: 15px;
+  font-weight: 600;
+}
+.project-view-card-header .mono,
+.project-view-description,
+.project-view-card-section,
+.project-view-editor-grid {
+  font-size: 12px;
+}
+.project-view-description,
+.project-view-environments {
+  margin: 10px 0 0;
+}
+.project-view-card-section {
+  margin-top: 13px;
+  padding-top: 11px;
+  border-top: 1px solid var(--border);
+}
+.project-view-card-section h4 {
+  margin: 0 0 5px;
+  color: #455565;
+  font-size: 12px;
+  font-weight: 600;
+}
+.project-view-card-section p {
+  margin-bottom: 0;
+}
+.project-view-deployments,
+.project-view-order {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.project-view-deployments li,
+.project-view-order li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+}
+.project-view-deployments small {
+  display: block;
+}
+.project-view-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+.project-view-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.project-view-editor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 14px;
+}
+.project-view-editor-grid fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.project-view-editor-grid legend {
+  padding: 0 4px;
+  font-weight: 600;
+}
+.project-view-editor-grid p {
+  margin: 8px 0 0;
+}
+.project-view-picker,
+.project-view-order {
+  max-height: 215px;
+  overflow: auto;
+}
+.project-view-picker {
+  margin-top: 8px;
+}
+.project-view-picker .checkbox-row {
+  margin-bottom: 3px;
+}
+.project-view-default,
+.project-view-picker .checkbox-row {
+  justify-content: flex-start;
+}
+.project-view-order li {
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.project-view-order .row-actions {
+  flex-shrink: 0;
+}
+@media (max-width: 760px) {
+  .project-views-layout,
+  .project-view-editor-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .project-views-layout {
+    gap: 14px;
+  }
+  .project-views-nav > div {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .project-views-nav h2 {
+    width: 100%;
+  }
+  .project-views-grid {
+    padding: 0 12px 12px;
+  }
+}
 .back-link {
   display: inline-flex;
   align-items: center;
@@ -1383,6 +1572,16 @@ tbody tr:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
   margin-top: 3px;
+}
+@media (max-width: 640px) {
+  .resource-list > .registry-row {
+    flex-wrap: wrap;
+  }
+  .registry-row .row-actions {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
 }
 .batch-selector-options {
   display: grid;

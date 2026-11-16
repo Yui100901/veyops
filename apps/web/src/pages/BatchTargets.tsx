@@ -2,7 +2,13 @@ import { useState } from 'react';
 import { Server as ServerIcon } from 'lucide-react';
 import { useResource } from '../api';
 import { ErrorBanner, Field, Loading, Status } from '../components';
-import type { Environment, ProjectDetail, Server, ServerGroup } from '../models';
+import type {
+  Environment,
+  ProjectDetail,
+  Server,
+  ServerGroup,
+  SystemRuntimeDefaults,
+} from '../models';
 
 export interface TargetSelection {
   serverIds?: string[];
@@ -21,13 +27,12 @@ export interface TargetPreview {
 
 export interface ExecutionOptions {
   strategy: 'PARALLEL' | 'SEQUENTIAL';
-  maxParallel: number;
+  maxParallel?: number;
   failurePolicy: 'CONTINUE' | 'STOP';
 }
 
 export const defaultExecutionOptions: ExecutionOptions = {
   strategy: 'PARALLEL',
-  maxParallel: 3,
   failurePolicy: 'CONTINUE',
 };
 
@@ -286,6 +291,7 @@ export function BatchStrategy({
   onChange: (options: ExecutionOptions) => void;
   disabled?: boolean;
 }) {
+  const defaults = useResource<SystemRuntimeDefaults>('/system');
   return (
     <div className="form-grid">
       <Field label="执行方式">
@@ -300,14 +306,20 @@ export function BatchStrategy({
           <option value="SEQUENTIAL">顺序执行</option>
         </select>
       </Field>
-      <Field label="最大并发">
+      <Field label="最大并发" hint="留空使用系统默认值。">
         <input
           type="number"
           min={1}
           max={10}
-          value={options.strategy === 'SEQUENTIAL' ? 1 : options.maxParallel}
+          value={options.strategy === 'SEQUENTIAL' ? 1 : (options.maxParallel ?? '')}
+          placeholder={String(defaults.data?.defaultMaxParallelTargets ?? '')}
           disabled={disabled || options.strategy === 'SEQUENTIAL'}
-          onChange={(event) => onChange({ ...options, maxParallel: Number(event.target.value) })}
+          onChange={(event) =>
+            onChange({
+              ...options,
+              maxParallel: event.target.value === '' ? undefined : Number(event.target.value),
+            })
+          }
         />
       </Field>
       <Field label="目标失败后">

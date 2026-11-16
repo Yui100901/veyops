@@ -4,6 +4,11 @@ export interface User {
   role: 'ADMIN' | 'OPERATOR' | 'VIEWER';
   mustChangePassword: boolean;
 }
+export interface SystemRuntimeDefaults {
+  defaultBuildLocation: 'TARGET' | 'MANAGER';
+  defaultMaxParallelTargets: number;
+  logRetentionDays: number;
+}
 export interface Credential {
   id: string;
   name: string;

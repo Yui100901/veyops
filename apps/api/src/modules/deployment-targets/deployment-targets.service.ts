@@ -27,11 +27,13 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateIf,
 } from 'class-validator';
 import { randomUUID } from 'node:crypto';
 import { DatabaseService } from '../../core/database/database.service';
 import { ServersService } from '../servers/servers.service';
 import { AuditService } from '../audit/audit.service';
+import { SystemSettingsService } from '../system/system-settings.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 
@@ -44,7 +46,11 @@ export class DeploymentTargetDto {
   @IsUUID('all', { each: true })
   serverIds!: string[];
   @IsOptional() @IsIn(['PARALLEL', 'SEQUENTIAL']) strategy = 'PARALLEL';
-  @IsOptional() @IsInt() @Min(1) @Max(10) maxParallel = 3;
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsInt()
+  @Min(1)
+  @Max(10)
+  maxParallel?: number;
   @IsOptional() @IsIn(['CONTINUE', 'STOP']) failurePolicy = 'CONTINUE';
 }
 @Injectable()
@@ -53,6 +59,7 @@ export class DeploymentTargetsService {
     private readonly database: DatabaseService,
     private readonly servers: ServersService,
     private readonly audit: AuditService,
+    private readonly settings: SystemSettingsService,
   ) {}
   async list() {
     const rows = await this.database.db
@@ -90,6 +97,8 @@ export class DeploymentTargetsService {
     if (!serverIds.length) throw new BadRequestException('部署目标不能为空');
     await this.servers.snapshot(serverIds);
     if (id) await this.get(id);
+    const maxParallel =
+      input.maxParallel ?? (id ? undefined : (await this.settings.get()).defaultMaxParallelTargets);
     const targetId = id || randomUUID(),
       now = Date.now();
     await this.database.db.transaction().execute(async (tx) => {
@@ -97,7 +106,7 @@ export class DeploymentTargetsService {
         name: input.name,
         description: input.description,
         strategy: input.strategy,
-        max_parallel: input.maxParallel,
+        max_parallel: maxParallel,
         failure_policy: input.failurePolicy,
         updated_at: now,
       };

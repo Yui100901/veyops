@@ -38,18 +38,20 @@ Windows 下若 better-sqlite3 预编译下载失败，检查到 GitHub Releases 
 | 凭据     | AES-256-GCM 加密、元数据列表、改名、轮换、禁用、引用保护、API 不返回密文或明文                                       |
 | 服务器   | 新增、编辑、软移除、标签筛选、分组成员管理、SSH 主机指纹验证、系统状态及执行历史                                     |
 | 项目     | 项目、仓库、服务、环境、访问地址、依赖和部署目标管理，以及部署记录聚合                                               |
+| 项目视图 | 全部、生产、测试和异常预设，支持账号自定义项目集合、排序、默认视图和部署状态聚合                                     |
 | 命令     | 按服务器、分组、标签、项目、环境或部署目标选择，去重预览、确认执行、并行或顺序执行、失败策略、版本化命令模板         |
 | 任务     | 数据库队列、原子领取、SQLite 单 Worker 租约、心跳、异常 NEEDS_ATTENTION、每目标/步骤状态、取消                       |
 | 日志     | 本地文件、凭据流式脱敏、偏移续读、SSE、页面轮询查看历史和运行日志                                                    |
 | 运维方案 | 编辑步骤、参数、前置检查和执行后验证，按版本执行，查看逐目标结果并重试，预置巡检和 Docker、Node.js、Nginx 初始化方案 |
 | 控制台   | 概览、资源页面、批量命令二次确认、任务结果/日志、审计、配置展示                                                      |
+| 系统设置 | 管理员可设置默认构建位置、目标并发和任务日志保留期，保存后在执行入口生效                                             |
 | 交付     | Pipeline 表单/步骤排序/不可变版本、固定 Commit、目标端与管理端构建、文件发布与 Docker Compose、产物/逐服务器部署记录 |
 | 环境     | 部署目标 CRUD、服务仓库关联、服务环境配置、普通/敏感变量分层合并与执行快照                                           |
 | AI       | 可选 OpenAI 兼容 Provider、加密 API Key、启停/连接测试、私有会话、业务工具、草稿、三种权限模式与提案确认             |
 
 使用方法见 [Pipeline 与构建部署](docs/PIPELINES.md)、[AI 工具与权限](docs/AI工具与权限.md)，本轮结果见 [v0.2 验证报告](docs/v0.2验证报告.md)。
 
-**后续工作**：SSH Git 仓库可信注入、独立 Worker 入口、自动回滚等。
+**后续工作**：SSH Git 仓库可信注入、自动回滚等。
 
 ## Pipeline 与 AI
 
@@ -106,6 +108,21 @@ DATABASE_URL=postgresql://veyops:password@db.example.internal:5432/veyops
 
 切换数据库只会切换连接，现有数据保留在原库。PostgreSQL 账号需对应用所在 schema 有建表权限。多进程共用 PostgreSQL 时还需共享 `DATA_DIR` 和 `ENCRYPTION_KEY`，并保持主机时钟同步。
 
+管理员可在「系统设置」修改默认构建位置、目标并发和任务日志保留期。日志默认长期保留，启用清理后由 Worker 定期删除超期的已结束任务日志。任务状态、审计和产物仍可查询。
+
+### 单独启动 Worker
+
+默认启动方式在 API 进程内运行 Worker。分开运行时，在共同配置中设置 `WORKER_ENABLED=false`，并分别启动 API 与 Worker。
+
+```text
+npm start
+npm run start:worker
+```
+
+两个进程使用同一数据库、`DATA_DIR` 和 `ENCRYPTION_KEY`。SQLite 只启动一个 Worker。PostgreSQL 的多进程任务领取依赖数据库租约。Worker 需要能够访问部署或构建所需的 SSH 目标及运行环境。
+
+使用 Docker Compose 时同样在 `.env` 中设置 `WORKER_ENABLED=false`，再运行 `docker compose --profile split-worker up -d --build`。独立 Worker 共用数据卷，并在 API 就绪后启动。
+
 备份使用维护 CLI，保存数据库、任务日志、托管产物和数据目录中的配置。将主密钥与备份分开保存。恢复后可设置 `WORKER_ENABLED=false`，核对历史和待执行任务后再启动 Worker。原生安装和 Compose 的命令见[备份与恢复](docs/BACKUP.md)。
 
 ## 测试与验证
@@ -136,4 +153,4 @@ apps/web/src/            React 管理界面
 docs/                   需求梳理、API、验证与后续工作
 ```
 
-API 与 Worker 同进程运行，遵守统一处理器注册机制。独立 Worker 入口、界面用户管理和日志轮转待开发。
+API 与独立 Worker 使用同一套任务处理器。界面用户管理待开发。

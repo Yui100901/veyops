@@ -13,7 +13,7 @@ import {
   PageHeader,
   Section,
 } from '../components';
-import type { ProjectDetail, Server, User } from '../models';
+import type { ProjectDetail, Server, SystemRuntimeDefaults, User } from '../models';
 import type { DeploymentTarget } from './Delivery';
 
 export function DeploymentTargetsPage({ user }: { user: User }) {
@@ -161,8 +161,10 @@ function TargetEditor({
 }) {
   const [ids, setIds] = useState(target.serverIds || []);
   const [strategy, setStrategy] = useState(target.strategy || 'PARALLEL');
+  const [maxParallel, setMaxParallel] = useState(String(target.maxParallel ?? ''));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const defaults = useResource<SystemRuntimeDefaults>(target.id ? null : '/system');
   async function save(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!ids.length) {
@@ -178,7 +180,7 @@ function TargetEditor({
         description: String(f.get('description')),
         serverIds: ids,
         strategy,
-        maxParallel: strategy === 'SEQUENTIAL' ? 1 : Number(f.get('maxParallel')),
+        maxParallel: f.get('maxParallel') ? Number(f.get('maxParallel')) : undefined,
         failurePolicy: f.get('failurePolicy'),
       };
       if (target.id)
@@ -234,14 +236,25 @@ function TargetEditor({
               <option value="SEQUENTIAL">顺序执行</option>
             </select>
           </Field>
-          <Field label="最大并发">
+          <Field
+            label="最大并发"
+            hint={
+              strategy === 'SEQUENTIAL'
+                ? undefined
+                : target.id
+                  ? '留空保留原并发值。'
+                  : '留空使用系统默认值。'
+            }
+          >
             <input
               type="number"
               name="maxParallel"
               disabled={strategy === 'SEQUENTIAL'}
               min={1}
               max={10}
-              defaultValue={target.maxParallel || 3}
+              value={strategy === 'SEQUENTIAL' ? 1 : maxParallel}
+              placeholder={String(defaults.data?.defaultMaxParallelTargets ?? '')}
+              onChange={(event) => setMaxParallel(event.target.value)}
             />
           </Field>
         </div>
@@ -366,6 +379,7 @@ function EnvironmentConfigEditor({
     `/services/${serviceId}/environments/${environmentId}/config`,
   );
   const targets = useResource<DeploymentTarget[]>('/deployment-targets');
+  const defaults = useResource<SystemRuntimeDefaults>('/system');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [artifactType, setArtifactType] = useState('FILE');
@@ -382,7 +396,7 @@ function EnvironmentConfigEditor({
         method: 'PUT',
         body: JSON.stringify({
           targetId: f.get('targetId'),
-          buildLocation: f.get('buildLocation'),
+          buildLocation: f.get('buildLocation') || undefined,
           artifactType: f.get('artifactType'),
           deployMethod: f.get('deployMethod'),
           deployPath: f.get('deployPath'),
@@ -432,7 +446,14 @@ function EnvironmentConfigEditor({
             </Field>
             <div className="form-grid">
               <Field label="构建位置">
-                <select name="buildLocation" defaultValue={config.data?.buildLocation || 'TARGET'}>
+                <select name="buildLocation" defaultValue={config.data?.buildLocation || ''}>
+                  <option value="">
+                    {config.data
+                      ? '保留当前构建位置'
+                      : defaults.data
+                        ? `使用系统默认（${defaults.data.defaultBuildLocation === 'MANAGER' ? '管理端隔离环境' : '目标服务器'}）`
+                        : '使用系统默认'}
+                  </option>
                   <option value="TARGET">目标服务器</option>
                   <option value="MANAGER">管理端隔离环境</option>
                 </select>

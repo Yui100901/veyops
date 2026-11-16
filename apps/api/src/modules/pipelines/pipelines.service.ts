@@ -16,10 +16,11 @@ import { TasksService } from '../tasks/tasks.service';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { AuditService } from '../audit/audit.service';
 import { ServiceConfigsService } from '../service-configs/service-configs.service';
-import { RegistriesService } from '../registries/registries.service';
+import { lockRegistry, RegistriesService } from '../registries/registries.service';
 import { PipelineExecutor } from './pipeline-executor.service';
 import { webhookBuildSocket } from '../builds/builds.service';
 import { PipelineAnalysisService } from '../ai/pipeline-analysis.service';
+import { SystemSettingsService } from '../system/system-settings.service';
 import {
   ConfirmedPipelineRunDto,
   CreatePipelineDto,
@@ -42,6 +43,7 @@ export class PipelinesService implements OnModuleInit {
     private readonly configs: ServiceConfigsService,
     private readonly registries: RegistriesService,
     private readonly analysis: PipelineAnalysisService,
+    private readonly settings: SystemSettingsService,
   ) {}
   onModuleInit() {
     this.handlers.register({
@@ -141,11 +143,17 @@ export class PipelinesService implements OnModuleInit {
     validateGitUrl(row.clone_url);
   }
   async create(input: CreatePipelineDto, userId: string) {
-    await this.resources(input.projectId, input.serviceId, input.definition);
+    const definition: PipelineDefinition = {
+      ...input.definition,
+      buildLocation:
+        input.definition.buildLocation ?? (await this.settings.get()).defaultBuildLocation,
+    };
+    await this.resources(input.projectId, input.serviceId, definition);
     const id = randomUUID(),
       now = Date.now();
     await this.database.db.transaction().execute(async (tx) => {
       await this.lockRepository(tx, input.projectId, input.definition.repositoryId);
+      if (input.definition.registryId) await lockRegistry(tx, input.definition.registryId);
       await tx
         .insertInto('pipelines')
         .values({
@@ -164,7 +172,7 @@ export class PipelinesService implements OnModuleInit {
           id: randomUUID(),
           pipeline_id: id,
           version: 1,
-          definition_json: JSON.stringify(input.definition),
+          definition_json: JSON.stringify(definition),
           created_by: userId,
           created_at: now,
         })
@@ -175,9 +183,14 @@ export class PipelinesService implements OnModuleInit {
   }
   async update(id: string, input: UpdatePipelineDto, userId: string) {
     const current = await this.get(id);
-    await this.resources(current.projectId, current.serviceId, input.definition);
+    const definition: PipelineDefinition = {
+      ...input.definition,
+      buildLocation: input.definition.buildLocation ?? current.definition.buildLocation ?? 'TARGET',
+    };
+    await this.resources(current.projectId, current.serviceId, definition);
     await this.database.db.transaction().execute(async (tx) => {
       await this.lockRepository(tx, current.projectId, input.definition.repositoryId);
+      if (input.definition.registryId) await lockRegistry(tx, input.definition.registryId);
       const pipeline = await tx
         .updateTable('pipelines')
         .set((eb) => ({
@@ -195,7 +208,7 @@ export class PipelinesService implements OnModuleInit {
           id: randomUUID(),
           pipeline_id: id,
           version: pipeline.current_version,
-          definition_json: JSON.stringify(input.definition),
+          definition_json: JSON.stringify(definition),
           created_by: userId,
           created_at: Date.now(),
         })

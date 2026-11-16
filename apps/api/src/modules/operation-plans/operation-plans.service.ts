@@ -14,6 +14,7 @@ import {
 } from '../command-center/command-parameters';
 import { seedPlanTemplates } from './plan-templates';
 import { AuditService } from '../audit/audit.service';
+import { SystemSettingsService } from '../system/system-settings.service';
 import type { Selectable } from 'kysely';
 import type { OperationPlansTable } from '../../core/database/schema';
 
@@ -75,6 +76,7 @@ export class OperationPlansService implements OnModuleInit {
     private readonly executor: MultiTargetExecutor,
     private readonly targets: TargetResolver,
     private readonly audit: AuditService,
+    private readonly settings: SystemSettingsService,
   ) {}
   async onModuleInit() {
     this.registry.register({
@@ -246,7 +248,7 @@ export class OperationPlansService implements OnModuleInit {
           targets: await this.targets.resolveForExecution(input),
           steps,
           strategy: input.strategy,
-          maxParallel: input.maxParallel,
+          maxParallel: input.maxParallel ?? (await this.settings.get()).defaultMaxParallelTargets,
           failurePolicy: input.failurePolicy,
           timeout: input.timeout,
         },

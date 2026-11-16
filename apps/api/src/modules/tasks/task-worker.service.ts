@@ -1,4 +1,10 @@
-import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnApplicationBootstrap,
+  OnModuleDestroy,
+  Optional,
+} from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
@@ -8,6 +14,7 @@ import { TasksService } from './tasks.service';
 import { TaskLogService } from './task-log.service';
 import type { TaskHandler, TaskPayload, TaskRecord, TaskStatus } from './tasks.types';
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
+import { SystemSettingsService } from '../system/system-settings.service';
 
 const TASK_LEASE_MS = 60_000;
 const SQLITE_LEASE_MS = 45_000;
@@ -16,6 +23,7 @@ const EXECUTION_INTERRUPTED = '执行进程中断，远程执行结果需人工�
 const EXECUTION_FAILED = '执行记录未完整保存，远程执行结果需人工核查';
 const LOG_FAILED = '任务日志存储失败，远程执行结果需人工核查';
 const CANCELLED = '任务已取消';
+const LOG_PRUNE_INTERVAL_MS = 60 * 60_000;
 
 @Injectable()
 export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -29,18 +37,24 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
   private controller?: AbortController;
   private stopping = false;
   private sqliteLeaseLost = false;
+  private nextLogPruneAt = 0;
   constructor(
     private readonly database: DatabaseService,
     private readonly tasks: TasksService,
     private readonly registry: TaskHandlerRegistry,
     private readonly logs: TaskLogService,
+    @Optional() private readonly settings?: SystemSettingsService,
   ) {}
   onApplicationBootstrap() {
-    if (process.env.WORKER_ENABLED === 'false') return;
-    this.timer = setInterval(() => {
+    if (process.env.WORKER_ENABLED !== 'false') this.start();
+  }
+  start(keepAlive = false) {
+    if (this.stopping) return;
+    this.timer ??= setInterval(() => {
       void this.tick().catch((error: Error) => this.logger.error(error.message));
     }, 1000);
-    this.timer.unref();
+    if (keepAlive) this.timer.ref();
+    else this.timer.unref();
   }
   onModuleDestroy() {
     return this.shutdown();
@@ -101,6 +115,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       return;
     }
     await this.recoverExpired();
+    await this.pruneLogs();
     if (this.running || this.stopping) return;
     const task = await this.claim(true);
     if (!task) return;
@@ -111,6 +126,22 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         this.running = undefined;
         this.controller = undefined;
       });
+  }
+  private async pruneLogs() {
+    if (!this.settings || this.stopping || Date.now() < this.nextLogPruneAt) return;
+    this.nextLogPruneAt = Date.now() + LOG_PRUNE_INTERVAL_MS;
+    try {
+      const { logRetentionDays } = await this.settings.get();
+      if (!logRetentionDays) {
+        this.nextLogPruneAt = Date.now() + 60_000;
+        return;
+      }
+      const result = await this.logs.pruneExpired(this.database.db, logRetentionDays);
+      if (result.more) this.nextLogPruneAt = Date.now() + 60_000;
+      if (result.failed) this.logger.warn(`本轮有 ${result.failed} 份过期任务日志清理失败`);
+    } catch {
+      this.logger.warn('任务日志保留策略执行失败，下次周期将重试');
+    }
   }
   async claim(requireSqliteLease = false) {
     // The conditional UPDATE is atomic in both dialects. Remote work never holds a DB transaction.

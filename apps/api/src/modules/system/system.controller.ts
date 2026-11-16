@@ -1,9 +1,15 @@
-import { Controller, Get, Module } from '@nestjs/common';
+import { Body, Controller, Get, Module, Patch, Req } from '@nestjs/common';
 import { DatabaseService } from '../../core/database/database.service';
 import { ServersService } from '../servers/servers.service';
 import { ProjectsService } from '../projects/projects.service';
 import { TasksService } from '../tasks/tasks.service';
-import { Public } from '../auth/auth.decorators';
+import { Public, Roles } from '../auth/auth.decorators';
+import type { AuthRequest } from '../auth/auth.guard';
+import {
+  SystemSettingsModule,
+  SystemSettingsService,
+  UpdateSystemSettingsDto,
+} from './system-settings.service';
 
 @Controller()
 class SystemController {
@@ -12,17 +18,17 @@ class SystemController {
     private readonly servers: ServersService,
     private readonly projects: ProjectsService,
     private readonly tasks: TasksService,
+    private readonly settings: SystemSettingsService,
   ) {}
   @Public() @Get('health') health() {
     return { status: 'ok', version: '0.2.0' };
   }
-  @Get('system') system() {
+  @Get('system') async system() {
     return {
       version: '0.2.0',
       database: this.database.client,
       workerEnabled: process.env.WORKER_ENABLED !== 'false',
-      defaultBuildLocation: 'TARGET',
-      defaultMaxParallelTargets: 3,
+      ...(await this.settings.get()),
       defaultAiPermission: 'CONFIRM',
       stage: 'Pipeline、构建部署与可选 AI',
       features: {
@@ -32,12 +38,19 @@ class SystemController {
         commands: true,
         operationPlans: true,
         projects: true,
+        views: true,
         pipelines: true,
         deployments: true,
         ai: true,
         backups: true,
       },
     };
+  }
+  @Roles('ADMIN') @Patch('system') update(
+    @Body() input: UpdateSystemSettingsDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.settings.update(input, req.user.id);
   }
   @Get('dashboard') async dashboard() {
     const [servers, projects, tasks, total, active] = await Promise.all([
@@ -68,5 +81,5 @@ class SystemController {
     };
   }
 }
-@Module({ controllers: [SystemController] })
+@Module({ imports: [SystemSettingsModule], controllers: [SystemController] })
 export class SystemModule {}

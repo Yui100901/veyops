@@ -8,6 +8,7 @@ import { AuditService } from '../audit/audit.service';
 import type { Database } from '../../core/database/schema';
 import type { Transaction } from 'kysely';
 import type { TaskPayload } from '../tasks/tasks.types';
+import { SystemSettingsService } from '../system/system-settings.service';
 
 @Injectable()
 export class CommandCenterService implements OnModuleInit {
@@ -17,6 +18,7 @@ export class CommandCenterService implements OnModuleInit {
     private readonly registry: TaskHandlerRegistry,
     private readonly executor: MultiTargetExecutor,
     private readonly audit: AuditService,
+    private readonly settings: SystemSettingsService,
   ) {}
   onModuleInit() {
     this.registry.register({
@@ -42,7 +44,7 @@ export class CommandCenterService implements OnModuleInit {
           targets: await this.targets.resolveForExecution(input),
           steps: [{ name: '执行命令', command: input.command }],
           strategy: input.strategy,
-          maxParallel: input.maxParallel,
+          maxParallel: input.maxParallel ?? (await this.settings.get()).defaultMaxParallelTargets,
           failurePolicy: input.failurePolicy,
           timeout: input.timeout,
           commandTemplate: template,

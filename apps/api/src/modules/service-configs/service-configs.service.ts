@@ -22,6 +22,7 @@ import {
   Matches,
   MaxLength,
   ValidateNested,
+  ValidateIf,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { randomUUID } from 'node:crypto';
@@ -33,10 +34,13 @@ import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { DeploymentTargetsService } from '../deployment-targets/deployment-targets.service';
 import { relativePath } from '../pipelines/pipeline.validation';
+import { SystemSettingsService } from '../system/system-settings.service';
 
 class ServiceConfigDto {
   @IsUUID() targetId!: string;
-  @IsIn(['TARGET', 'MANAGER']) buildLocation = 'TARGET';
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsIn(['TARGET', 'MANAGER'])
+  buildLocation?: 'TARGET' | 'MANAGER';
   @IsIn(['FILE', 'DOCKER_IMAGE']) artifactType = 'FILE';
   @IsIn(['FILE', 'DOCKER_COMPOSE']) deployMethod = 'FILE';
   @IsOptional() @IsString() @MaxLength(1024) deployPath = '';
@@ -94,6 +98,7 @@ export class ServiceConfigsService {
     private readonly database: DatabaseService,
     private readonly targets: DeploymentTargetsService,
     private readonly audit: AuditService,
+    private readonly settings: SystemSettingsService,
   ) {}
   private async service(id: string) {
     const r = await this.database.db
@@ -167,6 +172,7 @@ export class ServiceConfigsService {
         service_id: serviceId,
         environment_id: environmentId,
         ...values,
+        build_location: input.buildLocation ?? (await this.settings.get()).defaultBuildLocation,
         created_at: now,
       })
       .onConflict((conflict) =>

@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { sql } from 'kysely';
 import { DatabaseService } from '../core/database/database.service';
+import { SystemSettingsService } from '../modules/system/system-settings.service';
 import { AuditService } from '../modules/audit/audit.service';
 import { DeploymentTargetsService } from '../modules/deployment-targets/deployment-targets.service';
 import type { ServersService } from '../modules/servers/servers.service';
@@ -121,11 +122,12 @@ for (const client of ['sqlite', 'postgres'] as const) {
       }
 
       const audit = new AuditService(database);
-      const targets = new DeploymentTargetsService(database, {} as ServersService, audit);
-      const configs = new ServiceConfigsService(database, targets, audit);
+      const settings = new SystemSettingsService(database, audit);
+      const targets = new DeploymentTargetsService(database, {} as ServersService, audit, settings);
+      const configs = new ServiceConfigsService(database, targets, audit, settings);
       const base = {
         targetId: target,
-        buildLocation: 'TARGET',
+        buildLocation: 'TARGET' as const,
         artifactType: 'FILE',
         deployMethod: 'FILE',
         deployPath: '/srv/fixture',

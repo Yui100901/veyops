@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import {
   appendFileSync,
   closeSync,
-  existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readSync,
@@ -10,12 +10,38 @@ import {
 } from 'node:fs';
 import { resolve, dirname, relative } from 'node:path';
 import { Subject } from 'rxjs';
+import type { Kysely } from 'kysely';
 import { dataDirectory } from '../../core/config';
+import type { Database } from '../../core/database/schema';
+import { missingLogFile, pruneTaskLogs, type LogRetentionResult } from './task-log-retention';
 
 @Injectable()
 export class TaskLogService {
   readonly changes = new Subject<{ taskId: string }>();
   private readonly dataDir = dataDirectory;
+  private retentionCursor?: { days: number; id: string };
+
+  async pruneExpired(
+    database: Kysely<Database>,
+    days: number,
+    now = Date.now(),
+  ): Promise<LogRetentionResult> {
+    if (!Number.isInteger(days) || days < 1 || !Number.isSafeInteger(now)) {
+      this.retentionCursor = undefined;
+      return { removed: 0, missing: 0, skipped: 0, failed: 0, more: false };
+    }
+    const cutoff = now - days * 86_400_000;
+    const current = this.retentionCursor?.days === days ? this.retentionCursor.id : undefined;
+    const { result, nextCursor } = await pruneTaskLogs(
+      database,
+      this.dataDir,
+      cutoff,
+      current,
+      (id, createdAt) => this.key(id, createdAt),
+    );
+    this.retentionCursor = nextCursor ? { days, id: nextCursor } : undefined;
+    return result;
+  }
   key(taskId: string, at: number): string {
     const date = new Date(at);
     return `logs/${date.getUTCFullYear()}/${String(date.getUTCMonth() + 1).padStart(2, '0')}/${taskId}.log`;
@@ -38,35 +64,38 @@ export class TaskLogService {
     return statSync(file).size;
   }
   read(key: string | null, offset = 0): { content: string; nextOffset: number } {
-    if (!key) return { content: '', nextOffset: 0 };
-    const file = this.path(key);
-    if (!existsSync(file)) return { content: '', nextOffset: 0 };
-    const size = statSync(file).size;
-    const start = Math.max(0, Math.min(size, Math.floor(offset)));
-    const buffer = Buffer.alloc(Math.min(size - start, 256 * 1024));
-    const fd = openSync(file, 'r');
-    let bytes: number;
+    return this.readChunk(key, () => offset) ?? { content: '', nextOffset: offset };
+  }
+  private readChunk(key: string | null, position: (size: number) => number) {
+    if (!key) return undefined;
+    let fd: number;
     try {
-      bytes = readSync(fd, buffer, 0, buffer.length, start);
+      fd = openSync(this.path(key), 'r');
+    } catch (error) {
+      if (missingLogFile(error)) return undefined;
+      throw error;
+    }
+    try {
+      const size = fstatSync(fd).size;
+      const start = Math.max(0, Math.min(size, Math.floor(position(size))));
+      const buffer = Buffer.alloc(Math.min(size - start, 256 * 1024));
+      const bytes = readSync(fd, buffer, 0, buffer.length, start);
+      let end = bytes;
+      // End chunks at a UTF-8 boundary so offset based continuation is lossless.
+      if (start + bytes < size && end > 0) {
+        let lead = end - 1;
+        while (lead > 0 && (buffer[lead]! & 0xc0) === 0x80) lead--;
+        const first = buffer[lead]!;
+        const expected =
+          first < 0x80 ? 1 : (first & 0xe0) === 0xc0 ? 2 : (first & 0xf0) === 0xe0 ? 3 : 4;
+        if (end - lead < expected) end = lead;
+      }
+      return { content: buffer.subarray(0, end).toString('utf8'), nextOffset: start + end };
     } finally {
       closeSync(fd);
     }
-    // End chunks at a UTF-8 boundary so offset based continuation is lossless.
-    let end = bytes;
-    if (start + bytes < size && end > 0) {
-      let lead = end - 1;
-      while (lead > 0 && (buffer[lead]! & 0xc0) === 0x80) lead--;
-      const first = buffer[lead]!;
-      const expected =
-        first < 0x80 ? 1 : (first & 0xe0) === 0xc0 ? 2 : (first & 0xf0) === 0xe0 ? 3 : 4;
-      if (end - lead < expected) end = lead;
-    }
-    return { content: buffer.subarray(0, end).toString('utf8'), nextOffset: start + end };
   }
   tail(key: string | null): string {
-    if (!key) return '';
-    const file = this.path(key);
-    if (!existsSync(file)) return '';
-    return this.read(key, Math.max(0, statSync(file).size - 64 * 1024)).content;
+    return this.readChunk(key, (size) => Math.max(0, size - 64 * 1024))?.content ?? '';
   }
 }

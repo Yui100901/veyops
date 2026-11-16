@@ -387,6 +387,87 @@ async function checkApi(databaseUrl?: string) {
       .send({ username: 'viewer', password: newPassword })
       .expect(201);
     await viewer.get('/api/v1/servers').expect(200);
+    const initialSettings = await viewer.get('/api/v1/system').expect(200);
+    assert.equal(initialSettings.body.data.defaultBuildLocation, 'TARGET');
+    assert.equal(initialSettings.body.data.defaultMaxParallelTargets, 3);
+    assert.equal(initialSettings.body.data.logRetentionDays, 0);
+    await viewer.patch('/api/v1/system').send({ logRetentionDays: 7 }).expect(403);
+    await api.patch('/api/v1/system').send({ defaultMaxParallelTargets: 11 }).expect(400);
+    await api.patch('/api/v1/system').send({ logRetentionDays: null }).expect(400);
+    await api.patch('/api/v1/system').send({ defaultBuildLocation: 'OTHER' }).expect(400);
+    await Promise.all([
+      api.patch('/api/v1/system').send({ defaultBuildLocation: 'MANAGER' }).expect(200),
+      api
+        .patch('/api/v1/system')
+        .send({ defaultMaxParallelTargets: 6, logRetentionDays: 7 })
+        .expect(200),
+    ]);
+    const savedSettings = await viewer.get('/api/v1/system').expect(200);
+    assert.equal(savedSettings.body.data.defaultBuildLocation, 'MANAGER');
+    assert.equal(savedSettings.body.data.defaultMaxParallelTargets, 6);
+    assert.equal(savedSettings.body.data.logRetentionDays, 7);
+
+    const targetWithDefaults = await api
+      .post('/api/v1/deployment-targets')
+      .send({ name: 'System default target', serverIds: [serverId] })
+      .expect(201);
+    assert.equal(targetWithDefaults.body.data.maxParallel, 6);
+    const commandWithDefaults = await api
+      .post('/api/v1/commands/execute')
+      .send({
+        name: 'System defaults command',
+        command: 'true',
+        serverIds: [serverId],
+        confirmed: true,
+      })
+      .expect(201);
+    const queuedCommand = await db
+      .selectFrom('tasks')
+      .select('payload_json')
+      .where('id', '=', commandWithDefaults.body.data.id)
+      .executeTakeFirstOrThrow();
+    assert.equal(JSON.parse(queuedCommand.payload_json).maxParallel, 6);
+
+    const pipeline = {
+      name: 'System default pipeline',
+      projectId,
+      serviceId,
+      definition: { repositoryId, deployPath: '/tmp/veyops-settings-pipeline' },
+    };
+    const pipelineWithDefaults = await api.post('/api/v1/pipelines').send(pipeline).expect(201);
+    assert.equal(pipelineWithDefaults.body.data.definition.buildLocation, 'MANAGER');
+    assert.equal(pipelineWithDefaults.body.data.definition.artifactType, 'FILE');
+    const pipelinePath = `/api/v1/pipelines/${pipelineWithDefaults.body.data.id}`;
+    const configPath = `/api/v1/services/${serviceId}/environments/${environmentId}/config`;
+    const existingConfig = await api
+      .put(configPath)
+      .send({ targetId, deployPath: '/tmp/veyops-test-service' })
+      .expect(200);
+    assert.equal(existingConfig.body.data.buildLocation, 'TARGET');
+
+    await api
+      .patch('/api/v1/system')
+      .send({ defaultBuildLocation: 'TARGET', defaultMaxParallelTargets: 5 })
+      .expect(200);
+    const retainedPipeline = await api
+      .patch(pipelinePath)
+      .send({ name: pipeline.name, definition: pipeline.definition })
+      .expect(200);
+    assert.equal(retainedPipeline.body.data.definition.buildLocation, 'MANAGER');
+    const newPipeline = await api
+      .post('/api/v1/pipelines')
+      .send({
+        ...pipeline,
+        name: 'System default pipeline explicit',
+        definition: { ...pipeline.definition, buildLocation: 'MANAGER' },
+      })
+      .expect(201);
+    assert.equal(newPipeline.body.data.definition.buildLocation, 'MANAGER');
+    const retainedTarget = await api
+      .patch(`/api/v1/deployment-targets/${targetWithDefaults.body.data.id}`)
+      .send({ name: 'System default target updated', serverIds: [serverId] })
+      .expect(200);
+    assert.equal(retainedTarget.body.data.maxParallel, 6);
     await viewer.post(retryUrl).send({ confirmed: true }).expect(403);
     await viewer
       .post('/api/v1/credentials')
@@ -398,6 +479,9 @@ async function checkApi(databaseUrl?: string) {
       .expect(403);
     const audit = await api.get('/api/v1/audit').expect(200);
     assert.ok(audit.body.data.some((r: { action: string }) => r.action === 'credential.create'));
+    assert.ok(
+      audit.body.data.some((r: { action: string }) => r.action === 'system.settings.update'),
+    );
     assert.equal(JSON.stringify(audit.body).includes('server-secret-123'), false);
     await api.delete(`/api/v1/servers/${serverId}`).expect(200);
     await api.get(`/api/v1/servers/${serverId}`).expect(404);

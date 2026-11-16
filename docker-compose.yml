@@ -6,7 +6,7 @@ services:
     init: true
     ports:
       - "127.0.0.1:${PORT:-3000}:3000"
-    environment:
+    environment: &veyops-environment
       NODE_ENV: production
       HOST: 0.0.0.0
       PORT: "3000"
@@ -20,8 +20,22 @@ services:
       WORKER_CONCURRENCY: "1"
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       AI_PIPELINE_ANALYSIS: ${AI_PIPELINE_ANALYSIS:-false}
-    volumes:
+    volumes: &veyops-volumes
       - veyops-data:/app/data
+
+  worker:
+    profiles: [split-worker]
+    image: veyops:local
+    restart: unless-stopped
+    init: true
+    command: ["node", "apps/api/dist/worker.js"]
+    environment: *veyops-environment
+    volumes: *veyops-volumes
+    healthcheck:
+      disable: true
+    depends_on:
+      veyops:
+        condition: service_healthy
 
 volumes:
   veyops-data:

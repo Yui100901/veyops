@@ -1,4 +1,5 @@
 import { Type } from 'class-transformer';
+import { OmitType } from '@nestjs/swagger';
 import type { PipelineExecutionMode } from './pipeline.types';
 import {
   ArrayMaxSize,
@@ -16,6 +17,7 @@ import {
   Max,
   Min,
   ValidateNested,
+  ValidateIf,
 } from 'class-validator';
 
 export class PipelineStepDto {
@@ -46,22 +48,29 @@ export class PipelineDefinitionDto {
   @Type(() => PipelineStepDto)
   steps: PipelineStepDto[] = [];
 }
+class PipelineDefinitionInputDto extends OmitType(PipelineDefinitionDto, [
+  'buildLocation',
+] as const) {
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsIn(['TARGET', 'MANAGER'])
+  buildLocation?: PipelineDefinitionDto['buildLocation'];
+}
 export class CreatePipelineDto {
   @IsUUID() projectId!: string;
   @IsUUID() serviceId!: string;
   @IsString() @Length(1, 120) name!: string;
   @IsDefined()
   @ValidateNested()
-  @Type(() => PipelineDefinitionDto)
-  definition!: PipelineDefinitionDto;
+  @Type(() => PipelineDefinitionInputDto)
+  definition!: PipelineDefinitionInputDto;
   @IsOptional() @IsBoolean() enabled = true;
 }
 export class UpdatePipelineDto {
   @IsString() @Length(1, 120) name!: string;
   @IsDefined()
   @ValidateNested()
-  @Type(() => PipelineDefinitionDto)
-  definition!: PipelineDefinitionDto;
+  @Type(() => PipelineDefinitionInputDto)
+  definition!: PipelineDefinitionInputDto;
   @IsOptional() @IsBoolean() enabled = true;
 }
 export class RunPipelineDto {
