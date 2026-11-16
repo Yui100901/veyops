@@ -4,6 +4,20 @@
 
 通过部署环境或密码管理器独立保存原有的 `ENCRYPTION_KEY`，恢复时使用相同的密钥。开发实例自动生成的 `DATA_DIR/config/encryption.key` 也需要单独保管。外部 `.env`、数据库账号、容器 Registry 内的镜像及部署目标端的数据各自保留。备份文件可能包含敏感日志和应用数据，请按生产数据限制目录访问。
 
+## 控制台
+
+管理员可在「系统设置 → 备份管理」创建在线备份、核对备份完整性并下载 `.tar.gz`。备份存放在 `DATA_DIR/backups`。通过 CLI 创建并放在该目录下的备份也可在页面管理，目录名需以字母或数字开头，由最多 96 个字母、数字、下划线或短横线组成。页面下载需要服务端有 `tar`，Compose 发布镜像已包含。
+
+在线备份先取得数据库快照，随后复制日志、产物和配置文件。建议在业务写入较少时执行。需要在同一维护窗口保存数据库和托管文件时，按下文停止源 API 和 Worker，再用维护命令创建备份。
+
+下载后把归档解压到新的专用目录，将该目录传给 `restore` 命令。在空目标实例中使用源实例的主密钥，并在验证恢复结果前保持 Worker 禁用。
+
+```sh
+mkdir ./restore-bundle
+tar -xzf ./downloaded-veyops-backup.tar.gz -C ./restore-bundle
+node apps/api/dist/core/database/backup-cli.js restore ./restore-bundle
+```
+
 ## 原生安装
 
 在实例目录运行 `npm run build -w apps/api`。命令读取与运行实例相同的环境变量和 `.env`，其中包括 `DATABASE_CLIENT`、`DATABASE_PATH` 或 `DATABASE_URL`、`DATA_DIR` 以及主密钥。PostgreSQL 需要安装兼容的 `pg_dump` 和 `pg_restore`，可通过 `VEYOPS_PG_DUMP` 和 `VEYOPS_PG_RESTORE` 指定可执行文件路径。优先选择与服务端主版本相同的客户端。[PostgreSQL 客户端文档](https://www.postgresql.org/docs/17/app-pgdump.html)

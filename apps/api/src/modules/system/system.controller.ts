@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Module, Patch, Req } from '@nestjs/common';
 import { DatabaseService } from '../../core/database/database.service';
+import { appVersion } from '../../core/version';
 import { Public, Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import {
@@ -21,11 +22,11 @@ class SystemController {
     private readonly settings: SystemSettingsService,
   ) {}
   @Public() @Get('health') health() {
-    return { status: 'ok', version: '0.2.0' };
+    return { status: 'ok', version: appVersion };
   }
   @Get('system') async system() {
     return {
-      version: '0.2.0',
+      version: appVersion,
       database: this.database.client,
       workerEnabled: process.env.WORKER_ENABLED !== 'false',
       ...(await this.settings.get()),

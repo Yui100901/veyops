@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 import {
+  Archive,
   Check,
   Database,
   FileClock,
@@ -118,12 +119,17 @@ export function SystemPage({ user }: { user: User }) {
       <PageHeader
         eyebrow="WORKSPACE SETTINGS"
         title="系统设置"
-        description="查看运行环境，管理执行默认值、日志保留和 AI 权限。"
+        description="查看运行环境，管理执行默认值、日志保留、数据备份和 AI 权限。"
         action={
           user.role === 'ADMIN' && (
-            <a className="button secondary" href="#/settings/users">
-              <Users size={16} /> 用户管理
-            </a>
+            <>
+              <a className="button secondary" href="#/settings/users">
+                <Users size={16} /> 用户管理
+              </a>
+              <a className="button secondary" href="#/settings/backups">
+                <Archive size={16} /> 备份管理
+              </a>
+            </>
           )
         }
       />

@@ -66,6 +66,19 @@
 - `recentDeployments` 最多六条逐服务器发布记录，含项目、服务、环境、服务器、对应任务、发布版本、执行和健康状态。按开始时间降序，未记录开始时间时使用 Pipeline 运行创建时间。已停用服务器的历史发布仍可查看。
 - `recentTasks` 和 `recentFailedTasks` 分别最多六条。后者独立查询 `FAILED`、`PARTIAL_FAILED`、`TIMED_OUT` 和 `NEEDS_ATTENTION`，较旧的失败任务不会被新的成功任务挤出。
 
+### 备份
+
+以下接口仅管理员可用。返回的备份元数据含 `id`、`createdAt`、`databaseClient` 和 `fileCount`，其中 `fileCount` 包含数据库快照和托管文件。
+
+| 方法 | 路径 | 说明 |
+| ---- | ---- | ---- |
+| GET | /backups | 列出本实例备份目录中具有有效认证清单的备份 |
+| POST | /backups | 创建在线备份，完成后返回元数据和状态码 201 |
+| POST | /backups/:id/verify | 校验清单和文件 SHA-256，成功返回元数据 |
+| GET | /backups/:id/download | 返回校验后的 `.tar.gz` 流，禁止缓存，解压目录可用于离线恢复 |
+
+备份目录固定为 `DATA_DIR/backups`。在线备份先生成数据库快照，再复制托管文件。需要数据库和文件位于同一维护窗口时，使用停机备份。恢复步骤见 [数据备份与恢复](BACKUP.md)。
+
 ## 项目视图
 
 | 方法   | 路径       | 请求 / 说明                                                                |

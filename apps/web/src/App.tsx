@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { version as appVersion } from '../../../package.json';
 import type { FormEvent, ReactNode } from 'react';
 import {
   ArrowRight,
@@ -29,6 +30,7 @@ import { DashboardPage } from './pages/Dashboard';
 import { CredentialsPage, ProjectPage, ProjectsPage, ServersPage } from './pages/Resources';
 import { CommandsPage, PlansPage, TaskPage, TasksPage } from './pages/Operations';
 import { AuditPage, SystemPage } from './pages/System';
+import { BackupsPage } from './pages/Backups';
 import { AIPage } from './pages/AI';
 import { DeliveryRecordsPage, PipelinesPage, RegistriesPage } from './pages/Delivery';
 import { DeploymentTargetsPage } from './pages/DeploymentConfig';
@@ -480,6 +482,7 @@ export function App() {
     page = <TaskPage key={route} id={route.slice(7)} user={user} />;
   else if (route === '/audit') page = <AuditPage />;
   else if (route === '/settings') page = <SystemPage user={user} />;
+  else if (routePath === '/settings/backups') page = <BackupsPage user={user} />;
   else if (routePath === '/settings/users') page = <UsersPage user={user} />;
   else if (routePath === '/account/password') page = changePassword;
   else if (route === '/ai') page = <AIPage user={user} />;
@@ -537,7 +540,7 @@ export function App() {
         <div className="sidebar-bottom">
           <div className="local-label">
             <span />
-            本地运维工作台<span>v0.2.0</span>
+            本地运维工作台<span>v{appVersion}</span>
           </div>
           <div className="user-card">
             <span className="user-avatar">{user.username.slice(0, 1).toUpperCase()}</span>
@@ -583,9 +586,11 @@ export function App() {
                 ? '构建产物'
                 : routePath === '/settings/users'
                   ? '用户管理'
-                  : routePath === '/account/password'
-                    ? '修改密码'
-                    : (current?.name ?? '页面')}
+                  : routePath === '/settings/backups'
+                    ? '数据备份'
+                    : routePath === '/account/password'
+                      ? '修改密码'
+                      : (current?.name ?? '页面')}
             </strong>
           </div>
           <div className="topbar-right">

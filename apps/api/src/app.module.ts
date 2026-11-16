@@ -13,6 +13,7 @@ import { TasksModule } from './modules/tasks/tasks.module';
 import { CommandCenterModule } from './modules/command-center/command-center.module';
 import { OperationPlansModule } from './modules/operation-plans/operation-plans.module';
 import { SystemModule } from './modules/system/system.controller';
+import { BackupModule } from './modules/system/backup.controller';
 import { BuildRunnerModule } from './infrastructure/build-runner/process-runner.service';
 import { DeploymentTargetsModule } from './modules/deployment-targets/deployment-targets.service';
 import { ServiceConfigsModule } from './modules/service-configs/service-configs.service';
@@ -44,6 +45,7 @@ import { ViewsModule } from './modules/views/views.module';
     AiModule,
     InitialConfigurationModule,
     SystemModule,
+    BackupModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: AuthGuard }],
 })

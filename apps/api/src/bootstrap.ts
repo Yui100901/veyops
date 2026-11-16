@@ -11,6 +11,7 @@ import { resolve } from 'node:path';
 import { AppModule } from './app.module';
 import { ApiExceptionFilter, ApiResponseInterceptor } from './core/http';
 import { workspaceRoot } from './core/config';
+import { appVersion } from './core/version';
 
 export function configureApp(app: NestExpressApplication) {
   app.disable('x-powered-by');
@@ -32,8 +33,8 @@ export async function createApp() {
       app,
       new DocumentBuilder()
         .setTitle('veyops API')
-        .setDescription('首个可运行迭代 API；接口用法见 docs/API.md')
-        .setVersion('0.1.0')
+        .setDescription('接口用法见 docs/API.md')
+        .setVersion(appVersion)
         .addCookieAuth('veyops_session')
         .build(),
     );

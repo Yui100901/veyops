@@ -790,12 +790,75 @@ tbody tr:hover {
 .account-password-panel {
   max-width: 520px;
 }
+.backup-panel + .backup-panel {
+  margin-top: 18px;
+}
+.backup-notice {
+  overflow-wrap: anywhere;
+}
+.backup-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.backup-list-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 22px;
+}
+.backup-list-row + .backup-list-row {
+  border-top: 1px solid #edf1f4;
+}
+.backup-name {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.backup-name strong {
+  font-size: 12px;
+}
+.backup-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 12px;
+  margin-top: 4px;
+  color: #667b87;
+  font-size: 11px;
+}
+.backup-restore-body {
+  padding: 4px 22px 20px;
+  color: #4f6775;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.backup-restore-body ol {
+  margin: 12px 0;
+  padding-left: 20px;
+}
+.backup-restore-body summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--accent);
+  font-weight: 600;
+}
+.backup-restore-body p {
+  margin: 10px 0 7px;
+}
 @media (max-width: 600px) {
   .user-management-table :is(th, td) {
     padding-inline: 9px;
   }
   .user-management-table .row-actions {
     gap: 7px;
+  }
+  .backup-list-row,
+  .backup-restore-body {
+    padding-inline: 14px;
   }
 }
 .search-input {

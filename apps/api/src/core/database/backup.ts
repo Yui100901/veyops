@@ -31,7 +31,7 @@ export type BackupSettings = {
 };
 
 type BackupFile = { path: string; sha256: string };
-type Manifest = {
+export type BackupManifest = {
   version: 1;
   createdAt: string;
   database: { client: 'sqlite' } | { client: 'postgres'; schema: string };
@@ -122,17 +122,17 @@ async function copyEntry(source: string, destination: string, path: string) {
   return digest(output);
 }
 
-function signature(manifest: Manifest, key: Buffer) {
+function signature(manifest: BackupManifest, key: Buffer) {
   return createHmac('sha256', key)
     .update('veyops-backup-v1\0')
     .update(JSON.stringify(manifest))
     .digest();
 }
 
-async function readManifest(root: string, key: Buffer): Promise<Manifest> {
+export async function readBackupManifest(root: string, key: Buffer): Promise<BackupManifest> {
   const file = await regularFile(root, manifestFile);
   const { manifest, hmac } = JSON.parse(await readFile(file, 'utf8')) as {
-    manifest: Manifest;
+    manifest: BackupManifest;
     hmac: string;
   };
   if (
@@ -144,6 +144,8 @@ async function readManifest(root: string, key: Buffer): Promise<Manifest> {
   )
     throw new Error('Backup manifest authentication failed; check the original ENCRYPTION_KEY');
   if (
+    typeof manifest.createdAt !== 'string' ||
+    !Number.isFinite(Date.parse(manifest.createdAt)) ||
     !manifest.database ||
     !['sqlite', 'postgres'].includes(manifest.database.client) ||
     (manifest.database.client === 'postgres' && typeof manifest.database.schema !== 'string') ||
@@ -164,6 +166,15 @@ async function readManifest(root: string, key: Buffer): Promise<Manifest> {
     paths.add(file.path);
   }
   if (!paths.has(databaseFile)) throw new Error('Backup manifest has no database snapshot');
+  return manifest;
+}
+
+export async function verifyBackup(root: string, key: Buffer) {
+  const manifest = await readBackupManifest(root, key);
+  for (const { path, sha256 } of manifest.files) {
+    if ((await digest(await regularFile(root, path))) !== sha256)
+      throw new Error(`Backup checksum failed: ${path}`);
+  }
   return manifest;
 }
 
@@ -207,7 +218,7 @@ export async function createBackup(settings: BackupSettings, output: string) {
     const database = settings.database;
     const databaseFile = databaseFiles[database.client];
     const snapshot = join(stage, databaseFile);
-    let savedDatabase: Manifest['database'];
+    let savedDatabase: BackupManifest['database'];
     if (database.client === 'sqlite') {
       const sqlite = openSqlite(database.path);
       try {
@@ -227,7 +238,7 @@ export async function createBackup(settings: BackupSettings, output: string) {
         files.push({ path, sha256: await copyEntry(root, stage, path) });
       }
     }
-    const manifest: Manifest = {
+    const manifest: BackupManifest = {
       version: 1,
       createdAt: new Date().toISOString(),
       database: savedDatabase,
@@ -270,7 +281,7 @@ export async function restoreBackup(settings: BackupSettings, input: string) {
   const source = await realpath(resolve(input));
   const root = await canonicalPath(resolve(settings.dataDir));
   if (contains(source, root)) throw new Error('Restore data directory must be outside the backup');
-  const manifest = await readManifest(source, settings.key);
+  const manifest = await readBackupManifest(source, settings.key);
   const database = settings.database;
   if (database.client !== manifest.database.client)
     throw new Error('Backup database type differs from the destination');

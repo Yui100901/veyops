@@ -1,7 +1,7 @@
 services:
   veyops:
     build: .
-    image: veyops:local
+    image: ${VEYOPS_IMAGE:-veyops:local}
     restart: unless-stopped
     init: true
     ports:
@@ -25,7 +25,7 @@ services:
 
   worker:
     profiles: [split-worker]
-    image: veyops:local
+    image: ${VEYOPS_IMAGE:-veyops:local}
     restart: unless-stopped
     init: true
     command: ["node", "apps/api/dist/worker.js"]

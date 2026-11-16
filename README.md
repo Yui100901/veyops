@@ -2,7 +2,7 @@
 
 以项目为中心、通过 SSH 管理服务器的轻量运维平台。根据 [需求文档](需求文档.md) 开发，技术栈为 **NestJS + React + TypeScript + Kysely**，默认 SQLite，可配置 PostgreSQL，不依赖 Redis 和 Agent。
 
-当前为 **v0.2.0：Pipeline、构建部署与可选 AI**。已打通四种构建部署组合和 AI 工具调用；完整 V1.0 仍有后续工作，详见 [需求梳理与实施计划](docs/需求梳理与实施计划.md)。
+当前版本为 **v1.0.0**。支持管理端和目标端构建、文件与镜像交付、批量运维、可选 AI、用户管理和备份。源码、Compose 与离线镜像的安装步骤见 [发布与安装](docs/RELEASES.md)。
 
 ## 启动
 
@@ -126,7 +126,7 @@ npm run start:worker
 
 使用 Docker Compose 时同样在 `.env` 中设置 `WORKER_ENABLED=false`，再运行 `docker compose --profile split-worker up -d --build`。独立 Worker 共用数据卷，并在 API 就绪后启动。
 
-备份使用维护 CLI，保存数据库、任务日志、托管产物和数据目录中的配置。将主密钥与备份分开保存。恢复后可设置 `WORKER_ENABLED=false`，核对历史和待执行任务后再启动 Worker。原生安装和 Compose 的命令见[备份与恢复](docs/BACKUP.md)。
+管理员可在「系统设置 → 备份管理」创建、校验和下载备份。备份包含数据库、任务日志、托管产物和数据目录中的配置。将主密钥与备份分开保存。恢复使用维护 CLI，先设置 `WORKER_ENABLED=false`，核对历史和待执行任务后再启动 Worker。步骤见 [备份与恢复](docs/BACKUP.md)。
 
 ## 测试与验证
 
