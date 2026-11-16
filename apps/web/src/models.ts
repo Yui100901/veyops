@@ -210,9 +210,26 @@ export interface Plan {
 export interface Dashboard {
   servers: { total: number; online: number; offline: number; unknown: number };
   projects: number;
+  services: { total: number; running: number; abnormal: number };
   totalTasks: number;
   activeTasks: number;
   recentTasks: Task[];
+  recentFailedTasks: Task[];
+  recentDeployments: DashboardDeployment[];
+}
+export interface DashboardDeployment extends Omit<
+  DeploymentSummary,
+  'serverId' | 'healthStatus' | 'releaseVersion'
+> {
+  projectId: string;
+  projectName: string;
+  serviceName: string;
+  environmentName: string;
+  serverId: string | null;
+  serverName: string;
+  healthStatus: string | null;
+  releaseVersion: string | null;
+  createdAt: number;
 }
 export interface Audit {
   id: string;

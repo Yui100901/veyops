@@ -2,14 +2,13 @@ import { Injectable } from '@nestjs/common';
 import type { Kysely, SelectQueryBuilder, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
+import {
+  deploymentRows,
+  failedDeploymentStatuses,
+  failedHealthStatuses,
+  latestDeploymentTargets,
+} from '../deployments/deployment-history';
 
-export const failedDeploymentStatuses = [
-  'FAILED',
-  'PARTIAL_FAILED',
-  'TIMED_OUT',
-  'NEEDS_ATTENTION',
-];
-export const failedHealthStatuses = ['FAILED', 'UNKNOWN'];
 type EnvironmentType = 'PRODUCTION' | 'TESTING';
 type ProjectIds = SelectQueryBuilder<Database, 'projects', { id: string }>;
 
@@ -48,7 +47,7 @@ export class ViewsRepository {
       );
     if (scope.type === 'abnormal') {
       const unhealthy = this.db
-        .selectFrom(this.latestRows(projects).as('latest'))
+        .selectFrom(latestDeploymentTargets(this.db, projects).as('latest'))
         .select('projectId')
         .where('targetRank', '=', 1)
         .where((eb) =>
@@ -60,43 +59,6 @@ export class ViewsRepository {
       return projects.where('id', 'in', unhealthy);
     }
     return projects;
-  }
-
-  private deploymentRows(projectIds: ProjectIds, environmentType?: EnvironmentType) {
-    let query = this.db
-      .selectFrom('deployment_records as deployment')
-      .innerJoin('pipeline_runs as run', 'run.id', 'deployment.pipeline_run_id')
-      .innerJoin('environments as environment', 'environment.id', 'deployment.environment_id')
-      .where('run.project_id', 'in', projectIds);
-    if (environmentType) query = query.where('environment.environment_type', '=', environmentType);
-    return query;
-  }
-
-  private latestRows(projectIds: ProjectIds, environmentType?: EnvironmentType) {
-    return this.deploymentRows(projectIds, environmentType)
-      .where('deployment.server_id', 'is not', null)
-      .select([
-        'run.project_id as projectId',
-        'deployment.status as status',
-        'deployment.health_status as healthStatus',
-      ])
-      .select((eb) =>
-        eb.fn
-          .agg<number>('row_number', [])
-          .over((window) =>
-            window
-              .partitionBy([
-                'run.project_id',
-                'deployment.service_id',
-                'deployment.environment_id',
-                'deployment.server_id',
-              ])
-              .orderBy(eb.fn.coalesce('deployment.started_at', 'run.created_at'), 'desc')
-              .orderBy('run.created_at', 'desc')
-              .orderBy('deployment.id', 'desc'),
-          )
-          .as('targetRank'),
-      );
   }
 
   async presetProjects(scope: ViewScope) {
@@ -166,7 +128,7 @@ export class ViewsRepository {
         ]),
       );
 
-    const rankedRecent = this.deploymentRows(projectIds, environmentType)
+    const rankedRecent = deploymentRows(this.db, projectIds, environmentType)
       .innerJoin('services as service', 'service.id', 'deployment.service_id')
       .leftJoin('servers as server', 'server.id', 'deployment.server_id')
       .select([
@@ -207,7 +169,7 @@ export class ViewsRepository {
       environments.orderBy('name').orderBy('id').execute(),
       addresses.orderBy('name').orderBy('id').execute(),
       this.db
-        .selectFrom(this.latestRows(projectIds, environmentType).as('latest'))
+        .selectFrom(latestDeploymentTargets(this.db, projectIds, { environmentType }).as('latest'))
         .select(['projectId', 'status', 'healthStatus'])
         .where('targetRank', '=', 1)
         .execute(),

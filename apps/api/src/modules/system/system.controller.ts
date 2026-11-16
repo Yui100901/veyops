@@ -1,10 +1,13 @@
 import { Body, Controller, Get, Module, Patch, Req } from '@nestjs/common';
 import { DatabaseService } from '../../core/database/database.service';
-import { ServersService } from '../servers/servers.service';
-import { ProjectsService } from '../projects/projects.service';
-import { TasksService } from '../tasks/tasks.service';
 import { Public, Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
+import {
+  serviceDeploymentCounts,
+  workspaceRecentDeployments,
+} from '../deployments/deployment-history';
+import { taskDto } from '../tasks/tasks.service';
+import { failedTaskStatuses } from '../tasks/tasks.types';
 import {
   SystemSettingsModule,
   SystemSettingsService,
@@ -15,9 +18,6 @@ import {
 class SystemController {
   constructor(
     private readonly database: DatabaseService,
-    private readonly servers: ServersService,
-    private readonly projects: ProjectsService,
-    private readonly tasks: TasksService,
     private readonly settings: SystemSettingsService,
   ) {}
   @Public() @Get('health') health() {
@@ -53,31 +53,59 @@ class SystemController {
     return this.settings.update(input, req.user.id);
   }
   @Get('dashboard') async dashboard() {
-    const [servers, projects, tasks, total, active] = await Promise.all([
-      this.servers.list(),
-      this.projects.list(),
-      this.tasks.list(),
-      this.database.db
-        .selectFrom('tasks')
-        .select((eb) => eb.fn.countAll<number>().as('count'))
+    const db = this.database.db;
+    const limit = 6;
+    const liveProjects = db.selectFrom('projects').where('deleted_at', 'is', null).select('id');
+    const recentTasks = db
+      .selectFrom('tasks')
+      .selectAll()
+      .orderBy('created_at', 'desc')
+      .orderBy('id', 'desc')
+      .limit(limit);
+    const [servers, projects, tasks, services, deployments, recent, failures] = await Promise.all([
+      db
+        .selectFrom('servers')
+        .where('is_active', '=', 1)
+        .select(({ fn }) => [
+          fn.countAll<number>().as('total'),
+          fn.countAll<number>().filterWhere('status', '=', 'ONLINE').as('online'),
+          fn.countAll<number>().filterWhere('status', '=', 'OFFLINE').as('offline'),
+          fn.countAll<number>().filterWhere('status', '=', 'UNKNOWN').as('unknown'),
+        ])
         .executeTakeFirstOrThrow(),
-      this.database.db
-        .selectFrom('tasks')
-        .select((eb) => eb.fn.countAll<number>().as('count'))
-        .where('status', 'in', ['PENDING', 'RUNNING', 'CANCEL_REQUESTED'])
+      db
+        .selectFrom(liveProjects.as('liveProjects'))
+        .select(({ fn }) => fn.countAll<number>().as('count'))
         .executeTakeFirstOrThrow(),
+      db
+        .selectFrom('tasks')
+        .select(({ fn }) => [
+          fn.countAll<number>().as('total'),
+          fn
+            .countAll<number>()
+            .filterWhere('status', 'in', ['PENDING', 'RUNNING', 'CANCEL_REQUESTED'])
+            .as('active'),
+        ])
+        .executeTakeFirstOrThrow(),
+      serviceDeploymentCounts(db, liveProjects),
+      workspaceRecentDeployments(db, liveProjects, limit),
+      recentTasks.execute(),
+      recentTasks.where('status', 'in', failedTaskStatuses).execute(),
     ]);
     return {
       servers: {
-        total: servers.length,
-        online: servers.filter((s) => s.status === 'ONLINE').length,
-        offline: servers.filter((s) => s.status === 'OFFLINE').length,
-        unknown: servers.filter((s) => s.status === 'UNKNOWN').length,
+        total: Number(servers.total),
+        online: Number(servers.online),
+        offline: Number(servers.offline),
+        unknown: Number(servers.unknown),
       },
-      projects: projects.length,
-      totalTasks: Number(total.count),
-      activeTasks: Number(active.count),
-      recentTasks: tasks.slice(0, 6),
+      projects: Number(projects.count),
+      services,
+      totalTasks: Number(tasks.total),
+      activeTasks: Number(tasks.active),
+      recentDeployments: deployments,
+      recentTasks: recent.map(taskDto),
+      recentFailedTasks: failures.map(taskDto),
     };
   }
 }

@@ -11,6 +11,13 @@ export type TaskStatus =
   | 'CANCELLED'
   | 'TIMED_OUT'
   | 'NEEDS_ATTENTION';
+
+export const failedTaskStatuses = [
+  'FAILED',
+  'PARTIAL_FAILED',
+  'TIMED_OUT',
+  'NEEDS_ATTENTION',
+] as const;
 export const terminalTaskStatuses = [
   'SUCCESS',
   'FAILED',

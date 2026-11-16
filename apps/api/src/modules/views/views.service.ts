@@ -7,12 +7,8 @@ import {
 import { randomUUID } from 'node:crypto';
 import { AuditService } from '../audit/audit.service';
 import { SaveViewDto } from './views.dto';
-import {
-  failedDeploymentStatuses,
-  failedHealthStatuses,
-  type ViewScope,
-  ViewsRepository,
-} from './views.repository';
+import { failedDeploymentStatuses, failedHealthStatuses } from '../deployments/deployment-history';
+import { type ViewScope, ViewsRepository } from './views.repository';
 
 const presets = [
   { id: 'all', kind: 'ALL', name: '全部项目', description: '' },
