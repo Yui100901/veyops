@@ -8,6 +8,6 @@ import { CommandTemplatesService } from './command-templates.service';
 @Module({
   controllers: [CommandCenterController, CommandTemplatesController],
   providers: [CommandCenterService, CommandTemplatesService, TargetResolver],
-  exports: [TargetResolver, CommandCenterService],
+  exports: [TargetResolver, CommandCenterService, CommandTemplatesService],
 })
 export class CommandCenterModule {}

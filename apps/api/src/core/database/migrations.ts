@@ -725,8 +725,12 @@ const indexes: readonly (readonly [string, string[]])[] = [
   ['audit_logs', ['resource_type', 'resource_id', 'created_at']],
 ];
 
-async function up(db: Kysely<unknown>): Promise<void> {
-  for (const definition of tables) {
+async function createTables(
+  db: Kysely<unknown>,
+  definitions: readonly TableDefinition[],
+  tableIndexes: typeof indexes,
+): Promise<void> {
+  for (const definition of definitions) {
     let table: CreateTableBuilder<string, string> = db.schema.createTable(definition.name);
     for (const [name, type, options = {}] of definition.columns) {
       table = table.addColumn(name, type, (column) => {
@@ -751,13 +755,17 @@ async function up(db: Kysely<unknown>): Promise<void> {
     }
     await table.execute();
   }
-  for (const [table, columns] of indexes) {
+  for (const [table, columns] of tableIndexes) {
     await db.schema
       .createIndex(`${table}_${columns.join('_')}_idx`)
       .on(table)
       .columns(columns)
       .execute();
   }
+}
+
+async function up(db: Kysely<unknown>): Promise<void> {
+  await createTables(db, tables, indexes);
 }
 
 async function down(db: Kysely<unknown>): Promise<void> {
@@ -934,6 +942,10 @@ export const releaseProtectionMigration: Migration = {
   },
   async down(db) {
     // A downgraded Worker must never run tasks that were waiting for approval.
+    const waiting = db.selectFrom('tasks').select('id')
+      .where('status', '=', 'PENDING').where('available_at', '=', Number.MAX_SAFE_INTEGER);
+    await db.updateTable('task_targets').set({ status: 'CANCELLED', finished_at: Date.now() })
+      .where('status', '=', 'PENDING').where('task_id', 'in', waiting).execute();
     await db.updateTable('tasks').set({
       status: 'CANCELLED',
       finished_at: Date.now(),
@@ -958,6 +970,140 @@ export const pushedImageArchivesMigration: Migration = {
   },
 };
 
+const operationScheduleTables: TableDefinition[] = [
+  {
+    name: 'operation_schedules',
+    columns: [
+      ['id', 'text', { primaryKey: true }],
+      ['name', 'text'],
+      ['owner_id', 'text', { references: 'users.id' }],
+      ['kind', 'text'],
+      ['source_id', 'text'],
+      ['source_version', 'integer'],
+      ['config_json', 'text'],
+      ['approved_targets_json', 'text'],
+      ['status', 'text'],
+      ['status_reason', 'text', { nullable: true }],
+      ['next_run_at', 'bigint', { nullable: true }],
+      ['revision', 'integer', { default: 1 }],
+      ['created_at', 'bigint'],
+      ['updated_at', 'bigint'],
+    ],
+  },
+  {
+    name: 'operation_schedule_runs',
+    columns: [
+      ['id', 'text', { primaryKey: true }],
+      ['schedule_id', 'text', { references: 'operation_schedules.id' }],
+      ['scheduled_at', 'bigint'],
+      ['triggered_at', 'bigint'],
+      ['status', 'text'],
+      ['reason', 'text', { nullable: true }],
+      ['task_id', 'text', { nullable: true, references: 'tasks.id' }],
+      ['confirmation_expires_at', 'bigint', { nullable: true }],
+      ['missed_until', 'bigint', { nullable: true }],
+      ['snapshot_json', 'text'],
+    ],
+    unique: [['schedule_id', 'scheduled_at']],
+  },
+];
+
+const operationSchedulesMigration: Migration = {
+  async up(db) {
+    await createTables(db, operationScheduleTables, [
+      ['operation_schedules', ['status', 'next_run_at']],
+      ['operation_schedule_runs', ['status', 'confirmation_expires_at']],
+    ]);
+  },
+  async down(db) {
+    for (const { name } of [...operationScheduleTables].reverse())
+      await db.schema.dropTable(name).execute();
+  },
+};
+
+const notificationTables: TableDefinition[] = [
+  {
+    name: 'notification_events',
+    columns: [
+      ['id', 'text', { primaryKey: true }],
+      ['task_id', 'text', { references: 'tasks.id' }],
+      ['project_id', 'text', { references: 'projects.id' }],
+      ['service_id', 'text', { nullable: true, references: 'services.id' }],
+      ['environment_id', 'text', { nullable: true, references: 'environments.id' }],
+      ['stage', 'text'],
+      ['level', 'text'],
+      ['status', 'text'],
+      ['summary_json', 'text'],
+      ['created_at', 'bigint'],
+    ],
+    unique: [['task_id', 'stage']],
+  },
+  {
+    name: 'user_notifications',
+    columns: [
+      ['id', 'text', { primaryKey: true }],
+      ['event_id', 'text', { references: 'notification_events.id', onDelete: 'cascade' }],
+      ['user_id', 'text', { references: 'users.id', onDelete: 'cascade' }],
+      ['read_at', 'bigint', { nullable: true }],
+      ['created_at', 'bigint'],
+    ],
+    unique: [['event_id', 'user_id']],
+  },
+  {
+    name: 'notification_preferences',
+    columns: [
+      ['user_id', 'text', { primaryKey: true, references: 'users.id', onDelete: 'cascade' }],
+      ['email', 'text', { nullable: true }],
+      ['email_enabled', 'integer', { default: 0 }],
+      ['minimum_level', 'text', { default: 'FAILURE' }],
+      ['verified_at', 'bigint', { nullable: true }],
+      ['verification_hash', 'text', { nullable: true }],
+      ['verification_expires_at', 'bigint', { nullable: true }],
+      ['verification_requested_at', 'bigint', { nullable: true }],
+      ['verification_attempts', 'integer', { default: 0 }],
+    ],
+  },
+  {
+    name: 'notification_subscriptions',
+    columns: [
+      ['user_id', 'text', { references: 'users.id', onDelete: 'cascade' }],
+      ['project_id', 'text', { references: 'projects.id', onDelete: 'cascade' }],
+      ['stage', 'text'],
+    ],
+    primaryKey: ['user_id', 'project_id', 'stage'],
+  },
+  {
+    name: 'notification_mail',
+    columns: [
+      ['id', 'text', { primaryKey: true }],
+      ['notification_id', 'text', { references: 'user_notifications.id', onDelete: 'cascade' }],
+      ['status', 'text'],
+      ['attempts', 'integer', { default: 0 }],
+      ['available_at', 'bigint'],
+      ['lease_id', 'text', { nullable: true }],
+      ['lease_expires_at', 'bigint', { nullable: true }],
+      ['sent_at', 'bigint', { nullable: true }],
+      ['error', 'text', { nullable: true }],
+    ],
+    unique: [['notification_id']],
+  },
+];
+
+const notificationsMigration: Migration = {
+  async up(db) {
+    await createTables(db, notificationTables, [
+      ['user_notifications', ['user_id', 'created_at']],
+      ['user_notifications', ['user_id', 'read_at']],
+      ['notification_subscriptions', ['project_id', 'stage']],
+      ['notification_mail', ['status', 'available_at']],
+    ]);
+  },
+  async down(db) {
+    for (const { name } of [...notificationTables].reverse())
+      await db.schema.dropTable(name).execute();
+  },
+};
+
 export const migrationProvider: MigrationProvider = {
   async getMigrations() {
     return {
@@ -970,6 +1116,8 @@ export const migrationProvider: MigrationProvider = {
       '007_release_protection': releaseProtectionMigration,
       '008_artifact_retention': artifactRetentionMigration,
       '009_pushed_image_archives': pushedImageArchivesMigration,
+      '010_operation_schedules': operationSchedulesMigration,
+      '011_notifications': notificationsMigration,
     };
   },
 };

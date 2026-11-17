@@ -46,7 +46,14 @@ export function TasksPage() {
         eyebrow="EXECUTION HISTORY"
         title="任务中心"
         description="统一追踪执行进度，保留每一台服务器的独立结果。"
-        action={<RefreshButton onClick={resource.reload} />}
+        action={
+          <>
+            <a className="button secondary" href="#/tasks/schedules">
+              <Clock3 size={16} /> 定时运维
+            </a>
+            <RefreshButton onClick={resource.reload} />
+          </>
+        }
       />
       <ErrorBanner error={resource.error} retry={resource.reload} />
       <Section

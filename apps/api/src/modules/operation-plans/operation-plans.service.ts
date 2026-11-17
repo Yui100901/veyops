@@ -6,7 +6,7 @@ import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { MultiTargetExecutor } from '../../infrastructure/ssh/multi-target.executor';
 import { TargetResolver } from '../command-center/target-resolver.service';
 import { CreatePlanDto, RunPlanDto } from './operation-plan.dto';
-import { ExecutionStep } from '../tasks/tasks.types';
+import type { CreateTaskInput, ExecutionStep } from '../tasks/tasks.types';
 import {
   CommandParameterDto,
   parameterEnvironment,
@@ -15,8 +15,8 @@ import {
 import { seedPlanTemplates } from './plan-templates';
 import { AuditService } from '../audit/audit.service';
 import { SystemSettingsService } from '../system/system-settings.service';
-import type { Selectable } from 'kysely';
-import type { OperationPlansTable } from '../../core/database/schema';
+import type { Selectable, Transaction } from 'kysely';
+import type { Database, OperationPlansTable } from '../../core/database/schema';
 
 interface PlanDefinition {
   steps: ExecutionStep[];
@@ -209,7 +209,7 @@ export class OperationPlansService implements OnModuleInit {
       ...readPlanDefinition(row.definition_json),
     }));
   }
-  async run(id: string, input: RunPlanDto, userId: string) {
+  async prepareRun(id: string, input: RunPlanDto) {
     const plan = await this.database.db
       .selectFrom('operation_plans')
       .selectAll()
@@ -238,23 +238,24 @@ export class OperationPlansService implements OnModuleInit {
       ...definition.steps,
       ...checks(definition.postChecks, 'postcheck'),
     ].map((step) => ({ ...step, command: environment + step.command }));
-    const task = await this.tasks.create(
-      {
-        type: 'OPERATION_PLAN',
-        name: `${definition.name ?? plan.name} · v${version.version}`,
-        operationPlanVersionId: version.id,
-        scope: await this.targets.executionScope(input),
-        payload: {
-          targets: await this.targets.resolveForExecution(input),
-          steps,
-          strategy: input.strategy,
-          maxParallel: input.maxParallel ?? (await this.settings.get()).defaultMaxParallelTargets,
-          failurePolicy: input.failurePolicy,
-          timeout: input.timeout,
-        },
+    const execution: CreateTaskInput = {
+      type: 'OPERATION_PLAN',
+      name: `${definition.name ?? plan.name} · v${version.version}`,
+      operationPlanVersionId: version.id,
+      scope: await this.targets.executionScope(input),
+      payload: {
+        targets: await this.targets.resolveForExecution(input),
+        steps,
+        strategy: input.strategy,
+        maxParallel: input.maxParallel ?? (await this.settings.get()).defaultMaxParallelTargets,
+        failurePolicy: input.failurePolicy,
+        timeout: input.timeout,
       },
-      userId,
-      async (tx) => {
+    };
+    return {
+      input: execution,
+      version: version.version,
+      beforeInsert: async (tx: Transaction<Database>) => {
         const active = await tx
           .updateTable('operation_plans')
           .set((eb) => ({ enabled: eb.ref('enabled') }))
@@ -264,10 +265,15 @@ export class OperationPlansService implements OnModuleInit {
           .executeTakeFirst();
         if (!active) throw new BadRequestException('运维方案已禁用');
       },
-    );
+    };
+  }
+
+  async run(id: string, input: RunPlanDto, userId: string) {
+    const execution = await this.prepareRun(id, input);
+    const task = await this.tasks.create(execution.input, userId, execution.beforeInsert);
     await this.audit.record(userId, 'operation_plan.run', 'task', task.id, {
       planId: id,
-      version: version.version,
+      version: execution.version,
     });
     return task;
   }

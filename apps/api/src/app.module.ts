@@ -23,6 +23,8 @@ import { PipelineHooksModule } from './modules/pipeline-hooks/pipeline-hooks.mod
 import { AiModule } from './modules/ai/ai.module';
 import { InitialConfigurationModule } from './core/initial-configuration';
 import { ViewsModule } from './modules/views/views.module';
+import { OperationSchedulesModule } from './modules/operation-schedules/operation-schedules.module';
+import { NotificationsModule } from './modules/notifications/notifications.module';
 
 @Module({
   imports: [
@@ -48,6 +50,8 @@ import { ViewsModule } from './modules/views/views.module';
     SystemModule,
     BackupModule,
     ArtifactRetentionModule,
+    OperationSchedulesModule,
+    NotificationsModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: AuthGuard }],
 })

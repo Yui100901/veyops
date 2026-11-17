@@ -138,6 +138,38 @@
 
 `POST /tasks/:id/targets/:targetId/retry` 接收 `{confirmed:true}`。管理员或提交任务的运维人员可重试明确返回失败退出码的目标，以及执行前已跳过的目标。重试使用原任务的命令或方案版本，生成独立任务并返回 `retryOf`。同一来源目标的重复请求返回同一次重试，下一次重试可从该重试任务发起。
 
+## 定时运维
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/operation-schedules` | 列出计划和最近一次执行，管理员可查看所有计划 |
+| GET | `/operation-schedules/time-zone` | 获取系统默认 IANA 时区 |
+| POST | `/operation-schedules/preview` | 预览版本、参数、目标、命令步骤和之后的触发时间，返回 `configurationHash` |
+| POST / PATCH | `/operation-schedules` 或 `/operation-schedules/:id` | 创建或编辑，携带预览参数、`enabled` 和 `expectedConfigurationHash` |
+| POST | `/operation-schedules/:id/enable` | 重新预览后携带 `expectedConfigurationHash` 启用 |
+| POST / DELETE | `/operation-schedules/:id/disable` 或 `/operation-schedules/:id` | 停止后续触发或删除计划，已有任务和历史可查 |
+| GET | `/operation-schedules/:id/runs` | 执行历史及关联任务，可查看跳过、待确认和暂停原因 |
+| POST | `/operation-schedules/:id/runs/:runId/approve` | 提交 `{confirmed:true}` 后复核权限、版本和目标，再入队 |
+
+预览参数包含 `name`、`kind`（`COMMAND_TEMPLATE` 或 `OPERATION_PLAN`）、`sourceId`、`sourceVersion`、`timing`、`target`。`timing` 使用 `ONCE` 与 `runAt`（Unix 毫秒）、`INTERVAL` 与 `intervalSeconds`，或 `CRON` 与五字段 `cron`。可选 `timeZone` 使用 IANA 名称。`target` 至少选一台 `serverIds` 或一个 `groupIds`。可配置 `parameters`、`strategy`、`maxParallel`、`failurePolicy`、`timeoutSeconds` 和 `requireConfirmation`。逐次确认默认开启。
+
+Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑保存，周期计划继续等待下一个有效时刻。
+
+## 站内与邮件通知
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/notifications` | 返回 `items` 和 `unreadCount`，支持 `projectId`、`level` 和 `unread` 过滤 |
+| GET | `/notifications/unread-count` | 获取个人未读数 |
+| PATCH | `/notifications/:id/read` 或 `/notifications/read-all` | 标记单条或全部已读 |
+| GET / PUT | `/notifications/preferences` | 个人收件邮箱、`emailEnabled`、`minimumLevel` 和邮箱验证时间 |
+| POST | `/notifications/email/verify-request` 或 `/notifications/email/verify-confirm` | 申请六位邮箱验证码，确认时提交 `{code}` |
+| GET / PUT | `/notifications/subscriptions` | 读取或保存 `{subscriptions:[{projectId,stage}]}` |
+| GET / PUT | `/notifications/smtp` | 管理员设置发件地址、平台访问地址、SMTP 和凭据引用 |
+| POST | `/notifications/smtp/test` | 管理员验证 SMTP 连接和认证 |
+
+通知阶段为 `BUILD`、`DEPLOY`、`ROLLBACK`，等级依次为 `NORMAL`、`WARNING`、`FAILURE`。邮件阈值包含所选等级，个人站内通知保留全部等级。手动与 AI 提交的任务通知发起人，自动触发的任务通知对应项目与阶段的有效订阅者。SMTP 凭据来自凭据中心，使用用户名及密码的发件配置需选择 TLS 或 STARTTLS。邮件队列对明确的临时失败有限重试，投递结果不明时标记待核查。
+
 ## 运维方案
 
 `GET /operation-plans` 查询方案，`POST /operation-plans` 创建，`PATCH /operation-plans/:id` 保存新版本，`DELETE /operation-plans/:id` 归档。`GET /operation-plans/:id/versions` 查询历史版本，`POST /operation-plans/:id/run` 执行指定版本。
@@ -194,7 +226,7 @@ Pipeline 定义、四种组合、目录保护和环境覆盖规则见 [构建部
 
 ### 发布保护与回滚
 
-管理员通过服务环境配置的 `releasePolicy` 设置 `requireApproval`、`rollbackMode`（`OFF`、`PREVIOUS_HEALTHY`、`PINNED`）、可选的 `pinnedDeploymentId` 和 `healthCheck`。健康检查包含可选的 `httpUrl`、`compose`，以及 `attempts`、`intervalSeconds`、`timeoutSeconds`。文件服务环境可另配置 `stopCommand`。
+管理员通过服务环境配置的 `releasePolicy` 设置 `requireApproval`、`rollbackMode`（`OFF`、`PREVIOUS_HEALTHY`、`PINNED`）、可选的 `pinnedDeploymentId`、`archivePushedImage` 和 `healthCheck`。健康检查包含可选的 `httpUrl`、`compose`，以及 `attempts`、`intervalSeconds`、`timeoutSeconds`。文件服务环境可另配置 `stopCommand`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -218,7 +250,7 @@ Pipeline 和产物部署预览的 `requireApproval` 表示部署是否需要管�
 
 这些接口需要管理员权限。策略接口同时传入 `serviceId` 和 `environmentId` 查询参数可管理服务环境覆盖，省略时操作全局策略，删除覆盖时必须指定服务环境。
 
-默认保留最近 20 批且在 30 天内的构建产物。Worker 定期清理超限的托管归档，保护当前运行版本、回滚基线、排队或执行中的任务和人工固定的产物。外部 Registry 与旧目标端归档由各自的存储策略保留。`GET /artifacts` 保留已清理记录，`prunedAt` 表示产物已停止提供下载和部署，`archiveDeletedAt` 记录本地文件清理完成的时间。物理删除失败的归档会在后续清理时重试。
+默认保留最近 20 批且在 30 天内的构建产物。Worker 定期清理超限的托管归档，保护当前运行版本、回滚基线、排队或执行中的任务和人工固定的产物。外部 Registry 与旧目标端归档由各自的存储策略保留。`GET /artifacts` 保留已清理记录，`prunedAt` 表示托管归档停止使用，`archiveDeletedAt` 记录本地文件清理完成的时间。Registry Digest 可用时仍能用于发布。物理删除失败的归档会在后续清理时重试。
 
 ## v0.2 AI 接口
 

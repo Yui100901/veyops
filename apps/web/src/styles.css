@@ -581,6 +581,30 @@ pre {
 .topbar-date {
   color: #a1adb5;
 }
+.notification-bell {
+  position: relative;
+  flex: none;
+  color: #526571;
+}
+.notification-bell[aria-current='page'] {
+  color: var(--accent-dark);
+  background: #eaf5f2;
+}
+.notification-count {
+  position: absolute;
+  top: -3px;
+  right: -5px;
+  min-width: 17px;
+  padding: 0 4px;
+  border: 1px solid white;
+  border-radius: 20px;
+  color: white;
+  background: #b9334b;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
 .secure-indicator {
   display: inline-flex;
   align-items: center;
@@ -590,6 +614,96 @@ pre {
 }
 .mobile-menu {
   display: none;
+}
+.notification-filters.form-grid {
+  padding: 16px 22px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  border-bottom: 1px solid var(--border);
+}
+.delivery-notices,
+.schedule-history {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.delivery-notices li,
+.schedule-history li {
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.delivery-notices li:last-child,
+.schedule-history li:last-child {
+  border-bottom: 0;
+}
+.delivery-notices .is-unread {
+  background: #f1f9f6;
+  border-inline-start: 3px solid var(--accent);
+  padding-inline-start: 19px;
+}
+.delivery-notice-top,
+.delivery-notice-labels,
+.schedule-history-heading,
+.schedule-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.delivery-notice-top,
+.schedule-history-heading {
+  justify-content: space-between;
+}
+.delivery-notice-top h3 {
+  font-size: 14px;
+  margin: 0;
+}
+.delivery-notice-top time,
+.delivery-notices p,
+.schedule-history p,
+.schedule-secondary {
+  color: #526571;
+}
+.delivery-notices p,
+.schedule-history p {
+  margin: 5px 0;
+}
+.delivery-notices .schedule-actions,
+.schedule-history .schedule-actions {
+  margin-top: 8px;
+}
+.notice-unread-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.notification-settings-form {
+  display: grid;
+  gap: 8px;
+}
+.notification-settings-form + .notification-settings-form {
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+.notification-subscriptions th,
+.notification-subscriptions td {
+  padding-inline: 8px;
+  white-space: normal;
+}
+.schedule-secondary {
+  display: block;
+  margin-top: 4px;
+}
+.schedule-command {
+  margin: 8px 0 0;
+  padding: 10px;
+  border-radius: 6px;
+  background: #f4f7f8;
+  color: #263540;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 .main-content {
   padding: 32px 36px 48px;

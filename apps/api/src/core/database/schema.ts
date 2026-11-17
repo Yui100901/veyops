@@ -532,6 +532,87 @@ export interface AuditLogsTable {
   created_at: number;
 }
 
+export interface OperationSchedulesTable {
+  id: string;
+  name: string;
+  owner_id: string;
+  kind: string;
+  source_id: string;
+  source_version: number;
+  config_json: string;
+  approved_targets_json: string;
+  status: string;
+  status_reason: Generated<string | null>;
+  next_run_at: Generated<number | null>;
+  revision: Generated<number>;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface OperationScheduleRunsTable {
+  id: string;
+  schedule_id: string;
+  scheduled_at: number;
+  triggered_at: number;
+  status: string;
+  reason: Generated<string | null>;
+  task_id: Generated<string | null>;
+  confirmation_expires_at: Generated<number | null>;
+  missed_until: Generated<number | null>;
+  snapshot_json: string;
+}
+
+export interface NotificationEventsTable {
+  id: string;
+  task_id: string;
+  project_id: string;
+  service_id: Generated<string | null>;
+  environment_id: Generated<string | null>;
+  stage: string;
+  level: string;
+  status: string;
+  summary_json: string;
+  created_at: number;
+}
+
+export interface UserNotificationsTable {
+  id: string;
+  event_id: string;
+  user_id: string;
+  read_at: Generated<number | null>;
+  created_at: number;
+}
+
+export interface NotificationPreferencesTable {
+  user_id: string;
+  email: Generated<string | null>;
+  email_enabled: Generated<number>;
+  minimum_level: Generated<string>;
+  verified_at: Generated<number | null>;
+  verification_hash: Generated<string | null>;
+  verification_expires_at: Generated<number | null>;
+  verification_requested_at: Generated<number | null>;
+  verification_attempts: Generated<number>;
+}
+
+export interface NotificationSubscriptionsTable {
+  user_id: string;
+  project_id: string;
+  stage: string;
+}
+
+export interface NotificationMailTable {
+  id: string;
+  notification_id: string;
+  status: string;
+  attempts: Generated<number>;
+  available_at: number;
+  lease_id: Generated<string | null>;
+  lease_expires_at: Generated<number | null>;
+  sent_at: Generated<number | null>;
+  error: Generated<string | null>;
+}
+
 export interface Database {
   users: UsersTable;
   auth_sessions: AuthSessionsTable;
@@ -575,4 +656,11 @@ export interface Database {
   views: ViewsTable;
   view_projects: ViewProjectsTable;
   audit_logs: AuditLogsTable;
+  operation_schedules: OperationSchedulesTable;
+  operation_schedule_runs: OperationScheduleRunsTable;
+  notification_events: NotificationEventsTable;
+  user_notifications: UserNotificationsTable;
+  notification_preferences: NotificationPreferencesTable;
+  notification_subscriptions: NotificationSubscriptionsTable;
+  notification_mail: NotificationMailTable;
 }

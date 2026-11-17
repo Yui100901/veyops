@@ -36,6 +36,13 @@ import { DeliveryRecordsPage, PipelinesPage, RegistriesPage } from './pages/Deli
 import { DeploymentTargetsPage } from './pages/DeploymentConfig';
 import { ProjectViewsPage } from './pages/ProjectViews';
 import { UsersPage } from './pages/Users';
+import { OperationSchedulesPage } from './pages/OperationSchedules';
+import {
+  NotificationBell,
+  NotificationPage,
+  NotificationPreferencesPage,
+  NotificationSmtpPage,
+} from './pages/Notifications';
 import { userRoleNames } from './models';
 import type { User } from './models';
 
@@ -71,6 +78,17 @@ const navigation = [
     ],
   },
 ];
+
+const routeTitles: Record<string, string> = {
+  '/artifacts': '构建产物',
+  '/settings/users': '用户管理',
+  '/settings/backups': '数据备份',
+  '/settings/smtp': 'SMTP 发件设置',
+  '/account/password': '修改密码',
+  '/account/notifications': '通知设置',
+  '/tasks/schedules': '定时运维',
+  '/notifications': '通知',
+};
 
 function Brand({ inverse = false }: { inverse?: boolean }) {
   return (
@@ -480,12 +498,16 @@ export function App() {
   else if (route === '/commands') page = <CommandsPage user={user} />;
   else if (route === '/plans') page = <PlansPage user={user} />;
   else if (route === '/tasks') page = <TasksPage />;
+  else if (routePath === '/tasks/schedules') page = <OperationSchedulesPage user={user} />;
   else if (route.startsWith('/tasks/'))
     page = <TaskPage key={route} id={route.slice(7)} user={user} />;
   else if (route === '/audit') page = <AuditPage />;
   else if (route === '/settings') page = <SystemPage user={user} />;
   else if (routePath === '/settings/backups') page = <BackupsPage user={user} />;
   else if (routePath === '/settings/users') page = <UsersPage user={user} />;
+  else if (routePath === '/settings/smtp') page = <NotificationSmtpPage user={user} />;
+  else if (routePath === '/notifications') page = <NotificationPage />;
+  else if (routePath === '/account/notifications') page = <NotificationPreferencesPage />;
   else if (routePath === '/account/password') page = changePassword;
   else if (route === '/ai') page = <AIPage user={user} />;
   else
@@ -583,19 +605,10 @@ export function App() {
             </button>
             <span className="topbar-workspace">工作空间</span>
             <span className="breadcrumb-slash">/</span>
-            <strong>
-              {route === '/artifacts'
-                ? '构建产物'
-                : routePath === '/settings/users'
-                  ? '用户管理'
-                  : routePath === '/settings/backups'
-                    ? '数据备份'
-                    : routePath === '/account/password'
-                      ? '修改密码'
-                      : (current?.name ?? '页面')}
-            </strong>
+            <strong>{routeTitles[routePath] ?? current?.name ?? '页面'}</strong>
           </div>
           <div className="topbar-right">
+            <NotificationBell key={user.id} active={routePath === '/notifications'} />
             <span className="secure-indicator">
               <ShieldCheck size={14} />
               安全会话

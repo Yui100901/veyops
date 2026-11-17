@@ -134,6 +134,54 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
       })),
     )
     .execute();
+  await db
+    .insertInto('operation_schedules')
+    .values({
+      id: 'schedule',
+      name: 'Existing template schedule',
+      owner_id: 'existing-user',
+      kind: 'COMMAND_TEMPLATE',
+      source_id: 'existing-template',
+      source_version: 1,
+      config_json: '{}',
+      approved_targets_json: '[]',
+      status: 'ENABLED',
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+  const occurrence = {
+    id: 'run',
+    schedule_id: 'schedule',
+    scheduled_at: now,
+    triggered_at: now,
+    status: 'SKIPPED',
+    snapshot_json: '{}',
+  };
+  await db.insertInto('operation_schedule_runs').values(occurrence).execute();
+  await assert.rejects(
+    db
+      .insertInto('operation_schedule_runs')
+      .values({ ...occurrence, id: 'duplicate' })
+      .execute(),
+  );
+  const event = {
+    id: 'event',
+    task_id: 'DEPLOY',
+    project_id: 'project',
+    stage: 'DEPLOY',
+    level: 'NORMAL',
+    status: 'SUCCESS',
+    summary_json: '{}',
+    created_at: now,
+  };
+  await db.insertInto('notification_events').values(event).execute();
+  await assert.rejects(
+    db
+      .insertInto('notification_events')
+      .values({ ...event, id: 'duplicate' })
+      .execute(),
+  );
   const rollback = await migrator.migrateTo('001_initial');
   assert.ifError(rollback.error);
   assert.deepEqual(await db.selectFrom('tasks').select(['id', 'status']).orderBy('id').execute(), [
@@ -145,6 +193,8 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
   await assert.rejects(db.selectFrom('artifacts').select('archive_key').execute());
   await assert.rejects(db.selectFrom('artifacts').select('compose_yaml').execute());
   await assert.rejects(db.selectFrom('command_template_versions').select('id').execute());
+  await assert.rejects(db.selectFrom('operation_schedules').select('id').execute());
+  await assert.rejects(db.selectFrom('notification_events').select('id').execute());
   assert.deepEqual(
     await db
       .selectFrom('artifacts')

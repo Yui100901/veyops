@@ -16,6 +16,8 @@ import type { TaskHandler, TaskPayload, TaskRecord, TaskStatus } from './tasks.t
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
 import { SystemSettingsService } from '../system/system-settings.service';
 import { ArtifactRetentionService } from '../artifacts/artifact-retention.service';
+import { OperationSchedulesService } from '../operation-schedules/operation-schedules.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 const TASK_LEASE_MS = 60_000;
 const SQLITE_LEASE_MS = 45_000;
@@ -48,6 +50,8 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     private readonly logs: TaskLogService,
     @Optional() private readonly settings?: SystemSettingsService,
     @Optional() private readonly artifactRetention?: ArtifactRetentionService,
+    @Optional() private readonly schedules?: OperationSchedulesService,
+    @Optional() private readonly notifications?: NotificationsService,
   ) {}
   onApplicationBootstrap() {
     if (process.env.WORKER_ENABLED !== 'false') this.start();
@@ -119,6 +123,13 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       return;
     }
     await this.recoverExpired();
+    if (!this.stopping && this.schedules) {
+      try {
+        await this.schedules.tick();
+      } catch {
+        this.logger.warn('定时运维评估失败，将在下一轮重试');
+      }
+    }
     await this.pruneLogs();
     await this.pruneArtifacts();
     if (this.running || this.stopping) return;
@@ -229,6 +240,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         .execute();
       for (const task of expired) {
         await this.settleExecutionRows(tx, task.id, now, 'NEEDS_ATTENTION', EXECUTION_INTERRUPTED);
+        await this.notifications?.recordTaskCompletion(tx, task.id, now);
       }
     });
   }
@@ -437,6 +449,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         .where('id', '=', task.id)
         .where('lease_owner', '=', this.owner)
         .execute();
+      await this.notifications?.recordTaskCompletion(tx, task.id, now);
       return true;
     });
   }

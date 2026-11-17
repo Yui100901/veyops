@@ -86,7 +86,7 @@ export function ServerPicker({
   );
 }
 
-function TargetOptions({
+export function TargetOptions({
   label,
   options,
   selected,

@@ -7,6 +7,7 @@ import {
   FileClock,
   HardDrive,
   LockKeyhole,
+  Mail,
   Pencil,
   Server,
   Settings2,
@@ -130,6 +131,9 @@ export function SystemPage({ user }: { user: User }) {
               </a>
               <a className="button secondary" href="#/settings/backups">
                 <Archive size={16} /> 备份管理
+              </a>
+              <a className="button secondary" href="#/settings/smtp">
+                <Mail size={16} /> SMTP 发件设置
               </a>
             </>
           )

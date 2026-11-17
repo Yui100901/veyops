@@ -3,11 +3,13 @@ import './core/config';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { TaskWorkerService } from './modules/tasks/task-worker.service';
+import { NotificationsService } from './modules/notifications/notifications.service';
 
 async function main() {
   const app = await NestFactory.createApplicationContext(AppModule, { abortOnError: false });
   app.enableShutdownHooks();
   app.get(TaskWorkerService).start(true);
+  app.get(NotificationsService).start();
   console.log('veyops Worker ready');
 }
 

@@ -158,7 +158,7 @@ export class CommandTemplatesService {
     }));
   }
 
-  async run(id: string, input: RunCommandTemplateDto, userId: string) {
+  async prepareRun(id: string, input: RunCommandTemplateDto) {
     const template = await this.template(id);
     if (!template.enabled) throw new BadRequestException('命令模板已禁用');
     const version = await this.database.db
@@ -169,7 +169,7 @@ export class CommandTemplatesService {
       .executeTakeFirst();
     if (!version) throw new NotFoundException('命令模板版本不存在');
     const definition = presentFields(version);
-    return this.commands.execute(
+    const execution = await this.commands.prepareExecution(
       {
         ...input,
         name: `${version.name} · v${version.version}`,
@@ -177,9 +177,11 @@ export class CommandTemplatesService {
         command:
           parameterEnvironment(definition.parameters, input.parameters ?? {}) + definition.command,
       },
-      userId,
       { id, version: version.version },
-      async (tx) => {
+    );
+    return {
+      input: execution,
+      beforeInsert: async (tx: Transaction<Database>) => {
         const active = await tx
           .updateTable('command_templates')
           .set((eb) => ({ enabled: eb.ref('enabled') }))
@@ -189,6 +191,11 @@ export class CommandTemplatesService {
           .executeTakeFirst();
         if (!active) throw new BadRequestException('命令模板已禁用');
       },
-    );
+    };
+  }
+
+  async run(id: string, input: RunCommandTemplateDto, userId: string) {
+    const execution = await this.prepareRun(id, input);
+    return this.commands.submitPrepared(execution.input, userId, execution.beforeInsert);
   }
 }
