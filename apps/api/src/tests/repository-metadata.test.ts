@@ -277,6 +277,29 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
   await admin.get(`/api/v1/projects/${other}/repositories/${id}/branches`).expect(404);
   assert.equal(fixture.authenticatedRequests(), 0);
   const metadata = app.get(RepositoryMetadataService);
+  const access = { clone_url: create.cloneUrl, credential_id: credential };
+  assert.deepEqual(
+    await metadata.branchHeads(project, id, ['main', 'feature/release', 'not-found'], access),
+    new Map([
+      ['main', main],
+      ['feature/release', feature],
+    ]),
+  );
+  await assert.rejects(
+    metadata.branchHeads(project, id, ['main'], { ...access, credential_id: null }),
+    /仓库配置已变化/,
+  );
+  await viewer.get(`${metadataPath}/environment-files`).query({ commitSha: first }).expect(403);
+  await operator.get(`${metadataPath}/environment-files`).query({ commitSha: 'main' }).expect(400);
+  const environmentFiles = await operator
+    .get(`${metadataPath}/environment-files`)
+    .query({ commitSha: first })
+    .expect(200);
+  assert.deepEqual(environmentFiles.body.data, {
+    files: [{ path: 'services/web/.env', keys: ['SHOULD_NOT_SEND'] }],
+  });
+  assert.equal(environmentFiles.text.includes('env-file-private'), false);
+  const requestsBeforeInvalidQueries = fixture.authenticatedRequests();
   await assert.rejects(
     metadata.readDeploymentDoc(other, id, first, 'docs/DEPLOY.md'),
     /仓库不存在/,
@@ -286,7 +309,7 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
     metadata.readDeploymentDoc(project, id, 'main', 'DEPLOY.md'),
     /完整 Git Commit/,
   );
-  assert.equal(fixture.authenticatedRequests(), 0);
+  assert.equal(fixture.authenticatedRequests(), requestsBeforeInvalidQueries);
   const originalDoc = await metadata.readDeploymentDoc(project, id, first, 'docs/DEPLOY.md');
   assert.equal(originalDoc.commitSha, first);
   assert.equal(originalDoc.path, 'docs/DEPLOY.md');

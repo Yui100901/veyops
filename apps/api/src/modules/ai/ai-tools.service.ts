@@ -16,6 +16,23 @@ import { AiRepositoryAnalysisDto } from './ai.dto';
 import { AiRepositoryAnalysisService } from './ai-repository-analysis.service';
 import { AiSourceChangeService } from './ai-source-change.service';
 import { setTimeout as sleep } from 'node:timers/promises';
+import type { PipelineDefinition } from '../pipelines/pipeline.types';
+
+function aiPipelineDefinition(definition: PipelineDefinition) {
+  if (!definition.nodes) return definition;
+  return {
+    ...definition,
+    nodes: definition.nodes.map(({ variables, ...node }) => ({
+      ...node,
+      ...(variables && {
+        variables: variables.map(({ key, credentialId }) => ({
+          key,
+          sensitive: Boolean(credentialId),
+        })),
+      }),
+    })),
+  };
+}
 
 const str = { type: 'string' };
 const ids = { type: 'array', items: str, minItems: 1, maxItems: 100 };
@@ -179,6 +196,7 @@ export type PreparedAiAction = {
   serverIds: string[];
   projectId?: string;
   repositoryId?: string;
+  sourceRepositoryIds?: string[];
   aiApprovalHash?: string;
   conversationId?: string;
   preview: Record<string, unknown>;
@@ -345,11 +363,12 @@ export class AiToolsService {
         serverIds: preview.serverIds,
         projectId: preview.projectId,
         repositoryId: preview.definition.repositoryId,
+        sourceRepositoryIds: preview.nodeSources?.map(({ repositoryId }) => repositoryId),
         aiApprovalHash: preview.aiApprovalHash,
         bindingsHash: createHash('sha256')
           .update(this.bindingHash(targets) + ':' + preview.aiApprovalHash)
           .digest('hex'),
-        preview: { ...preview },
+        preview: { ...preview, definition: aiPipelineDefinition(preview.definition) },
       };
     }
     throw new BadRequestException('AI 工具未注册');
@@ -507,13 +526,18 @@ export class AiToolsService {
             projectId ? snapshot : await this.policy.snapshot(result.projectId),
             result.projectId,
           );
-          return result;
+          return { ...result, definition: aiPipelineDefinition(result.definition) };
         }
-        return (await service.list()).filter(
-          (p) =>
-            (!projectId || p.projectId === projectId) &&
-            this.policy.allowedProject(p.projectId, snapshot),
-        );
+        return (await service.list())
+          .filter(
+            (p) =>
+              (!projectId || p.projectId === projectId) &&
+              this.policy.allowedProject(p.projectId, snapshot),
+          )
+          .map((pipeline) => ({
+            ...pipeline,
+            definition: aiPipelineDefinition(pipeline.definition),
+          }));
       }
       case 'analyze_repository_deployment': {
         if (!user || user.role === 'VIEWER')

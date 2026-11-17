@@ -23,6 +23,40 @@ export interface PipelineStep {
   command: string;
   timeout?: number;
 }
+export const pipelineNodeTypes = [
+  'CHECKOUT',
+  'ENVIRONMENT',
+  'INSTALL',
+  'BUILD',
+  'TEST',
+  'SHELL',
+  'PACKAGE',
+  'DEPLOY',
+] as const;
+export interface PipelineNodeVariable {
+  key: string;
+  value?: string;
+  credentialId?: string;
+}
+export interface PipelineNode {
+  id: string;
+  name: string;
+  type: (typeof pipelineNodeTypes)[number];
+  repositoryId?: string;
+  branch?: string;
+  environmentBranches?: Record<string, string>;
+  directory?: string;
+  command?: string;
+  timeout?: number;
+  variables?: PipelineNodeVariable[];
+  envFile?: string;
+}
+export interface PipelineNodeSource {
+  url: string;
+  credentialId: string | null;
+  commitSha: string;
+  branch?: string;
+}
 export interface PipelineDefinition {
   repositoryId: string;
   buildLocation: 'TARGET' | 'MANAGER';
@@ -41,6 +75,7 @@ export interface PipelineDefinition {
   registryId?: string;
   imageRepository?: string;
   steps: PipelineStep[];
+  nodes?: PipelineNode[];
 }
 export interface PipelineSnapshot {
   releasePolicy?: ReleasePolicy;
@@ -58,12 +93,15 @@ export interface PipelineSnapshot {
   pipelineVersionId: string;
   projectId: string;
   serviceId: string;
+  projectName?: string;
+  serviceName?: string;
   environmentId: string;
   targetId?: string;
   targetSelection?: DeploymentSelection;
   targetMemberIds?: string[];
   commitSha: string;
   repository: { url: string; credentialId: string | null };
+  nodeSources?: Record<string, PipelineNodeSource>;
   registry?: { registryUrl: string; credentialId: string | null };
   definition: PipelineDefinition;
   variables: Record<string, string>;

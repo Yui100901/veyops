@@ -99,7 +99,7 @@ test('Pipeline AI analysis submits bounded metadata without tools or raw step/er
   const { analyzer, captured } = await serve(context, {
     content: JSON.stringify({
       summary: `安装阶段失败，响应中的密钥 ${apiKey}`,
-      failedPhase: 'BUILD',
+      failedPhase: 'TEST',
       nextActions: ['检查构建步骤', 'x'.repeat(300), '第三项', '第四项', '第五项'],
       extra: 'discarded',
     }),
@@ -114,9 +114,14 @@ test('Pipeline AI analysis submits bounded metadata without tools or raw step/er
   const result = await analyzer.analyze({
     ...input,
     targetCounts: { total: 2, succeeded: 1, failed: 1000 },
-    steps: [input.steps[1]!, unsafe, ...Array.from({ length: 50 }, () => input.steps[0]!)],
+    steps: [
+      input.steps[1]!,
+      { phase: 'TEST', status: 'FAILED', exitCode: 3 },
+      unsafe,
+      ...Array.from({ length: 50 }, () => input.steps[0]!),
+    ],
   });
-  assert.equal(result?.failedPhase, 'BUILD');
+  assert.equal(result?.failedPhase, 'TEST');
   assert.ok(result.summary.includes('[REDACTED]'));
   assert.equal(result.summary.includes(apiKey), false);
   assert.equal(result.nextActions.length, 4);
@@ -140,7 +145,8 @@ test('Pipeline AI analysis submits bounded metadata without tools or raw step/er
   assert.deepEqual(metadata.targetCounts, input.targetCounts);
   assert.equal(metadata.steps.length, 32);
   assert.deepEqual(metadata.steps[0], { phase: 'BUILD', status: 'FAILED', exitCode: 2 });
-  assert.deepEqual(metadata.steps[1], { phase: 'UNKNOWN', status: 'UNKNOWN', exitCode: null });
+  assert.deepEqual(metadata.steps[1], { phase: 'TEST', status: 'FAILED', exitCode: 3 });
+  assert.deepEqual(metadata.steps[2], { phase: 'UNKNOWN', status: 'UNKNOWN', exitCode: null });
 });
 
 test('Pipeline AI analysis ignores tool calls, malformed responses and invented failed phases', async (context) => {

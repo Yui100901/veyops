@@ -1,0 +1,112 @@
+.pipeline-node-graph {
+  display: flex;
+  align-items: stretch;
+  margin: 0;
+  padding: 4px 4px 10px;
+  overflow-x: auto;
+  list-style: none;
+}
+
+.pipeline-node-graph-item {
+  display: flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+}
+
+.pipeline-node-graph-edge {
+  align-self: center;
+  width: 17px;
+  height: 17px;
+  margin: 0 7px;
+  color: #6f8790;
+}
+
+.pipeline-node-graph-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  min-width: 136px;
+  max-width: 205px;
+  min-height: 64px;
+  padding: 8px 12px;
+  border: 1px solid #d7e3e6;
+  border-radius: 8px;
+  background: #f8fbfc;
+  color: #314855;
+  text-align: left;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+button.pipeline-node-graph-card:hover,
+a.pipeline-node-graph-card:hover,
+.pipeline-node-graph-card[aria-pressed='true'] {
+  border-color: #5ea399;
+  background: #f0f9f7;
+}
+
+.pipeline-node-graph-card:focus-visible {
+  outline: 2px solid #168b79;
+  outline-offset: 2px;
+}
+
+.pipeline-node-graph-kind,
+.pipeline-node-graph-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #536c79;
+}
+
+.pipeline-node-graph-name {
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.pipeline-node-graph-detail {
+  color: #536c79;
+  font-size: 12px;
+}
+
+.pipeline-run-graph .pipeline-node-graph {
+  margin: 0 15px 9px;
+}
+
+.pipeline-run-scope {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+}
+
+.pipeline-run-scope select {
+  max-width: min(34vw, 240px);
+  padding: 5px 8px;
+  border: 1px solid #d7e3e6;
+  border-radius: 6px;
+  background: white;
+  color: inherit;
+}
+
+.pipeline-run-graph .error-banner,
+.pipeline-run-log-selection {
+  margin: 9px 18px;
+}
+
+.pipeline-run-log-selection {
+  color: #435c68;
+  font-size: 13px;
+}
+
+.pipeline-run-selected-step {
+  background: #edf8f5;
+}
+
+.pipeline-run-log-marker {
+  border-radius: 3px;
+  background: #f9df8c;
+  color: #172731;
+  scroll-margin-block: 22px;
+}

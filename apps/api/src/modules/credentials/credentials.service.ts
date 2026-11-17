@@ -21,6 +21,8 @@ import { encryptionKey } from '../../core/config';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { AuditService } from '../audit/audit.service';
+import { pipelineNodeSecrets } from '../pipelines/pipeline-node-config';
+import type { PipelineDefinition } from '../pipelines/pipeline.types';
 
 const credentialTypes = [
   'SSH_PASSWORD',
@@ -180,7 +182,25 @@ export class CredentialsService {
       .executeTakeFirst();
     if (!row) throw new NotFoundException('凭据不存在');
     try {
-      await this.database.db.deleteFrom('credentials').where('id', '=', id).execute();
+      await this.database.db.transaction().execute(async (tx) => {
+        await tx
+          .updateTable('credentials')
+          .set((eb) => ({ updated_at: eb.ref('updated_at') }))
+          .where('id', '=', id)
+          .execute();
+        const versions = await tx
+          .selectFrom('pipeline_versions')
+          .select('definition_json')
+          .where('definition_json', 'like', `%${id}%`)
+          .execute();
+        if (
+          versions.some(({ definition_json }) =>
+            pipelineNodeSecrets(JSON.parse(definition_json) as PipelineDefinition).includes(id),
+          )
+        )
+          throw new ConflictException('凭据被流水线环境节点引用');
+        await tx.deleteFrom('credentials').where('id', '=', id).execute();
+      });
     } catch {
       throw new ConflictException('凭据正在被资源或历史任务引用，不能删除；可以禁用');
     }

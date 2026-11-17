@@ -182,6 +182,13 @@ export interface ProjectDependency {
   dependencyType: 'RUNTIME' | 'DEPLOYMENT';
   description: string;
 }
+export type PipelineNodeType =
+  'CHECKOUT' | 'ENVIRONMENT' | 'INSTALL' | 'BUILD' | 'TEST' | 'SHELL' | 'PACKAGE' | 'DEPLOY';
+export interface PipelineGraphNode {
+  id: string;
+  name: string;
+  type: PipelineNodeType;
+}
 export interface Task {
   id: string;
   type: string;
@@ -193,6 +200,7 @@ export interface Task {
   deploymentSkippedReason?: string | null;
   deployAfterBuild?: boolean;
   pipelineRunId?: string | null;
+  pipelineGraph?: { buildLocation: 'TARGET' | 'MANAGER'; nodes: PipelineGraphNode[] };
   result?: {
     aiAnalysis?:
       | { status: 'SUCCESS'; summary: string; failedPhase: string | null; nextActions: string[] }

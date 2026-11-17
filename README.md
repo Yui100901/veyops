@@ -58,7 +58,7 @@ Windows 下若 better-sqlite3 预编译下载失败，检查到 GitHub Releases 
 
 ## Pipeline 与 AI
 
-创建项目、HTTP(S) 仓库、服务和环境后，在 Pipeline 页面填写构建与部署配置。每次编辑追加版本，运行时选择完整 Commit 和服务器或分组，预览后确认。支持 `TARGET/MANAGER × FILE/DOCKER_IMAGE` 四种组合。文件部署使用专属目录和原子 `current` 切换。Docker 部署使用 Registry 不可变 Digest 和 `${VEYOPS_IMAGE}` Compose 模板。
+创建项目、HTTP(S) 仓库、服务和环境后，在 Pipeline 页面组合源码、环境、依赖安装、构建、测试、打包与发布节点。每次编辑追加版本，运行时预览各源码提交及目标服务器。支持 `TARGET/MANAGER × FILE/DOCKER_IMAGE` 四种组合。文件部署使用专属目录和原子 `current` 切换。Docker 部署使用 Registry 不可变 Digest 和 `${VEYOPS_IMAGE}` Compose 模板。
 
 选择「仅构建」可检出固定提交并生成文件产物或镜像。Gitea Webhook 在专用 rootless Docker 环境中自动构建指定分支提交。发布锁按主机、服务环境与部署路径限制并发，远端结果不确定时保留锁供核查。接入与恢复步骤见 [Pipeline 文档](docs/PIPELINES.md)。
 

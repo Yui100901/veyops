@@ -8,7 +8,11 @@ import { AiProvidersService } from './ai-providers.service';
 const phases = [
   'PREPARE',
   'CHECKOUT',
+  'ENVIRONMENT',
+  'INSTALL',
   'BUILD',
+  'TEST',
+  'SHELL',
   'MANAGER_BUILD',
   'PACKAGE',
   'ARTIFACT',

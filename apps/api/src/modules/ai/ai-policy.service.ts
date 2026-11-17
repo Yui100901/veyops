@@ -28,6 +28,7 @@ export interface AiActionScope {
   serverIds: string[];
   projectId?: string;
   repositoryId?: string;
+  sourceRepositoryIds?: string[];
   aiApprovalHash?: string;
 }
 const validActions = new Set([
@@ -133,6 +134,7 @@ export class AiPolicyService {
         throw new ForbiddenException('操作类型不在 AI 授权范围内');
     }
     if (input.repositoryId) this.assertRepository(input.repositoryId, snapshot);
+    for (const id of input.sourceRepositoryIds ?? []) this.assertRepository(id, snapshot);
     const sourceWrite =
       input.action === 'publish_source_branch' || input.action === 'open_pull_request';
     if (sourceWrite && (!input.projectId || !input.repositoryId))

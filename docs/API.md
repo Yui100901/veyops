@@ -193,6 +193,8 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 
 服务环境、流水线运行、产物部署和 Webhook 可直接提交 `serverIds` 或 `groupIds`，可同时选用两者，并配置 `strategy`、`maxParallel` 和 `failurePolicy`。运行与产物部署可继承服务环境的选择。预览返回已去重的 `serverIds` 与保存的 `targetSelection`。提交时携带 `expectedConfigurationHash`，成员变化后重新预览。旧 `targetId` 及相关接口保留兼容。
 
+节点式流水线在 `definition.nodes` 保存有序节点。`id` 在同一版本中唯一，步骤记录用 `node:<id>` 关联节点。生效分支由主源码节点明确指定时，运行请求可以省略 `commitSha`。预览返回 `nodeSources` 数组，其中每项包含节点 ID、仓库 ID、固定的 `commitSha` 和可选 `branch`。详情 `GET /tasks/:id` 的 `pipelineGraph` 返回节点 ID、名称、类型及构建位置。查看某次提交中的环境文件可调用 `GET /projects/:projectId/repositories/:repositoryId/environment-files?commitSha=<SHA>`，响应提供文件路径和变量名。
+
 | 方法             | 路径                                               | 说明                                                                                                     |
 | ---------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | GET/POST         | /deployment-targets                                | 目标列表/创建：`{name,serverIds,strategy,maxParallel,failurePolicy,description?}`                        |

@@ -443,6 +443,41 @@ test('Gitea signed push builds the pinned version once and keeps the build resul
       .executeTakeFirstOrThrow();
     assert.equal(directRun.target_id, null);
     assert.deepEqual(JSON.parse(directRun.target_selection_json!).groupIds, [group.id]);
+
+    await api
+      .patch(`/api/v1/pipelines/${pipelineId}`)
+      .send({
+        name: 'CI',
+        definition: {
+          ...definition,
+          nodes: [
+            { id: 'source', name: 'Source', type: 'CHECKOUT', branch: settings.branch },
+            { id: 'archive', name: 'Archive', type: 'PACKAGE' },
+          ],
+        },
+      })
+      .expect(200);
+    const composedSettings = { ...settings, targetId: undefined, groupIds: [group.id] };
+    await api
+      .put(settingsPath)
+      .send({ ...composedSettings, branch: 'main' })
+      .expect(400);
+    await api.put(settingsPath).send(composedSettings).expect(200);
+    for (const eventCommit of ['1'.repeat(40), '2'.repeat(40)]) {
+      const body = raw({ ...push, after: eventCommit });
+      const signature = createHmac('sha256', nextSecret).update(body).digest('hex');
+      const delivered = (await deliver(body, 'push', signature).expect(200)).body.data;
+      assert.equal(delivered.accepted, true);
+      const stored = await db
+        .selectFrom('tasks')
+        .select('payload_json')
+        .where('id', '=', delivered.taskId)
+        .executeTakeFirstOrThrow();
+      const { pipeline } = JSON.parse(stored.payload_json);
+      assert.equal(pipeline.nodeSources.source.commitSha, eventCommit);
+      assert.equal(pipeline.nodeSources.source.branch, settings.branch);
+      assert.equal(pipeline.deployAfterBuild, undefined);
+    }
   } finally {
     await app.close();
     model.closeAllConnections();

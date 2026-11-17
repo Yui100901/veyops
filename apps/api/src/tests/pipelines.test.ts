@@ -37,6 +37,7 @@ import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { DeploymentsService } from '../modules/deployments/deployments.service';
 import { PipelineDefinitionDto } from '../modules/pipelines/pipeline.dto';
 import { SystemSettingsService } from '../modules/system/system-settings.service';
+import { RepositoryMetadataService } from '../modules/projects/repository-metadata.service';
 import type { PipelineArtifact, PipelineSnapshot } from '../modules/pipelines/pipeline.types';
 import type { TaskExecutionContext, TaskRecord, TaskStatus } from '../modules/tasks/tasks.types';
 import {
@@ -560,6 +561,10 @@ test('Pipeline versions and commits are fixed atomically with task and run recor
       {} as PipelineAnalysisService,
       new SystemSettingsService(database, new AuditService(database)),
       new ArtifactsService(database),
+      new RepositoryMetadataService(
+        database,
+        new CredentialsService(database, new AuditService(database)),
+      ),
     );
     const created = await pipelines.create(
       { name: 'release', projectId: project, serviceId: service, definition: d, enabled: true },

@@ -214,12 +214,16 @@ export class PipelineHooksService {
     } else {
       validateBranch(input.branch);
       await this.secret(input.secretCredentialId);
-      const preview = await this.pipelines.preview(id, {
-        ...input,
-        commitSha: '0'.repeat(40), // Preview only validates configuration; the delivery supplies a real commit.
-        confirmed: true,
-        mode: 'BUILD_ONLY',
-      });
+      const preview = await this.pipelines.preview(
+        id,
+        {
+          ...input,
+          commitSha: '0'.repeat(40), // Preview only validates configuration; the delivery supplies a real commit.
+          confirmed: true,
+          mode: 'BUILD_ONLY',
+        },
+        input.branch,
+      );
       if (input.enabled) this.pipelines.assertAutomaticBuild(preview);
       const values = {
         environment_id: input.environmentId,
@@ -231,7 +235,7 @@ export class PipelineHooksService {
         branch: input.branch,
         enabled: input.enabled ? 1 : 0,
         pipeline_version: preview.version,
-        configuration_hash: preview.configurationHash,
+        configuration_hash: preview.webhookConfigurationHash ?? preview.configurationHash,
         repository_key: await this.repositoryKey(
           preview.projectId,
           preview.definition.repositoryId,
@@ -308,13 +312,13 @@ export class PipelineHooksService {
       mode: 'BUILD_ONLY' as const,
       version: hook.pipeline_version,
     };
-    const preview = await this.pipelines.preview(id, input);
+    const preview = await this.pipelines.preview(id, input, hook.branch);
     if (
       (await this.repositoryKey(preview.projectId, preview.definition.repositoryId)) !==
       hook.repository_key
     )
       throw new ForbiddenException('Pipeline 仓库已修改，请重新保存 Webhook 配置');
-    if (preview.configurationHash !== hook.configuration_hash)
+    if ((preview.webhookConfigurationHash ?? preview.configurationHash) !== hook.configuration_hash)
       throw new ConflictException('Pipeline 的有效构建配置已改变，请重新保存 Webhook 配置');
     const idempotencyKey = `gitea:${createHash('sha256')
       .update(JSON.stringify([id, payload.ref, input.commitSha]))

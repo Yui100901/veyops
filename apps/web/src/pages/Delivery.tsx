@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from 'react';
+import { Fragment, lazy, Suspense, useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import {
   ArrowDown,
@@ -51,6 +51,16 @@ import {
   selectedDeploymentServers,
   useDeploymentInventory,
 } from './DeploymentSelection';
+import {
+  nodeConfigurationError,
+  nodesFromLegacy,
+  type PipelineNode,
+  type PipelineNodeSource,
+} from './pipeline-node-definition';
+import { PipelineNodeGraph } from './PipelineNodeGraph';
+import './pipeline-nodes.css';
+
+const PipelineNodesEditor = lazy(() => import('./PipelineNodes'));
 
 export interface PipelineDefinition {
   repositoryId: string;
@@ -70,6 +80,7 @@ export interface PipelineDefinition {
   registryId?: string;
   imageRepository: string;
   steps?: { name: string; type: string; command: string; timeout?: number; location?: string }[];
+  nodes?: PipelineNode[];
 }
 export interface Pipeline {
   id: string;
@@ -492,10 +503,15 @@ function PipelineEditor({
   const [enabled, setEnabled] = useState(pipeline.enabled ?? true);
   const [definition, setDefinition] = useState<
     Omit<PipelineDefinition, 'buildLocation'> & Partial<Pick<PipelineDefinition, 'buildLocation'>>
-  >({
-    ...emptyDefinition,
-    ...pipeline.definition,
-    buildLocation: pipeline.definition?.buildLocation,
+  >(() => {
+    const initial = {
+      ...emptyDefinition,
+      ...pipeline.definition,
+      buildLocation: pipeline.definition?.buildLocation,
+    };
+    if (!pipeline.id && !pipeline.definition?.artifactType && !initial.nodes)
+      initial.nodes = nodesFromLegacy(initial);
+    return initial;
   });
   const defaults = useResource<SystemRuntimeDefaults>(pipeline.id ? null : '/system');
   const defaultBuildLocation = defaults.data?.defaultBuildLocation;
@@ -510,10 +526,47 @@ function PipelineEditor({
   function changeProject(id: string) {
     setProjectId(id);
     setServiceId('');
-    field('repositoryId', '');
+    setDefinition((current) => ({
+      ...current,
+      repositoryId: '',
+      nodes: current.nodes?.map((node) =>
+        node.type === 'CHECKOUT'
+          ? {
+              ...node,
+              repositoryId: undefined,
+              branch: undefined,
+              environmentBranches: undefined,
+            }
+          : node,
+      ),
+    }));
+  }
+  function changeRepository(repositoryId: string) {
+    setDefinition((current) => ({
+      ...current,
+      repositoryId,
+      nodes: current.nodes?.map((node) =>
+        node.type === 'CHECKOUT' &&
+        (!node.repositoryId || node.repositoryId === current.repositoryId)
+          ? {
+              ...node,
+              repositoryId: undefined,
+              branch: undefined,
+              environmentBranches: undefined,
+            }
+          : node,
+      ),
+    }));
   }
   async function save(e: FormEvent) {
     e.preventDefault();
+    if (definition.nodes) {
+      const invalid = nodeConfigurationError(definition.nodes, definition.repositoryId);
+      if (invalid) {
+        setError(invalid);
+        return;
+      }
+    }
     setBusy(true);
     setError('');
     try {
@@ -523,6 +576,7 @@ function PipelineEditor({
         enabled,
         definition: {
           ...definition,
+          ...(definition.nodes && { installCommand: '', buildCommand: '', steps: [] }),
           registryId: definition.registryId || undefined,
           imageRepository: definition.imageRepository || undefined,
         },
@@ -603,11 +657,11 @@ function PipelineEditor({
           </Field>
         </div>
         <div className="form-grid">
-          <Field label="仓库" required>
+          <Field label={definition.nodes ? '主仓库' : '仓库'} required>
             <select
               value={definition.repositoryId}
               required
-              onChange={(e) => field('repositoryId', e.target.value)}
+              onChange={(e) => changeRepository(e.target.value)}
             >
               <option value="">选择仓库</option>
               {project.data?.repositories.map((r) => (
@@ -675,22 +729,45 @@ function PipelineEditor({
             />
           </Field>
         )}
-        <div className="form-grid">
-          <Field label="依赖安装命令" hint="可留空，跳过依赖安装。">
-            <input
-              className="mono"
-              value={definition.installCommand}
-              onChange={(e) => field('installCommand', e.target.value)}
-            />
-          </Field>
-          <Field label="构建命令" hint="以构建环境用户身份执行。">
-            <input
-              className="mono"
-              value={definition.buildCommand}
-              onChange={(e) => field('buildCommand', e.target.value)}
-            />
-          </Field>
+        <div className="pipeline-nodes-heading">
+          <h3>流水线节点</h3>
+          {!definition.nodes && (
+            <button
+              className="button secondary small"
+              type="button"
+              onClick={() => field('nodes', nodesFromLegacy(definition))}
+            >
+              <Workflow size={18} /> 转为节点编排
+            </button>
+          )}
         </div>
+        {definition.nodes ? (
+          <Suspense fallback={<Loading />}>
+            <PipelineNodesEditor
+              nodes={definition.nodes}
+              project={project.data}
+              primaryRepositoryId={definition.repositoryId}
+              onChange={(nodes) => field('nodes', nodes)}
+            />
+          </Suspense>
+        ) : (
+          <div className="form-grid">
+            <Field label="依赖安装命令" hint="可留空，跳过依赖安装。">
+              <input
+                className="mono"
+                value={definition.installCommand}
+                onChange={(e) => field('installCommand', e.target.value)}
+              />
+            </Field>
+            <Field label="构建命令" hint="以构建环境用户身份执行。">
+              <input
+                className="mono"
+                value={definition.buildCommand}
+                onChange={(e) => field('buildCommand', e.target.value)}
+              />
+            </Field>
+          </div>
+        )}
         {definition.artifactType === 'FILE' ? (
           <Field label="产物目录" required hint="相对于仓库子目录，例如 dist、build。">
             <input
@@ -790,115 +867,117 @@ function PipelineEditor({
             onChange={(e) => field('healthCheckCommand', e.target.value)}
           />
         </Field>
-        <details className="advanced-options">
-          <summary>自定义 Shell 步骤 · {definition.steps?.length || 0} 步</summary>
-          <p className="muted">按顺序追加自定义步骤。每次修改生成新版本。</p>
-          {(definition.steps || []).map((step, index) => (
-            <div className="custom-step" key={index}>
-              <div className="form-grid">
-                <Field label={`步骤 ${index + 1} 名称`}>
-                  <input
-                    required
-                    value={step.name}
-                    onChange={(e) =>
-                      field(
-                        'steps',
-                        definition.steps!.map((s, i) =>
-                          i === index ? { ...s, name: e.target.value } : s,
-                        ),
-                      )
-                    }
-                  />
-                </Field>
-                <Field label="超时（秒）">
-                  <input
-                    type="number"
-                    min={1}
-                    max={3600}
-                    value={step.timeout || 300}
-                    onChange={(e) =>
-                      field(
-                        'steps',
-                        definition.steps!.map((s, i) =>
-                          i === index ? { ...s, timeout: Number(e.target.value) } : s,
-                        ),
-                      )
-                    }
-                  />
-                </Field>
-              </div>
-              <textarea
-                aria-label={`步骤 ${index + 1} 命令`}
-                required
-                rows={2}
-                className="mono"
-                value={step.command}
-                onChange={(e) =>
-                  field(
-                    'steps',
-                    definition.steps!.map((s, i) =>
-                      i === index ? { ...s, command: e.target.value } : s,
-                    ),
-                  )
-                }
-              />
-              <div className="step-actions">
-                <button
-                  type="button"
-                  className="text-button"
-                  disabled={index === 0}
-                  aria-label="上移步骤"
-                  onClick={() => {
-                    const arr = [...definition.steps!];
-                    [arr[index - 1], arr[index]] = [arr[index]!, arr[index - 1]!];
-                    field('steps', arr);
-                  }}
-                >
-                  <ArrowUp size={14} />
-                </button>
-                <button
-                  type="button"
-                  className="text-button"
-                  disabled={index === definition.steps!.length - 1}
-                  aria-label="下移步骤"
-                  onClick={() => {
-                    const arr = [...definition.steps!];
-                    [arr[index + 1], arr[index]] = [arr[index]!, arr[index + 1]!];
-                    field('steps', arr);
-                  }}
-                >
-                  <ArrowDown size={14} />
-                </button>
-                <button
-                  type="button"
-                  className="text-button danger-text"
-                  onClick={() =>
+        {!definition.nodes && (
+          <details className="advanced-options">
+            <summary>自定义 Shell 步骤 · {definition.steps?.length || 0} 步</summary>
+            <p className="muted">按顺序追加自定义步骤。每次修改生成新版本。</p>
+            {(definition.steps || []).map((step, index) => (
+              <div className="custom-step" key={index}>
+                <div className="form-grid">
+                  <Field label={`步骤 ${index + 1} 名称`}>
+                    <input
+                      required
+                      value={step.name}
+                      onChange={(e) =>
+                        field(
+                          'steps',
+                          definition.steps!.map((s, i) =>
+                            i === index ? { ...s, name: e.target.value } : s,
+                          ),
+                        )
+                      }
+                    />
+                  </Field>
+                  <Field label="超时（秒）">
+                    <input
+                      type="number"
+                      min={1}
+                      max={3600}
+                      value={step.timeout || 300}
+                      onChange={(e) =>
+                        field(
+                          'steps',
+                          definition.steps!.map((s, i) =>
+                            i === index ? { ...s, timeout: Number(e.target.value) } : s,
+                          ),
+                        )
+                      }
+                    />
+                  </Field>
+                </div>
+                <textarea
+                  aria-label={`步骤 ${index + 1} 命令`}
+                  required
+                  rows={2}
+                  className="mono"
+                  value={step.command}
+                  onChange={(e) =>
                     field(
                       'steps',
-                      definition.steps!.filter((_, i) => i !== index),
+                      definition.steps!.map((s, i) =>
+                        i === index ? { ...s, command: e.target.value } : s,
+                      ),
                     )
                   }
-                >
-                  <Trash2 size={14} />
-                  移除
-                </button>
+                />
+                <div className="step-actions">
+                  <button
+                    type="button"
+                    className="text-button"
+                    disabled={index === 0}
+                    aria-label="上移步骤"
+                    onClick={() => {
+                      const arr = [...definition.steps!];
+                      [arr[index - 1], arr[index]] = [arr[index]!, arr[index - 1]!];
+                      field('steps', arr);
+                    }}
+                  >
+                    <ArrowUp size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    className="text-button"
+                    disabled={index === definition.steps!.length - 1}
+                    aria-label="下移步骤"
+                    onClick={() => {
+                      const arr = [...definition.steps!];
+                      [arr[index + 1], arr[index]] = [arr[index]!, arr[index + 1]!];
+                      field('steps', arr);
+                    }}
+                  >
+                    <ArrowDown size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    className="text-button danger-text"
+                    onClick={() =>
+                      field(
+                        'steps',
+                        definition.steps!.filter((_, i) => i !== index),
+                      )
+                    }
+                  >
+                    <Trash2 size={14} />
+                    移除
+                  </button>
+                </div>
               </div>
-            </div>
-          ))}
-          <button
-            type="button"
-            className="button secondary small"
-            onClick={() =>
-              field('steps', [
-                ...(definition.steps || []),
-                { name: '自定义步骤', type: 'SHELL', command: '', timeout: 300 },
-              ])
-            }
-          >
-            <Plus size={14} />
-            添加步骤
-          </button>
-        </details>
+            ))}
+            <button
+              type="button"
+              className="button secondary small"
+              onClick={() =>
+                field('steps', [
+                  ...(definition.steps || []),
+                  { name: '自定义步骤', type: 'SHELL', command: '', timeout: 300 },
+                ])
+              }
+            >
+              <Plus size={14} />
+              添加步骤
+            </button>
+          </details>
+        )}
         <label className="checkbox-row">
           <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
           启用此 Pipeline
@@ -921,6 +1000,7 @@ type PipelinePreview = {
   aiApprovalHash?: string;
   allowPartialDeploy?: boolean;
   requireApproval?: boolean;
+  nodeSources?: PipelineNodeSource[];
 };
 
 function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () => void }) {
@@ -948,10 +1028,17 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
     () => setSelection(deploymentSelection(environmentConfig.data)),
     [environmentConfig.data],
   );
-  const versionDefinition = versions.data?.find((entry) => entry.version === version)?.definition;
-  const repositoryId =
-    versionDefinition?.repositoryId ||
-    (version === pipeline.currentVersion ? pipeline.definition.repositoryId : undefined);
+  const versionDefinition =
+    versions.data?.find((entry) => entry.version === version)?.definition ??
+    (version === pipeline.currentVersion ? pipeline.definition : undefined);
+  const primarySource = versionDefinition?.nodes?.[0];
+  const configuredBranch =
+    primarySource?.environmentBranches?.[environmentId] || primarySource?.branch;
+  const onlyBuild = Boolean(
+    versionDefinition?.nodes && !versionDefinition.nodes.some(({ type }) => type === 'DEPLOY'),
+  );
+  const requestedMode = onlyBuild ? 'BUILD_ONLY' : mode;
+  const repositoryId = versionDefinition?.repositoryId;
   const repository = project.data?.repositories.find((entry) => entry.id === repositoryId);
   async function run(e: FormEvent) {
     e.preventDefault();
@@ -967,10 +1054,10 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
         const result = await post<PipelinePreview>(`/pipelines/${pipeline.id}/preview`, {
           ...selection,
           environmentId,
-          commitSha,
+          commitSha: configuredBranch ? undefined : commitSha,
           version,
-          mode,
-          allowPartialDeploy: mode === 'DEPLOY' && allowPartialDeploy,
+          mode: requestedMode,
+          allowPartialDeploy: requestedMode === 'DEPLOY' && allowPartialDeploy,
           confirmed: true,
         });
         setCopyNotice('');
@@ -980,7 +1067,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
       const task = await post<Task>(`/pipelines/${pipeline.id}/run`, {
         ...deploymentSelection(preview.targetSelection ?? selection),
         environmentId: preview.environmentId,
-        commitSha: preview.commitSha,
+        commitSha: configuredBranch ? undefined : preview.commitSha,
         version: preview.version,
         mode: preview.mode,
         allowPartialDeploy:
@@ -1001,7 +1088,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
       setBusy(false);
     }
   }
-  const buildOnly = (preview?.mode ?? mode) === 'BUILD_ONLY';
+  const buildOnly = (preview?.mode ?? requestedMode) === 'BUILD_ONLY';
   const definition = preview?.definition;
   const environmentName = project.data?.environments.find(
     (e) => e.id === preview?.environmentId,
@@ -1010,7 +1097,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
     <Modal
       title={`运行 · ${pipeline.name}`}
       wide
-      description="选择 Git Commit、Pipeline 版本和执行目标。构建产物归档并校验后可进入部署阶段。"
+      description="选择版本和目标，预览执行节点及每个仓库的固定提交。"
       onClose={() => {
         if (!busy) onClose();
       }}
@@ -1041,8 +1128,11 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
         {!preview || !definition ? (
           <fieldset disabled={busy}>
             <Field label="运行模式" required>
-              <select value={mode} onChange={(e) => setMode(e.target.value as ExecutionMode)}>
-                <option value="DEPLOY">构建并部署</option>
+              <select
+                value={requestedMode}
+                onChange={(e) => setMode(e.target.value as ExecutionMode)}
+              >
+                {!onlyBuild && <option value="DEPLOY">构建并部署</option>}
                 <option value="BUILD_ONLY">仅构建</option>
               </select>
             </Field>
@@ -1106,7 +1196,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 ))}
               </select>
             </Field>
-            {repository && (
+            {!configuredBranch && repository && (
               <div className="repository-run-picker">
                 <button
                   className="button secondary small"
@@ -1120,7 +1210,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 <span className="muted">{repository.name}</span>
               </div>
             )}
-            {browsing && repository && (
+            {!configuredBranch && browsing && repository && (
               <RepositoryBrowser
                 key={repository.id}
                 projectId={pipeline.projectId}
@@ -1133,27 +1223,33 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 }}
               />
             )}
-            <Field
-              label="Git Commit SHA"
-              required
-              hint={
-                commitOrigin
-                  ? `已选 ${commitOrigin.branch} 上的提交。`
-                  : '可手动输入完整的 40 或 64 位十六进制 SHA。'
-              }
-            >
-              <input
-                className="mono"
-                value={commitSha}
-                onChange={(e) => {
-                  setCommitSha(e.target.value.trim());
-                  setCommitOrigin(undefined);
-                }}
+            {configuredBranch ? (
+              <p className="field-note">
+                预览时锁定主仓库分支 <code>{configuredBranch}</code> 的最新提交。
+              </p>
+            ) : (
+              <Field
+                label="Git Commit SHA"
                 required
-                pattern="(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})"
-                placeholder="选择提交或输入完整 SHA"
-              />
-            </Field>
+                hint={
+                  commitOrigin
+                    ? `已选 ${commitOrigin.branch} 上的提交。`
+                    : '可手动输入完整的 40 或 64 位十六进制 SHA。'
+                }
+              >
+                <input
+                  className="mono"
+                  value={commitSha}
+                  onChange={(e) => {
+                    setCommitSha(e.target.value.trim());
+                    setCommitOrigin(undefined);
+                  }}
+                  required
+                  pattern="(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})"
+                  placeholder="选择提交或输入完整 SHA"
+                />
+              </Field>
+            )}
           </fieldset>
         ) : (
           <>
@@ -1177,7 +1273,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                   <span>{repository.name}</span>
                 </>
               )}
-              {commitOrigin && (
+              {!configuredBranch && commitOrigin && (
                 <>
                   <span>所选提交</span>
                   <span>
@@ -1214,6 +1310,37 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 </>
               )}
             </div>
+            {definition.nodes && (
+              <section className="pipeline-nodes-editor" aria-label="执行节点预览">
+                <h3 className="field-title">执行节点</h3>
+                <PipelineNodeGraph
+                  items={definition.nodes.map((node) => ({
+                    ...node,
+                    ...(node.type === 'DEPLOY' && buildOnly && { statusLabel: '本次跳过' }),
+                  }))}
+                />
+                {!!preview.nodeSources?.length && (
+                  <ul className="pipeline-node-sources" aria-label="固定源码提交">
+                    {preview.nodeSources.map((source) => {
+                      const node = definition.nodes?.find(({ id }) => id === source.id);
+                      const sourceRepository = project.data?.repositories.find(
+                        ({ id }) => id === source.repositoryId,
+                      );
+                      return (
+                        <li key={source.id}>
+                          <strong>
+                            {[node?.name, sourceRepository?.name, source.branch]
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </strong>
+                          <code>{source.commitSha}</code>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </section>
+            )}
             {!buildOnly && definition.startCommand && (
               <>
                 <h3 className="field-title">启动命令</h3>
@@ -1284,6 +1411,7 @@ function PipelineVersions({ pipeline, onClose }: { pipeline: Pipeline; onClose: 
                 <span>{formatTime(v.createdAt)}</span>
                 {v.version === pipeline.currentVersion && <span className="muted">当前版本</span>}
               </summary>
+              {v.definition.nodes && <PipelineNodeGraph items={v.definition.nodes} />}
               <pre className="code-preview">{JSON.stringify(v.definition, null, 2)}</pre>
             </details>
           ))

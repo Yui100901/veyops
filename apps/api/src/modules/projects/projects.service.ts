@@ -35,6 +35,8 @@ import { Roles } from '../auth/auth.decorators';
 import type { CurrentUser } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { recentDeployments } from '../deployments/deployment-history';
+import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
+import type { PipelineDefinition } from '../pipelines/pipeline.types';
 import {
   lockProjectGraph,
   ProjectRelationsController,
@@ -503,9 +505,10 @@ export class ProjectsService {
             .execute();
           if (
             association ||
-            definitions.some(
-              ({ definition_json }) =>
-                (JSON.parse(definition_json) as { repositoryId?: string }).repositoryId === id,
+            definitions.some(({ definition_json }) =>
+              pipelineSourceRepositories(
+                JSON.parse(definition_json) as PipelineDefinition,
+              ).includes(id),
             )
           )
             throw new ConflictException('仓库被服务或 Pipeline 版本引用，不能删除');

@@ -22,6 +22,7 @@ import { PipelineExecutor } from './pipeline-executor.service';
 import { webhookBuildSocket } from '../builds/builds.service';
 import { PipelineAnalysisService } from '../ai/pipeline-analysis.service';
 import { SystemSettingsService } from '../system/system-settings.service';
+import { RepositoryMetadataService } from '../projects/repository-metadata.service';
 import {
   confirmDeploymentMembers,
   directDeploymentSelection,
@@ -38,6 +39,12 @@ import {
   UpdatePipelineDto,
 } from './pipeline.dto';
 import type { PipelineDefinition, PipelineExecutionMode, PipelineSnapshot } from './pipeline.types';
+import {
+  pipelineNodeSecrets,
+  pipelineSourceRepositories,
+  resolvePipelineSources,
+  validatePipelineNodes,
+} from './pipeline-node-config';
 import { safeDeployPath, validateDefinition, validateGitUrl } from './pipeline.validation';
 
 @Injectable()
@@ -54,6 +61,7 @@ export class PipelinesService implements OnModuleInit {
     private readonly analysis: PipelineAnalysisService,
     private readonly settings: SystemSettingsService,
     private readonly artifacts: ArtifactsService,
+    private readonly metadata: RepositoryMetadataService,
   ) {}
   onModuleInit() {
     this.handlers.register({
@@ -118,31 +126,76 @@ export class PipelinesService implements OnModuleInit {
     fromArtifact = false,
   ) {
     validateDefinition(definition, mode === 'DEPLOY' && !fromArtifact);
+    validatePipelineNodes(definition);
     if (fromArtifact) safeDeployPath(definition.deployPath);
     const project = await this.database.db
       .selectFrom('projects')
-      .select('id')
+      .select(['id', 'name'])
       .where('id', '=', projectId)
       .where('deleted_at', 'is', null)
       .executeTakeFirst();
     const service = await this.database.db
       .selectFrom('services')
-      .select('project_id')
+      .select(['project_id', 'name'])
       .where('id', '=', serviceId)
       .executeTakeFirst();
-    const repository = await this.database.db
+    const repositoryIds = fromArtifact
+      ? [definition.repositoryId]
+      : pipelineSourceRepositories(definition);
+    const repositoryRows = await this.database.db
       .selectFrom('repositories')
       .selectAll()
-      .where('id', '=', definition.repositoryId)
-      .executeTakeFirst();
-    if (!project || service?.project_id !== projectId || repository?.project_id !== projectId)
+      .where('id', 'in', repositoryIds)
+      .where('project_id', '=', projectId)
+      .execute();
+    if (
+      !project ||
+      service?.project_id !== projectId ||
+      repositoryRows.length !== repositoryIds.length
+    )
       throw new BadRequestException('项目、服务和仓库必须存在且属于同一项目');
-    validateGitUrl(repository.clone_url);
+    for (const row of repositoryRows) validateGitUrl(row.clone_url);
+    const repositories = new Map(repositoryRows.map((row) => [row.id, row]));
+    const repository = repositories.get(definition.repositoryId)!;
+    if (!fromArtifact) {
+      const nodeSecrets = pipelineNodeSecrets(definition);
+      if (nodeSecrets.length) {
+        const active = await this.database.db
+          .selectFrom('credentials')
+          .select('id')
+          .where('id', 'in', nodeSecrets)
+          .where('status', '=', 'ACTIVE')
+          .execute();
+        if (active.length !== nodeSecrets.length)
+          throw new BadRequestException('环境节点引用的凭据不存在或已禁用');
+      }
+      const environmentIds = [
+        ...new Set(
+          definition.nodes?.flatMap((node) => Object.keys(node.environmentBranches ?? {})),
+        ),
+      ];
+      if (mode === undefined && environmentIds.length) {
+        const environments = await this.database.db
+          .selectFrom('environments')
+          .select('id')
+          .where('project_id', '=', projectId)
+          .where('id', 'in', environmentIds)
+          .execute();
+        if (environments.length !== environmentIds.length)
+          throw new BadRequestException('源码节点的分支配置包含其他项目的环境');
+      }
+    }
     const registry =
       mode !== 'BUILD_ONLY' && definition.registryId
         ? await this.registries.get(definition.registryId)
         : undefined;
-    return { repository, registry };
+    return {
+      repository,
+      repositories,
+      registry,
+      projectName: project.name,
+      serviceName: service.name,
+    };
   }
   private async lockRepository(tx: Transaction<Database>, projectId: string, repositoryId: string) {
     const row = await tx
@@ -155,6 +208,18 @@ export class PipelinesService implements OnModuleInit {
     if (!row) throw new BadRequestException('项目仓库不存在');
     validateGitUrl(row.clone_url);
   }
+  private async lockNodeCredentials(tx: Transaction<Database>, definition: PipelineDefinition) {
+    for (const id of pipelineNodeSecrets(definition).sort()) {
+      const locked = await tx
+        .updateTable('credentials')
+        .set((eb) => ({ updated_at: eb.ref('updated_at') }))
+        .where('id', '=', id)
+        .where('status', '=', 'ACTIVE')
+        .returning('id')
+        .executeTakeFirst();
+      if (!locked) throw new BadRequestException('环境节点引用的凭据不存在或已禁用');
+    }
+  }
   async create(input: CreatePipelineDto, userId: string) {
     const definition: PipelineDefinition = {
       ...input.definition,
@@ -165,7 +230,9 @@ export class PipelinesService implements OnModuleInit {
     const id = randomUUID(),
       now = Date.now();
     await this.database.db.transaction().execute(async (tx) => {
-      await this.lockRepository(tx, input.projectId, input.definition.repositoryId);
+      for (const repositoryId of pipelineSourceRepositories(definition))
+        await this.lockRepository(tx, input.projectId, repositoryId);
+      await this.lockNodeCredentials(tx, definition);
       if (input.definition.registryId) await lockRegistry(tx, input.definition.registryId);
       await tx
         .insertInto('pipelines')
@@ -202,7 +269,9 @@ export class PipelinesService implements OnModuleInit {
     };
     await this.resources(current.projectId, current.serviceId, definition);
     await this.database.db.transaction().execute(async (tx) => {
-      await this.lockRepository(tx, current.projectId, input.definition.repositoryId);
+      for (const repositoryId of pipelineSourceRepositories(definition))
+        await this.lockRepository(tx, current.projectId, repositoryId);
+      await this.lockNodeCredentials(tx, definition);
       if (input.definition.registryId) await lockRegistry(tx, input.definition.registryId);
       const pipeline = await tx
         .updateTable('pipelines')
@@ -240,13 +309,16 @@ export class PipelinesService implements OnModuleInit {
     await this.audit.record(userId, 'pipeline.disable', 'pipeline', id);
     return { success: true };
   }
-  private async prepare(id: string, input: RunPipelineDto, fromArtifact = false) {
-    const mode = input.mode ?? 'DEPLOY';
-    if (mode !== 'BUILD_ONLY' && mode !== 'DEPLOY')
+  private async prepare(
+    id: string,
+    input: RunPipelineDto,
+    fromArtifact = false,
+    webhookBranch?: string,
+  ) {
+    if (input.mode !== undefined && input.mode !== 'BUILD_ONLY' && input.mode !== 'DEPLOY')
       throw new BadRequestException('无效Pipeline执行模式');
-    if (input.allowPartialDeploy && mode !== 'DEPLOY')
-      throw new BadRequestException('仅构建不支持部分发布');
-    if (!/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(input.commitSha))
+    const requestedSha = input.commitSha?.toLowerCase();
+    if (requestedSha && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(requestedSha))
       throw new BadRequestException('Pipeline必须固定完整Git Commit SHA');
     const pipeline = await this.get(id);
     if (!pipeline.enabled) throw new BadRequestException('Pipeline已禁用');
@@ -319,6 +391,13 @@ export class PipelinesService implements OnModuleInit {
       PipelineDefinitionDto,
       JSON.parse(version.definition_json),
     ) as PipelineDefinition;
+    const buildOnlyNodes =
+      definition.nodes && !definition.nodes.some((node) => node.type === 'DEPLOY');
+    const mode = input.mode ?? (buildOnlyNodes ? 'BUILD_ONLY' : 'DEPLOY');
+    if (mode === 'DEPLOY' && buildOnlyNodes && !fromArtifact)
+      throw new BadRequestException('所选流水线版本没有发布节点，可构建后手动部署归档产物');
+    if (input.allowPartialDeploy && mode !== 'DEPLOY')
+      throw new BadRequestException('仅构建不支持部分发布');
     const config = env.config;
     if (config) {
       for (const name of [
@@ -336,6 +415,8 @@ export class PipelinesService implements OnModuleInit {
         if (value) (definition as unknown as Record<string, string>)[name] = value;
       }
       if (config.workingDirectory) definition.repoPath = config.workingDirectory;
+      const buildNode = definition.nodes?.find((node) => node.type === 'BUILD');
+      if (buildNode && config.buildCommand) buildNode.command = config.buildCommand;
     }
     const errors = await validate(plainToInstance(PipelineDefinitionDto, definition));
     if (errors.length) throw new BadRequestException('有效Pipeline配置不合法');
@@ -344,13 +425,36 @@ export class PipelinesService implements OnModuleInit {
       servers.some((s) => !s.credentialId || !s.hostKeyFingerprint)
     )
       throw new BadRequestException('执行目标必须配置SSH凭据和已确认指纹');
-    const { repository, registry } = await this.resources(
+    const { repository, repositories, registry, projectName, serviceName } = await this.resources(
       pipeline.projectId,
       pipeline.serviceId,
       definition,
       mode,
       fromArtifact,
     );
+    const sources =
+      definition.nodes && !fromArtifact
+        ? await resolvePipelineSources(
+            definition,
+            repositories,
+            this.metadata,
+            environment.id,
+            requestedSha,
+            webhookBranch,
+          )
+        : undefined;
+    const commitSha = sources?.commitSha ?? requestedSha;
+    if (!commitSha) throw new BadRequestException('请选择完整 Git Commit SHA');
+    const protectedVariables = new Set(Object.keys(env.secretVariables));
+    if (!fromArtifact) {
+      for (const node of definition.nodes ?? []) {
+        for (const variable of node.variables ?? []) {
+          if (protectedVariables.has(variable.key))
+            throw new BadRequestException('环境节点不能覆盖凭据变量');
+          if (variable.credentialId) protectedVariables.add(variable.key);
+        }
+      }
+    }
     return {
       pipeline,
       version,
@@ -360,12 +464,19 @@ export class PipelinesService implements OnModuleInit {
       definition,
       repository,
       registry,
+      projectName,
+      serviceName,
+      sources,
+      commitSha,
       env,
       mode,
       allowPartialDeploy: input.allowPartialDeploy === true,
     };
   }
-  private configurationHash(p: Awaited<ReturnType<PipelinesService['prepare']>>) {
+  private configurationHash(
+    p: Awaited<ReturnType<PipelinesService['prepare']>>,
+    includeSourceCommits = true,
+  ) {
     const canonical = (value: unknown): unknown =>
       Array.isArray(value)
         ? value.map(canonical)
@@ -389,6 +500,18 @@ export class PipelinesService implements OnModuleInit {
               }),
             ...(p.allowPartialDeploy && { allowPartialDeploy: true }),
             repository: { url: p.repository.clone_url, credentialId: p.repository.credential_id },
+            ...(p.sources && {
+              nodeSources: Object.fromEntries(
+                Object.entries(p.sources.nodeSources).map(([id, source]) => [
+                  id,
+                  includeSourceCommits
+                    ? source
+                    : { url: source.url, credentialId: source.credentialId, branch: source.branch },
+                ]),
+              ),
+              projectName: p.projectName,
+              serviceName: p.serviceName,
+            }),
             ...(p.registry && {
               registry: {
                 registryUrl: p.registry.registryUrl,
@@ -414,8 +537,8 @@ export class PipelinesService implements OnModuleInit {
       )
       .digest('hex');
   }
-  async preview(id: string, input: RunPipelineDto) {
-    const p = await this.prepare(id, input);
+  async preview(id: string, input: RunPipelineDto, webhookBranch?: string) {
+    const p = await this.prepare(id, input, false, webhookBranch);
     const configurationHash = this.configurationHash(p);
     const aiApprovalHash = createHash('sha256')
       .update(
@@ -425,7 +548,7 @@ export class PipelinesService implements OnModuleInit {
           p.environment.id,
           p.target.id,
           p.mode,
-          input.commitSha.toLowerCase(),
+          p.commitSha,
           configurationHash,
         ]),
       )
@@ -443,9 +566,11 @@ export class PipelinesService implements OnModuleInit {
       requireApproval: p.mode === 'DEPLOY' && Boolean(p.env.config?.releasePolicy?.requireApproval),
       allowPartialDeploy: p.allowPartialDeploy,
       version: p.version.version,
-      commitSha: input.commitSha.toLowerCase(),
+      commitSha: p.commitSha,
+      ...(p.sources && { nodeSources: p.sources.preview }),
       definition: p.definition,
       configurationHash,
+      ...(webhookBranch && { webhookConfigurationHash: this.configurationHash(p, false) }),
       aiApprovalHash,
       hasSecretVariables: Object.keys(p.env.secretVariables).length > 0,
     };
@@ -453,8 +578,8 @@ export class PipelinesService implements OnModuleInit {
   assertAutomaticBuild(preview: { definition: PipelineDefinition; hasSecretVariables: boolean }) {
     if (preview.definition.buildLocation !== 'MANAGER')
       throw new BadRequestException('Webhook 仅支持管理端隔离构建，请修改有效构建位置');
-    if (preview.hasSecretVariables)
-      throw new BadRequestException('Webhook 自动构建不能使用环境中的敏感变量');
+    if (preview.hasSecretVariables || pipelineNodeSecrets(preview.definition).length)
+      throw new BadRequestException('Webhook 自动构建不能使用环境或节点中的敏感变量');
     if (!webhookBuildSocket())
       throw new BadRequestException('请先配置 Webhook 专用 rootless Docker 构建环境');
   }
@@ -477,6 +602,11 @@ export class PipelinesService implements OnModuleInit {
       }),
       commitSha,
       repository: { url: p.repository.clone_url, credentialId: p.repository.credential_id },
+      ...(p.sources && {
+        nodeSources: p.sources.nodeSources,
+        projectName: p.projectName,
+        serviceName: p.serviceName,
+      }),
       ...(p.registry && {
         registry: { registryUrl: p.registry.registryUrl, credentialId: p.registry.credentialId },
       }),
@@ -798,8 +928,13 @@ export class PipelinesService implements OnModuleInit {
     if (input.confirmed !== true) throw new BadRequestException('必须确认执行Pipeline');
     if (options.triggerType === 'WEBHOOK' && input.mode !== 'BUILD_ONLY')
       throw new BadRequestException('Webhook只允许触发仅构建');
-    const p = await this.prepare(id, input);
-    if (p.target.selection && !input.expectedConfigurationHash)
+    const p = await this.prepare(
+      id,
+      input,
+      false,
+      options.triggerType === 'WEBHOOK' ? options.gitRef?.slice('refs/heads/'.length) : undefined,
+    );
+    if ((p.target.selection || p.definition.nodes) && !input.expectedConfigurationHash)
       throw new ConflictException('请先预览并确认服务器、分组和执行配置');
     if (options.triggerType === 'WEBHOOK')
       this.assertAutomaticBuild({
@@ -817,7 +952,7 @@ export class PipelinesService implements OnModuleInit {
       input.expectedConfigurationHash !== this.configurationHash(p)
     )
       throw new ConflictException('执行配置已变化，请重新确认');
-    const commit = input.commitSha.toLowerCase();
+    const commit = p.commitSha;
     const snapshot: PipelineSnapshot = {
       ...this.snapshot(p, commit),
       mode: 'BUILD_ONLY',

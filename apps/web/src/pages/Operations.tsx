@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState, type Ref } from 'react';
 import {
   ArrowLeft,
   Clock3,
@@ -24,8 +24,36 @@ import {
 import type { Task, TaskTarget, User } from '../models';
 import { TaskTable, taskTypeLabel } from './Dashboard';
 import { RunArtifacts } from './Delivery';
+import type { PipelineLogSelection, PipelineTaskStep } from './PipelineRunGraph';
+
+const PipelineRunGraph = lazy(() => import('./PipelineRunGraph'));
 
 export { CommandsPage, PlansPage } from './BatchOperations';
+
+function renderTaskLog(
+  content: string,
+  steps: PipelineTaskStep[] | undefined,
+  stepId: string | undefined,
+  selection: Ref<HTMLElement>,
+) {
+  const nodeSteps = new Set(
+    steps?.filter((step) => step.key.startsWith('node:')).map((step) => step.id),
+  );
+  const segments = content.split(/\[node:([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\] /g);
+  return segments.flatMap((segment, index) => {
+    if (index % 2) return nodeSteps.has(segment) ? [] : [`[node:${segment}] `];
+    if (!stepId || segments[index - 1] !== stepId) return [segment];
+    const lineBreak = segment.indexOf('\n');
+    const end = lineBreak === -1 ? segment.length : lineBreak;
+    return [
+      <mark className="pipeline-run-log-marker" key={stepId} ref={selection}>
+        {segment.slice(0, end)}
+      </mark>,
+      segment.slice(end),
+    ];
+  });
+}
+
 export function TasksPage() {
   const resource = useResource<Task[]>('/tasks', 3000);
   const [filter, setFilter] = useState('ALL');
@@ -115,17 +143,16 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
   const task = useResource<Task>(`/tasks/${id}`, 2000);
   const targets = useResource<TaskTarget[]>(`/tasks/${id}/targets`, 2000);
   const logs = useTaskLogs(id);
-  const steps = useResource<
-    {
-      id: string;
-      serverId: string;
-      key: string;
-      name: string;
-      order: number;
-      status: string;
-      exitCode: number | null;
-    }[]
-  >(`/tasks/${id}/steps`, 2000);
+  const steps = useResource<PipelineTaskStep[]>(`/tasks/${id}/steps`, 2000);
+  const logPanel = useRef<HTMLPreElement>(null);
+  const logMarker = useRef<HTMLElement>(null);
+  const [logSelection, setLogSelection] = useState<PipelineLogSelection>();
+  const selectedStepId = logSelection?.step.id;
+  const selectedLogPresent =
+    !!selectedStepId && logs.data.content.includes(`[node:${selectedStepId}] `);
+  useEffect(() => {
+    if (selectedLogPresent) logMarker.current?.scrollIntoView({ block: 'nearest' });
+  }, [selectedStepId, selectedLogPresent]);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [retryTarget, setRetryTarget] = useState<TaskTarget>();
   const [busy, setBusy] = useState(false);
@@ -165,11 +192,14 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
   const value = task.data;
   const analysis = value.result?.aiAnalysis;
   const failedPhase = analysis?.status === 'SUCCESS' && analysis.failedPhase;
+  const nodeTypes = new Map(
+    value.pipelineGraph?.nodes.map((node) => [`node:${node.id}`, node.type]),
+  );
   const failedStep =
     failedPhase &&
     steps.data?.find(
       (step) =>
-        step.key.split(':')[0] === failedPhase &&
+        (nodeTypes.get(step.key) ?? step.key.split(':')[0]) === failedPhase &&
         ['FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION'].includes(step.status),
     );
   return (
@@ -253,6 +283,25 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
       {value.deploymentSkippedReason && (
         <p className="field-note">已跳过部署 · {value.deploymentSkippedReason}</p>
       )}
+      {value.pipelineGraph && (
+        <Suspense fallback={<Loading />}>
+          <PipelineRunGraph
+            task={value}
+            graph={value.pipelineGraph}
+            targets={targets.data ?? []}
+            steps={steps.data}
+            stepsError={steps.error}
+            retrySteps={steps.reload}
+            selectedStepId={selectedStepId}
+            onLog={(selection) => {
+              setLogSelection(selection);
+              logPanel.current?.focus();
+              if (selectedStepId === selection.step.id)
+                logMarker.current?.scrollIntoView({ block: 'nearest' });
+            }}
+          />
+        </Suspense>
+      )}
       {value.pipelineRunId && value.executionMode !== 'DEPLOY_ARTIFACT' && (
         <RunArtifacts
           key={value.pipelineRunId}
@@ -329,9 +378,27 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
           className="logs-panel"
         >
           <ErrorBanner error={logs.error} />
-          <pre className="task-logs" aria-label="执行日志">
-            {logs.data?.content ||
-              (activeTask(value.status) ? '等待 Worker 输出日志…' : '这个任务暂无日志。')}
+          {logSelection && (
+            <p className="pipeline-run-log-selection" id="pipeline-log-selection" role="status">
+              选中节点 · {logSelection.targetName} / {logSelection.step.name}
+              {' · '}
+              {selectedLogPresent ? '已定位到节点开始处' : '查看当前保留的任务日志'}
+            </p>
+          )}
+          <pre
+            className="task-logs"
+            aria-label="执行日志"
+            aria-describedby={logSelection ? 'pipeline-log-selection' : undefined}
+            ref={logPanel}
+            tabIndex={-1}
+          >
+            {logs.data.content
+              ? value.pipelineGraph
+                ? renderTaskLog(logs.data.content, steps.data, selectedStepId, logMarker)
+                : logs.data.content
+              : activeTask(value.status)
+                ? '等待 Worker 输出日志…'
+                : '这个任务暂无日志。'}
           </pre>
         </Section>
       </div>
@@ -350,9 +417,17 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
               </thead>
               <tbody>
                 {steps.data.map((step) => (
-                  <tr key={step.id}>
+                  <tr
+                    key={step.id}
+                    className={
+                      selectedStepId === step.id ? 'pipeline-run-selected-step' : undefined
+                    }
+                  >
                     <td>
-                      {step.serverId === 'manager'
+                      {step.serverId === 'manager' ||
+                      (step.key.startsWith('node:') &&
+                        value.deliveryStage === 'BUILD' &&
+                        value.pipelineGraph?.buildLocation === 'MANAGER')
                         ? '管理端'
                         : targets.data?.find((t) => t.serverId === step.serverId)?.serverName ||
                           step.serverId}

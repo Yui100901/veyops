@@ -1,6 +1,7 @@
 import {
   BadGatewayException,
   BadRequestException,
+  ConflictException,
   Controller,
   Get,
   Injectable,
@@ -14,11 +15,12 @@ import { execFile } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { promisify } from 'node:util';
+import { parseEnv, promisify } from 'node:util';
 import { DatabaseService } from '../../core/database/database.service';
 import { Roles } from '../auth/auth.decorators';
 import { gitCredentialHelper } from '../builds/builds.service';
 import { CredentialsService } from '../credentials/credentials.service';
+import { isGitBranchName as isBranchName } from './git-ref';
 
 const exec = promisify(execFile);
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -44,6 +46,7 @@ const gitEnvironmentKeys = new Set([
   'SSL_CERT_DIR',
 ]);
 const gitCredentialTypes = new Set(['GIT_TOKEN', 'GIT_PASSWORD', 'USERNAME_PASSWORD']);
+type RepositoryAccess = { clone_url: string; credential_id: string | null };
 
 export function isGitCredentialType(type: string): boolean {
   return gitCredentialTypes.has(type);
@@ -116,21 +119,6 @@ class RepositoryCommitsQuery {
   @IsOptional() @IsString() @Matches(/^(?:[1-9]|[1-4][0-9]|50)$/) limit?: string;
 }
 
-function isBranchName(name: string): boolean {
-  return (
-    name.length > 0 &&
-    name.length <= 255 &&
-    !name.startsWith('-') &&
-    name !== '@' &&
-    !name.endsWith('.') &&
-    !name.includes('..') &&
-    !name.includes('@{') &&
-    !/[ ~^:?*[\]\\]/.test(name) &&
-    [...name].every((char) => char.charCodeAt(0) >= 32 && char.charCodeAt(0) !== 127) &&
-    name.split('/').every((part) => part && !part.startsWith('.') && !part.endsWith('.lock'))
-  );
-}
-
 export function httpCloneUrl(value: string): string {
   if (
     !/^https?:\/\//i.test(value) ||
@@ -173,6 +161,81 @@ export class RepositoryMetadataService {
     return this.withRepository(projectId, repositoryId, (repository) =>
       this.listBranches(repository),
     );
+  }
+
+  branchHeads(
+    projectId: string,
+    repositoryId: string,
+    names: string[],
+    expected: RepositoryAccess,
+  ) {
+    return this.withRepository(
+      projectId,
+      repositoryId,
+      async (repository) => {
+        const refs = new Map(names.map((name) => [`${branchPrefix}${name}`, name]));
+        const lines = (
+          await repository.run([
+            'ls-remote',
+            '--refs',
+            '--heads',
+            '--',
+            repository.url,
+            ...refs.keys(),
+          ])
+        )
+          .trim()
+          .split(/\r?\n/);
+        const heads = new Map<string, string>();
+        for (const line of lines) {
+          const [sha, ref] = line.split('\t');
+          const name = refs.get(ref);
+          if (name && shaPattern.test(sha)) heads.set(name, sha);
+        }
+        return heads;
+      },
+      expected,
+    );
+  }
+
+  environmentFiles(projectId: string, repositoryId: string, commitSha?: string) {
+    const sha = typeof commitSha === 'string' ? commitSha.toLowerCase() : undefined;
+    if (!sha || !shaPattern.test(sha)) throw new BadRequestException('请选择完整 Git Commit SHA');
+    return this.withRepository(projectId, repositoryId, async (repository) => {
+      const gitDir = await this.fetchPinnedCommit(repository, sha);
+      const tree = await repository.runBytes(
+        [gitDir, 'ls-tree', '-r', '-z', sha],
+        analysisTreeMaxBytes,
+      );
+      const candidates = parseAnalysisTree(tree.toString('utf8'))
+        .filter(
+          ({ path }) =>
+            path.length <= 300 &&
+            /^(?:[A-Za-z0-9_.-]+\/)*\.env(?:\.[A-Za-z0-9_-]+)*$/.test(path) &&
+            repository.redact(path) === path,
+        )
+        .slice(0, 20);
+      const files: { path: string; keys: string[] }[] = [];
+      for (const { path, object } of candidates) {
+        try {
+          const content = await this.readAnalysisBlob(
+            repository,
+            gitDir,
+            object,
+            deploymentDocMaxBytes,
+          );
+          const keys = Object.keys(parseEnv(content))
+            .filter(
+              (key) => /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key) && repository.redact(key) === key,
+            )
+            .slice(0, 100);
+          files.push({ path, keys });
+        } catch (error) {
+          if (!(error instanceof BadRequestException)) throw error;
+        }
+      }
+      return { files };
+    });
   }
 
   async commits(projectId: string, repositoryId: string, query: RepositoryCommitsQuery) {
@@ -442,6 +505,7 @@ export class RepositoryMetadataService {
     projectId: string,
     repositoryId: string,
     callback: (repository: GitRepository) => Promise<T>,
+    expected?: RepositoryAccess,
   ): Promise<T> {
     const repository = await this.database.db
       .selectFrom('repositories')
@@ -452,6 +516,12 @@ export class RepositoryMetadataService {
       .where('projects.deleted_at', 'is', null)
       .executeTakeFirst();
     if (!repository) throw new NotFoundException('仓库不存在');
+    if (
+      expected &&
+      (expected.clone_url !== repository.clone_url ||
+        expected.credential_id !== repository.credential_id)
+    )
+      throw new ConflictException('源码节点的仓库配置已变化，请重新预览');
     const url = httpCloneUrl(repository.clone_url);
     const workspace = await mkdtemp(join(tmpdir(), 'veyops-git-'));
     try {
@@ -566,5 +636,14 @@ export class RepositoryMetadataController {
     @Query() query: RepositoryCommitsQuery,
   ) {
     return this.metadata.commits(projectId, repositoryId, query);
+  }
+
+  @Get('environment-files')
+  environmentFiles(
+    @Param('projectId') projectId: string,
+    @Param('repositoryId') repositoryId: string,
+    @Query('commitSha') commitSha?: string,
+  ) {
+    return this.metadata.environmentFiles(projectId, repositoryId, commitSha);
   }
 }

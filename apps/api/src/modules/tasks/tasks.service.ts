@@ -35,7 +35,10 @@ function retryable(task: Selectable<TasksTable>, target: Selectable<TaskTargetsT
 }
 
 export function taskDto(task: Selectable<TasksTable>) {
-  const payload = JSON.parse(task.payload_json) as TaskPayload;
+  return presentTask(task, JSON.parse(task.payload_json) as TaskPayload);
+}
+
+function presentTask(task: Selectable<TasksTable>, payload: TaskPayload) {
   const pipeline = task.task_type === 'PIPELINE' ? payload.pipeline : undefined;
   const result = task.result_json ? JSON.parse(task.result_json) : null;
   return {
@@ -214,7 +217,18 @@ export class TasksService {
     return task;
   }
   async get(id: string) {
-    return taskDto(await this.row(id));
+    const task = await this.row(id);
+    const payload = JSON.parse(task.payload_json) as TaskPayload;
+    const definition = task.task_type === 'PIPELINE' ? payload.pipeline?.definition : undefined;
+    return {
+      ...presentTask(task, payload),
+      ...(definition?.nodes?.length && {
+        pipelineGraph: {
+          buildLocation: definition.buildLocation,
+          nodes: definition.nodes.map(({ id, type, name }) => ({ id, type, name })),
+        },
+      }),
+    };
   }
   async targets(id: string, user?: CurrentUser) {
     const task = await this.row(id);

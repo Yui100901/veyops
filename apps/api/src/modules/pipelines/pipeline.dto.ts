@@ -1,6 +1,7 @@
 import { Type } from 'class-transformer';
 import { OmitType } from '@nestjs/swagger';
-import type { PipelineExecutionMode } from './pipeline.types';
+import { pipelineNodeTypes } from './pipeline.types';
+import type { PipelineExecutionMode, PipelineNode } from './pipeline.types';
 import { DeploymentSelectionDto } from '../deployment-targets/deployment-selection';
 import {
   ArrayMaxSize,
@@ -12,6 +13,7 @@ import {
   IsDefined,
   IsIn,
   IsInt,
+  IsObject,
   IsOptional,
   IsString,
   IsUUID,
@@ -28,6 +30,29 @@ export class PipelineStepDto {
   @IsIn(['SHELL']) type = 'SHELL' as const;
   @IsString() @Length(1, 65536) command!: string;
   @IsOptional() @IsInt() @Min(1) @Max(3600) timeout?: number;
+}
+class PipelineNodeVariableDto {
+  @IsString() @Matches(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/) key!: string;
+  @IsOptional() @IsString() @Length(0, 65536) value?: string;
+  @IsOptional() @IsUUID() credentialId?: string;
+}
+class PipelineNodeDto implements PipelineNode {
+  @IsString() @Matches(/^[A-Za-z0-9_-]{1,64}$/) id!: string;
+  @IsString() @Length(1, 120) name!: string;
+  @IsIn(pipelineNodeTypes) type!: PipelineNode['type'];
+  @IsOptional() @IsUUID() repositoryId?: string;
+  @IsOptional() @IsString() @Length(1, 255) branch?: string;
+  @IsOptional() @IsObject() environmentBranches?: Record<string, string>;
+  @IsOptional() @IsString() @Length(1, 300) directory?: string;
+  @IsOptional() @IsString() @Length(1, 65536) command?: string;
+  @IsOptional() @IsInt() @Min(1) @Max(3600) timeout?: number;
+  @IsOptional() @IsString() @Length(1, 300) envFile?: string;
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => PipelineNodeVariableDto)
+  variables?: PipelineNodeVariableDto[];
 }
 export class PipelineDefinitionDto {
   @IsUUID() repositoryId!: string;
@@ -51,6 +76,13 @@ export class PipelineDefinitionDto {
   @ValidateNested({ each: true })
   @Type(() => PipelineStepDto)
   steps: PipelineStepDto[] = [];
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsArray()
+  @ArrayMinSize(2)
+  @ArrayMaxSize(40)
+  @ValidateNested({ each: true })
+  @Type(() => PipelineNodeDto)
+  nodes?: PipelineNodeDto[];
 }
 class PipelineDefinitionInputDto extends OmitType(PipelineDefinitionDto, [
   'buildLocation',
@@ -79,7 +111,7 @@ export class UpdatePipelineDto {
 }
 export class RunPipelineDto extends DeploymentSelectionDto {
   @IsUUID() environmentId!: string;
-  @IsString() @Matches(/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/) commitSha!: string;
+  @IsOptional() @IsString() @Matches(/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/) commitSha?: string;
   @IsBoolean() @Equals(true, { message: '必须确认执行目标和Pipeline版本' }) confirmed!: boolean;
   @IsOptional() @IsInt() @Min(1) version?: number;
   @IsOptional() @IsIn(['BUILD_ONLY', 'DEPLOY']) mode?: PipelineExecutionMode;

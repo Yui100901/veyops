@@ -43,6 +43,9 @@ export class PipelineAnalysisService {
       .orderBy('step_order')
       .limit(64)
       .execute();
+    const nodeTypes = new Map(
+      snapshot.definition.nodes?.map((node) => [`node:${node.id}`, node.type]),
+    );
     const succeeded = targetStatuses.filter((target) => target.status === 'SUCCESS').length;
     const failed = targetStatuses.filter((target) =>
       ['FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION'].includes(target.status),
@@ -52,7 +55,7 @@ export class PipelineAnalysisService {
         status: row.status,
         mode: snapshot.mode === 'BUILD_ONLY' ? 'BUILD_ONLY' : 'DEPLOY',
         targetCounts: { total: targetStatuses.length, succeeded, failed },
-        steps,
+        steps: steps.map((step) => ({ ...step, phase: nodeTypes.get(step.phase) ?? step.phase })),
       },
       signal,
     );

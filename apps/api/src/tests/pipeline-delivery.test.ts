@@ -38,6 +38,8 @@ async function checkDelivery(databaseUrl?: string) {
     await import('../infrastructure/build-runner/process-runner.service.js');
   const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
   const { DeploymentsService } = await import('../modules/deployments/deployments.service.js');
+  const { RepositoryMetadataService } =
+    await import('../modules/projects/repository-metadata.service.js');
 
   const archive = Buffer.from('fixture file artifact\n');
   const checksum = createHash('sha256').update(archive).digest('hex');
@@ -53,18 +55,22 @@ async function checkDelivery(databaseUrl?: string) {
   let failedBuildServer: string | undefined;
   let registryPullFails = false;
   let archivePlatformMismatch = false;
+  let auxiliaryCommit = 'c'.repeat(40);
   const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(ProcessRunnerService)
     .useValue({
       run: async (_command: string, args: string[], options: { gzipOutput?: { path: string } }) => {
         const script = args.at(-1) ?? '';
-        if (script.includes('clone --no-checkout') || script.includes("printf 'VEYOPS_ARTIFACT")) {
+        const checkout =
+          script.includes('clone --no-checkout') ||
+          script.includes('fetch --no-recurse-submodules --no-tags --depth=1');
+        if (checkout || script.includes("printf 'VEYOPS_ARTIFACT")) {
           const mount = args.find((arg) => arg.endsWith(',dst=/workspace'))!;
           const workspace = mount.slice('type=bind,src='.length, -',dst=/workspace'.length);
-          if (script.includes('clone --no-checkout')) {
+          if (checkout) {
             managerCheckouts.push(script);
             if (script.includes(failingCommit)) return { exitCode: 77, stdout: '', stderr: '' };
-            await mkdir(join(workspace, 'repo'));
+            await mkdir(join(workspace, 'repo'), { recursive: true });
             await writeFile(join(workspace, 'repo', 'Dockerfile'), 'FROM scratch\n');
             await writeFile(join(workspace, 'repo', 'compose.yaml'), compose);
           } else {
@@ -135,6 +141,17 @@ async function checkDelivery(databaseUrl?: string) {
       download: async (_target: unknown, source: string, destination: string) => {
         await writeFile(destination, source.endsWith('/compose.snapshot.yaml') ? compose : archive);
       },
+    })
+    .overrideProvider(RepositoryMetadataService)
+    .useValue({
+      branchHeads: async (_projectId: string, _repositoryId: string, branches: string[]) =>
+        new Map(
+          branches.flatMap((branch) => {
+            if (branch === 'release/service') return [[branch, successfulCommit]];
+            if (branch === 'release/shared') return [[branch, auxiliaryCommit]];
+            return [];
+          }),
+        ),
     })
     .compile();
   const app = moduleRef.createNestApplication<NestExpressApplication>({ logger: false });
@@ -676,6 +693,149 @@ async function checkDelivery(databaseUrl?: string) {
     assert.equal((await db.selectFrom('deployment_targets').select('id').execute()).length, 1);
     const server = (await api.get(`/api/v1/servers/${serverIds[0]}`).expect(200)).body.data;
     assert.ok(server.projects.some((item: { id: string }) => item.id === project.id));
+
+    const sharedRepo = await create(`/projects/${project.id}/repositories`, {
+      name: 'Shared',
+      cloneUrl: 'https://repo.example.test/team/shared.git',
+    });
+    const nodeEnvironment = await create(`/projects/${project.id}/environments`, {
+      name: 'Node checks',
+      slug: 'node-checks',
+      environmentType: 'TESTING',
+    });
+    const customCredential = await create('/credentials', {
+      name: 'Node value',
+      type: 'CUSTOM_SECRET',
+      secret: { value: 'node-private-fixture' },
+    });
+    const nodes = [
+      {
+        id: 'source',
+        name: 'Source',
+        type: 'CHECKOUT',
+        environmentBranches: { [nodeEnvironment.id]: 'release/service' },
+      },
+      {
+        id: 'shared',
+        name: 'Shared source',
+        type: 'CHECKOUT',
+        repositoryId: sharedRepo.id,
+        branch: 'release/shared',
+        directory: 'modules/shared',
+      },
+      {
+        id: 'environment',
+        name: 'Environment',
+        type: 'ENVIRONMENT',
+        variables: [
+          { key: 'NODE_FLAG', value: 'checked' },
+          { key: 'TEST_TOKEN', credentialId: customCredential.id },
+        ],
+      },
+      { id: 'build', name: 'Build', type: 'BUILD', command: 'echo BUILD_NODE_FIXTURE' },
+      { id: 'test', name: 'Test', type: 'TEST', command: 'test "$NODE_FLAG" = checked' },
+      { id: 'archive', name: 'Archive', type: 'PACKAGE' },
+      { id: 'publish', name: 'Publish', type: 'DEPLOY' },
+    ];
+    const composedInput = {
+      name: 'Composed delivery',
+      projectId: project.id,
+      serviceId: service.id,
+      definition: {
+        ...definition,
+        deployPath: '/opt/pipeline-composed',
+        buildLocation: 'MANAGER',
+        nodes,
+      },
+    };
+    await post('/pipelines', {
+      ...composedInput,
+      definition: { ...composedInput.definition, nodes: [nodes[0], nodes[3], ...nodes.slice(1)] },
+    }).expect(400);
+    const composed = await create('/pipelines', composedInput);
+    await api.delete(`/api/v1/projects/${project.id}/repositories/${sharedRepo.id}`).expect(409);
+    await api.delete(`/api/v1/credentials/${customCredential.id}`).expect(409);
+    const composedPath = `/pipelines/${composed.id}`;
+    const selection = {
+      environmentId: nodeEnvironment.id,
+      serverIds: [serverIds[0]],
+      confirmed: true,
+    };
+    const previewNodes = await create(`${composedPath}/preview`, selection);
+    assert.equal(previewNodes.commitSha, successfulCommit);
+    assert.deepEqual(previewNodes.nodeSources, [
+      {
+        id: 'source',
+        repositoryId: repo.id,
+        branch: 'release/service',
+        commitSha: successfulCommit,
+      },
+      {
+        id: 'shared',
+        repositoryId: sharedRepo.id,
+        branch: 'release/shared',
+        commitSha: auxiliaryCommit,
+      },
+    ]);
+    auxiliaryCommit = 'd'.repeat(40);
+    await post(`${composedPath}/run`, {
+      ...selection,
+      expectedConfigurationHash: previewNodes.configurationHash,
+    }).expect(409);
+    auxiliaryCommit = 'c'.repeat(40);
+
+    const assertSteps = async (id: string, expected: string[]) => {
+      const steps = (await api.get(`/api/v1/tasks/${id}/steps`).expect(200)).body.data as {
+        key: string;
+        status: string;
+      }[];
+      const tracked = steps.filter(({ key }) => key.startsWith('node:'));
+      assert.deepEqual(
+        tracked.map(({ key }) => key.slice(5)),
+        expected,
+      );
+      assert.ok(tracked.every(({ status }) => status === 'SUCCESS'));
+    };
+    for (const buildLocation of ['MANAGER', 'TARGET']) {
+      const pipeline =
+        buildLocation === 'MANAGER'
+          ? composed
+          : await create('/pipelines', {
+              ...composedInput,
+              definition: { ...composedInput.definition, buildLocation },
+            });
+      const path = `/pipelines/${pipeline.id}`;
+      const preview = await create(`${path}/preview`, selection);
+      const queued = await create(`${path}/run`, {
+        ...selection,
+        expectedConfigurationHash: preview.configurationHash,
+      });
+      const completed = await runTask(queued.id);
+      assert.equal(completed.status, 'SUCCESS');
+      assert.equal(completed.pipelineGraph.buildLocation, buildLocation);
+      assert.deepEqual(
+        completed.pipelineGraph.nodes,
+        nodes.map(({ id, name, type }) => ({ id, name, type })),
+      );
+      await assertSteps(
+        completed.id,
+        nodes.slice(0, -1).map(({ id }) => id),
+      );
+      assert.ok(completed.deploymentTaskId);
+      const released = await runTask(completed.deploymentTaskId);
+      assert.equal(released.status, 'SUCCESS');
+      await assertSteps(released.id, ['publish']);
+    }
+    await api
+      .patch(`/api/v1${composedPath}`)
+      .send({
+        name: composedInput.name,
+        definition: { ...composedInput.definition, nodes: nodes.slice(0, -1) },
+      })
+      .expect(200);
+    const buildOnlyPreview = await create(`${composedPath}/preview`, selection);
+    assert.equal(buildOnlyPreview.mode, 'BUILD_ONLY');
+    await post(`${composedPath}/preview`, { ...selection, mode: 'DEPLOY' }).expect(400);
   } finally {
     await app.close();
   }

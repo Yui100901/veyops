@@ -6,6 +6,7 @@ import {
   BuildCommandError,
   BuildsService,
   BuildSession,
+  type RunPipelineNode,
   archiveMetadata,
   enterRepositoryDirectory,
   packScript,
@@ -37,6 +38,7 @@ type PipelinePhase =
   | 'HEALTH_CHECK'
   | 'ROLLBACK'
   | 'CLEANUP';
+type ReportPhase = <T>(phase: PipelinePhase, name: string, action: () => Promise<T>) => Promise<T>;
 
 type ComposeRelease = { compose: string; docker: string; image: string; imageId?: string };
 type RollbackCandidate = {
@@ -92,11 +94,15 @@ export class PipelineExecutor {
     if (!snapshot) throw new Error('缺少固定Pipeline快照');
     const buildOnly = snapshot.mode === 'BUILD_ONLY';
     const deployArtifact = snapshot.mode === 'DEPLOY_ARTIFACT';
+    const nodes = snapshot.definition.nodes;
+    const packageNode = nodes?.find((node) => node.type === 'PACKAGE');
+    const deployNode = nodes?.find((node) => node.type === 'DEPLOY');
     if (
       snapshot.triggerType === 'WEBHOOK' &&
       (!buildOnly ||
         snapshot.definition.buildLocation !== 'MANAGER' ||
-        Object.keys(snapshot.secretVariables).length)
+        Object.keys(snapshot.secretVariables).length ||
+        nodes?.some((node) => node.variables?.some((variable) => variable.credentialId)))
     )
       throw new Error('Webhook只允许在隔离管理端执行无敏感环境变量的仅构建任务');
     const siblingCancellation = new AbortController();
@@ -151,6 +157,7 @@ export class PipelineExecutor {
     let manager: BuildOutput | undefined;
     let managerArtifact: PipelineArtifact | undefined;
     let managerTarget: { serverId: string; targetId: string } | undefined;
+    let managerStepCount = 0;
     try {
       if (!deployArtifact && snapshot.definition.buildLocation === 'MANAGER') {
         // Manager executes exactly once, before any target deploys the same immutable artifact.
@@ -158,23 +165,49 @@ export class PipelineExecutor {
         const first = task.payload.targets[0];
         if (!first || context.signal.aborted) return;
         managerTarget = { serverId: first.id, targetId: await context.startTarget(first.id) };
-        const managerStep = await context.startStep(
-          managerTarget.targetId,
-          first.id,
-          {
-            key: 'MANAGER_BUILD',
-            name: '管理端隔离构建',
-            command: '',
-          },
-          0,
-        );
+        const managerTargetId = managerTarget.targetId;
+        const legacyStep = nodes
+          ? undefined
+          : await context.startStep(
+              managerTargetId,
+              first.id,
+              { key: 'MANAGER_BUILD', name: '管理端隔离构建', command: '' },
+              managerStepCount++,
+            );
+        const runNode: RunPipelineNode = (node, run) =>
+          this.trackStep(
+            context,
+            managerTargetId,
+            first.id,
+            `node:${node.id}`,
+            node.name,
+            managerStepCount++,
+            run,
+          );
+        const saveManagerArtifact = async (output: BuildOutput) => {
+          managerArtifact = await this.artifacts.create(snapshot, {
+            storageKey: output.localArchive ?? output.imageReference!,
+            archiveKey: output.archiveKey,
+            archiveImageId: output.archiveImageId,
+            archiveImagePlatform: output.archiveImagePlatform,
+            composeYaml: output.composeYaml,
+            checksum: output.checksum,
+            sizeBytes: output.sizeBytes,
+            imageDigest: output.imageDigest,
+            imageReference: output.imageReference,
+            imageTag: output.imageTag,
+            imageId: output.imageId,
+            storageType: output.imageId ? 'LOCAL_IMAGE' : undefined,
+          });
+        };
         try {
-          manager = await this.builds.manager(session);
-          await context.finishStep(managerStep, 'SUCCESS', 0);
+          manager = await this.builds.manager(session, runNode, saveManagerArtifact);
+          if (legacyStep) await context.finishStep(legacyStep, 'SUCCESS', 0);
         } catch (error) {
           const status = this.builds.errorKind(error);
           const message = error instanceof Error ? error.message : '管理端构建失败';
-          await context.finishStep(managerStep, status, commandExitCode(error), message);
+          if (legacyStep)
+            await context.finishStep(legacyStep, status, commandExitCode(error), message);
           for (const target of task.payload.targets) {
             if (context.signal.aborted && target.id !== first.id) break;
             const id =
@@ -186,20 +219,7 @@ export class PipelineExecutor {
           context.log(`管理端构建未完成，未开始任何部署：${message}\n`);
           return;
         }
-        managerArtifact = await this.artifacts.create(snapshot, {
-          storageKey: manager.localArchive ?? manager.imageReference!,
-          archiveKey: manager.archiveKey,
-          archiveImageId: manager.archiveImageId,
-          archiveImagePlatform: manager.archiveImagePlatform,
-          composeYaml: manager.composeYaml,
-          checksum: manager.checksum,
-          sizeBytes: manager.sizeBytes,
-          imageDigest: manager.imageDigest,
-          imageReference: manager.imageReference,
-          imageTag: manager.imageTag,
-          imageId: manager.imageId,
-          storageType: manager.imageId ? 'LOCAL_IMAGE' : undefined,
-        });
+        if (!managerArtifact) await saveManagerArtifact(manager);
         if (context.signal.aborted) {
           await context.finishTarget(managerTarget.targetId, 'CANCELLED', null);
           return;
@@ -239,38 +259,35 @@ export class PipelineExecutor {
           let targetExitCode: number | null = 0;
           const work = `/tmp/veyops-${task.id}-${target.id}`;
           let createdWork = false;
-          let stepIndex = managerBuilt ? 1 : 0;
+          let stepIndex = managerBuilt ? managerStepCount : 0;
           const phases = new Map<PipelinePhase, number>();
           const step = async <T>(
             phase: PipelinePhase,
             name: string,
             action: () => Promise<T>,
           ): Promise<T> => {
-            if (context.signal.aborted) throw new SshExecutionError('任务已取消', 'CANCELLED');
             const phaseCount = (phases.get(phase) ?? 0) + 1;
             phases.set(phase, phaseCount);
-            const id = await context.startStep(
+            return this.trackStep(
+              context,
               targetId,
               target.id,
-              { key: phaseCount === 1 ? phase : `${phase}:${phaseCount}`, name, command: '' },
+              phaseCount === 1 ? phase : `${phase}:${phaseCount}`,
+              name,
               stepIndex++,
+              action,
             );
-            context.log(`${name}\n`, target.id);
-            try {
-              const result = await action();
-              await context.finishStep(id, 'SUCCESS', 0);
-              return result;
-            } catch (caught) {
-              const kind = this.builds.errorKind(caught);
-              await context.finishStep(
-                id,
-                kind,
-                commandExitCode(caught),
-                caught instanceof Error ? caught.message : '步骤失败',
-              );
-              throw caught;
-            }
           };
+          const runNode: RunPipelineNode = (node, run) =>
+            this.trackStep(
+              context,
+              targetId,
+              target.id,
+              `node:${node.id}`,
+              node.name,
+              stepIndex++,
+              run,
+            );
           const beginDeployment = async () => {
             lock = deploymentLock(snapshot);
             await step('PREPARE', '获取目标主机发布锁', async () => {
@@ -379,79 +396,75 @@ export class PipelineExecutor {
             );
             createdWork = true;
             if (!deployArtifact && snapshot.definition.buildLocation === 'TARGET') {
-              await step('CHECKOUT', '检出固定Git Commit', () =>
-                this.builds.remoteCheckout(target, work, session),
-              );
-              await step('BUILD', '安装依赖与构建', () =>
-                this.builds.remoteBuild(target, work, session),
-              );
-            }
-            if (snapshot.definition.artifactType === 'FILE') {
-              const archive = work + '/artifact.tar.gz';
-              let checksum = deploymentInput?.checksum ?? manager?.checksum,
-                sizeBytes = manager?.sizeBytes;
-              const localArchive = deploymentInput?.localArchive ?? manager?.localArchive;
-              if (localArchive) {
-                await step('TRANSFER', 'SFTP分发已归档的构建产物', () =>
-                  this.ssh.upload(target, localArchive, archive, {
-                    timeout: 300,
-                    signal: context.signal,
-                  }),
+              if (nodes) await this.builds.remoteNodes(target, work, session, runNode);
+              else {
+                await step('CHECKOUT', '检出固定Git Commit', () =>
+                  this.builds.remoteCheckout(target, work, session),
                 );
-              } else if (!deployArtifact) {
-                const output = await step('PACKAGE', '打包与校验文件产物', () =>
-                  this.builds.remoteCapture(
-                    target,
-                    packScript(
-                      work,
-                      snapshot.definition.repoPath,
-                      snapshot.definition.outputPath,
-                      archive,
-                    ),
-                    session,
-                  ),
+                await step('BUILD', '安装依赖与构建', () =>
+                  this.builds.remoteBuild(target, work, session),
                 );
-                ({ checksum, sizeBytes } = archiveMetadata(output));
-              } else throw new Error('缺少已校验的文件产物归档');
-              if (buildOnly) {
-                const storageKey = await step('ARTIFACT', '保存并校验构建产物', () =>
-                  this.builds.retainRemoteArchive(target, archive, checksum!, sizeBytes!, session),
-                );
-                artifact = await this.artifacts.create(snapshot, {
-                  storageType: 'LOCAL_FILE',
-                  storageKey,
-                  serverId: target.id,
-                  checksum,
-                  sizeBytes,
-                });
-                continue;
               }
-              const persistent =
-                snapshot.definition.deployPath + '/.artifacts/' + task.id + '.tar.gz';
-              await beginDeployment();
-              await step('DEPLOY', '校验归档与准备候选版本', () =>
-                this.prepareFileRelease(target, archive, checksum!, session),
-              );
-              if (!artifact)
-                artifact = await this.artifacts.create(snapshot, {
-                  storageKey: persistent,
-                  serverId: target.id,
-                  checksum,
-                  sizeBytes,
-                });
-              await activate('原子切换文件发布版本', () =>
-                this.activateFileRelease(target, work, session, stoppedRelease),
-              );
-            } else {
-              if (buildOnly) {
-                const composeYaml = await step('PACKAGE', '归档 Compose 配置', () =>
-                  this.builds.remoteComposeSnapshot(target, work, session),
+            }
+            if (buildOnly) {
+              const packageBuild = () =>
+                this.packageTargetBuild(
+                  target,
+                  work,
+                  session,
+                  packageNode ? async (_phase, _name, run) => run() : step,
                 );
-                if (
-                  snapshot.deployAfterBuild &&
-                  snapshot.definition.registryId &&
-                  snapshot.definition.imageRepository
-                ) {
+              artifact = packageNode
+                ? await runNode(packageNode, packageBuild)
+                : await packageBuild();
+              continue;
+            }
+            const release = async () => {
+              if (snapshot.definition.artifactType === 'FILE') {
+                const archive = work + '/artifact.tar.gz';
+                let checksum = deploymentInput?.checksum ?? manager?.checksum,
+                  sizeBytes = manager?.sizeBytes;
+                const localArchive = deploymentInput?.localArchive ?? manager?.localArchive;
+                if (localArchive) {
+                  await step('TRANSFER', 'SFTP分发已归档的构建产物', () =>
+                    this.ssh.upload(target, localArchive, archive, {
+                      timeout: 300,
+                      signal: context.signal,
+                    }),
+                  );
+                } else if (!deployArtifact) {
+                  const output = await step('PACKAGE', '打包与校验文件产物', () =>
+                    this.builds.remoteCapture(
+                      target,
+                      packScript(
+                        work,
+                        snapshot.definition.repoPath,
+                        snapshot.definition.outputPath,
+                        archive,
+                      ),
+                      session,
+                    ),
+                  );
+                  ({ checksum, sizeBytes } = archiveMetadata(output));
+                } else throw new Error('缺少已校验的文件产物归档');
+                const persistent =
+                  snapshot.definition.deployPath + '/.artifacts/' + task.id + '.tar.gz';
+                await beginDeployment();
+                await step('DEPLOY', '校验归档与准备候选版本', () =>
+                  this.prepareFileRelease(target, archive, checksum!, session),
+                );
+                if (!artifact)
+                  artifact = await this.artifacts.create(snapshot, {
+                    storageKey: persistent,
+                    serverId: target.id,
+                    checksum,
+                    sizeBytes,
+                  });
+                await activate('原子切换文件发布版本', () =>
+                  this.activateFileRelease(target, work, session, stoppedRelease),
+                );
+              } else {
+                if (!manager && !deployArtifact) {
                   const image = await step('IMAGE', '构建镜像、推送并固定Digest', () =>
                     this.targetImage(target, work, session),
                   );
@@ -461,73 +474,49 @@ export class PipelineExecutor {
                     imageDigest: image.digest,
                     imageTag: image.tag,
                     ...image.archive,
-                    composeYaml,
-                    serverId: target.id,
-                  });
-                } else {
-                  const image = await step('IMAGE', '构建并记录本地Docker镜像', () =>
-                    this.builds.remoteBuildOnlyImage(target, work, session),
-                  );
-                  artifact = await this.artifacts.create(snapshot, {
-                    ...image,
-                    composeYaml,
-                    storageKey: image.imageReference,
-                    storageType: 'REMOTE_IMAGE',
                     serverId: target.id,
                   });
                 }
-                continue;
-              }
-              if (!manager && !deployArtifact) {
-                const image = await step('IMAGE', '构建镜像、推送并固定Digest', () =>
-                  this.targetImage(target, work, session),
+                await beginDeployment();
+                composeRelease = await step('DEPLOY', '校验Compose配置并拉取镜像', () =>
+                  this.prepareComposeRelease(
+                    target,
+                    work,
+                    artifact!.imageReference!,
+                    session,
+                    manager,
+                    deploymentInput,
+                  ),
                 );
-                artifact = await this.artifacts.create(snapshot, {
-                  storageKey: image.reference,
-                  imageReference: image.reference,
-                  imageDigest: image.digest,
-                  imageTag: image.tag,
-                  ...image.archive,
-                  serverId: target.id,
+                await activate('启动Compose发布版本', () =>
+                  this.activateComposeRelease(target, session, composeRelease!),
+                );
+              }
+              if (snapshot.definition.startCommand)
+                await step('START', '启动/更新服务', () =>
+                  this.inRelease(
+                    target,
+                    work,
+                    snapshot.definition.startCommand,
+                    session,
+                    '启动命令失败。请检查服务进程、配置、宿主机端口占用和运行日志',
+                  ),
+                );
+              if (this.hasHealthCheck(snapshot)) {
+                await step('HEALTH_CHECK', '健康检查', async () => {
+                  health = 'UNKNOWN';
+                  try {
+                    await this.checkReleaseHealth(target, work, session, composeRelease);
+                    health = 'HEALTHY';
+                  } catch (error) {
+                    if (error instanceof BuildCommandError) health = 'FAILED';
+                    throw error;
+                  }
                 });
               }
-              await beginDeployment();
-              composeRelease = await step('DEPLOY', '校验Compose配置并拉取镜像', () =>
-                this.prepareComposeRelease(
-                  target,
-                  work,
-                  artifact!.imageReference!,
-                  session,
-                  manager,
-                  deploymentInput,
-                ),
-              );
-              await activate('启动Compose发布版本', () =>
-                this.activateComposeRelease(target, session, composeRelease!),
-              );
-            }
-            if (snapshot.definition.startCommand)
-              await step('START', '启动/更新服务', () =>
-                this.inRelease(
-                  target,
-                  work,
-                  snapshot.definition.startCommand,
-                  session,
-                  '启动命令失败。请检查服务进程、配置、宿主机端口占用和运行日志',
-                ),
-              );
-            if (this.hasHealthCheck(snapshot)) {
-              await step('HEALTH_CHECK', '健康检查', async () => {
-                health = 'UNKNOWN';
-                try {
-                  await this.checkReleaseHealth(target, work, session, composeRelease);
-                  health = 'HEALTHY';
-                } catch (error) {
-                  if (error instanceof BuildCommandError) health = 'FAILED';
-                  throw error;
-                }
-              });
-            }
+            };
+            if (deployNode) await runNode(deployNode, release);
+            else await release();
           } catch (caught) {
             status = this.builds.errorKind(caught);
             targetExitCode = commandExitCode(caught);
@@ -643,6 +632,92 @@ export class PipelineExecutor {
         context.log('管理端临时构建目录清理失败，请检查本地磁盘\n');
       }
     }
+  }
+  private async trackStep<T>(
+    context: TaskExecutionContext,
+    targetId: string,
+    serverId: string,
+    key: string,
+    name: string,
+    index: number,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    if (context.signal.aborted) throw new SshExecutionError('任务已取消', 'CANCELLED');
+    const id = await context.startStep(targetId, serverId, { key, name, command: '' }, index);
+    const marker = key.startsWith('node:') ? `[node:${id}] ` : '';
+    context.log(`${marker}${name}\n`, serverId);
+    try {
+      const result = await action();
+      await context.finishStep(id, 'SUCCESS', 0);
+      return result;
+    } catch (error) {
+      await context.finishStep(
+        id,
+        this.builds.errorKind(error),
+        commandExitCode(error),
+        error instanceof Error ? error.message : '步骤失败',
+      );
+      throw error;
+    }
+  }
+
+  private async packageTargetBuild(
+    target: SshTarget,
+    work: string,
+    session: BuildSession,
+    step: ReportPhase,
+  ) {
+    const { snapshot } = session;
+    const { repoPath, outputPath, artifactType, registryId, imageRepository } = snapshot.definition;
+    if (artifactType === 'FILE') {
+      const archive = work + '/artifact.tar.gz';
+      const output = await step('PACKAGE', '打包与校验文件产物', () =>
+        this.builds.remoteCapture(target, packScript(work, repoPath, outputPath, archive), session),
+      );
+      const metadata = archiveMetadata(output);
+      const storageKey = await step('ARTIFACT', '保存并校验构建产物', () =>
+        this.builds.retainRemoteArchive(
+          target,
+          archive,
+          metadata.checksum,
+          metadata.sizeBytes,
+          session,
+        ),
+      );
+      return this.artifacts.create(snapshot, {
+        storageType: 'LOCAL_FILE',
+        storageKey,
+        serverId: target.id,
+        ...metadata,
+      });
+    }
+    const composeYaml = await step('PACKAGE', '归档 Compose 配置', () =>
+      this.builds.remoteComposeSnapshot(target, work, session),
+    );
+    if (snapshot.deployAfterBuild && registryId && imageRepository) {
+      const image = await step('IMAGE', '构建镜像、推送并固定Digest', () =>
+        this.targetImage(target, work, session),
+      );
+      return this.artifacts.create(snapshot, {
+        storageKey: image.reference,
+        imageReference: image.reference,
+        imageDigest: image.digest,
+        imageTag: image.tag,
+        ...image.archive,
+        composeYaml,
+        serverId: target.id,
+      });
+    }
+    const image = await step('IMAGE', '构建并记录本地Docker镜像', () =>
+      this.builds.remoteBuildOnlyImage(target, work, session),
+    );
+    return this.artifacts.create(snapshot, {
+      ...image,
+      composeYaml,
+      storageKey: image.imageReference,
+      storageType: 'REMOTE_IMAGE',
+      serverId: target.id,
+    });
   }
   private async finishDeployment(
     id: string,
