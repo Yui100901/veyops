@@ -17,6 +17,7 @@ async function checkApi(databaseUrl?: string) {
   process.env.DATA_DIR = directory;
   process.env.ENCRYPTION_KEY = randomBytes(32).toString('hex');
   process.env.WORKER_ENABLED = 'false';
+  process.env.COOKIE_SECURE = 'false';
   const initialPassword = 'fixture-initial-password';
   const newPassword = 'fixture-changed-password';
   process.env.ADMIN_PASSWORD = initialPassword;
@@ -41,6 +42,8 @@ async function checkApi(databaseUrl?: string) {
     await api.get('/api/v1/servers').expect(401);
     const status = await api.get('/api/v1/auth/status').expect(200);
     assert.equal(status.body.data.initialized, true);
+    assert.match(status.headers['content-security-policy'], /script-src 'self'/);
+    assert.doesNotMatch(status.headers['content-security-policy'], /upgrade-insecure-requests/);
     await api
       .post('/api/v1/auth/setup')
       .send({ username: 'attacker', password: initialPassword })

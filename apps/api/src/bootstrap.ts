@@ -15,7 +15,16 @@ import { appVersion } from './core/version';
 
 export function configureApp(app: NestExpressApplication) {
   app.disable('x-powered-by');
-  app.use(helmet());
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          // The app can be served over HTTP on a LAN without a TLS proxy.
+          upgradeInsecureRequests: process.env.COOKIE_SECURE === 'true' ? [] : null,
+        },
+      },
+    }),
+  );
   app.use(cookieParser());
   app.setGlobalPrefix('api/v1');
   app.useGlobalPipes(
