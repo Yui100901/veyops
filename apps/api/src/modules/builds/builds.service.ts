@@ -1,8 +1,20 @@
 import { Injectable } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { chmod, lstat, mkdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { basename, isAbsolute, join, resolve, relative } from 'node:path';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, isAbsolute, join, resolve, relative, sep } from 'node:path';
 import { dataDirectory } from '../../core/config';
 import { SshExecutionError, SshService, SshTarget } from '../../infrastructure/ssh/ssh.service';
 import {
@@ -11,6 +23,7 @@ import {
   type ProcessOptions,
 } from '../../infrastructure/build-runner/process-runner.service';
 import { CredentialsService } from '../credentials/credentials.service';
+import { maxComposeBytes } from '../artifacts/artifacts.service';
 import { RegistriesService } from '../registries/registries.service';
 import type { PipelineSnapshot, BuildOutput } from '../pipelines/pipeline.types';
 import { shellQuote as q } from '../pipelines/pipeline.validation';
@@ -137,6 +150,26 @@ function inspectedImageId(output: string): string {
   const id = output.trim();
   if (!/^sha256:[a-f0-9]{64}$/.test(id)) throw new Error('未读取到已构建的Docker镜像ID');
   return id;
+}
+
+const imageArchiveInspect = '{{.Id}} {{.Os}}/{{.Architecture}}';
+
+function inspectedArchiveImage(output: string) {
+  const match = /^(sha256:[a-f0-9]{64}) ([a-z0-9]+\/[a-z0-9]+)$/.exec(output.trim());
+  if (!match) throw new Error('未读取到归档镜像的内容 ID 和平台');
+  return { archiveImageId: match[1]!, archiveImagePlatform: match[2]! };
+}
+
+async function readComposeSnapshot(path: string) {
+  const stats = await lstat(path).catch(() => null);
+  if (!stats?.isFile() || stats.size < 1 || stats.size > maxComposeBytes)
+    throw new Error('Compose 配置不是可归档的普通文件，或超过 256 KiB 限制');
+  const bytes = await readFile(path).catch(() => null);
+  if (!bytes || bytes.length > maxComposeBytes)
+    throw new Error('无法读取符合归档要求的 Compose 配置');
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  if (!text.trim() || text.includes('\0')) throw new Error('Compose 配置为空或不符合归档要求');
+  return text;
 }
 
 @Injectable()
@@ -329,8 +362,42 @@ export class BuildsService {
       30,
     );
     const imageId = inspectedImageId(output);
+    return {
+      imageReference,
+      imageId,
+      ...(await this.retainRemoteImageArchive(target, work, session, 'docker', imageReference)),
+    };
+  }
+
+  async archivePushedTargetImage(
+    target: SshTarget,
+    work: string,
+    session: BuildSession,
+    dockerConfig: string,
+    imageReference: string,
+  ) {
+    const docker = `docker --config ${q(dockerConfig)}`;
+    const inspection = await this.remoteCapture(
+      target,
+      `${docker} image inspect --format ${q(imageArchiveInspect)} ${q(imageReference)}`,
+      session,
+      30,
+    );
+    return {
+      ...inspectedArchiveImage(inspection),
+      ...(await this.retainRemoteImageArchive(target, work, session, docker, imageReference)),
+    };
+  }
+
+  private async retainRemoteImageArchive(
+    target: SshTarget,
+    work: string,
+    session: BuildSession,
+    docker: string,
+    imageReference: string,
+  ) {
     const archive = work + '/image.tar.gz';
-    const save = `ulimit -f ${maxArchiveBytes / 1024}; docker image save ${q(imageReference)} | gzip -1 > ${q(archive)}`;
+    const save = `ulimit -f ${maxArchiveBytes / 1024}; ${docker} image save ${q(imageReference)} | gzip -1 > ${q(archive)}`;
     const metadata = archiveMetadata(
       await this.remoteCapture(
         target,
@@ -346,7 +413,42 @@ export class BuildsService {
       metadata.sizeBytes,
       session,
     );
-    return { imageReference, imageId, archiveKey: basename(storagePath), ...metadata };
+    return { archiveKey: basename(storagePath), ...metadata };
+  }
+  async remoteComposeSnapshot(target: SshTarget, work: string, session: BuildSession) {
+    const d = session.snapshot.definition;
+    const path = work + '/compose.snapshot.yaml';
+    try {
+      await this.remote(
+        target,
+        `set -eu; ${enterRepositoryDirectory(work, d.repoPath)};
+candidate=${q('./' + d.composeFilePath)}
+if ! test -e "$candidate" && ! test -L "$candidate"; then exit 44; fi
+${resolveRepositoryFile(d.composeFilePath)}
+test -s "$veyops_file"; test "$(wc -c < "$veyops_file")" -le ${maxComposeBytes}
+umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(path)}`,
+        session,
+        30,
+        'Compose 配置归档失败。请检查文件路径、权限和大小',
+      );
+    } catch (error) {
+      if (
+        error instanceof BuildCommandError &&
+        error.exitCode === 44 &&
+        !session.snapshot.deployAfterBuild
+      )
+        return;
+      throw error;
+    }
+    const directory = await mkdtemp(join(tmpdir(), 'veyops-compose-'));
+    const local = join(directory, 'compose.yaml');
+    try {
+      await this.ssh.download(target, path, local, { timeout: 30, signal: session.context.signal });
+      return await readComposeSnapshot(local);
+    } finally {
+      await rm(local, { force: true });
+      await rm(directory, { recursive: true, force: true });
+    }
   }
   async retainRemoteArchive(
     target: SshTarget,
@@ -476,7 +578,23 @@ export class BuildsService {
       for (const checked of [await realpath(dockerfile), await realpath(buildContext)])
         if (relative(repoRoot, checked).startsWith('..') || isAbsolute(relative(repoRoot, checked)))
           throw new Error('Docker构建路径超出仓库');
-      if (session.snapshot.mode === 'BUILD_ONLY') {
+      const buildOnly = session.snapshot.mode === 'BUILD_ONLY';
+      let composeYaml: string | undefined;
+      if (buildOnly) {
+        const composePath = await realpath(resolve(buildContext, d.composeFilePath)).catch(
+          (error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT' && !session.snapshot.deployAfterBuild) return undefined;
+            throw new Error('无法读取 Compose 配置，请确认配置文件位于仓库内');
+          },
+        );
+        if (composePath) {
+          const pathInRepo = relative(repoRoot, composePath);
+          if (pathInRepo === '..' || pathInRepo.startsWith(`..${sep}`) || isAbsolute(pathInRepo))
+            throw new Error('Compose 配置路径超出仓库');
+          composeYaml = await readComposeSnapshot(composePath);
+        }
+      }
+      if (buildOnly && !(session.snapshot.deployAfterBuild && d.registryId && d.imageRepository)) {
         const imageReference = localImageTag(session);
         await this.local(
           session,
@@ -490,22 +608,11 @@ export class BuildsService {
           30,
         );
         const imageId = inspectedImageId(inspected.stdout);
-        const archive = join(root, 'image.tar.gz');
-        const exported = await this.runDocker(session, ['image', 'save', imageReference], 600, {
-          signal: session.context.signal,
-          log: true,
-          gzipOutput: { path: archive, maxBytes: maxArchiveBytes },
-        });
-        if (exported.exitCode !== 0)
-          throw new BuildCommandError(exported.exitCode, 'Docker镜像导出失败');
-        const archiveKey = `${session.taskId}.tar.gz`;
-        const stored = await this.retainManagerArchive(archive, archiveKey, session);
         return {
           imageReference,
           imageId,
-          archiveKey,
-          checksum: stored.checksum,
-          sizeBytes: stored.sizeBytes,
+          ...(await this.retainManagerImageArchive(session, root, imageReference)),
+          composeYaml,
           cleanup,
         };
       }
@@ -534,6 +641,19 @@ export class BuildsService {
         '镜像推送失败。请检查 Registry 的网络、认证和仓库写入权限',
       );
       const imageDigest = pushedImageDigest(pushed.stdout, imageTag);
+      const offline = session.snapshot.releasePolicy?.archivePushedImage
+        ? await this.archivePushedManagerImage(session, root, dockerConfig, image)
+        : undefined;
+      if (buildOnly) {
+        return {
+          ...offline,
+          imageReference: `${repository}@${imageDigest}`,
+          imageTag,
+          imageDigest,
+          composeYaml,
+          cleanup,
+        };
+      }
       const localCompose = join(workspace, 'compose.yaml');
       await this.container(
         session,
@@ -545,6 +665,7 @@ export class BuildsService {
       );
       if ((await lstat(localCompose)).isSymbolicLink()) throw new Error('拒绝符号链接Compose文件');
       return {
+        ...offline,
         imageReference: `${repository}@${imageDigest}`,
         imageTag,
         imageDigest,
@@ -556,6 +677,43 @@ export class BuildsService {
       throw error;
     }
   }
+  private async archivePushedManagerImage(
+    session: BuildSession,
+    root: string,
+    dockerConfig: string,
+    image: string,
+  ) {
+    const inspection = await this.local(
+      session,
+      ['--config', dockerConfig, 'image', 'inspect', '--format', imageArchiveInspect, image],
+      30,
+    );
+    return {
+      ...inspectedArchiveImage(inspection.stdout),
+      ...(await this.retainManagerImageArchive(session, root, image, dockerConfig)),
+    };
+  }
+
+  private async retainManagerImageArchive(
+    session: BuildSession,
+    root: string,
+    image: string,
+    dockerConfig?: string,
+  ) {
+    const archive = join(root, 'image.tar.gz');
+    const options = dockerConfig ? ['--config', dockerConfig] : [];
+    const exported = await this.runDocker(session, [...options, 'image', 'save', image], 600, {
+      signal: session.context.signal,
+      log: true,
+      gzipOutput: { path: archive, maxBytes: maxArchiveBytes },
+    });
+    if (exported.exitCode !== 0)
+      throw new BuildCommandError(exported.exitCode, 'Docker镜像导出失败');
+    const archiveKey = `${session.taskId}.tar.gz`;
+    const { checksum, sizeBytes } = await this.retainManagerArchive(archive, archiveKey, session);
+    return { archiveKey, checksum, sizeBytes };
+  }
+
   private async retainManagerArchive(archive: string, key: string, session: BuildSession) {
     const details = await lstat(archive);
     if (!details.isFile() || !details.size || details.size > maxArchiveBytes)

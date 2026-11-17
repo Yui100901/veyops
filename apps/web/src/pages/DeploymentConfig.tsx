@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Check, Network, Pencil, Plus, Server as ServerIcon, Trash2 } from 'lucide-react';
-import { api, message, post, remove, useResource } from '../api';
+import { api, formatTime, message, post, remove, useResource } from '../api';
 import {
   Confirm,
   Empty,
@@ -13,8 +13,16 @@ import {
   PageHeader,
   Section,
 } from '../components';
-import type { ProjectDetail, Server, SystemRuntimeDefaults, User } from '../models';
+import type {
+  DeploymentRecord,
+  ProjectDetail,
+  ReleasePolicy,
+  Server,
+  SystemRuntimeDefaults,
+  User,
+} from '../models';
 import type { DeploymentTarget } from './Delivery';
+import { ArtifactRetentionPolicy } from './ArtifactRetention';
 
 export function DeploymentTargetsPage({ user }: { user: User }) {
   const targets = useResource<DeploymentTarget[]>('/deployment-targets');
@@ -280,7 +288,9 @@ type EnvironmentConfig = {
   outputPath?: string;
   composeFilePath?: string;
   startCommand?: string;
+  stopCommand?: string;
   healthCheckCommand?: string;
+  releasePolicy?: ReleasePolicy;
 };
 export function ProjectDeploymentConfig({
   project,
@@ -383,6 +393,7 @@ function EnvironmentConfigEditor({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [artifactType, setArtifactType] = useState('FILE');
+  const [editRetention, setEditRetention] = useState(false);
   useEffect(() => {
     setArtifactType(config.data?.artifactType || 'FILE');
   }, [config.data]);
@@ -405,7 +416,23 @@ function EnvironmentConfigEditor({
           outputPath: f.get('outputPath'),
           composeFilePath: f.get('composeFilePath'),
           startCommand: f.get('startCommand'),
+          stopCommand: f.get('stopCommand') ?? undefined,
           healthCheckCommand: f.get('healthCheckCommand'),
+          ...(user.role === 'ADMIN' && {
+            releasePolicy: {
+              requireApproval: f.has('requireReleaseApproval'),
+              rollbackMode: f.get('rollbackMode'),
+              pinnedDeploymentId: f.get('pinnedDeploymentId') || undefined,
+              archivePushedImage: f.has('archivePushedImage'),
+              healthCheck: {
+                httpUrl: String(f.get('healthHttpUrl') || '').trim() || undefined,
+                compose: f.has('healthCompose'),
+                attempts: Number(f.get('healthAttempts')),
+                intervalSeconds: Number(f.get('healthIntervalSeconds')),
+                timeoutSeconds: Number(f.get('healthTimeoutSeconds')),
+              },
+            },
+          }),
         }),
       });
       onSaved();
@@ -527,6 +554,17 @@ function EnvironmentConfigEditor({
                 defaultValue={config.data?.startCommand}
               />
             </Field>
+            {artifactType === 'FILE' && (
+              <Field label="停止命令" hint="替换该版本时执行。命令应只停止本服务。">
+                <textarea
+                  className="mono"
+                  name="stopCommand"
+                  rows={2}
+                  defaultValue={config.data?.stopCommand}
+                  placeholder="继承 Pipeline"
+                />
+              </Field>
+            )}
             <Field label="健康检查命令">
               <textarea
                 className="mono"
@@ -535,10 +573,164 @@ function EnvironmentConfigEditor({
                 defaultValue={config.data?.healthCheckCommand}
               />
             </Field>
+            <fieldset disabled={user.role !== 'ADMIN'}>
+              <ReleasePolicyFields
+                policy={config.data?.releasePolicy}
+                projectId={project.id}
+                serviceId={serviceId}
+                environmentId={environmentId}
+                composeDeployment={artifactType === 'DOCKER_IMAGE'}
+              />
+              {user.role === 'ADMIN' && (
+                <button
+                  type="button"
+                  className="button secondary small"
+                  onClick={() => setEditRetention(true)}
+                >
+                  环境产物保留策略
+                </button>
+              )}
+            </fieldset>
           </fieldset>
         </Form>
       )}
+      {editRetention && (
+        <ArtifactRetentionPolicy
+          scope={{ serviceId, environmentId }}
+          onClose={() => setEditRetention(false)}
+        />
+      )}
     </Modal>
+  );
+}
+function ReleasePolicyFields({
+  policy,
+  projectId,
+  serviceId,
+  environmentId,
+  composeDeployment,
+}: {
+  policy?: ReleasePolicy;
+  projectId: string;
+  serviceId: string;
+  environmentId: string;
+  composeDeployment: boolean;
+}) {
+  const [mode, setMode] = useState<ReleasePolicy['rollbackMode']>(policy?.rollbackMode ?? 'OFF');
+  const history = useResource<DeploymentRecord[]>(
+    mode === 'PINNED' ? `/deployments?projectId=${encodeURIComponent(projectId)}` : null,
+  );
+  const candidates = history.data?.filter(
+    (record) =>
+      record.serviceId === serviceId &&
+      record.environmentId === environmentId &&
+      record.healthStatus === 'HEALTHY' &&
+      record.rollbackAvailable,
+  );
+  const pinned = policy?.pinnedDeploymentId;
+  return (
+    <>
+      <h3 className="field-title">发布保护</h3>
+      <label className="checkbox-row">
+        <input
+          name="requireReleaseApproval"
+          type="checkbox"
+          defaultChecked={policy?.requireApproval}
+        />
+        <span>部署前需要审批</span>
+      </label>
+      {composeDeployment && (
+        <label className="checkbox-row">
+          <input
+            name="archivePushedImage"
+            type="checkbox"
+            defaultChecked={policy?.archivePushedImage}
+          />
+          <span>推送 Registry 后保留离线镜像归档</span>
+        </label>
+      )}
+      <Field label="自动回滚策略" hint="发布激活后确认失败时按此策略恢复。">
+        <select
+          name="rollbackMode"
+          value={mode}
+          onChange={(event) => setMode(event.target.value as ReleasePolicy['rollbackMode'])}
+        >
+          <option value="OFF">关闭</option>
+          <option value="PREVIOUS_HEALTHY">恢复目标上一次健康发布</option>
+          <option value="PINNED">恢复指定的历史发布</option>
+        </select>
+      </Field>
+      {mode === 'PINNED' && (
+        <>
+          <ErrorBanner error={history.error} retry={history.reload} />
+          <Field label="回滚基线" required>
+            <select name="pinnedDeploymentId" defaultValue={pinned ?? ''} required>
+              <option value="">{history.loading ? '正在查询发布历史' : '选择历史发布'}</option>
+              {pinned && !candidates?.some((record) => record.id === pinned) && (
+                <option value={pinned}>当前已固定 · {pinned.slice(0, 8)}</option>
+              )}
+              {candidates?.map((record) => (
+                <option key={record.id} value={record.id}>
+                  {record.releaseVersion?.slice(0, 12) || record.id.slice(0, 8)} ·{' '}
+                  {formatTime(record.finishedAt)} · {record.serverId.slice(0, 8)}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </>
+      )}
+      <h3 className="field-title">发布健康检查</h3>
+      <Field label="HTTP 检查地址" hint="由目标服务器请求，使用不含凭据的 HTTP 或 HTTPS 地址。">
+        <input
+          name="healthHttpUrl"
+          type="url"
+          placeholder="http://127.0.0.1:8080/health"
+          defaultValue={policy?.healthCheck.httpUrl ?? ''}
+        />
+      </Field>
+      {composeDeployment && (
+        <label className="checkbox-row">
+          <input
+            name="healthCompose"
+            type="checkbox"
+            defaultChecked={policy?.healthCheck.compose}
+          />
+          <span>检查 Compose 容器的健康状态</span>
+        </label>
+      )}
+      <div className="form-grid">
+        <Field label="检查次数" required>
+          <input
+            name="healthAttempts"
+            type="number"
+            min={1}
+            max={20}
+            defaultValue={policy?.healthCheck.attempts ?? 1}
+            required
+          />
+        </Field>
+        <Field label="重试间隔（秒）" required>
+          <input
+            name="healthIntervalSeconds"
+            type="number"
+            min={0}
+            max={60}
+            defaultValue={policy?.healthCheck.intervalSeconds ?? 0}
+            required
+          />
+        </Field>
+        <Field label="单次超时（秒）" required>
+          <input
+            name="healthTimeoutSeconds"
+            type="number"
+            min={1}
+            max={300}
+            defaultValue={policy?.healthCheck.timeoutSeconds ?? 120}
+            required
+          />
+        </Field>
+      </div>
+    </>
   );
 }
 function RepositoryBinding({

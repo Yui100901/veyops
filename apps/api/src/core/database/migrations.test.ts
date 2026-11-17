@@ -90,10 +90,16 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
   assert.deepEqual(
     await db
       .selectFrom('artifacts')
-      .select(['archive_key', 'storage_key', 'size_bytes'])
+      .select(['archive_key', 'storage_key', 'size_bytes', 'compose_yaml', 'compose_checksum'])
       .where('id', '=', 'artifact')
       .executeTakeFirstOrThrow(),
-    { archive_key: null, storage_key: 'historical.tar.gz', size_bytes: artifactBytes },
+    {
+      archive_key: null,
+      storage_key: 'historical.tar.gz',
+      size_bytes: artifactBytes,
+      compose_yaml: null,
+      compose_checksum: null,
+    },
   );
   assert.deepEqual(
     await db
@@ -115,11 +121,29 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
   const repeat = await migrator.migrateToLatest();
   assert.ifError(repeat.error);
   assert.deepEqual(repeat.results, []);
+  await db
+    .insertInto('tasks')
+    .values(
+      ['DEPLOY_ARTIFACT', 'DEPLOY'].map((mode) => ({
+        id: mode,
+        task_type: 'PIPELINE',
+        payload_json: JSON.stringify({ pipeline: { mode } }),
+        created_by: 'existing-user',
+        created_at: now,
+        updated_at: now,
+      })),
+    )
+    .execute();
   const rollback = await migrator.migrateTo('001_initial');
   assert.ifError(rollback.error);
+  assert.deepEqual(await db.selectFrom('tasks').select(['id', 'status']).orderBy('id').execute(), [
+    { id: 'DEPLOY', status: 'PENDING' },
+    { id: 'DEPLOY_ARTIFACT', status: 'CANCELLED' },
+  ]);
   await assert.rejects(db.selectFrom('pipeline_webhooks').select('pipeline_id').execute());
   await assert.rejects(db.selectFrom('users').select('must_change_password').execute());
   await assert.rejects(db.selectFrom('artifacts').select('archive_key').execute());
+  await assert.rejects(db.selectFrom('artifacts').select('compose_yaml').execute());
   await assert.rejects(db.selectFrom('command_template_versions').select('id').execute());
   assert.deepEqual(
     await db

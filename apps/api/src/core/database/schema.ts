@@ -169,6 +169,7 @@ export interface ServiceEnvironmentConfigsTable {
   stop_command: Generated<string>;
   restart_command: Generated<string>;
   health_check_json: Generated<string>;
+  release_policy_json: Generated<string>;
   config_json: Generated<string>;
   created_at: number;
   updated_at: number;
@@ -266,6 +267,7 @@ export interface TasksTable {
   attempt_count: Generated<number>;
   max_attempts: Generated<number>;
   available_at: Generated<number>;
+  release_approved_by: Generated<string | null>;
   lease_owner: Generated<string | null>;
   lease_expires_at: Generated<number | null>;
   heartbeat_at: Generated<number | null>;
@@ -340,6 +342,13 @@ export interface RegistriesTable {
 }
 
 export interface ArtifactsTable {
+  pinned_at: Generated<number | null>;
+  pruned_at: Generated<number | null>;
+  archive_deleted_at: Generated<number | null>;
+  archive_image_id: Generated<string | null>;
+  archive_image_platform: Generated<string | null>;
+  compose_yaml: Generated<string | null>;
+  compose_checksum: Generated<string | null>;
   id: string;
   project_id: string;
   service_id: string;
@@ -372,6 +381,9 @@ export interface DeploymentRecordsTable {
   deploy_path: Generated<string | null>;
   health_status: Generated<string | null>;
   previous_deployment_id: Generated<string | null>;
+  rollback_of_deployment_id: Generated<string | null>;
+  release_snapshot_json: Generated<string | null>;
+  activated_at: Generated<number | null>;
   started_at: Generated<number | null>;
   finished_at: Generated<number | null>;
 }

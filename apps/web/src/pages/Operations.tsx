@@ -22,7 +22,7 @@ import {
   Status,
 } from '../components';
 import type { Task, TaskTarget, User } from '../models';
-import { TaskTable } from './Dashboard';
+import { TaskTable, taskTypeLabel } from './Dashboard';
 import { RunArtifacts } from './Delivery';
 
 export { CommandsPage, PlansPage } from './BatchOperations';
@@ -177,7 +177,11 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
         description={`任务 ID · ${id}`}
         action={
           <>
-            <Status value={value.status} />
+            {value.approvalStatus === 'PENDING' ? (
+              <span className="tag">待审批</span>
+            ) : (
+              <Status value={value.status} />
+            )}
             {activeTask(value.status) && user.role !== 'VIEWER' && (
               <button
                 className="button secondary"
@@ -202,13 +206,7 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
         </span>
         <span>开始 {formatTime(value.startedAt)}</span>
         <span>完成 {formatTime(value.finishedAt)}</span>
-        <span className="tag">
-          {value.type === 'PIPELINE'
-            ? value.executionMode === 'BUILD_ONLY'
-              ? 'Pipeline · 仅构建'
-              : 'Pipeline · 构建并部署'
-            : value.type}
-        </span>
+        <span className="tag">{taskTypeLabel(value)}</span>
         {value.type === 'PIPELINE' && (
           <>
             <a className="text-link" href="#/artifacts">
@@ -221,15 +219,39 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
             )}
           </>
         )}
+        {value.sourceBuildTaskId && (
+          <a className="text-link" href={`#/tasks/${value.sourceBuildTaskId}`}>
+            来源构建任务 →
+          </a>
+        )}
+        {value.deploymentTaskId && (
+          <a className="text-link" href={`#/tasks/${value.deploymentTaskId}`}>
+            关联部署任务 →
+          </a>
+        )}
       </div>
+      {value.approvalStatus === 'PENDING' && (
+        <p className="field-note">
+          此发布在管理员批准后开始执行。
+          {user.role === 'ADMIN' && (
+            <a className="text-link" href="#/deployments">
+              查看待审批发布 →
+            </a>
+          )}
+        </p>
+      )}
       {(value.errorSummary || value.errorMessage) && (
         <ErrorBanner error={value.errorSummary || value.errorMessage} />
       )}
-      {value.pipelineRunId && (
+      {value.deploymentSkippedReason && (
+        <p className="field-note">已跳过部署 · {value.deploymentSkippedReason}</p>
+      )}
+      {value.pipelineRunId && value.executionMode !== 'DEPLOY_ARTIFACT' && (
         <RunArtifacts
           key={value.pipelineRunId}
           runId={value.pipelineRunId}
           polling={activeTask(value.status)}
+          canDeploy={user.role !== 'VIEWER'}
         />
       )}
       {analysis && (

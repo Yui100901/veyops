@@ -14,6 +14,7 @@ import { CommandCenterModule } from './modules/command-center/command-center.mod
 import { OperationPlansModule } from './modules/operation-plans/operation-plans.module';
 import { SystemModule } from './modules/system/system.controller';
 import { BackupModule } from './modules/system/backup.controller';
+import { ArtifactRetentionModule } from './modules/artifacts/artifact-retention.module';
 import { BuildRunnerModule } from './infrastructure/build-runner/process-runner.service';
 import { DeploymentTargetsModule } from './modules/deployment-targets/deployment-targets.service';
 import { ServiceConfigsModule } from './modules/service-configs/service-configs.service';
@@ -46,6 +47,7 @@ import { ViewsModule } from './modules/views/views.module';
     InitialConfigurationModule,
     SystemModule,
     BackupModule,
+    ArtifactRetentionModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: AuthGuard }],
 })

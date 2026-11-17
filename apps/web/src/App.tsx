@@ -471,8 +471,10 @@ export function App() {
     page = <ProjectViewsPage user={user} id={routePath.slice(7) || undefined} />;
   else if (routePath === '/pipelines')
     page = <PipelinesPage user={user} repositoryScope={routeSearch} />;
-  else if (route === '/artifacts') page = <DeliveryRecordsPage type="artifacts" />;
-  else if (route === '/deployments') page = <DeliveryRecordsPage type="deployments" />;
+  else if (route === '/artifacts')
+    page = <DeliveryRecordsPage key={route} type="artifacts" user={user} />;
+  else if (route === '/deployments')
+    page = <DeliveryRecordsPage key={route} type="deployments" user={user} />;
   else if (route === '/targets') page = <DeploymentTargetsPage user={user} />;
   else if (route === '/registries') page = <RegistriesPage user={user} />;
   else if (route === '/commands') page = <CommandsPage user={user} />;

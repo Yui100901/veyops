@@ -18,6 +18,8 @@ import {
 import { TaskLogService } from './task-log.service';
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
 import type { CurrentUser } from '../auth/auth.decorators';
+import { pendingReleaseApprovalTime, serviceReleasePolicy } from '../deployments/release-policy';
+import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
 
 const terminal = new Set<string>(terminalTaskStatuses);
 export const isTerminalStatus = (status: string) => terminal.has(status);
@@ -35,6 +37,7 @@ function retryable(task: Selectable<TasksTable>, target: Selectable<TaskTargetsT
 export function taskDto(task: Selectable<TasksTable>) {
   const payload = JSON.parse(task.payload_json) as TaskPayload;
   const pipeline = task.task_type === 'PIPELINE' ? payload.pipeline : undefined;
+  const result = task.result_json ? JSON.parse(task.result_json) : null;
   return {
     id: task.id,
     type: task.task_type,
@@ -46,15 +49,25 @@ export function taskDto(task: Selectable<TasksTable>) {
     startedAt: task.started_at,
     finishedAt: task.finished_at,
     errorSummary: task.error_summary,
-    result: task.result_json ? JSON.parse(task.result_json) : null,
+    result,
     operationPlanVersionId: task.operation_plan_version_id,
     commandTemplate: payload.commandTemplate ?? null,
     retryOf: payload.retryOf ?? null,
     ...(task.task_type === 'PIPELINE'
       ? {
-          executionMode: pipeline?.mode ?? 'DEPLOY',
+          executionMode: pipeline?.deployAfterBuild ? 'DEPLOY' : (pipeline?.mode ?? 'DEPLOY'),
+          deliveryStage: pipeline?.mode === 'BUILD_ONLY' ? 'BUILD' : 'DEPLOY',
+          deployAfterBuild: pipeline?.deployAfterBuild ?? false,
+          sourceBuildTaskId: pipeline?.sourceBuildTaskId ?? null,
+          deploymentTaskId: (result?.deploymentTaskId as string | undefined) ?? null,
+          deploymentSkippedReason: (result?.deploymentSkippedReason as string | undefined) ?? null,
           pipelineRunId: pipeline?.runId ?? null,
           triggerType: pipeline?.triggerType ?? 'MANUAL',
+          approvalStatus: task.release_approved_by
+            ? 'APPROVED'
+            : task.status === 'PENDING' && task.available_at === pendingReleaseApprovalTime
+              ? 'PENDING'
+              : null,
         }
       : {}),
   };
@@ -78,90 +91,118 @@ export class TasksService {
     userId: string,
     beforeInsert?: (tx: Transaction<Database>) => Promise<void>,
   ) {
+    const taskId = await this.database.db.transaction().execute(async (tx) => {
+      await beforeInsert?.(tx);
+      return this.createInTransaction(tx, input, userId);
+    });
+    return this.get(taskId);
+  }
+  async createInTransaction(tx: Transaction<Database>, input: CreateTaskInput, userId: string) {
     const targets = input.payload.targets;
     if (!targets.length || new Set(targets.map((target) => target.id)).size !== targets.length)
       throw new BadRequestException('任务目标必须明确指定且不能重复');
     const id = randomUUID();
     const now = Date.now();
-    const taskId = await this.database.db.transaction().execute(async (tx) => {
-      await beforeInsert?.(tx);
-      const inserted = await tx
-        .insertInto('tasks')
-        .values({
-          id,
-          task_type: input.type,
-          name: input.name,
-          created_by: userId,
-          operation_plan_version_id: input.operationPlanVersionId ?? null,
-          project_id: input.scope?.projectId ?? null,
-          service_id: input.scope?.serviceId ?? null,
-          environment_id: input.scope?.environmentId ?? null,
-          target_id: input.scope?.targetId ?? null,
-          idempotency_key: input.idempotencyKey ?? null,
-          payload_json: JSON.stringify(input.payload),
-          created_at: now,
-          updated_at: now,
-          available_at: now,
-          log_file_key: this.logStore.key(id, now),
-        })
-        .onConflict((conflict) => conflict.column('idempotency_key').doNothing())
-        .returning('id')
-        .executeTakeFirst();
-      if (!inserted) {
-        const existing = await tx
-          .selectFrom('tasks')
-          .select('id')
-          .where('idempotency_key', '=', input.idempotencyKey!)
-          .executeTakeFirstOrThrow();
-        return existing.id;
-      }
+    const pipeline = input.payload.pipeline;
+    if (pipeline?.deploymentArtifacts?.length)
+      await lockAvailableArtifacts(
+        tx,
+        pipeline.deploymentArtifacts.map((artifact) => artifact.id),
+      );
+    const deployment = input.type === 'PIPELINE' && pipeline && pipeline.mode !== 'BUILD_ONLY';
+    const currentPolicy = deployment
+      ? (await serviceReleasePolicy(tx, pipeline.serviceId, pipeline.environmentId)).policy
+      : undefined;
+    const payload = deployment
+      ? {
+          ...input.payload,
+          pipeline: {
+            ...pipeline,
+            releasePolicy: pipeline.rollbackOfDeploymentId
+              ? {
+                  ...(pipeline.releasePolicy ?? currentPolicy!),
+                  requireApproval: currentPolicy!.requireApproval,
+                  rollbackMode: 'OFF',
+                }
+              : currentPolicy,
+          },
+        }
+      : input.payload;
+    const inserted = await tx
+      .insertInto('tasks')
+      .values({
+        id,
+        task_type: input.type,
+        name: input.name,
+        created_by: userId,
+        operation_plan_version_id: input.operationPlanVersionId ?? null,
+        project_id: input.scope?.projectId ?? null,
+        service_id: input.scope?.serviceId ?? null,
+        environment_id: input.scope?.environmentId ?? null,
+        target_id: input.scope?.targetId ?? null,
+        idempotency_key: input.idempotencyKey ?? null,
+        payload_json: JSON.stringify(payload),
+        created_at: now,
+        updated_at: now,
+        available_at: currentPolicy?.requireApproval ? pendingReleaseApprovalTime : now,
+        log_file_key: this.logStore.key(id, now),
+      })
+      .onConflict((conflict) => conflict.column('idempotency_key').doNothing())
+      .returning('id')
+      .executeTakeFirst();
+    if (!inserted) {
+      const existing = await tx
+        .selectFrom('tasks')
+        .select('id')
+        .where('idempotency_key', '=', input.idempotencyKey!)
+        .executeTakeFirstOrThrow();
+      return existing.id;
+    }
+    await tx
+      .insertInto('task_targets')
+      .values(
+        targets.map((target) => ({
+          id: randomUUID(),
+          task_id: id,
+          server_id: target.id,
+          server_name_snapshot: target.name,
+          host_snapshot: target.host,
+          port_snapshot: target.port,
+          username_snapshot: target.username,
+          credential_id_snapshot: target.credentialId,
+          fingerprint_snapshot: target.hostKeyFingerprint,
+        })),
+      )
+      .execute();
+    if (
+      input.pipelineRun &&
+      input.scope?.projectId &&
+      input.scope.serviceId &&
+      input.scope.environmentId &&
+      input.scope.targetId
+    ) {
+      const run = input.pipelineRun;
       await tx
-        .insertInto('task_targets')
-        .values(
-          targets.map((target) => ({
-            id: randomUUID(),
-            task_id: id,
-            server_id: target.id,
-            server_name_snapshot: target.name,
-            host_snapshot: target.host,
-            port_snapshot: target.port,
-            username_snapshot: target.username,
-            credential_id_snapshot: target.credentialId,
-            fingerprint_snapshot: target.hostKeyFingerprint,
-          })),
-        )
+        .insertInto('pipeline_runs')
+        .values({
+          id: run.id,
+          task_id: id,
+          pipeline_id: run.pipelineId,
+          pipeline_version_id: run.pipelineVersionId,
+          project_id: input.scope.projectId,
+          service_id: input.scope.serviceId,
+          environment_id: input.scope.environmentId,
+          target_id: input.scope.targetId,
+          git_ref: run.gitRef,
+          commit_sha: run.commitSha,
+          build_location_snapshot: run.buildLocation,
+          artifact_type_snapshot: run.artifactType,
+          trigger_type: run.triggerType ?? 'MANUAL',
+          created_at: now,
+        })
         .execute();
-      if (
-        input.pipelineRun &&
-        input.scope?.projectId &&
-        input.scope.serviceId &&
-        input.scope.environmentId &&
-        input.scope.targetId
-      ) {
-        const run = input.pipelineRun;
-        await tx
-          .insertInto('pipeline_runs')
-          .values({
-            id: run.id,
-            task_id: id,
-            pipeline_id: run.pipelineId,
-            pipeline_version_id: run.pipelineVersionId,
-            project_id: input.scope.projectId,
-            service_id: input.scope.serviceId,
-            environment_id: input.scope.environmentId,
-            target_id: input.scope.targetId,
-            git_ref: run.gitRef,
-            commit_sha: run.commitSha,
-            build_location_snapshot: run.buildLocation,
-            artifact_type_snapshot: run.artifactType,
-            trigger_type: run.triggerType ?? 'MANUAL',
-            created_at: now,
-          })
-          .execute();
-      }
-      return id;
-    });
-    return this.get(taskId);
+    }
+    return id;
   }
   async list(type?: string) {
     let query = this.database.db.selectFrom('tasks').selectAll();

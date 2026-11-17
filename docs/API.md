@@ -169,10 +169,12 @@
 | GET/PATCH/DELETE | /pipelines/:id                                     | 查询/新增版本/禁用并保留历史                                                                             |
 | GET              | /pipelines/:id/versions                            | 不可变历史版本                                                                                           |
 | POST             | /pipelines/:id/preview                             | 固定版本、环境配置与目标的执行预览                                                                       |
-| POST             | /pipelines/:id/run                                 | `{environmentId,targetId,commitSha,version?,confirmed:true,mode?}`，`mode` 可选 `DEPLOY` 或 `BUILD_ONLY` |
+| POST             | /pipelines/:id/run                                 | 接收 `{environmentId,targetId,commitSha,version?,confirmed:true,mode?,allowPartialDeploy?}` 并返回构建任务 |
+| POST             | /pipelines/:id/artifact-deploy/preview             | 接收 `{artifactIds,environmentId,targetId,version?}`，返回来源提交、选定版本、目标及 `configurationHash` |
+| POST             | /pipelines/:id/artifact-deploy                     | 与产物预览参数相同，另需 `confirmed: true`、`expectedConfigurationHash`，可带 `expectedServerIds`。返回部署任务 |
 | GET/PUT          | /pipelines/:id/webhook                             | 管理员查询或保存 Gitea 触发配置 `{environmentId,targetId,branch,secretCredentialId,enabled}`             |
 | POST             | /webhooks/gitea/:pipelineId                        | 接收签名的 Gitea Push，按配置触发仅构建                                                                  |
-| GET              | /artifacts                                         | 产物列表，支持 `projectId` 和 `pipelineRunId` 筛选，返回 `downloadAvailable`                             |
+| GET              | /artifacts                                         | 产物列表，支持 `projectId` 和 `pipelineRunId` 筛选，返回 `downloadAvailable`、`deployable`、`pipelineId`、`pipelineVersion`、`environmentId` 和 `targetId` |
 | GET              | /artifacts/:id/download                            | 登录后下载平台归档，响应头 `X-Artifact-SHA256` 提供校验和                                                |
 | GET              | /deployments                                       | 逐服务器交付记录，支持projectId筛选                                                                      |
 | GET/POST         | /registries                                        | Registry列表/创建（创建仅ADMIN）                                                                         |
@@ -184,7 +186,39 @@
 
 Pipeline 定义、四种组合、目录保护和环境覆盖规则见 [构建部署说明](PIPELINES.md)。环境配置字段包括 `targetId,buildLocation,artifactType,deployMethod,deployPath,buildCommand,workingDirectory,outputPath,composeFilePath,startCommand,healthCheckCommand`。敏感变量只接收凭据引用；普通值和引用二选一。
 
+运行请求的 `mode` 支持 `DEPLOY`（默认）和 `BUILD_ONLY`。`DEPLOY` 在构建成功、产物归档后创建独立部署任务。默认整批成功后部署，`allowPartialDeploy: true` 允许目标端构建只发布成功目标。构建任务详情返回 `deliveryStage: "BUILD"`、`deploymentTaskId` 和 `deploymentSkippedReason`，部署任务详情返回 `deliveryStage: "DEPLOY"` 和 `sourceBuildTaskId`。
+
+已有产物部署要求同一 Pipeline、环境和构建任务，默认使用来源构建版本。管理端产物可供多个目标使用，目标端产物按来源服务器匹配。提交需携带预览返回的 `configurationHash` 作为 `expectedConfigurationHash`。产物、目标或有效配置变化时返回 `409`，重新预览确认后再提交。
+
 `GET /deployments` 返回 `previousDeploymentId`，指向同一目标上一成功的部署记录。发布结果不确定时状态为 `NEEDS_ATTENTION`。启用 AI 分析后，`GET /tasks/:id` 的 `result.aiAnalysis` 异步附加 `{status:"SUCCESS",summary,failedPhase,nextActions}` 或 `{status:"UNAVAILABLE"}`。
+
+### 发布保护与回滚
+
+管理员通过服务环境配置的 `releasePolicy` 设置 `requireApproval`、`rollbackMode`（`OFF`、`PREVIOUS_HEALTHY`、`PINNED`）、可选的 `pinnedDeploymentId` 和 `healthCheck`。健康检查包含可选的 `httpUrl`、`compose`，以及 `attempts`、`intervalSeconds`、`timeoutSeconds`。文件服务环境可另配置 `stopCommand`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/deployments/approvals` | 管理员查看等待批准的发布任务及提交、产物和服务器 ID。 |
+| `POST` | `/deployments/approvals/:id/approve` | 管理员批准固定目标和产物。返回任务。 |
+| `POST` | `/deployments/:id/rollback/preview` | 预览使用历史发布快照回滚的范围，返回 `confirmationHash`。 |
+| `POST` | `/deployments/:id/rollback` | 提交预览的 `confirmationHash` 开始回滚，返回可能仍待审批的任务。 |
+
+Pipeline 和产物部署预览的 `requireApproval` 表示部署是否需要管理员批准。部署任务的 `approvalStatus` 为 `PENDING`、`APPROVED` 或 `null`。`GET /deployments` 提供 `isCurrent`、`rollbackAvailable`、`rollbackOfDeploymentId` 和关联任务 ID。
+
+### 产物保留
+
+| 方法与路径 | 用途 |
+| --- | --- |
+| `GET /artifact-retention/policy` | 读取有效保留策略和 `inherited` 状态。 |
+| `PUT /artifact-retention/policy` | 保存 `{maxBuilds,maxDays}`，限制分别为 1–1000 批和 1–3650 天。 |
+| `DELETE /artifact-retention/policy` | 删除服务环境覆盖，恢复继承系统策略。 |
+| `PUT /artifact-retention/artifacts/:id/pin` | 以 `{pinned:true}` 固定产物，以 `{pinned:false}` 解除固定。 |
+| `GET /artifact-retention/preview` | 返回候选总组数 `total` 和最多 50 组 `candidates`，相同归档文件的记录归在一组。每组返回 `artifactIds`、`createdAt` 和 `sizeBytes`。 |
+| `POST /artifact-retention/prune` | 接受 `{artifactIds,confirmed:true}`，每组选一个 ID。执行时复核保护并返回 `pruned`、`skipped` 和 `failed` 的产物 ID。 |
+
+这些接口需要管理员权限。策略接口同时传入 `serviceId` 和 `environmentId` 查询参数可管理服务环境覆盖，省略时操作全局策略，删除覆盖时必须指定服务环境。
+
+默认保留最近 20 批且在 30 天内的构建产物。Worker 定期清理超限的托管归档，保护当前运行版本、回滚基线、排队或执行中的任务和人工固定的产物。外部 Registry 与旧目标端归档由各自的存储策略保留。`GET /artifacts` 保留已清理记录，`prunedAt` 表示产物已停止提供下载和部署，`archiveDeletedAt` 记录本地文件清理完成的时间。物理删除失败的归档会在后续清理时重试。
 
 ## v0.2 AI 接口
 

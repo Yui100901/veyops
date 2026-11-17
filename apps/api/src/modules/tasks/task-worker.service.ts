@@ -15,6 +15,7 @@ import { TaskLogService } from './task-log.service';
 import type { TaskHandler, TaskPayload, TaskRecord, TaskStatus } from './tasks.types';
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
 import { SystemSettingsService } from '../system/system-settings.service';
+import { ArtifactRetentionService } from '../artifacts/artifact-retention.service';
 
 const TASK_LEASE_MS = 60_000;
 const SQLITE_LEASE_MS = 45_000;
@@ -24,6 +25,7 @@ const EXECUTION_FAILED = '执行记录未完整保存，远程执行结果需人
 const LOG_FAILED = '任务日志存储失败，远程执行结果需人工核查';
 const CANCELLED = '任务已取消';
 const LOG_PRUNE_INTERVAL_MS = 60 * 60_000;
+const ARTIFACT_PRUNE_INTERVAL_MS = 60 * 60_000;
 
 @Injectable()
 export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -38,12 +40,14 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
   private stopping = false;
   private sqliteLeaseLost = false;
   private nextLogPruneAt = 0;
+  private nextArtifactPruneAt = Date.now() + ARTIFACT_PRUNE_INTERVAL_MS;
   constructor(
     private readonly database: DatabaseService,
     private readonly tasks: TasksService,
     private readonly registry: TaskHandlerRegistry,
     private readonly logs: TaskLogService,
     @Optional() private readonly settings?: SystemSettingsService,
+    @Optional() private readonly artifactRetention?: ArtifactRetentionService,
   ) {}
   onApplicationBootstrap() {
     if (process.env.WORKER_ENABLED !== 'false') this.start();
@@ -116,6 +120,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     }
     await this.recoverExpired();
     await this.pruneLogs();
+    await this.pruneArtifacts();
     if (this.running || this.stopping) return;
     const task = await this.claim(true);
     if (!task) return;
@@ -127,6 +132,16 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         this.controller = undefined;
       });
   }
+  private async pruneArtifacts() {
+    if (!this.artifactRetention || this.stopping || this.running || Date.now() < this.nextArtifactPruneAt) return;
+    this.nextArtifactPruneAt = Date.now() + ARTIFACT_PRUNE_INTERVAL_MS;
+    try {
+      await this.artifactRetention.pruneExpired();
+    } catch {
+      this.logger.warn('构建产物保留规则执行失败，将在下次调度重试');
+    }
+  }
+
   private async pruneLogs() {
     if (!this.settings || this.stopping || Date.now() < this.nextLogPruneAt) return;
     this.nextLogPruneAt = Date.now() + LOG_PRUNE_INTERVAL_MS;
@@ -259,10 +274,15 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       } catch (cause) {
         failure = { cause };
       }
+      const completedRecord = record;
+      const onFinalize = handler?.onFinalize;
       finalized = await this.finalize(
         task,
         failure,
         this.stopping || lostLease || this.sqliteLeaseLost,
+        completedRecord && onFinalize
+          ? (tx, status) => onFinalize(tx, completedRecord, task.created_by, status)
+          : undefined,
       );
     } finally {
       clearInterval(heartbeat);
@@ -305,6 +325,10 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     task: Selectable<TasksTable>,
     failure: { cause: unknown } | undefined,
     interrupted: boolean,
+    onFinalize?: (
+      tx: Transaction<Database>,
+      status: TaskStatus,
+    ) => Promise<{ deploymentTaskId?: string; deploymentSkippedReason?: string } | undefined>,
   ) {
     return this.database.db.transaction().execute(async (tx) => {
       if (!(await lockTaskLease(tx, task.id, this.owner, true))) return false;
@@ -393,6 +417,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         unfinishedMessage,
         uncertain,
       );
+      const continuation = await onFinalize?.(tx, status);
       await tx
         .updateTable('tasks')
         .set({
@@ -401,6 +426,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
           result_json: JSON.stringify({
             total: targets.length,
             success: targets.filter((target) => target.status === 'SUCCESS').length,
+            ...continuation,
           }),
           finished_at: now,
           updated_at: now,

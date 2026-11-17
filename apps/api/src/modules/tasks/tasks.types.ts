@@ -1,5 +1,7 @@
 import { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
+import type { Transaction } from 'kysely';
+import type { Database } from '../../core/database/schema';
 
 export type TaskStatus =
   | 'PENDING'
@@ -77,6 +79,12 @@ export interface TaskExecutionContext {
 export interface TaskHandler {
   type: string;
   execute(task: TaskRecord, context: TaskExecutionContext): Promise<void>;
+  onFinalize?(
+    tx: Transaction<Database>,
+    task: TaskRecord,
+    userId: string,
+    status: TaskStatus,
+  ): Promise<{ deploymentTaskId?: string; deploymentSkippedReason?: string } | undefined>;
   afterCompletion?(task: TaskRecord, signal: AbortSignal): Promise<void>;
 }
 

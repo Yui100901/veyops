@@ -875,6 +875,89 @@ export const batchOperationsMigration: Migration = {
   },
 };
 
+export const artifactDeploymentMigration: Migration = {
+  async up(db) {
+    await db.schema.alterTable('artifacts').addColumn('compose_yaml', 'text').execute();
+    await db.schema.alterTable('artifacts').addColumn('compose_checksum', 'text').execute();
+  },
+  async down(db) {
+    // V1.0 treats unknown pipeline modes as legacy deploy runs.
+    const splitTask = sql<boolean>`(payload_json like '%"mode":"DEPLOY_ARTIFACT"%' or payload_json like '%"deployAfterBuild":true%')`;
+    const active = await db
+      .selectFrom('tasks')
+      .select('id')
+      .where('task_type', '=', 'PIPELINE')
+      .where(splitTask)
+      .where('status', 'in', ['RUNNING', 'CANCEL_REQUESTED'])
+      .executeTakeFirst();
+    if (active) throw new Error('仍有执行中的拆分交付任务，请完成或核查后再降级');
+    const now = Date.now();
+    const cancelled = await db
+      .updateTable('tasks')
+      .set({ status: 'CANCELLED', updated_at: now, finished_at: now, error_summary: '拆分交付任务已随数据库降级取消' })
+      .where('task_type', '=', 'PIPELINE')
+      .where(splitTask)
+      .where('status', '=', 'PENDING')
+      .returning('id')
+      .execute();
+    for (const task of cancelled) {
+      await db.updateTable('task_targets').set({ status: 'CANCELLED', finished_at: now })
+        .where('task_id', '=', task.id).where('status', '=', 'PENDING').execute();
+    }
+    await db.schema.alterTable('artifacts').dropColumn('compose_checksum').execute();
+    await db.schema.alterTable('artifacts').dropColumn('compose_yaml').execute();
+  },
+};
+
+export const artifactRetentionMigration: Migration = {
+  async up(db) {
+    await db.schema.alterTable('artifacts').addColumn('pinned_at', 'bigint').execute();
+    await db.schema.alterTable('artifacts').addColumn('pruned_at', 'bigint').execute();
+    await db.schema.alterTable('artifacts').addColumn('archive_deleted_at', 'bigint').execute();
+  },
+  async down(db) {
+    await db.schema.alterTable('artifacts').dropColumn('archive_deleted_at').execute();
+    await db.schema.alterTable('artifacts').dropColumn('pruned_at').execute();
+    await db.schema.alterTable('artifacts').dropColumn('pinned_at').execute();
+  },
+};
+
+export const releaseProtectionMigration: Migration = {
+  async up(db) {
+    await db.schema.alterTable('service_environment_configs')
+      .addColumn('release_policy_json', 'text', (column) => column.notNull().defaultTo('{}'))
+      .execute();
+    await db.schema.alterTable('deployment_records').addColumn('release_snapshot_json', 'text').execute();
+    await db.schema.alterTable('deployment_records').addColumn('rollback_of_deployment_id', 'text').execute();
+    await db.schema.alterTable('deployment_records').addColumn('activated_at', 'bigint').execute();
+    await db.schema.alterTable('tasks').addColumn('release_approved_by', 'text').execute();
+  },
+  async down(db) {
+    // A downgraded Worker must never run tasks that were waiting for approval.
+    await db.updateTable('tasks').set({
+      status: 'CANCELLED',
+      finished_at: Date.now(),
+      error_summary: '发布审批已随数据库降级取消',
+    }).where('status', '=', 'PENDING').where('available_at', '=', Number.MAX_SAFE_INTEGER).execute();
+    await db.schema.alterTable('tasks').dropColumn('release_approved_by').execute();
+    await db.schema.alterTable('deployment_records').dropColumn('activated_at').execute();
+    await db.schema.alterTable('deployment_records').dropColumn('rollback_of_deployment_id').execute();
+    await db.schema.alterTable('deployment_records').dropColumn('release_snapshot_json').execute();
+    await db.schema.alterTable('service_environment_configs').dropColumn('release_policy_json').execute();
+  },
+};
+
+export const pushedImageArchivesMigration: Migration = {
+  async up(db) {
+    await db.schema.alterTable('artifacts').addColumn('archive_image_id', 'text').execute();
+    await db.schema.alterTable('artifacts').addColumn('archive_image_platform', 'text').execute();
+  },
+  async down(db) {
+    await db.schema.alterTable('artifacts').dropColumn('archive_image_platform').execute();
+    await db.schema.alterTable('artifacts').dropColumn('archive_image_id').execute();
+  },
+};
+
 export const migrationProvider: MigrationProvider = {
   async getMigrations() {
     return {
@@ -883,6 +966,10 @@ export const migrationProvider: MigrationProvider = {
       '003_pipeline_webhooks': pipelineWebhookMigration,
       '004_artifact_archives': artifactArchiveMigration,
       '005_batch_operations': batchOperationsMigration,
+      '006_artifact_deployment': artifactDeploymentMigration,
+      '007_release_protection': releaseProtectionMigration,
+      '008_artifact_retention': artifactRetentionMigration,
+      '009_pushed_image_archives': pushedImageArchivesMigration,
     };
   },
 };

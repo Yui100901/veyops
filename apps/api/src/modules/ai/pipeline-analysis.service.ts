@@ -50,7 +50,7 @@ export class PipelineAnalysisService {
     const analysis = await this.analyzer.analyze(
       {
         status: row.status,
-        mode: snapshot.mode ?? 'DEPLOY',
+        mode: snapshot.mode === 'BUILD_ONLY' ? 'BUILD_ONLY' : 'DEPLOY',
         targetCounts: { total: targetStatuses.length, succeeded, failed },
         steps,
       },

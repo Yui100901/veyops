@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import {
   ArrowDown,
@@ -32,6 +32,7 @@ import {
 } from '../components';
 import type {
   Credential,
+  DeploymentRecord,
   Project,
   ProjectDetail,
   Server,
@@ -40,6 +41,8 @@ import type {
   User,
 } from '../models';
 import { RepositoryBrowser } from './RepositoryBrowser';
+import { ReleaseApprovals, RollbackRelease } from './ReleaseOperations';
+import { ArtifactCleanup, ArtifactRetentionPolicy } from './ArtifactRetention';
 
 export interface DeploymentTarget {
   id: string;
@@ -61,6 +64,7 @@ export interface PipelineDefinition {
   outputPath: string;
   deployPath: string;
   startCommand: string;
+  stopCommand?: string;
   healthCheckCommand: string;
   dockerfilePath: string;
   composeFilePath: string;
@@ -759,6 +763,16 @@ function PipelineEditor({
             onChange={(e) => field('startCommand', e.target.value)}
           />
         </Field>
+        {definition.artifactType === 'FILE' && (
+          <Field label="停止命令（可选）" hint="替换该版本时执行。命令应只停止本服务。">
+            <textarea
+              className="mono"
+              rows={2}
+              value={definition.stopCommand ?? ''}
+              onChange={(event) => field('stopCommand', event.target.value)}
+            />
+          </Field>
+        )}
         <Field
           label="健康检查命令（可选）"
           hint="退出码 0 表示健康，例如 curl --fail http://127.0.0.1:8080/health。"
@@ -899,6 +913,8 @@ type PipelinePreview = {
   serverIds: string[];
   configurationHash: string;
   aiApprovalHash?: string;
+  allowPartialDeploy?: boolean;
+  requireApproval?: boolean;
 };
 
 function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () => void }) {
@@ -915,8 +931,9 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
   const [browsing, setBrowsing] = useState(false);
   const [commitOrigin, setCommitOrigin] = useState<{ branch: string; subject: string }>();
   const [mode, setMode] = useState<ExecutionMode>('BUILD_ONLY');
+  const [allowPartialDeploy, setAllowPartialDeploy] = useState(false);
   const [preview, setPreview] = useState<PipelinePreview>();
-  const [approvalNotice, setApprovalNotice] = useState('');
+  const [copyNotice, setCopyNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const versionDefinition = versions.data?.find((entry) => entry.version === version)?.definition;
@@ -937,9 +954,10 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
           commitSha,
           version,
           mode,
+          allowPartialDeploy: mode === 'DEPLOY' && allowPartialDeploy,
           confirmed: true,
         });
-        setApprovalNotice('');
+        setCopyNotice('');
         setPreview(result);
         return;
       }
@@ -949,6 +967,8 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
         commitSha: preview.commitSha,
         version: preview.version,
         mode: preview.mode,
+        allowPartialDeploy:
+          preview.allowPartialDeploy ?? (preview.mode === 'DEPLOY' && allowPartialDeploy),
         expectedConfigurationHash: preview.configurationHash,
         expectedServerIds: preview.serverIds,
         confirmed: true,
@@ -970,7 +990,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
   return (
     <Modal
       title={`运行 · ${pipeline.name}`}
-      description="固定 Git Commit、Pipeline 版本和执行目标，再提交至统一任务队列。"
+      description="选择 Git Commit、Pipeline 版本和执行目标。构建产物归档并校验后可进入部署阶段。"
       onClose={() => {
         if (!busy) onClose();
       }}
@@ -987,7 +1007,9 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
           preview
             ? buildOnly
               ? '确认仅构建'
-              : '确认构建并部署'
+              : preview.requireApproval
+                ? '确认构建并提交发布审批'
+                : '确认构建并部署'
             : buildOnly
               ? '预览构建'
               : '预览部署'
@@ -1005,9 +1027,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
               </select>
             </Field>
             {buildOnly && (
-              <p className="field-note">
-                完成后保留构建产物。镜像保留在构建端，无需推送 Registry 或启动应用容器。
-              </p>
+              <p className="field-note">构建完成后可下载归档，或从已归档的产物发起独立部署。</p>
             )}
             <Field label="环境" required>
               <select
@@ -1037,6 +1057,16 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 ))}
               </select>
             </Field>
+            {!buildOnly && (
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={allowPartialDeploy}
+                  onChange={(e) => setAllowPartialDeploy(e.target.checked)}
+                />
+                允许只部署构建和归档成功的目标
+              </label>
+            )}
             <Field label="Pipeline 版本">
               <select
                 required
@@ -1153,6 +1183,12 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
               )}
               {!buildOnly && (
                 <>
+                  <span>发布范围</span>
+                  <span>
+                    {(preview.allowPartialDeploy ?? allowPartialDeploy)
+                      ? '部署构建和归档成功的目标'
+                      : '全部目标的产物就绪后部署'}
+                  </span>
                   <span>部署目录</span>
                   <code>{definition.deployPath}</code>
                 </>
@@ -1177,23 +1213,27 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                   onClick={async () => {
                     try {
                       await navigator.clipboard.writeText(preview.aiApprovalHash!);
-                      setApprovalNotice('已复制执行指纹。');
+                      setCopyNotice('已复制执行指纹。');
                     } catch {
-                      setApprovalNotice('无法复制，请手动选择指纹。');
+                      setCopyNotice('无法复制，请手动选择指纹。');
                     }
                   }}
                 >
                   复制指纹
                 </button>
-                {!!approvalNotice && (
+                {!!copyNotice && (
                   <p className="field-note" role="status">
-                    {approvalNotice}
+                    {copyNotice}
                   </p>
                 )}
               </details>
             )}
             <p className="muted">
-              {buildOnly ? '构建完成后可在构建产物中查看结果。' : '请核对部署目录和启动命令。'}
+              {buildOnly
+                ? '构建完成后可在构建产物中查看结果。'
+                : preview.requireApproval
+                  ? '产物通过校验后会创建部署任务，等待管理员批准。'
+                  : '归档和校验通过后会创建独立部署任务，可从构建任务跳转查看。'}
             </p>
           </>
         )}
@@ -1235,6 +1275,7 @@ function PipelineVersions({ pipeline, onClose }: { pipeline: Pipeline; onClose: 
 
 type Artifact = {
   id: string;
+  projectId?: string;
   artifactType: string;
   storageType: string;
   storageKey: string;
@@ -1248,21 +1289,38 @@ type Artifact = {
   createdAt: number;
   serviceId: string;
   pipelineRunId?: string;
+  pipelineId?: string;
+  pipelineVersion?: number;
+  serverId?: string | null;
+  environmentId?: string;
+  targetId?: string;
+  deployable?: boolean;
+  pinnedAt?: number | null;
+  prunedAt?: number | null;
 };
-type Deployment = {
-  id: string;
-  status: string;
-  serviceId: string;
+type DeployableArtifact = Artifact & {
+  projectId: string;
+  pipelineRunId: string;
+  pipelineId: string;
+  pipelineVersion: number;
   environmentId: string;
-  serverId: string;
-  deployPath?: string;
-  releaseVersion?: string;
-  healthStatus?: string;
-  previousDeploymentId?: string | null;
-  startedAt?: number;
-  finishedAt?: number;
-  taskId?: string;
 };
+type ArtifactDeployPreview = Omit<PipelinePreview, 'mode'> & {
+  mode: 'DEPLOY_ARTIFACT';
+  artifactIds: string[];
+};
+
+function isDeployableArtifact(artifact: Artifact): artifact is DeployableArtifact {
+  return Boolean(
+    artifact.deployable &&
+    artifact.projectId &&
+    artifact.pipelineRunId &&
+    artifact.pipelineId &&
+    artifact.pipelineVersion &&
+    artifact.environmentId,
+  );
+}
+
 const storageLabels: Record<string, string> = {
   LOCAL_FILE: '平台文件',
   REMOTE_FILE: '服务器文件',
@@ -1270,12 +1328,27 @@ const storageLabels: Record<string, string> = {
   REMOTE_IMAGE: '目标端镜像',
   REGISTRY_IMAGE: 'Registry 镜像',
 };
+const healthStatusLabels: Record<string, string> = {
+  HEALTHY: '通过',
+  FAILED: '失败',
+  NOT_CHECKED: '未检查',
+  UNKNOWN: '待核查',
+};
 
-export function RunArtifacts({ runId, polling }: { runId: string; polling: boolean }) {
+export function RunArtifacts({
+  runId,
+  polling,
+  canDeploy,
+}: {
+  runId: string;
+  polling: boolean;
+  canDeploy: boolean;
+}) {
   const artifacts = useResource<Artifact[]>(
     `/artifacts?pipelineRunId=${encodeURIComponent(runId)}`,
     polling ? 2000 : 0,
   );
+  const [selection, setSelection] = useState<DeployableArtifact>();
   return (
     <Section title="本次构建产物" action={<RefreshButton onClick={artifacts.reload} />}>
       <ErrorBanner error={artifacts.error} />
@@ -1304,7 +1377,10 @@ export function RunArtifacts({ runId, polling }: { runId: string; polling: boole
                     {artifact.checksum || artifact.imageDigest || artifact.imageId || '—'}
                   </td>
                   <td>
-                    <ArtifactDownload artifact={artifact} />
+                    <ArtifactActions
+                      artifact={artifact}
+                      onDeploy={canDeploy && !polling ? setSelection : undefined}
+                    />
                   </td>
                 </tr>
               ))}
@@ -1314,11 +1390,15 @@ export function RunArtifacts({ runId, polling }: { runId: string; polling: boole
       ) : (
         <p className="field-note">{polling ? '等待构建生成产物' : '本次运行暂无产物'}</p>
       )}
+      {selection && (
+        <DeployArtifacts artifact={selection} onClose={() => setSelection(undefined)} />
+      )}
     </Section>
   );
 }
 
 function ArtifactDownload({ artifact }: { artifact: Artifact }) {
+  if (artifact.prunedAt != null) return <span className="muted">归档已清理</span>;
   if (artifact.downloadAvailable)
     return (
       <a
@@ -1334,8 +1414,262 @@ function ArtifactDownload({ artifact }: { artifact: Artifact }) {
   return <span className="muted">—</span>;
 }
 
-export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments' }) {
-  const records = useResource<(Artifact & Deployment)[]>(`/${type}`);
+function ArtifactActions({
+  artifact,
+  onDeploy,
+}: {
+  artifact: Artifact;
+  onDeploy?: (artifact: DeployableArtifact) => void;
+}) {
+  return (
+    <div className="row-actions">
+      <ArtifactDownload artifact={artifact} />
+      {onDeploy && isDeployableArtifact(artifact) && (
+        <button className="button secondary small" type="button" onClick={() => onDeploy(artifact)}>
+          {artifact.serverId ? '部署同次构建产物' : '部署产物'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function DeployArtifacts({
+  artifact,
+  onClose,
+}: {
+  artifact: DeployableArtifact;
+  onClose: () => void;
+}) {
+  const project = useResource<ProjectDetail>(`/projects/${artifact.projectId}`);
+  const targets = useResource<DeploymentTarget[]>('/deployment-targets');
+  const servers = useResource<Server[]>('/servers');
+  const versions = useResource<{ version: number; definition: PipelineDefinition }[]>(
+    `/pipelines/${artifact.pipelineId}/versions`,
+  );
+  const batch = useResource<Artifact[]>(
+    `/artifacts?pipelineRunId=${encodeURIComponent(artifact.pipelineRunId)}`,
+  );
+  const [targetId, setTargetId] = useState(artifact.targetId ?? '');
+  const [version, setVersion] = useState(artifact.pipelineVersion);
+  const [preview, setPreview] = useState<ArtifactDeployPreview>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const selectedTarget = targets.data?.find((target) => target.id === targetId);
+  const environment = project.data?.environments.find(
+    (entry) => entry.id === artifact.environmentId,
+  );
+  const serverNames = new Map(servers.data?.map((server) => [server.id, server.name]));
+  const deployableArtifacts = batch.data?.filter(isDeployableArtifact) ?? [];
+  const matchingArtifacts = artifact.serverId
+    ? deployableArtifacts.filter(
+        (entry) => entry.serverId && selectedTarget?.serverIds.includes(entry.serverId),
+      )
+    : deployableArtifacts.filter((entry) => entry.id === artifact.id);
+  const coveredServers = new Set(matchingArtifacts.map((entry) => entry.serverId));
+  const missingServers = artifact.serverId
+    ? (selectedTarget?.serverIds.filter((id) => !coveredServers.has(id)) ?? [])
+    : [];
+  const resourceError = project.error || targets.error || versions.error || batch.error;
+
+  async function deploy(event: FormEvent) {
+    event.preventDefault();
+    if (busy) return;
+    if (
+      !preview &&
+      (!environment ||
+        !selectedTarget?.serverIds.length ||
+        !versions.data?.some((entry) => entry.version === version) ||
+        !matchingArtifacts.length ||
+        missingServers.length)
+    ) {
+      setError('请确认环境、部署配置版本和目标，并选择产物齐全的目标组。');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    const path = `/pipelines/${artifact.pipelineId}/artifact-deploy`;
+    try {
+      if (!preview) {
+        const result = await post<ArtifactDeployPreview>(`${path}/preview`, {
+          artifactIds: matchingArtifacts.map((entry) => entry.id),
+          environmentId: artifact.environmentId,
+          targetId,
+          version,
+        });
+        setPreview(result);
+        return;
+      }
+      const task = await post<Task>(path, {
+        artifactIds: preview.artifactIds,
+        environmentId: preview.environmentId,
+        targetId: preview.targetId,
+        version: preview.version,
+        expectedServerIds: preview.serverIds,
+        expectedConfigurationHash: preview.configurationHash,
+        confirmed: true,
+      });
+      onClose();
+      navigate(`/tasks/${task.id}`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) setPreview(undefined);
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title="部署已归档产物"
+      description="核对发布目标和部署配置，使用同一次构建中已校验的归档。"
+      onClose={() => {
+        if (!busy) onClose();
+      }}
+    >
+      <Form
+        submit={preview ? (preview.requireApproval ? '提交发布审批' : '确认部署') : '预览部署'}
+        onSubmit={deploy}
+        onCancel={() => {
+          if (preview) {
+            setPreview(undefined);
+            setError('');
+          } else onClose();
+        }}
+        busy={busy}
+        error={error}
+      >
+        <ErrorBanner error={resourceError} />
+        {preview ? (
+          <>
+            <div className="confirmation-summary">
+              <ShieldCheck size={24} />
+              <div>
+                <strong>
+                  将使用 {preview.artifactIds.length} 份归档部署到 {preview.serverIds.length}{' '}
+                  台服务器
+                </strong>
+                <p>
+                  {environment?.name} · {selectedTarget?.name} · Pipeline v{preview.version}
+                </p>
+              </div>
+            </div>
+            <div className="deployment-review">
+              <span>固定 Commit</span>
+              <code>{preview.commitSha}</code>
+              <span>产物类型</span>
+              <strong>{preview.definition.artifactType === 'FILE' ? '文件' : 'Docker 镜像'}</strong>
+              <span>目标服务器</span>
+              <span>{preview.serverIds.map((id) => serverNames.get(id) ?? id).join('、')}</span>
+              <span>部署目录</span>
+              <code>{preview.definition.deployPath}</code>
+            </div>
+            <details className="advanced-options">
+              <summary>产物校验值</summary>
+              <div className="deployment-review">
+                {preview.artifactIds.map((id) => {
+                  const entry = matchingArtifacts.find((artifact) => artifact.id === id);
+                  return (
+                    <Fragment key={id}>
+                      <span>
+                        {entry?.serverId
+                          ? (serverNames.get(entry.serverId) ?? entry.serverId)
+                          : '归档'}
+                      </span>
+                      <code>{entry?.checksum || entry?.imageDigest || id}</code>
+                    </Fragment>
+                  );
+                })}
+              </div>
+            </details>
+            {preview.definition.startCommand && (
+              <>
+                <h3 className="field-title">启动命令</h3>
+                <pre className="code-preview">{preview.definition.startCommand}</pre>
+              </>
+            )}
+            {preview.requireApproval && <p className="field-note">管理员批准后开始部署。</p>}
+          </>
+        ) : (
+          <fieldset disabled={busy}>
+            <Field label="构建提交">
+              <output className="mono">{artifact.sourceCommit || '—'}</output>
+            </Field>
+            <Field label="环境" hint="沿用构建时的服务环境。">
+              <output>{environment?.name || (project.loading ? '加载中…' : '原环境不可用')}</output>
+            </Field>
+            <Field label="部署目标" required>
+              <select
+                required
+                value={targetId}
+                onChange={(event) => setTargetId(event.target.value)}
+              >
+                <option value="">选择目标组</option>
+                {targets.data?.map((target) => (
+                  <option value={target.id} key={target.id}>
+                    {target.name} · {target.serverIds.length} 台
+                  </option>
+                ))}
+              </select>
+            </Field>
+            {missingServers.length > 0 && !batch.loading && (
+              <p className="field-note">
+                本次构建缺少以下目标的归档：
+                {missingServers.map((id) => serverNames.get(id) ?? id).join('、')}
+              </p>
+            )}
+            <Field label="部署配置版本" required>
+              <select
+                required
+                value={version}
+                onChange={(event) => setVersion(Number(event.target.value))}
+              >
+                {versions.data?.map((entry) => (
+                  <option key={entry.version} value={entry.version}>
+                    v{entry.version}
+                    {entry.version === artifact.pipelineVersion ? ' · 构建时版本' : ''}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          </fieldset>
+        )}
+      </Form>
+    </Modal>
+  );
+}
+
+export function DeliveryRecordsPage({
+  type,
+  user,
+}: {
+  type: 'artifacts' | 'deployments';
+  user: User;
+}) {
+  const records = useResource<(Artifact & DeploymentRecord)[]>(`/${type}`);
+  const servers = useResource<Server[]>(type === 'deployments' ? '/servers' : null);
+  const [selection, setSelection] = useState<DeployableArtifact>();
+  const [rollback, setRollback] = useState<DeploymentRecord>();
+  const [retention, setRetention] = useState<'policy' | 'cleanup'>();
+  const [pinning, setPinning] = useState<string>();
+  const [pinError, setPinError] = useState('');
+  const canWrite = user.role !== 'VIEWER';
+
+  async function togglePin(artifact: Artifact) {
+    setPinning(artifact.id);
+    setPinError('');
+    try {
+      await api(`/artifact-retention/artifacts/${artifact.id}/pin`, {
+        method: 'PUT',
+        body: JSON.stringify({ pinned: artifact.pinnedAt == null }),
+      });
+      await records.reload();
+    } catch (cause) {
+      setPinError(message(cause));
+    } finally {
+      setPinning(undefined);
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -1346,7 +1680,21 @@ export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments
             ? '记录构建来源、存储位置和校验信息，追踪每一份交付物。'
             : '每台服务器独立记录部署与健康检查结果。'
         }
-        action={<RefreshButton onClick={records.reload} />}
+        action={
+          <div className="row-actions">
+            {type === 'artifacts' && user.role === 'ADMIN' && (
+              <>
+                <button className="button secondary" onClick={() => setRetention('policy')}>
+                  保留策略
+                </button>
+                <button className="button secondary" onClick={() => setRetention('cleanup')}>
+                  清理预览
+                </button>
+              </>
+            )}
+            <RefreshButton onClick={records.reload} />
+          </div>
+        }
       />
       <div className="record-tabs">
         <a className={type === 'artifacts' ? 'active' : ''} href="#/artifacts">
@@ -1359,6 +1707,8 @@ export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments
         </a>
       </div>
       <ErrorBanner error={records.error} retry={records.reload} />
+      {type === 'artifacts' && <ErrorBanner error={pinError} />}
+      {type === 'deployments' && user.role === 'ADMIN' && <ReleaseApprovals />}
       <Section
         title={type === 'artifacts' ? '产物历史' : '部署历史'}
         subtitle="由 Pipeline 执行引擎生成"
@@ -1398,6 +1748,7 @@ export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments
                       <th>结果</th>
                       <th>健康检查</th>
                       <th>结束时间</th>
+                      {canWrite && <th>操作</th>}
                     </>
                   )}
                 </tr>
@@ -1424,6 +1775,7 @@ export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments
                               {(r.sizeBytes / 1024).toFixed(1)} KiB
                             </small>
                           )}
+                          {r.pinnedAt != null && <small className="cell-detail">已固定</small>}
                         </td>
                         <td className="mono" title={r.sourceCommit}>
                           {r.sourceCommit?.slice(0, 12) || '—'}
@@ -1436,30 +1788,84 @@ export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments
                         </td>
                         <td className="nowrap muted">{formatTime(r.createdAt)}</td>
                         <td>
-                          <ArtifactDownload artifact={r} />
+                          <ArtifactActions
+                            artifact={r}
+                            onDeploy={user.role === 'VIEWER' ? undefined : setSelection}
+                          />
+                          {user.role === 'ADMIN' &&
+                            r.prunedAt == null &&
+                            (r.downloadAvailable || r.deployable || r.pinnedAt != null) && (
+                              <button
+                                className="button secondary small"
+                                type="button"
+                                disabled={pinning != null}
+                                onClick={() => void togglePin(r)}
+                              >
+                                {pinning === r.id
+                                  ? '正在更新…'
+                                  : r.pinnedAt != null
+                                    ? '取消固定'
+                                    : '固定产物'}
+                              </button>
+                            )}
                         </td>
                       </>
                     ) : (
                       <>
                         <td className="mono">
-                          {r.releaseVersion || r.id.slice(0, 8)}
+                          {r.taskId ? (
+                            <a href={`#/tasks/${r.taskId}`} className="text-link">
+                              {r.releaseVersion || r.id.slice(0, 8)}
+                            </a>
+                          ) : (
+                            r.releaseVersion || r.id.slice(0, 8)
+                          )}
                           {r.previousDeploymentId && (
                             <small className="cell-detail" title={r.previousDeploymentId}>
                               上一成功部署 {r.previousDeploymentId.slice(0, 8)}
                             </small>
                           )}
+                          {r.isCurrent && <small className="cell-detail">当前发布</small>}
+                          {r.rollbackOfDeploymentId && (
+                            <small className="cell-detail" title={r.rollbackOfDeploymentId}>
+                              回滚基线 {r.rollbackOfDeploymentId.slice(0, 8)}
+                            </small>
+                          )}
                         </td>
-                        <td className="mono truncate" title={r.serverId}>
-                          {r.serverId || '—'}
+                        <td className="truncate" title={r.serverId}>
+                          {servers.data?.find((server) => server.id === r.serverId)?.name ||
+                            r.serverId ||
+                            '—'}
                         </td>
                         <td className="mono truncate" title={r.deployPath}>
                           {r.deployPath || '—'}
                         </td>
                         <td>
                           <Status value={r.status} />
+                          {r.rollbackStatus && (
+                            <small className="cell-detail">
+                              回滚 <Status value={r.rollbackStatus} />
+                            </small>
+                          )}
                         </td>
-                        <td>{r.healthStatus || '未配置'}</td>
+                        <td>{healthStatusLabels[r.healthStatus] || r.healthStatus || '未配置'}</td>
                         <td className="nowrap muted">{formatTime(r.finishedAt)}</td>
+                        {canWrite && (
+                          <td>
+                            {r.isCurrent ? null : r.rollbackAvailable ? (
+                              <button
+                                className="button secondary small"
+                                onClick={() => setRollback(r)}
+                              >
+                                回滚到此版本
+                              </button>
+                            ) : r.status === 'SUCCESS' ? (
+                              <span className="muted">
+                                {r.rollbackUnavailableReason || '缺少可用的回滚快照'}
+                              </span>
+                            ) : null}
+                          </td>
+                        )}
                       </>
                     )}
                   </tr>
@@ -1469,6 +1875,18 @@ export function DeliveryRecordsPage({ type }: { type: 'artifacts' | 'deployments
           </div>
         )}
       </Section>
+      {type === 'artifacts' && selection && (
+        <DeployArtifacts artifact={selection} onClose={() => setSelection(undefined)} />
+      )}
+      {type === 'deployments' && rollback && (
+        <RollbackRelease record={rollback} onClose={() => setRollback(undefined)} />
+      )}
+      {type === 'artifacts' && retention === 'policy' && (
+        <ArtifactRetentionPolicy onClose={() => setRetention(undefined)} />
+      )}
+      {type === 'artifacts' && retention === 'cleanup' && (
+        <ArtifactCleanup onClose={() => setRetention(undefined)} onPruned={records.reload} />
+      )}
     </>
   );
 }

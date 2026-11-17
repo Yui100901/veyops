@@ -11,30 +11,95 @@ import {
   Res,
   StreamableFile,
 } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open, realpath } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import type { Response } from 'express';
 import { dataDirectory } from '../../core/config';
 import { DatabaseService } from '../../core/database/database.service';
-import type { ArtifactsTable } from '../../core/database/schema';
-import type { Selectable } from 'kysely';
+import type { ArtifactsTable, Database } from '../../core/database/schema';
+import type { Kysely, Selectable } from 'kysely';
 import type { PipelineSnapshot, PipelineArtifact } from '../pipelines/pipeline.types';
-
-const isLocalImage = (storageType: string) =>
-  storageType === 'LOCAL_IMAGE' || storageType === 'REMOTE_IMAGE';
+import { archiveKey, isLocalImage } from './artifact-availability';
 
 const uuid = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
-const archiveName = new RegExp(`^${uuid}(?:-${uuid})?\\.(?:tar|tar\\.gz)$`, 'i');
+const sha256 = /^[a-f0-9]{64}$/;
+const digest = /^sha256:[a-f0-9]{64}$/;
+const registryReference = /^[a-zA-Z0-9._:/-]+@sha256:[a-f0-9]{64}$/;
+const registryTag = /^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$/;
+const imagePlatform = /^[a-z0-9]+\/[a-z0-9]+$/;
+const localImageReference = new RegExp(
+  `^veyops-build/${uuid}(?:/${uuid})?:[a-f0-9]{40,64}-${uuid}$`,
+);
+export const maxComposeBytes = 256 * 1024;
 
-function downloadKey(row: Selectable<ArtifactsTable>) {
-  if (row.archive_key && isLocalImage(row.storage_type) && archiveName.test(row.archive_key))
-    return row.archive_key;
-  if (row.storage_type !== 'LOCAL_FILE') return null;
-  // Legacy records saved the absolute local path. Only use the generated filename in this instance's data directory.
-  const key = row.storage_key.split(/[\\/]/).at(-1) ?? '';
-  return archiveName.test(key) && key.endsWith('.tar.gz') ? key : null;
+export interface DeploymentArtifact {
+  id: string;
+  localArchive?: string;
+  checksum?: string;
+  imageReference?: string;
+  imageId?: string;
+  composeYaml?: string;
+  offlineImage?: {
+    reference: string;
+    imageId: string;
+    platform: string;
+    readArchive: () => Promise<{ localArchive: string; checksum: string }>;
+  };
+}
+
+function hasDeployableMetadata(row: Selectable<ArtifactsTable>) {
+  if (row.pruned_at !== null && row.storage_type !== 'REGISTRY_IMAGE') return false;
+  const hasArchive = Boolean(
+    archiveKey(row) &&
+    row.checksum &&
+    sha256.test(row.checksum) &&
+    row.size_bytes !== null &&
+    Number.isSafeInteger(row.size_bytes) &&
+    row.size_bytes > 0,
+  );
+  if (row.artifact_type === 'FILE') return hasArchive && row.storage_type === 'LOCAL_FILE';
+  if (
+    row.artifact_type !== 'DOCKER_IMAGE' ||
+    !row.compose_yaml ||
+    Buffer.byteLength(row.compose_yaml) > maxComposeBytes ||
+    !row.compose_checksum ||
+    !sha256.test(row.compose_checksum) ||
+    !row.image_digest ||
+    !digest.test(row.image_digest)
+  )
+    return false;
+  if (row.storage_type === 'REGISTRY_IMAGE')
+    return (
+      registryReference.test(row.storage_key) && row.storage_key.endsWith(`@${row.image_digest}`)
+    );
+  return hasArchive && isLocalImage(row.storage_type) && localImageReference.test(row.storage_key);
+}
+
+function checksumOf(text: string) {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+function deploymentFingerprint(row: Selectable<ArtifactsTable>) {
+  return checksumOf(
+    JSON.stringify([
+      row.id,
+      row.pipeline_run_id,
+      row.server_id,
+      row.source_commit,
+      row.artifact_type,
+      row.storage_type,
+      row.storage_key,
+      row.archive_key,
+      row.checksum,
+      row.size_bytes,
+      row.image_digest,
+      row.archive_image_id,
+      row.archive_image_platform,
+      row.compose_checksum,
+    ]),
+  );
 }
 
 @Injectable()
@@ -63,6 +128,8 @@ export class ArtifactsService {
         storage_type: storageType,
         storage_key: artifact.storageKey,
         archive_key: artifact.archiveKey ?? null,
+        archive_image_id: artifact.archiveImageId ?? null,
+        archive_image_platform: artifact.archiveImagePlatform ?? null,
         server_id: artifact.serverId ?? null,
         registry_id: storageType === 'REGISTRY_IMAGE' ? (d.registryId ?? null) : null,
         image_repository: localImage
@@ -72,6 +139,8 @@ export class ArtifactsService {
           ? artifact.imageReference!.slice(imageTagPosition + 1)
           : (artifact.imageTag ?? null),
         image_digest: artifact.imageId ?? artifact.imageDigest ?? null,
+        compose_yaml: artifact.composeYaml ?? null,
+        compose_checksum: artifact.composeYaml ? checksumOf(artifact.composeYaml) : null,
         checksum: artifact.checksum ?? null,
         size_bytes: artifact.sizeBytes ?? null,
         source_commit: snapshot.commitSha,
@@ -81,18 +150,42 @@ export class ArtifactsService {
     return { ...artifact, id };
   }
   async list(projectId?: string, pipelineRunId?: string) {
-    let q = this.database.db.selectFrom('artifacts').selectAll();
-    if (projectId) q = q.where('project_id', '=', projectId);
-    if (pipelineRunId) q = q.where('pipeline_run_id', '=', pipelineRunId);
-    return (await q.orderBy('created_at', 'desc').limit(200).execute()).map((r) => ({
+    let query = this.database.db
+      .selectFrom('artifacts')
+      .leftJoin('pipeline_runs', 'pipeline_runs.id', 'artifacts.pipeline_run_id')
+      .leftJoin('pipeline_versions', 'pipeline_versions.id', 'pipeline_runs.pipeline_version_id')
+      .leftJoin('tasks', 'tasks.id', 'pipeline_runs.task_id')
+      .selectAll('artifacts')
+      .select([
+        'pipeline_runs.pipeline_id as pipelineId',
+        'pipeline_versions.version as pipelineVersion',
+        'pipeline_runs.environment_id as environmentId',
+        'pipeline_runs.target_id as targetId',
+        'tasks.status as taskStatus',
+      ]);
+    if (projectId) query = query.where('artifacts.project_id', '=', projectId);
+    if (pipelineRunId) query = query.where('artifacts.pipeline_run_id', '=', pipelineRunId);
+    return (await query.orderBy('artifacts.created_at', 'desc').limit(200).execute()).map((r) => ({
       id: r.id,
       projectId: r.project_id,
       serviceId: r.service_id,
       pipelineRunId: r.pipeline_run_id,
+      pipelineId: r.pipelineId,
+      pipelineVersion: r.pipelineVersion,
+      environmentId: r.environmentId,
+      targetId: r.targetId,
+      deployable:
+        (r.taskStatus === 'SUCCESS' || r.taskStatus === 'PARTIAL_FAILED') &&
+        hasDeployableMetadata(r),
       artifactType: r.artifact_type,
       storageType: r.storage_type,
       storageKey: r.storage_key,
-      downloadAvailable: Boolean(downloadKey(r)),
+      downloadAvailable: r.pruned_at === null && Boolean(archiveKey(r)),
+      pinnedAt: r.pinned_at,
+      prunedAt: r.pruned_at,
+      archiveDeletedAt: r.archive_deleted_at,
+      archiveImageId: r.archive_image_id,
+      archiveImagePlatform: r.archive_image_platform,
       serverId: r.server_id,
       imageRepository: r.image_repository,
       imageTag: r.image_tag,
@@ -105,22 +198,129 @@ export class ArtifactsService {
     }));
   }
 
+  async deployableIn(db: Kysely<Database>, runId: string) {
+    const rows = await db
+      .selectFrom('artifacts')
+      .selectAll()
+      .where('pipeline_run_id', '=', runId)
+      .orderBy('id')
+      .execute();
+    return rows.filter(hasDeployableMetadata).map((row) => ({
+      id: row.id,
+      serverId: row.server_id,
+      fingerprint: deploymentFingerprint(row),
+    }));
+  }
+
+  async forDeployment(snapshot: PipelineSnapshot, serverId: string): Promise<DeploymentArtifact> {
+    const candidates = snapshot.deploymentArtifacts?.filter(
+      (artifact) => artifact.serverId === null || artifact.serverId === serverId,
+    );
+    if (!snapshot.sourceBuildTaskId || candidates?.length !== 1)
+      throw new ConflictException('目标必须对应唯一的已归档构建产物');
+    const candidate = candidates[0]!;
+    const row = await this.database.db
+      .selectFrom('artifacts')
+      .innerJoin('pipeline_runs', 'pipeline_runs.id', 'artifacts.pipeline_run_id')
+      .innerJoin('tasks', 'tasks.id', 'pipeline_runs.task_id')
+      .selectAll('artifacts')
+      .where('artifacts.id', '=', candidate.id)
+      .where('pipeline_runs.task_id', '=', snapshot.sourceBuildTaskId)
+      .where('tasks.status', 'in', ['SUCCESS', 'PARTIAL_FAILED'])
+      .where('pipeline_runs.pipeline_id', '=', snapshot.pipelineId)
+      .where('pipeline_runs.environment_id', '=', snapshot.environmentId)
+      .where('pipeline_runs.commit_sha', '=', snapshot.commitSha)
+      .where('artifacts.project_id', '=', snapshot.projectId)
+      .where('artifacts.service_id', '=', snapshot.serviceId)
+      .where('artifacts.artifact_type', '=', snapshot.definition.artifactType)
+      .where('artifacts.source_commit', '=', snapshot.commitSha)
+      .executeTakeFirst();
+    if (!row || row.server_id !== candidate.serverId || !hasDeployableMetadata(row))
+      throw new ConflictException('构建产物不可发布或与当前任务范围不一致');
+    if (candidate.fingerprint && candidate.fingerprint !== deploymentFingerprint(row))
+      throw new ConflictException('已确认的构建产物校验信息发生变化');
+    if (row.server_id) {
+      const successful = await this.database.db
+        .selectFrom('task_targets')
+        .select('id')
+        .where('task_id', '=', snapshot.sourceBuildTaskId)
+        .where('server_id', '=', row.server_id)
+        .where('status', '=', 'SUCCESS')
+        .executeTakeFirst();
+      if (!successful) throw new ConflictException('产物来源目标构建未成功');
+    }
+    if (row.compose_yaml && checksumOf(row.compose_yaml) !== row.compose_checksum)
+      throw new ConflictException('Compose 配置未通过完整性校验');
+    const key = row.pruned_at === null ? archiveKey(row) : null;
+    const registry = row.storage_type === 'REGISTRY_IMAGE';
+    const archive = key && !registry ? await this.verifiedArchive(key, row) : undefined;
+    const offlineImage =
+      registry &&
+      key &&
+      row.archive_image_id &&
+      digest.test(row.archive_image_id) &&
+      row.archive_image_platform &&
+      imagePlatform.test(row.archive_image_platform) &&
+      row.image_tag &&
+      registryTag.test(row.image_tag)
+        ? {
+            reference: `${row.storage_key.slice(0, row.storage_key.indexOf('@'))}:${row.image_tag}`,
+            imageId: row.archive_image_id,
+            platform: row.archive_image_platform,
+            readArchive: () => this.verifiedArchive(key, row),
+          }
+        : undefined;
+    return {
+      id: row.id,
+      ...archive,
+      offlineImage,
+      composeYaml: row.compose_yaml ?? undefined,
+      imageReference: row.artifact_type === 'DOCKER_IMAGE' ? row.storage_key : undefined,
+      imageId: isLocalImage(row.storage_type) ? (row.image_digest ?? undefined) : undefined,
+    };
+  }
+
+  private async verifiedArchive(key: string, row: Selectable<ArtifactsTable>) {
+    if (
+      !row.checksum ||
+      !sha256.test(row.checksum) ||
+      !row.size_bytes ||
+      !Number.isSafeInteger(row.size_bytes)
+    )
+      throw new ConflictException('缺少有效的归档校验信息');
+    const localArchive = await this.resolveArchive(key);
+    const file = await open(localArchive, constants.O_RDONLY | (constants.O_NOFOLLOW || 0)).catch(
+      () => null,
+    );
+    if (!file) throw new NotFoundException('产物归档不存在或无法读取');
+    try {
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.size !== row.size_bytes)
+        throw new ConflictException('产物归档大小与记录不一致');
+      const hash = createHash('sha256');
+      try {
+        for await (const chunk of file.createReadStream({ autoClose: false }))
+          hash.update(chunk as Buffer);
+      } catch {
+        throw new ConflictException('产物归档读取失败');
+      }
+      if (hash.digest('hex') !== row.checksum)
+        throw new ConflictException('产物归档未通过完整性校验');
+      return { localArchive, checksum: row.checksum };
+    } finally {
+      await file.close();
+    }
+  }
+
   async download(id: string) {
     const row = await this.database.db
       .selectFrom('artifacts')
       .selectAll()
       .where('id', '=', id)
       .executeTakeFirst();
-    const key = row && downloadKey(row);
+    const key = row && row.pruned_at === null && archiveKey(row);
     if (!key) throw new NotFoundException('该产物没有可下载的归档');
-    const dataRoot = await realpath(dataDirectory).catch(() => null);
-    const artifactRoot = dataRoot && join(dataRoot, 'artifacts');
-    if (!artifactRoot || (await realpath(artifactRoot).catch(() => null)) !== artifactRoot)
-      throw new NotFoundException('产物归档不存在');
-    const path = join(artifactRoot, key);
-    const resolved = await realpath(path).catch(() => null);
-    if (!resolved || dirname(resolved) !== artifactRoot || basename(resolved) !== key)
-      throw new NotFoundException('产物归档不存在');
+    const resolved = await this.resolveArchive(key);
     const file = await open(resolved, constants.O_RDONLY | (constants.O_NOFOLLOW || 0)).catch(
       () => null,
     );
@@ -147,6 +347,17 @@ export class ArtifactsService {
       await file.close();
       throw error;
     }
+  }
+
+  private async resolveArchive(key: string) {
+    const dataRoot = await realpath(dataDirectory).catch(() => null);
+    const artifactRoot = dataRoot && join(dataRoot, 'artifacts');
+    if (!artifactRoot || (await realpath(artifactRoot).catch(() => null)) !== artifactRoot)
+      throw new NotFoundException('产物归档不存在');
+    const resolved = await realpath(join(artifactRoot, key)).catch(() => null);
+    if (!resolved || dirname(resolved) !== artifactRoot || basename(resolved) !== key)
+      throw new NotFoundException('产物归档不存在');
+    return resolved;
   }
 }
 @Controller('artifacts')

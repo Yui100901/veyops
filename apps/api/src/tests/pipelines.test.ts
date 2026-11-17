@@ -559,6 +559,7 @@ test('Pipeline versions and commits are fixed atomically with task and run recor
       {} as RegistriesService,
       {} as PipelineAnalysisService,
       new SystemSettingsService(database, new AuditService(database)),
+      new ArtifactsService(database),
     );
     const created = await pipelines.create(
       { name: 'release', projectId: project, serviceId: service, definition: d, enabled: true },
@@ -826,6 +827,9 @@ for (const location of ['TARGET', 'MANAGER'] as const)
         } as unknown as ArtifactsService;
         const deploymentStates: string[] = [];
         const deployments = {
+          activeSnapshot: async () => undefined,
+          assertApproval: async () => undefined,
+          markActivated: async () => undefined,
           start: async () => {
             assert.equal(buildOnly, false);
             return randomUUID();
@@ -897,7 +901,7 @@ for (const location of ['TARGET', 'MANAGER'] as const)
         if (buildOnly) {
           assert.doesNotMatch(
             actualCommands,
-            /compose|START_SERVICE|CHECK_HEALTH|docker.+(?:push|login|run)\b/,
+            /START_SERVICE|CHECK_HEALTH|docker.+(?:compose|push|login|run)\b/,
           );
           assert.ok(
             calls.every((c) => !c.args?.some((arg) => ['push', 'login', 'compose'].includes(arg))),
@@ -1000,7 +1004,7 @@ test('known manager build errors finish targets without falsely claiming uncerta
     builds,
     {} as SshService,
     {} as ArtifactsService,
-    {} as DeploymentsService,
+    { assertApproval: async () => undefined } as unknown as DeploymentsService,
   ).execute(task, context);
   assert.deepEqual(states, ['TIMED_OUT', 'TIMED_OUT']);
 });

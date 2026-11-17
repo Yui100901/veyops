@@ -6,12 +6,14 @@ import { BuildsService } from '../builds/builds.service';
 import { ArtifactsController, ArtifactsService } from '../artifacts/artifacts.service';
 import { DeploymentsController, DeploymentsService } from '../deployments/deployments.service';
 import { RegistriesController, RegistriesService } from '../registries/registries.service';
+import { ReleaseRequestsController, ReleaseRequestsService } from '../deployments/release-requests.service';
 @Global()
 @Module({
   controllers: [
     PipelinesController,
     ArtifactsController,
     DeploymentsController,
+    ReleaseRequestsController,
     RegistriesController,
   ],
   providers: [
@@ -20,6 +22,7 @@ import { RegistriesController, RegistriesService } from '../registries/registrie
     BuildsService,
     ArtifactsService,
     DeploymentsService,
+    ReleaseRequestsService,
     RegistriesService,
   ],
   exports: [PipelinesService, ArtifactsService, DeploymentsService, RegistriesService],

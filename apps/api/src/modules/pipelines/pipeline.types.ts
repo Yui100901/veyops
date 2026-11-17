@@ -2,6 +2,20 @@ import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
 
 export type PipelineExecutionMode = 'BUILD_ONLY' | 'DEPLOY';
 
+export interface ReleasePolicy {
+  requireApproval: boolean;
+  archivePushedImage?: boolean;
+  rollbackMode: 'OFF' | 'PREVIOUS_HEALTHY' | 'PINNED';
+  pinnedDeploymentId?: string;
+  healthCheck: {
+    httpUrl?: string;
+    compose?: boolean;
+    attempts: number;
+    intervalSeconds: number;
+    timeoutSeconds: number;
+  };
+}
+
 export interface PipelineStep {
   name: string;
   type: 'SHELL';
@@ -19,6 +33,7 @@ export interface PipelineDefinition {
   outputPath: string;
   deployPath: string;
   startCommand: string;
+  stopCommand?: string;
   healthCheckCommand: string;
   dockerfilePath: string;
   composeFilePath: string;
@@ -27,7 +42,15 @@ export interface PipelineDefinition {
   steps: PipelineStep[];
 }
 export interface PipelineSnapshot {
-  mode?: PipelineExecutionMode;
+  releasePolicy?: ReleasePolicy;
+  rollbackOfDeploymentId?: string;
+  expectedCurrentDeploymentId?: string | null;
+  releaseKey?: string;
+  mode?: PipelineExecutionMode | 'DEPLOY_ARTIFACT';
+  deployAfterBuild?: boolean;
+  allowPartialDeploy?: boolean;
+  deploymentArtifacts?: { id: string; serverId: string | null; fingerprint?: string }[];
+  sourceBuildTaskId?: string;
   triggerType?: 'MANUAL' | 'WEBHOOK';
   runId: string;
   pipelineId: string;
@@ -47,7 +70,10 @@ export interface PipelineArtifact {
   id: string;
   storageKey: string;
   archiveKey?: string;
+  archiveImageId?: string;
+  archiveImagePlatform?: string;
   storageType?: 'LOCAL_FILE' | 'REMOTE_FILE' | 'LOCAL_IMAGE' | 'REMOTE_IMAGE' | 'REGISTRY_IMAGE';
+  composeYaml?: string;
   checksum?: string;
   sizeBytes?: number;
   imageDigest?: string;
@@ -59,7 +85,10 @@ export interface PipelineArtifact {
 export interface BuildOutput {
   localArchive?: string;
   archiveKey?: string;
+  archiveImageId?: string;
+  archiveImagePlatform?: string;
   localCompose?: string;
+  composeYaml?: string;
   imageReference?: string;
   imageDigest?: string;
   imageTag?: string;

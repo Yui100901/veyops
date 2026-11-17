@@ -88,6 +88,13 @@ function task(snapshot: PipelineSnapshot): TaskRecord {
 function fixture(
   remote: (command: string, options?: SshOptions) => Promise<number | void>,
   actualBuilds = false,
+  rollbackCandidate?: {
+    id: string;
+    artifactId: string;
+    snapshot: PipelineSnapshot;
+    releaseKey: string;
+  },
+  activeSnapshot?: PipelineSnapshot,
 ) {
   const commands: string[] = [];
   const logs: string[] = [];
@@ -95,6 +102,7 @@ function fixture(
   const targetResults: { exitCode: number | null; error?: string }[] = [];
   const artifacts: Omit<PipelineArtifact, 'id'>[] = [];
   const deployments: { status: string; health: DeploymentHealth }[] = [];
+  const releaseSnapshots: PipelineSnapshot[] = [];
   const steps: { key?: string; status?: TaskStatus; exitCode?: number | null; error?: string }[] =
     [];
   let deploymentsStarted = 0;
@@ -102,7 +110,10 @@ function fixture(
     resolveVariables: async () => ({ values: {}, secrets: [] }),
     remoteCheckout: async () => undefined,
     remoteBuild: async () => undefined,
-    remoteCapture: async () => `VEYOPS_ARTIFACT:${'c'.repeat(64)}:1`,
+    remoteCapture: async (_target: SshTarget, command: string) =>
+      command.startsWith('readlink --')
+        ? `releases/${activeSnapshot?.releaseKey ?? rollbackCandidate?.releaseKey}`
+        : `VEYOPS_ARTIFACT:${'c'.repeat(64)}:1`,
     remote: async (_: SshTarget, command: string) => {
       commands.push(command);
       await remote(command);
@@ -116,22 +127,33 @@ function fixture(
       return { exitCode: (await remote(command, options)) ?? 0 };
     },
     uploadContent: async () => undefined,
+    upload: async () => undefined,
   } as unknown as SshService;
   const artifactService = {
     create: async (_: PipelineSnapshot, artifact: Omit<PipelineArtifact, 'id'>) => {
       artifacts.push(artifact);
       return { ...artifact, id: randomUUID() };
     },
+    forDeployment: async (release: PipelineSnapshot) => ({
+      id: release.deploymentArtifacts?.[0]?.id,
+      localArchive: '/test-artifacts/fixture.tar.gz',
+      checksum: 'c'.repeat(64),
+    }),
   } as unknown as ArtifactsService;
   const deploymentService = {
-    start: async () => {
+    activeSnapshot: async () => activeSnapshot,
+    assertApproval: async () => undefined,
+    markActivated: async () => undefined,
+    start: async (release: PipelineSnapshot) => {
       deploymentsStarted++;
+      releaseSnapshots.push(release);
       return randomUUID();
     },
     finish: async (_id: string, status: string, _artifactId: string, health: DeploymentHealth) => {
       deployments.push({ status, health });
       return true;
     },
+    rollbackCandidate: async () => rollbackCandidate,
   } as unknown as DeploymentsService;
   const builds = actualBuilds
     ? new BuildsService(
@@ -172,6 +194,7 @@ function fixture(
     statuses,
     targetResults,
     deployments,
+    releaseSnapshots,
     steps,
     get deploymentsStarted() {
       return deploymentsStarted;
@@ -299,13 +322,105 @@ test('known health failure records the failed release and unlocks without automa
 });
 
 test('an interrupted health check records an unknown health result and keeps the lock', async () => {
+  const release = snapshot();
+  release.releasePolicy = {
+    requireApproval: false,
+    rollbackMode: 'PREVIOUS_HEALTHY',
+    healthCheck: { attempts: 3, intervalSeconds: 0, timeoutSeconds: 4 },
+  };
   const environment = fixture(async (command) => {
     if (command.includes('candidate-health-marker'))
       throw new SshExecutionError('timed out', 'TIMED_OUT');
   });
-  await environment.run(task(snapshot()));
+  await environment.run(task(release));
   assert.deepEqual(environment.deployments, [{ status: 'NEEDS_ATTENTION', health: 'UNKNOWN' }]);
   assert.equal(environment.commands.filter((command) => command.includes('rmdir --')).length, 1);
+  assert.equal(
+    environment.commands.filter((command) => command.includes('candidate-health-marker')).length,
+    1,
+  );
+  assert.ok(environment.steps.every((step) => step.key !== 'ROLLBACK'));
+});
+
+test('release health checks retry known HTTP failures and hold ownership until readiness', async () => {
+  const release = snapshot();
+  release.definition.healthCheckCommand = '';
+  release.releasePolicy = {
+    requireApproval: false,
+    rollbackMode: 'OFF',
+    healthCheck: {
+      httpUrl: 'http://127.0.0.1:8080/health',
+      attempts: 3,
+      intervalSeconds: 0,
+      timeoutSeconds: 4,
+    },
+  };
+  let checks = 0;
+  const environment = fixture(async (command) => {
+    if (command.includes('curl --disable')) {
+      assert.match(command, /--max-time 4.*'http:\/\/127\.0\.0\.1:8080\/health'/);
+      if (++checks === 1) throw new BuildCommandError(22, 'not ready');
+    }
+  });
+  await environment.run(task(release));
+  assert.equal(checks, 2);
+  assert.deepEqual(environment.deployments, [{ status: 'SUCCESS', health: 'HEALTHY' }]);
+  assert.ok(environment.logs.some((line) => line.includes('第 1/3 次未通过')));
+  const lastCheck = environment.commands
+    .map((command) => command.includes('curl --disable'))
+    .lastIndexOf(true);
+  const releaseLock = environment.commands
+    .map((command) => command.includes('rmdir --'))
+    .lastIndexOf(true);
+  assert.ok(releaseLock > lastCheck);
+});
+
+test('automatic rollback restores the archived release under the same lock', async () => {
+  const release = snapshot();
+  release.releasePolicy = {
+    requireApproval: false,
+    rollbackMode: 'PREVIOUS_HEALTHY',
+    healthCheck: { attempts: 1, intervalSeconds: 0, timeoutSeconds: 5 },
+  };
+  const artifactId = randomUUID();
+  const previous = {
+    id: randomUUID(),
+    artifactId,
+    releaseKey: randomUUID(),
+    snapshot: {
+      ...release,
+      mode: 'DEPLOY_ARTIFACT' as const,
+      commitSha: 'b'.repeat(40),
+      sourceBuildTaskId: randomUUID(),
+      deploymentArtifacts: [{ id: artifactId, serverId: target.id }],
+      definition: { ...release.definition, healthCheckCommand: 'test -f restored-health-marker' },
+    },
+  };
+  const environment = fixture(
+    async (command) => {
+      if (command.includes('candidate-health-marker'))
+        throw new BuildCommandError(1, 'check failed');
+    },
+    false,
+    previous,
+  );
+  await environment.run(task(release));
+  assert.deepEqual(environment.deployments, [
+    { status: 'FAILED', health: 'FAILED' },
+    { status: 'SUCCESS', health: 'HEALTHY' },
+  ]);
+  assert.deepEqual(environment.statuses, ['FAILED']);
+  assert.equal(environment.releaseSnapshots[1].commitSha, previous.snapshot.commitSha);
+  assert.equal(environment.releaseSnapshots[1].runId, release.runId);
+  assert.equal(
+    environment.commands.filter((command) => command.includes('Reject alias paths')).length,
+    1,
+  );
+  assert.equal(environment.commands.filter((command) => command.includes('mv -Tf')).length, 2);
+  assert.ok(
+    environment.commands.map((command) => command.includes('rmdir --')).lastIndexOf(true) >
+      environment.commands.findIndex((command) => command.includes('restored-health-marker')),
+  );
 });
 
 test('an unconfirmed activation keeps ownership and temporary files for investigation', async () => {
@@ -538,16 +653,38 @@ test('Docker and Compose checks report missing platform tools before deployment 
 });
 
 test('pre-activation failure releases ownership and leaves the previous release active', async () => {
+  const release = snapshot();
+  release.definition.stopCommand = 'echo fixture-stop-service';
   const environment = fixture(async (command) => {
     if (command.includes('sha256sum -c')) throw new BuildCommandError(1, 'bad checksum');
   });
-  await environment.run(task(snapshot()));
+  await environment.run(task(release));
   assert.deepEqual(environment.deployments, [{ status: 'FAILED', health: 'NOT_CHECKED' }]);
   assert.equal(
     environment.commands.some((command) => command.includes('mv -Tf')),
     false,
   );
+  assert.ok(environment.commands.every((command) => !command.includes('fixture-stop-service')));
   assert.equal(environment.commands.filter((command) => command.includes('rmdir --')).length, 2);
+});
+
+test('file activation validates the candidate archive before stopping the current snapshot', async () => {
+  const release = snapshot();
+  release.definition.stopCommand = 'fixture-stop-candidate';
+  const active = {
+    ...release,
+    releaseKey: randomUUID(),
+    definition: { ...release.definition, stopCommand: 'fixture-stop-current' },
+  };
+  const environment = fixture(async () => undefined, false, undefined, active);
+  await environment.run(task(release));
+  const prepared = environment.commands.findIndex((command) => command.includes('sha256sum -c'));
+  const activation = environment.commands.find((command) => command.includes('mv -Tf'))!;
+  assert.ok(prepared >= 0 && environment.commands.indexOf(activation) > prepared);
+  assert.ok(activation.indexOf('fixture-stop-current') < activation.indexOf('mv -Tf'));
+  assert.match(activation, /fixture-stop-current/);
+  assert.doesNotMatch(activation, /fixture-stop-candidate/);
+  assert.deepEqual(environment.statuses, ['SUCCESS']);
 });
 
 test('only-build skips the publication lock, activation and deployment record', async () => {

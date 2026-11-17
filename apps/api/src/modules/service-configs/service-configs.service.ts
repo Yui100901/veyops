@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Body,
   Controller,
+  ForbiddenException,
   Get,
   Global,
   Injectable,
@@ -16,11 +17,15 @@ import {
   IsArray,
   IsBoolean,
   IsIn,
+  IsInt,
+  IsObject,
   IsOptional,
   IsString,
   IsUUID,
   Matches,
+  Max,
   MaxLength,
+  Min,
   ValidateNested,
   ValidateIf,
 } from 'class-validator';
@@ -35,6 +40,25 @@ import type { AuthRequest } from '../auth/auth.guard';
 import { DeploymentTargetsService } from '../deployment-targets/deployment-targets.service';
 import { relativePath } from '../pipelines/pipeline.validation';
 import { SystemSettingsService } from '../system/system-settings.service';
+import { readReleasePolicy } from '../deployments/release-policy';
+import type { ReleasePolicy } from '../pipelines/pipeline.types';
+import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
+
+class HealthCheckDto {
+  @IsOptional() @IsString() @MaxLength(2048) httpUrl?: string;
+  @IsOptional() @IsBoolean() compose?: boolean;
+  @IsInt() @Min(1) @Max(20) attempts = 1;
+  @IsInt() @Min(0) @Max(60) intervalSeconds = 0;
+  @IsInt() @Min(1) @Max(300) timeoutSeconds = 120;
+}
+
+class ReleasePolicyDto implements ReleasePolicy {
+  @IsBoolean() requireApproval = false;
+  @IsBoolean() archivePushedImage = false;
+  @IsIn(['OFF', 'PREVIOUS_HEALTHY', 'PINNED']) rollbackMode: ReleasePolicy['rollbackMode'] = 'OFF';
+  @IsOptional() @IsUUID() pinnedDeploymentId?: string;
+  @IsObject() @ValidateNested() @Type(() => HealthCheckDto) healthCheck = new HealthCheckDto();
+}
 
 class ServiceConfigDto {
   @IsUUID() targetId!: string;
@@ -49,7 +73,13 @@ class ServiceConfigDto {
   @IsOptional() @IsString() @MaxLength(1024) outputPath = '';
   @IsOptional() @IsString() @MaxLength(1024) composeFilePath = '';
   @IsOptional() @IsString() @MaxLength(65536) startCommand = '';
+  @IsOptional() @IsString() @MaxLength(65536) stopCommand?: string;
   @IsOptional() @IsString() @MaxLength(65536) healthCheckCommand = '';
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => ReleasePolicyDto)
+  releasePolicy?: ReleasePolicyDto;
 }
 class VariableDto {
   @IsString() @Matches(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/) key!: string;
@@ -89,7 +119,9 @@ const present = (r: Selectable<Database['service_environment_configs']>) => ({
   outputPath: r.build_output_path,
   composeFilePath: r.compose_file_path,
   startCommand: r.start_command,
+  stopCommand: r.stop_command,
   healthCheckCommand: (JSON.parse(r.health_check_json) as { command?: string }).command || '',
+  releasePolicy: readReleasePolicy(r.release_policy_json),
 });
 
 @Injectable()
@@ -137,8 +169,34 @@ export class ServiceConfigsService {
       .executeTakeFirst();
     return r ? present(r) : null;
   }
-  async save(serviceId: string, environmentId: string, input: ServiceConfigDto, userId: string) {
+  async save(
+    serviceId: string,
+    environmentId: string,
+    input: ServiceConfigDto,
+    userId: string,
+    admin = true,
+  ) {
     if (input.workingDirectory) relativePath(input.workingDirectory);
+    const policy = input.releasePolicy;
+    if (policy && !admin) throw new ForbiddenException('仅管理员可以修改发布保护策略');
+    if (policy?.healthCheck.httpUrl) {
+      const url = URL.canParse(policy.healthCheck.httpUrl)
+        ? new URL(policy.healthCheck.httpUrl)
+        : undefined;
+      if (
+        !url ||
+        !['http:', 'https:'].includes(url.protocol) ||
+        url.username ||
+        url.password ||
+        url.hash
+      )
+        throw new BadRequestException('健康检查地址必须是无凭据的 HTTP 或 HTTPS URL');
+      policy.healthCheck.httpUrl = url.toString();
+    }
+    if (policy?.healthCheck.compose && input.deployMethod !== 'DOCKER_COMPOSE')
+      throw new BadRequestException('Compose 健康检查需要 Docker Compose 部署');
+    if (policy?.rollbackMode === 'PINNED' && !policy.pinnedDeploymentId)
+      throw new BadRequestException('请选择已健康验收的回滚版本');
     await this.assertScope(serviceId, environmentId);
     await this.targets.get(input.targetId);
     if ((input.artifactType === 'FILE') !== (input.deployMethod === 'FILE'))
@@ -150,6 +208,7 @@ export class ServiceConfigsService {
         input.deployPath.split('/').includes('..'))
     )
       throw new BadRequestException('部署目录必须为安全绝对路径');
+    const buildLocation = input.buildLocation ?? (await this.settings.get()).defaultBuildLocation;
     const now = Date.now(),
       values = {
         target_id: input.targetId,
@@ -162,24 +221,55 @@ export class ServiceConfigsService {
         build_output_path: input.outputPath,
         compose_file_path: input.composeFilePath,
         start_command: input.startCommand,
+        stop_command: input.stopCommand,
         health_check_json: JSON.stringify({ command: input.healthCheckCommand }),
+        ...(policy && { release_policy_json: JSON.stringify(policy) }),
         updated_at: now,
       };
-    const config = await this.database.db
-      .insertInto('service_environment_configs')
-      .values({
-        id: randomUUID(),
-        service_id: serviceId,
-        environment_id: environmentId,
-        ...values,
-        build_location: input.buildLocation ?? (await this.settings.get()).defaultBuildLocation,
-        created_at: now,
-      })
-      .onConflict((conflict) =>
-        conflict.columns(['service_id', 'environment_id']).doUpdateSet(values),
-      )
-      .returningAll()
-      .executeTakeFirstOrThrow();
+    const config = await this.database.db.transaction().execute(async (tx) => {
+      if (policy?.rollbackMode === 'PINNED') {
+        const baseline = await tx
+          .selectFrom('deployment_records')
+          .select(['pipeline_run_id', 'artifact_id'])
+          .where('id', '=', policy.pinnedDeploymentId!)
+          .where('service_id', '=', serviceId)
+          .where('environment_id', '=', environmentId)
+          .where('status', '=', 'SUCCESS')
+          .where('health_status', '=', 'HEALTHY')
+          .where('release_snapshot_json', 'is not', null)
+          .executeTakeFirst();
+        if (!baseline?.artifact_id)
+          throw new BadRequestException('固定回滚版本必须属于当前服务环境且具备健康发布记录');
+        const artifacts = await tx
+          .selectFrom('deployment_records')
+          .select('artifact_id')
+          .where('pipeline_run_id', '=', baseline.pipeline_run_id)
+          .where('service_id', '=', serviceId)
+          .where('environment_id', '=', environmentId)
+          .where('status', '=', 'SUCCESS')
+          .where('health_status', '=', 'HEALTHY')
+          .execute();
+        await lockAvailableArtifacts(
+          tx,
+          artifacts.flatMap((row) => (row.artifact_id ? [row.artifact_id] : [])),
+        );
+      }
+      return tx
+        .insertInto('service_environment_configs')
+        .values({
+          id: randomUUID(),
+          service_id: serviceId,
+          environment_id: environmentId,
+          ...values,
+          build_location: buildLocation,
+          created_at: now,
+        })
+        .onConflict((conflict) =>
+          conflict.columns(['service_id', 'environment_id']).doUpdateSet(values),
+        )
+        .returningAll()
+        .executeTakeFirstOrThrow();
+    });
     await this.audit.record(userId, 'service-environment.configure', 'service', serviceId, {
       environmentId,
     });
@@ -391,7 +481,7 @@ class ServiceConfigsController {
     @Body() dto: ServiceConfigDto,
     @Req() req: AuthRequest,
   ) {
-    return this.service.save(s, e, dto, req.user.id);
+    return this.service.save(s, e, dto, req.user.id, req.user.role === 'ADMIN');
   }
   @Get('environments/:envId/variables') envVars(@Param('envId') e: string) {
     return this.service.listVariables(e);

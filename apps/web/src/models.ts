@@ -60,6 +60,29 @@ export interface DeploymentSummary {
   finishedAt: number | null;
   projectId?: string;
 }
+export interface DeploymentRecord extends DeploymentSummary {
+  artifactId?: string | null;
+  deployPath?: string;
+  previousDeploymentId?: string | null;
+  rollbackAvailable?: boolean;
+  rollbackUnavailableReason?: string;
+  isCurrent?: boolean;
+  rollbackOfDeploymentId?: string | null;
+  rollbackStatus?: string | null;
+}
+export interface ReleasePolicy {
+  requireApproval: boolean;
+  rollbackMode: 'OFF' | 'PREVIOUS_HEALTHY' | 'PINNED';
+  pinnedDeploymentId?: string | null;
+  archivePushedImage?: boolean;
+  healthCheck: {
+    httpUrl?: string | null;
+    compose?: boolean;
+    attempts: number;
+    intervalSeconds: number;
+    timeoutSeconds: number;
+  };
+}
 export interface ServerDetail extends Server {
   updatedAt: number;
   groups: Pick<ServerGroup, 'id' | 'name'>[];
@@ -154,7 +177,13 @@ export interface ProjectDependency {
 export interface Task {
   id: string;
   type: string;
-  executionMode?: 'BUILD_ONLY' | 'DEPLOY' | null;
+  executionMode?: 'BUILD_ONLY' | 'DEPLOY' | 'DEPLOY_ARTIFACT' | null;
+  approvalStatus?: 'PENDING' | 'APPROVED' | null;
+  deliveryStage?: 'BUILD' | 'DEPLOY' | null;
+  sourceBuildTaskId?: string | null;
+  deploymentTaskId?: string | null;
+  deploymentSkippedReason?: string | null;
+  deployAfterBuild?: boolean;
   pipelineRunId?: string | null;
   result?: {
     aiAnalysis?:

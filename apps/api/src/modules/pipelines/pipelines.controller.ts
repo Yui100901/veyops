@@ -3,6 +3,8 @@ import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { PipelinesService } from './pipelines.service';
 import {
+  ArtifactDeployDto,
+  ArtifactDeployPreviewDto,
   ConfirmedPipelineRunDto,
   CreatePipelineDto,
   RunPipelineDto,
@@ -51,5 +53,18 @@ export class PipelinesController {
     @Req() req: AuthRequest,
   ) {
     return this.pipelines.run(id, input, req.user.id);
+  }
+  @Post(':id/artifact-deploy/preview') @Roles('ADMIN', 'OPERATOR') previewArtifactDeploy(
+    @Param('id') id: string,
+    @Body() input: ArtifactDeployPreviewDto,
+  ) {
+    return this.pipelines.previewArtifactDeploy(id, input);
+  }
+  @Post(':id/artifact-deploy') @Roles('ADMIN', 'OPERATOR') deployArtifact(
+    @Param('id') id: string,
+    @Body() input: ArtifactDeployDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.pipelines.deployArtifact(id, input, req.user.id);
   }
 }

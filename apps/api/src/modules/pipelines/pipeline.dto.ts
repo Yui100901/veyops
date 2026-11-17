@@ -3,6 +3,8 @@ import { OmitType } from '@nestjs/swagger';
 import type { PipelineExecutionMode } from './pipeline.types';
 import {
   ArrayMaxSize,
+  ArrayMinSize,
+  ArrayUnique,
   Equals,
   IsArray,
   IsBoolean,
@@ -37,6 +39,7 @@ export class PipelineDefinitionDto {
   @IsString() @Length(1, 300) outputPath = 'dist';
   @IsString() @Length(0, 500) deployPath = '';
   @IsString() @Length(0, 65536) startCommand = '';
+  @IsOptional() @IsString() @Length(0, 65536) stopCommand?: string;
   @IsString() @Length(0, 65536) healthCheckCommand = '';
   @IsString() @Length(1, 300) dockerfilePath = 'Dockerfile';
   @IsString() @Length(1, 300) composeFilePath = 'compose.yaml';
@@ -80,6 +83,7 @@ export class RunPipelineDto {
   @IsBoolean() @Equals(true, { message: '必须确认执行目标和Pipeline版本' }) confirmed!: boolean;
   @IsOptional() @IsInt() @Min(1) version?: number;
   @IsOptional() @IsIn(['BUILD_ONLY', 'DEPLOY']) mode?: PipelineExecutionMode;
+  @IsOptional() @IsBoolean() allowPartialDeploy?: boolean;
 }
 
 export class ConfirmedPipelineRunDto extends RunPipelineDto {
@@ -89,4 +93,27 @@ export class ConfirmedPipelineRunDto extends RunPipelineDto {
   @IsUUID(undefined, { each: true })
   expectedServerIds?: string[];
   @IsOptional() @Matches(/^[a-f0-9]{64}$/) expectedConfigurationHash?: string;
+}
+
+export class ArtifactDeployPreviewDto {
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(100)
+  @ArrayUnique()
+  @IsUUID(undefined, { each: true })
+  artifactIds!: string[];
+
+  @IsUUID() environmentId!: string;
+  @IsUUID() targetId!: string;
+  @IsOptional() @IsInt() @Min(1) version?: number;
+}
+
+export class ArtifactDeployDto extends ArtifactDeployPreviewDto {
+  @IsBoolean() @Equals(true) confirmed!: boolean;
+  @Matches(/^[a-f0-9]{64}$/) expectedConfigurationHash!: string;
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsUUID(undefined, { each: true })
+  expectedServerIds?: string[];
 }

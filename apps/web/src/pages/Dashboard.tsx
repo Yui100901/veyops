@@ -17,6 +17,14 @@ const taskTypeNames: Record<string, string> = {
   PIPELINE: 'Pipeline',
 };
 
+export function taskTypeLabel(task: Task) {
+  if (task.executionMode === 'DEPLOY_ARTIFACT') return 'Pipeline · 产物部署';
+  if (task.type !== 'PIPELINE') return taskTypeNames[task.type] ?? task.type;
+  if (task.deliveryStage === 'BUILD' && task.deployAfterBuild) return 'Pipeline · 构建阶段';
+  if (task.executionMode === 'BUILD_ONLY') return 'Pipeline · 仅构建';
+  return 'Pipeline · 构建并部署';
+}
+
 export function TaskTable({ tasks, compact = false }: { tasks: Task[]; compact?: boolean }) {
   return (
     <div className="table-scroll">
@@ -32,10 +40,7 @@ export function TaskTable({ tasks, compact = false }: { tasks: Task[]; compact?:
         </thead>
         <tbody>
           {tasks.map((task) => {
-            const type =
-              task.type === 'PIPELINE' && task.executionMode === 'BUILD_ONLY'
-                ? 'Pipeline · 仅构建'
-                : (taskTypeNames[task.type] ?? task.type);
+            const type = taskTypeLabel(task);
             return (
               <tr key={task.id}>
                 <td>
@@ -59,7 +64,11 @@ export function TaskTable({ tasks, compact = false }: { tasks: Task[]; compact?:
                   </td>
                 )}
                 <td>
-                  <Status value={task.status} />
+                  {task.approvalStatus === 'PENDING' ? (
+                    <span className="tag">待审批</span>
+                  ) : (
+                    <Status value={task.status} />
+                  )}
                 </td>
                 {!compact && <td className="muted nowrap">{formatTime(task.createdAt)}</td>}
                 {!compact && (

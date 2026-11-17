@@ -27,6 +27,7 @@ import {
 } from '../components';
 import type { Audit, SystemRuntimeDefaults, User } from '../models';
 import { AISettings } from './AI';
+import { ArtifactRetentionPolicy } from './ArtifactRetention';
 
 export function AuditPage() {
   const resource = useResource<Audit[]>('/audit');
@@ -108,6 +109,7 @@ type SystemInfo = Partial<SystemRuntimeDefaults> & {
 export function SystemPage({ user }: { user: User }) {
   const resource = useResource<SystemInfo>('/system');
   const [editing, setEditing] = useState(false);
+  const [editingRetention, setEditingRetention] = useState(false);
   const value = resource.data;
   const db =
     typeof value?.database === 'string'
@@ -209,6 +211,20 @@ export function SystemPage({ user }: { user: User }) {
                     : '—'}
               </strong>
             </div>
+            {user.role === 'ADMIN' && (
+              <div className="setting-row">
+                <span>
+                  <Archive size={17} /> 构建产物保留
+                </span>
+                <button
+                  className="button secondary small"
+                  type="button"
+                  onClick={() => setEditingRetention(true)}
+                >
+                  保留策略
+                </button>
+              </div>
+            )}
           </Section>
           <Section title="安全基础" subtitle="资源访问与执行的安全机制">
             <div className="security-feature">
@@ -265,6 +281,7 @@ export function SystemPage({ user }: { user: User }) {
           }}
         />
       )}
+      {editingRetention && <ArtifactRetentionPolicy onClose={() => setEditingRetention(false)} />}
     </>
   );
 }
