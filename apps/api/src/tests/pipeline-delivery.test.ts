@@ -11,12 +11,14 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 
 let testDirectory: Promise<string> | undefined;
+const deliveryDirectory = () =>
+  (testDirectory ??= mkdtemp(join(tmpdir(), 'veyops-pipeline-delivery-')));
 after(async () => {
   if (testDirectory) await rm(await testDirectory, { recursive: true, force: true });
 });
 
 async function checkDelivery(databaseUrl?: string) {
-  const directory = await (testDirectory ??= mkdtemp(join(tmpdir(), 'veyops-pipeline-delivery-')));
+  const directory = await deliveryDirectory();
   const initialPassword = 'fixture-delivery-initial';
   const password = 'fixture-delivery-changed';
   process.env.DATA_DIR = directory;
@@ -35,6 +37,7 @@ async function checkDelivery(databaseUrl?: string) {
   const { ProcessRunnerService } =
     await import('../infrastructure/build-runner/process-runner.service.js');
   const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
+  const { DeploymentsService } = await import('../modules/deployments/deployments.service.js');
 
   const archive = Buffer.from('fixture file artifact\n');
   const checksum = createHash('sha256').update(archive).digest('hex');
@@ -45,6 +48,7 @@ async function checkDelivery(databaseUrl?: string) {
   const failingCommit = 'b'.repeat(40);
   const managerCheckouts: string[] = [];
   const remoteCommands: { serverId: string; command: string }[] = [];
+  const releaseLinks = new Map<string, string>();
   const transferredArchives: string[] = [];
   let failedBuildServer: string | undefined;
   let registryPullFails = false;
@@ -93,6 +97,14 @@ async function checkDelivery(databaseUrl?: string) {
         options?: { onData?: (chunk: string) => void },
       ) => {
         remoteCommands.push({ serverId: target.id, command });
+        const switched = /ln -s '([^']+)' '[^']+'; mv -Tf -- '[^']+' '([^']+)'/.exec(command);
+        if (switched) releaseLinks.set(`${target.id}:${switched[2]}`, switched[1]!);
+        const reading = /^readlink -- '([^']+)'$/.exec(command);
+        if (reading) {
+          const link = releaseLinks.get(`${target.id}:${reading[1]}`);
+          if (link) options?.onData?.(`${link}\n`);
+          return { exitCode: link ? 0 : 1 };
+        }
         if (command.includes('BUILD_FIXTURE') && target.id === failedBuildServer)
           return { exitCode: 77 };
         if (command.includes("printf 'VEYOPS_ARTIFACT"))
@@ -451,9 +463,11 @@ async function checkDelivery(databaseUrl?: string) {
         );
       }
       registryPullFails = true;
-      const fallbackStart = remoteCommands.length;
+      const fallbackStart: number = remoteCommands.length;
       assert.equal((await runTask(archivedPush.deploymentTaskId)).status, 'SUCCESS');
-      const fallbackCommands = remoteCommands.slice(fallbackStart).map(({ command }) => command);
+      const fallbackCommands: string[] = remoteCommands
+        .slice(fallbackStart)
+        .map(({ command }) => command);
       assert.equal(
         fallbackCommands.filter((cmd) => cmd.includes(imageDigest) && cmd.includes(' pull')).length,
         2,
@@ -495,19 +509,22 @@ async function checkDelivery(databaseUrl?: string) {
       registryPullFails = false;
     }
 
-    await api
-      .put(`/api/v1/services/${service.id}/environments/${environment.id}/config`)
-      .send({
-        targetId: target.id,
-        artifactType: 'FILE',
-        deployMethod: 'FILE',
-        buildLocation: 'MANAGER',
-        deployPath: definition.deployPath,
-        releasePolicy: { requireApproval: true },
-      })
-      .expect(200);
-    const runProtected = async () => {
+    const saveApprovalPolicy = (requireApproval: boolean) =>
+      api
+        .put(`/api/v1/services/${service.id}/environments/${environment.id}/config`)
+        .send({
+          targetId: target.id,
+          artifactType: 'FILE',
+          deployMethod: 'FILE',
+          buildLocation: 'MANAGER',
+          deployPath: definition.deployPath,
+          releasePolicy: { requireApproval },
+        })
+        .expect(200);
+    await saveApprovalPolicy(true);
+    const runProtected = async (disableAfterSubmit = false) => {
       const started = await create(`${managerPath}/run`, { ...base, commitSha: successfulCommit });
+      if (disableAfterSubmit) await saveApprovalPolicy(false);
       const built = await runTask(started.id);
       assert.ok(built.deploymentTaskId);
       const pending = await getTask(built.deploymentTaskId);
@@ -522,8 +539,9 @@ async function checkDelivery(databaseUrl?: string) {
       await post(`/deployments/approvals/${pending.id}/approve`, {}).expect(409);
       return runTask(pending.id);
     };
-    const rollbackSource = await runProtected();
+    const rollbackSource = await runProtected(true);
     assert.equal(rollbackSource.status, 'SUCCESS');
+    await saveApprovalPolicy(true);
     const nextVersion = await runProtected();
     assert.equal(nextVersion.status, 'SUCCESS');
     const history = await db
@@ -532,6 +550,33 @@ async function checkDelivery(databaseUrl?: string) {
       .where('pipeline_run_id', '=', rollbackSource.pipelineRunId)
       .where('server_id', '=', serverIds[0]!)
       .executeTakeFirstOrThrow();
+    const selectedPolicy = (
+      await api
+        .put(`/api/v1/services/${service.id}/environments/${environment.id}/config`)
+        .send({
+          targetId: target.id,
+          artifactType: 'FILE',
+          deployMethod: 'FILE',
+          buildLocation: 'MANAGER',
+          deployPath: definition.deployPath,
+          releasePolicy: {
+            requireApproval: true,
+            rollbackMode: 'PINNED',
+            pinnedDeploymentId: history.id,
+          },
+        })
+        .expect(200)
+    ).body.data.releasePolicy;
+    const baselineSnapshot = app.get(DeploymentsService).rollbackSnapshot(history);
+    assert.ok(baselineSnapshot);
+    for (const id of serverIds) {
+      const fixed = await app
+        .get(DeploymentsService)
+        .rollbackCandidate({ ...baselineSnapshot.snapshot, releasePolicy: selectedPolicy }, id);
+      assert.ok(fixed);
+      assert.equal(fixed.snapshot.runId, rollbackSource.pipelineRunId);
+      assert.notEqual(fixed.currentReleaseKey, fixed.releaseKey);
+    }
     const rollbackPath = `/deployments/${history.id}/rollback`;
     const rollbackPreview = await create(`${rollbackPath}/preview`, {});
     assert.equal(rollbackPreview.artifactId, history.artifact_id);
@@ -566,6 +611,7 @@ test(
     skip: !process.env.VEYOPS_TEST_POSTGRES_URL,
   },
   async () => {
+    process.env.DATA_DIR = await deliveryDirectory();
     const { withIsolatedPostgres } = await import('./helpers/isolated-postgres.js');
     await withIsolatedPostgres(process.env.VEYOPS_TEST_POSTGRES_URL!, checkDelivery);
   },

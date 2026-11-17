@@ -233,7 +233,12 @@ export class DeploymentsService {
       .innerJoin('pipeline_runs', 'pipeline_runs.id', 'deployment_records.pipeline_run_id')
       .leftJoin('artifacts', 'artifacts.id', 'deployment_records.artifact_id')
       .selectAll('deployment_records')
-      .select(['pipeline_runs.project_id', 'pipeline_runs.task_id', 'artifacts.pruned_at'])
+      .select([
+        'pipeline_runs.project_id',
+        'pipeline_runs.task_id',
+        'artifacts.pruned_at',
+        'artifacts.storage_type',
+      ])
       .select((eb) =>
         eb
           .selectFrom('deployment_records as active')
@@ -277,7 +282,9 @@ export class DeploymentsService {
         deployPath: r.deploy_path,
         healthStatus: r.health_status,
         previousDeploymentId: r.previous_deployment_id,
-        rollbackAvailable: r.pruned_at === null && Boolean(this.rollbackSnapshot(r)),
+        rollbackAvailable:
+          (r.pruned_at === null || r.storage_type === 'REGISTRY_IMAGE') &&
+          Boolean(this.rollbackSnapshot(r)),
         isCurrent: r.current_id === r.id,
         rollbackOfDeploymentId: r.rollback_of_deployment_id,
         rollbackStatus: r.rollback_status,

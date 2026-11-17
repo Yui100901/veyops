@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm, rmdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { dataDirectory } from '../core/config';
 import { DatabaseService } from '../core/database/database.service';
@@ -265,6 +265,29 @@ async function verifyRetention(t: TestContext, database: DatabaseService) {
     true,
   );
   assert.equal((await retention.configure(null, ids.user, scope)).inherited, true);
+
+  const registry = await archive(oldRun.runId, expired);
+  const registryDigest = `sha256:${'a'.repeat(64)}`;
+  await db
+    .updateTable('artifacts')
+    .set({
+      artifact_type: 'DOCKER_IMAGE',
+      storage_type: 'REGISTRY_IMAGE',
+      storage_key: `registry.example.invalid/test/web@${registryDigest}`,
+      archive_key: basename(registry.file),
+      image_digest: registryDigest,
+      compose_yaml: 'services: {}',
+      compose_checksum: 'c'.repeat(64),
+    })
+    .where('id', '=', registry.id)
+    .execute();
+  assert.deepEqual((await retention.prune([registry.id], ids.user, now)).pruned, [registry.id]);
+  await assert.rejects(readFile(registry.file), /ENOENT/);
+  await db.transaction().execute((tx) => lockAvailableArtifacts(tx, [registry.id]));
+  const registryRow = (await artifacts.list(ids.project)).find((row) => row.id === registry.id)!;
+  assert.equal(registryRow.deployable, true);
+  assert.equal(registryRow.downloadAvailable, false);
+  assert.equal(registryRow.imageDigest, registryDigest);
 
   const delayed = await archive(oldRun.runId, expired);
   await rm(delayed.file);

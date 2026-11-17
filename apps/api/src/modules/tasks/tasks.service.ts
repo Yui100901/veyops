@@ -109,25 +109,18 @@ export class TasksService {
         tx,
         pipeline.deploymentArtifacts.map((artifact) => artifact.id),
       );
-    const deployment = input.type === 'PIPELINE' && pipeline && pipeline.mode !== 'BUILD_ONLY';
-    const currentPolicy = deployment
-      ? (await serviceReleasePolicy(tx, pipeline.serviceId, pipeline.environmentId)).policy
-      : undefined;
-    const payload = deployment
-      ? {
-          ...input.payload,
-          pipeline: {
-            ...pipeline,
-            releasePolicy: pipeline.rollbackOfDeploymentId
-              ? {
-                  ...(pipeline.releasePolicy ?? currentPolicy!),
-                  requireApproval: currentPolicy!.requireApproval,
-                  rollbackMode: 'OFF',
-                }
-              : currentPolicy,
-          },
-        }
-      : input.payload;
+    let payload = input.payload;
+    let availableAt = now;
+    if (input.type === 'PIPELINE' && pipeline && pipeline.mode !== 'BUILD_ONLY') {
+      const { policy } = await serviceReleasePolicy(tx, pipeline.serviceId, pipeline.environmentId);
+      const requireApproval =
+        policy.requireApproval || Boolean(pipeline.releasePolicy?.requireApproval);
+      const releasePolicy = pipeline.rollbackOfDeploymentId
+        ? { ...(pipeline.releasePolicy ?? policy), requireApproval, rollbackMode: 'OFF' as const }
+        : { ...policy, requireApproval };
+      payload = { ...input.payload, pipeline: { ...pipeline, releasePolicy } };
+      if (requireApproval) availableAt = pendingReleaseApprovalTime;
+    }
     const inserted = await tx
       .insertInto('tasks')
       .values({
@@ -144,7 +137,7 @@ export class TasksService {
         payload_json: JSON.stringify(payload),
         created_at: now,
         updated_at: now,
-        available_at: currentPolicy?.requireApproval ? pendingReleaseApprovalTime : now,
+        available_at: availableAt,
         log_file_key: this.logStore.key(id, now),
       })
       .onConflict((conflict) => conflict.column('idempotency_key').doNothing())

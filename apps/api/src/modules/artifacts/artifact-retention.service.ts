@@ -170,12 +170,18 @@ async function archiveGroups(db: Kysely<Database>, now: number) {
         'artifacts.registry_id',
         'artifacts.image_digest',
         'artifacts.pinned_at',
+        'artifacts.pruned_at',
         'artifacts.size_bytes',
         'artifacts.created_at',
         'pipeline_runs.environment_id',
         'tasks.status as taskStatus',
       ])
-      .where('artifacts.pruned_at', 'is', null)
+      .where((eb) =>
+        eb.or([
+          eb('artifacts.pruned_at', 'is', null),
+          eb('artifacts.storage_type', '=', 'REGISTRY_IMAGE'),
+        ]),
+      )
       .orderBy('artifacts.created_at', 'desc')
       .orderBy('artifacts.id', 'desc')
       .execute(),
@@ -211,7 +217,7 @@ async function archiveGroups(db: Kysely<Database>, now: number) {
       runs.set(scope, ranks);
       overCount = (ranks.get(a.pipeline_run_id) ?? 0) > policy.maxBuilds;
     }
-    const key = archiveKey(a);
+    const key = a.pruned_at === null ? archiveKey(a) : null;
     if (!key) continue;
     const group = groups.get(key) ?? { key, members: [] };
     groups.set(key, group);
