@@ -119,7 +119,7 @@ export class ReleaseRequestsService {
     const server = await this.servers.get(row.server_id);
     if (!server.credentialId || !server.hostKeyFingerprint)
       throw new ConflictException('目标必须配置 SSH 凭据和已确认指纹');
-    await assertCurrentTargets(db, source.snapshot, [server]);
+    await assertCurrentTargets(db, { ...source.snapshot, rollbackOfDeploymentId: row.id }, [server]);
     const current = await this.deployments.current(
       db,
       row.service_id,

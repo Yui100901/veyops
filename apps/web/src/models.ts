@@ -47,6 +47,14 @@ export interface ServerGroup {
   description?: string;
   serverIds: string[];
 }
+export interface DeploymentSelection {
+  targetId?: string | null;
+  serverIds?: string[];
+  groupIds?: string[];
+  strategy?: 'PARALLEL' | 'SEQUENTIAL';
+  maxParallel?: number;
+  failurePolicy?: 'CONTINUE' | 'STOP';
+}
 export interface DeploymentSummary {
   id: string;
   taskId: string;

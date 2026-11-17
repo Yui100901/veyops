@@ -220,7 +220,10 @@ export function BatchTargetPicker({
 }) {
   const servers = useResource<Server[]>('/servers');
   const groups = useResource<ServerGroup[]>('/server-groups');
-  const deployments = useResource<NamedTarget[]>('/deployment-targets');
+  const legacyTargetIds = selection.deploymentTargetIds ?? [];
+  const deployments = useResource<NamedTarget[]>(
+    legacyTargetIds.length ? '/deployment-targets' : null,
+  );
   const projects = useResource<NamedTarget[]>('/projects');
   const tagOptions = [...new Set(servers.data?.flatMap((server) => server.tags))].sort();
   const optionSets = [
@@ -231,11 +234,10 @@ export function BatchTargetPicker({
       options: tagOptions.map((tag) => ({ id: tag, name: tag })),
     },
     { key: 'projectIds', label: '项目', options: projects.data ?? [] },
-    { key: 'deploymentTargetIds', label: '部署目标', options: deployments.data ?? [] },
   ] as const;
   return (
     <>
-      <ErrorBanner error={servers.error || groups.error || deployments.error || projects.error} />
+      <ErrorBanner error={servers.error || groups.error || projects.error} />
       {servers.loading ? (
         <Loading />
       ) : (
@@ -257,6 +259,18 @@ export function BatchTargetPicker({
             onChange={(ids) => onChange({ ...selection, [key]: ids })}
           />
         ))}
+        {legacyTargetIds.length > 0 && (
+          <TargetOptions
+            label="历史选择"
+            options={legacyTargetIds.map((id) => ({
+              id,
+              name: deployments.data?.find((item) => item.id === id)?.name ?? id,
+            }))}
+            selected={legacyTargetIds}
+            disabled={disabled}
+            onChange={(deploymentTargetIds) => onChange({ ...selection, deploymentTargetIds })}
+          />
+        )}
         <EnvironmentTargetOptions
           projects={projects.data ?? []}
           selected={selection.environmentIds ?? []}

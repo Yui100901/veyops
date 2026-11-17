@@ -1,6 +1,7 @@
 import { Type } from 'class-transformer';
 import { OmitType } from '@nestjs/swagger';
 import type { PipelineExecutionMode } from './pipeline.types';
+import { DeploymentSelectionDto } from '../deployment-targets/deployment-selection';
 import {
   ArrayMaxSize,
   ArrayMinSize,
@@ -76,9 +77,8 @@ export class UpdatePipelineDto {
   definition!: PipelineDefinitionInputDto;
   @IsOptional() @IsBoolean() enabled = true;
 }
-export class RunPipelineDto {
+export class RunPipelineDto extends DeploymentSelectionDto {
   @IsUUID() environmentId!: string;
-  @IsUUID() targetId!: string;
   @IsString() @Matches(/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/) commitSha!: string;
   @IsBoolean() @Equals(true, { message: '必须确认执行目标和Pipeline版本' }) confirmed!: boolean;
   @IsOptional() @IsInt() @Min(1) version?: number;
@@ -95,7 +95,7 @@ export class ConfirmedPipelineRunDto extends RunPipelineDto {
   @IsOptional() @Matches(/^[a-f0-9]{64}$/) expectedConfigurationHash?: string;
 }
 
-export class ArtifactDeployPreviewDto {
+export class ArtifactDeployPreviewDto extends DeploymentSelectionDto {
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(100)
@@ -104,7 +104,6 @@ export class ArtifactDeployPreviewDto {
   artifactIds!: string[];
 
   @IsUUID() environmentId!: string;
-  @IsUUID() targetId!: string;
   @IsOptional() @IsInt() @Min(1) version?: number;
 }
 

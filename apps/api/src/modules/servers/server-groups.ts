@@ -44,8 +44,9 @@ class ServerGroupsController {
       .innerJoin('servers', 'servers.id', 'server_group_members.server_id')
       .select(['group_id', 'server_id'])
       .where('servers.is_active', '=', 1)
+      .orderBy('server_group_members.sort_order')
       .orderBy('server_group_members.created_at')
-      .orderBy('server_id')
+      .orderBy('server_group_members.server_id')
       .execute();
     return groups.map((g) => ({
       id: g.id,
@@ -90,7 +91,12 @@ class ServerGroupsController {
         await tx
           .insertInto('server_group_members')
           .values(
-            serverIds.map((serverId) => ({ group_id: id, server_id: serverId, created_at: now })),
+            serverIds.map((serverId, index) => ({
+              group_id: id,
+              server_id: serverId,
+              created_at: now,
+              sort_order: index,
+            })),
           )
           .execute();
     });

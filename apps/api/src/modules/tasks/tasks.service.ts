@@ -171,8 +171,7 @@ export class TasksService {
       input.pipelineRun &&
       input.scope?.projectId &&
       input.scope.serviceId &&
-      input.scope.environmentId &&
-      input.scope.targetId
+      input.scope.environmentId
     ) {
       const run = input.pipelineRun;
       await tx
@@ -185,7 +184,10 @@ export class TasksService {
           project_id: input.scope.projectId,
           service_id: input.scope.serviceId,
           environment_id: input.scope.environmentId,
-          target_id: input.scope.targetId,
+          target_id: input.scope.targetId ?? null,
+          target_selection_json: payload.pipeline?.targetSelection
+            ? JSON.stringify(payload.pipeline.targetSelection)
+            : null,
           git_ref: run.gitRef,
           commit_sha: run.commitSha,
           build_location_snapshot: run.buildLocation,

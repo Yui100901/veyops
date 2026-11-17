@@ -8,7 +8,6 @@ import {
   FileCode2,
   GitBranch,
   Boxes,
-  Network,
   FolderGit2,
   KeyRound,
   LayoutDashboard,
@@ -33,7 +32,6 @@ import { AuditPage, SystemPage } from './pages/System';
 import { BackupsPage } from './pages/Backups';
 import { AIPage } from './pages/AI';
 import { DeliveryRecordsPage, PipelinesPage, RegistriesPage } from './pages/Delivery';
-import { DeploymentTargetsPage } from './pages/DeploymentConfig';
 import { ProjectViewsPage } from './pages/ProjectViews';
 import { UsersPage } from './pages/Users';
 import { OperationSchedulesPage } from './pages/OperationSchedules';
@@ -70,7 +68,6 @@ const navigation = [
   {
     label: '管理',
     items: [
-      { path: '/targets', name: '部署目标', icon: Network },
       { path: '/registries', name: '镜像仓库', icon: Boxes },
       { path: '/credentials', name: '凭据中心', icon: KeyRound },
       { path: '/audit', name: '操作审计', icon: FileClock },
@@ -475,7 +472,7 @@ export function App() {
     .find((item) => (item.path === '/' ? route === '/' : route.startsWith(item.path)));
   let page;
   if (route === '/') page = <DashboardPage />;
-  else if (route === '/servers') page = <ServersPage user={user} />;
+  else if (routePath === '/servers' || routePath === '/targets') page = <ServersPage user={user} />;
   else if (route === '/credentials') page = <CredentialsPage user={user} />;
   else if (route === '/projects') page = <ProjectsPage user={user} />;
   else if (routePath.startsWith('/projects/')) {
@@ -493,7 +490,6 @@ export function App() {
     page = <DeliveryRecordsPage key={route} type="artifacts" user={user} />;
   else if (route === '/deployments')
     page = <DeliveryRecordsPage key={route} type="deployments" user={user} />;
-  else if (route === '/targets') page = <DeploymentTargetsPage user={user} />;
   else if (route === '/registries') page = <RegistriesPage user={user} />;
   else if (route === '/commands') page = <CommandsPage user={user} />;
   else if (route === '/plans') page = <PlansPage user={user} />;

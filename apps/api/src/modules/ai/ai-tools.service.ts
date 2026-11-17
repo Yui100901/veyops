@@ -104,7 +104,7 @@ export const aiToolDefinitions = [
   ),
   tool(
     'run_pipeline',
-    '运行已保存 Pipeline 的固定版本、环境、部署目标和 Commit。完全控制仅对管理员已授权的组合免确认',
+    '运行已保存 Pipeline 的固定版本、环境和 Commit，默认使用服务环境配置的服务器或分组。完全控制仅对管理员已授权的组合免确认',
     {
       pipelineId: str,
       environmentId: str,
@@ -113,7 +113,7 @@ export const aiToolDefinitions = [
       version: { type: 'integer', minimum: 1 },
       mode: { type: 'string', enum: ['BUILD_ONLY', 'DEPLOY'] },
     },
-    ['pipelineId', 'environmentId', 'targetId', 'commitSha'],
+    ['pipelineId', 'environmentId', 'commitSha'],
   ),
   tool(
     'draft_source_change',
@@ -313,7 +313,7 @@ export class AiToolsService {
       const pipelineId = this.string(data, 'pipelineId');
       const input = {
         environmentId: this.string(data, 'environmentId'),
-        targetId: this.string(data, 'targetId'),
+        ...(data.targetId === undefined ? {} : { targetId: this.string(data, 'targetId') }),
         commitSha: this.string(data, 'commitSha'),
         confirmed: true,
         ...(data.mode === undefined ? {} : { mode: data.mode }),

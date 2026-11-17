@@ -6,6 +6,10 @@ import type { Database } from '../../core/database/schema';
 import { ExecutionOptionsDto, TargetSelectionDto } from './command.dto';
 import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import type { CreateTaskInput } from '../tasks/tasks.types';
+import {
+  selectedServerIds,
+  storedDeploymentSelection,
+} from '../deployment-targets/deployment-selection';
 
 @Injectable()
 export class TargetResolver {
@@ -34,13 +38,12 @@ export class TargetResolver {
       if (rows.length !== environmentIds.length)
         throw new BadRequestException('部分所选环境不存在');
     }
-    if (!projectIds.length && !environmentIds.length) return [];
+    if (!projectIds.length && !environmentIds.length) return { legacyIds: [], serverIds: [] };
     const rows = await db
       .selectFrom('service_environment_configs as c')
       .innerJoin('environments as e', 'e.id', 'c.environment_id')
       .innerJoin('projects as p', 'p.id', 'e.project_id')
-      .innerJoin('deployment_targets as d', 'd.id', 'c.target_id')
-      .select('d.id')
+      .select(['c.target_id', 'c.target_selection_json'])
       .where('p.deleted_at', 'is', null)
       .where((eb) =>
         eb.or([
@@ -49,9 +52,16 @@ export class TargetResolver {
         ]),
       )
       .distinct()
-      .orderBy('d.id')
+      .orderBy('c.target_id')
       .execute();
-    return rows.map(({ id }) => id);
+    const serverIds: string[] = [],
+      legacyIds: string[] = [];
+    for (const row of rows) {
+      const selection = storedDeploymentSelection(row.target_selection_json);
+      if (selection) serverIds.push(...(await selectedServerIds(db, selection)));
+      else if (row.target_id) legacyIds.push(row.target_id);
+    }
+    return { legacyIds, serverIds };
   }
 
   async resolve(input: TargetSelectionDto, db: Kysely<Database> = this.database.db) {
@@ -73,10 +83,9 @@ export class TargetResolver {
         .execute();
       ids.push(...members.map((member) => member.server_id));
     }
-    for (const targetId of new Set([
-      ...(input.deploymentTargetIds ?? []),
-      ...(await this.scopedTargets(input, db)),
-    ])) {
+    const scoped = await this.scopedTargets(input, db);
+    ids.push(...scoped.serverIds);
+    for (const targetId of new Set([...(input.deploymentTargetIds ?? []), ...scoped.legacyIds])) {
       const target = await db
         .selectFrom('deployment_targets')
         .select('id')

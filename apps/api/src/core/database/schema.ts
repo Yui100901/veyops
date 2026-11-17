@@ -68,6 +68,7 @@ export interface ServerGroupsTable {
 }
 
 export interface ServerGroupMembersTable {
+  sort_order: Generated<number>;
   group_id: string;
   server_id: string;
   created_at: number;
@@ -154,6 +155,7 @@ export interface ServiceEnvironmentConfigsTable {
   service_id: string;
   environment_id: string;
   target_id: Generated<string | null>;
+  target_selection_json: Generated<string | null>;
   build_location: Generated<string | null>;
   artifact_type: Generated<string>;
   deploy_method: Generated<string>;
@@ -239,7 +241,8 @@ export interface PipelineWebhooksTable {
   pipeline_version: number;
   configuration_hash: string;
   environment_id: string;
-  target_id: string;
+  target_id: Generated<string | null>;
+  target_selection_json: Generated<string | null>;
   secret_credential_id: string;
   created_by: string;
   branch: string;
@@ -324,7 +327,8 @@ export interface PipelineRunsTable {
   project_id: string;
   service_id: string;
   environment_id: string;
-  target_id: string;
+  target_id: Generated<string | null>;
+  target_selection_json: Generated<string | null>;
   git_ref: string;
   commit_sha: string;
   build_location_snapshot: string;

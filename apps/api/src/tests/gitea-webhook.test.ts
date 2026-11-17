@@ -413,6 +413,36 @@ test('Gitea signed push builds the pinned version once and keeps the build resul
       reason: 'DISABLED',
     });
     assert.equal((await db.selectFrom('pipeline_runs').select('id').execute()).length, 3);
+
+    const group = (
+      await api
+        .post('/api/v1/server-groups')
+        .send({ name: 'build group', serverIds: [server.body.data.id] })
+        .expect(201)
+    ).body.data;
+    await api
+      .patch(`/api/v1/credentials/${settings.secretCredentialId}`)
+      .send({ status: 'ACTIVE' })
+      .expect(200);
+    const direct = (
+      await api
+        .put(settingsPath)
+        .send({ ...settings, targetId: undefined, groupIds: [group.id] })
+        .expect(200)
+    ).body.data;
+    assert.equal(direct.targetId, null);
+    assert.deepEqual(direct.groupIds, [group.id]);
+    const directPush = raw({ ...push, after: 'f'.repeat(40) });
+    const signed = createHmac('sha256', nextSecret).update(directPush).digest('hex');
+    const directDelivery = (await deliver(directPush, 'push', signed).expect(200)).body.data;
+    assert.equal(directDelivery.accepted, true);
+    const directRun = await db
+      .selectFrom('pipeline_runs')
+      .select(['target_id', 'target_selection_json'])
+      .where('task_id', '=', directDelivery.taskId)
+      .executeTakeFirstOrThrow();
+    assert.equal(directRun.target_id, null);
+    assert.deepEqual(JSON.parse(directRun.target_selection_json!).groupIds, [group.id]);
   } finally {
     await app.close();
     model.closeAllConnections();

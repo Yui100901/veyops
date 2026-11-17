@@ -21,10 +21,26 @@ import { DatabaseService } from '../../core/database/database.service';
 import type { ArtifactsTable, Database } from '../../core/database/schema';
 import type { Kysely, Selectable } from 'kysely';
 import type { PipelineSnapshot, PipelineArtifact } from '../pipelines/pipeline.types';
+import type { TaskPayload } from '../tasks/tasks.types';
+import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
 import { archiveKey, isLocalImage } from './artifact-availability';
 
 const uuid = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
 const sha256 = /^[a-f0-9]{64}$/;
+
+function historicalServerSelection(value: string | null) {
+  if (!value) return null;
+  const payload = JSON.parse(value) as TaskPayload;
+  return payload.targets?.length
+    ? {
+        serverIds: payload.targets.map((target) => target.id),
+        groupIds: [],
+        strategy: payload.strategy,
+        maxParallel: payload.maxParallel,
+        failurePolicy: payload.failurePolicy,
+      }
+    : null;
+}
 const digest = /^sha256:[a-f0-9]{64}$/;
 const registryReference = /^[a-zA-Z0-9._:/-]+@sha256:[a-f0-9]{64}$/;
 const registryTag = /^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$/;
@@ -161,6 +177,8 @@ export class ArtifactsService {
         'pipeline_versions.version as pipelineVersion',
         'pipeline_runs.environment_id as environmentId',
         'pipeline_runs.target_id as targetId',
+        'pipeline_runs.target_selection_json as targetSelectionJson',
+        'tasks.payload_json as sourceTaskPayload',
         'tasks.status as taskStatus',
       ]);
     if (projectId) query = query.where('artifacts.project_id', '=', projectId);
@@ -174,6 +192,9 @@ export class ArtifactsService {
       pipelineVersion: r.pipelineVersion,
       environmentId: r.environmentId,
       targetId: r.targetId,
+      targetSelection:
+        historicalServerSelection(r.sourceTaskPayload) ??
+        storedDeploymentSelection(r.targetSelectionJson),
       deployable:
         (r.taskStatus === 'SUCCESS' || r.taskStatus === 'PARTIAL_FAILED') &&
         hasDeployableMetadata(r),

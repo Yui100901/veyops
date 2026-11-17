@@ -5,7 +5,7 @@ Pipeline是服务级的版本化交付配置。每次修改追加不可变版本
 ## 配置与运行
 
 1. 创建项目、HTTP(S) Git 仓库、服务和环境。管理员可为私有仓库关联 Git Token 或用户名密码凭据。打开仓库详情测试连接、浏览分支和最近提交。
-2. 创建部署目标并明确服务器成员及执行顺序、并发和失败策略。
+2. 在服务环境或运行表单直接选择服务器和服务器分组，并设置执行方式、并发和失败策略。预览展示展开后的成员。
 3. 创建Pipeline，选择仓库、构建位置、产物类型、构建命令及专用部署目录。
 4. 可选地保存服务环境配置及环境变量。非空环境配置覆盖Pipeline的同名构建/部署字段，服务环境变量覆盖环境变量。
 5. 在 Pipeline 运行对话框选版本，再从该版本的仓库选择分支和提交，也可直接输入 40 或 64 位完整 SHA。预览确认后，任务始终使用该 SHA。
@@ -38,7 +38,7 @@ Pipeline是服务级的版本化交付配置。每次修改追加不可变版本
 
 服务环境配置中的工作目录以仓库根为基准，例如 `apps/web`。填写后覆盖 Pipeline 的 `repoPath`，留空时继承。安装、构建、文件产物、Dockerfile 和 Compose 路径均相对于有效工作目录。
 
-通过 `POST /api/v1/pipelines/:id/run` 提交运行，参数为 `{environmentId,targetId,commitSha,version?,confirmed:true,mode?,allowPartialDeploy?}`。省略 `version` 时固定当前版本。提交可携带预览返回的 `configurationHash` 和 `serverIds` 作为 `expectedConfigurationHash` 和 `expectedServerIds`，资源变化后需要重新预览。AI 确认流程也会校验目标和配置哈希。
+通过 `POST /api/v1/pipelines/:id/run` 提交运行，提供环境、提交、版本及目标配置。选择可由 `serverIds`、`groupIds` 指定或继承服务环境。提交时确认 `confirmed:true` 并携带预览返回的 `configurationHash` 作为 `expectedConfigurationHash`。可同时带上预览成员作为 `expectedServerIds`。资源变化后需要重新预览，AI 确认流程也会校验成员和配置哈希。
 
 ## 仅构建
 
@@ -54,7 +54,7 @@ Pipeline是服务级的版本化交付配置。每次修改追加不可变版本
 
 ## 部署已有产物
 
-从构建任务的产物区或交付记录的产物列表选择部署，预览来源 SHA、版本、环境和目标，确认后可打开新的部署任务。API 先调用 `POST /pipelines/:id/artifact-deploy/preview`，请求包含 `{artifactIds,environmentId,targetId,version?}`。确认时调用 `POST /pipelines/:id/artifact-deploy`，同时提供 `confirmed: true`、预览的 `expectedConfigurationHash`，以及可选的 `expectedServerIds`。
+从构建任务的产物区或交付记录的产物列表选择部署，预览来源 SHA、版本、环境和目标，确认后可打开新的部署任务。API 先调用 `POST /pipelines/:id/artifact-deploy/preview`，提交 `artifactIds`、`environmentId`、选定的 `serverIds` 或 `groupIds`，以及可选的 `version`。确认时调用 `POST /pipelines/:id/artifact-deploy`，同时提供 `confirmed: true`、预览返回的 `configurationHash` 作为 `expectedConfigurationHash`，以及可选的 `expectedServerIds`。
 
 所选产物来自同一 Pipeline、环境及构建任务。管理端产物可分发到所选环境的目标，目标端产物须和所选服务器逐一匹配。默认使用来源构建的 Pipeline 版本。部署会再次校验文件归档、镜像和 Compose 数据，任务直接进入发布准备。只有可验证归档、来源或 Compose 数据齐备的历史产物可部署，其他历史仍可查询。
 

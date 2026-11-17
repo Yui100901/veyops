@@ -33,21 +33,40 @@ import { CredentialsService } from '../credentials/credentials.service';
 import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
-import { SshService } from '../../infrastructure/ssh/ssh.service';
+import { SshHostKeyMismatchError, SshService } from '../../infrastructure/ssh/ssh.service';
 import { summarizeProbe } from '../../infrastructure/ssh/server-probe';
 import { recentDeployments } from '../deployments/deployment-history';
+import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
 import type { Selectable } from 'kysely';
 import type { Database } from '../../core/database/schema';
+import {
+  acceptHostKey,
+  hostKeyAcceptanceToken,
+  hostKeyFingerprint,
+  normalizeSshHost,
+  offerHostKey,
+  sameHostKey,
+} from './host-key-acceptance';
 
-class ServerDto {
-  @IsString() @MinLength(1) @MaxLength(100) name!: string;
+class SshEndpointDto {
   @IsString() @Matches(/^[a-zA-Z0-9:._-]{1,253}$/) host!: string;
   @IsInt() @Min(1) @Max(65535) port = 22;
+}
+
+class HostKeyProbeDto extends SshEndpointDto {
+  @IsOptional() @IsUUID() serverId?: string;
+}
+
+class AcceptHostKeyDto {
+  @IsString() @Matches(hostKeyAcceptanceToken) hostKeyAcceptanceToken!: string;
+}
+
+class ServerDto extends SshEndpointDto {
+  @IsString() @MinLength(1) @MaxLength(100) name!: string;
   @IsString() @Matches(/^[a-zA-Z0-9_.-]{1,64}$/) username!: string;
   @IsUUID() credentialId!: string;
-  @IsString()
-  @Matches(/^(?:SHA256:[A-Za-z0-9+/]{43}=?|[a-fA-F0-9]{64})$/)
-  hostKeyFingerprint!: string;
+  @IsOptional() @IsString() @Matches(hostKeyFingerprint) hostKeyFingerprint?: string;
+  @IsOptional() @IsString() @Matches(hostKeyAcceptanceToken) hostKeyAcceptanceToken?: string;
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(20)
@@ -124,10 +143,18 @@ export class ServersService {
         .selectFrom('projects as projects')
         .innerJoin('services as services', 'services.project_id', 'projects.id')
         .innerJoin('service_environment_configs as configs', 'configs.service_id', 'services.id')
-        .innerJoin('deployment_target_servers as members', 'members.target_id', 'configs.target_id')
-        .select(['projects.id as id', 'projects.name as name', 'projects.slug as slug'])
-        .distinct()
-        .where('members.server_id', '=', id)
+        .leftJoin('deployment_target_servers as members', (join) =>
+          join
+            .onRef('members.target_id', '=', 'configs.target_id')
+            .on('members.server_id', '=', id),
+        )
+        .select([
+          'projects.id as id',
+          'projects.name as name',
+          'projects.slug as slug',
+          'configs.target_selection_json',
+          'members.server_id as legacyServerId',
+        ])
         .where('projects.deleted_at', 'is', null)
         .orderBy('projects.name')
         .execute(),
@@ -164,7 +191,18 @@ export class ServersService {
     return {
       ...server,
       groups,
-      projects,
+      projects: [
+        ...new Map(
+          projects.flatMap(({ target_selection_json, legacyServerId, ...project }) => {
+            const selection = storedDeploymentSelection(target_selection_json);
+            const applies = selection
+              ? selection.serverIds.includes(id) ||
+                groups.some((group) => selection.groupIds.includes(group.id))
+              : legacyServerId === id;
+            return applies ? [[project.id, project] as const] : [];
+          }),
+        ).values(),
+      ],
       recentDeployments: deployments,
       recentCommands: commands,
       probeHistory: probes.map((row) => {
@@ -183,69 +221,191 @@ export class ServersService {
     };
   }
   async create(dto: ServerDto, userId: string) {
+    if (Boolean(dto.hostKeyFingerprint) === Boolean(dto.hostKeyAcceptanceToken))
+      throw new BadRequestException('请探测并确认 SSH 主机指纹，或提供一个已独立核对的指纹');
+    const host = normalizeSshHost(dto.host);
     await this.credentials.assertSsh(dto.credentialId);
     const now = Date.now();
     const id = randomUUID();
-    await this.database.db
-      .insertInto('servers')
-      .values({
+    await this.database.db.transaction().execute(async (tx) => {
+      const fingerprint = dto.hostKeyAcceptanceToken
+        ? await acceptHostKey(tx, dto.hostKeyAcceptanceToken, { host, port: dto.port, userId })
+        : dto.hostKeyFingerprint!;
+      await tx
+        .insertInto('servers')
+        .values({
+          id,
+          name: dto.name,
+          host,
+          port: dto.port,
+          username: dto.username,
+          credential_id: dto.credentialId,
+          host_key_fingerprint: fingerprint,
+          tags_json: JSON.stringify(dto.tags || []),
+          description: dto.description ?? '',
+          status: 'UNKNOWN',
+          os_type: null,
+          last_checked_at: null,
+          is_active: 1,
+          created_at: now,
+          updated_at: now,
+        })
+        .execute();
+      await this.audit.record(
+        userId,
+        'server.create',
+        'server',
         id,
-        name: dto.name,
-        host: dto.host,
-        port: dto.port,
-        username: dto.username,
-        credential_id: dto.credentialId,
-        host_key_fingerprint: dto.hostKeyFingerprint,
-        tags_json: JSON.stringify(dto.tags || []),
-        description: dto.description ?? '',
-        status: 'UNKNOWN',
-        os_type: null,
-        last_checked_at: null,
-        is_active: 1,
-        created_at: now,
-        updated_at: now,
-      })
-      .execute();
-    await this.audit.record(userId, 'server.create', 'server', id);
+        { host, port: dto.port, fingerprint },
+        tx,
+      );
+    });
     return this.get(id);
   }
+
+  async probeHostKey(dto: HostKeyProbeDto, userId: string) {
+    const host = normalizeSshHost(dto.host);
+    const previous = dto.serverId ? await this.get(dto.serverId) : undefined;
+    let observed: Awaited<ReturnType<SshService['inspectHostKey']>>;
+    try {
+      observed = await this.ssh.inspectHostKey({ host, port: dto.port });
+    } catch {
+      throw new BadRequestException('未能读取 SSH 主机指纹，请检查连接地址、端口和网络');
+    }
+    const offer = await offerHostKey(
+      this.database.db,
+      { host, port: dto.port, userId, fingerprint: observed.fingerprint },
+      previous,
+    );
+    return {
+      host,
+      port: dto.port,
+      ...observed,
+      ...offer,
+      ...(previous && {
+        ...(previous.hostKeyFingerprint && { previousFingerprint: previous.hostKeyFingerprint }),
+        ...(host === normalizeSshHost(previous.host) &&
+          dto.port === previous.port && {
+            matchesPrevious: sameHostKey(observed.fingerprint, previous.hostKeyFingerprint),
+          }),
+      }),
+    };
+  }
+
   async update(id: string, dto: ServerDto, userId: string) {
     const previous = await this.get(id);
+    const host = normalizeSshHost(dto.host);
+    const endpointChanged = normalizeSshHost(previous.host) !== host || previous.port !== dto.port;
+    if (endpointChanged && (!dto.hostKeyAcceptanceToken || dto.hostKeyFingerprint))
+      throw new BadRequestException('已更改 SSH 地址或端口，请重新探测并确认主机指纹');
+    if (
+      !endpointChanged &&
+      (dto.hostKeyAcceptanceToken ||
+        (dto.hostKeyFingerprint &&
+          !sameHostKey(dto.hostKeyFingerprint, previous.hostKeyFingerprint)))
+    )
+      throw new BadRequestException('请使用主机指纹的独立确认操作');
     await this.credentials.assertSsh(dto.credentialId);
     const connectionChanged =
-      previous.host !== dto.host ||
-      previous.port !== dto.port ||
+      endpointChanged ||
       previous.username !== dto.username ||
-      previous.credentialId !== dto.credentialId ||
-      previous.hostKeyFingerprint !== dto.hostKeyFingerprint;
-    await this.database.db
-      .updateTable('servers')
-      .set({
-        name: dto.name,
-        host: dto.host,
-        port: dto.port,
-        username: dto.username,
-        credential_id: dto.credentialId,
-        host_key_fingerprint: dto.hostKeyFingerprint,
-        tags_json: JSON.stringify(dto.tags || []),
-        description: dto.description ?? previous.description,
-        ...(connectionChanged ? { status: 'UNKNOWN', last_checked_at: null, os_type: null } : {}),
-        updated_at: Date.now(),
-      })
-      .where('id', '=', id)
-      .where('is_active', '=', 1)
-      .execute();
-    await this.audit.record(userId, 'server.update', 'server', id);
+      previous.credentialId !== dto.credentialId;
+    await this.database.db.transaction().execute(async (tx) => {
+      const fingerprint = dto.hostKeyAcceptanceToken
+        ? await acceptHostKey(
+            tx,
+            dto.hostKeyAcceptanceToken,
+            { host, port: dto.port, userId },
+            previous,
+          )
+        : undefined;
+      const saved = await tx
+        .updateTable('servers')
+        .set({
+          name: dto.name,
+          host: endpointChanged ? host : previous.host,
+          port: dto.port,
+          username: dto.username,
+          credential_id: dto.credentialId,
+          ...(fingerprint && { host_key_fingerprint: fingerprint }),
+          tags_json: JSON.stringify(dto.tags || []),
+          description: dto.description ?? previous.description,
+          ...(connectionChanged ? { status: 'UNKNOWN', last_checked_at: null, os_type: null } : {}),
+          updated_at: Math.max(Date.now(), previous.updatedAt + 1),
+        })
+        .where('id', '=', id)
+        .where('is_active', '=', 1)
+        .where('updated_at', '=', previous.updatedAt)
+        .returning('id')
+        .executeTakeFirst();
+      if (!saved) throw new ConflictException('服务器配置已变化，请刷新后重试');
+      const detail = fingerprint
+        ? {
+            previous: {
+              host: previous.host,
+              port: previous.port,
+              fingerprint: previous.hostKeyFingerprint || null,
+            },
+            accepted: { host, port: dto.port, fingerprint },
+          }
+        : {};
+      await this.audit.record(userId, 'server.update', 'server', id, detail, tx);
+    });
     return this.get(id);
   }
+
+  async confirmHostKey(id: string, dto: AcceptHostKeyDto, userId: string) {
+    const previous = await this.get(id);
+    const host = normalizeSshHost(previous.host);
+    await this.database.db.transaction().execute(async (tx) => {
+      const accepted = await acceptHostKey(
+        tx,
+        dto.hostKeyAcceptanceToken,
+        { host, port: previous.port, userId },
+        previous,
+      );
+      if (sameHostKey(accepted, previous.hostKeyFingerprint)) return;
+      const saved = await tx
+        .updateTable('servers')
+        .set({
+          host_key_fingerprint: accepted,
+          status: 'UNKNOWN',
+          last_checked_at: null,
+          os_type: null,
+          updated_at: Math.max(Date.now(), previous.updatedAt + 1),
+        })
+        .where('id', '=', id)
+        .where('is_active', '=', 1)
+        .where('updated_at', '=', previous.updatedAt)
+        .returning('id')
+        .executeTakeFirst();
+      if (!saved) throw new ConflictException('服务器配置已变化，请重新探测并确认');
+      await this.audit.record(
+        userId,
+        'server.host_key.accept',
+        'server',
+        id,
+        {
+          host,
+          port: previous.port,
+          previousFingerprint: previous.hostKeyFingerprint || null,
+          fingerprint: accepted,
+        },
+        tx,
+      );
+    });
+    return this.get(id);
+  }
+
   async test(id: string, userId: string) {
     const server = await this.get(id);
     let result: Awaited<ReturnType<SshService['probe']>> | null = null;
+    let hostKeyMismatch: SshHostKeyMismatchError | undefined;
     try {
       const probe = await this.ssh.probe(server);
       if (probe.exitCode === 0) result = probe;
-    } catch {
-      // Connection failures are reported as offline. Database and audit failures propagate separately.
+    } catch (error) {
+      if (error instanceof SshHostKeyMismatchError) hostKeyMismatch = error;
     }
     const checkedAt = Date.now();
     const status = result ? 'ONLINE' : 'OFFLINE';
@@ -259,7 +419,16 @@ export class ServersService {
       .returning('id')
       .executeTakeFirst();
     if (!updated) throw new ConflictException('服务器配置已变化，请重新检测');
-    await this.audit.record(userId, 'server.test', 'server', id, { status, checkedAt, ...summary });
+    await this.audit.record(userId, 'server.test', 'server', id, {
+      status,
+      checkedAt,
+      ...summary,
+      ...(hostKeyMismatch && { reason: 'HOST_KEY_MISMATCH' }),
+    });
+    if (hostKeyMismatch)
+      throw new ConflictException(
+        `${hostKeyMismatch.message}，核实后请选择「核对 SSH 指纹」并重新确认`,
+      );
     if (!result)
       throw new BadRequestException('SSH 连接失败：请检查地址、凭据、网络及已确认的主机指纹');
     return { success: true, server: await this.get(id), result };
@@ -286,6 +455,19 @@ class ServersController {
   }
   @Roles('ADMIN', 'OPERATOR') @Post() create(@Body() dto: ServerDto, @Req() req: AuthRequest) {
     return this.service.create(dto, req.user.id);
+  }
+  @Roles('ADMIN', 'OPERATOR') @Post('host-key/probe') probeHostKey(
+    @Body() dto: HostKeyProbeDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.probeHostKey(dto, req.user.id);
+  }
+  @Roles('ADMIN', 'OPERATOR') @Post(':id/host-key/accept') confirmHostKey(
+    @Param('id') id: string,
+    @Body() dto: AcceptHostKeyDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.confirmHostKey(id, dto, req.user.id);
   }
   @Roles('ADMIN', 'OPERATOR') @Patch(':id') update(
     @Param('id') id: string,

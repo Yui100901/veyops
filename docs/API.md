@@ -37,7 +37,9 @@
 | GET / POST           | /credentials               | 列表 / `{name,type,secret,metadata?}`                                                                        |
 | PATCH                | /credentials/:id           | `{name?,secret?,status?:'ACTIVE'\|'DISABLED'}`                                                               |
 | DELETE               | /credentials/:id           | 引用检查后删除                                                                                               |
-| GET / POST           | /servers                   | 列表 / `{name,host,port?:22,username,credentialId,hostKeyFingerprint,tags?,description?}`                    |
+| GET / POST           | /servers                   | 列表 / 创建时提交 `{name,host,port?:22,username,credentialId,hostKeyAcceptanceToken,tags?,description?}` |
+| POST                 | /servers/host-key/probe    | 提交 `{host,port?,serverId?}`，握手读取公钥并返回算法、指纹、一次性接受令牌及有效期 |
+| POST                 | /servers/:id/host-key/accept | 对已有服务器提交 `{hostKeyAcceptanceToken}`，确认探测到的新指纹 |
 | GET / PATCH          | /servers/:id               | 详情含分组、所属项目、探测与执行历史 / 完整服务器配置                                                        |
 | DELETE               | /servers/:id               | 软移除，不删除历史                                                                                           |
 | POST                 | /servers/:id/test          | 只读连接检查，返回 `{success,server,result:{exitCode,output}}`                                               |
@@ -189,6 +191,8 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 
 ## v0.2 交付接口
 
+服务环境、流水线运行、产物部署和 Webhook 可直接提交 `serverIds` 或 `groupIds`，可同时选用两者，并配置 `strategy`、`maxParallel` 和 `failurePolicy`。运行与产物部署可继承服务环境的选择。预览返回已去重的 `serverIds` 与保存的 `targetSelection`。提交时携带 `expectedConfigurationHash`，成员变化后重新预览。旧 `targetId` 及相关接口保留兼容。
+
 | 方法             | 路径                                               | 说明                                                                                                     |
 | ---------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | GET/POST         | /deployment-targets                                | 目标列表/创建：`{name,serverIds,strategy,maxParallel,failurePolicy,description?}`                        |
@@ -201,12 +205,12 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 | GET/PATCH/DELETE | /pipelines/:id                                     | 查询/新增版本/禁用并保留历史                                                                             |
 | GET              | /pipelines/:id/versions                            | 不可变历史版本                                                                                           |
 | POST             | /pipelines/:id/preview                             | 固定版本、环境配置与目标的执行预览                                                                       |
-| POST             | /pipelines/:id/run                                 | 接收 `{environmentId,targetId,commitSha,version?,confirmed:true,mode?,allowPartialDeploy?}` 并返回构建任务 |
-| POST             | /pipelines/:id/artifact-deploy/preview             | 接收 `{artifactIds,environmentId,targetId,version?}`，返回来源提交、选定版本、目标及 `configurationHash` |
+| POST             | /pipelines/:id/run                                 | 接收环境、目标选择、`commitSha`、`confirmed: true` 和预览的 `expectedConfigurationHash`，返回构建任务 |
+| POST             | /pipelines/:id/artifact-deploy/preview             | 接收 `artifactIds`、`environmentId`、目标选择和可选 `version`，返回来源提交、选定版本、目标及 `configurationHash` |
 | POST             | /pipelines/:id/artifact-deploy                     | 与产物预览参数相同，另需 `confirmed: true`、`expectedConfigurationHash`，可带 `expectedServerIds`。返回部署任务 |
-| GET/PUT          | /pipelines/:id/webhook                             | 管理员查询或保存 Gitea 触发配置 `{environmentId,targetId,branch,secretCredentialId,enabled}`             |
+| GET/PUT          | /pipelines/:id/webhook                             | 管理员查询或保存 Gitea 触发配置，提交环境、目标选择、`branch`、`secretCredentialId` 和 `enabled`             |
 | POST             | /webhooks/gitea/:pipelineId                        | 接收签名的 Gitea Push，按配置触发仅构建                                                                  |
-| GET              | /artifacts                                         | 产物列表，支持 `projectId` 和 `pipelineRunId` 筛选，返回 `downloadAvailable`、`deployable`、`pipelineId`、`pipelineVersion`、`environmentId` 和 `targetId` |
+| GET              | /artifacts                                         | 产物列表，支持 `projectId` 和 `pipelineRunId` 筛选，返回 `downloadAvailable`、`deployable`、`pipelineId`、`pipelineVersion`、`environmentId` 和归档时的 `targetSelection` |
 | GET              | /artifacts/:id/download                            | 登录后下载平台归档，响应头 `X-Artifact-SHA256` 提供校验和                                                |
 | GET              | /deployments                                       | 逐服务器交付记录，支持projectId筛选                                                                      |
 | GET/POST         | /registries                                        | Registry列表/创建（创建仅ADMIN）                                                                         |
@@ -216,7 +220,7 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 
 管理员和操作员可调用 `/projects/:projectId/repositories/:repositoryId/connection`、`/branches` 和 `/commits` 的 GET 接口检查仓库、读取分支和查询最近提交。`/commits` 接受 `branch` 和 `limit`，默认 20 条，最多 50 条。给仓库绑定凭据需要管理员角色。
 
-Pipeline 定义、四种组合、目录保护和环境覆盖规则见 [构建部署说明](PIPELINES.md)。环境配置字段包括 `targetId,buildLocation,artifactType,deployMethod,deployPath,buildCommand,workingDirectory,outputPath,composeFilePath,startCommand,healthCheckCommand`。敏感变量只接收凭据引用；普通值和引用二选一。
+Pipeline 定义、四种组合、目录保护和环境覆盖规则见 [构建部署说明](PIPELINES.md)。环境配置字段包括 `serverIds`、`groupIds`、`buildLocation`、`artifactType`、`deployMethod`、`deployPath`、`buildCommand`、`workingDirectory`、`outputPath`、`composeFilePath`、`startCommand` 和 `healthCheckCommand`。敏感变量以凭据引用传入。
 
 运行请求的 `mode` 支持 `DEPLOY`（默认）和 `BUILD_ONLY`。`DEPLOY` 在构建成功、产物归档后创建独立部署任务。默认整批成功后部署，`allowPartialDeploy: true` 允许目标端构建只发布成功目标。构建任务详情返回 `deliveryStage: "BUILD"`、`deploymentTaskId` 和 `deploymentSkippedReason`，部署任务详情返回 `deliveryStage: "DEPLOY"` 和 `sourceBuildTaskId`。
 

@@ -33,6 +33,7 @@ import {
 import type {
   Credential,
   DeploymentRecord,
+  DeploymentSelection,
   Project,
   ProjectDetail,
   Server,
@@ -43,16 +44,14 @@ import type {
 import { RepositoryBrowser } from './RepositoryBrowser';
 import { ReleaseApprovals, RollbackRelease } from './ReleaseOperations';
 import { ArtifactCleanup, ArtifactRetentionPolicy } from './ArtifactRetention';
+import {
+  DeploymentSelectionPicker,
+  deploymentSelection,
+  hasDeploymentSelection,
+  selectedDeploymentServers,
+  useDeploymentInventory,
+} from './DeploymentSelection';
 
-export interface DeploymentTarget {
-  id: string;
-  name: string;
-  description?: string;
-  serverIds: string[];
-  strategy: 'PARALLEL' | 'SEQUENTIAL';
-  maxParallel: number;
-  failurePolicy: 'CONTINUE' | 'STOP';
-}
 export interface PipelineDefinition {
   repositoryId: string;
   buildLocation: 'TARGET' | 'MANAGER';
@@ -191,8 +190,8 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
           <strong>一个流程，两种构建位置</strong>
           <p>目标端就地构建，或管理端在独立容器中构建一次、分发同一产物。运行时固定配置与版本。</p>
         </div>
-        <a className="text-link" href="#/targets">
-          管理部署目标 →
+        <a className="text-link" href="#/servers">
+          管理服务器与分组 →
         </a>
       </div>
       {pipelines.loading ? (
@@ -205,7 +204,7 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
             description={
               repositoryId
                 ? '创建 Pipeline 时会预填当前仓库，再选择服务和构建方式。'
-                : '先创建项目、仓库、服务和部署目标，再定义构建与发布方式。'
+                : '先创建项目、仓库和服务，再选择服务器或服务器分组执行。'
             }
             action={
               <a href="#/projects" className="button secondary">
@@ -267,6 +266,7 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
                     </button>
                     <button
                       className="button primary small"
+                      aria-label={`运行 ${p.name}`}
                       disabled={!p.enabled}
                       onClick={() => setRunning(p)}
                     >
@@ -298,28 +298,31 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
   );
 }
 
-type WebhookInput = {
+type WebhookInput = DeploymentSelection & {
   environmentId: string;
-  targetId: string;
   branch: string;
   secretCredentialId: string;
   enabled: boolean;
 };
-type WebhookConfig = WebhookInput & { endpoint: string; version?: number };
+type WebhookConfig = WebhookInput & {
+  endpoint: string;
+  version?: number;
+};
 
 function PipelineWebhook({ pipeline, onClose }: { pipeline: Pipeline; onClose: () => void }) {
   const path = `/pipelines/${pipeline.id}/webhook`;
   const configuration = useResource<WebhookConfig | null>(path);
   const project = useResource<ProjectDetail>(`/projects/${pipeline.projectId}`);
-  const targets = useResource<DeploymentTarget[]>('/deployment-targets');
+  const inventory = useDeploymentInventory();
   const credentials = useResource<Credential[]>('/credentials');
+  const [selection, setSelection] = useState<DeploymentSelection>(() => deploymentSelection());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const loading =
-    configuration.loading || project.loading || targets.loading || credentials.loading;
-  const loadError = configuration.error || project.error || targets.error || credentials.error;
+  const loading = configuration.loading || project.loading || credentials.loading;
+  const loadError = configuration.error || project.error || credentials.error;
   const config = configuration.data;
+  useEffect(() => setSelection(deploymentSelection(config)), [config]);
   const sharedSecrets = credentials.data?.filter(
     (c) => c.type === 'CUSTOM_SECRET' && c.status === 'ACTIVE',
   );
@@ -335,10 +338,14 @@ function PipelineWebhook({ pipeline, onClose }: { pipeline: Pipeline; onClose: (
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (busy) return;
+    if (!hasDeploymentSelection(selection)) {
+      setError('请选择服务器或服务器分组。');
+      return;
+    }
     const values = new FormData(event.currentTarget);
     const input: WebhookInput = {
+      ...selection,
       environmentId: String(values.get('environmentId')),
-      targetId: String(values.get('targetId')),
       branch: String(values.get('branch')).trim(),
       secretCredentialId: String(values.get('secretCredentialId')),
       enabled: values.get('enabled') === 'on',
@@ -359,6 +366,7 @@ function PipelineWebhook({ pipeline, onClose }: { pipeline: Pipeline; onClose: (
   return (
     <Modal
       title="Gitea Webhook"
+      wide
       description={`匹配的 Push 事件会在专用构建环境中构建 ${pipeline.name}。生效的构建位置须为管理端，环境须适合自动构建且不含敏感变量。`}
       onClose={() => {
         if (!busy) onClose();
@@ -373,7 +381,6 @@ function PipelineWebhook({ pipeline, onClose }: { pipeline: Pipeline; onClose: (
             retry={() => {
               void configuration.reload();
               void project.reload();
-              void targets.reload();
               void credentials.reload();
             }}
           />
@@ -418,16 +425,15 @@ function PipelineWebhook({ pipeline, onClose }: { pipeline: Pipeline; onClose: (
               ))}
             </select>
           </Field>
-          <Field label="目标组" required>
-            <select name="targetId" required defaultValue={config?.targetId || ''}>
-              <option value="">选择目标组</option>
-              {targets.data?.map((target) => (
-                <option key={target.id} value={target.id}>
-                  {target.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {config?.targetId && !hasDeploymentSelection(selection) && (
+            <p className="field-note">请重新选择触发时使用的服务器或服务器分组。</p>
+          )}
+          <DeploymentSelectionPicker
+            inventory={inventory}
+            value={selection}
+            onChange={setSelection}
+            disabled={busy}
+          />
           <Field label="分支" required>
             <input
               name="branch"
@@ -906,7 +912,7 @@ type ExecutionMode = 'BUILD_ONLY' | 'DEPLOY';
 type PipelinePreview = {
   mode: ExecutionMode;
   environmentId: string;
-  targetId: string;
+  targetSelection?: DeploymentSelection | null;
   version: number;
   commitSha: string;
   definition: PipelineDefinition;
@@ -919,13 +925,15 @@ type PipelinePreview = {
 
 function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () => void }) {
   const project = useResource<ProjectDetail>(`/projects/${pipeline.projectId}`);
-  const targets = useResource<DeploymentTarget[]>('/deployment-targets');
-  const servers = useResource<Server[]>('/servers');
+  const inventory = useDeploymentInventory();
   const versions = useResource<{ version: number; definition: PipelineDefinition }[]>(
     `/pipelines/${pipeline.id}/versions`,
   );
   const [environmentId, setEnvironmentId] = useState('');
-  const [targetId, setTargetId] = useState('');
+  const environmentConfig = useResource<DeploymentSelection | null>(
+    environmentId ? `/services/${pipeline.serviceId}/environments/${environmentId}/config` : null,
+  );
+  const [selection, setSelection] = useState<DeploymentSelection>(() => deploymentSelection());
   const [commitSha, setCommitSha] = useState('');
   const [version, setVersion] = useState(pipeline.currentVersion);
   const [browsing, setBrowsing] = useState(false);
@@ -936,6 +944,10 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
   const [copyNotice, setCopyNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  useEffect(
+    () => setSelection(deploymentSelection(environmentConfig.data)),
+    [environmentConfig.data],
+  );
   const versionDefinition = versions.data?.find((entry) => entry.version === version)?.definition;
   const repositoryId =
     versionDefinition?.repositoryId ||
@@ -944,13 +956,17 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
   async function run(e: FormEvent) {
     e.preventDefault();
     if (busy) return;
+    if (!preview && !hasDeploymentSelection(selection)) {
+      setError('请选择服务器或服务器分组。');
+      return;
+    }
     setBusy(true);
     setError('');
     try {
       if (!preview) {
         const result = await post<PipelinePreview>(`/pipelines/${pipeline.id}/preview`, {
+          ...selection,
           environmentId,
-          targetId,
           commitSha,
           version,
           mode,
@@ -962,8 +978,8 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
         return;
       }
       const task = await post<Task>(`/pipelines/${pipeline.id}/run`, {
+        ...deploymentSelection(preview.targetSelection ?? selection),
         environmentId: preview.environmentId,
-        targetId: preview.targetId,
         commitSha: preview.commitSha,
         version: preview.version,
         mode: preview.mode,
@@ -975,7 +991,11 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
       });
       navigate(`/tasks/${task.id}`);
     } catch (err) {
-      if (err instanceof ApiError && err.status === 409) setPreview(undefined);
+      if (err instanceof ApiError && err.status === 409) {
+        setPreview(undefined);
+        void inventory.servers.reload();
+        void inventory.groups.reload();
+      }
       setError(message(err));
     } finally {
       setBusy(false);
@@ -983,13 +1003,13 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
   }
   const buildOnly = (preview?.mode ?? mode) === 'BUILD_ONLY';
   const definition = preview?.definition;
-  const targetName = targets.data?.find((t) => t.id === preview?.targetId)?.name;
   const environmentName = project.data?.environments.find(
     (e) => e.id === preview?.environmentId,
   )?.name;
   return (
     <Modal
       title={`运行 · ${pipeline.name}`}
+      wide
       description="选择 Git Commit、Pipeline 版本和执行目标。构建产物归档并校验后可进入部署阶段。"
       onClose={() => {
         if (!busy) onClose();
@@ -1017,7 +1037,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
         busy={busy}
         error={error}
       >
-        <ErrorBanner error={project.error || targets.error || versions.error} />
+        <ErrorBanner error={project.error || versions.error} />
         {!preview || !definition ? (
           <fieldset disabled={busy}>
             <Field label="运行模式" required>
@@ -1033,7 +1053,10 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
               <select
                 value={environmentId}
                 required
-                onChange={(e) => setEnvironmentId(e.target.value)}
+                onChange={(e) => {
+                  setEnvironmentId(e.target.value);
+                  setSelection(deploymentSelection());
+                }}
               >
                 <option value="">选择项目环境</option>
                 {project.data?.environments.map((e) => (
@@ -1043,20 +1066,17 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 ))}
               </select>
             </Field>
-            <Field
-              label={buildOnly ? '目标组' : '部署目标'}
-              required
-              hint={buildOnly ? '提供目标端构建所用的服务器和执行策略。' : undefined}
-            >
-              <select value={targetId} required onChange={(e) => setTargetId(e.target.value)}>
-                <option value="">明确选择目标</option>
-                {targets.data?.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.name} · {t.serverIds?.length || 0} 台
-                  </option>
-                ))}
-              </select>
-            </Field>
+            <ErrorBanner error={environmentConfig.error} retry={environmentConfig.reload} />
+            {environmentId && environmentConfig.loading ? (
+              <Loading />
+            ) : (
+              <DeploymentSelectionPicker
+                inventory={inventory}
+                value={selection}
+                onChange={setSelection}
+                disabled={busy}
+              />
+            )}
             {!buildOnly && (
               <label className="checkbox-row">
                 <input
@@ -1146,7 +1166,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                     : `将对 ${preview.serverIds.length} 台服务器执行构建与部署`}
                 </strong>
                 <p>
-                  {targetName} · {environmentName} · Pipeline v{preview.version}
+                  {[environmentName, `Pipeline v${preview.version}`].filter(Boolean).join(' · ')}
                 </p>
               </div>
             </div>
@@ -1171,16 +1191,16 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
               <strong>{buildLabels[definition.buildLocation]}</strong>
               <span>产物类型</span>
               <strong>{definition.artifactType === 'FILE' ? '文件' : 'Docker 镜像'}</strong>
-              {(!buildOnly || definition.buildLocation === 'TARGET') && (
-                <>
-                  <span>目标服务器</span>
-                  <span>
-                    {preview.serverIds
-                      .map((id) => servers.data?.find((server) => server.id === id)?.name || id)
-                      .join('、')}
-                  </span>
-                </>
-              )}
+              <span>
+                {buildOnly && definition.buildLocation === 'MANAGER' ? '关联服务器' : '目标服务器'}
+              </span>
+              <span>
+                {preview.serverIds
+                  .map(
+                    (id) => inventory.servers.data?.find((server) => server.id === id)?.name || id,
+                  )
+                  .join('、')}
+              </span>
               {!buildOnly && (
                 <>
                   <span>发布范围</span>
@@ -1293,7 +1313,7 @@ type Artifact = {
   pipelineVersion?: number;
   serverId?: string | null;
   environmentId?: string;
-  targetId?: string;
+  targetSelection?: DeploymentSelection | null;
   deployable?: boolean;
   pinnedAt?: number | null;
   prunedAt?: number | null;
@@ -1441,35 +1461,40 @@ function DeployArtifacts({
   onClose: () => void;
 }) {
   const project = useResource<ProjectDetail>(`/projects/${artifact.projectId}`);
-  const targets = useResource<DeploymentTarget[]>('/deployment-targets');
-  const servers = useResource<Server[]>('/servers');
+  const inventory = useDeploymentInventory();
   const versions = useResource<{ version: number; definition: PipelineDefinition }[]>(
     `/pipelines/${artifact.pipelineId}/versions`,
   );
   const batch = useResource<Artifact[]>(
     `/artifacts?pipelineRunId=${encodeURIComponent(artifact.pipelineRunId)}`,
   );
-  const [targetId, setTargetId] = useState(artifact.targetId ?? '');
+  const [selection, setSelection] = useState<DeploymentSelection>(() => {
+    const source = deploymentSelection(artifact.targetSelection);
+    return !hasDeploymentSelection(source) && artifact.serverId
+      ? { ...source, serverIds: [artifact.serverId] }
+      : source;
+  });
   const [version, setVersion] = useState(artifact.pipelineVersion);
   const [preview, setPreview] = useState<ArtifactDeployPreview>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const selectedTarget = targets.data?.find((target) => target.id === targetId);
+  const selectedServers = selectedDeploymentServers(selection, inventory.groups.data ?? []);
+  const groupsLoading = Boolean(selection.groupIds?.length && inventory.groups.loading);
   const environment = project.data?.environments.find(
     (entry) => entry.id === artifact.environmentId,
   );
-  const serverNames = new Map(servers.data?.map((server) => [server.id, server.name]));
+  const serverNames = new Map(inventory.servers.data?.map((server) => [server.id, server.name]));
   const deployableArtifacts = batch.data?.filter(isDeployableArtifact) ?? [];
   const matchingArtifacts = artifact.serverId
     ? deployableArtifacts.filter(
-        (entry) => entry.serverId && selectedTarget?.serverIds.includes(entry.serverId),
+        (entry) => entry.serverId && selectedServers.includes(entry.serverId),
       )
     : deployableArtifacts.filter((entry) => entry.id === artifact.id);
   const coveredServers = new Set(matchingArtifacts.map((entry) => entry.serverId));
   const missingServers = artifact.serverId
-    ? (selectedTarget?.serverIds.filter((id) => !coveredServers.has(id)) ?? [])
+    ? selectedServers.filter((id) => !coveredServers.has(id))
     : [];
-  const resourceError = project.error || targets.error || versions.error || batch.error;
+  const resourceError = project.error || versions.error || batch.error;
 
   async function deploy(event: FormEvent) {
     event.preventDefault();
@@ -1477,12 +1502,13 @@ function DeployArtifacts({
     if (
       !preview &&
       (!environment ||
-        !selectedTarget?.serverIds.length ||
+        groupsLoading ||
+        !selectedServers.length ||
         !versions.data?.some((entry) => entry.version === version) ||
         !matchingArtifacts.length ||
         missingServers.length)
     ) {
-      setError('请确认环境、部署配置版本和目标，并选择产物齐全的目标组。');
+      setError('请确认环境、部署配置版本，并选择产物齐全的服务器或服务器分组。');
       return;
     }
     setBusy(true);
@@ -1491,18 +1517,18 @@ function DeployArtifacts({
     try {
       if (!preview) {
         const result = await post<ArtifactDeployPreview>(`${path}/preview`, {
+          ...selection,
           artifactIds: matchingArtifacts.map((entry) => entry.id),
           environmentId: artifact.environmentId,
-          targetId,
           version,
         });
         setPreview(result);
         return;
       }
       const task = await post<Task>(path, {
+        ...deploymentSelection(preview.targetSelection ?? selection),
         artifactIds: preview.artifactIds,
         environmentId: preview.environmentId,
-        targetId: preview.targetId,
         version: preview.version,
         expectedServerIds: preview.serverIds,
         expectedConfigurationHash: preview.configurationHash,
@@ -1511,7 +1537,12 @@ function DeployArtifacts({
       onClose();
       navigate(`/tasks/${task.id}`);
     } catch (err) {
-      if (err instanceof ApiError && err.status === 409) setPreview(undefined);
+      if (err instanceof ApiError && err.status === 409) {
+        setPreview(undefined);
+        void inventory.servers.reload();
+        void inventory.groups.reload();
+        void batch.reload();
+      }
       setError(message(err));
     } finally {
       setBusy(false);
@@ -1521,6 +1552,7 @@ function DeployArtifacts({
   return (
     <Modal
       title="部署已归档产物"
+      wide
       description="核对发布目标和部署配置，使用同一次构建中已校验的归档。"
       onClose={() => {
         if (!busy) onClose();
@@ -1549,7 +1581,7 @@ function DeployArtifacts({
                   台服务器
                 </strong>
                 <p>
-                  {environment?.name} · {selectedTarget?.name} · Pipeline v{preview.version}
+                  {[environment?.name, `Pipeline v${preview.version}`].filter(Boolean).join(' · ')}
                 </p>
               </div>
             </div>
@@ -1597,21 +1629,13 @@ function DeployArtifacts({
             <Field label="环境" hint="沿用构建时的服务环境。">
               <output>{environment?.name || (project.loading ? '加载中…' : '原环境不可用')}</output>
             </Field>
-            <Field label="部署目标" required>
-              <select
-                required
-                value={targetId}
-                onChange={(event) => setTargetId(event.target.value)}
-              >
-                <option value="">选择目标组</option>
-                {targets.data?.map((target) => (
-                  <option value={target.id} key={target.id}>
-                    {target.name} · {target.serverIds.length} 台
-                  </option>
-                ))}
-              </select>
-            </Field>
-            {missingServers.length > 0 && !batch.loading && (
+            <DeploymentSelectionPicker
+              inventory={inventory}
+              value={selection}
+              onChange={setSelection}
+              disabled={busy}
+            />
+            {missingServers.length > 0 && !batch.loading && !groupsLoading && (
               <p className="field-note">
                 本次构建缺少以下目标的归档：
                 {missingServers.map((id) => serverNames.get(id) ?? id).join('、')}

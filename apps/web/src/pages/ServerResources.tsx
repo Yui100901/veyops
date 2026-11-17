@@ -2,11 +2,29 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Pencil, Plus, Trash2, Users } from 'lucide-react';
 import { api, formatTime, message, post, remove, useResource } from '../api';
-import { Confirm, ErrorBanner, Field, Form, Loading, Modal, Section, Status } from '../components';
+import {
+  Confirm,
+  ErrorBanner,
+  Field,
+  Form,
+  Loading,
+  Modal,
+  RefreshButton,
+  Section,
+  Status,
+} from '../components';
 import type { DeploymentSummary, Server, ServerDetail, ServerGroup } from '../models';
 import { ServerPicker } from './BatchTargets';
 
-export function ServerGroups({ servers, canEdit }: { servers: Server[]; canEdit: boolean }) {
+export function ServerGroups({
+  servers,
+  canEdit,
+  serversLoading,
+}: {
+  servers: Server[];
+  canEdit: boolean;
+  serversLoading: boolean;
+}) {
   const groups = useResource<ServerGroup[]>('/server-groups');
   const [editing, setEditing] = useState<ServerGroup | 'new'>();
   const [deleting, setDeleting] = useState<ServerGroup>();
@@ -31,12 +49,15 @@ export function ServerGroups({ servers, canEdit }: { servers: Server[]; canEdit:
       <Section
         title="服务器分组"
         action={
-          canEdit && (
-            <button className="button secondary" onClick={() => setEditing('new')}>
-              <Plus size={16} />
-              创建分组
-            </button>
-          )
+          <>
+            <RefreshButton onClick={groups.reload} />
+            {canEdit && (
+              <button className="button primary" onClick={() => setEditing('new')}>
+                <Plus size={18} />
+                创建分组
+              </button>
+            )}
+          </>
         }
       >
         <ErrorBanner error={groups.error} retry={groups.reload} />
@@ -53,7 +74,7 @@ export function ServerGroups({ servers, canEdit }: { servers: Server[]; canEdit:
                 </span>
                 <div>
                   <strong>{group.name}</strong>
-                  <small>{group.description}</small>
+                  {group.description && <small>{group.description}</small>}
                   <div className="tags">
                     {group.serverIds.map((id) => (
                       <span className="tag" key={id}>
@@ -93,6 +114,7 @@ export function ServerGroups({ servers, canEdit }: { servers: Server[]; canEdit:
         <GroupEditor
           group={editing === 'new' ? undefined : editing}
           servers={servers}
+          serversLoading={serversLoading}
           onClose={() => setEditing(undefined)}
           onSave={() => {
             setEditing(undefined);
@@ -119,11 +141,13 @@ export function ServerGroups({ servers, canEdit }: { servers: Server[]; canEdit:
 function GroupEditor({
   group,
   servers,
+  serversLoading,
   onClose,
   onSave,
 }: {
   group?: ServerGroup;
   servers: Server[];
+  serversLoading: boolean;
   onClose: () => void;
   onSave: () => void;
 }) {
@@ -166,12 +190,16 @@ function GroupEditor({
           />
         </Field>
         <h3 className="field-title">分组成员</h3>
-        <ServerPicker
-          servers={servers}
-          selected={selected}
-          setSelected={setSelected}
-          disabled={busy}
-        />
+        {serversLoading ? (
+          <Loading />
+        ) : (
+          <ServerPicker
+            servers={servers}
+            selected={selected}
+            setSelected={setSelected}
+            disabled={busy}
+          />
+        )}
       </Form>
     </Modal>
   );

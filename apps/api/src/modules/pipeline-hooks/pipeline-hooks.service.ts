@@ -13,6 +13,7 @@ import { AuditService } from '../audit/audit.service';
 import { CredentialsService } from '../credentials/credentials.service';
 import { PipelinesService } from '../pipelines/pipelines.service';
 import { SavePipelineWebhookDto } from './pipeline-hooks.dto';
+import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
 
 export function pipelineWebhookEndpoint(id: string) {
   return `/api/v1/webhooks/gitea/${id}`;
@@ -23,6 +24,8 @@ function present(row: Selectable<Database['pipeline_webhooks']>) {
     pipelineId: row.pipeline_id,
     environmentId: row.environment_id,
     targetId: row.target_id,
+    ...storedDeploymentSelection(row.target_selection_json),
+    targetSelection: storedDeploymentSelection(row.target_selection_json) ?? null,
     branch: row.branch,
     secretCredentialId: row.secret_credential_id,
     enabled: row.enabled === 1,
@@ -143,7 +146,12 @@ export class PipelineHooksService {
       .where('pipeline_version', '=', hook.pipeline_version)
       .where('configuration_hash', '=', hook.configuration_hash)
       .where('environment_id', '=', hook.environment_id)
-      .where('target_id', '=', hook.target_id)
+      .where('target_id', hook.target_id === null ? 'is' : '=', hook.target_id)
+      .where(
+        'target_selection_json',
+        hook.target_selection_json === null ? 'is' : '=',
+        hook.target_selection_json,
+      )
       .where('secret_credential_id', '=', hook.secret_credential_id)
       .returning('pipeline_id')
       .executeTakeFirst();
@@ -207,8 +215,7 @@ export class PipelineHooksService {
       validateBranch(input.branch);
       await this.secret(input.secretCredentialId);
       const preview = await this.pipelines.preview(id, {
-        environmentId: input.environmentId,
-        targetId: input.targetId,
+        ...input,
         commitSha: '0'.repeat(40), // Preview only validates configuration; the delivery supplies a real commit.
         confirmed: true,
         mode: 'BUILD_ONLY',
@@ -216,7 +223,10 @@ export class PipelineHooksService {
       if (input.enabled) this.pipelines.assertAutomaticBuild(preview);
       const values = {
         environment_id: input.environmentId,
-        target_id: input.targetId,
+        target_id: input.targetId ?? null,
+        target_selection_json: preview.targetSelection
+          ? JSON.stringify(preview.targetSelection)
+          : null,
         secret_credential_id: input.secretCredentialId,
         branch: input.branch,
         enabled: input.enabled ? 1 : 0,
@@ -290,7 +300,9 @@ export class PipelineHooksService {
     await this.activeAdmin(hook.created_by);
     const input = {
       environmentId: hook.environment_id,
-      targetId: hook.target_id,
+      ...(storedDeploymentSelection(hook.target_selection_json) ?? {
+        targetId: hook.target_id ?? undefined,
+      }),
       commitSha: payload.after.toLowerCase(),
       confirmed: true,
       mode: 'BUILD_ONLY' as const,

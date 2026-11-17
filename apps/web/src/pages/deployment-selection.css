@@ -1,0 +1,44 @@
+.deployment-source-picker {
+  min-width: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+.deployment-source-picker > legend {
+  margin-bottom: 0.65rem;
+  font-weight: 600;
+}
+.deployment-source-columns {
+  display: grid;
+  gap: 0.9rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+}
+.deployment-source-columns > section {
+  min-width: 0;
+  padding: 0.65rem;
+  border: 1px solid #dce7e8;
+  border-radius: 0.5rem;
+}
+.deployment-source-columns h3 {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.35rem;
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+}
+.deployment-source-columns h3 span {
+  color: #52666c;
+  font-size: 0.9em;
+  font-weight: 400;
+}
+.deployment-source-columns .server-picker {
+  padding: 0;
+  max-height: 13rem;
+}
+.deployment-source-columns .server-option small,
+.deployment-source-selection p {
+  overflow-wrap: anywhere;
+}
+.deployment-source-selection p {
+  margin: 0.3rem 0 0;
+}

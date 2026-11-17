@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
 import { Server, utils, Connection } from 'ssh2';
-import { SshService, SshTarget } from '../infrastructure/ssh/ssh.service';
+import { SshHostKeyMismatchError, SshService, SshTarget } from '../infrastructure/ssh/ssh.service';
 import type { CredentialsService } from '../modules/credentials/credentials.service';
 
 test('SFTP uses verified SSH to upload content/files and download identical artifact bytes', async () => {
@@ -126,7 +126,7 @@ test('SFTP uses verified SSH to upload content/files and download identical arti
       service.upload({ ...target, hostKeyFingerprint: '0'.repeat(64) }, local, '/blocked', {
         timeout: 5,
       }),
-      /SFTP/,
+      SshHostKeyMismatchError,
     );
     assert.equal(files.has('/blocked'), false);
   } finally {

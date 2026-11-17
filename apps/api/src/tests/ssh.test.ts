@@ -4,7 +4,12 @@ import { after, before, test } from 'node:test';
 import { createHash, generateKeyPairSync } from 'node:crypto';
 import { AddressInfo, createServer } from 'node:net';
 import { Server, Connection, utils } from 'ssh2';
-import { SshExecutionError, SshService, SshTarget } from '../infrastructure/ssh/ssh.service';
+import {
+  SshExecutionError,
+  SshHostKeyMismatchError,
+  SshService,
+  SshTarget,
+} from '../infrastructure/ssh/ssh.service';
 import { CredentialsService } from '../modules/credentials/credentials.service';
 import { MultiTargetExecutor } from '../infrastructure/ssh/multi-target.executor';
 import type { TaskExecutionContext, TaskStatus } from '../modules/tasks/tasks.types';
@@ -27,11 +32,13 @@ if (parsedClientKey instanceof Error) throw parsedClientKey;
 const fingerprint = `SHA256:${createHash('sha256').update(parsed.getPublicSSH()).digest('base64').replace(/=+$/, '')}`;
 const connections = new Set<Connection>();
 let target: SshTarget;
+let authenticationRequests = 0;
 const server = new Server({ hostKeys: [hostKey] }, (connection) => {
   connections.add(connection);
   connection.on('close', () => connections.delete(connection));
   connection.on('error', () => undefined);
   connection.on('authentication', (ctx) => {
+    authenticationRequests++;
     if (ctx.method === 'password' && ctx.username === 'ops' && ctx.password === password)
       ctx.accept();
     else if (
@@ -93,6 +100,20 @@ after(async () => {
 const service = (secret = password) =>
   new SshService({ decrypt: async () => ({ password: secret }) } as unknown as CredentialsService);
 
+test('real SSH host-key probe stops before authentication and never loads a credential', async () => {
+  const requestsBefore = authenticationRequests;
+  const ssh = new SshService({
+    decrypt: async () => {
+      throw new Error('Host-key discovery must not decrypt credentials');
+    },
+  } as unknown as CredentialsService);
+  assert.deepEqual(await ssh.inspectHostKey({ host: target.host, port: target.port }), {
+    algorithm: 'ssh-rsa',
+    fingerprint,
+  });
+  assert.equal(authenticationRequests, requestsBefore);
+});
+
 test('real SSH connection validates host key, authenticates and redacts streamed credentials', async () => {
   let output = '';
   const result = await service().execute(target, 'inspect', {
@@ -106,10 +127,12 @@ test('real SSH connection validates host key, authenticates and redacts streamed
   assert.equal(output.includes(password), false);
 });
 test('real SSH rejects a changed host key and a wrong password', async () => {
+  const requestsBefore = authenticationRequests;
   await assert.rejects(
     service().execute({ ...target, hostKeyFingerprint: '0'.repeat(64) }, 'inspect', { timeout: 5 }),
-    /verification failed|host|fingerprint/i,
+    SshHostKeyMismatchError,
   );
+  assert.equal(authenticationRequests, requestsBefore);
   await assert.rejects(
     service('incorrect').execute(target, 'inspect', { timeout: 5 }),
     /authentication/i,

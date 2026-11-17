@@ -3,6 +3,10 @@ import type { Database } from '../../core/database/schema';
 import type { ReleasePolicy } from '../pipelines/pipeline.types';
 import type { PipelineSnapshot, PipelineTarget } from '../pipelines/pipeline.types';
 import { ConflictException } from '@nestjs/common';
+import {
+  selectedServerIds,
+  storedDeploymentSelection,
+} from '../deployment-targets/deployment-selection';
 
 export const pendingReleaseApprovalTime = Number.MAX_SAFE_INTEGER;
 
@@ -38,17 +42,41 @@ export async function assertCurrentTargets(
 ) {
   const config = await db
     .selectFrom('service_environment_configs')
-    .select(['target_id', 'deploy_path'])
+    .select(['target_id', 'target_selection_json', 'deploy_path'])
     .where('service_id', '=', pipeline.serviceId)
     .where('environment_id', '=', pipeline.environmentId)
     .executeTakeFirst();
   if (config?.deploy_path && config.deploy_path !== pipeline.definition.deployPath)
     throw new ConflictException('发布目录已变化，请重新预览并提交');
+  const snapshotIds =
+    pipeline.targetSelection && !pipeline.rollbackOfDeploymentId
+      ? await selectedServerIds(db, pipeline.targetSelection)
+      : undefined;
+  if (
+    snapshotIds &&
+    pipeline.targetMemberIds &&
+    JSON.stringify(pipeline.targetMemberIds) !== JSON.stringify(snapshotIds)
+  )
+    throw new ConflictException('发布成员已变化，请重新预览并提交');
+  const configured = storedDeploymentSelection(config?.target_selection_json);
+  const legacyId = config?.target_id ?? pipeline.targetId;
+  const currentIds = configured
+    ? await selectedServerIds(db, configured)
+    : legacyId
+      ? (
+          await db
+            .selectFrom('deployment_target_servers')
+            .select('server_id')
+            .where('target_id', '=', legacyId)
+            .execute()
+        ).map((row) => row.server_id)
+      : (snapshotIds ??
+        (pipeline.targetSelection ? await selectedServerIds(db, pipeline.targetSelection) : []));
+  if (!currentIds.length) throw new ConflictException('发布成员已变化，请重新预览并提交');
   const current = await db
-    .selectFrom('deployment_target_servers as member')
-    .innerJoin('servers as server', 'server.id', 'member.server_id')
+    .selectFrom('servers as server')
     .innerJoin('credentials as credential', 'credential.id', 'server.credential_id')
-    .where('member.target_id', '=', config?.target_id ?? pipeline.targetId)
+    .where('server.id', 'in', currentIds)
     .where('server.is_active', '=', 1)
     .where('credential.status', '=', 'ACTIVE')
     .select([

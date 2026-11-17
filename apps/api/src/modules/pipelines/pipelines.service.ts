@@ -22,6 +22,11 @@ import { PipelineExecutor } from './pipeline-executor.service';
 import { webhookBuildSocket } from '../builds/builds.service';
 import { PipelineAnalysisService } from '../ai/pipeline-analysis.service';
 import { SystemSettingsService } from '../system/system-settings.service';
+import {
+  confirmDeploymentMembers,
+  directDeploymentSelection,
+  selectedServerIds,
+} from '../deployment-targets/deployment-selection';
 import type { CreateTaskInput, TaskPayload, TaskRecord, TaskStatus } from '../tasks/tasks.types';
 import {
   ArtifactDeployDto,
@@ -259,24 +264,57 @@ export class PipelinesService implements OnModuleInit {
       .executeTakeFirst();
     if (environment?.project_id !== pipeline.projectId)
       throw new BadRequestException('环境必须属于Pipeline项目');
-    const target = await this.database.db
-      .selectFrom('deployment_targets')
-      .selectAll()
-      .where('id', '=', input.targetId)
-      .executeTakeFirst();
-    if (!target) throw new BadRequestException('执行目标不存在');
-    const members = await this.database.db
-      .selectFrom('deployment_target_servers')
-      .select('server_id')
-      .where('target_id', '=', target.id)
-      .orderBy('sort_order')
-      .execute();
-    const servers = await this.servers.snapshot(members.map((m) => m.server_id));
     const env = await this.configs.readSnapshot(
       pipeline.serviceId,
       input.environmentId,
       input.targetId,
     );
+    const configured = env.config?.targetSelection;
+    const defaultParallel =
+      input.serverIds !== undefined || input.groupIds !== undefined
+        ? (input.maxParallel ??
+          configured?.maxParallel ??
+          (await this.settings.get()).defaultMaxParallelTargets)
+        : 1;
+    const selection =
+      directDeploymentSelection(
+        {
+          ...input,
+          strategy: input.strategy ?? configured?.strategy,
+          failurePolicy: input.failurePolicy ?? configured?.failurePolicy,
+        },
+        defaultParallel,
+      ) ?? (input.targetId ? undefined : (configured ?? undefined));
+    const legacyId =
+      input.targetId ?? (selection ? undefined : (env.config?.targetId ?? undefined));
+    const legacy = legacyId
+      ? await this.database.db
+          .selectFrom('deployment_targets')
+          .selectAll()
+          .where('id', '=', legacyId)
+          .executeTakeFirst()
+      : undefined;
+    if (!selection && !legacy) throw new BadRequestException('请选择服务器或服务器分组');
+    const members = selection
+      ? await selectedServerIds(this.database.db, selection)
+      : (
+          await this.database.db
+            .selectFrom('deployment_target_servers')
+            .select('server_id')
+            .where('target_id', '=', legacy!.id)
+            .orderBy('sort_order')
+            .execute()
+        ).map((member) => member.server_id);
+    const servers = await this.servers.snapshot(members);
+    const target = selection
+      ? {
+          id: undefined,
+          selection,
+          strategy: selection.strategy,
+          max_parallel: selection.maxParallel,
+          failure_policy: selection.failurePolicy,
+        }
+      : { ...legacy!, selection: undefined };
     const definition = plainToInstance(
       PipelineDefinitionDto,
       JSON.parse(version.definition_json),
@@ -345,9 +383,10 @@ export class PipelinesService implements OnModuleInit {
             definition: p.definition,
             // Preserve existing deploy confirmations made before execution modes were introduced.
             ...(p.mode === 'BUILD_ONLY' ? { mode: p.mode } : {}),
-            ...(p.mode === 'DEPLOY' && p.env.config?.releasePolicy && {
-              releasePolicy: p.env.config.releasePolicy,
-            }),
+            ...(p.mode === 'DEPLOY' &&
+              p.env.config?.releasePolicy && {
+                releasePolicy: p.env.config.releasePolicy,
+              }),
             ...(p.allowPartialDeploy && { allowPartialDeploy: true }),
             repository: { url: p.repository.clone_url, credentialId: p.repository.credential_id },
             ...(p.registry && {
@@ -369,6 +408,7 @@ export class PipelinesService implements OnModuleInit {
             strategy: p.target.strategy,
             maxParallel: p.target.max_parallel,
             failurePolicy: p.target.failure_policy,
+            ...(p.target.selection?.groupIds.length && { groupIds: p.target.selection.groupIds }),
           }),
         ),
       )
@@ -396,7 +436,8 @@ export class PipelinesService implements OnModuleInit {
       serviceId: p.pipeline.serviceId,
       environmentId: p.environment.id,
       environmentType: p.environment.environment_type,
-      targetId: p.target.id,
+      targetId: p.target.id ?? null,
+      targetSelection: p.target.selection ?? null,
       serverIds: p.servers.map((s) => s.id),
       mode: p.mode,
       requireApproval: p.mode === 'DEPLOY' && Boolean(p.env.config?.releasePolicy?.requireApproval),
@@ -430,6 +471,10 @@ export class PipelinesService implements OnModuleInit {
       serviceId: p.pipeline.serviceId,
       environmentId: p.environment.id,
       targetId: p.target.id,
+      ...(p.target.selection && {
+        targetSelection: p.target.selection,
+        targetMemberIds: p.servers.map((server) => server.id),
+      }),
       commitSha,
       repository: { url: p.repository.clone_url, credentialId: p.repository.credential_id },
       ...(p.registry && {
@@ -691,7 +736,8 @@ export class PipelinesService implements OnModuleInit {
       serviceId: p.pipeline.serviceId,
       environmentId: p.environment.id,
       environmentType: p.environment.environment_type,
-      targetId: p.target.id,
+      targetId: p.target.id ?? null,
+      targetSelection: p.target.selection ?? null,
       serverIds: targets,
       mode: 'DEPLOY_ARTIFACT' as const,
       requireApproval: Boolean(p.env.config?.releasePolicy?.requireApproval),
@@ -726,6 +772,9 @@ export class PipelinesService implements OnModuleInit {
         this.executionTargets(p),
       ),
       userId,
+      snapshot.targetSelection
+        ? (tx) => confirmDeploymentMembers(tx, snapshot.targetSelection!, targets)
+        : undefined,
     );
     await this.audit.record(userId, 'pipeline.artifact-deploy', 'task', task.id, {
       sourceBuildTaskId: source.task_id,
@@ -750,6 +799,8 @@ export class PipelinesService implements OnModuleInit {
     if (options.triggerType === 'WEBHOOK' && input.mode !== 'BUILD_ONLY')
       throw new BadRequestException('Webhook只允许触发仅构建');
     const p = await this.prepare(id, input);
+    if (p.target.selection && !input.expectedConfigurationHash)
+      throw new ConflictException('请先预览并确认服务器、分组和执行配置');
     if (options.triggerType === 'WEBHOOK')
       this.assertAutomaticBuild({
         definition: p.definition,
@@ -785,7 +836,11 @@ export class PipelinesService implements OnModuleInit {
         options.gitRef,
       ),
       userId,
-      options.beforeInsert,
+      async (tx) => {
+        await options.beforeInsert?.(tx);
+        if (snapshot.targetSelection)
+          await confirmDeploymentMembers(tx, snapshot.targetSelection, snapshot.targetMemberIds!);
+      },
     );
     if (task.pipelineRunId === snapshot.runId) {
       await this.audit.record(userId, 'pipeline.run', 'task', task.id, {

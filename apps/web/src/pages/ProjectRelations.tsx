@@ -156,8 +156,8 @@ export function ProjectRelations({
       <Section
         title="项目部署概览"
         action={
-          <a href="#/targets" className="text-link">
-            部署目标管理
+          <a href="#/servers" className="text-link">
+            管理服务器与分组
           </a>
         }
       >

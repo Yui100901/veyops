@@ -38,6 +38,12 @@ import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { DeploymentTargetsService } from '../deployment-targets/deployment-targets.service';
+import {
+  DeploymentSelectionDto,
+  directDeploymentSelection,
+  selectedServerIds,
+  storedDeploymentSelection,
+} from '../deployment-targets/deployment-selection';
 import { relativePath } from '../pipelines/pipeline.validation';
 import { SystemSettingsService } from '../system/system-settings.service';
 import { readReleasePolicy } from '../deployments/release-policy';
@@ -60,8 +66,7 @@ class ReleasePolicyDto implements ReleasePolicy {
   @IsObject() @ValidateNested() @Type(() => HealthCheckDto) healthCheck = new HealthCheckDto();
 }
 
-class ServiceConfigDto {
-  @IsUUID() targetId!: string;
+class ServiceConfigDto extends DeploymentSelectionDto {
   @ValidateIf((_object, value) => value !== undefined)
   @IsIn(['TARGET', 'MANAGER'])
   buildLocation?: 'TARGET' | 'MANAGER';
@@ -110,6 +115,8 @@ const present = (r: Selectable<Database['service_environment_configs']>) => ({
   serviceId: r.service_id,
   environmentId: r.environment_id,
   targetId: r.target_id,
+  ...storedDeploymentSelection(r.target_selection_json),
+  targetSelection: storedDeploymentSelection(r.target_selection_json) ?? null,
   buildLocation: r.build_location,
   artifactType: r.artifact_type,
   deployMethod: r.deploy_method,
@@ -198,7 +205,10 @@ export class ServiceConfigsService {
     if (policy?.rollbackMode === 'PINNED' && !policy.pinnedDeploymentId)
       throw new BadRequestException('请选择已健康验收的回滚版本');
     await this.assertScope(serviceId, environmentId);
-    await this.targets.get(input.targetId);
+    const defaults = await this.settings.get();
+    const selection = directDeploymentSelection(input, defaults.defaultMaxParallelTargets);
+    if (!selection && !input.targetId) throw new BadRequestException('请选择服务器或服务器分组');
+    if (input.targetId) await this.targets.get(input.targetId);
     if ((input.artifactType === 'FILE') !== (input.deployMethod === 'FILE'))
       throw new BadRequestException('产物类型与部署方式不匹配');
     if (
@@ -208,10 +218,11 @@ export class ServiceConfigsService {
         input.deployPath.split('/').includes('..'))
     )
       throw new BadRequestException('部署目录必须为安全绝对路径');
-    const buildLocation = input.buildLocation ?? (await this.settings.get()).defaultBuildLocation;
+    const buildLocation = input.buildLocation ?? defaults.defaultBuildLocation;
     const now = Date.now(),
       values = {
-        target_id: input.targetId,
+        target_id: input.targetId ?? null,
+        target_selection_json: selection ? JSON.stringify(selection) : null,
         build_location: input.buildLocation,
         artifact_type: input.artifactType,
         deploy_method: input.deployMethod,
@@ -227,6 +238,7 @@ export class ServiceConfigsService {
         updated_at: now,
       };
     const config = await this.database.db.transaction().execute(async (tx) => {
+      if (selection) await selectedServerIds(tx, selection);
       if (policy?.rollbackMode === 'PINNED') {
         const baseline = await tx
           .selectFrom('deployment_records')

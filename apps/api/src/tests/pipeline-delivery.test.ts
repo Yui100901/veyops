@@ -598,6 +598,84 @@ async function checkDelivery(databaseUrl?: string) {
     assert.equal(restoredRecord.artifact_id, history.artifact_id);
     assert.equal(restoredRecord.rollback_of_deployment_id, history.id);
     assert.equal(restoredRecord.health_status, 'HEALTHY');
+
+    const group = await create('/server-groups', {
+      name: 'Direct release group',
+      serverIds: [serverIds[1]],
+    });
+    const directConfig = {
+      serverIds: [serverIds[0]],
+      groupIds: [group.id],
+      strategy: 'SEQUENTIAL',
+      maxParallel: 1,
+      failurePolicy: 'STOP',
+      artifactType: 'FILE',
+      deployMethod: 'FILE',
+      buildLocation: 'MANAGER',
+      deployPath: definition.deployPath,
+      releasePolicy: { requireApproval: false },
+    };
+    const saved = (
+      await api
+        .put(`/api/v1/services/${service.id}/environments/${environment.id}/config`)
+        .send(directConfig)
+        .expect(200)
+    ).body.data;
+    assert.equal(saved.targetId, null);
+    assert.deepEqual(saved.targetSelection.groupIds, [group.id]);
+    const direct = { environmentId: environment.id, commitSha: successfulCommit, confirmed: true };
+    const initialPreview = await create(`${managerPath}/preview`, direct);
+    assert.deepEqual(initialPreview.serverIds, serverIds);
+    await post(`${managerPath}/run`, direct).expect(409);
+    await api
+      .patch(`/api/v1/server-groups/${group.id}`)
+      .send({ name: group.name, serverIds: [serverIds[0]] })
+      .expect(200);
+    await post(`${managerPath}/run`, {
+      ...direct,
+      expectedConfigurationHash: initialPreview.configurationHash,
+    }).expect(409);
+    const currentPreview = await create(`${managerPath}/preview`, direct);
+    assert.deepEqual(currentPreview.serverIds, [serverIds[0]]);
+    const directTask = await create(`${managerPath}/run`, {
+      ...direct,
+      expectedConfigurationHash: currentPreview.configurationHash,
+    });
+    await api
+      .patch(`/api/v1/server-groups/${group.id}`)
+      .send({ name: group.name, serverIds: [serverIds[1]] })
+      .expect(200);
+    const directBuild = await runTask(directTask.id);
+    assert.equal(directBuild.status, 'SUCCESS');
+    assert.ok(directBuild.deploymentTaskId);
+    const directRelease = await runTask(directBuild.deploymentTaskId);
+    assert.equal(directRelease.status, 'SUCCESS');
+    const directRecords = await db
+      .selectFrom('deployment_records')
+      .select('server_id')
+      .where('pipeline_run_id', '=', directRelease.pipelineRunId)
+      .execute();
+    assert.deepEqual(directRecords, [{ server_id: serverIds[0] }]);
+    const archived = await api
+      .get(`/api/v1/artifacts?pipelineRunId=${directBuild.pipelineRunId}`)
+      .expect(200);
+    assert.deepEqual(archived.body.data[0].targetSelection, {
+      serverIds: [serverIds[0]],
+      groupIds: [],
+      strategy: directConfig.strategy,
+      maxParallel: directConfig.maxParallel,
+      failurePolicy: directConfig.failurePolicy,
+    });
+    const run = await db
+      .selectFrom('pipeline_runs')
+      .select(['target_id', 'target_selection_json'])
+      .where('id', '=', directRelease.pipelineRunId)
+      .executeTakeFirstOrThrow();
+    assert.equal(run.target_id, null);
+    assert.deepEqual(JSON.parse(run.target_selection_json!).serverIds, [serverIds[0]]);
+    assert.equal((await db.selectFrom('deployment_targets').select('id').execute()).length, 1);
+    const server = (await api.get(`/api/v1/servers/${serverIds[0]}`).expect(200)).body.data;
+    assert.ok(server.projects.some((item: { id: string }) => item.id === project.id));
   } finally {
     await app.close();
   }

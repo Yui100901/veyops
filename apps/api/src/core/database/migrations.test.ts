@@ -74,8 +74,76 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
     })
     .execute();
 
+  await db
+    .insertInto('servers')
+    .values(
+      ['one', 'two'].map((id) => ({
+        id,
+        name: id,
+        host: `${id}.test`,
+        username: 'ops',
+        created_at: now,
+        updated_at: now,
+      })),
+    )
+    .execute();
+  await db
+    .insertInto('environments')
+    .values({
+      id: 'env',
+      project_id: 'project',
+      name: 'Testing',
+      slug: 'testing',
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+  await db
+    .insertInto('deployment_targets')
+    .values({
+      id: 'legacy-target',
+      name: 'Legacy release',
+      strategy: 'SEQUENTIAL',
+      max_parallel: 2,
+      failure_policy: 'STOP',
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+  await db
+    .insertInto('deployment_target_servers')
+    .values([
+      { target_id: 'legacy-target', server_id: 'one', sort_order: 1 },
+      { target_id: 'legacy-target', server_id: 'two', sort_order: 0 },
+    ])
+    .execute();
+  await db
+    .insertInto('service_environment_configs')
+    .values({
+      id: 'legacy-config',
+      service_id: 'service',
+      environment_id: 'env',
+      target_id: 'legacy-target',
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+
   const upgrade = await migrator.migrateToLatest();
   assert.ifError(upgrade.error);
+  const config = await db
+    .selectFrom('service_environment_configs')
+    .select(['target_id', 'target_selection_json'])
+    .where('id', '=', 'legacy-config')
+    .executeTakeFirstOrThrow();
+  assert.equal(config.target_id, 'legacy-target');
+  assert.deepEqual(JSON.parse(config.target_selection_json!), {
+    serverIds: ['two', 'one'],
+    groupIds: [],
+    strategy: 'SEQUENTIAL',
+    maxParallel: 2,
+    failurePolicy: 'STOP',
+  });
   assert.ok(
     upgrade.results?.some((migration) => migration.migrationName === '004_artifact_archives'),
   );

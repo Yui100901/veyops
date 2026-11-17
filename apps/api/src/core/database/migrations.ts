@@ -902,15 +902,24 @@ export const artifactDeploymentMigration: Migration = {
     const now = Date.now();
     const cancelled = await db
       .updateTable('tasks')
-      .set({ status: 'CANCELLED', updated_at: now, finished_at: now, error_summary: '拆分交付任务已随数据库降级取消' })
+      .set({
+        status: 'CANCELLED',
+        updated_at: now,
+        finished_at: now,
+        error_summary: '拆分交付任务已随数据库降级取消',
+      })
       .where('task_type', '=', 'PIPELINE')
       .where(splitTask)
       .where('status', '=', 'PENDING')
       .returning('id')
       .execute();
     for (const task of cancelled) {
-      await db.updateTable('task_targets').set({ status: 'CANCELLED', finished_at: now })
-        .where('task_id', '=', task.id).where('status', '=', 'PENDING').execute();
+      await db
+        .updateTable('task_targets')
+        .set({ status: 'CANCELLED', finished_at: now })
+        .where('task_id', '=', task.id)
+        .where('status', '=', 'PENDING')
+        .execute();
     }
     await db.schema.alterTable('artifacts').dropColumn('compose_checksum').execute();
     await db.schema.alterTable('artifacts').dropColumn('compose_yaml').execute();
@@ -932,30 +941,55 @@ export const artifactRetentionMigration: Migration = {
 
 export const releaseProtectionMigration: Migration = {
   async up(db) {
-    await db.schema.alterTable('service_environment_configs')
+    await db.schema
+      .alterTable('service_environment_configs')
       .addColumn('release_policy_json', 'text', (column) => column.notNull().defaultTo('{}'))
       .execute();
-    await db.schema.alterTable('deployment_records').addColumn('release_snapshot_json', 'text').execute();
-    await db.schema.alterTable('deployment_records').addColumn('rollback_of_deployment_id', 'text').execute();
+    await db.schema
+      .alterTable('deployment_records')
+      .addColumn('release_snapshot_json', 'text')
+      .execute();
+    await db.schema
+      .alterTable('deployment_records')
+      .addColumn('rollback_of_deployment_id', 'text')
+      .execute();
     await db.schema.alterTable('deployment_records').addColumn('activated_at', 'bigint').execute();
     await db.schema.alterTable('tasks').addColumn('release_approved_by', 'text').execute();
   },
   async down(db) {
     // A downgraded Worker must never run tasks that were waiting for approval.
-    const waiting = db.selectFrom('tasks').select('id')
-      .where('status', '=', 'PENDING').where('available_at', '=', Number.MAX_SAFE_INTEGER);
-    await db.updateTable('task_targets').set({ status: 'CANCELLED', finished_at: Date.now() })
-      .where('status', '=', 'PENDING').where('task_id', 'in', waiting).execute();
-    await db.updateTable('tasks').set({
-      status: 'CANCELLED',
-      finished_at: Date.now(),
-      error_summary: '发布审批已随数据库降级取消',
-    }).where('status', '=', 'PENDING').where('available_at', '=', Number.MAX_SAFE_INTEGER).execute();
+    const waiting = db
+      .selectFrom('tasks')
+      .select('id')
+      .where('status', '=', 'PENDING')
+      .where('available_at', '=', Number.MAX_SAFE_INTEGER);
+    await db
+      .updateTable('task_targets')
+      .set({ status: 'CANCELLED', finished_at: Date.now() })
+      .where('status', '=', 'PENDING')
+      .where('task_id', 'in', waiting)
+      .execute();
+    await db
+      .updateTable('tasks')
+      .set({
+        status: 'CANCELLED',
+        finished_at: Date.now(),
+        error_summary: '发布审批已随数据库降级取消',
+      })
+      .where('status', '=', 'PENDING')
+      .where('available_at', '=', Number.MAX_SAFE_INTEGER)
+      .execute();
     await db.schema.alterTable('tasks').dropColumn('release_approved_by').execute();
     await db.schema.alterTable('deployment_records').dropColumn('activated_at').execute();
-    await db.schema.alterTable('deployment_records').dropColumn('rollback_of_deployment_id').execute();
+    await db.schema
+      .alterTable('deployment_records')
+      .dropColumn('rollback_of_deployment_id')
+      .execute();
     await db.schema.alterTable('deployment_records').dropColumn('release_snapshot_json').execute();
-    await db.schema.alterTable('service_environment_configs').dropColumn('release_policy_json').execute();
+    await db.schema
+      .alterTable('service_environment_configs')
+      .dropColumn('release_policy_json')
+      .execute();
   },
 };
 
@@ -1104,6 +1138,81 @@ const notificationsMigration: Migration = {
   },
 };
 
+const directDeploymentSelectionMigration: Migration = {
+  async up(db) {
+    await db.schema
+      .alterTable('server_group_members')
+      .addColumn('sort_order', 'integer', (column) => column.notNull().defaultTo(0))
+      .execute();
+    const selections = ['service_environment_configs', 'pipeline_webhooks', 'pipeline_runs'];
+    for (const table of selections) {
+      await db.schema.alterTable(table).addColumn('target_selection_json', 'text').execute();
+    }
+    // Replace only the legacy column rather than rebuilding tables referenced by artifacts and history.
+    for (const table of ['pipeline_webhooks', 'pipeline_runs']) {
+      await db.schema
+        .alterTable(table)
+        .addColumn('legacy_target_id', 'text', (column) =>
+          column.references('deployment_targets.id').onDelete('restrict'),
+        )
+        .execute();
+      await db
+        .updateTable(table)
+        .set((eb) => ({ legacy_target_id: eb.ref('target_id') }))
+        .execute();
+      await db.schema.alterTable(table).dropColumn('target_id').execute();
+      await db.schema.alterTable(table).renameColumn('legacy_target_id', 'target_id').execute();
+    }
+    const legacy = await db.selectFrom('deployment_targets').selectAll().execute();
+    for (const target of legacy) {
+      const members = await db
+        .selectFrom('deployment_target_servers as m')
+        .innerJoin('servers as s', 's.id', 'm.server_id')
+        .select(['m.server_id', 's.is_active'])
+        .where('m.target_id', '=', target.id)
+        .orderBy('m.sort_order')
+        .execute();
+      const value = JSON.stringify({
+        serverIds: members.map((member) => member.server_id),
+        groupIds: [],
+        strategy: target.strategy,
+        maxParallel: target.max_parallel,
+        failurePolicy: target.failure_policy,
+      });
+      await db
+        .updateTable('service_environment_configs')
+        .set({ target_selection_json: value })
+        .where('target_id', '=', target.id)
+        .execute();
+      await db
+        .updateTable('pipeline_webhooks')
+        .set({
+          target_selection_json: value,
+          ...((!members.length || members.some((member) => member.is_active !== 1)) && {
+            enabled: 0,
+          }),
+        })
+        .where('target_id', '=', target.id)
+        .execute();
+    }
+  },
+  async down(db) {
+    for (const table of ['pipeline_webhooks', 'pipeline_runs', 'service_environment_configs']) {
+      const direct = await db
+        .selectFrom(table)
+        .select('target_selection_json')
+        .where('target_id', 'is', null)
+        .where('target_selection_json', 'is not', null)
+        .executeTakeFirst();
+      if (direct) throw new Error('直接选择的发布记录或配置无法转换回旧目标，请恢复升级前备份');
+    }
+    for (const table of ['pipeline_webhooks', 'pipeline_runs', 'service_environment_configs']) {
+      await db.schema.alterTable(table).dropColumn('target_selection_json').execute();
+    }
+    await db.schema.alterTable('server_group_members').dropColumn('sort_order').execute();
+  },
+};
+
 export const migrationProvider: MigrationProvider = {
   async getMigrations() {
     return {
@@ -1118,6 +1227,7 @@ export const migrationProvider: MigrationProvider = {
       '009_pushed_image_archives': pushedImageArchivesMigration,
       '010_operation_schedules': operationSchedulesMigration,
       '011_notifications': notificationsMigration,
+      '012_direct_deployment_selection': directDeploymentSelectionMigration,
     };
   },
 };

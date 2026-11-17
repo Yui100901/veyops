@@ -1,4 +1,5 @@
 import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
+import type { DeploymentSelection } from '../deployment-targets/deployment-selection';
 
 export type PipelineExecutionMode = 'BUILD_ONLY' | 'DEPLOY';
 
@@ -58,7 +59,9 @@ export interface PipelineSnapshot {
   projectId: string;
   serviceId: string;
   environmentId: string;
-  targetId: string;
+  targetId?: string;
+  targetSelection?: DeploymentSelection;
+  targetMemberIds?: string[];
   commitSha: string;
   repository: { url: string; credentialId: string | null };
   registry?: { registryUrl: string; credentialId: string | null };

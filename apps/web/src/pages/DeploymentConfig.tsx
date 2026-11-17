@@ -1,284 +1,25 @@
 import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Check, Network, Pencil, Plus, Server as ServerIcon, Trash2 } from 'lucide-react';
-import { api, formatTime, message, post, remove, useResource } from '../api';
-import {
-  Confirm,
-  Empty,
-  ErrorBanner,
-  Field,
-  Form,
-  Loading,
-  Modal,
-  PageHeader,
-  Section,
-} from '../components';
+import { Check } from 'lucide-react';
+import { api, formatTime, message, useResource } from '../api';
+import { Empty, ErrorBanner, Field, Form, Loading, Modal, Section } from '../components';
 import type {
   DeploymentRecord,
+  DeploymentSelection,
   ProjectDetail,
   ReleasePolicy,
-  Server,
   SystemRuntimeDefaults,
   User,
 } from '../models';
-import type { DeploymentTarget } from './Delivery';
 import { ArtifactRetentionPolicy } from './ArtifactRetention';
+import {
+  DeploymentSelectionPicker,
+  deploymentSelection,
+  hasDeploymentSelection,
+  useDeploymentInventory,
+} from './DeploymentSelection';
 
-export function DeploymentTargetsPage({ user }: { user: User }) {
-  const targets = useResource<DeploymentTarget[]>('/deployment-targets');
-  const servers = useResource<Server[]>('/servers');
-  const [editing, setEditing] = useState<Partial<DeploymentTarget>>();
-  const [deleting, setDeleting] = useState<DeploymentTarget>();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  async function deleteTarget() {
-    if (!deleting) return;
-    setBusy(true);
-    setError('');
-    try {
-      await remove(`/deployment-targets/${deleting.id}`);
-      setDeleting(undefined);
-      void targets.reload();
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <>
-      <PageHeader
-        eyebrow="DEPLOYMENT RESOURCES"
-        title="部署目标"
-        description="将多台服务器组织成可复用的发布目标，并固定执行顺序、并发和失败策略。"
-        action={
-          user.role !== 'VIEWER' && (
-            <button
-              className="button primary"
-              onClick={() => {
-                setError('');
-                setEditing({});
-              }}
-            >
-              <Plus size={16} />
-              创建部署目标
-            </button>
-          )
-        }
-      />
-      <ErrorBanner error={targets.error || servers.error} retry={targets.reload} />
-      <Section title="目标集合" subtitle="运行任务时保存目标快照，后续修改不会改变已经启动的任务">
-        {targets.loading ? (
-          <Loading />
-        ) : !targets.data?.length ? (
-          <Empty
-            icon={<Network size={26} />}
-            title="创建第一个部署目标"
-            description="明确选择成员服务器，再设置并行或顺序部署策略。"
-          />
-        ) : (
-          <div className="target-grid">
-            {targets.data.map((t) => (
-              <div className="target-card" key={t.id}>
-                <div className="target-card-top">
-                  <span className="resource-avatar">
-                    <Network size={22} />
-                  </span>
-                  <strong>{t.name}</strong>
-                  <span className="tag">{t.serverIds.length} 台</span>
-                </div>
-                <p>{t.description || '可复用的服务器执行集合'}</p>
-                <div className="target-members">
-                  {t.serverIds.map((id) => (
-                    <span key={id}>
-                      <ServerIcon size={13} />
-                      {servers.data?.find((s) => s.id === id)?.name || id.slice(0, 8)}
-                    </span>
-                  ))}
-                </div>
-                <div className="target-card-footer">
-                  <small>
-                    {t.strategy === 'SEQUENTIAL' ? '顺序执行' : `并行 · 最大 ${t.maxParallel} 台`} ·{' '}
-                    {t.failurePolicy === 'STOP' ? '失败停止' : '失败继续'}
-                  </small>
-                  {user.role !== 'VIEWER' && (
-                    <div>
-                      <button
-                        className="text-button"
-                        onClick={() => {
-                          setError('');
-                          setEditing(t);
-                        }}
-                      >
-                        <Pencil size={14} />
-                        编辑
-                      </button>
-                      <button
-                        className="text-button danger-text"
-                        onClick={() => {
-                          setError('');
-                          setDeleting(t);
-                        }}
-                        aria-label={`删除目标 ${t.name}`}
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </Section>
-      {editing && (
-        <TargetEditor
-          target={editing}
-          servers={servers.data || []}
-          onClose={() => setEditing(undefined)}
-          onSaved={() => {
-            setEditing(undefined);
-            void targets.reload();
-          }}
-        />
-      )}
-      {deleting && (
-        <Confirm
-          title="删除部署目标"
-          description={`确认删除“${deleting.name}”？已经保存的任务历史会保留。被环境配置引用的目标需先解除关联。`}
-          destructive
-          onClose={() => setDeleting(undefined)}
-          onConfirm={deleteTarget}
-          busy={busy}
-          error={error}
-        />
-      )}
-    </>
-  );
-}
-function TargetEditor({
-  target,
-  servers,
-  onClose,
-  onSaved,
-}: {
-  target: Partial<DeploymentTarget>;
-  servers: Server[];
-  onClose: () => void;
-  onSaved: () => void;
-}) {
-  const [ids, setIds] = useState(target.serverIds || []);
-  const [strategy, setStrategy] = useState(target.strategy || 'PARALLEL');
-  const [maxParallel, setMaxParallel] = useState(String(target.maxParallel ?? ''));
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const defaults = useResource<SystemRuntimeDefaults>(target.id ? null : '/system');
-  async function save(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (!ids.length) {
-      setError('请至少选择一台服务器');
-      return;
-    }
-    setBusy(true);
-    setError('');
-    const f = new FormData(e.currentTarget);
-    try {
-      const body = {
-        name: String(f.get('name')),
-        description: String(f.get('description')),
-        serverIds: ids,
-        strategy,
-        maxParallel: f.get('maxParallel') ? Number(f.get('maxParallel')) : undefined,
-        failurePolicy: f.get('failurePolicy'),
-      };
-      if (target.id)
-        await api(`/deployment-targets/${target.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify(body),
-        });
-      else await post('/deployment-targets', body);
-      onSaved();
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <Modal title={target.id ? '编辑部署目标' : '创建部署目标'} onClose={onClose}>
-      <Form onSubmit={save} onCancel={onClose} busy={busy} error={error}>
-        <Field label="名称" required>
-          <input name="name" defaultValue={target.name} required maxLength={100} autoFocus />
-        </Field>
-        <Field label="描述">
-          <input name="description" defaultValue={target.description} maxLength={2000} />
-        </Field>
-        <h3 className="field-title">成员服务器 · 已选择 {ids.length} 台</h3>
-        <p className="muted">按选择顺序执行。取消后重新选择可调整成员顺序。</p>
-        <div className="server-picker">
-          {servers.map((s) => (
-            <label className={`server-option ${ids.includes(s.id) ? 'selected' : ''}`} key={s.id}>
-              <input
-                type="checkbox"
-                checked={ids.includes(s.id)}
-                onChange={(e) =>
-                  setIds(e.target.checked ? [...ids, s.id] : ids.filter((id) => id !== s.id))
-                }
-              />
-              <ServerIcon size={16} />
-              <span>
-                <strong>{s.name}</strong>
-                <small>{s.host}</small>
-              </span>
-              {ids.includes(s.id) && <span className="tag">{ids.indexOf(s.id) + 1}</span>}
-            </label>
-          ))}
-        </div>
-        <div className="form-grid">
-          <Field label="执行方式">
-            <select
-              value={strategy}
-              onChange={(e) => setStrategy(e.target.value as 'PARALLEL' | 'SEQUENTIAL')}
-            >
-              <option value="PARALLEL">并行执行</option>
-              <option value="SEQUENTIAL">顺序执行</option>
-            </select>
-          </Field>
-          <Field
-            label="最大并发"
-            hint={
-              strategy === 'SEQUENTIAL'
-                ? undefined
-                : target.id
-                  ? '留空保留原并发值。'
-                  : '留空使用系统默认值。'
-            }
-          >
-            <input
-              type="number"
-              name="maxParallel"
-              disabled={strategy === 'SEQUENTIAL'}
-              min={1}
-              max={10}
-              value={strategy === 'SEQUENTIAL' ? 1 : maxParallel}
-              placeholder={String(defaults.data?.defaultMaxParallelTargets ?? '')}
-              onChange={(event) => setMaxParallel(event.target.value)}
-            />
-          </Field>
-        </div>
-        <Field label="失败策略">
-          <select name="failurePolicy" defaultValue={target.failurePolicy || 'CONTINUE'}>
-            <option value="CONTINUE">继续其他目标</option>
-            <option value="STOP">停止派发剩余目标</option>
-          </select>
-        </Field>
-      </Form>
-    </Modal>
-  );
-}
-
-type EnvironmentConfig = {
-  targetId: string;
+type EnvironmentConfig = DeploymentSelection & {
   buildLocation: string;
   artifactType: string;
   deployMethod: string;
@@ -388,17 +129,24 @@ function EnvironmentConfigEditor({
   const config = useResource<EnvironmentConfig | null>(
     `/services/${serviceId}/environments/${environmentId}/config`,
   );
-  const targets = useResource<DeploymentTarget[]>('/deployment-targets');
+  const inventory = useDeploymentInventory();
   const defaults = useResource<SystemRuntimeDefaults>('/system');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [artifactType, setArtifactType] = useState('FILE');
+  const [selection, setSelection] = useState<DeploymentSelection>(() => deploymentSelection());
   const [editRetention, setEditRetention] = useState(false);
   useEffect(() => {
     setArtifactType(config.data?.artifactType || 'FILE');
+    setSelection(deploymentSelection(config.data));
   }, [config.data]);
   async function save(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (busy || user.role === 'VIEWER') return;
+    if (!hasDeploymentSelection(selection)) {
+      setError('请选择服务器或服务器分组。');
+      return;
+    }
     const f = new FormData(e.currentTarget);
     setBusy(true);
     setError('');
@@ -406,7 +154,7 @@ function EnvironmentConfigEditor({
       await api(`/services/${serviceId}/environments/${environmentId}/config`, {
         method: 'PUT',
         body: JSON.stringify({
-          targetId: f.get('targetId'),
+          ...selection,
           buildLocation: f.get('buildLocation') || undefined,
           artifactType: f.get('artifactType'),
           deployMethod: f.get('deployMethod'),
@@ -451,6 +199,10 @@ function EnvironmentConfigEditor({
     >
       {config.loading ? (
         <Loading />
+      ) : config.error ? (
+        <div className="form-body">
+          <ErrorBanner error={config.error} retry={config.reload} />
+        </div>
       ) : (
         <Form
           onSubmit={save}
@@ -459,18 +211,16 @@ function EnvironmentConfigEditor({
           error={error}
           submit={user.role === 'VIEWER' ? '只读用户' : '保存环境配置'}
         >
-          <ErrorBanner error={config.error || targets.error} />
           <fieldset disabled={user.role === 'VIEWER'}>
-            <Field label="部署目标" required>
-              <select name="targetId" required defaultValue={config.data?.targetId || ''}>
-                <option value="">选择目标集合</option>
-                {targets.data?.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.name} · {t.serverIds.length} 台
-                  </option>
-                ))}
-              </select>
-            </Field>
+            {config.data?.targetId && !hasDeploymentSelection(selection) && (
+              <p className="field-note">请重新选择此环境的服务器或服务器分组。</p>
+            )}
+            <DeploymentSelectionPicker
+              inventory={inventory}
+              value={selection}
+              onChange={setSelection}
+              disabled={busy || user.role === 'VIEWER'}
+            />
             <div className="form-grid">
               <Field label="构建位置">
                 <select name="buildLocation" defaultValue={config.data?.buildLocation || ''}>

@@ -32,6 +32,17 @@ export class SshExecutionError extends Error {
   }
 }
 
+export class SshHostKeyMismatchError extends SshExecutionError {
+  constructor(kind: 'FAILED' | 'NEEDS_ATTENTION' = 'FAILED') {
+    super('SSH 主机指纹与已确认值不一致，连接已中止', kind);
+  }
+}
+
+export interface SshHostKey {
+  algorithm: string;
+  fingerprint: string;
+}
+
 export function fingerprintMatches(rawKey: Buffer, expected: string): boolean {
   const digest = createHash('sha256').update(rawKey).digest();
   const normalized = expected.trim();
@@ -50,6 +61,49 @@ export function fingerprintMatches(rawKey: Buffer, expected: string): boolean {
 export class SshService {
   constructor(private readonly credentials: CredentialsService) {}
 
+  async inspectHostKey(endpoint: Pick<SshTarget, 'host' | 'port'>): Promise<SshHostKey> {
+    return new Promise((resolve, reject) => {
+      const client = new Client();
+      let observed: SshHostKey | undefined;
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        client.destroy();
+        if (observed) resolve(observed);
+        else reject(new SshExecutionError('未能读取 SSH 主机指纹，请检查连接地址、端口和网络'));
+      };
+      const timer = setTimeout(finish, 8_000);
+      client.on('error', finish);
+      client.once('close', finish);
+      try {
+        client.connect({
+          ...endpoint,
+          username: 'host-key-probe',
+          readyTimeout: 8_000,
+          hostVerifier: (key: Buffer) => {
+            // The host key type is the first SSH string in the public-key blob.
+            if (key.length < 4) return false;
+            const length = key.readUInt32BE(0);
+            if (!length || length > 128 || length > key.length - 4) return false;
+            const algorithm = key.subarray(4, length + 4).toString('latin1');
+            if (/^[\w@.+-]+$/.test(algorithm)) {
+              observed = {
+                algorithm,
+                fingerprint: `SHA256:${createHash('sha256').update(key).digest('base64').replace(/=+$/, '')}`,
+              };
+            }
+            // Stop key exchange before user authentication. This probe has no credential.
+            return false;
+          },
+        });
+      } catch {
+        finish();
+      }
+    });
+  }
+
   async execute(
     target: SshTarget,
     command: string,
@@ -66,6 +120,7 @@ export class SshService {
       const client = new Client();
       let channel: ClientChannel | undefined;
       let settled = false;
+      let hostKeyRejected = false;
       let outputBytes = 0;
       const outputLimit = 5 * 1024 * 1024;
       const decoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') };
@@ -138,7 +193,10 @@ export class SshService {
         port: target.port,
         username: target.username,
         readyTimeout: Math.min(options.timeout * 1000, 15_000),
-        hostVerifier: (key: Buffer) => fingerprintMatches(key, target.hostKeyFingerprint!),
+        hostVerifier: (key: Buffer) => {
+          hostKeyRejected = !fingerprintMatches(key, target.hostKeyFingerprint!);
+          return !hostKeyRejected;
+        },
         keepaliveInterval: 10_000,
         keepaliveCountMax: 3,
       };
@@ -185,19 +243,23 @@ export class SshService {
       });
       client.on('error', (error: Error) =>
         finish(
-          new SshExecutionError(
-            redactText(error.message, secretValues),
-            channel ? 'NEEDS_ATTENTION' : 'FAILED',
-          ),
+          hostKeyRejected
+            ? new SshHostKeyMismatchError(channel ? 'NEEDS_ATTENTION' : 'FAILED')
+            : new SshExecutionError(
+                redactText(error.message, secretValues),
+                channel ? 'NEEDS_ATTENTION' : 'FAILED',
+              ),
         ),
       );
       client.on('close', () => {
         if (!settled)
           finish(
-            new SshExecutionError(
-              'SSH 连接意外断开，远程执行结果未知',
-              channel ? 'NEEDS_ATTENTION' : 'FAILED',
-            ),
+            hostKeyRejected
+              ? new SshHostKeyMismatchError(channel ? 'NEEDS_ATTENTION' : 'FAILED')
+              : new SshExecutionError(
+                  'SSH 连接意外断开，远程执行结果未知',
+                  channel ? 'NEEDS_ATTENTION' : 'FAILED',
+                ),
           );
       });
       try {
@@ -274,6 +336,7 @@ export class SshService {
       const client = new Client();
       let sftp: SFTPWrapper | undefined;
       let settled = false;
+      let hostKeyRejected = false;
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
@@ -308,10 +371,19 @@ export class SshService {
         }),
       );
       client.on('error', () =>
-        finish(new SshExecutionError('SFTP 连接失败，请检查主机指纹和凭据')),
+        finish(
+          hostKeyRejected
+            ? new SshHostKeyMismatchError(sftp ? 'NEEDS_ATTENTION' : 'FAILED')
+            : new SshExecutionError('SFTP 连接失败，请检查主机指纹和凭据'),
+        ),
       );
       client.on('close', () => {
-        if (!settled) finish(new SshExecutionError('SFTP 连接意外中断'));
+        if (!settled)
+          finish(
+            hostKeyRejected
+              ? new SshHostKeyMismatchError(sftp ? 'NEEDS_ATTENTION' : 'FAILED')
+              : new SshExecutionError('SFTP 连接意外中断'),
+          );
       });
       try {
         client.connect({
@@ -319,7 +391,10 @@ export class SshService {
           port: target.port,
           username: target.username,
           readyTimeout: Math.min(options.timeout * 1000, 15000),
-          hostVerifier: (key: Buffer) => fingerprintMatches(key, target.hostKeyFingerprint!),
+          hostVerifier: (key: Buffer) => {
+            hostKeyRejected = !fingerprintMatches(key, target.hostKeyFingerprint!);
+            return !hostKeyRejected;
+          },
           ...(secret.privateKey
             ? { privateKey: secret.privateKey, passphrase: secret.passphrase }
             : { password: secret.password }),
