@@ -14,6 +14,32 @@ export interface TargetSelection {
   environmentIds?: string[];
 }
 
+type EnvironmentProjects = Record<string, string>;
+
+// Keep ownership alongside the form selection. Only target IDs belong in execution requests.
+export function useBatchSelection(initial: TargetSelection = {}, owners: EnvironmentProjects = {}) {
+  const [selection, setTargets] = useState(initial);
+  const [environmentProjects, setOwners] = useState(owners);
+  function setSelection(targets: TargetSelection, additionalOwners?: EnvironmentProjects) {
+    if (additionalOwners) setOwners((previous) => ({ ...previous, ...additionalOwners }));
+    setTargets(targets);
+  }
+  const projects = [...new Set(selection.projectIds)];
+  const environments = [...new Set(selection.environmentIds)];
+  let projectId: string | undefined;
+  if (
+    !selection.serverIds?.length &&
+    !selection.groupIds?.length &&
+    !selection.tags?.length &&
+    !selection.deploymentTargetIds?.length
+  ) {
+    if (projects.length === 1 && !environments.length) projectId = projects[0];
+    if (!projects.length && environments.length === 1)
+      projectId = environmentProjects[environments[0]];
+  }
+  return { selection, setSelection, projectId, environmentProjects };
+}
+
 export interface TargetPreview {
   count: number;
   targets: { id: string; name: string; host: string }[];
@@ -134,7 +160,7 @@ function EnvironmentTargetOptions({
 }: {
   projects: NamedTarget[];
   selected: string[];
-  onChange: (ids: string[]) => void;
+  onChange: (ids: string[], owners: EnvironmentProjects) => void;
   disabled?: boolean;
 }) {
   return (
@@ -165,7 +191,7 @@ function ProjectEnvironmentOptions({
 }: {
   project: NamedTarget;
   selected: string[];
-  onChange: (ids: string[]) => void;
+  onChange: (ids: string[], owners: EnvironmentProjects) => void;
   disabled?: boolean;
 }) {
   const [path, setPath] = useState<string | null>(null);
@@ -193,10 +219,10 @@ function ProjectEnvironmentOptions({
             selected={selected.filter((id) => environments.some((item) => item.id === id))}
             disabled={disabled}
             onChange={(ids) =>
-              onChange([
-                ...selected.filter((id) => !environments.some((item) => item.id === id)),
-                ...ids,
-              ])
+              onChange(
+                [...selected.filter((id) => !environments.some((item) => item.id === id)), ...ids],
+                Object.fromEntries(ids.map((id) => [id, project.id])),
+              )
             }
           />
         ))}
@@ -210,7 +236,7 @@ export function BatchTargetPicker({
   disabled,
 }: {
   selection: TargetSelection;
-  onChange: (selection: TargetSelection) => void;
+  onChange: (selection: TargetSelection, owners?: EnvironmentProjects) => void;
   disabled?: boolean;
 }) {
   const servers = useResource<Server[]>('/servers');
@@ -270,7 +296,7 @@ export function BatchTargetPicker({
           projects={projects.data ?? []}
           selected={selection.environmentIds ?? []}
           disabled={disabled}
-          onChange={(environmentIds) => onChange({ ...selection, environmentIds })}
+          onChange={(environmentIds, owners) => onChange({ ...selection, environmentIds }, owners)}
         />
       </div>
     </>

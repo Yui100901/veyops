@@ -33,15 +33,18 @@ export class CommandCenterService implements OnModuleInit {
     input: ExecuteCommandDto,
     template?: TaskPayload['commandTemplate'],
   ): Promise<CreateTaskInput> {
+    const scope = await this.targets.executionScope(input);
     return {
       type: 'COMMAND',
       name: input.name ?? '临时命令',
-      scope: await this.targets.executionScope(input),
+      scope,
       payload: {
         targets: await this.targets.resolveForExecution(input),
         steps: [{ name: '执行命令', command: input.command }],
         strategy: input.strategy,
-        maxParallel: input.maxParallel ?? (await this.settings.get()).defaultMaxParallelTargets,
+        maxParallel:
+          input.maxParallel ??
+          (await this.settings.get(scope?.projectId)).defaultMaxParallelTargets,
         failurePolicy: input.failurePolicy,
         timeout: input.timeout,
         commandTemplate: template,

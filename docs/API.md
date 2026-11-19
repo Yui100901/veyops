@@ -114,6 +114,8 @@
 
 日志保留期为 0–3650 天，默认 0 表示长期保留。Worker 周期性清理已结束且超过所属项目保留期的任务日志，保留任务记录、子步骤、审计和产物。未关联项目的任务使用系统保留期。
 
+批量命令、命令模板及运维方案只选一个项目，或只选该项目下的一个环境时，省略 `maxParallel` 会使用该项目的并发设置。混合选择、跨项目选择或直接选择服务器、分组时，省略并发数会使用系统设置。
+
 ## 运维中心与命令
 
 网页入口为 `#/operations`。临时命令、命令模板、运维方案和定时运维分别使用 `#/operations/commands`、`#/operations/templates`、`#/operations/plans`、`#/operations/schedules`。原有 `#/commands`、`#/plans`、`#/tasks/schedules` 书签仍可打开对应分区。

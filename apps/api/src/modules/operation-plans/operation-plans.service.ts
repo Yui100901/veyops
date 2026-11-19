@@ -238,16 +238,19 @@ export class OperationPlansService implements OnModuleInit {
       ...definition.steps,
       ...checks(definition.postChecks, 'postcheck'),
     ].map((step) => ({ ...step, command: environment + step.command }));
+    const scope = await this.targets.executionScope(input);
     const execution: CreateTaskInput = {
       type: 'OPERATION_PLAN',
       name: `${definition.name ?? plan.name} · v${version.version}`,
       operationPlanVersionId: version.id,
-      scope: await this.targets.executionScope(input),
+      scope,
       payload: {
         targets: await this.targets.resolveForExecution(input),
         steps,
         strategy: input.strategy,
-        maxParallel: input.maxParallel ?? (await this.settings.get()).defaultMaxParallelTargets,
+        maxParallel:
+          input.maxParallel ??
+          (await this.settings.get(scope?.projectId)).defaultMaxParallelTargets,
         failurePolicy: input.failurePolicy,
         timeout: input.timeout,
       },

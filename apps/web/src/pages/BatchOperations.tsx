@@ -27,6 +27,7 @@ import {
   BatchTargetPicker,
   defaultExecutionOptions,
   ResolvedTargets,
+  useBatchSelection,
 } from './BatchTargets';
 import type { ExecutionOptions, TargetPreview, TargetSelection } from './BatchTargets';
 import { OperationSchedulesPage } from './OperationSchedules';
@@ -162,7 +163,7 @@ export function OperationsCenterPage({ tab, user }: { tab: OperationsTab; user: 
 }
 
 function CommandsPage({ user }: { user: User }) {
-  const [selection, setSelection] = useState<TargetSelection>({});
+  const { selection, setSelection, projectId, environmentProjects } = useBatchSelection();
   const [command, setCommand] = useState('');
   const [name, setName] = useState('');
   const [timeout, setTimeoutValue] = useState(300);
@@ -227,6 +228,7 @@ function CommandsPage({ user }: { user: User }) {
             <Section title="执行策略">
               <div className="form-body">
                 <BatchStrategy
+                  projectId={projectId}
                   options={options}
                   onChange={setOptions}
                   disabled={!canEdit || busy}
@@ -313,6 +315,7 @@ function CommandsPage({ user }: { user: User }) {
           entry={reference}
           canRun={canEdit}
           initialSelection={selection}
+          initialEnvironmentProjects={environmentProjects}
           initialOptions={options}
           onClose={() => setReference(undefined)}
         />
@@ -482,6 +485,7 @@ function OperationRun({
   entry,
   canRun,
   initialSelection = {},
+  initialEnvironmentProjects,
   initialOptions = defaultExecutionOptions,
   onClose,
 }: {
@@ -490,13 +494,17 @@ function OperationRun({
   canRun: boolean;
   user: User;
   initialSelection?: TargetSelection;
+  initialEnvironmentProjects?: Record<string, string>;
   initialOptions?: ExecutionOptions;
   onClose: () => void;
 }) {
   const base = `${endpoint}/${entry.id}`;
   const history = useResource<(PlanVersion | TemplateVersion)[]>(`${base}/versions`);
   const [versionNumber, setVersionNumber] = useState(entry.currentVersion);
-  const [selection, setSelection] = useState(initialSelection);
+  const { selection, setSelection, projectId } = useBatchSelection(
+    initialSelection,
+    initialEnvironmentProjects,
+  );
   const [options, setOptions] = useState(initialOptions);
   const [review, setReview] = useState<{
     preview: TargetPreview;
@@ -604,6 +612,7 @@ function OperationRun({
                 />
                 <h3 className="field-title">执行策略</h3>
                 <BatchStrategy
+                  projectId={projectId}
                   options={options}
                   onChange={setOptions}
                   disabled={busy || Boolean(review)}

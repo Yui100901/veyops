@@ -271,6 +271,8 @@ async function checkApi(databaseUrl?: string) {
       })
       .expect(201);
     await api.delete(`/api/v1/servers/${retired.body.data.id}`).expect(200);
+    const scopedSettings = `/api/v1/projects/${projectId}/execution-settings`;
+    await api.patch(scopedSettings).send({ defaultMaxParallelTargets: 2 }).expect(200);
     for (const isolatedSelection of [
       { groupIds: [group.body.data.id] },
       { projectIds: [projectId] },
@@ -284,7 +286,7 @@ async function checkApi(databaseUrl?: string) {
         resolved.body.data.targets.map((row: { id: string }) => row.id),
         [serverId],
       );
-      if ('environmentIds' in isolatedSelection) {
+      if ('environmentIds' in isolatedSelection || 'projectIds' in isolatedSelection) {
         const queued = await api
           .post('/api/v1/commands/execute')
           .send({
@@ -296,12 +298,18 @@ async function checkApi(databaseUrl?: string) {
           .expect(201);
         const scope = await db
           .selectFrom('tasks')
-          .select(['project_id', 'environment_id'])
+          .select(['project_id', 'environment_id', 'payload_json'])
           .where('id', '=', queued.body.data.id)
           .executeTakeFirstOrThrow();
-        assert.deepEqual(scope, { project_id: projectId, environment_id: environmentId });
+        assert.equal(scope.project_id, projectId);
+        assert.equal(
+          scope.environment_id,
+          'environmentIds' in isolatedSelection ? environmentId : null,
+        );
+        assert.equal(JSON.parse(scope.payload_json).maxParallel, 2);
       }
     }
+    await api.patch(scopedSettings).send({ defaultMaxParallelTargets: null }).expect(200);
     const selection = {
       serverIds: [serverId],
       projectIds: [projectId],
