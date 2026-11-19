@@ -4,6 +4,13 @@ import { TaskHandler } from './tasks.types';
 @Injectable()
 export class TaskHandlerRegistry {
   private readonly handlers = new Map<string, TaskHandler>();
+  private graphPump?: (taskId?: string) => Promise<void>;
+  registerGraphPump(pump: (taskId?: string) => Promise<void>): void {
+    this.graphPump = pump;
+  }
+  advanceGraphRuns(taskId?: string): Promise<void> | undefined {
+    return this.graphPump?.(taskId);
+  }
   register(handler: TaskHandler): void {
     if (this.handlers.has(handler.type))
       throw new Error(`Task handler already registered: ${handler.type}`);

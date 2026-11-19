@@ -666,6 +666,58 @@ export interface PipelineTriggerHistoryTable {
 }
 
 export interface Database {
+  execution_graphs: {
+    id: string;
+    project_id: string;
+    revision: number;
+    draft_json: string;
+    published_version: Generated<number | null>;
+    created_at: number;
+    updated_at: number;
+  };
+  execution_graph_versions: {
+    id: string;
+    graph_id: string;
+    version: number;
+    source_revision: number;
+    definition_json: string;
+    created_at: number;
+    created_by: string;
+  };
+  execution_flow_runs: {
+    id: string;
+    graph_id: string;
+    project_id: string;
+    version: number;
+    flow_id: string;
+    flow_name: string;
+    created_by: string;
+    idempotency_key: string;
+    request_hash: string;
+    configuration_hash: string;
+    inputs_json: string;
+    status: string;
+    created_at: number;
+    finished_at: Generated<number | null>;
+    parent_run_id: Generated<string | null>;
+    task_id: Generated<string | null>;
+  };
+  execution_node_runs: {
+    id: string;
+    run_id: string;
+    node_id: string;
+    name: string;
+    node_type: string;
+    position: number;
+    status: string;
+    log: string;
+    started_at: Generated<number | null>;
+    finished_at: Generated<number | null>;
+    task_id: Generated<string | null>;
+    child_run_id: Generated<string | null>;
+    output_json: Generated<string | null>;
+    dispatch_json: Generated<string | null>;
+  };
   monitor_settings: {
     id: number;
     enabled: number;

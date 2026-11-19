@@ -9,6 +9,7 @@ import {
 } from '../../tests/helpers/isolated-postgres';
 import { migrationProvider } from './migrations';
 import { migrateSqlite } from './database.service';
+import { initialGraphDraft } from './execution-graphs-migration';
 import type { Database } from './schema';
 
 const now = 1_800_000_000_000;
@@ -213,8 +214,102 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
       updated_at: now,
     })
     .execute();
-  const upgrade = await migrator.migrateToLatest();
+  const upgrade = await migrator.migrateTo('017_linux_monitoring');
   assert.ifError(upgrade.error);
+  const graphUpgrade = await migrator.migrateToLatest();
+  assert.ifError(graphUpgrade.error);
+  assert.deepEqual(await db.selectFrom('execution_graphs').select('id').execute(), []);
+  const graph = await db
+    .insertInto('execution_graphs')
+    .values({
+      id: 'graph',
+      project_id: 'project',
+      revision: 1,
+      draft_json: initialGraphDraft,
+      created_at: now,
+      updated_at: now,
+    })
+    .returningAll()
+    .executeTakeFirstOrThrow();
+  assert.equal(graph.published_version, null);
+  assert.equal(graph.revision, 1);
+  assert.deepEqual(
+    JSON.parse(graph.draft_json).flows[0].nodes.map((node: { type: string }) => node.type),
+    ['START', 'END'],
+  );
+  await assert.rejects(
+    db
+      .insertInto('execution_graphs')
+      .values({ ...graph, id: 'duplicate-graph' })
+      .execute(),
+  );
+  const unpublished = {
+    id: 'run-unpublished',
+    project_id: 'project',
+    graph_id: graph.id,
+    version: 1,
+    flow_id: 'main',
+    flow_name: 'main',
+    created_by: 'existing-user',
+    idempotency_key: 'request',
+    request_hash: 'request-hash',
+    configuration_hash: 'configuration-hash',
+    inputs_json: '{}',
+    status: 'SUCCESS',
+    created_at: now,
+  };
+  await assert.rejects(db.insertInto('execution_flow_runs').values(unpublished).execute());
+  await db
+    .insertInto('execution_graph_versions')
+    .values({
+      id: 'graph-version-1',
+      graph_id: graph.id,
+      version: 1,
+      source_revision: 1,
+      definition_json: graph.draft_json,
+      created_by: 'existing-user',
+      created_at: now,
+    })
+    .execute();
+  await db
+    .insertInto('execution_flow_runs')
+    .values({ ...unpublished, id: 'run-published' })
+    .execute();
+  await db
+    .insertInto('execution_flow_runs')
+    .values({
+      ...unpublished,
+      id: 'nested-run',
+      parent_run_id: 'run-published',
+      idempotency_key: 'nested',
+    })
+    .execute();
+  await db
+    .insertInto('execution_node_runs')
+    .values({
+      id: 'call',
+      run_id: 'run-published',
+      node_id: 'call',
+      node_type: 'FLOW_CALL',
+      name: 'Call',
+      position: 1,
+      status: 'SUCCESS',
+      log: '',
+      child_run_id: 'nested-run',
+    })
+    .execute();
+  await assert.rejects(
+    db.deleteFrom('execution_flow_runs').where('id', '=', 'nested-run').execute(),
+  );
+  await assert.rejects(
+    db
+      .insertInto('execution_flow_runs')
+      .values({ ...unpublished, id: 'duplicate-request' })
+      .execute(),
+  );
+  await assert.rejects(
+    db.deleteFrom('execution_graph_versions').where('id', '=', 'graph-version-1').execute(),
+  );
   assert.deepEqual(
     await db
       .selectFrom('pipeline_webhooks')
@@ -287,6 +382,7 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
   const repeat = await migrator.migrateToLatest();
   assert.ifError(repeat.error);
   assert.deepEqual(repeat.results, []);
+  assert.deepEqual(await db.selectFrom('execution_graphs').selectAll().execute(), [graph]);
   await db
     .insertInto('tasks')
     .values(
@@ -347,6 +443,13 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
       .insertInto('notification_events')
       .values({ ...event, id: 'duplicate' })
       .execute(),
+  );
+  const graphRollback = await migrator.migrateTo('017_linux_monitoring');
+  assert.ifError(graphRollback.error);
+  await assert.rejects(db.selectFrom('execution_graphs').select('id').execute());
+  assert.equal(
+    (await db.selectFrom('pipeline_runs').select('id').executeTakeFirstOrThrow()).id,
+    'run1',
   );
   const rollback = await migrator.migrateTo('001_initial');
   assert.ifError(rollback.error);

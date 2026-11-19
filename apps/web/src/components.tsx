@@ -80,6 +80,8 @@ export function RefreshButton({ onClick }: { onClick: () => void }) {
 
 const statusNames: Record<string, string> = {
   PENDING: '等待执行',
+  QUEUED: '已入队',
+  WAITING: '等待审批或处理',
   RUNNING: '执行中',
   SUCCESS: '成功',
   FAILED: '失败',
@@ -100,7 +102,9 @@ export function Status({ value }: { value: string }) {
     ? 'green'
     : ['FAILED', 'OFFLINE', 'TIMED_OUT', 'PARTIAL_FAILED'].includes(value)
       ? 'red'
-      : ['RUNNING', 'PENDING', 'CANCEL_REQUESTED', 'NEEDS_ATTENTION'].includes(value)
+      : ['RUNNING', 'PENDING', 'QUEUED', 'WAITING', 'CANCEL_REQUESTED', 'NEEDS_ATTENTION'].includes(
+            value,
+          )
         ? 'amber'
         : 'gray';
   return (

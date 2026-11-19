@@ -20,6 +20,13 @@ import {
   type LogRetentionResult,
 } from './task-log-retention';
 
+export function redactTaskLog(text: string) {
+  return text.replace(
+    /((?:password|api[_-]?key|access[_-]?token|secret)\s*[=:]\s*)[^\s]+/gi,
+    '$1[REDACTED]',
+  );
+}
+
 @Injectable()
 export class TaskLogService {
   readonly changes = new Subject<{ taskId: string }>();
@@ -71,10 +78,7 @@ export class TaskLogService {
     const file = this.path(key);
     mkdirSync(dirname(file), { recursive: true });
     // Defense in depth for common credential assignments; SSH output is also stream-redacted.
-    const scrubbed = text.replace(
-      /((?:password|api[_-]?key|access[_-]?token|secret)\s*[=:]\s*)[^\s]+/gi,
-      '$1[REDACTED]',
-    );
+    const scrubbed = redactTaskLog(text);
     appendFileSync(file, scrubbed, { encoding: 'utf8', mode: 0o600 });
     this.changes.next({ taskId });
     return statSync(file).size;

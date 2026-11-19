@@ -3,9 +3,12 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Optional,
   NotFoundException,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { graphTaskKeyPrefix } from '../execution-graphs/graph-run-lifecycle';
+import { TaskHandlerRegistry } from './task-handler.registry';
 import { Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import { Database, TaskTargetsTable, TasksTable } from '../../core/database/schema';
@@ -85,6 +88,7 @@ export class TasksService {
   constructor(
     private readonly database: DatabaseService,
     private readonly logStore: TaskLogService,
+    @Optional() private readonly registry?: TaskHandlerRegistry,
   ) {}
   bindCancellation(id: string, controller: AbortController): () => void {
     this.cancellations.set(id, controller);
@@ -389,7 +393,7 @@ export class TasksService {
   async recentLog(id: string) {
     return this.logStore.tail((await this.row(id)).log_file_key);
   }
-  async cancel(id: string) {
+  async cancel(id: string, reconcileGraph = true) {
     const row = await this.row(id);
     if (isTerminalStatus(row.status)) throw new BadRequestException('已结束的任务不能取消');
     const now = Date.now();
@@ -401,14 +405,14 @@ export class TasksService {
         .where('status', '=', 'PENDING')
         .returning('id')
         .executeTakeFirst();
-      if (pending)
+      if (pending) {
         await tx
           .updateTable('task_targets')
           .set({ status: 'CANCELLED', finished_at: now })
           .where('task_id', '=', id)
           .where('status', '=', 'PENDING')
           .execute();
-      else
+      } else
         await tx
           .updateTable('tasks')
           .set({ status: 'CANCEL_REQUESTED', cancel_requested_at: now, updated_at: now })
@@ -417,6 +421,8 @@ export class TasksService {
           .execute();
     });
     this.cancellations.get(id)?.abort();
+    if (reconcileGraph && row.idempotency_key?.startsWith(graphTaskKeyPrefix))
+      await this.registry?.advanceGraphRuns(id)?.catch(() => undefined);
     return this.get(id);
   }
   context(task: Selectable<TasksTable>, signal: AbortSignal): TaskExecutionContext {

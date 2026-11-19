@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1180,6 +1180,222 @@ async function checkDelivery(databaseUrl?: string) {
     } finally {
       isolation.mock.restore();
     }
+
+    const graphPath = `/projects/${project.id}/execution-graph`;
+    const graph = (await api.get('/api/v1' + graphPath).expect(200)).body.data;
+    const graphFlow = (id: string, type: 'BUILD' | 'DEPLOY_ARTIFACT') => ({
+      id,
+      name: id,
+      nodes: [
+        { id: 'start-' + id, type: 'START', name: '开始' },
+        { id: 'action-' + id, type, name: id, pipelineId: managerPipeline.id, pipelineVersion: 1 },
+        { id: 'end-' + id, type: 'END', name: '完成' },
+      ],
+      edges: [
+        { from: 'start-' + id, to: 'action-' + id },
+        { from: 'action-' + id, to: 'end-' + id },
+      ],
+    });
+    const composedFlow = graphFlow('composed', 'BUILD');
+    composedFlow.nodes.splice(2, 0, {
+      id: 'deploy-composed',
+      type: 'DEPLOY_ARTIFACT',
+      name: '部署上游产物',
+      pipelineId: managerPipeline.id,
+      pipelineVersion: 1,
+    });
+    composedFlow.edges.splice(
+      1,
+      1,
+      { from: 'action-composed', to: 'deploy-composed' },
+      { from: 'deploy-composed', to: 'end-composed' },
+    );
+    const definitionWithDelivery = {
+      flows: [graphFlow('build', 'BUILD'), graphFlow('release', 'DEPLOY_ARTIFACT'), composedFlow],
+    };
+    const foreignGraph = '/api/v1/projects/' + otherProject.id + '/execution-graph';
+    const foreign = (await api.get(foreignGraph).expect(200)).body.data;
+    const rejected = await api
+      .put(foreignGraph + '/draft')
+      .send({ expectedRevision: foreign.revision, definition: definitionWithDelivery });
+    assert.ok(
+      [400, 404].includes(rejected.status),
+      'a delivery action cannot use a pipeline from another project',
+    );
+    const edited = (
+      await api
+        .put('/api/v1' + graphPath + '/draft')
+        .send({ expectedRevision: graph.revision, definition: definitionWithDelivery })
+        .expect(200)
+    ).body.data;
+    const published = await create(graphPath + '/publish', { expectedRevision: edited.revision });
+    const graphEnv = await create(`/projects/${project.id}/environments`, {
+      name: 'Graph release',
+      slug: 'graph-release',
+      environmentType: 'TESTING',
+    });
+    const selected = { environmentId: graphEnv.id, serverIds: [serverIds[0]] };
+    const waitGraph = async (id: string) => {
+      for (let attempt = 0; attempt < 160; attempt++) {
+        const detail = (await api.get('/api/v1' + graphPath + '/runs/' + id).expect(200)).body.data;
+        if (
+          !['QUEUED', 'RUNNING', 'WAITING', 'PENDING', 'CANCEL_REQUESTED'].includes(detail.status)
+        )
+          return detail;
+        await worker.tick();
+        await delay(15);
+      }
+      assert.fail('Flow did not reach a terminal status: ' + id);
+    };
+    const submitFlow = async (flow: string, inputs: object) => {
+      const path = graphPath + '/flows/' + flow;
+      const request = { version: published.publishedVersion, inputs };
+      const preview = await create(path + '/preview', request);
+      const confirmed = {
+        ...request,
+        expectedConfigurationHash: preview.configurationHash,
+        idempotencyKey: randomUUID(),
+      };
+      const submitted = await create(path + '/run', confirmed);
+      const replay = await create(path + '/run', confirmed);
+      assert.equal(replay.id, submitted.id);
+      assert.equal(replay.taskId, submitted.taskId);
+      const task = await runTask(submitted.taskId);
+      const detail = await waitGraph(submitted.id);
+      return { task, detail };
+    };
+    const graphBuild = await submitFlow('build', { ...selected, commitSha: successfulCommit });
+    assert.equal(graphBuild.task.status, 'SUCCESS', graphBuild.task.errorSummary);
+    assert.equal(graphBuild.task.deploymentTaskId, null);
+    assert.equal(graphBuild.detail.status, 'SUCCESS');
+    assert.equal(graphBuild.detail.commitSha, successfulCommit);
+    const archiveForGraph = await db
+      .selectFrom('artifacts')
+      .selectAll()
+      .where('pipeline_run_id', '=', graphBuild.task.pipelineRunId)
+      .executeTakeFirstOrThrow();
+    assert.equal(archiveForGraph.checksum, checksum);
+    const graphRelease = await submitFlow('release', {
+      ...selected,
+      artifactIds: [archiveForGraph.id],
+    });
+    assert.equal(graphRelease.task.status, 'SUCCESS', graphRelease.task.errorSummary);
+    assert.equal(graphRelease.detail.status, 'SUCCESS');
+    assert.equal(graphRelease.detail.serviceId, service.id);
+    assert.deepEqual(graphRelease.detail.artifactIds, [archiveForGraph.id]);
+    const combined = await submitFlow('composed', { ...selected, commitSha: successfulCommit });
+    assert.equal(combined.detail.status, 'SUCCESS');
+    const graphDeploy = combined.detail.nodes.find(
+      (node: { nodeId: string }) => node.nodeId === 'deploy-composed',
+    );
+    assert.ok(graphDeploy.taskId && graphDeploy.taskId !== combined.task.id);
+    assert.equal((await getTask(graphDeploy.taskId)).sourceBuildTaskId, combined.task.id);
+    const releaseFlow = graphPath + '/flows/release';
+    const releaseInput = {
+      version: published.publishedVersion,
+      inputs: { ...selected, artifactIds: [archiveForGraph.id] },
+    };
+    const beforePolicyChange = await create(releaseFlow + '/preview', releaseInput);
+    await api
+      .put(`/api/v1/services/${service.id}/environments/${graphEnv.id}/config`)
+      .send({ ...directConfig, groupIds: [], releasePolicy: { requireApproval: true } })
+      .expect(200);
+    await post(releaseFlow + '/run', {
+      ...releaseInput,
+      expectedConfigurationHash: beforePolicyChange.configurationHash,
+      idempotencyKey: randomUUID(),
+    }).expect(409);
+    const protectedPreview = await create(releaseFlow + '/preview', releaseInput);
+    assert.equal(protectedPreview.requireApproval, true);
+    const submitProtected = () =>
+      create(releaseFlow + '/run', {
+        ...releaseInput,
+        expectedConfigurationHash: protectedPreview.configurationHash,
+        idempotencyKey: randomUUID(),
+      });
+    const waiting = await submitProtected();
+    assert.equal(waiting.status, 'WAITING');
+    const beforeApproval = activations().length;
+    await worker.tick();
+    assert.equal(activations().length, beforeApproval);
+    await create('/tasks/' + waiting.taskId + '/cancel', {});
+    const cancelled = await waitGraph(waiting.id);
+    assert.equal(cancelled.status, 'CANCELLED');
+    assert.equal(cancelled.nodes.at(-1).status, 'SKIPPED');
+    const approved = await submitProtected();
+    await create('/deployments/approvals/' + approved.taskId + '/approve', {});
+    assert.equal((await runTask(approved.taskId)).status, 'SUCCESS');
+    const beforeRejectedBuild = activations().length;
+    const failedGraphBuild = await submitFlow('build', { ...selected, commitSha: failingCommit });
+    assert.equal(failedGraphBuild.detail.status, 'FAILED');
+    assert.equal(failedGraphBuild.detail.nodes.at(-1).status, 'SKIPPED');
+    assert.equal(activations().length, beforeRejectedBuild);
+    const buildFlow = graphPath + '/flows/build';
+    const ready = {
+      version: published.publishedVersion,
+      inputs: { ...selected, commitSha: successfulCommit },
+    };
+    const buildPreview = await create(buildFlow + '/preview', ready);
+    const buildRequest = {
+      ...ready,
+      expectedConfigurationHash: buildPreview.configurationHash,
+      idempotencyKey: randomUUID(),
+    };
+    const { AuditService } = await import('../modules/audit/audit.service.js');
+    const graphAudit = app.get(AuditService);
+    const originalRecord = graphAudit.record.bind(graphAudit);
+    const fault = mock.method(
+      graphAudit,
+      'record',
+      (...args: Parameters<typeof graphAudit.record>) => {
+        if (args[1] === 'execution-flow.run')
+          throw new Error('simulated graph persistence failure');
+        return originalRecord(...args);
+      },
+    );
+    const taskCount = () =>
+      db
+        .selectFrom('tasks')
+        .select((eb) => eb.fn.countAll().as('count'))
+        .executeTakeFirstOrThrow();
+    const prior = await taskCount();
+    try {
+      await post(buildFlow + '/run', buildRequest).expect(500);
+      assert.deepEqual(
+        await taskCount(),
+        prior,
+        'an unsuccessful graph write must also roll back its delivery task',
+      );
+      assert.equal(
+        await db
+          .selectFrom('execution_flow_runs')
+          .select('id')
+          .where('idempotency_key', '=', buildRequest.idempotencyKey)
+          .executeTakeFirst(),
+        undefined,
+      );
+    } finally {
+      fault.mock.restore();
+    }
+    const [interrupted, duplicate] = await Promise.all([
+      create(buildFlow + '/run', buildRequest),
+      create(buildFlow + '/run', buildRequest),
+    ]);
+    assert.equal(interrupted.id, duplicate.id);
+    assert.equal(interrupted.taskId, duplicate.taskId);
+    const claimed = await worker.claim();
+    assert.equal(claimed?.id, interrupted.taskId);
+    await db
+      .updateTable('tasks')
+      .set({ lease_expires_at: Date.now() - 1 })
+      .where('id', '=', interrupted.taskId)
+      .execute();
+    await worker.recoverExpired();
+    const recovered = await waitGraph(interrupted.id);
+    assert.equal(recovered.status, 'NEEDS_ATTENTION');
+    assert.equal(recovered.nodes[1].status, 'NEEDS_ATTENTION');
+    assert.equal(recovered.nodes[2].status, 'SKIPPED');
+    assert.equal((await create(buildFlow + '/run', buildRequest)).taskId, interrupted.taskId);
   } finally {
     await app.close();
   }

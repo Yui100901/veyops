@@ -919,6 +919,24 @@ export class PipelinesService implements OnModuleInit {
       id,
       input,
     );
+    const buildTask = await this.database.db
+      .selectFrom('tasks')
+      .select('payload_json')
+      .where('id', '=', source.task_id)
+      .executeTakeFirstOrThrow();
+    const built = (JSON.parse(buildTask.payload_json) as TaskPayload).pipeline;
+    const sources = (built?.definition.nodes ?? []).flatMap((node) => {
+      const snapshot = built?.nodeSources?.[node.id];
+      if (node.type !== 'CHECKOUT' || !snapshot || !built) return [];
+      return [
+        {
+          id: node.id,
+          repositoryId: node.repositoryId ?? built.definition.repositoryId,
+          commitSha: snapshot.commitSha,
+          branch: snapshot.branch,
+        },
+      ];
+    });
     return {
       pipelineId: id,
       projectId: p.pipeline.projectId,
@@ -932,18 +950,48 @@ export class PipelinesService implements OnModuleInit {
       requireApproval: Boolean(p.env.config?.releasePolicy?.requireApproval),
       version: p.version.version,
       commitSha: source.commit_sha,
+      sourceBuildTaskId: source.task_id,
+      nodeSources: sources.length
+        ? sources
+        : [{ repositoryId: built?.definition.repositoryId, commitSha: source.commit_sha }],
       definition: p.definition,
       configurationHash,
       artifactIds,
     };
   }
 
-  async deployArtifact(id: string, input: ArtifactDeployDto, userId: string) {
+  async previewArtifactDeployPlan(
+    id: string,
+    input: Omit<ArtifactDeployPreviewDto, 'artifactIds'> & { commitSha: string },
+  ) {
+    const p = await this.prepare(id, { ...input, confirmed: true, mode: 'DEPLOY' }, true);
+    return {
+      version: p.version.version,
+      serviceId: p.pipeline.serviceId,
+      environmentId: p.environment.id,
+      commitSha: p.commitSha,
+      serverIds: p.servers.map(({ id }) => id),
+      requireApproval: Boolean(p.env.config?.releasePolicy?.requireApproval),
+      configurationHash: this.configurationHash(p),
+    };
+  }
+
+  async deployArtifact(
+    id: string,
+    input: ArtifactDeployDto,
+    userId: string,
+    options: {
+      idempotencyKey?: string;
+      expectedPlanHash?: string;
+      afterInsert?: (tx: Transaction<Database>, taskId: string) => Promise<void>;
+    } = {},
+  ) {
     if (input.confirmed !== true) throw new BadRequestException('必须确认产物和部署目标');
     const { p, references, source, configurationHash, artifactIds, targets } =
       await this.prepareArtifactDeploy(id, input);
     if (
       input.expectedConfigurationHash !== configurationHash ||
+      (options.expectedPlanHash && options.expectedPlanHash !== this.configurationHash(p)) ||
       (input.expectedServerIds &&
         JSON.stringify([...input.expectedServerIds].sort()) !== JSON.stringify([...targets].sort()))
     )
@@ -959,17 +1007,20 @@ export class PipelinesService implements OnModuleInit {
         snapshot,
         `${p.pipeline.name} · v${p.version.version} · ${source.commit_sha.slice(0, 8)} · 部署产物`,
         this.executionTargets(p),
+        options.idempotencyKey,
       ),
       userId,
       snapshot.targetSelection
         ? (tx) => confirmDeploymentMembers(tx, snapshot.targetSelection!, targets)
         : undefined,
+      options.afterInsert,
     );
-    await this.audit.record(userId, 'pipeline.artifact-deploy', 'task', task.id, {
-      sourceBuildTaskId: source.task_id,
-      artifactIds,
-      targetCount: targets.length,
-    });
+    if (task.pipelineRunId === snapshot.runId)
+      await this.audit.record(userId, 'pipeline.artifact-deploy', 'task', task.id, {
+        sourceBuildTaskId: source.task_id,
+        artifactIds,
+        targetCount: targets.length,
+      });
     return task;
   }
 

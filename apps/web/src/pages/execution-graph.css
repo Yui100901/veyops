@@ -1,0 +1,238 @@
+.execution-graph {
+  min-width: 0;
+}
+.graph-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+  padding: 0.7rem 1rem;
+  border-top: 1px solid var(--border);
+}
+.graph-fields,
+.graph-properties,
+.graph-run-form,
+.graph-run-form > fieldset,
+.graph-review {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+.graph-fields,
+.graph-run-form > fieldset {
+  margin: 0;
+  border: 0;
+}
+.graph-fields {
+  padding: 1.1rem;
+}
+.graph-run-form > fieldset {
+  padding: 0;
+}
+.graph-run-form > fieldset[hidden] {
+  display: none;
+}
+.graph-fields h3,
+.graph-fields p,
+.graph-notice {
+  margin: 0;
+}
+.graph-flow-select {
+  display: flex;
+  gap: 0.75rem;
+  align-items: end;
+  flex-wrap: wrap;
+}
+.graph-flow-select > .field {
+  flex: 1 1 15rem;
+  max-width: 32rem;
+}
+.graph-node {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  max-width: 100%;
+  min-height: 3.1rem;
+  padding: 0.5rem 0.8rem;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  color: inherit;
+  background: #fff;
+}
+button.graph-node {
+  cursor: pointer;
+}
+button.graph-node:hover,
+button.graph-node[aria-pressed='true'] {
+  border-color: var(--accent);
+  color: var(--accent-dark);
+  background: #eff8ff;
+}
+.graph-node svg {
+  flex: none;
+}
+.graph-node span {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.graph-node small {
+  color: var(--muted);
+}
+.graph-properties,
+.graph-review,
+.graph-artifacts {
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  padding: 1rem;
+}
+.graph-properties {
+  border-left: 3px solid var(--accent);
+}
+.graph-notice {
+  color: var(--accent-dark);
+}
+.graph-run-form {
+  border-top: 1px solid var(--border);
+  padding-top: 1rem;
+}
+.graph-review,
+.graph-logs li {
+  overflow-wrap: anywhere;
+}
+.graph-logs {
+  display: grid;
+  gap: 0.8rem;
+  padding-left: 1.6rem;
+  margin: 0;
+}
+.graph-logs pre {
+  overflow: auto;
+  white-space: pre-wrap;
+  background: #f5f8fc;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  padding: 0.65rem;
+}
+.graph-artifacts {
+  max-height: 19rem;
+  overflow: auto;
+  margin: 0;
+}
+@media (max-width: 650px) {
+  .graph-fields {
+    padding: 0.8rem;
+  }
+}
+
+.graph-canvas {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  background: #f5f8fc;
+  overflow: hidden;
+}
+.graph-canvas-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.55rem 0.8rem;
+  background: #fff;
+  border-bottom: 1px solid var(--border);
+  gap: 0.6rem;
+}
+.graph-canvas-controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.graph-canvas-controls select {
+  min-width: 5rem;
+}
+.graph-canvas-scroll {
+  max-height: 33rem;
+  overflow: auto;
+}
+.graph-canvas-viewport {
+  overflow: hidden;
+}
+.graph-canvas-content {
+  position: relative;
+  transform-origin: top left;
+  user-select: none;
+}
+.graph-connectors {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+.graph-connectors g > path {
+  fill: none;
+  stroke: #7890aa;
+  stroke-width: 2;
+}
+.graph-connectors .graph-arrow {
+  fill: #7890aa;
+}
+.graph-connectors .edge-true > path {
+  stroke: #328063;
+}
+.graph-connectors .edge-false > path {
+  stroke: #a56430;
+}
+.graph-connectors g > path.graph-edge-hit {
+  pointer-events: stroke;
+  cursor: pointer;
+  stroke: transparent;
+  stroke-width: 13;
+}
+.graph-connectors text {
+  paint-order: stroke;
+  stroke: #f5f8fc;
+  stroke-width: 5;
+  fill: #384858;
+  font-size: 12px;
+}
+.graph-node strong {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.graph-selection {
+  position: absolute;
+  pointer-events: none;
+  z-index: 1;
+  border: 1px solid var(--accent);
+  background: rgb(50 125 215 / 12%);
+}
+.graph-edge-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.graph-delivery-preview {
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+  display: grid;
+  gap: 0.5rem;
+}
+
+.graph-canvas-editing {
+  touch-action: none;
+}
+.graph-canvas-editing .graph-node {
+  cursor: grab;
+}
+.graph-canvas-editing .graph-node:active {
+  cursor: grabbing;
+}

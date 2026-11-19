@@ -31,6 +31,7 @@ import {
   MinLength,
 } from 'class-validator';
 import { DatabaseService } from '../../core/database/database.service';
+import { initialGraphDraft } from '../../core/database/execution-graphs-migration';
 import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { CurrentUser } from '../auth/auth.decorators';
@@ -272,24 +273,39 @@ export class ProjectsService {
     const id = randomUUID();
     const now = Date.now();
     try {
-      await this.database.db
-        .insertInto('projects')
-        .values({
-          id,
-          name: dto.name,
-          slug: dto.slug,
-          description: dto.description || '',
-          tags_json: JSON.stringify(dto.tags || []),
-          status: 'ACTIVE',
-          created_by: userId,
-          created_at: now,
-          updated_at: now,
-        })
-        .execute();
-    } catch {
-      throw new ConflictException('项目标识已存在');
+      await this.database.db.transaction().execute(async (tx) => {
+        await tx
+          .insertInto('projects')
+          .values({
+            id,
+            name: dto.name,
+            slug: dto.slug,
+            description: dto.description || '',
+            tags_json: JSON.stringify(dto.tags || []),
+            status: 'ACTIVE',
+            created_by: userId,
+            created_at: now,
+            updated_at: now,
+          })
+          .execute();
+        await tx
+          .insertInto('execution_graphs')
+          .values({
+            id,
+            project_id: id,
+            revision: 1,
+            draft_json: initialGraphDraft,
+            created_at: now,
+            updated_at: now,
+          })
+          .execute();
+        await this.audit.record(userId, 'project.create', 'project', id, {}, tx);
+      });
+    } catch (error) {
+      if (hasConstraint(error, 'SQLITE_CONSTRAINT_UNIQUE', '23505'))
+        throw new ConflictException('项目标识已存在');
+      throw error;
     }
-    await this.audit.record(userId, 'project.create', 'project', id);
     return this.get(id);
   }
   async update(id: string, dto: ProjectDto, userId: string) {

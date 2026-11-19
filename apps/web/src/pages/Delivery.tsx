@@ -2032,7 +2032,7 @@ function PipelineVersions({ pipeline, onClose }: { pipeline: Pipeline; onClose: 
   );
 }
 
-type Artifact = {
+export type Artifact = {
   id: string;
   projectId?: string;
   artifactType: string;
@@ -2069,7 +2069,7 @@ type ArtifactDeployPreview = Omit<PipelinePreview, 'mode'> & {
   artifactIds: string[];
 };
 
-function isDeployableArtifact(artifact: Artifact): artifact is DeployableArtifact {
+export function isDeployableArtifact(artifact: Artifact): artifact is DeployableArtifact {
   return Boolean(
     artifact.deployable &&
     artifact.projectId &&

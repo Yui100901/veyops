@@ -16,6 +16,7 @@ import { TasksService } from './tasks.service';
 import { TaskLogService } from './task-log.service';
 import type { TaskHandler, TaskPayload, TaskRecord, TaskStatus } from './tasks.types';
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
+import { graphTaskKeyPrefix } from '../execution-graphs/graph-run-lifecycle';
 import { SystemSettingsService } from '../system/system-settings.service';
 import { ArtifactRetentionService } from '../artifacts/artifact-retention.service';
 import { OperationSchedulesService } from '../operation-schedules/operation-schedules.service';
@@ -30,6 +31,7 @@ const LOG_FAILED = '任务日志存储失败，远程执行结果需人工核查
 const CANCELLED = '任务已取消';
 const LOG_PRUNE_INTERVAL_MS = 60 * 60_000;
 const ARTIFACT_PRUNE_INTERVAL_MS = 60 * 60_000;
+const MAX_GRAPH_TASKS_PER_WORKER = 3;
 
 @Injectable()
 export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -40,9 +42,15 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
   private evaluatingTriggers?: Promise<void>;
   private diagnosing?: Promise<void>;
   private polling?: Promise<void>;
-  private running?: Promise<void>;
+  private readonly activeJobs = new Map<
+    string,
+    {
+      running: Promise<void>;
+      controller: AbortController;
+      graph: boolean;
+    }
+  >();
   private shutdownPromise?: Promise<void>;
-  private controller?: AbortController;
   private stopping = false;
   private sqliteLeaseLost = false;
   private nextLogPruneAt = 0;
@@ -81,11 +89,11 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     this.shutdownController.abort();
-    this.controller?.abort();
+    for (const job of this.activeJobs.values()) job.controller.abort();
     await this.polling?.catch(() => undefined);
     await this.evaluatingTriggers;
     await this.diagnosing;
-    await this.running;
+    await Promise.all([...this.activeJobs.values()].map((job) => job.running));
     if (this.database.client === 'sqlite') {
       await this.database.db
         .deleteFrom('system_settings')
@@ -124,9 +132,9 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
   }
   private async poll() {
     if (!(await this.ownSqliteLease())) {
-      if (this.running) {
+      if (this.activeJobs.size) {
         this.sqliteLeaseLost = true;
-        this.controller?.abort();
+        for (const job of this.activeJobs.values()) job.controller.abort();
       }
       return;
     }
@@ -139,6 +147,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         });
     }
     await this.recoverExpired();
+    if (!this.stopping) await this.advanceGraphRuns();
     if (this.failures && !this.stopping) {
       this.diagnosing ??= this.failures
         .tick(this.shutdownController.signal)
@@ -156,22 +165,33 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     }
     await this.pruneLogs();
     await this.pruneArtifacts();
-    if (this.running || this.stopping) return;
-    const task = await this.claim(true);
-    if (!task) return;
-    this.sqliteLeaseLost = false;
-    this.running = this.execute(task)
-      .catch(() => this.logger.error('任务状态写入失败，租约过期后将进入人工核查'))
-      .finally(() => {
-        this.running = undefined;
-        this.controller = undefined;
+    if (!this.activeJobs.size) this.sqliteLeaseLost = false;
+    while (
+      !this.stopping &&
+      !this.sqliteLeaseLost &&
+      this.activeJobs.size < MAX_GRAPH_TASKS_PER_WORKER &&
+      [...this.activeJobs.values()].every((job) => job.graph)
+    ) {
+      const task = await this.claim(true, this.activeJobs.size > 0);
+      if (!task) return;
+      const controller = new AbortController();
+      const running = this.execute(task, controller)
+        .catch(() => this.logger.error('任务状态写入失败，租约过期后将进入人工核查'))
+        .finally(() => {
+          this.activeJobs.delete(task.id);
+        });
+      this.activeJobs.set(task.id, {
+        controller,
+        running,
+        graph: task.idempotency_key?.startsWith(graphTaskKeyPrefix) === true,
       });
+    }
   }
   private async pruneArtifacts() {
     if (
       !this.artifactRetention ||
       this.stopping ||
-      this.running ||
+      this.activeJobs.size > 0 ||
       Date.now() < this.nextArtifactPruneAt
     )
       return;
@@ -202,18 +222,19 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       this.logger.warn('任务日志保留策略执行失败，下次周期将重试');
     }
   }
-  async claim(requireSqliteLease = false) {
+  async claim(requireSqliteLease = false, parallelGraph = false) {
     // The conditional UPDATE is atomic in both dialects. Remote work never holds a DB transaction.
     const candidate = await this.database.db
       .selectFrom('tasks')
-      .select('id')
+      .select(['id', 'idempotency_key'])
       .where('status', '=', 'PENDING')
       .where('available_at', '<=', Date.now())
       .orderBy('priority', 'desc')
       .orderBy('created_at')
       .limit(1)
       .executeTakeFirst();
-    if (!candidate) return undefined;
+    if (!candidate || (parallelGraph && !candidate.idempotency_key?.startsWith(graphTaskKeyPrefix)))
+      return undefined;
     const now = Date.now();
     let claim = this.database.db
       .updateTable('tasks')
@@ -229,6 +250,19 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       .where('id', '=', candidate.id)
       .where('status', '=', 'PENDING');
     if (requireSqliteLease && this.database.client === 'sqlite') {
+      let conflicts = this.database.db
+        .selectFrom('tasks as active')
+        .select('active.id')
+        .where('active.status', 'in', ['RUNNING', 'CANCEL_REQUESTED']);
+      if (parallelGraph)
+        conflicts = conflicts.where((active) =>
+          active.or([
+            active('active.lease_owner', 'is', null),
+            active('active.lease_owner', '!=', this.owner),
+            active('active.idempotency_key', 'is', null),
+            active('active.idempotency_key', 'not like', graphTaskKeyPrefix + '%'),
+          ]),
+        );
       claim = claim.where((eb) =>
         eb.and([
           eb.exists(
@@ -239,14 +273,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
               .where('value_json', '=', JSON.stringify(this.owner))
               .where('updated_at', '>=', now - SQLITE_LEASE_MS),
           ),
-          eb.not(
-            eb.exists(
-              eb
-                .selectFrom('tasks as active')
-                .select('active.id')
-                .where('active.status', 'in', ['RUNNING', 'CANCEL_REQUESTED']),
-            ),
-          ),
+          eb.not(eb.exists(conflicts)),
         ]),
       );
     }
@@ -256,7 +283,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     const now = Date.now();
     // The parent and its execution/deployment records must move together; otherwise a
     // process crash between updates could leave RUNNING history that is never revisited.
-    await this.database.db.transaction().execute(async (tx) => {
+    const graphTasks = await this.database.db.transaction().execute(async (tx) => {
       const expired = await tx
         .updateTable('tasks')
         .set({
@@ -269,18 +296,25 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         })
         .where('status', 'in', ['RUNNING', 'CANCEL_REQUESTED'])
         .where('lease_expires_at', '<', now)
-        .returning('id')
+        .returning(['id', 'idempotency_key'])
         .execute();
       for (const task of expired) {
         await this.settleExecutionRows(tx, task.id, now, 'NEEDS_ATTENTION', EXECUTION_INTERRUPTED);
         await this.notifications?.recordTaskCompletion(tx, task.id, now);
         await this.failures?.completion(tx, task.id, now);
       }
+      return expired.filter((task) => task.idempotency_key?.startsWith(graphTaskKeyPrefix));
     });
+    for (const task of graphTasks) await this.advanceGraphRuns(task.id);
   }
-  private async execute(task: Selectable<TasksTable>) {
-    const controller = new AbortController();
-    this.controller = controller;
+  private async advanceGraphRuns(taskId?: string) {
+    try {
+      await this.registry.advanceGraphRuns(taskId);
+    } catch {
+      this.logger.warn('执行图调度暂不可用，将在下一轮重试');
+    }
+  }
+  private async execute(task: Selectable<TasksTable>, controller: AbortController) {
     const unbind = this.tasks.bindCancellation(task.id, controller);
     const context = this.tasks.context(task, controller.signal);
     let lostLease = false;
@@ -343,9 +377,10 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     } finally {
       clearInterval(heartbeat);
       unbind();
-      this.controller = undefined;
       await heartbeatInProgress;
     }
+    if (finalized && !this.stopping && task.idempotency_key?.startsWith(graphTaskKeyPrefix))
+      await this.advanceGraphRuns(task.id);
 
     if (
       finalized &&

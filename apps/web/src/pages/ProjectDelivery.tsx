@@ -143,6 +143,7 @@ export function ProjectDelivery({
         <p className="field-note">{project.name} 已归档，可查看历史交付记录。</p>
       )}
       <nav className="record-tabs" aria-label="项目交付">
+        <a href={`#/projects/${id}/execution-graph`}>执行图</a>
         {(Object.keys(deliveryTabs) as DeliveryTab[])
           .filter((key) => key !== 'approvals' || canApprove)
           .map((key) => (

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { DatabaseModule } from './core/database/database.service';
+import { ExecutionGraphsModule } from './modules/execution-graphs/execution-graphs.module';
 import { AuditModule } from './modules/audit/audit.service';
 import { AuthModule } from './modules/auth/auth.module';
 import { AuthGuard } from './modules/auth/auth.guard';
@@ -45,6 +46,7 @@ import { MonitoringModule } from './modules/monitoring/monitoring.module';
     CommandCenterModule,
     OperationPlansModule,
     PipelinesModule,
+    ExecutionGraphsModule,
     PipelineHooksModule,
     AiModule,
     InitialConfigurationModule,

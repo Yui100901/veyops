@@ -1615,6 +1615,9 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
         </span>
       </div>
       <nav className="resource-section-switcher" aria-label="项目详情">
+        <button type="button" onClick={() => navigate(`/projects/${id}/execution-graph`)}>
+          执行图
+        </button>
         <button type="button" onClick={() => navigate(deliveryPath(id, 'pipelines'))}>
           流水线
         </button>

@@ -1,3 +1,4 @@
+import { executionGraphsMigration } from './execution-graphs-migration';
 import {
   sql,
   type Kysely,
@@ -1447,6 +1448,7 @@ export const migrationProvider: MigrationProvider = {
             await db.schema.dropTable(name).execute();
         },
       } satisfies Migration,
+      '018_project_execution_graphs': executionGraphsMigration,
     };
   },
 };

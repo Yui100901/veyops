@@ -92,6 +92,26 @@
 
 备份目录固定为 `DATA_DIR/backups`。在线备份先生成数据库快照，再复制托管文件。需要数据库和文件位于同一维护窗口时，使用停机备份。恢复步骤见 [数据备份与恢复](BACKUP.md)。
 
+## 项目执行图
+
+以下路径均以 `/projects/:projectId/execution-graph` 为前缀。登录用户可读，管理员和操作员可保存、发布和手动运行；归档项目保留历史查询。
+
+| 方法与相对路径 | 请求与结果 |
+| --- | --- |
+| `GET /` | 返回 `id, projectId, revision, publishedVersion, draft`。新项目带一条“开始 → 结束”的示例流，首次发布前版本为 null。 |
+| `PUT /draft` | 提交 `{expectedRevision, definition:{flows:[...]}}`。保存后返回新的修订号。其他人已保存时返回 409。流有稳定 ID、名称、节点列表及显式的 `{from,to}` 连线。 |
+| `POST /publish` | 提交 `{expectedRevision}`，将已保存草稿发布为不可变的完整图版本。重复发布同一修订返回原版本。 |
+| `GET /versions`、`GET /versions/:version` | 列出发布历史，或读取指定版本当时的完整定义。 |
+| `POST /extract/preview`、`POST /extract` | 提交 `{expectedRevision,flowId,nodeIds,name,mode}`，其中 `mode` 为 `REPLACE` 或 `COPY`。预览返回入口、出口和节点数量；提交更新草稿。选区须连通，具有一条进入连线及一条无条件离开连线。 |
+| `POST /flows/:flowId/preview` | 提交 `{version, inputs?}`。返回实际节点、配置摘要；交付流额外返回固定提交、服务、环境、目标及审批要求。 |
+| `POST /flows/:flowId/run` | 使用与预览相同的版本和输入，附 `expectedConfigurationHash`、`idempotencyKey`。同一用户在同一项目重试同一请求可取回原运行；换参数复用同一键返回 409。 |
+| `GET /runs`、`GET /runs/:runId` | 按时间倒序返回运行，每页最多 100 条。传 `?before=<上一页最后一个运行 ID>` 查看更早记录。详情返回当时的图版本、流定义、输入及节点结果。交付节点包含关联任务 ID，可查逐台服务器、步骤、日志和产物。 |
+| `POST /runs/:runId/cancel` | 取消尚未完成的运行，并将取消传给相关任务和子流。等待中和已经开始的外部操作使用各自的任务状态。 |
+
+每条流有一个 `START` 和一个 `END`。日志节点填写 `message`，`CONDITION` 使用 `{key,value}` 比较 `inputs.value`（`key: input`）或 `inputs.commitSha`（`key: commitSha`），发出的两条边分别标记 `when: TRUE` 和 `when: FALSE`。并行分支由 `PARALLEL` 发起，`JOIN` 等待实际命中的分支。使用 `FLOW_CALL.flowId` 启动同一已发布图版本中的子流，子流独立记录日志和状态。
+
+交付节点使用同项目的 `pipelineId` 和固定 `pipelineVersion`。构建时输入 `environmentId` 和提交 SHA（或由源码节点的分支解析），独立部署时选择历史 `artifactIds`。同一执行流的部署节点可省略历史产物，预览会查找同一流水线唯一的可达上游构建节点，并在 `deliveries` 中标出来源。发布仍校验实际产物及已确认的部署配置。目标可沿用环境或显式提供 `serverIds`、`groupIds`。构建成功后从运行详情的 `artifactIds` 获取产物，可通过 `GET /artifacts/:id/download` 下载可用归档。
+
 ## 项目视图
 
 | 方法   | 路径       | 请求 / 说明                                                                |

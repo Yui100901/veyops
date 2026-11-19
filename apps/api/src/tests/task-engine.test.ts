@@ -429,6 +429,64 @@ test('registered handlers execute through the queue and persist target and paren
     await fixture.database.onApplicationShutdown();
   }
 });
+test('a SQLite worker processes independent graph nodes concurrently and preserves normal queue order', async () => {
+  const { database, userId, logs, tasks } = await databaseFixture();
+  const registry = new TaskHandlerRegistry();
+  const worker = new TaskWorkerService(database, tasks, registry, logs);
+  const started = new Set<string>();
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    const serverId = randomUUID();
+    await database.db
+      .insertInto('servers')
+      .values({
+        id: serverId,
+        name: 'server',
+        host: 'host',
+        username: 'ops',
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      })
+      .execute();
+    const submit = (name: string, idempotencyKey?: string) =>
+      tasks.create(
+        { type: 'COMMAND', name, payload: payload([target(serverId)]), idempotencyKey },
+        userId,
+      );
+    const left = await submit('left', 'execution-flow:' + randomUUID());
+    const right = await submit('right', 'execution-flow:' + randomUUID());
+    const regular = await submit('regular');
+    registry.register({
+      type: 'COMMAND',
+      execute: async (task, ctx) => {
+        const targetId = await ctx.startTarget(serverId);
+        started.add(task.id);
+        if (task.id !== regular.id) await gate;
+        await ctx.finishTarget(targetId, 'SUCCESS', 0);
+      },
+    });
+    await worker.tick();
+    await waitFor(async () => started.has(left.id) && started.has(right.id));
+    assert.equal((await tasks.get(left.id)).status, 'RUNNING');
+    assert.equal((await tasks.get(right.id)).status, 'RUNNING');
+    assert.equal((await tasks.get(regular.id)).status, 'PENDING');
+    release();
+    await waitFor(
+      async () =>
+        (await tasks.get(left.id)).status === 'SUCCESS' &&
+        (await tasks.get(right.id)).status === 'SUCCESS',
+    );
+    await worker.tick();
+    await waitFor(async () => (await tasks.get(regular.id)).status === 'SUCCESS');
+  } finally {
+    release();
+    await worker.shutdown();
+    await database.onApplicationShutdown();
+  }
+});
 test('running cancellation signals the active handler and reaches CANCELLED', async () => {
   const fixture = await databaseFixture();
   let worker: TaskWorkerService | undefined;

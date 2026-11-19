@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { version as appVersion } from '../../../package.json';
 import type { FormEvent, ReactNode } from 'react';
 import {
@@ -42,6 +42,8 @@ import {
 } from './pages/Notifications';
 import { userRoleNames } from './models';
 import type { User } from './models';
+
+const ProjectExecutionGraph = lazy(() => import('./pages/ProjectExecutionGraph'));
 
 const navigation = [
   {
@@ -476,6 +478,22 @@ export function App() {
   else if (routePath === '/servers' || routePath === '/targets') page = <ServersPage user={user} />;
   else if (route === '/credentials') page = <CredentialsPage user={user} />;
   else if (route === '/projects') page = <ProjectsPage user={user} />;
+  else if (
+    routeRoot === 'projects' &&
+    routeId &&
+    routeSection === 'execution-graph' &&
+    !unexpectedSegment
+  )
+    page = (
+      <Suspense fallback={<Loading />}>
+        <ProjectExecutionGraph
+          key={routeId}
+          id={routeId}
+          user={user}
+          runId={params.get('run') ?? undefined}
+        />
+      </Suspense>
+    );
   else if (
     routeRoot === 'projects' &&
     routeId &&

@@ -6,10 +6,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { Pool } from 'pg';
+import { Test } from '@nestjs/testing';
 import { createBackup, restoreBackup, type BackupSettings } from '../core/database/backup';
 import { DatabaseService } from '../core/database/database.service';
+import { initialGraphDraft } from '../core/database/execution-graphs-migration';
 import { AuditService } from '../modules/audit/audit.service';
 import { CredentialsService } from '../modules/credentials/credentials.service';
+import { ExecutionGraphsService } from '../modules/execution-graphs/execution-graphs.service';
+import { GraphRunnerService } from '../modules/execution-graphs/graph-runner.service';
+import type { GraphDefinition } from '../modules/execution-graphs/execution-graph-definition';
+import { PipelinesService } from '../modules/pipelines/pipelines.service';
 import {
   createPostgresService,
   postgresTestUrl,
@@ -18,6 +24,8 @@ import {
 
 const sampleUser = 'test-admin';
 const sampleTask = 'test-task';
+const graphProject = 'backup-project';
+const historicalLog = 'first version completed';
 const taskLog = 'logs/2026/11/test-task.log';
 const artifact = 'artifacts/test-task.tar.gz';
 const config = 'config/operator.json';
@@ -69,6 +77,27 @@ function credentials(database: DatabaseService, key: Buffer) {
   }
 }
 
+async function withGraphServices(
+  database: DatabaseService,
+  work: (graphs: ExecutionGraphsService, runner: GraphRunnerService) => Promise<void>,
+) {
+  const module = await Test.createTestingModule({
+    providers: [
+      ExecutionGraphsService,
+      GraphRunnerService,
+      AuditService,
+      { provide: DatabaseService, useValue: { db: database.db } },
+      // This fixture uses only local log nodes; a delivery task must never be submitted.
+      { provide: PipelinesService, useValue: {} },
+    ],
+  }).compile();
+  try {
+    await work(module.get(ExecutionGraphsService), module.get(GraphRunnerService));
+  } finally {
+    await module.close();
+  }
+}
+
 async function seed(database: DatabaseService, key: Buffer) {
   await database.onModuleInit();
   await database.db
@@ -99,6 +128,62 @@ async function seed(database: DatabaseService, key: Buffer) {
       updated_at: 2,
     })
     .execute();
+  await database.db
+    .insertInto('projects')
+    .values({
+      id: graphProject,
+      name: 'Backup project',
+      slug: 'backup-project',
+      created_by: sampleUser,
+      created_at: 2,
+      updated_at: 2,
+    })
+    .execute();
+  await database.db
+    .insertInto('execution_graphs')
+    .values({
+      id: graphProject,
+      project_id: graphProject,
+      revision: 1,
+      draft_json: initialGraphDraft,
+      created_at: 2,
+      updated_at: 2,
+    })
+    .execute();
+  await withGraphServices(database, async (graphs, runner) => {
+    const draft: GraphDefinition = JSON.parse(initialGraphDraft);
+    const flow = draft.flows[0];
+    const report = { id: 'report', type: 'LOG' as const, name: '验收日志', message: historicalLog };
+    flow.nodes.splice(1, 0, report);
+    flow.edges = [
+      { from: 'start', to: report.id },
+      { from: report.id, to: 'end' },
+    ];
+    let saved = await graphs.save(
+      graphProject,
+      { expectedRevision: 1, definition: draft },
+      sampleUser,
+    );
+    await graphs.publish(graphProject, saved.revision, sampleUser);
+    const preview = await runner.preview(graphProject, flow.id, { version: 1 });
+    await runner.run(
+      graphProject,
+      flow.id,
+      {
+        version: 1,
+        expectedConfigurationHash: preview.configurationHash,
+        idempotencyKey: 'backup-check',
+      },
+      sampleUser,
+    );
+    report.message = 'second version';
+    saved = await graphs.save(
+      graphProject,
+      { expectedRevision: saved.revision, definition: draft },
+      sampleUser,
+    );
+    await graphs.publish(graphProject, saved.revision, sampleUser);
+  });
   return credential.id;
 }
 
@@ -117,6 +202,24 @@ async function verify(
       .executeTakeFirstOrThrow();
     assert.equal(task.status, 'SUCCESS');
     assert.equal(task.log_file_key, taskLog);
+    await withGraphServices(database, async (graphs, runner) => {
+      assert.equal((await graphs.get(graphProject)).publishedVersion, 2);
+      assert.equal(
+        (await graphs.version(graphProject, 2)).definition.flows[0].nodes[1].message,
+        'second version',
+      );
+      const runs = await runner.list(graphProject);
+      assert.equal(runs.length, 1);
+      const restored = await runner.get(graphProject, runs[0].id);
+      assert.equal(restored.version, 1);
+      assert.equal(restored.status, 'SUCCESS');
+      assert.equal(restored.definition.nodes[1].message, historicalLog);
+      assert.deepEqual(
+        restored.nodes.map((node) => node.nodeId),
+        ['start', 'report', 'end'],
+      );
+      assert.equal(restored.nodes[1].log, historicalLog);
+    });
     assert.deepEqual(await credentials(database, key).decrypt(credentialId), secret);
     for (const [path, expected] of Object.entries(sampleContents)) {
       const restored = await readFile(join(target, path));
