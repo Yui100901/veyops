@@ -35,6 +35,11 @@ export class PipelineHookSettingsController {
   ) {
     return this.hooks.save(id, input, req.user.id);
   }
+
+  @Post('preview')
+  preview(@Param('id', new ParseUUIDPipe()) id: string, @Body() input: SavePipelineWebhookDto) {
+    return this.hooks.previewBinding(id, input);
+  }
 }
 
 @Controller('webhooks/gitea')

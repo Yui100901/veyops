@@ -12,6 +12,7 @@ import type {
   User,
 } from '../models';
 import { ArtifactRetentionPolicy } from './ArtifactRetention';
+import { FailureHandling } from './FailureHandling';
 import {
   DeploymentSelectionPicker,
   deploymentSelection,
@@ -20,6 +21,7 @@ import {
 } from './DeploymentSelection';
 
 type EnvironmentConfig = DeploymentSelection & {
+  executionMode?: 'DEPLOY' | 'BUILD_ONLY' | null;
   buildLocation: string;
   artifactType: string;
   deployMethod: string;
@@ -49,7 +51,7 @@ export function ProjectDeploymentConfig({
       title="服务与部署配置"
       subtitle="绑定代码仓库，并为每个服务和环境设置可独立覆盖的部署配置"
       action={
-        <a className="text-link" href="#/pipelines">
+        <a className="text-link" href={`#/projects/${project.id}/pipelines`}>
           打开 Pipeline →
         </a>
       }
@@ -136,6 +138,7 @@ function EnvironmentConfigEditor({
   const [artifactType, setArtifactType] = useState('FILE');
   const [selection, setSelection] = useState<DeploymentSelection>(() => deploymentSelection());
   const [editRetention, setEditRetention] = useState(false);
+  const [tab, setTab] = useState<'settings' | 'failure'>('settings');
   useEffect(() => {
     setArtifactType(config.data?.artifactType || 'FILE');
     setSelection(deploymentSelection(config.data));
@@ -156,6 +159,7 @@ function EnvironmentConfigEditor({
         body: JSON.stringify({
           ...selection,
           buildLocation: f.get('buildLocation') || undefined,
+          executionMode: f.get('executionMode') || null,
           artifactType: f.get('artifactType'),
           deployMethod: f.get('deployMethod'),
           deployPath: f.get('deployPath'),
@@ -197,153 +201,173 @@ function EnvironmentConfigEditor({
       onClose={onClose}
       wide
     >
-      {config.loading ? (
-        <Loading />
-      ) : config.error ? (
-        <div className="form-body">
-          <ErrorBanner error={config.error} retry={config.reload} />
-        </div>
-      ) : (
-        <Form
-          onSubmit={save}
-          onCancel={onClose}
-          busy={busy || user.role === 'VIEWER'}
-          error={error}
-          submit={user.role === 'VIEWER' ? '只读用户' : '保存环境配置'}
-        >
-          <fieldset disabled={user.role === 'VIEWER'}>
-            {config.data?.targetId && !hasDeploymentSelection(selection) && (
-              <p className="field-note">请重新选择此环境的服务器或服务器分组。</p>
-            )}
-            <DeploymentSelectionPicker
-              inventory={inventory}
-              value={selection}
-              onChange={setSelection}
-              disabled={busy || user.role === 'VIEWER'}
-            />
-            <div className="form-grid">
-              <Field label="构建位置">
-                <select name="buildLocation" defaultValue={config.data?.buildLocation || ''}>
-                  <option value="">
-                    {config.data
-                      ? '保留当前构建位置'
-                      : defaults.data
-                        ? `使用系统默认（${defaults.data.defaultBuildLocation === 'MANAGER' ? '管理端隔离环境' : '目标服务器'}）`
-                        : '使用系统默认'}
-                  </option>
-                  <option value="TARGET">目标服务器</option>
-                  <option value="MANAGER">管理端隔离环境</option>
-                </select>
-              </Field>
-              <Field label="产物类型">
-                <select
-                  name="artifactType"
-                  value={artifactType}
-                  onChange={(e) => setArtifactType(e.target.value)}
-                >
-                  <option value="FILE">文件产物</option>
-                  <option value="DOCKER_IMAGE">Docker 镜像</option>
-                </select>
-              </Field>
-            </div>
-            <div className="form-grid">
-              <Field label="部署方式">
-                <select
-                  name="deployMethod"
-                  value={artifactType === 'FILE' ? 'FILE' : 'DOCKER_COMPOSE'}
-                  onChange={() => undefined}
-                >
-                  <option value="FILE">文件部署</option>
-                  <option value="DOCKER_COMPOSE">Docker Compose</option>
-                </select>
-              </Field>
-              <Field label="仓库工作目录">
-                <input
-                  name="workingDirectory"
-                  defaultValue={config.data?.workingDirectory}
-                  placeholder="如 apps/web，留空继承 Pipeline"
-                />
-              </Field>
-            </div>
-            <Field label="部署目录">
-              <input
-                name="deployPath"
-                defaultValue={config.data?.deployPath}
-                placeholder="继承 Pipeline"
+      <nav className="resource-section-switcher" aria-label="服务环境配置">
+        <button type="button" aria-pressed={tab === 'settings'} onClick={() => setTab('settings')}>
+          部署设置
+        </button>
+        <button type="button" aria-pressed={tab === 'failure'} onClick={() => setTab('failure')}>
+          故障处理
+        </button>
+      </nav>
+      {tab === 'failure' && (
+        <FailureHandling user={user} serviceId={serviceId} environmentId={environmentId} />
+      )}
+      <div hidden={tab !== 'settings'}>
+        {config.loading ? (
+          <Loading />
+        ) : config.error ? (
+          <div className="form-body">
+            <ErrorBanner error={config.error} retry={config.reload} />
+          </div>
+        ) : (
+          <Form
+            onSubmit={save}
+            onCancel={onClose}
+            busy={busy || user.role === 'VIEWER'}
+            error={error}
+            submit={user.role === 'VIEWER' ? '只读用户' : '保存环境配置'}
+          >
+            <fieldset disabled={user.role === 'VIEWER'}>
+              {config.data?.targetId && !hasDeploymentSelection(selection) && (
+                <p className="field-note">请重新选择此环境的服务器或服务器分组。</p>
+              )}
+              <DeploymentSelectionPicker
+                inventory={inventory}
+                value={selection}
+                onChange={setSelection}
+                disabled={busy || user.role === 'VIEWER'}
               />
-            </Field>
-            <Field label="构建命令">
-              <input
-                className="mono"
-                name="buildCommand"
-                defaultValue={config.data?.buildCommand}
-                placeholder="继承 Pipeline"
-              />
-            </Field>
-            <div className="form-grid">
-              <Field label="产物目录">
+              <div className="form-grid">
+                <Field label="构建位置">
+                  <select name="buildLocation" defaultValue={config.data?.buildLocation || ''}>
+                    <option value="">
+                      {config.data
+                        ? '保留当前构建位置'
+                        : defaults.data
+                          ? `使用系统默认（${defaults.data.defaultBuildLocation === 'MANAGER' ? '管理端隔离环境' : '目标服务器'}）`
+                          : '使用系统默认'}
+                    </option>
+                    <option value="TARGET">目标服务器</option>
+                    <option value="MANAGER">管理端隔离环境</option>
+                  </select>
+                </Field>
+                <Field label="运行模式">
+                  <select name="executionMode" defaultValue={config.data?.executionMode || ''}>
+                    <option value="">沿用流水线默认模式</option>
+                    <option value="BUILD_ONLY">仅构建</option>
+                    <option value="DEPLOY">构建并部署</option>
+                  </select>
+                </Field>
+                <Field label="产物类型">
+                  <select
+                    name="artifactType"
+                    value={artifactType}
+                    onChange={(e) => setArtifactType(e.target.value)}
+                  >
+                    <option value="FILE">文件产物</option>
+                    <option value="DOCKER_IMAGE">Docker 镜像</option>
+                  </select>
+                </Field>
+              </div>
+              <div className="form-grid">
+                <Field label="部署方式">
+                  <select
+                    name="deployMethod"
+                    value={artifactType === 'FILE' ? 'FILE' : 'DOCKER_COMPOSE'}
+                    onChange={() => undefined}
+                  >
+                    <option value="FILE">文件部署</option>
+                    <option value="DOCKER_COMPOSE">Docker Compose</option>
+                  </select>
+                </Field>
+                <Field label="仓库工作目录">
+                  <input
+                    name="workingDirectory"
+                    defaultValue={config.data?.workingDirectory}
+                    placeholder="如 apps/web，留空继承 Pipeline"
+                  />
+                </Field>
+              </div>
+              <Field label="部署目录">
                 <input
-                  name="outputPath"
-                  defaultValue={config.data?.outputPath}
+                  name="deployPath"
+                  defaultValue={config.data?.deployPath}
                   placeholder="继承 Pipeline"
                 />
               </Field>
-              <Field label="Compose 文件路径">
+              <Field label="构建命令">
                 <input
-                  name="composeFilePath"
-                  defaultValue={config.data?.composeFilePath}
+                  className="mono"
+                  name="buildCommand"
+                  defaultValue={config.data?.buildCommand}
                   placeholder="继承 Pipeline"
                 />
               </Field>
-            </div>
-            <Field label="启动命令">
-              <textarea
-                className="mono"
-                name="startCommand"
-                rows={2}
-                defaultValue={config.data?.startCommand}
-              />
-            </Field>
-            {artifactType === 'FILE' && (
-              <Field label="停止命令" hint="替换该版本时执行。命令应只停止本服务。">
+              <div className="form-grid">
+                <Field label="产物目录">
+                  <input
+                    name="outputPath"
+                    defaultValue={config.data?.outputPath}
+                    placeholder="继承 Pipeline"
+                  />
+                </Field>
+                <Field label="Compose 文件路径">
+                  <input
+                    name="composeFilePath"
+                    defaultValue={config.data?.composeFilePath}
+                    placeholder="继承 Pipeline"
+                  />
+                </Field>
+              </div>
+              <Field label="启动命令">
                 <textarea
                   className="mono"
-                  name="stopCommand"
+                  name="startCommand"
                   rows={2}
-                  defaultValue={config.data?.stopCommand}
-                  placeholder="继承 Pipeline"
+                  defaultValue={config.data?.startCommand}
                 />
               </Field>
-            )}
-            <Field label="健康检查命令">
-              <textarea
-                className="mono"
-                name="healthCheckCommand"
-                rows={2}
-                defaultValue={config.data?.healthCheckCommand}
-              />
-            </Field>
-            <fieldset disabled={user.role !== 'ADMIN'}>
-              <ReleasePolicyFields
-                policy={config.data?.releasePolicy}
-                projectId={project.id}
-                serviceId={serviceId}
-                environmentId={environmentId}
-                composeDeployment={artifactType === 'DOCKER_IMAGE'}
-              />
-              {user.role === 'ADMIN' && (
-                <button
-                  type="button"
-                  className="button secondary small"
-                  onClick={() => setEditRetention(true)}
-                >
-                  环境产物保留策略
-                </button>
+              {artifactType === 'FILE' && (
+                <Field label="停止命令" hint="替换该版本时执行。命令应只停止本服务。">
+                  <textarea
+                    className="mono"
+                    name="stopCommand"
+                    rows={2}
+                    defaultValue={config.data?.stopCommand}
+                    placeholder="继承 Pipeline"
+                  />
+                </Field>
               )}
+              <Field label="健康检查命令">
+                <textarea
+                  className="mono"
+                  name="healthCheckCommand"
+                  rows={2}
+                  defaultValue={config.data?.healthCheckCommand}
+                />
+              </Field>
+              <fieldset disabled={user.role !== 'ADMIN'}>
+                <ReleasePolicyFields
+                  policy={config.data?.releasePolicy}
+                  projectId={project.id}
+                  serviceId={serviceId}
+                  environmentId={environmentId}
+                  composeDeployment={artifactType === 'DOCKER_IMAGE'}
+                />
+                {user.role === 'ADMIN' && (
+                  <button
+                    type="button"
+                    className="button secondary small"
+                    onClick={() => setEditRetention(true)}
+                  >
+                    环境产物保留策略
+                  </button>
+                )}
+              </fieldset>
             </fieldset>
-          </fieldset>
-        </Form>
-      )}
+          </Form>
+        )}
+      </div>
       {editRetention && (
         <ArtifactRetentionPolicy
           scope={{ serviceId, environmentId }}

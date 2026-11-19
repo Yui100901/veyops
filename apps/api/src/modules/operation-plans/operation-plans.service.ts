@@ -268,9 +268,55 @@ export class OperationPlansService implements OnModuleInit {
     };
   }
 
-  async run(id: string, input: RunPlanDto, userId: string) {
+  async run(
+    id: string,
+    input: RunPlanDto,
+    userId: string,
+    repair?: import('../tasks/tasks.types').AiRepairOrigin,
+  ) {
     const execution = await this.prepareRun(id, input);
-    const task = await this.tasks.create(execution.input, userId, execution.beforeInsert);
+    if (repair) {
+      const source = await this.database.db
+        .selectFrom('tasks')
+        .select(['project_id', 'service_id', 'environment_id'])
+        .where('id', '=', repair.taskId)
+        .executeTakeFirstOrThrow();
+      if (!source.project_id || !source.service_id || !source.environment_id)
+        throw new BadRequestException('故障来源缺少服务环境');
+      execution.input.scope = {
+        projectId: source.project_id,
+        serviceId: source.service_id,
+        environmentId: source.environment_id,
+      };
+      execution.input.payload.aiRepair = repair;
+      execution.input.idempotencyKey = 'ai-repair:' + repair.taskId;
+    }
+    const task = await this.tasks.create(
+      execution.input,
+      userId,
+      execution.beforeInsert,
+      repair
+        ? async (tx, taskId) => {
+            const incident = await tx
+              .updateTable('ai_failure_incidents')
+              .set({ status: 'REPAIRING', repair_task_id: taskId, updated_at: Date.now() })
+              .where('task_id', '=', repair.taskId)
+              .where('proposal_id', '=', repair.proposalId)
+              .where('status', '=', 'AWAITING_APPROVAL')
+              .returning('task_id')
+              .executeTakeFirst();
+            if (!incident) throw new BadRequestException('故障提案已失效');
+            await this.audit.record(
+              userId,
+              'ai.failure.repair',
+              'task',
+              repair.taskId,
+              { repairTaskId: taskId, proposalId: repair.proposalId, automatic: repair.automatic },
+              tx,
+            );
+          }
+        : undefined,
+    );
     await this.audit.record(userId, 'operation_plan.run', 'task', task.id, {
       planId: id,
       version: execution.version,

@@ -129,8 +129,106 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
     })
     .execute();
 
+  assert.ifError((await migrator.migrateTo('003_pipeline_webhooks')).error);
+  await db
+    .insertInto('pipelines')
+    .values({
+      id: 'ci',
+      project_id: 'project',
+      service_id: 'service',
+      name: 'CI',
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+  await db
+    .insertInto('pipeline_versions')
+    .values({
+      id: 'v1',
+      pipeline_id: 'ci',
+      version: 1,
+      definition_json: '{}',
+      created_by: 'existing-user',
+      created_at: now,
+    })
+    .execute();
+  await db
+    .insertInto('tasks')
+    .values({
+      id: 'push',
+      task_type: 'PIPELINE',
+      payload_json: '{}',
+      created_by: 'existing-user',
+      status: 'SUCCESS',
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+  await db
+    .insertInto('pipeline_runs')
+    .values({
+      id: 'run1',
+      pipeline_id: 'ci',
+      task_id: 'push',
+      pipeline_version_id: 'v1',
+      project_id: 'project',
+      service_id: 'service',
+      environment_id: 'env',
+      target_id: 'legacy-target',
+      git_ref: 'refs/heads/release/test',
+      commit_sha: 'a'.repeat(40),
+      build_location_snapshot: 'MANAGER',
+      artifact_type_snapshot: 'FILE',
+      trigger_type: 'WEBHOOK',
+      created_at: now,
+    })
+    .execute();
+  await db
+    .insertInto('credentials')
+    .values({
+      id: 'key',
+      name: 'hook',
+      type: 'CUSTOM_SECRET',
+      ciphertext: 'fixture',
+      nonce: 'fixture',
+      auth_tag: 'fixture',
+      created_by: 'existing-user',
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+  await db
+    .insertInto('pipeline_webhooks')
+    .values({
+      pipeline_id: 'ci',
+      pipeline_version: 1,
+      environment_id: 'env',
+      target_id: 'legacy-target',
+      secret_credential_id: 'key',
+      created_by: 'existing-user',
+      branch: 'release/test',
+      repository_key: 'https://example.test/ci',
+      configuration_hash: 'fixture',
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
   const upgrade = await migrator.migrateToLatest();
   assert.ifError(upgrade.error);
+  assert.deepEqual(
+    await db
+      .selectFrom('pipeline_webhooks')
+      .select(['follow_mode', 'confirmed_mode'])
+      .executeTakeFirstOrThrow(),
+    { follow_mode: 0, confirmed_mode: 'BUILD_ONLY' },
+  );
+  assert.deepEqual(
+    await db
+      .selectFrom('pipeline_trigger_history')
+      .select(['task_id', 'branch', 'mode', 'status'])
+      .executeTakeFirstOrThrow(),
+    { task_id: 'push', branch: 'release/test', mode: 'BUILD_ONLY', status: 'QUEUED' },
+  );
   const config = await db
     .selectFrom('service_environment_configs')
     .select(['target_id', 'target_selection_json'])
@@ -255,6 +353,7 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
   assert.deepEqual(await db.selectFrom('tasks').select(['id', 'status']).orderBy('id').execute(), [
     { id: 'DEPLOY', status: 'PENDING' },
     { id: 'DEPLOY_ARTIFACT', status: 'CANCELLED' },
+    { id: 'push', status: 'SUCCESS' },
   ]);
   await assert.rejects(db.selectFrom('pipeline_webhooks').select('pipeline_id').execute());
   await assert.rejects(db.selectFrom('users').select('must_change_password').execute());

@@ -1,10 +1,10 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, test } from 'node:test';
+import { after, mock, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
@@ -38,6 +38,9 @@ async function checkDelivery(databaseUrl?: string) {
     await import('../infrastructure/build-runner/process-runner.service.js');
   const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
   const { DeploymentsService } = await import('../modules/deployments/deployments.service.js');
+  const { PipelineTriggersService } =
+    await import('../modules/pipeline-triggers/pipeline-triggers.service.js');
+  const { BuildsService } = await import('../modules/builds/builds.service.js');
   const { RepositoryMetadataService } =
     await import('../modules/projects/repository-metadata.service.js');
 
@@ -54,6 +57,7 @@ async function checkDelivery(databaseUrl?: string) {
   const transferredArchives: string[] = [];
   let failedBuildServer: string | undefined;
   let registryPullFails = false;
+  let failNextHealthCheck = false;
   let archivePlatformMismatch = false;
   let auxiliaryCommit = 'c'.repeat(40);
   const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
@@ -61,9 +65,7 @@ async function checkDelivery(databaseUrl?: string) {
     .useValue({
       run: async (_command: string, args: string[], options: { gzipOutput?: { path: string } }) => {
         const script = args.at(-1) ?? '';
-        const checkout =
-          script.includes('clone --no-checkout') ||
-          script.includes('fetch --no-recurse-submodules --no-tags --depth=1');
+        const checkout = script.includes('fetch --no-recurse-submodules --no-tags --depth=1');
         if (checkout || script.includes("printf 'VEYOPS_ARTIFACT")) {
           const mount = args.find((arg) => arg.endsWith(',dst=/workspace'))!;
           const workspace = mount.slice('type=bind,src='.length, -',dst=/workspace'.length);
@@ -103,6 +105,10 @@ async function checkDelivery(databaseUrl?: string) {
         options?: { onData?: (chunk: string) => void },
       ) => {
         remoteCommands.push({ serverId: target.id, command });
+        if (failNextHealthCheck && command.includes('AUTO_HEALTH_CHECK')) {
+          failNextHealthCheck = false;
+          return { exitCode: 1 };
+        }
         const switched = /ln -s '([^']+)' '[^']+'; mv -Tf -- '[^']+' '([^']+)'/.exec(command);
         if (switched) releaseLinks.set(`${target.id}:${switched[2]}`, switched[1]!);
         const reading = /^readlink -- '([^']+)'$/.exec(command);
@@ -144,6 +150,11 @@ async function checkDelivery(databaseUrl?: string) {
     })
     .overrideProvider(RepositoryMetadataService)
     .useValue({
+      refreshBranches: async () => ({
+        defaultBranch: 'main',
+        branches: [{ name: 'main', sha: successfulCommit }],
+        status: 'CURRENT',
+      }),
       branchHeads: async (_projectId: string, _repositoryId: string, branches: string[]) =>
         new Map(
           branches.flatMap((branch) => {
@@ -154,7 +165,10 @@ async function checkDelivery(databaseUrl?: string) {
         ),
     })
     .compile();
-  const app = moduleRef.createNestApplication<NestExpressApplication>({ logger: false });
+  const app = moduleRef.createNestApplication<NestExpressApplication>({
+    logger: false,
+    rawBody: true,
+  });
   configureApp(app);
   try {
     await app.init();
@@ -191,6 +205,10 @@ async function checkDelivery(databaseUrl?: string) {
       cloneUrl: 'https://repo.example.test/team/app.git',
     });
     const service = await create(`/projects/${project.id}/services`, { name: 'Web', slug: 'web' });
+    const otherProject = await create('/projects', {
+      name: 'Second delivery project',
+      slug: 'delivery-other',
+    });
     const environment = await create(`/projects/${project.id}/environments`, {
       name: 'Testing',
       slug: 'testing',
@@ -244,6 +262,15 @@ async function checkDelivery(databaseUrl?: string) {
     assert.equal(build.status, 'SUCCESS');
     assert.ok(build.deploymentTaskId);
     assert.equal(managerCheckouts.length, 1);
+    assert.ok(managerCheckouts[0].includes(`--depth=1 origin '${successfulCommit}'`));
+    const buildPayload = await db
+      .selectFrom('tasks')
+      .select('payload_json')
+      .where('id', '=', build.id)
+      .executeTakeFirstOrThrow();
+    const legacySnapshot = JSON.parse(buildPayload.payload_json).pipeline;
+    assert.equal(legacySnapshot.projectName, project.name);
+    assert.equal(legacySnapshot.serviceName, service.name);
     assert.equal(remoteCommands.length, 0);
     assert.equal((await deployments()).length, 0);
 
@@ -312,6 +339,12 @@ async function checkDelivery(databaseUrl?: string) {
     const strict = await create(`${targetPath}/run`, { ...base, commitSha: successfulCommit });
     const strictBuild = await runTask(strict.id);
     assert.equal(strictBuild.status, 'PARTIAL_FAILED');
+    assert.equal(
+      remoteCommands.filter(({ command }) =>
+        command.includes(`--depth=1 origin '${successfulCommit}'`),
+      ).length,
+      2,
+    );
     assert.equal(strictBuild.deploymentTaskId ?? null, null);
     assert.ok(strictBuild.deploymentSkippedReason);
     assert.equal(activations().length, 4);
@@ -551,6 +584,29 @@ async function checkDelivery(databaseUrl?: string) {
       assert.equal(activations().length, activationCount);
       const approvals = (await api.get('/api/v1/deployments/approvals').expect(200)).body.data;
       assert.ok(approvals.some((entry: { id: string }) => entry.id === pending.id));
+      const approvalQuery = {
+        projectId: project.id,
+        serviceId: service.id,
+        environmentId: environment.id,
+        commit: 'AAA',
+        recordId: pending.id,
+      };
+      const pendingList = (
+        await api.get('/api/v1/deployments/approvals').query(approvalQuery).expect(200)
+      ).body.data;
+      assert.deepEqual(
+        pendingList.map((row: { id: string }) => row.id),
+        [pending.id],
+      );
+      assert.deepEqual(
+        (
+          await api
+            .get('/api/v1/deployments/approvals')
+            .query({ ...approvalQuery, projectId: otherProject.id })
+            .expect(200)
+        ).body.data,
+        [],
+      );
       const approved = await create(`/deployments/approvals/${pending.id}/approve`, {});
       assert.equal(approved.approvalStatus, 'APPROVED');
       await post(`/deployments/approvals/${pending.id}/approve`, {}).expect(409);
@@ -806,12 +862,22 @@ async function checkDelivery(databaseUrl?: string) {
             });
       const path = `/pipelines/${pipeline.id}`;
       const preview = await create(`${path}/preview`, selection);
+      const managerOffset = managerCheckouts.length;
+      const targetOffset = remoteCommands.length;
       const queued = await create(`${path}/run`, {
         ...selection,
         expectedConfigurationHash: preview.configurationHash,
       });
       const completed = await runTask(queued.id);
       assert.equal(completed.status, 'SUCCESS');
+      const checkoutCommands =
+        buildLocation === 'MANAGER'
+          ? managerCheckouts.slice(managerOffset)
+          : remoteCommands.slice(targetOffset).map(({ command }) => command);
+      for (const sha of [successfulCommit, auxiliaryCommit])
+        assert.ok(
+          checkoutCommands.some((command) => command.includes(`--depth=1 origin '${sha}'`)),
+        );
       assert.equal(completed.pipelineGraph.buildLocation, buildLocation);
       assert.deepEqual(
         completed.pipelineGraph.nodes,
@@ -836,6 +902,264 @@ async function checkDelivery(databaseUrl?: string) {
     const buildOnlyPreview = await create(`${composedPath}/preview`, selection);
     assert.equal(buildOnlyPreview.mode, 'BUILD_ONLY');
     await post(`${composedPath}/preview`, { ...selection, mode: 'DEPLOY' }).expect(400);
+
+    // The same commit can legitimately belong to several projects. Each list must apply
+    // its project, service and environment predicates before returning any matching records.
+    const otherRepo = await create(`/projects/${otherProject.id}/repositories`, {
+      name: 'Repo',
+      cloneUrl: 'https://repo.example.test/team/other.git',
+    });
+    const otherService = await create(`/projects/${otherProject.id}/services`, {
+      name: 'Web',
+      slug: 'web',
+    });
+    const otherEnv = await create(`/projects/${otherProject.id}/environments`, {
+      name: 'Test',
+      slug: 'test',
+      environmentType: 'TESTING',
+    });
+    const otherPipeline = await create('/pipelines', {
+      name: 'Second pipeline',
+      projectId: otherProject.id,
+      serviceId: otherService.id,
+      definition: {
+        ...definition,
+        repositoryId: otherRepo.id,
+        buildLocation: 'MANAGER',
+        deployPath: '/opt/second-project',
+      },
+    });
+    const otherBuild = await runTask(
+      (
+        await create(`/pipelines/${otherPipeline.id}/run`, {
+          ...base,
+          environmentId: otherEnv.id,
+          commitSha: successfulCommit,
+        })
+      ).id,
+    );
+    assert.equal(otherBuild.status, 'SUCCESS');
+    assert.equal((await runTask(otherBuild.deploymentTaskId)).status, 'SUCCESS');
+    const scope = { serviceId: otherService.id, environmentId: otherEnv.id, commit: 'AAA' };
+    const list = async (path: string, query: object) =>
+      (
+        await api
+          .get('/api/v1' + path)
+          .query(query)
+          .expect(200)
+      ).body.data;
+    for (const [path, expected] of [
+      ['/artifacts', 1],
+      ['/deployments', 2],
+    ] as const) {
+      const rows = await list(path, { projectId: otherProject.id, ...scope });
+      assert.equal(rows.length, expected);
+      assert.ok(
+        rows.every(
+          (row: { projectId: string; sourceCommit: string }) =>
+            row.projectId === otherProject.id && row.sourceCommit === successfulCommit,
+        ),
+      );
+      for (const override of [
+        { projectId: project.id },
+        { serviceId: service.id },
+        { environmentId: environment.id },
+        { commit: 'f' },
+      ]) {
+        assert.deepEqual(
+          await list(path, { projectId: otherProject.id, ...scope, ...override }),
+          [],
+        );
+      }
+      const [historical] = await list(path, { recordId: rows[0].id });
+      assert.equal(historical.projectId, otherProject.id);
+      assert.equal(
+        (await list(path, { projectId: otherProject.id, taskId: historical.taskId })).length,
+        expected,
+      );
+      assert.deepEqual(await list(path, { projectId: project.id, taskId: historical.taskId }), []);
+      assert.deepEqual(await list(path, { recordId: historical.id, projectId: project.id }), []);
+      assert.ok((await getTask(historical.taskId)).pipelineRunId);
+    }
+    assert.equal((await list(`/projects/${otherProject.id}/runs`, scope)).length, 2);
+    assert.deepEqual(await list(`/projects/${project.id}/runs`, scope), []);
+    assert.deepEqual(
+      (await list('/pipelines', { projectId: otherProject.id, serviceId: otherService.id })).map(
+        (item: { id: string }) => item.id,
+      ),
+      [otherPipeline.id],
+    );
+    assert.deepEqual(
+      await list('/pipelines', { projectId: project.id, serviceId: otherService.id }),
+      [],
+    );
+    await api.get('/api/v1/artifacts').query({ commit: '%' }).expect(400);
+    await api.delete('/api/v1/projects/' + otherProject.id).expect(200);
+    await api.get('/api/v1/projects/' + otherProject.id).expect(404);
+    const historicalContext = (
+      await api.get(`/api/v1/projects/${otherProject.id}/delivery-context`).expect(200)
+    ).body.data;
+    assert.equal(historicalContext.archived, true);
+    assert.equal(historicalContext.services[0].id, otherService.id);
+    assert.equal((await list('/artifacts', { projectId: otherProject.id, ...scope })).length, 1);
+
+    // Exercise all trigger entry points through the real queue, artifact and release services.
+    // Docker and SSH commands use the same fixtures as the manual delivery tests above.
+    process.env.WEBHOOK_BUILD_DOCKER_SOCKET = '/run/user/1000/fixture-docker.sock';
+    const isolation = mock.method(
+      app.get(BuildsService) as unknown as {
+        configureWebhookDocker: () => Promise<void>;
+      },
+      'configureWebhookDocker',
+      async () => {},
+    );
+    try {
+      const runner = app.get(PipelineTriggersService);
+      const autoEnv = await create(`/projects/${project.id}/environments`, {
+        name: 'Automatic deployment',
+        slug: 'automatic',
+        environmentType: 'TESTING',
+      });
+      const autoPipeline = await create('/pipelines', {
+        name: 'Auto',
+        projectId: project.id,
+        serviceId: service.id,
+        definition: {
+          ...definition,
+          buildLocation: 'MANAGER',
+          defaultMode: 'BUILD_ONLY',
+          healthCheckCommand: 'echo AUTO_HEALTH_CHECK',
+          deployPath: '/opt/automatic-delivery',
+        },
+      });
+      const path = '/pipelines/' + autoPipeline.id;
+      const key = 'fixture-integration-push-signature-key';
+      const hookSecret = await create('/credentials', {
+        name: 'Push',
+        type: 'CUSTOM_SECRET',
+        secret: { value: key },
+      });
+      const branch = 'release/shared';
+      const settings = {
+        environmentId: autoEnv.id,
+        branch,
+        secretCredentialId: hookSecret.id,
+        enabled: true,
+        followMode: true,
+      };
+      const sendPush = async (sha: string) => {
+        const body = JSON.stringify({
+          ref: 'refs/heads/' + branch,
+          after: sha,
+          repository: { clone_url: 'https://repo.example.test/team/app.git' },
+        });
+        return (
+          await api
+            .post('/api/v1/webhooks/gitea/' + autoPipeline.id)
+            .set('Content-Type', 'application/json')
+            .set('X-Gitea-Event', 'push')
+            .set('X-Gitea-Signature', createHmac('sha256', key).update(body).digest('hex'))
+            .send(body)
+            .expect(200)
+        ).body.data;
+      };
+      let commitNumber = 0;
+      const setMode = (mode: string | null) =>
+        api
+          .put(`/api/v1/services/${service.id}/environments/${autoEnv.id}/config`)
+          .send({
+            targetId: target.id,
+            buildLocation: 'MANAGER',
+            executionMode: mode,
+            artifactType: 'FILE',
+            deployMethod: 'FILE',
+            releasePolicy: { requireApproval: true, rollbackMode: 'PREVIOUS_HEALTHY' },
+          })
+          .expect(200);
+      for (const mode of ['BUILD_ONLY', 'DEPLOY']) {
+        await setMode(mode === 'DEPLOY' ? 'DEPLOY' : null);
+        const preview = await create(path + '/webhook/preview', settings);
+        assert.equal(preview.mode, mode);
+        await api
+          .put('/api/v1' + path + '/webhook')
+          .send({ ...settings, expectedBindingHash: preview.bindingHash })
+          .expect(200);
+        for (const kind of ['POLL', 'WEBHOOK', 'SCHEDULE']) {
+          auxiliaryCommit = (++commitNumber).toString(16).padStart(40, '0');
+          let taskId: string;
+          if (kind === 'WEBHOOK') {
+            taskId = (await sendPush(auxiliaryCommit)).taskId;
+            assert.equal((await sendPush(auxiliaryCommit)).taskId, taskId);
+          } else {
+            const config = {
+              kind,
+              environmentId: autoEnv.id,
+              version: 1,
+              branch,
+              buildCurrent: true,
+              timing:
+                kind === 'POLL'
+                  ? { type: 'INTERVAL', intervalSeconds: 3600 }
+                  : { type: 'ONCE', runAt: Date.now() + 3600_000 },
+            };
+            const rulePreview = await create(path + '/triggers/preview', config);
+            assert.equal(rulePreview.mode, mode);
+            const rule = await create(path + '/triggers', {
+              ...config,
+              expectedConfigurationHash: rulePreview.configurationHash,
+            });
+            await runner.tick(rule.nextAt);
+            const submitted = await db
+              .selectFrom('pipeline_trigger_history')
+              .selectAll()
+              .where('trigger_id', '=', rule.id)
+              .where('status', '=', 'QUEUED')
+              .executeTakeFirstOrThrow();
+            assert.equal(submitted.commit_sha, auxiliaryCommit);
+            taskId = submitted.task_id!;
+            if (kind === 'POLL') {
+              assert.equal((await sendPush(auxiliaryCommit)).taskId, taskId);
+              await create(path + '/triggers/' + rule.id + '/disable', {});
+            }
+          }
+          const build = await runTask(taskId);
+          assert.equal(build.status, 'SUCCESS', build.errorSummary);
+          assert.equal(build.triggerType, kind);
+          const artifact = await db
+            .selectFrom('artifacts')
+            .select('source_commit')
+            .where('pipeline_run_id', '=', build.pipelineRunId)
+            .executeTakeFirstOrThrow();
+          assert.equal(artifact.source_commit, auxiliaryCommit);
+          if (mode === 'BUILD_ONLY') assert.equal(build.deploymentTaskId, null);
+          else {
+            const release = await getTask(build.deploymentTaskId);
+            assert.equal(release.triggerType, kind);
+            assert.equal(release.approvalStatus, 'PENDING');
+            await create('/deployments/approvals/' + release.id + '/approve', {});
+            assert.equal((await runTask(release.id)).status, 'SUCCESS');
+          }
+        }
+      }
+      const beforeFailure = new Map(releaseLinks);
+      const buildFailure = await runTask((await sendPush(failingCommit)).taskId);
+      assert.equal(buildFailure.status, 'FAILED');
+      assert.equal(buildFailure.deploymentTaskId, null);
+      assert.deepEqual(releaseLinks, beforeFailure);
+      const badRelease = await runTask((await sendPush('e'.repeat(40))).taskId);
+      await create('/deployments/approvals/' + badRelease.deploymentTaskId + '/approve', {});
+      failNextHealthCheck = true;
+      assert.equal((await runTask(badRelease.deploymentTaskId)).status, 'PARTIAL_FAILED');
+      const restored = await db
+        .selectFrom('deployment_records')
+        .select(['health_status', 'rollback_of_deployment_id'])
+        .where('environment_id', '=', autoEnv.id)
+        .where('rollback_of_deployment_id', 'is not', null)
+        .execute();
+      assert.ok(restored.some((record) => record.health_status === 'HEALTHY'));
+    } finally {
+      isolation.mock.restore();
+    }
   } finally {
     await app.close();
   }

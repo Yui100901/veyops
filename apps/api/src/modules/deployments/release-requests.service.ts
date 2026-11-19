@@ -8,6 +8,7 @@ import {
   Param,
   ParseUUIDPipe,
   Post,
+  Query,
   Req,
 } from '@nestjs/common';
 import { Matches } from 'class-validator';
@@ -22,6 +23,7 @@ import { ServersService } from '../servers/servers.service';
 import { TasksService } from '../tasks/tasks.service';
 import type { TaskPayload } from '../tasks/tasks.types';
 import { DeploymentsService } from './deployments.service';
+import { DeliveryRecordFilters } from '../projects/delivery-filters';
 import {
   assertCurrentTargets,
   pendingReleaseApprovalTime,
@@ -43,20 +45,37 @@ export class ReleaseRequestsService {
     private readonly audit: AuditService,
   ) {}
 
-  async listApprovals() {
-    const tasks = await this.database.db
+  async listApprovals(filters: DeliveryRecordFilters = {}) {
+    let query = this.database.db
       .selectFrom('tasks')
-      .select(['id', 'name', 'payload_json', 'service_id', 'environment_id', 'created_at'])
+      .leftJoin('pipeline_runs', 'pipeline_runs.task_id', 'tasks.id')
+      .select([
+        'tasks.id',
+        'tasks.name',
+        'tasks.payload_json',
+        'tasks.project_id',
+        'tasks.service_id',
+        'tasks.environment_id',
+        'tasks.created_at',
+      ])
       .where('task_type', '=', 'PIPELINE')
       .where('status', '=', 'PENDING')
-      .where('available_at', '=', pendingReleaseApprovalTime)
-      .orderBy('created_at', 'asc')
-      .limit(200)
-      .execute();
+      .where('available_at', '=', pendingReleaseApprovalTime);
+    if (filters.projectId) query = query.where('tasks.project_id', '=', filters.projectId);
+    if (filters.recordId) query = query.where('tasks.id', '=', filters.recordId);
+    if (filters.pipelineRunId) query = query.where('pipeline_runs.id', '=', filters.pipelineRunId);
+    if (filters.taskId) query = query.where('tasks.id', '=', filters.taskId);
+    if (filters.serviceId) query = query.where('tasks.service_id', '=', filters.serviceId);
+    if (filters.environmentId)
+      query = query.where('tasks.environment_id', '=', filters.environmentId);
+    if (filters.commit)
+      query = query.where('pipeline_runs.commit_sha', 'like', filters.commit.toLowerCase() + '%');
+    const tasks = await query.orderBy('tasks.created_at', 'asc').limit(200).execute();
     return tasks.map((row) => {
       const payload = JSON.parse(row.payload_json) as TaskPayload;
       return {
         id: row.id,
+        projectId: row.project_id,
         name: row.name,
         serviceId: row.service_id,
         environmentId: row.environment_id,
@@ -119,7 +138,9 @@ export class ReleaseRequestsService {
     const server = await this.servers.get(row.server_id);
     if (!server.credentialId || !server.hostKeyFingerprint)
       throw new ConflictException('目标必须配置 SSH 凭据和已确认指纹');
-    await assertCurrentTargets(db, { ...source.snapshot, rollbackOfDeploymentId: row.id }, [server]);
+    await assertCurrentTargets(db, { ...source.snapshot, rollbackOfDeploymentId: row.id }, [
+      server,
+    ]);
     const current = await this.deployments.current(
       db,
       row.service_id,
@@ -266,8 +287,8 @@ export class ReleaseRequestsService {
 @Controller('deployments')
 export class ReleaseRequestsController {
   constructor(private readonly releases: ReleaseRequestsService) {}
-  @Roles('ADMIN') @Get('approvals') approvals() {
-    return this.releases.listApprovals();
+  @Roles('ADMIN') @Get('approvals') approvals(@Query() filters: DeliveryRecordFilters) {
+    return this.releases.listApprovals(filters);
   }
   @Roles('ADMIN') @Post('approvals/:id/approve') approve(
     @Param('id', ParseUUIDPipe) id: string,

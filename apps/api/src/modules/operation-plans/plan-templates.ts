@@ -147,6 +147,79 @@ exit 1`,
     ],
     postChecks: [{ name: '验证 Compose v2', command: 'docker compose version', timeout: 30 }],
   },
+  {
+    id: '41000000-0000-4000-8000-000000000006',
+    name: '文件系统容量与 inode 巡检',
+    description: '分别检查本地文件系统的可用空间与 inode，用于定位磁盘未满但无法写入的问题。',
+    category: 'INSPECTION',
+    osRequirements: 'Linux，GNU df',
+    steps: [
+      { name: '本地文件系统容量（KiB）', command: 'LC_ALL=C df -lkP', timeout: 30 },
+      { name: '本地 inode 使用量', command: 'LC_ALL=C df -liP', timeout: 30 },
+    ],
+  },
+  {
+    id: '41000000-0000-4000-8000-000000000007',
+    name: '构建工具版本核对',
+    description: '列出目标端常见编译器、包管理器与 Git 版本。缺少的工具会标记为不可用。',
+    category: 'INSPECTION',
+    osRequirements: 'Linux，POSIX shell',
+    steps: [
+      {
+        name: '编译器、运行时与包管理器',
+        command: `cd / || exit 1
+export COREPACK_ENABLE_NETWORK=0 npm_config_update_notifier=false
+for tool in git go java javac rustc cargo python3 node npm pnpm; do
+  printf '%s: ' "$tool"
+  if ! command -v "$tool" >/dev/null 2>&1; then echo unavailable; continue; fi
+  if version=$(case "$tool" in go) go version ;; java|javac) "$tool" -version ;; *) "$tool" --version ;; esac 2>&1); then
+    printf '%s\\n' "$version" | head -n 1
+  else echo 'version unavailable'; fi
+done`,
+        timeout: 60,
+      },
+    ],
+  },
+  {
+    id: '41000000-0000-4000-8000-000000000008',
+    name: '时区与时间同步核对',
+    description: '核对主机本地时间、UTC 时间，以及 systemd 提供的时区和同步状态。',
+    category: 'INSPECTION',
+    osRequirements: 'Linux，date；同步状态需要运行 systemd',
+    steps: [
+      {
+        name: '本地时间及 UTC',
+        command: "date '+%Y-%m-%d %H:%M:%S %z'; date -u '+%Y-%m-%d %H:%M:%S UTC'",
+        timeout: 10,
+      },
+      {
+        name: '同步状态',
+        command:
+          'if command -v timedatectl >/dev/null 2>&1 && test -d /run/systemd/system; then timedatectl show -p Timezone -p NTP -p NTPSynchronized; else echo "systemd time status unavailable"; fi',
+        timeout: 15,
+      },
+    ],
+  },
+  {
+    id: '41000000-0000-4000-8000-000000000009',
+    name: 'Linux 文件句柄与进程限额核对',
+    description: '检查当前 SSH 会话的文件句柄限制和内核的文件句柄、进程上限，供构建并发排查。',
+    category: 'INSPECTION',
+    osRequirements: 'Linux，已挂载 /proc',
+    steps: [
+      {
+        name: '会话文件句柄软硬上限',
+        command: 'printf "soft="; ulimit -Sn; printf "hard="; ulimit -Hn',
+        timeout: 10,
+      },
+      {
+        name: '内核上限',
+        command:
+          'set -e; for key in fs/file-max kernel/pid_max; do printf "%s=" "$key"; cat "/proc/sys/$key"; done',
+        timeout: 10,
+      },
+    ],
+  },
 ];
 
 export async function seedPlanTemplates(database: Kysely<Database>, userId: string): Promise<void> {

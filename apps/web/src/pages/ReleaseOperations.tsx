@@ -125,8 +125,8 @@ interface ReleaseApproval {
   rollbackOfDeploymentId?: string | null;
 }
 
-export function ReleaseApprovals() {
-  const approvals = useResource<ReleaseApproval[]>('/deployments/approvals');
+export function ReleaseApprovals({ query = '' }: { query?: string }) {
+  const approvals = useResource<ReleaseApproval[]>(`/deployments/approvals?${query}`);
   const [selected, setSelected] = useState<ReleaseApproval>();
 
   return (

@@ -1,9 +1,21 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Req } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Patch,
+  Post,
+  Put,
+  Req,
+} from '@nestjs/common';
 import { Roles } from '../auth/auth.decorators';
 import { AuthRequest } from '../auth/auth.guard';
 import {
   AiChatDto,
   AiPolicyDto,
+  AiRoutesDto,
   AiRepositoryAnalysisDto,
   CreateAiProviderDto,
   UpdateAiProviderDto,
@@ -54,11 +66,26 @@ export class AiController {
   @Get('policies') listPolicies() {
     return this.policy.list();
   }
+  @Get('routing') routing() {
+    return this.providers.routes();
+  }
+  @Roles('ADMIN') @Put('routing') updateRouting(
+    @Body() input: AiRoutesDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.providers.setRoutes(input, req.user.id);
+  }
   @Roles('ADMIN') @Patch('policies') updatePolicy(
     @Body() input: AiPolicyDto,
     @Req() req: AuthRequest,
   ) {
     return this.policy.update(input, req.user);
+  }
+  @Roles('ADMIN') @Delete('policies/projects/:projectId') resetProjectPolicy(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Req() req: AuthRequest,
+  ) {
+    return this.policy.resetProject(projectId, req.user);
   }
   @Post('chat') chat(@Body() input: AiChatDto, @Req() req: AuthRequest) {
     return this.ai.chat(input, req.user);
@@ -73,10 +100,10 @@ export class AiController {
     return this.ai.conversations(req.user.id);
   }
   @Get('conversations/:id/messages') messages(@Param('id') id: string, @Req() req: AuthRequest) {
-    return this.ai.messages(id, req.user.id);
+    return this.ai.messages(id, req.user);
   }
   @Get('proposals') listProposals(@Req() req: AuthRequest) {
-    return this.proposals.list(req.user.id);
+    return this.proposals.list(req.user);
   }
   @Roles('ADMIN', 'OPERATOR') @Post('proposals/:id/confirm') confirm(
     @Param('id') id: string,

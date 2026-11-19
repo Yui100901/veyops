@@ -11,16 +11,11 @@ import {
 } from 'lucide-react';
 import { api, message, navigate, post, useResource } from '../api';
 import { Empty, ErrorBanner, Field, Loading, Modal } from '../components';
-import type { Environment, Repository, Service } from '../models';
+import type { Environment, Repository, Service, User } from '../models';
+import { ContextAIButton } from './AI';
+import { deliveryPath } from './delivery-route';
 
-interface RepositoryBranch {
-  name: string;
-  sha: string;
-}
-interface RepositoryBranches {
-  defaultBranch: string | null;
-  branches: RepositoryBranch[];
-}
+import { BranchSyncControls, useRepositoryBranches } from './RepositoryBranches';
 export interface RepositoryCommit {
   sha: string;
   subject: string;
@@ -43,14 +38,16 @@ export function RepositoryBrowser({
   repository,
   onSelect,
   selectedSha,
+  onSynced,
 }: {
   projectId: string;
   repository: Repository;
   onSelect?: (commit: RepositoryCommit, branch: string) => void;
   selectedSha?: string;
+  onSynced?: () => void;
 }) {
   const path = repositoryPath(projectId, repository.id);
-  const branches = useResource<RepositoryBranches>(`${path}/branches`);
+  const branches = useRepositoryBranches(path, onSynced);
   const [chosenBranch, setChosenBranch] = useState('');
   const names = branches.data?.branches ?? [];
   const branch =
@@ -62,22 +59,12 @@ export function RepositoryBrowser({
   if (branches.loading) return <Loading />;
   return (
     <div className="repository-browser">
-      <ErrorBanner error={branches.error} retry={branches.reload} />
-      {!branches.error && !names.length && (
+      <BranchSyncControls branches={branches} />
+      {branches.data?.syncedAt && !names.length && (
         <Empty
           icon={<GitBranch size={25} />}
           title="仓库暂无分支"
           description="推送首次提交后，刷新分支列表即可查看。"
-          action={
-            <button
-              className="button secondary small"
-              type="button"
-              onClick={() => void branches.reload()}
-            >
-              <RefreshCw size={14} />
-              刷新分支
-            </button>
-          }
         />
       )}
       {branch && (
@@ -93,18 +80,9 @@ export function RepositoryBrowser({
                 ))}
               </select>
             </Field>
-            <button
-              className="button secondary icon-button"
-              type="button"
-              title="刷新分支"
-              aria-label="刷新分支"
-              onClick={() => void branches.reload()}
-            >
-              <RefreshCw size={15} />
-            </button>
           </div>
           <RepositoryCommits
-            key={branch}
+            key={`${branch}:${names.find((item) => item.name === branch)?.sha}`}
             path={path}
             branch={branch}
             onSelect={onSelect}
@@ -207,17 +185,21 @@ function RepositoryCommits({
 }
 
 export function RepositoryDetails({
+  user,
   projectId,
   repository,
   services,
   environments,
   onClose,
+  onSynced,
 }: {
   projectId: string;
   repository: Repository;
   services: Service[];
   environments: Environment[];
+  user: User;
   onClose: () => void;
+  onSynced?: () => void;
 }) {
   const [checking, setChecking] = useState(false);
   const [connection, setConnection] = useState<{ ok: true; defaultBranch: string | null }>();
@@ -281,10 +263,17 @@ export function RepositoryDetails({
           </button>
           <a
             className="text-link"
-            href={`#/pipelines?${new URLSearchParams({ projectId, repositoryId: repository.id })}`}
+            href={'#' + deliveryPath(projectId, 'pipelines', { repositoryId: repository.id })}
           >
             查看此仓库的 Pipeline →
           </a>
+          <ContextAIButton
+            user={user}
+            projectId={projectId}
+            context={{ kind: 'REPOSITORY', repositoryId: repository.id }}
+            objectName={repository.name}
+            label="询问 AI"
+          />
         </div>
         <ErrorBanner error={error} />
         {connection && (
@@ -295,10 +284,11 @@ export function RepositoryDetails({
           </p>
         )}
         {section === 'commits' && (
-          <RepositoryBrowser projectId={projectId} repository={repository} />
+          <RepositoryBrowser projectId={projectId} repository={repository} onSynced={onSynced} />
         )}
         {section === 'analysis' && (
           <RepositoryAnalysis
+            user={user}
             projectId={projectId}
             repository={repository}
             services={services}
@@ -322,17 +312,20 @@ interface RepositoryAnalysisResult {
 }
 
 function RepositoryAnalysis({
+  user,
   projectId,
   repository,
   services,
   environments,
 }: {
+  user: User;
   projectId: string;
   repository: Repository;
   services: Service[];
   environments: Environment[];
 }) {
   const [commit, setCommit] = useState<RepositoryCommit>();
+  const [selectedService, setSelectedService] = useState('');
   const [choosingCommit, setChoosingCommit] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -395,6 +388,25 @@ function RepositoryAnalysis({
           <GitBranch size={15} />
           {choosingCommit ? '收起提交列表' : '选择提交'}
         </button>
+        {(commit || selectedService) && (
+          <ContextAIButton
+            user={user}
+            projectId={projectId}
+            context={{
+              kind: 'REPOSITORY',
+              repositoryId: repository.id,
+              commitSha: commit?.sha,
+              serviceId: selectedService || undefined,
+            }}
+            objectName={[
+              repository.name,
+              services.find((service) => service.id === selectedService)?.name,
+            ]
+              .filter(Boolean)
+              .join(' · ')}
+            label={commit ? `询问 AI · ${commit.sha.slice(0, 8)}` : '询问此服务的仓库配置'}
+          />
+        )}
         {commit && (
           <button
             className="text-button"
@@ -435,7 +447,11 @@ function RepositoryAnalysis({
       >
         <fieldset className="form-grid" disabled={busy}>
           <Field label="服务" hint="可在采用草稿后关联服务。">
-            <select name="serviceId">
+            <select
+              name="serviceId"
+              value={selectedService}
+              onChange={(event) => setSelectedService(event.target.value)}
+            >
               <option value="">自动选择</option>
               {services.map((service) => (
                 <option key={service.id} value={service.id}>
@@ -531,7 +547,10 @@ function RepositoryAnalysis({
               onClick={() => {
                 sessionStorage.setItem('veyops:pipeline-draft', draftJson);
                 navigate(
-                  `/pipelines?${new URLSearchParams({ projectId, repositoryId: repository.id })}`,
+                  deliveryPath(projectId, 'pipelines', {
+                    repositoryId: repository.id,
+                    serviceId: result.draft.serviceId,
+                  }),
                 );
               }}
             >

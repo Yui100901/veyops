@@ -1,3 +1,5 @@
+import { PipelineTriggersService } from '../pipeline-triggers/pipeline-triggers.service';
+import { AiFailureHandlingService } from '../ai/ai-failure-handling.service';
 import {
   Injectable,
   Logger,
@@ -35,6 +37,8 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
   private readonly owner = randomUUID();
   private readonly shutdownController = new AbortController();
   private timer?: NodeJS.Timeout;
+  private evaluatingTriggers?: Promise<void>;
+  private diagnosing?: Promise<void>;
   private polling?: Promise<void>;
   private running?: Promise<void>;
   private shutdownPromise?: Promise<void>;
@@ -52,6 +56,8 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     @Optional() private readonly artifactRetention?: ArtifactRetentionService,
     @Optional() private readonly schedules?: OperationSchedulesService,
     @Optional() private readonly notifications?: NotificationsService,
+    @Optional() private readonly triggers?: PipelineTriggersService,
+    @Optional() private readonly failures?: AiFailureHandlingService,
   ) {}
   onApplicationBootstrap() {
     if (process.env.WORKER_ENABLED !== 'false') this.start();
@@ -77,6 +83,8 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     this.shutdownController.abort();
     this.controller?.abort();
     await this.polling?.catch(() => undefined);
+    await this.evaluatingTriggers;
+    await this.diagnosing;
     await this.running;
     if (this.database.client === 'sqlite') {
       await this.database.db
@@ -122,7 +130,23 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       }
       return;
     }
+    if (!this.stopping && this.triggers) {
+      this.evaluatingTriggers ??= this.triggers
+        .tick()
+        .catch(() => this.logger.warn('自动构建触发检查失败，将在下一轮重试'))
+        .finally(() => {
+          this.evaluatingTriggers = undefined;
+        });
+    }
     await this.recoverExpired();
+    if (this.failures && !this.stopping) {
+      this.diagnosing ??= this.failures
+        .tick(this.shutdownController.signal)
+        .catch(() => this.logger.warn('故障诊断调度暂不可用'))
+        .finally(() => {
+          this.diagnosing = undefined;
+        });
+    }
     if (!this.stopping && this.schedules) {
       try {
         await this.schedules.tick();
@@ -144,7 +168,13 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       });
   }
   private async pruneArtifacts() {
-    if (!this.artifactRetention || this.stopping || this.running || Date.now() < this.nextArtifactPruneAt) return;
+    if (
+      !this.artifactRetention ||
+      this.stopping ||
+      this.running ||
+      Date.now() < this.nextArtifactPruneAt
+    )
+      return;
     this.nextArtifactPruneAt = Date.now() + ARTIFACT_PRUNE_INTERVAL_MS;
     try {
       await this.artifactRetention.pruneExpired();
@@ -241,6 +271,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       for (const task of expired) {
         await this.settleExecutionRows(tx, task.id, now, 'NEEDS_ATTENTION', EXECUTION_INTERRUPTED);
         await this.notifications?.recordTaskCompletion(tx, task.id, now);
+        await this.failures?.completion(tx, task.id, now);
       }
     });
   }
@@ -277,6 +308,16 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
           payload: JSON.parse(task.payload_json) as TaskPayload,
         };
         handler = this.registry.get(task.task_type);
+        const origin = record.payload.aiRepair;
+        if (origin) {
+          if (!this.failures) throw new Error('修复权限检查不可用');
+          await this.failures.authorizeRepair(origin, task.id);
+          const startStep = context.startStep;
+          context.startStep = async (...args) => {
+            await this.failures!.authorizeRepair(origin, task.id);
+            return startStep(...args);
+          };
+        }
         if (!controller.signal.aborted) {
           context.log(
             `任务开始：${task.name}\n目标快照已固定，${record.payload.targets.length} 台服务器\n`,
@@ -450,6 +491,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         .where('lease_owner', '=', this.owner)
         .execute();
       await this.notifications?.recordTaskCompletion(tx, task.id, now);
+      await this.failures?.completion(tx, task.id, now);
       return true;
     });
   }

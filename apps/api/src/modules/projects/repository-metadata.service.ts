@@ -4,14 +4,19 @@ import {
   ConflictException,
   Controller,
   Get,
+  HttpException,
   Injectable,
   NotFoundException,
   Param,
+  Post,
   Query,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { IsOptional, IsString, Matches, MaxLength } from 'class-validator';
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import type { Selectable } from 'kysely';
+import type { RepositoriesTable } from '../../core/database/schema';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -47,6 +52,36 @@ const gitEnvironmentKeys = new Set([
 ]);
 const gitCredentialTypes = new Set(['GIT_TOKEN', 'GIT_PASSWORD', 'USERNAME_PASSWORD']);
 type RepositoryAccess = { clone_url: string; credential_id: string | null };
+type BranchCacheRow = Pick<
+  Selectable<RepositoriesTable>,
+  'branch_cache_json' | 'branch_error' | 'branch_checked_at'
+>;
+type BranchSnapshot = {
+  defaultBranch: string | null;
+  branches: { name: string; sha: string }[];
+  syncedAt: number;
+};
+
+export function branchCache(row: BranchCacheRow) {
+  const snapshot: BranchSnapshot | null = row.branch_cache_json
+    ? JSON.parse(row.branch_cache_json)
+    : null;
+  const status = row.branch_error
+    ? 'ERROR'
+    : !snapshot
+      ? 'PENDING'
+      : Date.now() - snapshot.syncedAt > 15 * 60_000
+        ? 'STALE'
+        : 'CURRENT';
+  return {
+    defaultBranch: snapshot?.defaultBranch ?? null,
+    branches: snapshot?.branches ?? [],
+    syncedAt: snapshot?.syncedAt ?? null,
+    checkedAt: row.branch_checked_at,
+    error: row.branch_error,
+    status,
+  };
+}
 
 export function isGitCredentialType(type: string): boolean {
   return gitCredentialTypes.has(type);
@@ -161,6 +196,64 @@ export class RepositoryMetadataService {
     return this.withRepository(projectId, repositoryId, (repository) =>
       this.listBranches(repository),
     );
+  }
+
+  private repositoryRow(projectId: string, repositoryId: string) {
+    return this.database.db
+      .selectFrom('repositories')
+      .innerJoin('projects', 'projects.id', 'repositories.project_id')
+      .selectAll('repositories')
+      .where('repositories.id', '=', repositoryId)
+      .where('repositories.project_id', '=', projectId)
+      .where('projects.deleted_at', 'is', null)
+      .executeTakeFirst();
+  }
+
+  async cachedBranches(projectId: string, repositoryId: string) {
+    const row = await this.repositoryRow(projectId, repositoryId);
+    if (!row) throw new NotFoundException('仓库不存在');
+    return branchCache(row);
+  }
+
+  async refreshBranches(projectId: string, repositoryId: string, timeoutMs = 25_000) {
+    const row = await this.repositoryRow(projectId, repositoryId);
+    if (!row) throw new NotFoundException('仓库不存在');
+    const requestId = randomUUID();
+    const update = this.database.db
+      .updateTable('repositories')
+      .where('project_id', '=', projectId)
+      .where('id', '=', repositoryId);
+    const claimed = await update
+      .set({ branch_request_id: requestId })
+      .where('updated_at', '=', row.updated_at)
+      .executeTakeFirst();
+    if (!claimed.numUpdatedRows) throw new ConflictException('仓库配置已变化，请刷新');
+    const finish = update.where('branch_request_id', '=', requestId);
+    let snapshot;
+    try {
+      snapshot = await this.withRepository(
+        projectId,
+        repositoryId,
+        (repository) => this.listBranches(repository),
+        row,
+        timeoutMs,
+      );
+    } catch (error) {
+      const reason =
+        error instanceof HttpException ? error.message : '分支同步失败，请检查仓库配置并重试';
+      await finish.set({ branch_checked_at: Date.now(), branch_error: reason }).execute();
+      return this.cachedBranches(projectId, repositoryId);
+    }
+    const syncedAt = Date.now();
+    await finish
+      .set({
+        default_branch: snapshot.defaultBranch ?? '',
+        branch_cache_json: JSON.stringify({ ...snapshot, syncedAt }),
+        branch_checked_at: syncedAt,
+        branch_error: null,
+      })
+      .execute();
+    return this.cachedBranches(projectId, repositoryId);
   }
 
   branchHeads(
@@ -506,6 +599,7 @@ export class RepositoryMetadataService {
     repositoryId: string,
     callback: (repository: GitRepository) => Promise<T>,
     expected?: RepositoryAccess,
+    timeoutMs = 25_000,
   ): Promise<T> {
     const repository = await this.database.db
       .selectFrom('repositories')
@@ -579,7 +673,7 @@ export class RepositoryMetadataService {
         GIT_CEILING_DIRECTORIES: dirname(workspace),
         GIT_NO_LAZY_FETCH: '1',
       });
-      const signal = AbortSignal.timeout(25_000);
+      const signal = AbortSignal.timeout(timeoutMs);
       const runBytes = async (args: string[], maxBuffer = 1024 * 1024) => {
         try {
           const { stdout } = await exec('git', [...options, ...args], {
@@ -627,6 +721,22 @@ export class RepositoryMetadataController {
   @Get('branches')
   branches(@Param('projectId') projectId: string, @Param('repositoryId') repositoryId: string) {
     return this.metadata.branches(projectId, repositoryId);
+  }
+
+  @Get('branch-cache')
+  cachedBranches(
+    @Param('projectId') projectId: string,
+    @Param('repositoryId') repositoryId: string,
+  ) {
+    return this.metadata.cachedBranches(projectId, repositoryId);
+  }
+
+  @Post('branch-cache/refresh')
+  refreshBranches(
+    @Param('projectId') projectId: string,
+    @Param('repositoryId') repositoryId: string,
+  ) {
+    return this.metadata.refreshBranches(projectId, repositoryId);
   }
 
   @Get('commits')

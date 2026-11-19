@@ -6,6 +6,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
+import { findLegacyWebhookTask } from './legacy-webhook-task';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import type { Transaction } from 'kysely';
@@ -38,7 +39,12 @@ import {
   RunPipelineDto,
   UpdatePipelineDto,
 } from './pipeline.dto';
-import type { PipelineDefinition, PipelineExecutionMode, PipelineSnapshot } from './pipeline.types';
+import type {
+  AutomaticPipelineTrigger,
+  PipelineDefinition,
+  PipelineExecutionMode,
+  PipelineSnapshot,
+} from './pipeline.types';
 import {
   pipelineNodeSecrets,
   pipelineSourceRepositories,
@@ -71,9 +77,10 @@ export class PipelinesService implements OnModuleInit {
       afterCompletion: (task, signal) => this.analysis.record(task, signal),
     });
   }
-  async list(projectId?: string) {
+  async list(projectId?: string, serviceId?: string) {
     let q = this.database.db.selectFrom('pipelines').selectAll();
     if (projectId) q = q.where('project_id', '=', projectId);
+    if (serviceId) q = q.where('service_id', '=', serviceId);
     const rows = await q.orderBy('created_at', 'desc').execute();
     return Promise.all(
       rows.map(async (row) => {
@@ -393,7 +400,11 @@ export class PipelinesService implements OnModuleInit {
     ) as PipelineDefinition;
     const buildOnlyNodes =
       definition.nodes && !definition.nodes.some((node) => node.type === 'DEPLOY');
-    const mode = input.mode ?? (buildOnlyNodes ? 'BUILD_ONLY' : 'DEPLOY');
+    const mode =
+      input.mode ??
+      env.config?.executionMode ??
+      definition.defaultMode ??
+      (buildOnlyNodes ? 'BUILD_ONLY' : 'DEPLOY');
     if (mode === 'DEPLOY' && buildOnlyNodes && !fromArtifact)
       throw new BadRequestException('所选流水线版本没有发布节点，可构建后手动部署归档产物');
     if (input.allowPartialDeploy && mode !== 'DEPLOY')
@@ -509,6 +520,8 @@ export class PipelinesService implements OnModuleInit {
                     : { url: source.url, credentialId: source.credentialId, branch: source.branch },
                 ]),
               ),
+            }),
+            ...((p.sources || includeSourceCommits) && {
               projectName: p.projectName,
               serviceName: p.serviceName,
             }),
@@ -577,9 +590,9 @@ export class PipelinesService implements OnModuleInit {
   }
   assertAutomaticBuild(preview: { definition: PipelineDefinition; hasSecretVariables: boolean }) {
     if (preview.definition.buildLocation !== 'MANAGER')
-      throw new BadRequestException('Webhook 仅支持管理端隔离构建，请修改有效构建位置');
+      throw new BadRequestException('自动触发仅支持管理端隔离构建，请修改有效构建位置');
     if (preview.hasSecretVariables || pipelineNodeSecrets(preview.definition).length)
-      throw new BadRequestException('Webhook 自动构建不能使用环境或节点中的敏感变量');
+      throw new BadRequestException('自动构建不能使用环境或节点中的敏感变量');
     if (!webhookBuildSocket())
       throw new BadRequestException('请先配置 Webhook 专用 rootless Docker 构建环境');
   }
@@ -602,11 +615,9 @@ export class PipelinesService implements OnModuleInit {
       }),
       commitSha,
       repository: { url: p.repository.clone_url, credentialId: p.repository.credential_id },
-      ...(p.sources && {
-        nodeSources: p.sources.nodeSources,
-        projectName: p.projectName,
-        serviceName: p.serviceName,
-      }),
+      projectName: p.projectName,
+      serviceName: p.serviceName,
+      ...(p.sources && { nodeSources: p.sources.nodeSources }),
       ...(p.registry && {
         registry: { registryUrl: p.registry.registryUrl, credentialId: p.registry.credentialId },
       }),
@@ -672,12 +683,14 @@ export class PipelinesService implements OnModuleInit {
     if (status !== 'SUCCESS' && !(status === 'PARTIAL_FAILED' && build.allowPartialDeploy))
       return { deploymentSkippedReason: '构建未达到发布条件，当前运行版本保留' };
 
+    const automatic = build.triggerType && build.triggerType !== 'MANUAL';
     const operator = await tx
       .selectFrom('users')
       .select('id')
       .where('id', '=', userId)
       .where('status', '=', 'ACTIVE')
-      .where('role', 'in', ['ADMIN', 'OPERATOR'])
+      .where('role', 'in', automatic ? ['ADMIN'] : ['ADMIN', 'OPERATOR'])
+      .where('must_change_password', '=', 0)
       .executeTakeFirst();
     const pipeline = await tx
       .selectFrom('pipelines')
@@ -919,24 +932,30 @@ export class PipelinesService implements OnModuleInit {
     input: ConfirmedPipelineRunDto,
     userId: string,
     options: {
-      triggerType?: 'WEBHOOK';
+      triggerType?: AutomaticPipelineTrigger;
       idempotencyKey?: string;
       gitRef?: string;
       beforeInsert?: (tx: Transaction<Database>) => Promise<void>;
+      afterInsert?: (tx: Transaction<Database>, taskId: string, created: boolean) => Promise<void>;
     } = {},
   ) {
     if (input.confirmed !== true) throw new BadRequestException('必须确认执行Pipeline');
-    if (options.triggerType === 'WEBHOOK' && input.mode !== 'BUILD_ONLY')
-      throw new BadRequestException('Webhook只允许触发仅构建');
+    if (
+      options.triggerType &&
+      (!options.gitRef?.startsWith('refs/heads/') ||
+        !input.commitSha ||
+        !input.expectedConfigurationHash)
+    )
+      throw new BadRequestException('自动触发必须固定分支、提交和已确认的配置');
     const p = await this.prepare(
       id,
       input,
       false,
-      options.triggerType === 'WEBHOOK' ? options.gitRef?.slice('refs/heads/'.length) : undefined,
+      options.triggerType ? options.gitRef?.slice('refs/heads/'.length) : undefined,
     );
     if ((p.target.selection || p.definition.nodes) && !input.expectedConfigurationHash)
       throw new ConflictException('请先预览并确认服务器、分组和执行配置');
-    if (options.triggerType === 'WEBHOOK')
+    if (options.triggerType)
       this.assertAutomaticBuild({
         definition: p.definition,
         hasSecretVariables: Object.keys(p.env.secretVariables).length > 0,
@@ -975,7 +994,27 @@ export class PipelinesService implements OnModuleInit {
         await options.beforeInsert?.(tx);
         if (snapshot.targetSelection)
           await confirmDeploymentMembers(tx, snapshot.targetSelection, snapshot.targetMemberIds!);
+        if (
+          (options.triggerType === 'WEBHOOK' || options.triggerType === 'POLL') &&
+          !snapshot.deployAfterBuild
+        )
+          return findLegacyWebhookTask(
+            tx,
+            snapshot,
+            this.executionTargets(p),
+            options.gitRef!,
+            input.targetId ?? p.env.config?.targetId,
+          );
       },
+      options.afterInsert &&
+        (async (tx, taskId) => {
+          const run = await tx
+            .selectFrom('pipeline_runs')
+            .select('id')
+            .where('task_id', '=', taskId)
+            .executeTakeFirstOrThrow();
+          await options.afterInsert!(tx, taskId, run.id === snapshot.runId);
+        }),
     );
     if (task.pipelineRunId === snapshot.runId) {
       await this.audit.record(userId, 'pipeline.run', 'task', task.id, {

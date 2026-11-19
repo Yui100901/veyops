@@ -80,12 +80,16 @@ Pipeline 是服务级的版本化交付配置。每次修改追加不可变版�
 
 1. 在专用 Linux 构建主机准备 rootless Docker 和 Docker CLI。API/Worker 以该 daemon 的非 root 用户运行，设置 `WEBHOOK_BUILD_DOCKER_SOCKET=/run/user/<UID>/docker.sock`。daemon 须使用 systemd、cgroup v2，并支持 CPU、内存和 PID 限制。API 进程和 daemon 需要用相同路径访问构建工作目录。默认 Compose 适合启动平台，启用自动构建需要额外接入上述环境。
 2. 在凭据中心创建「自定义密钥」凭据，保存至少 32 字节的随机共享密钥。
-3. 将 Pipeline 的有效构建位置设为管理端，选择只含普通构建变量的环境。在 Pipeline 卡片打开「Webhook」，选择分支、环境、目标组和共享密钥。自动构建记录保留目标组关联，无需连接其部署主机。原有目标端 Webhook 需要切换到管理端后重新保存。
+3. 将 Pipeline 的有效构建位置设为管理端，选择只含普通构建变量的环境。在项目服务的流水线中打开「Webhook」，选择分支、环境与共享密钥。发布目标默认沿用服务环境，也可单独指定服务器或分组。预览会列出实际运行模式、审批要求和服务器，确认后启用。使用环境目标的绑定遇到成员或分组变化时，需要重新预览保存。
 4. 在 Gitea 添加 `application/json` 的 Push Webhook，填写可访问的接收地址与同一共享密钥。推送到绑定分支后，在任务中心核对提交、产物和日志。
 
-接收端通过原始请求体校验 `X-Gitea-Signature`，按绑定的仓库克隆地址与分支筛选。同一 Pipeline、分支和提交的重复投递返回同一个任务。Webhook 固定以仅构建方式执行。配置接口为 `GET/PUT /pipelines/:id/webhook`，接收接口为 `POST /webhooks/gitea/:pipelineId`。[Gitea Webhook 文档](https://docs.gitea.com/1.22/usage/webhooks/)
+接收端通过原始请求体校验 `X-Gitea-Signature`，按绑定的仓库克隆地址与分支筛选。推送和轮询对同一版本、环境、生效配置和分支提交共用构建任务，每次受理都有独立记录。Webhook 沿用服务环境及流水线的运行模式。旧绑定在管理员预览并确认切换前继续仅构建。配置接口为 `GET/PUT /pipelines/:id/webhook`，接收接口为 `POST /webhooks/gitea/:pipelineId`。[Gitea Webhook 文档](https://docs.gitea.com/1.22/usage/webhooks/)
 
 Webhook 固定当前 Pipeline 版本及有效配置。环境、目标或仓库配置变化后需要重新保存。禁用绑定、换签名密钥与任务入队采用事务校验，已经入队的任务可在任务中心取消。自动构建始终使用显式指定的 Socket，不回退到系统 Docker。 [Docker rootless 设置](https://docs.docker.com/engine/security/rootless/) · [资源限制](https://docs.docker.com/engine/security/rootless/tips/#limiting-resources)
+
+## 定时构建与分支轮询
+
+项目服务的流水线卡片还提供「自动触发」。管理员可配置单次、固定间隔或 Cron 计划，或按间隔轮询分支。定时规则每个计划时刻可构建一次，轮询默认先记录当前提交，之后仅在提交变化时发起构建。可在规则历史查看因停机跳过、仓库读取失败或配置变化而暂停的记录。三种自动触发共用上述 rootless 构建环境。在构建并部署模式下，独立发布任务继续执行审批、产物校验、逐服务器健康检查及回滚策略。
 
 ## 构建与部署矩阵
 

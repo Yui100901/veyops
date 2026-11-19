@@ -1213,6 +1213,118 @@ const directDeploymentSelectionMigration: Migration = {
   },
 };
 
+const repositoryBranchCacheMigration: Migration = {
+  async up(db) {
+    await db.schema.alterTable('repositories').addColumn('branch_cache_json', 'text').execute();
+    await db.schema.alterTable('repositories').addColumn('branch_checked_at', 'bigint').execute();
+    await db.schema.alterTable('repositories').addColumn('branch_error', 'text').execute();
+    await db.schema.alterTable('repositories').addColumn('branch_request_id', 'text').execute();
+  },
+  async down(db) {
+    for (const column of [
+      'branch_request_id',
+      'branch_error',
+      'branch_checked_at',
+      'branch_cache_json',
+    ])
+      await db.schema.alterTable('repositories').dropColumn(column).execute();
+  },
+};
+
+const pipelineTriggerTables: TableDefinition[] = [
+  {
+    name: 'pipeline_triggers',
+    columns: [
+      ['id', 'text', { primaryKey: true }],
+      ['pipeline_id', 'text', { references: 'pipelines.id' }],
+      ['kind', 'text'],
+      ['version', 'integer'],
+      ['environment_id', 'text'],
+      ['branch', 'text'],
+      ['repository_id', 'text'],
+      ['owner_id', 'text'],
+      ['configuration_hash', 'text'],
+      ['repository_hash', 'text'],
+      ['timing_json', 'text'],
+      ['target_json', 'text', { nullable: true }],
+      ['mode', 'text'],
+      ['build_current', 'integer'],
+      ['baseline_sha', 'text', { nullable: true }],
+      ['status', 'text'],
+      ['reason', 'text', { nullable: true }],
+      ['next_at', 'bigint', { nullable: true }],
+      ['anchor_at', 'bigint'],
+      ['lease_id', 'text', { nullable: true }],
+      ['lease_until', 'bigint', { nullable: true }],
+      ['failures', 'integer'],
+    ],
+  },
+  {
+    name: 'pipeline_trigger_history',
+    columns: [
+      ['id', 'text', { primaryKey: true }],
+      ['pipeline_id', 'text', { references: 'pipelines.id' }],
+      ['kind', 'text'],
+      ['status', 'text'],
+      ['version', 'integer', { nullable: true }],
+      ['environment_id', 'text', { nullable: true }],
+      ['branch', 'text', { nullable: true }],
+      ['commit_sha', 'text', { nullable: true }],
+      ['mode', 'text', { nullable: true }],
+      ['task_id', 'text', { nullable: true }],
+      ['reason', 'text', { nullable: true }],
+      ['scheduled_at', 'bigint', { nullable: true }],
+      ['trigger_id', 'text', { nullable: true }],
+      ['created_at', 'bigint'],
+    ],
+    unique: [['trigger_id', 'scheduled_at']],
+  },
+];
+
+const pipelineTriggersMigration: Migration = {
+  async up(db) {
+    await createTables(db, pipelineTriggerTables, [
+      ['pipeline_triggers', ['status', 'next_at']],
+      ['pipeline_trigger_history', ['pipeline_id', 'created_at']],
+    ]);
+  },
+  async down(db) {
+    for (const { name } of [...pipelineTriggerTables].reverse())
+      await db.schema.dropTable(name).execute();
+  },
+};
+
+const aiFailureTables: TableDefinition[] = [
+  {
+    name: 'ai_failure_settings',
+    columns: [
+      ['service_id', 'text', { references: 'services.id', onDelete: 'cascade' }],
+      ['environment_id', 'text', { references: 'environments.id', onDelete: 'cascade' }],
+      ['enabled', 'integer'],
+      ['component', 'text', { nullable: true }],
+      ['revision', 'text'],
+    ],
+    primaryKey: ['service_id', 'environment_id'],
+  },
+  {
+    name: 'ai_failure_incidents',
+    columns: [
+      ['task_id', 'text', { primaryKey: true, references: 'tasks.id', onDelete: 'cascade' }],
+      ['service_id', 'text'],
+      ['environment_id', 'text'],
+      ['revision', 'text'],
+      ['status', 'text'],
+      ['summary', 'text'],
+      ['findings_json', 'text', { default: '[]' }],
+      ['proposal_id', 'text', { nullable: true }],
+      ['repair_task_id', 'text', { nullable: true }],
+      ['created_at', 'bigint'],
+      ['updated_at', 'bigint'],
+    ],
+    unique: [['proposal_id'], ['repair_task_id']],
+  },
+];
+
 export const migrationProvider: MigrationProvider = {
   async getMigrations() {
     return {
@@ -1228,6 +1340,113 @@ export const migrationProvider: MigrationProvider = {
       '010_operation_schedules': operationSchedulesMigration,
       '011_notifications': notificationsMigration,
       '012_direct_deployment_selection': directDeploymentSelectionMigration,
+      '013_repository_branch_cache': repositoryBranchCacheMigration,
+      '014_pipeline_triggers': pipelineTriggersMigration,
+      '015_automatic_execution_mode': {
+        async up(db) {
+          await db.schema
+            .alterTable('service_environment_configs')
+            .addColumn('execution_mode', 'text')
+            .execute();
+          await db.schema
+            .alterTable('pipeline_webhooks')
+            .addColumn('follow_mode', 'integer', (c) => c.notNull().defaultTo(0))
+            .execute();
+          await db.schema
+            .alterTable('pipeline_webhooks')
+            .addColumn('confirmed_mode', 'text', (c) => c.notNull().defaultTo('BUILD_ONLY'))
+            .execute();
+          await sql`insert into pipeline_trigger_history
+            (id, pipeline_id, kind, status, version, environment_id, branch, commit_sha, mode, task_id, created_at)
+            select 'legacy:' || r.id, r.pipeline_id, 'WEBHOOK', 'QUEUED', v.version, r.environment_id,
+              substr(r.git_ref, 12), r.commit_sha, 'BUILD_ONLY', r.task_id, r.created_at
+            from pipeline_runs r join pipeline_versions v on v.id = r.pipeline_version_id
+            where r.trigger_type = 'WEBHOOK'`.execute(db);
+        },
+        async down(db) {
+          await db.deleteFrom('pipeline_trigger_history').where('id', 'like', 'legacy:%').execute();
+          await db.schema.alterTable('pipeline_webhooks').dropColumn('confirmed_mode').execute();
+          await db.schema.alterTable('pipeline_webhooks').dropColumn('follow_mode').execute();
+          await db.schema
+            .alterTable('service_environment_configs')
+            .dropColumn('execution_mode')
+            .execute();
+        },
+      } satisfies Migration,
+      '016_ai_failure_handling': {
+        async up(db) {
+          await createTables(db, aiFailureTables, [
+            ['ai_failure_incidents', ['status', 'updated_at']],
+            ['ai_failure_incidents', ['service_id', 'environment_id', 'created_at']],
+          ]);
+        },
+        async down(db) {
+          for (const { name } of [...aiFailureTables].reverse())
+            await db.schema.dropTable(name).execute();
+        },
+      } satisfies Migration,
+      '017_linux_monitoring': {
+        async up(db) {
+          await createTables(
+            db,
+            [
+              {
+                name: 'monitor_settings',
+                columns: [
+                  ['id', 'integer', { primaryKey: true }],
+                  ['enabled', 'integer'],
+                  ['interval_seconds', 'integer'],
+                  ['retention_days', 'integer'],
+                  ['concurrency', 'integer'],
+                ],
+              },
+              {
+                name: 'monitor_hosts',
+                columns: [
+                  [
+                    'server_id',
+                    'text',
+                    { primaryKey: true, references: 'servers.id', onDelete: 'cascade' },
+                  ],
+                  ['enabled', 'integer'],
+                  ['interface_name', 'text', { nullable: true }],
+                  ['next_at', 'bigint'],
+                  ['lease', 'text', { nullable: true }],
+                  ['lease_until', 'bigint'],
+                  ['failures', 'integer'],
+                  ['attempt_at', 'bigint', { nullable: true }],
+                  ['sampled_at', 'bigint', { nullable: true }],
+                  ['raw_json', 'text', { nullable: true }],
+                  ['metrics_json', 'text', { nullable: true }],
+                  ['error', 'text', { nullable: true }],
+                ],
+              },
+              {
+                name: 'monitor_samples',
+                columns: [
+                  ['id', 'text', { primaryKey: true }],
+                  ['server_id', 'text', { references: 'servers.id', onDelete: 'cascade' }],
+                  ['at', 'bigint'],
+                  ['raw_json', 'text', { nullable: true }],
+                  ['metrics_json', 'text', { nullable: true }],
+                ],
+              },
+            ],
+            [
+              ['monitor_samples', ['server_id', 'at']],
+              ['monitor_samples', ['at']],
+              ['monitor_hosts', ['next_at']],
+            ],
+          );
+          await sql`insert into monitor_settings (id,enabled,interval_seconds,retention_days,concurrency) values (1,0,60,7,3)`.execute(
+            db,
+          );
+        },
+        async down(db) {
+          for (const name of ['monitor_samples', 'monitor_hosts', 'monitor_settings'])
+            await db.schema.dropTable(name).execute();
+        },
+      } satisfies Migration,
     };
   },
 };

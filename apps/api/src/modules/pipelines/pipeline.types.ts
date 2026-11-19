@@ -2,6 +2,7 @@ import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import type { DeploymentSelection } from '../deployment-targets/deployment-selection';
 
 export type PipelineExecutionMode = 'BUILD_ONLY' | 'DEPLOY';
+export type AutomaticPipelineTrigger = 'WEBHOOK' | 'SCHEDULE' | 'POLL';
 
 export interface ReleasePolicy {
   requireApproval: boolean;
@@ -58,6 +59,7 @@ export interface PipelineNodeSource {
   branch?: string;
 }
 export interface PipelineDefinition {
+  defaultMode?: PipelineExecutionMode;
   repositoryId: string;
   buildLocation: 'TARGET' | 'MANAGER';
   artifactType: 'FILE' | 'DOCKER_IMAGE';
@@ -87,7 +89,7 @@ export interface PipelineSnapshot {
   allowPartialDeploy?: boolean;
   deploymentArtifacts?: { id: string; serverId: string | null; fingerprint?: string }[];
   sourceBuildTaskId?: string;
-  triggerType?: 'MANUAL' | 'WEBHOOK';
+  triggerType?: 'MANUAL' | AutomaticPipelineTrigger;
   runId: string;
   pipelineId: string;
   pipelineVersionId: string;

@@ -135,7 +135,9 @@ export interface Repository {
   id: string;
   name: string;
   cloneUrl: string;
-  defaultBranch: string;
+  defaultBranch: string | null;
+  branchSyncStatus: 'PENDING' | 'CURRENT' | 'STALE' | 'ERROR';
+  branchCount: number;
   provider?: string;
   credentialId?: string | null;
   description?: string;
@@ -155,6 +157,7 @@ export interface Environment {
   description?: string;
 }
 export interface ProjectDetail extends Project {
+  archived?: boolean;
   repositories: Repository[];
   services: Service[];
   environments: Environment[];
@@ -191,6 +194,10 @@ export interface PipelineGraphNode {
 }
 export interface Task {
   id: string;
+  createdBy?: string | null;
+  projectId?: string | null;
+  serviceId?: string | null;
+  environmentId?: string | null;
   type: string;
   executionMode?: 'BUILD_ONLY' | 'DEPLOY' | 'DEPLOY_ARTIFACT' | null;
   approvalStatus?: 'PENDING' | 'APPROVED' | null;

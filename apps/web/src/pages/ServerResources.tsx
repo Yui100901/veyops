@@ -15,6 +15,8 @@ import {
 } from '../components';
 import type { DeploymentSummary, Server, ServerDetail, ServerGroup } from '../models';
 import { ServerPicker } from './BatchTargets';
+import { ServerMonitoring } from './ServerMonitoring';
+import type { MonitorRow } from './monitoring-data';
 
 export function ServerGroups({
   servers,
@@ -251,9 +253,24 @@ export function DeploymentHistory({
   );
 }
 
-export function ServerOverview({ server, onClose }: { server: Server; onClose: () => void }) {
+export function ServerOverview({
+  server,
+  onClose,
+  initialMetrics,
+  monitorRow,
+  canEdit,
+  onMonitorChange,
+}: {
+  server: Server;
+  onClose: () => void;
+  initialMetrics: boolean;
+  monitorRow?: MonitorRow;
+  canEdit: boolean;
+  onMonitorChange: () => void;
+}) {
   const detail = useResource<ServerDetail>(`/servers/${server.id}`);
   const entry = detail.data;
+  const [metrics, setMetrics] = useState(initialMetrics);
   return (
     <Modal
       title={server.name}
@@ -262,103 +279,122 @@ export function ServerOverview({ server, onClose }: { server: Server; onClose: (
       wide
     >
       <div className="form-body">
-        <ErrorBanner error={detail.error} retry={detail.reload} />
-        {detail.loading ? (
-          <Loading />
+        <nav className="resource-section-switcher" aria-label="服务器详情">
+          <button type="button" aria-pressed={!metrics} onClick={() => setMetrics(false)}>
+            概览
+          </button>
+          <button type="button" aria-pressed={metrics} onClick={() => setMetrics(true)}>
+            资源监控
+          </button>
+        </nav>
+        {metrics ? (
+          <ServerMonitoring
+            id={server.id}
+            canEdit={canEdit}
+            onChange={onMonitorChange}
+            summary={monitorRow}
+          />
         ) : (
-          entry && (
-            <>
-              <div className="task-meta">
-                <Status value={entry.status} />
-                <span>{entry.osType || '操作系统待检测'}</span>
-                <span>最近检测 {formatTime(entry.lastCheckedAt)}</span>
-              </div>
-              {entry.description && <p>{entry.description}</p>}
-              <div className="tags">
-                {(entry.groups ?? []).map((group) => (
-                  <span className="tag" key={group.id}>
-                    {group.name}
-                  </span>
-                ))}
-                {(entry.projects ?? []).map((project) => (
-                  <a className="text-link" key={project.id} href={`#/projects/${project.id}`}>
-                    {project.name}
-                  </a>
-                ))}
-              </div>
-              <h3 className="field-title">连接检测</h3>
-              {entry.probeHistory?.length ? (
-                <div className="table-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>时间</th>
-                        <th>状态</th>
-                        <th>系统与资源</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {entry.probeHistory.map((probe) => (
-                        <tr key={probe.id}>
-                          <td>{formatTime(probe.checkedAt)}</td>
-                          <td>
-                            <Status value={probe.status} />
-                          </td>
-                          <td>
-                            {probe.osType ?? '—'}
-                            {probe.metrics && (
-                              <small className="cell-sub">
-                                负载 {probe.metrics.loadAverage} · 内存可用{' '}
-                                {Math.round(probe.metrics.memoryAvailableKb / 1024)} MiB · 磁盘可用{' '}
-                                {Math.round(probe.metrics.diskAvailableKb / 1024)} MiB
-                              </small>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              ) : (
-                <p className="mini-empty">暂无检测记录</p>
-              )}
-              <h3 className="field-title">最近命令与运维</h3>
-              {entry.recentCommands?.length ? (
-                <div className="table-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>任务</th>
-                        <th>状态</th>
-                        <th>退出码</th>
-                        <th>时间</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {entry.recentCommands.map((command) => (
-                        <tr key={command.id}>
-                          <td>
-                            <a className="text-link" href={`#/tasks/${command.taskId}`}>
-                              {command.name}
-                            </a>
-                          </td>
-                          <td>
-                            <Status value={command.status} />
-                          </td>
-                          <td>{command.exitCode ?? '—'}</td>
-                          <td>{formatTime(command.finishedAt ?? command.startedAt)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              ) : (
-                <p className="mini-empty">暂无命令记录</p>
-              )}
-              <h3 className="field-title">最近部署</h3>
-              <DeploymentHistory rows={entry.recentDeployments ?? []} />
-            </>
-          )
+          <>
+            <ErrorBanner error={detail.error} retry={detail.reload} />
+            {detail.loading ? (
+              <Loading />
+            ) : (
+              entry && (
+                <>
+                  <div className="task-meta">
+                    <Status value={entry.status} />
+                    <span>{entry.osType || '操作系统待检测'}</span>
+                    <span>最近检测 {formatTime(entry.lastCheckedAt)}</span>
+                  </div>
+                  {entry.description && <p>{entry.description}</p>}
+                  <div className="tags">
+                    {(entry.groups ?? []).map((group) => (
+                      <span className="tag" key={group.id}>
+                        {group.name}
+                      </span>
+                    ))}
+                    {(entry.projects ?? []).map((project) => (
+                      <a className="text-link" key={project.id} href={`#/projects/${project.id}`}>
+                        {project.name}
+                      </a>
+                    ))}
+                  </div>
+                  <h3 className="field-title">连接检测</h3>
+                  {entry.probeHistory?.length ? (
+                    <div className="table-scroll">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>时间</th>
+                            <th>状态</th>
+                            <th>系统与资源</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {entry.probeHistory.map((probe) => (
+                            <tr key={probe.id}>
+                              <td>{formatTime(probe.checkedAt)}</td>
+                              <td>
+                                <Status value={probe.status} />
+                              </td>
+                              <td>
+                                {probe.osType ?? '—'}
+                                {probe.metrics && (
+                                  <small className="cell-sub">
+                                    负载 {probe.metrics.loadAverage} · 内存可用{' '}
+                                    {Math.round(probe.metrics.memoryAvailableKb / 1024)} MiB ·
+                                    磁盘可用 {Math.round(probe.metrics.diskAvailableKb / 1024)} MiB
+                                  </small>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <p className="mini-empty">暂无检测记录</p>
+                  )}
+                  <h3 className="field-title">最近命令与运维</h3>
+                  {entry.recentCommands?.length ? (
+                    <div className="table-scroll">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>任务</th>
+                            <th>状态</th>
+                            <th>退出码</th>
+                            <th>时间</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {entry.recentCommands.map((command) => (
+                            <tr key={command.id}>
+                              <td>
+                                <a className="text-link" href={`#/tasks/${command.taskId}`}>
+                                  {command.name}
+                                </a>
+                              </td>
+                              <td>
+                                <Status value={command.status} />
+                              </td>
+                              <td>{command.exitCode ?? '—'}</td>
+                              <td>{formatTime(command.finishedAt ?? command.startedAt)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <p className="mini-empty">暂无命令记录</p>
+                  )}
+                  <h3 className="field-title">最近部署</h3>
+                  <DeploymentHistory rows={entry.recentDeployments ?? []} />
+                </>
+              )
+            )}
+          </>
         )}
       </div>
     </Modal>

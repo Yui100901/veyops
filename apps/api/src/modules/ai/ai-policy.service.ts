@@ -1,6 +1,6 @@
 import { BadRequestException, ForbiddenException, Injectable } from '@nestjs/common';
 import { AiRepository } from './ai.repository';
-import { AiMode, AiPolicyDto } from './ai.dto';
+import { AiActionRuleDto, AiMode, AiPolicyDto } from './ai.dto';
 import { CurrentUser } from '../auth/auth.decorators';
 import { ProjectsService } from '../projects/projects.service';
 import { AuditService } from '../audit/audit.service';
@@ -13,6 +13,7 @@ export interface AiScope {
   allowedActions?: string[];
   deniedActions?: string[];
   requireConfirmActions?: string[];
+  actionRules?: AiActionRuleDto[];
 }
 export interface AiPolicy extends AiScope {
   mode: AiMode;
@@ -49,6 +50,7 @@ const validActions = new Set([
   'draft_pipeline',
   'analyze_repository_deployment',
   'draft_operation_plan',
+  'get_operation_plan',
 ]);
 @Injectable()
 export class AiPolicyService {
@@ -76,6 +78,14 @@ export class AiPolicyService {
         throw new BadRequestException('AI 策略包含未注册的操作类型');
     }
     if (input.projectId) await this.projects.get(input.projectId);
+    if (
+      input.actionRules?.some(
+        (rule) =>
+          (rule.action === 'publish_source_branch' || rule.action === 'open_pull_request') &&
+          (rule.serverId || rule.minimumTargets),
+      )
+    )
+      throw new BadRequestException('仓库写入规则仅支持按角色限制');
     if (input.mode === 'FULL_CONTROL' && !input.serverIds?.length)
       throw new BadRequestException('完全控制模式必须明确指定授权服务器范围');
     await this.repository.setPolicy(input);
@@ -84,21 +94,35 @@ export class AiPolicyService {
     });
     return this.list();
   }
+  async resetProject(projectId: string, user: CurrentUser) {
+    if (user.role !== 'ADMIN') throw new ForbiddenException('仅管理员可修改 AI 策略');
+    await this.projects.get(projectId);
+    await this.repository.deleteProjectPolicy(projectId);
+    await this.audit.record(user.id, 'ai.policy.inherit', 'ai_policy', projectId);
+    return this.list();
+  }
   async snapshot(projectId?: string): Promise<AiPolicySnapshot> {
+    return (await this.projectSnapshots())(projectId);
+  }
+  async projectSnapshots() {
     const all = await this.list();
-    const project = projectId ? all.projects.find((p) => p.projectId === projectId) : undefined;
-    return {
-      system: all.system,
-      ...(project ? { project } : {}),
-      mode: project?.mode ?? all.system.mode,
+    const byId = new Map(all.projects.map((policy) => [policy.projectId, policy]));
+    return (projectId?: string): AiPolicySnapshot => {
+      const project = projectId ? byId.get(projectId) : undefined;
+      return {
+        system: all.system,
+        ...(project && { project }),
+        mode: project?.mode ?? all.system.mode,
+      };
     };
   }
+  allowedRepository(repositoryId: string, snapshot: AiPolicySnapshot) {
+    return this.scopes(snapshot).every(
+      ({ repositoryIds }) => !repositoryIds || repositoryIds.includes(repositoryId),
+    );
+  }
   assertRepository(repositoryId: string, snapshot: AiPolicySnapshot) {
-    if (
-      this.scopes(snapshot).some(
-        ({ repositoryIds }) => repositoryIds && !repositoryIds.includes(repositoryId),
-      )
-    )
+    if (!this.allowedRepository(repositoryId, snapshot))
       throw new ForbiddenException('仓库不在 AI 授权范围内');
   }
   scopes(snapshot: AiPolicySnapshot): AiPolicy[] {
@@ -129,6 +153,18 @@ export class AiPolicyService {
     this.assertRead(input.action, snapshot, input.projectId, input.serverIds);
     if (snapshot.mode === 'READ_ONLY')
       throw new ForbiddenException('AI 只读模式禁止执行命令或部署');
+    const targetCount = new Set(input.serverIds).size;
+    const rules = this.scopes(snapshot)
+      .flatMap((scope) => scope.actionRules ?? [])
+      .filter(
+        (rule) =>
+          rule.action === input.action &&
+          (!rule.role || rule.role === user.role) &&
+          (!rule.serverId || input.serverIds.includes(rule.serverId)) &&
+          (!rule.minimumTargets || targetCount >= rule.minimumTargets),
+      );
+    if (rules.some((rule) => rule.effect === 'DENY'))
+      throw new ForbiddenException('该操作命中 AI 条件禁止规则');
     for (const scope of this.scopes(snapshot)) {
       if (scope.allowedActions && !scope.allowedActions.includes(input.action))
         throw new ForbiddenException('操作类型不在 AI 授权范围内');
@@ -149,6 +185,7 @@ export class AiPolicyService {
       throw new ForbiddenException('完全控制模式缺少明确的服务器授权范围');
     if (
       snapshot.mode === 'CONFIRM' ||
+      rules.some((rule) => rule.effect === 'CONFIRM') ||
       this.scopes(snapshot).some((s) => s.requireConfirmActions?.includes(input.action))
     )
       return 'REQUIRE_CONFIRM';

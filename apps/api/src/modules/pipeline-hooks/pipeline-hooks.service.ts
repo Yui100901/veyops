@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -14,6 +15,12 @@ import { CredentialsService } from '../credentials/credentials.service';
 import { PipelinesService } from '../pipelines/pipelines.service';
 import { SavePipelineWebhookDto } from './pipeline-hooks.dto';
 import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
+import {
+  commitTriggerKey,
+  recordPipelineTrigger,
+  type TriggerEvent,
+} from '../pipeline-triggers/trigger-history';
+import { isGitBranchName } from '../projects/git-ref';
 
 export function pipelineWebhookEndpoint(id: string) {
   return `/api/v1/webhooks/gitea/${id}`;
@@ -29,6 +36,8 @@ function present(row: Selectable<Database['pipeline_webhooks']>) {
     branch: row.branch,
     secretCredentialId: row.secret_credential_id,
     enabled: row.enabled === 1,
+    followMode: row.follow_mode === 1,
+    mode: row.confirmed_mode,
     version: row.pipeline_version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -49,23 +58,6 @@ export function canonicalRepositoryUrl(input: string) {
   )
     throw new Error('Invalid repository URL');
   return `${url.origin}${pathname}`;
-}
-
-function validateBranch(branch: string) {
-  // Match a complete Git branch name, without accepting globs or a refs/heads/ prefix.
-  if (
-    !branch ||
-    branch.length > 255 ||
-    branch === '@' ||
-    branch.startsWith('-') ||
-    branch.startsWith('refs/') ||
-    branch.endsWith('.') ||
-    branch.includes('..') ||
-    branch.includes('@{') ||
-    /[\s~^:?*[\\\x00-\x1F\x7F]/.test(branch) ||
-    branch.split('/').some((part) => !part || part.startsWith('.') || part.endsWith('.lock'))
-  )
-    throw new BadRequestException('请填写有效的 Git 分支名称，例如 main 或 release/next');
 }
 
 type PushPayload = {
@@ -144,6 +136,7 @@ export class PipelineHooksService {
       .where('branch', '=', hook.branch)
       .where('repository_key', '=', hook.repository_key)
       .where('pipeline_version', '=', hook.pipeline_version)
+      .where('follow_mode', '=', hook.follow_mode)
       .where('configuration_hash', '=', hook.configuration_hash)
       .where('environment_id', '=', hook.environment_id)
       .where('target_id', hook.target_id === null ? 'is' : '=', hook.target_id)
@@ -200,6 +193,74 @@ export class PipelineHooksService {
     }
   }
 
+  async previewBinding(id: string, input: SavePipelineWebhookDto) {
+    if (!isGitBranchName(input.branch) || input.branch.startsWith('refs/'))
+      throw new BadRequestException('请填写有效的 Git 分支名称，例如 release/next');
+    await this.secret(input.secretCredentialId);
+    let followMode = input.followMode === true;
+    if (!followMode) {
+      const installed = await this.row(id);
+      if (installed) followMode = installed.follow_mode === 1;
+      else {
+        // Legacy clients could create build-only hooks before modes were configurable.
+        const pipeline = await this.pipelines.get(id);
+        const env = await this.database.db
+          .selectFrom('service_environment_configs')
+          .select('execution_mode')
+          .where('service_id', '=', pipeline.serviceId)
+          .where('environment_id', '=', input.environmentId)
+          .executeTakeFirst();
+        followMode = Boolean(env?.execution_mode || pipeline.definition.defaultMode);
+      }
+    }
+    const preview = await this.pipelines.preview(
+      id,
+      {
+        ...input,
+        commitSha: '0'.repeat(40),
+        confirmed: true,
+        mode: followMode ? undefined : 'BUILD_ONLY',
+      },
+      input.branch,
+    );
+    if (input.enabled) this.pipelines.assertAutomaticBuild(preview);
+    const explicitTargets =
+      input.serverIds !== undefined || input.groupIds !== undefined
+        ? preview.targetSelection
+        : null;
+    const configurationHash = preview.webhookConfigurationHash ?? preview.configurationHash;
+    const bindingHash = createHash('sha256')
+      .update(
+        JSON.stringify([
+          id,
+          preview.version,
+          input.environmentId,
+          input.branch,
+          input.secretCredentialId,
+          preview.targetId,
+          explicitTargets,
+          input.targetId ?? null,
+          followMode,
+          configurationHash,
+        ]),
+      )
+      .digest('hex');
+    return {
+      version: preview.version,
+      mode: preview.mode,
+      followMode,
+      buildLocation: preview.definition.buildLocation,
+      requireApproval: preview.requireApproval,
+      serverIds: preview.serverIds,
+      targetSelection: preview.targetSelection,
+      explicitTargets,
+      bindingHash,
+      configurationHash,
+      projectId: preview.projectId,
+      repositoryId: preview.definition.repositoryId,
+    };
+  }
+
   async save(id: string, input: SavePipelineWebhookDto, userId: string) {
     await this.activeAdmin(userId);
     const existing = await this.row(id);
@@ -212,34 +273,26 @@ export class PipelineHooksService {
         .where('pipeline_id', '=', id)
         .execute();
     } else {
-      validateBranch(input.branch);
-      await this.secret(input.secretCredentialId);
-      const preview = await this.pipelines.preview(
-        id,
-        {
-          ...input,
-          commitSha: '0'.repeat(40), // Preview only validates configuration; the delivery supplies a real commit.
-          confirmed: true,
-          mode: 'BUILD_ONLY',
-        },
-        input.branch,
-      );
-      if (input.enabled) this.pipelines.assertAutomaticBuild(preview);
+      const preview = await this.previewBinding(id, input);
+      if (
+        (input.expectedBindingHash || (input.enabled && preview.mode === 'DEPLOY')) &&
+        input.expectedBindingHash !== preview.bindingHash
+      )
+        throw new ConflictException('Webhook 绑定配置已变化，请重新预览');
       const values = {
         environment_id: input.environmentId,
         target_id: input.targetId ?? null,
-        target_selection_json: preview.targetSelection
-          ? JSON.stringify(preview.targetSelection)
+        target_selection_json: preview.explicitTargets
+          ? JSON.stringify(preview.explicitTargets)
           : null,
         secret_credential_id: input.secretCredentialId,
         branch: input.branch,
         enabled: input.enabled ? 1 : 0,
+        follow_mode: preview.followMode ? 1 : 0,
+        confirmed_mode: preview.mode,
         pipeline_version: preview.version,
-        configuration_hash: preview.webhookConfigurationHash ?? preview.configurationHash,
-        repository_key: await this.repositoryKey(
-          preview.projectId,
-          preview.definition.repositoryId,
-        ),
+        configuration_hash: preview.configurationHash,
+        repository_key: await this.repositoryKey(preview.projectId, preview.repositoryId),
         created_by: userId,
         updated_at: now,
       };
@@ -301,15 +354,43 @@ export class PipelineHooksService {
     }
     if (deliveredRepository !== hook.repository_key)
       throw new ForbiddenException('Gitea Push 仓库不匹配');
+    const history = {
+      pipelineId: id,
+      kind: 'WEBHOOK' as const,
+      version: hook.pipeline_version,
+      environmentId: hook.environment_id,
+      branch: hook.branch,
+      commitSha: payload.after.toLowerCase(),
+      mode: hook.confirmed_mode,
+    };
+    try {
+      return await this.enqueue(hook, history, secret.nonce);
+    } catch (error) {
+      if (error instanceof HookDisabledError) return ignored('DISABLED');
+      await recordPipelineTrigger(this.database.db, {
+        ...history,
+        status: 'FAILED',
+        reason: error instanceof HttpException ? error.message : 'Webhook 构建未能入队',
+      });
+      throw error;
+    }
+  }
+
+  private async enqueue(
+    hook: HookRow,
+    history: Omit<TriggerEvent, 'status'> & { commitSha: string },
+    nonce: string,
+  ) {
+    const id = hook.pipeline_id;
     await this.activeAdmin(hook.created_by);
     const input = {
       environmentId: hook.environment_id,
       ...(storedDeploymentSelection(hook.target_selection_json) ?? {
         targetId: hook.target_id ?? undefined,
       }),
-      commitSha: payload.after.toLowerCase(),
+      commitSha: history.commitSha,
       confirmed: true,
-      mode: 'BUILD_ONLY' as const,
+      mode: hook.follow_mode === 1 ? undefined : ('BUILD_ONLY' as const),
       version: hook.pipeline_version,
     };
     const preview = await this.pipelines.preview(id, input, hook.branch);
@@ -320,36 +401,42 @@ export class PipelineHooksService {
       throw new ForbiddenException('Pipeline 仓库已修改，请重新保存 Webhook 配置');
     if ((preview.webhookConfigurationHash ?? preview.configurationHash) !== hook.configuration_hash)
       throw new ConflictException('Pipeline 的有效构建配置已改变，请重新保存 Webhook 配置');
-    const idempotencyKey = `gitea:${createHash('sha256')
-      .update(JSON.stringify([id, payload.ref, input.commitSha]))
-      .digest('hex')}`;
-    const task = await this.pipelines
-      .run(
-        id,
-        {
-          ...input,
-          version: preview.version,
-          expectedServerIds: preview.serverIds,
-          expectedConfigurationHash: preview.configurationHash,
-        },
-        hook.created_by,
-        {
-          triggerType: 'WEBHOOK',
-          idempotencyKey,
-          gitRef: payload.ref,
-          beforeInsert: (tx) => this.verifyDelivery(tx, hook, secret.nonce),
-        },
-      )
-      .catch((error: unknown) => {
-        if (error instanceof HookDisabledError) return null;
-        throw error;
-      });
-    if (!task) return ignored('DISABLED');
+    const idempotencyKey = commitTriggerKey(
+      id,
+      preview.version,
+      input.environmentId,
+      hook.branch,
+      input.commitSha,
+      hook.configuration_hash,
+    );
+    const task = await this.pipelines.run(
+      id,
+      {
+        ...input,
+        version: preview.version,
+        expectedServerIds: preview.serverIds,
+        expectedConfigurationHash: preview.configurationHash,
+      },
+      hook.created_by,
+      {
+        triggerType: 'WEBHOOK',
+        idempotencyKey,
+        gitRef: 'refs/heads/' + hook.branch,
+        beforeInsert: (tx) => this.verifyDelivery(tx, hook, nonce),
+        afterInsert: (tx, taskId, created) =>
+          recordPipelineTrigger(tx, {
+            ...history,
+            taskId,
+            mode: preview.mode,
+            status: created ? 'QUEUED' : 'DUPLICATE',
+          }),
+      },
+    );
     return {
       accepted: true as const,
       taskId: task.id,
       commitSha: input.commitSha,
-      mode: input.mode,
+      mode: preview.mode,
     };
   }
 }

@@ -25,6 +25,7 @@ import { InitialConfigurationModule } from './core/initial-configuration';
 import { ViewsModule } from './modules/views/views.module';
 import { OperationSchedulesModule } from './modules/operation-schedules/operation-schedules.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
+import { MonitoringModule } from './modules/monitoring/monitoring.module';
 
 @Module({
   imports: [
@@ -52,6 +53,7 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
     ArtifactRetentionModule,
     OperationSchedulesModule,
     NotificationsModule,
+    MonitoringModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: AuthGuard }],
 })

@@ -157,3 +157,23 @@
     grid-column: 1 / -1;
   }
 }
+.delivery-filters {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 14px 0 20px;
+}
+
+.delivery-filters label {
+  display: grid;
+  gap: 4px;
+}
+
+.delivery-section-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-bottom: 12px;
+}

@@ -1,4 +1,9 @@
-import { BadRequestException, ConflictException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+} from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { Selectable } from 'kysely';
 import { AiActionProposalsTable } from '../../core/database/schema';
@@ -7,6 +12,8 @@ import { AuditService } from '../audit/audit.service';
 import { AiRepository } from './ai.repository';
 import { AiPolicyService, AiPolicySnapshot } from './ai-policy.service';
 import { AiToolsService, PreparedAiAction } from './ai-tools.service';
+import { assertAiPipelineScope, scopeAiToolArguments } from './ai-context';
+import { AiFailureGuard } from './ai-failure-guard.service';
 
 export function proposalDto(row: Selectable<AiActionProposalsTable>) {
   const stored = JSON.parse(row.payload_json) as PreparedAiAction;
@@ -30,12 +37,42 @@ export class AiProposalsService {
     private readonly policy: AiPolicyService,
     private readonly tools: AiToolsService,
     private readonly audit: AuditService,
+    private readonly failureGuard?: AiFailureGuard,
   ) {}
-  async list(userId: string) {
-    return (await this.repository.proposals(userId)).map(proposalDto);
+  private scopedPreview(
+    row: Selectable<AiActionProposalsTable>,
+    policies: (id?: string) => AiPolicySnapshot,
+    user: CurrentUser,
+  ) {
+    const prepared = JSON.parse(row.payload_json) as PreparedAiAction;
+    const dto = proposalDto(row);
+    const scope = policies(prepared.projectId);
+    try {
+      this.policy.assertRead(prepared.action, scope, prepared.projectId, prepared.serverIds);
+      if (prepared.failureTaskId)
+        this.policy.assertRead(
+          'diagnose_deployment',
+          scope,
+          prepared.projectId,
+          prepared.serverIds,
+        );
+      if (prepared.repositoryId) this.policy.assertRepository(prepared.repositoryId, scope);
+      for (const id of prepared.sourceRepositoryIds ?? []) this.policy.assertRepository(id, scope);
+      this.policy.evaluate(user, prepared, scope);
+      return dto;
+    } catch (error) {
+      if (!(error instanceof ForbiddenException)) throw error;
+      return { ...dto, scopeRevoked: true, payload: {}, preview: {}, taskId: null };
+    }
   }
-  async waiting(conversationId: string, userId: string) {
-    return (await this.list(userId)).some(
+  async list(user: CurrentUser) {
+    const policies = await this.policy.projectSnapshots();
+    return (await this.repository.proposals(user.id)).map((row) =>
+      this.scopedPreview(row, policies, user),
+    );
+  }
+  async waiting(conversationId: string, user: CurrentUser) {
+    return (await this.list(user)).some(
       (proposal) => proposal.conversationId === conversationId && proposal.status === 'PENDING',
     );
   }
@@ -64,7 +101,7 @@ export class AiProposalsService {
     });
     return proposalDto(await this.repository.proposal(id, user.id));
   }
-  async confirm(id: string, user: CurrentUser) {
+  async confirm(id: string, user: CurrentUser, automatic = false) {
     const row = await this.repository.proposal(id, user.id);
     if (row.expires_at <= Date.now()) {
       await this.repository.expire(id);
@@ -72,7 +109,34 @@ export class AiProposalsService {
     }
     if (row.status !== 'PENDING') throw new ConflictException('操作提案已处理，不能重复确认');
     const stored = JSON.parse(row.payload_json) as PreparedAiAction;
-    const prepared = await this.tools.prepare(stored.action, stored.payload, user);
+    const repair = stored.failureTaskId
+      ? { taskId: stored.failureTaskId, proposalId: id, automatic }
+      : undefined;
+    if (repair) {
+      const context = await this.failureGuard?.repair(repair.taskId, repair);
+      if (
+        !context ||
+        context.actor.id !== user.id ||
+        stored.action !== 'initialize_component' ||
+        stored.payload.component !== context.component ||
+        stored.projectId !== context.projectId ||
+        stored.serverIds.length !== 1 ||
+        stored.serverIds[0] !== context.current.id
+      )
+        throw new ConflictException('故障修复绑定已失效');
+    }
+    const inputContext = stored.conversationId
+      ? await this.repository.conversationContext(stored.conversationId)
+      : undefined;
+    const context = inputContext
+      ? await this.repository.resolveContext(inputContext, stored.projectId, user)
+      : undefined;
+    const prepared = await this.tools.prepare(
+      stored.action,
+      scopeAiToolArguments(context, stored.action, stored.payload),
+      user,
+    );
+    if (prepared.action === 'run_pipeline') assertAiPipelineScope(context, prepared.preview);
     prepared.projectId ??= stored.projectId;
     if (
       prepared.bindingsHash !== stored.bindingsHash ||
@@ -88,7 +152,7 @@ export class AiProposalsService {
       throw new ConflictException('操作提案已处理或过期');
     try {
       // Consume first. If the process crashes here, a human must inspect rather than replay a write.
-      const task = await this.tools.execute(prepared, user);
+      const task = await this.tools.execute(prepared, user, repair);
       if ('sourceChange' in task) {
         await this.repository.recordSourceChange(id, {
           ...prepared.preview,
@@ -136,6 +200,12 @@ export class AiProposalsService {
       throw new ConflictException('操作提案已处理或过期');
     }
     await this.audit.record(user.id, 'ai.proposal.reject', 'ai_proposal', id);
-    return { proposal: proposalDto(await this.repository.proposal(id, user.id)) };
+    return {
+      proposal: this.scopedPreview(
+        await this.repository.proposal(id, user.id),
+        await this.policy.projectSnapshots(),
+        user,
+      ),
+    };
   }
 }

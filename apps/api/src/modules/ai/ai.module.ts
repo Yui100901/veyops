@@ -8,6 +8,9 @@ import { AiToolsService } from './ai-tools.service';
 import { AiProposalsService } from './ai-proposals.service';
 import { AiService } from './ai.service';
 import { AiController } from './ai.controller';
+import { AiFailureGuard } from './ai-failure-guard.service';
+import { AiFailureHandlingController } from './ai-failure-handling.controller';
+import { AiFailureHandlingService } from './ai-failure-handling.service';
 import { AiPipelineAnalyzer } from './ai-pipeline-analyzer.service';
 import { PipelineAnalysisService } from './pipeline-analysis.service';
 import { AiRepositoryAnalysisService } from './ai-repository-analysis.service';
@@ -17,9 +20,11 @@ import { OperationPlansModule } from '../operation-plans/operation-plans.module'
 @Global()
 @Module({
   imports: [CommandCenterModule, OperationPlansModule],
-  controllers: [AiController],
+  controllers: [AiController, AiFailureHandlingController],
   providers: [
     AiRepository,
+    AiFailureGuard,
+    AiFailureHandlingService,
     AiProvidersService,
     AiPolicyService,
     AiToolsService,
@@ -32,6 +37,6 @@ import { OperationPlansModule } from '../operation-plans/operation-plans.module'
     AiDeploymentToolsService,
     AiSourceChangeService,
   ],
-  exports: [AiProvidersService, AiService, PipelineAnalysisService],
+  exports: [AiProvidersService, AiService, PipelineAnalysisService, AiFailureHandlingService],
 })
 export class AiModule {}

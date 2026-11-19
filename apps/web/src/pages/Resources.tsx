@@ -17,8 +17,15 @@ import {
 import { api, ApiError, formatTime, message, navigate, post, remove, useResource } from '../api';
 import { ProjectDeploymentConfig } from './DeploymentConfig';
 import { RepositoryDetails } from './RepositoryBrowser';
+import { ContextAIButton, ProjectAISettings } from './AI';
+import { repositoryBranchLabel } from './RepositoryBranches';
 import { ServerGroups, ServerOverview } from './ServerResources';
+import { ServerComparison } from './ServerComparison';
+import { MonitorSummary } from './ServerMonitoring';
+import { metricNames, metricValue } from './monitoring-data';
+import type { MetricKey, MonitorRow } from './monitoring-data';
 import { ProjectRelations } from './ProjectRelations';
+import { deliveryPath } from './delivery-route';
 import {
   Confirm,
   Empty,
@@ -39,6 +46,7 @@ import type {
   ProjectDetail,
   Repository,
   Server,
+  ServerGroup,
   Service,
   User,
 } from '../models';
@@ -60,7 +68,14 @@ function tags(value: string) {
 
 export function ServersPage({ user }: { user: User }) {
   const resource = useResource<Server[]>('/servers');
+  const metrics = useResource<MonitorRow[]>('/monitoring/servers?summary=true', 30000);
+  const groups = useResource<ServerGroup[]>('/server-groups');
   const canEdit = user.role !== 'VIEWER';
+  const [compare, setCompare] = useState(false);
+  const [openMetrics, setOpenMetrics] = useState(false);
+  const [groupId, setGroupId] = useState('');
+  const [tag, setTag] = useState('');
+  const [sortBy, setSortBy] = useState<MetricKey | ''>('');
   const [section, setSection] = useState<'servers' | 'groups'>('servers');
   const [search, setSearch] = useState('');
   const [editor, setEditor] = useState<Server | 'new'>();
@@ -72,11 +87,32 @@ export function ServersPage({ user }: { user: User }) {
   const [testing, setTesting] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const list = (resource.data ?? []).filter((server) =>
-    `${server.name} ${server.host} ${server.tags.join(' ')}`
-      .toLowerCase()
-      .includes(search.toLowerCase()),
+  const byServer = new Map((metrics.data ?? []).map((row) => [row.serverId, row]));
+  const memberIds = new Set(groups.data?.find((item) => item.id === groupId)?.serverIds);
+  const list = (resource.data ?? []).filter(
+    (server) =>
+      (!groupId || memberIds.has(server.id)) &&
+      (!tag || server.tags.includes(tag)) &&
+      `${server.name} ${server.host} ${server.tags.join(' ')}`
+        .toLowerCase()
+        .includes(search.toLowerCase()),
   );
+  if (sortBy) {
+    const value = (id: string) => {
+      const row = byServer.get(id);
+      return metricValue(row?.metrics, sortBy, row?.interfaceName) ?? -1;
+    };
+    list.sort((left, right) => value(right.id) - value(left.id));
+  }
+  function inspect(server: Server, showMetrics: boolean) {
+    setOpenMetrics(showMetrics);
+    setInspecting(server);
+  }
+  function reloadServers() {
+    void resource.reload();
+    void metrics.reload();
+    void groups.reload();
+  }
   async function test(server: Server, saved = false) {
     setTesting(server.id);
     setNotice('');
@@ -143,7 +179,17 @@ export function ServersPage({ user }: { user: User }) {
         description="管理 SSH 主机与服务器分组。"
         action={
           <>
-            {section === 'servers' && <RefreshButton onClick={resource.reload} />}
+            {section === 'servers' && <RefreshButton onClick={reloadServers} />}
+            {section === 'servers' && canEdit && (
+              <button
+                type="button"
+                className="button secondary"
+                disabled={(resource.data?.length ?? 0) < 2}
+                onClick={() => setCompare(true)}
+              >
+                配置对比
+              </button>
+            )}
             {canEdit && section === 'servers' && (
               <button
                 className="button primary"
@@ -163,7 +209,10 @@ export function ServersPage({ user }: { user: User }) {
         <button
           type="button"
           aria-pressed={section === 'servers'}
-          onClick={() => setSection('servers')}
+          onClick={() => {
+            setSection('servers');
+            void groups.reload();
+          }}
         >
           服务器
         </button>
@@ -212,6 +261,45 @@ export function ServersPage({ user }: { user: User }) {
             </div>
           }
         >
+          {Boolean(resource.data?.length) && (
+            <div className="monitor-list-filters monitor-toolbar">
+              <select
+                aria-label="筛选服务器分组"
+                value={groupId}
+                onChange={(e) => setGroupId(e.target.value)}
+              >
+                <option value="">全部分组</option>
+                {groups.data?.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+              <select
+                aria-label="筛选服务器标签"
+                value={tag}
+                onChange={(e) => setTag(e.target.value)}
+              >
+                <option value="">全部标签</option>
+                {[...new Set(resource.data?.flatMap((s) => s.tags))].sort().map((t) => (
+                  <option key={t}>{t}</option>
+                ))}
+              </select>
+              <select
+                aria-label="按资源占用排序"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as MetricKey | '')}
+              >
+                <option value="">默认排序</option>
+                {Object.entries(metricNames).map(([k, v]) => (
+                  <option key={k} value={k}>
+                    {v}从高到低
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          <ErrorBanner error={groups.error || metrics.error} retry={reloadServers} />
           {resource.loading ? (
             <Loading />
           ) : !resource.data?.length ? (
@@ -237,7 +325,8 @@ export function ServersPage({ user }: { user: User }) {
                   <tr>
                     <th>服务器</th>
                     <th>连接地址</th>
-                    <th>最近状态</th>
+                    <th>SSH 状态</th>
+                    <th>资源监控</th>
                     <th>标签</th>
                     <th>最近检测</th>
                     <th>操作</th>
@@ -255,7 +344,7 @@ export function ServersPage({ user }: { user: User }) {
                             <button
                               className="text-button"
                               type="button"
-                              onClick={() => setInspecting(server)}
+                              onClick={() => inspect(server, false)}
                             >
                               {server.name}
                             </button>
@@ -274,6 +363,12 @@ export function ServersPage({ user }: { user: User }) {
                       </td>
                       <td>
                         <Status value={server.status} />
+                      </td>
+                      <td>
+                        <MonitorSummary
+                          row={byServer.get(server.id)}
+                          open={() => inspect(server, true)}
+                        />
                       </td>
                       <td>
                         <div className="tags">
@@ -374,7 +469,18 @@ export function ServersPage({ user }: { user: User }) {
         />
       )}
       {inspecting && (
-        <ServerOverview server={inspecting} onClose={() => setInspecting(undefined)} />
+        <ServerOverview
+          key={inspecting.id}
+          monitorRow={byServer.get(inspecting.id)}
+          server={inspecting}
+          initialMetrics={openMetrics}
+          canEdit={canEdit}
+          onMonitorChange={metrics.reload}
+          onClose={() => setInspecting(undefined)}
+        />
+      )}
+      {compare && (
+        <ServerComparison servers={resource.data ?? []} onClose={() => setCompare(false)} />
       )}
     </>
   );
@@ -1340,7 +1446,9 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
   const resource = useResource<ProjectDetail>(`/projects/${id}`);
   const backPath = viewId ? `/views/${viewId}` : '/projects';
   const credentials = useResource<Credential[]>('/credentials');
-  const [section, setSection] = useState<'resources' | 'relations' | 'deployment'>('resources');
+  const [section, setSection] = useState<'resources' | 'relations' | 'deployment' | 'ai'>(
+    'resources',
+  );
   const [editingProject, setEditingProject] = useState(false);
   const [deletingProject, setDeletingProject] = useState(false);
   const [adding, setAdding] = useState<'repositories' | 'services' | 'environments'>();
@@ -1365,7 +1473,6 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
         ...payload,
         cloneUrl: text(form, 'cloneUrl'),
         provider: text(form, 'provider'),
-        defaultBranch: text(form, 'defaultBranch'),
         ...(user.role === 'ADMIN' && (editingResource || text(form, 'credentialId'))
           ? { credentialId: text(form, 'credentialId') || null }
           : {}),
@@ -1469,6 +1576,12 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
         </span>
       </div>
       <nav className="resource-section-switcher" aria-label="项目详情">
+        <button type="button" onClick={() => navigate(deliveryPath(id, 'pipelines'))}>
+          流水线
+        </button>
+        <button type="button" onClick={() => navigate(deliveryPath(id, 'artifacts'))}>
+          交付记录
+        </button>
         <button
           type="button"
           aria-pressed={section === 'resources'}
@@ -1490,7 +1603,11 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
         >
           关系与记录
         </button>
+        <button type="button" aria-pressed={section === 'ai'} onClick={() => setSection('ai')}>
+          AI 执行权限
+        </button>
       </nav>
+      {section === 'ai' && <ProjectAISettings user={user} projectId={id} />}
       {section === 'resources' && (
         <div className="project-detail-grid">
           {(['repositories', 'services', 'environments'] as const).map((key) => (
@@ -1532,6 +1649,13 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
                           >
                             {item.name}
                           </button>
+                        ) : key === 'services' ? (
+                          <a
+                            className="text-link"
+                            href={'#' + deliveryPath(id, 'pipelines', { serviceId: item.id })}
+                          >
+                            {item.name} · 流水线
+                          </a>
                         ) : (
                           <strong>{item.name}</strong>
                         )}
@@ -1543,11 +1667,19 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
                       </div>
                       <span className="tag">
                         {key === 'repositories'
-                          ? (item as Repository).defaultBranch
+                          ? repositoryBranchLabel(item as Repository)
                           : key === 'services'
                             ? (item as Service).serviceType
                             : (item as Environment).environmentType}
                       </span>
+                      {key === 'repositories' && user.role === 'VIEWER' && (
+                        <ContextAIButton
+                          user={user}
+                          projectId={id}
+                          context={{ kind: 'REPOSITORY', repositoryId: item.id }}
+                          objectName={item.name}
+                        />
+                      )}
                       {user.role !== 'VIEWER' && (
                         <span className="row-actions">
                           <button
@@ -1611,8 +1743,10 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
       )}
       {inspectingRepository && (
         <RepositoryDetails
+          user={user}
           projectId={id}
           repository={inspectingRepository}
+          onSynced={resource.reload}
           services={project.services}
           environments={project.environments}
           onClose={() => setInspectingRepository(undefined)}
@@ -1681,15 +1815,7 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
                     </select>
                   </Field>
                 )}
-                <Field label="默认分支" required>
-                  <input
-                    name="defaultBranch"
-                    defaultValue={
-                      (editingResource as Repository | undefined)?.defaultBranch ?? 'main'
-                    }
-                    required
-                  />
-                </Field>
+                <p className="field-note">保存后会读取远端默认分支、分支列表和最新提交。</p>
                 <Field label="代码托管平台">
                   <select
                     name="provider"

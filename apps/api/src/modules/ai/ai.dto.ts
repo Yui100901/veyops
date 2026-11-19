@@ -1,3 +1,4 @@
+import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   IsArray,
@@ -12,6 +13,7 @@ import {
   Matches,
   Min,
   MinLength,
+  ValidateNested,
 } from 'class-validator';
 
 export class CreateAiProviderDto {
@@ -33,6 +35,25 @@ export class UpdateAiProviderDto {
   @IsOptional() @IsBoolean() enabled?: boolean;
 }
 export type AiMode = 'READ_ONLY' | 'CONFIRM' | 'FULL_CONTROL';
+export class AiRoutesDto {
+  @IsOptional() @IsUUID() chat?: string;
+  @IsOptional() @IsUUID() repository?: string;
+  @IsOptional() @IsUUID() diagnosis?: string;
+}
+export const aiWriteActions = [
+  'execute_command',
+  'run_pipeline',
+  'initialize_component',
+  'publish_source_branch',
+  'open_pull_request',
+] as const;
+export class AiActionRuleDto {
+  @IsIn(aiWriteActions) action!: (typeof aiWriteActions)[number];
+  @IsIn(['DENY', 'CONFIRM']) effect!: 'DENY' | 'CONFIRM';
+  @IsOptional() @IsIn(['ADMIN', 'OPERATOR']) role?: 'ADMIN' | 'OPERATOR';
+  @IsOptional() @IsUUID() serverId?: string;
+  @IsOptional() @IsInt() @Min(1) @Max(100) minimumTargets?: number;
+}
 export class AiPolicyDto {
   @IsIn(['READ_ONLY', 'CONFIRM', 'FULL_CONTROL']) mode!: AiMode;
   @IsOptional() @IsUUID() projectId?: string;
@@ -55,12 +76,39 @@ export class AiPolicyDto {
   @ArrayMaxSize(20)
   @IsString({ each: true })
   requireConfirmActions?: string[];
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(32)
+  @ValidateNested({ each: true })
+  @Type(() => AiActionRuleDto)
+  actionRules?: AiActionRuleDto[];
 }
+export const aiContextKinds = [
+  'REPOSITORY',
+  'SERVICE',
+  'PIPELINE',
+  'TASK',
+  'OPERATION_PLAN',
+] as const;
+export type AiContextKind = (typeof aiContextKinds)[number];
+
+export class AiContextDto {
+  @IsIn(aiContextKinds) kind!: AiContextKind;
+  @IsOptional() @IsUUID() repositoryId?: string;
+  @IsOptional() @IsUUID() serviceId?: string;
+  @IsOptional() @IsUUID() pipelineId?: string;
+  @IsOptional() @IsUUID() taskId?: string;
+  @IsOptional() @IsUUID() operationPlanId?: string;
+  @IsOptional() @IsInt() @Min(1) version?: number;
+  @IsOptional() @IsString() @Matches(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i) commitSha?: string;
+}
+
 export class AiChatDto {
   @IsString() @MinLength(1) @MaxLength(16000) message!: string;
   @IsOptional() @IsUUID() conversationId?: string;
   @IsOptional() @IsUUID() projectId?: string;
   @IsOptional() @IsUUID() providerId?: string;
+  @IsOptional() @ValidateNested() @Type(() => AiContextDto) context?: AiContextDto;
 }
 
 export class AiRepositoryAnalysisDto {

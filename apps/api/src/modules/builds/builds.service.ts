@@ -130,16 +130,12 @@ function gitCommand(credentialResponse?: string) {
 }
 export const checkoutScript = (
   url: string,
-  commit: string,
+  commitSha: string,
   workspace: string,
   credentialResponse?: string,
-) => {
-  const git = gitCommand(credentialResponse);
-  return `set -eu\ncommand -v git >/dev/null || { echo '构建环境缺少 Git CLI，请安装 Git 或选择包含 Git 的辅助镜像' >&2; exit 127; }\n${git} clone --no-checkout -- ${q(url)} ${q(workspace + '/repo')}\ncd ${q(workspace + '/repo')}\nif ! ${git} cat-file -e ${q(commit + '^{commit}')} 2>/dev/null; then ${git} fetch origin ${q(commit)}; fi\n${git} checkout --detach ${q(commit)}\ntest "$(${git} rev-parse HEAD)" = ${q(commit)}\n`;
-};
-type NodeSource = NonNullable<PipelineSnapshot['nodeSources']>[string];
+) => nodeCheckoutScript({ url, commitSha }, workspace, '.', credentialResponse);
 export function nodeCheckoutScript(
-  source: NodeSource,
+  source: { url: string; commitSha: string },
   workspace: string,
   directory: string,
   credentialResponse?: string,
@@ -766,7 +762,7 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     };
     const d = session.snapshot.definition;
     try {
-      if (session.snapshot.triggerType === 'WEBHOOK')
+      if (session.snapshot.triggerType && session.snapshot.triggerType !== 'MANUAL')
         await this.configureWebhookDocker(session, root);
       else
         await this.local(
@@ -914,8 +910,8 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     const repository = `${registry.registryUrl}/${d.imageRepository}`;
     const imageTag = registryImageTag(session);
     const image = `${repository}:${imageTag}`;
-    const dockerConfig = join(root, 'docker-config');
-    await mkdir(dockerConfig, { mode: 0o700 });
+    const dockerConfig = session.webhookDocker?.config ?? join(root, 'docker-config');
+    if (!session.webhookDocker) await mkdir(dockerConfig, { mode: 0o700 });
     await this.localRegistryLogin(
       registry.credentialId,
       registry.registryUrl,

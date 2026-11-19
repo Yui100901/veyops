@@ -5,8 +5,6 @@ import {
   ArrowRight,
   Command,
   FileClock,
-  FileCode2,
-  GitBranch,
   Boxes,
   FolderGit2,
   KeyRound,
@@ -19,7 +17,6 @@ import {
   Server,
   Settings2,
   ShieldCheck,
-  Sparkles,
   Terminal,
   X,
 } from 'lucide-react';
@@ -27,14 +24,16 @@ import { ApiError, api, message, navigate, post, useRoute } from './api';
 import { ErrorBanner, Loading, PageHeader, Section } from './components';
 import { DashboardPage } from './pages/Dashboard';
 import { CredentialsPage, ProjectPage, ProjectsPage, ServersPage } from './pages/Resources';
-import { CommandsPage, PlansPage, TaskPage, TasksPage } from './pages/Operations';
+import { TaskPage, TasksPage } from './pages/Operations';
+import { OperationsCenterPage, operationsTabForPath } from './pages/BatchOperations';
 import { AuditPage, SystemPage } from './pages/System';
 import { BackupsPage } from './pages/Backups';
 import { AIPage } from './pages/AI';
 import { DeliveryRecordsPage, PipelinesPage, RegistriesPage } from './pages/Delivery';
+import { ProjectDelivery, LegacyDeliveryLink } from './pages/ProjectDelivery';
+import { deliveryTabs, type DeliveryTab } from './pages/delivery-route';
 import { ProjectViewsPage } from './pages/ProjectViews';
 import { UsersPage } from './pages/Users';
-import { OperationSchedulesPage } from './pages/OperationSchedules';
 import {
   NotificationBell,
   NotificationPage,
@@ -57,12 +56,8 @@ const navigation = [
   {
     label: '运维与执行',
     items: [
-      { path: '/pipelines', name: 'Pipeline', icon: GitBranch },
-      { path: '/deployments', name: '交付记录', icon: Boxes },
-      { path: '/commands', name: '命令中心', icon: Terminal },
-      { path: '/plans', name: '运维方案', icon: FileCode2 },
+      { path: '/operations', name: '运维中心', icon: Terminal },
       { path: '/tasks', name: '任务中心', icon: ListTodo },
-      { path: '/ai', name: 'AI 助手', icon: Sparkles },
     ],
   },
   {
@@ -78,12 +73,14 @@ const navigation = [
 
 const routeTitles: Record<string, string> = {
   '/artifacts': '构建产物',
+  '/pipelines': '流水线',
+  '/deployments': '交付记录',
   '/settings/users': '用户管理',
   '/settings/backups': '数据备份',
   '/settings/smtp': 'SMTP 发件设置',
   '/account/password': '修改密码',
   '/account/notifications': '通知设置',
-  '/tasks/schedules': '定时运维',
+  '/ai': 'AI 助手',
   '/notifications': '通知',
 };
 
@@ -391,6 +388,8 @@ export function App() {
   const [loggingOut, setLoggingOut] = useState(false);
   const route = useRoute();
   const [routePath, routeSearch] = route.split('?', 2);
+  const [, routeRoot, routeId, routeSection, unexpectedSegment] = routePath.split('/');
+  const params = new URLSearchParams(routeSearch);
   async function boot() {
     setLoading(true);
     setError('');
@@ -467,15 +466,33 @@ export function App() {
     />
   );
   if (user.mustChangePassword) return changePassword;
+  const operationsTab = operationsTabForPath(routePath);
+  const navigationPath = operationsTab ? '/operations' : routePath;
   const current = navigation
     .flatMap((group) => group.items)
-    .find((item) => (item.path === '/' ? route === '/' : route.startsWith(item.path)));
+    .find((item) => navigationPath === item.path || navigationPath.startsWith(item.path + '/'));
   let page;
   if (route === '/') page = <DashboardPage />;
   else if (routePath === '/servers' || routePath === '/targets') page = <ServersPage user={user} />;
   else if (route === '/credentials') page = <CredentialsPage user={user} />;
   else if (route === '/projects') page = <ProjectsPage user={user} />;
-  else if (routePath.startsWith('/projects/')) {
+  else if (
+    routeRoot === 'projects' &&
+    routeId &&
+    routeSection &&
+    Object.hasOwn(deliveryTabs, routeSection) &&
+    !unexpectedSegment
+  ) {
+    page = (
+      <ProjectDelivery
+        key={route}
+        id={routeId}
+        tab={routeSection as DeliveryTab}
+        search={routeSearch}
+        user={user}
+      />
+    );
+  } else if (routeRoot === 'projects' && routeId && !routeSection) {
     const fromView = new URLSearchParams(routeSearch).get('view');
     const viewId =
       fromView && /^(all|production|testing|abnormal|[a-f0-9-]{36})$/.test(fromView)
@@ -484,17 +501,24 @@ export function App() {
     page = <ProjectPage key={route} id={routePath.slice(10)} user={user} viewId={viewId} />;
   } else if (routePath === '/views' || routePath.startsWith('/views/'))
     page = <ProjectViewsPage user={user} id={routePath.slice(7) || undefined} />;
+  else if (
+    (routeRoot === 'pipelines' || routeRoot === 'artifacts' || routeRoot === 'deployments') &&
+    !routeSection &&
+    (routeId ||
+      ['recordId', 'projectId', 'pipelineId', 'artifactId', 'deploymentId', 'pipelineRunId'].some(
+        (key) => params.has(key),
+      ))
+  )
+    page = <LegacyDeliveryLink key={route} tab={routeRoot} search={routeSearch} id={routeId} />;
   else if (routePath === '/pipelines')
     page = <PipelinesPage user={user} repositoryScope={routeSearch} />;
-  else if (route === '/artifacts')
+  else if (routePath === '/artifacts')
     page = <DeliveryRecordsPage key={route} type="artifacts" user={user} />;
-  else if (route === '/deployments')
+  else if (routePath === '/deployments')
     page = <DeliveryRecordsPage key={route} type="deployments" user={user} />;
   else if (route === '/registries') page = <RegistriesPage user={user} />;
-  else if (route === '/commands') page = <CommandsPage user={user} />;
-  else if (route === '/plans') page = <PlansPage user={user} />;
+  else if (operationsTab) page = <OperationsCenterPage tab={operationsTab} user={user} />;
   else if (route === '/tasks') page = <TasksPage />;
-  else if (routePath === '/tasks/schedules') page = <OperationSchedulesPage user={user} />;
   else if (route.startsWith('/tasks/'))
     page = <TaskPage key={route} id={route.slice(7)} user={user} />;
   else if (route === '/audit') page = <AuditPage />;
@@ -539,16 +563,8 @@ export function App() {
                 <a
                   href={`#${item.path}`}
                   key={item.path}
-                  className={
-                    (item.path === '/' ? route === '/' : route.startsWith(item.path))
-                      ? 'active'
-                      : ''
-                  }
-                  aria-current={
-                    (item.path === '/' ? route === '/' : route.startsWith(item.path))
-                      ? 'page'
-                      : undefined
-                  }
+                  className={item === current ? 'active' : ''}
+                  aria-current={item === current ? 'page' : undefined}
                 >
                   <item.icon size={18} />
                   <span>{item.name}</span>

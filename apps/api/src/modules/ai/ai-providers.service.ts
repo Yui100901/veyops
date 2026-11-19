@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { CredentialsService } from '../credentials/credentials.service';
 import { AuditService } from '../audit/audit.service';
 import { AiRepository } from './ai.repository';
-import { CreateAiProviderDto, UpdateAiProviderDto } from './ai.dto';
+import { AiRoutesDto, CreateAiProviderDto, UpdateAiProviderDto } from './ai.dto';
 import {
   completionUrl,
   OpenAiCompatibleService,
@@ -24,7 +24,7 @@ export class AiProvidersService {
       baseUrl: p.base_url,
       model: p.model,
       credentialId: p.credential_id,
-      configured: Boolean(p.credential_id),
+      configured: p.credential_status === 'ACTIVE',
       timeoutSeconds: p.timeout_seconds,
       enabled: p.enabled === 1,
       createdAt: p.created_at,
@@ -95,10 +95,31 @@ export class AiProvidersService {
     await this.audit.record(userId, 'ai.provider.delete', 'ai_provider', id);
     return { success: true };
   }
-  async resolve(id?: string) {
+  routes() {
+    return this.repository.routes();
+  }
+  async setRoutes(input: AiRoutesDto, userId: string) {
+    const routes: AiRoutesDto = {};
+    const providers = await this.repository.providers();
+    for (const purpose of ['chat', 'repository', 'diagnosis'] as const) {
+      const id = input[purpose];
+      if (!id) continue;
+      if (!providers.some((p) => p.id === id && p.enabled && p.credential_status === 'ACTIVE'))
+        throw new BadRequestException('模型路由必须选择启用且已配置凭据的连接');
+      routes[purpose] = id;
+    }
+    await this.repository.saveRoutes(routes);
+    await this.audit.record(userId, 'ai.routing.update', 'ai_routing', 'system', { ...routes });
+    return routes;
+  }
+  async resolve(id?: string, purpose: keyof AiRoutesDto = 'chat') {
+    const route = !id ? (await this.routes())[purpose] : undefined;
+    if (route) id = route;
     const provider = id
       ? await this.repository.provider(id)
-      : (await this.repository.providers()).find((p) => p.enabled === 1);
+      : (await this.repository.providers()).find(
+          (p) => p.enabled === 1 && p.credential_status === 'ACTIVE',
+        );
     if (!provider)
       throw new BadRequestException('尚未配置 AI Provider。AI 为可选功能，可在系统设置中添加');
     if (!provider.enabled) throw new BadRequestException('所选 AI Provider 已禁用');

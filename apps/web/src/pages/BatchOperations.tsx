@@ -1,7 +1,8 @@
 import { useState } from 'react';
+import { ContextAIButton } from './AI';
 import type { FormEvent, ReactNode } from 'react';
 import { FileCode2, Pencil, Play, Plus, Terminal, Trash2 } from 'lucide-react';
-import { api, formatTime, message, navigate, post, remove, useResource } from '../api';
+import { ApiError, api, formatTime, message, navigate, post, remove, useResource } from '../api';
 import {
   Confirm,
   Empty,
@@ -27,7 +28,8 @@ import {
   defaultExecutionOptions,
   ResolvedTargets,
 } from './BatchTargets';
-import type { TargetPreview, TargetSelection } from './BatchTargets';
+import type { ExecutionOptions, TargetPreview, TargetSelection } from './BatchTargets';
+import { OperationSchedulesPage } from './OperationSchedules';
 
 interface CommandTemplate {
   id: string;
@@ -107,7 +109,59 @@ function ParameterField({ parameter }: { parameter: OperationParameter }) {
   );
 }
 
-export function CommandsPage({ user }: { user: User }) {
+const operationsTabs = {
+  commands: '临时命令',
+  templates: '命令模板',
+  plans: '运维方案',
+  schedules: '定时运维',
+};
+type OperationsTab = keyof typeof operationsTabs;
+
+export function operationsTabForPath(path: string): OperationsTab | undefined {
+  if (path === '/operations' || path === '/commands') return 'commands';
+  if (path === '/plans') return 'plans';
+  if (path === '/tasks/schedules') return 'schedules';
+  const [, root, tab, extra] = path.split('/');
+  if (root === 'operations' && tab && extra === undefined && Object.hasOwn(operationsTabs, tab))
+    return tab as OperationsTab;
+}
+
+export function OperationsCenterPage({ tab, user }: { tab: OperationsTab; user: User }) {
+  return (
+    <>
+      <PageHeader
+        title="运维中心"
+        description="选择服务器和执行范围，预览命令或方案，并在任务中心查看逐台执行结果。"
+        action={
+          <a href="#/tasks" className="button secondary">
+            查看执行记录
+          </a>
+        }
+      />
+      <nav className="record-tabs" aria-label="运维中心">
+        {(Object.keys(operationsTabs) as OperationsTab[]).map((key) => (
+          <a
+            key={key}
+            href={`#/operations/${key}`}
+            className={key === tab ? 'active' : ''}
+            aria-current={key === tab ? 'page' : undefined}
+          >
+            {operationsTabs[key]}
+          </a>
+        ))}
+      </nav>
+      {tab === 'commands' ? (
+        <CommandsPage user={user} />
+      ) : tab === 'schedules' ? (
+        <OperationSchedulesPage user={user} />
+      ) : (
+        <ReusableOperations key={tab} mode={tab} user={user} />
+      )}
+    </>
+  );
+}
+
+function CommandsPage({ user }: { user: User }) {
   const [selection, setSelection] = useState<TargetSelection>({});
   const [command, setCommand] = useState('');
   const [name, setName] = useState('');
@@ -117,9 +171,13 @@ export function CommandsPage({ user }: { user: User }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const canEdit = user.role !== 'VIEWER';
+  const plans = useResource<Plan[]>(canEdit ? '/operation-plans' : null);
+  const availablePlans = (plans.data ?? []).filter((plan) => plan.enabled !== false);
+  const [reference, setReference] = useState<Plan>();
 
   async function prepare(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!canEdit || busy || preview) return;
     setBusy(true);
     setError('');
     try {
@@ -131,7 +189,7 @@ export function CommandsPage({ user }: { user: User }) {
     }
   }
   async function execute() {
-    if (!preview) return;
+    if (!preview || !canEdit || busy) return;
     setBusy(true);
     setError('');
     try {
@@ -147,6 +205,7 @@ export function CommandsPage({ user }: { user: User }) {
       });
       navigate(`/tasks/${task.id}`);
     } catch (err) {
+      if (err instanceof ApiError && [400, 409].includes(err.status)) setPreview(undefined);
       setError(message(err));
     } finally {
       setBusy(false);
@@ -154,17 +213,7 @@ export function CommandsPage({ user }: { user: User }) {
   }
   return (
     <>
-      <PageHeader
-        eyebrow="COMMAND CENTER"
-        title="命令中心"
-        description="选择服务器或资源范围，查看每台服务器的执行结果和日志。"
-        action={
-          <a href="#/plans" className="button secondary">
-            <FileCode2 size={16} />
-            运维方案
-          </a>
-        }
-      />
+      <ErrorBanner error={plans.error} retry={plans.reload} />
       <form className="command-layout" onSubmit={prepare}>
         <div>
           <Section title="执行目标" subtitle="可组合多种条件，预览会合并重复的服务器。">
@@ -191,7 +240,32 @@ export function CommandsPage({ user }: { user: User }) {
             </div>
           </Section>
         </div>
-        <Section title="临时命令" subtitle="以服务器配置的 SSH 用户身份执行">
+        <Section
+          title="临时命令"
+          subtitle="以服务器配置的 SSH 用户身份执行"
+          action={
+            canEdit && (
+              <select
+                className="button secondary"
+                aria-label="引用运维方案"
+                value=""
+                disabled={busy || !availablePlans.length}
+                onChange={(event) =>
+                  setReference(availablePlans.find((plan) => plan.id === event.target.value))
+                }
+              >
+                <option value="">
+                  {plans.loading || availablePlans.length ? '引用运维方案…' : '暂无可引用的方案'}
+                </option>
+                {availablePlans.map((plan) => (
+                  <option key={plan.id} value={plan.id}>
+                    {plan.name}
+                  </option>
+                ))}
+              </select>
+            )
+          }
+        >
           <div className="command-editor">
             <textarea
               aria-label="Shell 命令"
@@ -226,7 +300,17 @@ export function CommandsPage({ user }: { user: User }) {
           </div>
         </Section>
       </form>
-      <ReusableOperations mode="templates" user={user} />
+      {reference && (
+        <OperationRun
+          user={user}
+          endpoint="/operation-plans"
+          entry={reference}
+          canRun={canEdit}
+          initialSelection={selection}
+          initialOptions={options}
+          onClose={() => setReference(undefined)}
+        />
+      )}
       {preview && (
         <Confirm
           title="确认执行远程命令"
@@ -249,25 +333,6 @@ export function CommandsPage({ user }: { user: User }) {
           onConfirm={execute}
         />
       )}
-    </>
-  );
-}
-
-export function PlansPage({ user }: { user: User }) {
-  return (
-    <>
-      <PageHeader
-        eyebrow="REUSABLE OPERATIONS"
-        title="运维方案"
-        description="保存可复用的多步骤方案，并按固定版本执行。"
-        action={
-          <a href="#/commands" className="button secondary">
-            <Terminal size={16} />
-            命令中心
-          </a>
-        }
-      />
-      <ReusableOperations mode="plans" user={user} />
     </>
   );
 }
@@ -380,6 +445,7 @@ function ReusableOperations({ mode, user }: { mode: 'plans' | 'templates'; user:
       )}
       {viewing && (
         <OperationRun
+          user={user}
           endpoint={endpoint}
           entry={viewing}
           canRun={canEdit && viewing.enabled !== false}
@@ -403,24 +469,31 @@ function ReusableOperations({ mode, user }: { mode: 'plans' | 'templates'; user:
 }
 
 function OperationRun({
+  user,
   endpoint,
   entry,
   canRun,
+  initialSelection = {},
+  initialOptions = defaultExecutionOptions,
   onClose,
 }: {
   endpoint: string;
   entry: Plan | CommandTemplate;
   canRun: boolean;
+  user: User;
+  initialSelection?: TargetSelection;
+  initialOptions?: ExecutionOptions;
   onClose: () => void;
 }) {
   const base = `${endpoint}/${entry.id}`;
   const history = useResource<(PlanVersion | TemplateVersion)[]>(`${base}/versions`);
   const [versionNumber, setVersionNumber] = useState(entry.currentVersion);
-  const [selection, setSelection] = useState<TargetSelection>({});
-  const [options, setOptions] = useState(defaultExecutionOptions);
+  const [selection, setSelection] = useState(initialSelection);
+  const [options, setOptions] = useState(initialOptions);
   const [review, setReview] = useState<{
     preview: TargetPreview;
     parameters: Record<string, ParameterValue>;
+    version: number;
   }>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -429,13 +502,13 @@ function OperationRun({
 
   async function prepare(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!version) return;
+    if (!canRun || !version || busy || review) return;
     const parameters = operationParameters(new FormData(event.currentTarget), definitions);
     setBusy(true);
     setError('');
     try {
       const preview = await post<TargetPreview>('/commands/preview', selection);
-      setReview({ preview, parameters });
+      setReview({ preview, parameters, version: version.version });
     } catch (err) {
       setError(message(err));
     } finally {
@@ -444,7 +517,7 @@ function OperationRun({
   }
 
   async function run() {
-    if (!review) return;
+    if (!review || !canRun || busy) return;
     setBusy(true);
     setError('');
     try {
@@ -453,12 +526,13 @@ function OperationRun({
         ...options,
         maxParallel: options.strategy === 'SEQUENTIAL' ? 1 : options.maxParallel,
         parameters: review.parameters,
-        version: versionNumber,
+        version: review.version,
         expectedTargetHash: review.preview.targetHash,
         confirmed: true,
       });
       navigate(`/tasks/${task.id}`);
     } catch (err) {
+      if (err instanceof ApiError && [400, 409].includes(err.status)) setReview(undefined);
       setError(message(err));
     } finally {
       setBusy(false);
@@ -492,6 +566,18 @@ function OperationRun({
             </Field>
           )}
           {version && <VersionDefinition version={version} />}
+          {version && endpoint === '/operation-plans' && (
+            <ContextAIButton
+              user={user}
+              objectName={entry.name}
+              context={{
+                kind: 'OPERATION_PLAN',
+                operationPlanId: entry.id,
+                version: versionNumber,
+              }}
+              label={`AI 运维方案 · v${versionNumber}`}
+            />
+          )}
           {canRun && version && (
             <>
               <div key={versionNumber} hidden={Boolean(review)}>

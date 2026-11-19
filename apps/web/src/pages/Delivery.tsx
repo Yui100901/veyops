@@ -1,9 +1,10 @@
 import { Fragment, lazy, Suspense, useEffect, useState } from 'react';
-import type { FormEvent } from 'react';
+import type { ComponentProps, FormEvent } from 'react';
 import {
   ArrowDown,
   ArrowUp,
   Boxes,
+  CalendarClock,
   Copy,
   GitBranch,
   History,
@@ -58,11 +59,17 @@ import {
   type PipelineNodeSource,
 } from './pipeline-node-definition';
 import { PipelineNodeGraph } from './PipelineNodeGraph';
+import { deliveryPath } from './delivery-route';
+import { ContextAIButton } from './AI';
 import './pipeline-nodes.css';
 
 const PipelineNodesEditor = lazy(() => import('./PipelineNodes'));
+const PipelineTriggers = lazy(() =>
+  import('./PipelineTriggers').then((module) => ({ default: module.PipelineTriggers })),
+);
 
 export interface PipelineDefinition {
+  defaultMode?: ExecutionMode;
   repositoryId: string;
   buildLocation: 'TARGET' | 'MANAGER';
   artifactType: 'FILE' | 'DOCKER_IMAGE';
@@ -119,53 +126,105 @@ const emptyDefinition: PipelineDefinition = {
 };
 const buildLabels = { TARGET: '目标服务器构建', MANAGER: '管理端隔离构建' };
 
-export function PipelinesPage({ user, repositoryScope }: { user: User; repositoryScope?: string }) {
+function DeliveryHeading({
+  compact,
+  ...props
+}: ComponentProps<typeof PageHeader> & { compact: boolean }) {
+  return compact ? (
+    <div className="delivery-section-actions">{props.action}</div>
+  ) : (
+    <PageHeader {...props} />
+  );
+}
+
+export function PipelinesPage({
+  user,
+  repositoryScope,
+  project,
+}: {
+  user: User;
+  repositoryScope?: string;
+  project?: ProjectDetail;
+}) {
   const scope = new URLSearchParams(repositoryScope);
   const projectId = scope.get('projectId');
   const repositoryId = scope.get('repositoryId');
-  const scopedProject = useResource<ProjectDetail>(
-    projectId ? `/projects/${encodeURIComponent(projectId)}` : null,
-  );
-  const scopedRepository = scopedProject.data?.repositories.find(
+  const serviceId = scope.get('serviceId');
+  const focusedId = scope.get('recordId');
+  const scopedRepository = project?.repositories.find(
     (repository) => repository.id === repositoryId,
   );
-  const pipelines = useResource<Pipeline[]>(
-    projectId ? `/pipelines?projectId=${encodeURIComponent(projectId)}` : '/pipelines',
-  );
-  const projects = useResource<Project[]>('/projects');
+  const listQuery = new URLSearchParams();
+  if (projectId) listQuery.set('projectId', projectId);
+  if (serviceId) listQuery.set('serviceId', serviceId);
+  const pipelines = useResource<Pipeline[]>(`/pipelines?${listQuery}`);
+  const projects = useResource<Project[]>(project ? null : '/projects');
+  const projectList = project ? [project] : projects.data || [];
   const visiblePipelines = (pipelines.data || []).filter(
-    (pipeline) => !repositoryId || pipeline.definition?.repositoryId === repositoryId,
+    (pipeline) =>
+      (!focusedId || pipeline.id === focusedId) &&
+      (!repositoryId ||
+        pipeline.definition?.repositoryId === repositoryId ||
+        pipeline.definition?.nodes?.some(
+          (node) => node.type === 'CHECKOUT' && node.repositoryId === repositoryId,
+        )),
   );
   const [editing, setEditing] = useState<PipelineDraft>();
   const [running, setRunning] = useState<Pipeline>();
   const [versions, setVersions] = useState<Pipeline>();
   const [webhook, setWebhook] = useState<Pipeline>();
+  const [triggerPipeline, setTriggerPipeline] = useState<Pipeline>();
+  const canEdit = user.role !== 'VIEWER' && !project?.archived;
   useEffect(() => {
-    const raw = sessionStorage.getItem('veyops:pipeline-draft');
-    if (!raw || user.role === 'VIEWER') return;
-    sessionStorage.removeItem('veyops:pipeline-draft');
-    try {
-      const value = JSON.parse(raw) as PipelineDraft;
-      setEditing(value);
-    } catch {
-      /* draft is optional */
+    function openDraft() {
+      const raw = sessionStorage.getItem('veyops:pipeline-draft');
+      if (!raw || !canEdit) return;
+      try {
+        const value = JSON.parse(raw) as PipelineDraft;
+        if (
+          (projectId && value.projectId && projectId !== value.projectId) ||
+          (serviceId && value.serviceId && serviceId !== value.serviceId)
+        )
+          return;
+        sessionStorage.removeItem('veyops:pipeline-draft');
+        setEditing({
+          ...value,
+          projectId: projectId || value.projectId,
+          serviceId: serviceId || value.serviceId,
+        });
+      } catch {
+        /* draft is optional */
+      }
     }
-  }, [user.role]);
+    openDraft();
+    window.addEventListener('veyops:pipeline-draft', openDraft);
+    return () => window.removeEventListener('veyops:pipeline-draft', openDraft);
+  }, [canEdit, projectId, serviceId, repositoryScope]);
   return (
     <>
-      <PageHeader
+      <DeliveryHeading
+        compact={Boolean(project)}
         eyebrow="CONTINUOUS DELIVERY"
         title="Pipeline"
         description="从固定 Commit 到部署结果，让每次交付都有版本、有产物、可追踪。"
         action={
           <>
             <RefreshButton onClick={pipelines.reload} />
-            {user.role !== 'VIEWER' && (
+            {serviceId && !project?.archived && (
+              <ContextAIButton
+                user={user}
+                projectId={projectId ?? undefined}
+                context={{ kind: 'SERVICE', serviceId }}
+                objectName={project?.services.find((service) => service.id === serviceId)?.name}
+              />
+            )}
+            {canEdit && (
               <button
                 className="button primary"
                 onClick={() =>
                   setEditing({
                     projectId: projectId || undefined,
+                    serviceId: serviceId || undefined,
                     definition: repositoryId ? { repositoryId } : undefined,
                   })
                 }
@@ -178,33 +237,41 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
         }
       />
       <ErrorBanner
-        error={pipelines.error || projects.error || scopedProject.error}
+        error={pipelines.error || projects.error}
         retry={() => {
           void pipelines.reload();
           void projects.reload();
-          void scopedProject.reload();
         }}
       />
       {repositoryId && (
         <div className="repository-detail-actions">
           <span className="tag">仓库 · {scopedRepository?.name || repositoryId}</span>
-          <a href="#/pipelines" className="text-link">
+          <a
+            href={
+              projectId ? '#' + deliveryPath(projectId, 'pipelines', { serviceId }) : '#/pipelines'
+            }
+            className="text-link"
+          >
             查看全部 Pipeline
           </a>
         </div>
       )}
-      <div className="delivery-banner">
-        <span className="resource-avatar">
-          <Workflow size={25} />
-        </span>
-        <div>
-          <strong>一个流程，两种构建位置</strong>
-          <p>目标端就地构建，或管理端在独立容器中构建一次、分发同一产物。运行时固定配置与版本。</p>
+      {!project && (
+        <div className="delivery-banner">
+          <span className="resource-avatar">
+            <Workflow size={25} />
+          </span>
+          <div>
+            <strong>一个流程，两种构建位置</strong>
+            <p>
+              目标端就地构建，或管理端在独立容器中构建一次、分发同一产物。运行时固定配置与版本。
+            </p>
+          </div>
+          <a className="text-link" href="#/servers">
+            管理服务器与分组 →
+          </a>
         </div>
-        <a className="text-link" href="#/servers">
-          管理服务器与分组 →
-        </a>
-      </div>
+      )}
       {pipelines.loading ? (
         <Loading />
       ) : !visiblePipelines.length ? (
@@ -218,7 +285,10 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
                 : '先创建项目、仓库和服务，再选择服务器或服务器分组执行。'
             }
             action={
-              <a href="#/projects" className="button secondary">
+              <a
+                href={project ? '#/projects/' + project.id : '#/projects'}
+                className="button secondary"
+              >
                 前往项目管理
               </a>
             }
@@ -236,7 +306,19 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
               </div>
               <h2>{p.name}</h2>
               <p>
-                {projects.data?.find((v) => v.id === p.projectId)?.name || '项目'}
+                <a
+                  className="text-link"
+                  href={
+                    '#' +
+                    deliveryPath(p.projectId, 'pipelines', {
+                      serviceId: p.serviceId,
+                      recordId: p.id,
+                    })
+                  }
+                >
+                  {projectList.find((v) => v.id === p.projectId)?.name || '项目'} ·{' '}
+                  {project?.services.find((s) => s.id === p.serviceId)?.name || '所属服务'}
+                </a>
                 <span className="muted">
                   {' '}
                   · {p.definition?.artifactType === 'DOCKER_IMAGE' ? 'Docker 镜像' : '文件产物'}
@@ -254,11 +336,24 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
                 <Status value={p.enabled ? 'ACTIVE' : 'DISABLED'} />
               </div>
               <div className="pipeline-card-actions">
+                <ContextAIButton
+                  user={user}
+                  projectId={p.projectId}
+                  context={{ kind: 'PIPELINE', pipelineId: p.id }}
+                  objectName={p.name}
+                />
                 <button className="text-button" onClick={() => setVersions(p)}>
                   <History size={15} />
                   版本
                 </button>
-                {user.role === 'ADMIN' && (
+                <button
+                  className="text-button"
+                  aria-label={`查看 ${p.name} 的自动触发`}
+                  onClick={() => setTriggerPipeline(p)}
+                >
+                  <CalendarClock size={15} /> 自动触发
+                </button>
+                {user.role === 'ADMIN' && canEdit && (
                   <button
                     className="text-button"
                     aria-label={`配置 ${p.name} 的 Gitea Webhook`}
@@ -269,7 +364,7 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
                     Webhook
                   </button>
                 )}
-                {user.role !== 'VIEWER' && (
+                {canEdit && (
                   <>
                     <button className="text-button" onClick={() => setEditing(p)}>
                       <Pencil size={15} />
@@ -294,7 +389,9 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
       {editing && (
         <PipelineEditor
           pipeline={editing}
-          projects={projects.data || []}
+          projects={projectList}
+          lockProject={Boolean(projectId)}
+          lockService={Boolean(serviceId)}
           onClose={() => setEditing(undefined)}
           onSaved={() => {
             setEditing(undefined);
@@ -304,18 +401,108 @@ export function PipelinesPage({ user, repositoryScope }: { user: User; repositor
       )}
       {running && <RunPipeline pipeline={running} onClose={() => setRunning(undefined)} />}
       {versions && <PipelineVersions pipeline={versions} onClose={() => setVersions(undefined)} />}
+      {triggerPipeline && (
+        <TriggerSettings
+          pipeline={triggerPipeline}
+          canManage={user.role === 'ADMIN' && canEdit}
+          onClose={() => setTriggerPipeline(undefined)}
+        />
+      )}
       {webhook && <PipelineWebhook pipeline={webhook} onClose={() => setWebhook(undefined)} />}
     </>
   );
 }
 
+function TriggerSettings({
+  pipeline,
+  canManage,
+  onClose,
+}: {
+  pipeline: Pipeline;
+  canManage: boolean;
+  onClose: () => void;
+}) {
+  const project = useResource<ProjectDetail>(`/projects/${pipeline.projectId}/delivery-context`);
+  const repositoryId = pipeline.definition.repositoryId;
+  const cache = useResource<{ branches: { name: string }[]; defaultBranch: string | null }>(
+    canManage && repositoryId
+      ? `/projects/${pipeline.projectId}/repositories/${repositoryId}/branch-cache`
+      : null,
+  );
+  const [selectedEnv, setSelectedEnv] = useState<string>();
+  const [selectedBranch, setSelectedBranch] = useState<string>();
+  const environmentId = selectedEnv ?? project.data?.environments[0]?.id ?? '';
+  const primary = pipeline.definition.nodes?.[0];
+  const configuredBranch = primary?.environmentBranches?.[environmentId] || primary?.branch;
+  const branch =
+    configuredBranch ||
+    (selectedBranch ??
+      cache.data?.defaultBranch ??
+      project.data?.repositories.find((r) => r.id === repositoryId)?.defaultBranch ??
+      '');
+  return (
+    <Modal title={`自动触发 · ${pipeline.name}`} wide onClose={onClose}>
+      <div className="form-body">
+        <ErrorBanner error={project.error || cache.error} />
+        {canManage && (
+          <div className="form-grid">
+            <Field label="触发环境">
+              <select
+                value={environmentId}
+                onChange={(event) => {
+                  setSelectedEnv(event.target.value);
+                  setSelectedBranch(undefined);
+                }}
+              >
+                {!project.data?.environments.length && <option value="">暂无环境</option>}
+                {project.data?.environments.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    {e.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field
+              label="触发分支"
+              hint={configuredBranch ? '当前环境的源码节点已固定此分支。' : undefined}
+            >
+              <input
+                list="trigger-branches"
+                value={branch}
+                disabled={Boolean(configuredBranch)}
+                onChange={(event) => setSelectedBranch(event.target.value)}
+              />
+              <datalist id="trigger-branches">
+                {cache.data?.branches.map((b) => (
+                  <option key={b.name} value={b.name} />
+                ))}
+              </datalist>
+            </Field>
+          </div>
+        )}
+        <Suspense fallback={<Loading />}>
+          <PipelineTriggers
+            pipelineId={pipeline.id}
+            version={pipeline.currentVersion}
+            environmentId={environmentId}
+            branch={branch}
+            canManage={canManage}
+          />
+        </Suspense>
+      </div>
+    </Modal>
+  );
+}
+
 type WebhookInput = DeploymentSelection & {
+  followMode?: boolean;
   environmentId: string;
   branch: string;
   secretCredentialId: string;
   enabled: boolean;
 };
 type WebhookConfig = WebhookInput & {
+  mode?: ExecutionMode;
   endpoint: string;
   version?: number;
 };
@@ -330,10 +517,24 @@ function PipelineWebhook({ pipeline, onClose }: { pipeline: Pipeline; onClose: (
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [review, setReview] = useState<{
+    input: WebhookInput;
+    result: {
+      version: number;
+      mode: ExecutionMode;
+      serverIds: string[];
+      requireApproval: boolean;
+      bindingHash: string;
+    };
+  }>();
   const loading = configuration.loading || project.loading || credentials.loading;
   const loadError = configuration.error || project.error || credentials.error;
   const config = configuration.data;
-  useEffect(() => setSelection(deploymentSelection(config)), [config]);
+  const [inheritTargets, setInheritTargets] = useState(true);
+  useEffect(() => {
+    setSelection(deploymentSelection(config));
+    setInheritTargets(!config?.targetId && !hasDeploymentSelection(deploymentSelection(config)));
+  }, [config]);
   const sharedSecrets = credentials.data?.filter(
     (c) => c.type === 'CUSTOM_SECRET' && c.status === 'ACTIVE',
   );
@@ -349,26 +550,52 @@ function PipelineWebhook({ pipeline, onClose }: { pipeline: Pipeline; onClose: (
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (busy) return;
-    if (!hasDeploymentSelection(selection)) {
+    if (!inheritTargets && !hasDeploymentSelection(selection)) {
       setError('请选择服务器或服务器分组。');
       return;
     }
     const values = new FormData(event.currentTarget);
     const input: WebhookInput = {
-      ...selection,
+      ...(!inheritTargets && selection),
       environmentId: String(values.get('environmentId')),
       branch: String(values.get('branch')).trim(),
       secretCredentialId: String(values.get('secretCredentialId')),
       enabled: values.get('enabled') === 'on',
+      followMode: config?.followMode !== false || values.has('followMode'),
     };
     setBusy(true);
     setError('');
     setNotice('');
     try {
+      if (input.enabled) {
+        const result = await post<NonNullable<typeof review>['result']>(path + '/preview', input);
+        setReview({ input, result });
+        return;
+      }
       await api(path, { method: 'PUT', body: JSON.stringify(input) });
       await configuration.reload();
       setNotice('Webhook 配置已保存。');
     } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function confirmBinding(event: FormEvent) {
+    event.preventDefault();
+    if (!review || busy) return;
+    setBusy(true);
+    try {
+      await api(path, {
+        method: 'PUT',
+        body: JSON.stringify({ ...review.input, expectedBindingHash: review.result.bindingHash }),
+      });
+      await configuration.reload();
+      setNotice('Webhook 配置已保存。');
+      setError('');
+      setReview(undefined);
+    } catch (err) {
+      setReview(undefined);
       setError(message(err));
     } finally {
       setBusy(false);
@@ -397,90 +624,155 @@ function PipelineWebhook({ pipeline, onClose }: { pipeline: Pipeline; onClose: (
           />
         </div>
       ) : (
-        <Form onSubmit={save} onCancel={onClose} submit="保存 Webhook" busy={busy} error={error}>
-          {endpoint && (
-            <div className="webhook-url">
-              <Field
-                label="Webhook URL"
-                hint="Gitea 中选择 Push Events，内容类型设为 application/json，并填写同一共享密钥。URL 需能从 Gitea 访问。"
-              >
+        <>
+          {review && (
+            <Form
+              onSubmit={confirmBinding}
+              onCancel={() => setReview(undefined)}
+              submit="确认启用"
+              busy={busy}
+              error={error}
+            >
+              <p>
+                将对 {review.input.branch} 的推送运行 v{review.result.version}，在管理端隔离构建。
+              </p>
+              <p>
+                {review.result.mode === 'BUILD_ONLY'
+                  ? '仅构建并归档产物'
+                  : review.result.requireApproval
+                    ? '构建后申请发布审批'
+                    : '构建成功后自动部署'}{' '}
+                ·{' '}
+                {review.result.serverIds
+                  .map(
+                    (id) => inventory.servers.data?.find((server) => server.id === id)?.name ?? id,
+                  )
+                  .join('、')}
+              </p>
+            </Form>
+          )}
+          <div hidden={!!review}>
+            <Form
+              onSubmit={save}
+              onCancel={onClose}
+              submit="保存 Webhook"
+              busy={busy}
+              error={error}
+            >
+              {endpoint && (
+                <div className="webhook-url">
+                  <Field
+                    label="Webhook URL"
+                    hint="Gitea 中选择 Push Events，内容类型设为 application/json，并填写同一共享密钥。URL 需能从 Gitea 访问。"
+                  >
+                    <input
+                      value={endpoint}
+                      readOnly
+                      onFocus={(event) => event.currentTarget.select()}
+                    />
+                  </Field>
+                  <button
+                    className="button secondary small"
+                    type="button"
+                    onClick={() => void copy()}
+                  >
+                    <Copy size={14} />
+                    复制 URL
+                  </button>
+                </div>
+              )}
+              {notice && (
+                <p className="success-notice" role="status">
+                  {notice}
+                </p>
+              )}
+              {config?.version && (
+                <p className="field-note">
+                  已固定 Pipeline v{config.version} ·{' '}
+                  {config.mode === 'DEPLOY' ? '构建并部署' : '仅构建'}
+                  。如需切换到当前版本，请重新保存。
+                </p>
+              )}
+              <Field label="环境" required>
+                <select name="environmentId" required defaultValue={config?.environmentId || ''}>
+                  <option value="">选择项目环境</option>
+                  {project.data?.environments.map((environment) => (
+                    <option key={environment.id} value={environment.id}>
+                      {environment.name}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <label className="checkbox-row">
                 <input
-                  value={endpoint}
-                  readOnly
-                  onFocus={(event) => event.currentTarget.select()}
+                  type="checkbox"
+                  checked={inheritTargets}
+                  onChange={(event) => setInheritTargets(event.target.checked)}
+                />
+                沿用服务环境的服务器或分组
+              </label>
+              {!inheritTargets && config?.targetId && !hasDeploymentSelection(selection) && (
+                <p className="field-note">请重新选择触发时使用的服务器或服务器分组。</p>
+              )}
+              {!inheritTargets && (
+                <DeploymentSelectionPicker
+                  inventory={inventory}
+                  value={selection}
+                  onChange={setSelection}
+                  disabled={busy}
+                />
+              )}
+              <Field label="分支" required>
+                <input
+                  name="branch"
+                  required
+                  defaultValue={
+                    config?.branch ||
+                    pipeline.definition.nodes?.[0]?.branch ||
+                    project.data?.repositories.find(
+                      (r) => r.id === pipeline.definition.repositoryId,
+                    )?.defaultBranch ||
+                    ''
+                  }
+                  placeholder="例如 main"
                 />
               </Field>
-              <button className="button secondary small" type="button" onClick={() => void copy()}>
-                <Copy size={14} />
-                复制 URL
-              </button>
-            </div>
-          )}
-          {notice && (
-            <p className="success-notice" role="status">
-              {notice}
-            </p>
-          )}
-          {config?.version && (
-            <p className="field-note">
-              已固定 Pipeline v{config.version}。如需切换到当前版本，请重新保存。
-            </p>
-          )}
-          <Field label="环境" required>
-            <select name="environmentId" required defaultValue={config?.environmentId || ''}>
-              <option value="">选择项目环境</option>
-              {project.data?.environments.map((environment) => (
-                <option key={environment.id} value={environment.id}>
-                  {environment.name}
-                </option>
-              ))}
-            </select>
-          </Field>
-          {config?.targetId && !hasDeploymentSelection(selection) && (
-            <p className="field-note">请重新选择触发时使用的服务器或服务器分组。</p>
-          )}
-          <DeploymentSelectionPicker
-            inventory={inventory}
-            value={selection}
-            onChange={setSelection}
-            disabled={busy}
-          />
-          <Field label="分支" required>
-            <input
-              name="branch"
-              required
-              defaultValue={config?.branch || 'main'}
-              placeholder="例如 main"
-            />
-          </Field>
-          <Field label="签名密钥" required hint="Gitea 使用共享密钥生成 SHA-256 签名。">
-            <select
-              name="secretCredentialId"
-              required
-              defaultValue={config?.secretCredentialId || ''}
-            >
-              <option value="">选择共享密钥凭据</option>
-              {sharedSecrets?.map((credential) => (
-                <option key={credential.id} value={credential.id}>
-                  {credential.name}
-                </option>
-              ))}
-            </select>
-          </Field>
-          {!sharedSecrets?.length && (
-            <p className="field-note">
-              先在
-              <a className="text-link" href="#/credentials">
-                凭据中心
-              </a>
-              创建共享密钥。
-            </p>
-          )}
-          <label className="checkbox-row">
-            <input type="checkbox" name="enabled" defaultChecked={config?.enabled ?? false} />
-            启用 Push 触发
-          </label>
-        </Form>
+              <Field label="签名密钥" required hint="Gitea 使用共享密钥生成 SHA-256 签名。">
+                <select
+                  name="secretCredentialId"
+                  required
+                  defaultValue={config?.secretCredentialId || ''}
+                >
+                  <option value="">选择共享密钥凭据</option>
+                  {sharedSecrets?.map((credential) => (
+                    <option key={credential.id} value={credential.id}>
+                      {credential.name}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              {!sharedSecrets?.length && (
+                <p className="field-note">
+                  先在
+                  <a className="text-link" href="#/credentials">
+                    凭据中心
+                  </a>
+                  创建共享密钥。
+                </p>
+              )}
+              {config?.followMode === false && (
+                <label className="checkbox-row">
+                  <input type="checkbox" name="followMode" />
+                  将旧版仅构建绑定切换为跟随服务环境和流水线配置
+                </label>
+              )}
+              <label className="checkbox-row">
+                <input type="checkbox" name="enabled" defaultChecked={config?.enabled ?? false} />
+                启用 Push 触发
+              </label>
+            </Form>
+          </div>
+        </>
       )}
     </Modal>
   );
@@ -489,11 +781,15 @@ function PipelineWebhook({ pipeline, onClose }: { pipeline: Pipeline; onClose: (
 function PipelineEditor({
   pipeline,
   projects,
+  lockProject,
+  lockService,
   onClose,
   onSaved,
 }: {
   pipeline: PipelineDraft;
   projects: Project[];
+  lockProject: boolean;
+  lockService: boolean;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -517,6 +813,18 @@ function PipelineEditor({
   const defaultBuildLocation = defaults.data?.defaultBuildLocation;
   const buildLocation = definition.buildLocation ?? defaultBuildLocation ?? 'TARGET';
   const project = useResource<ProjectDetail>(projectId ? `/projects/${projectId}` : null);
+  const links = useResource<{ repositoryId: string; isPrimary: boolean }[]>(
+    serviceId ? `/services/${serviceId}/repositories` : null,
+  );
+  const linked = new Map(links.data?.map((link) => [link.repositoryId, link.isPrimary ? 0 : 1]));
+  const orderedProject = project.data && {
+    ...project.data,
+    repositories: [...project.data.repositories].sort(
+      (a, b) => (linked.get(a.id) ?? 2) - (linked.get(b.id) ?? 2),
+    ),
+  };
+  const preferred = orderedProject?.repositories.find((r) => linked.has(r.id));
+  const primaryRepositoryId = definition.repositoryId || (!pipeline.id && preferred?.id) || '';
   const registries = useResource<Registry[]>('/registries');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -561,7 +869,7 @@ function PipelineEditor({
   async function save(e: FormEvent) {
     e.preventDefault();
     if (definition.nodes) {
-      const invalid = nodeConfigurationError(definition.nodes, definition.repositoryId);
+      const invalid = nodeConfigurationError(definition.nodes, primaryRepositoryId);
       if (invalid) {
         setError(invalid);
         return;
@@ -576,6 +884,11 @@ function PipelineEditor({
         enabled,
         definition: {
           ...definition,
+          defaultMode:
+            definition.nodes && !definition.nodes.some((n) => n.type === 'DEPLOY')
+              ? 'BUILD_ONLY'
+              : (definition.defaultMode ?? 'DEPLOY'),
+          repositoryId: primaryRepositoryId,
           ...(definition.nodes && { installCommand: '', buildCommand: '', steps: [] }),
           registryId: definition.registryId || undefined,
           imageRepository: definition.imageRepository || undefined,
@@ -610,7 +923,7 @@ function PipelineEditor({
         error={error}
         submit={pipeline.id ? '保存新版本' : '创建 Pipeline'}
       >
-        <ErrorBanner error={project.error || registries.error} />
+        <ErrorBanner error={project.error || registries.error || links.error} />
         <div className="form-section-heading">
           <span>01</span>
           <h3>关联资源</h3>
@@ -628,7 +941,7 @@ function PipelineEditor({
           <Field label="项目" required>
             <select
               value={projectId}
-              disabled={!!pipeline.id}
+              disabled={!!pipeline.id || lockProject}
               required
               onChange={(e) => changeProject(e.target.value)}
             >
@@ -643,7 +956,7 @@ function PipelineEditor({
           <Field label="服务" required>
             <select
               value={serviceId}
-              disabled={!!pipeline.id}
+              disabled={!!pipeline.id || lockService}
               required
               onChange={(e) => setServiceId(e.target.value)}
             >
@@ -659,14 +972,15 @@ function PipelineEditor({
         <div className="form-grid">
           <Field label={definition.nodes ? '主仓库' : '仓库'} required>
             <select
-              value={definition.repositoryId}
+              value={primaryRepositoryId}
               required
               onChange={(e) => changeRepository(e.target.value)}
             >
               <option value="">选择仓库</option>
-              {project.data?.repositories.map((r) => (
+              {orderedProject?.repositories.map((r) => (
                 <option value={r.id} key={r.id}>
                   {r.name}
+                  {linked.has(r.id) ? ' · 服务已关联' : ''}
                 </option>
               ))}
             </select>
@@ -729,6 +1043,21 @@ function PipelineEditor({
             />
           </Field>
         )}
+        <Field label="默认运行模式" hint="服务环境可以覆盖此设置。">
+          <select
+            value={
+              definition.nodes && !definition.nodes.some((n) => n.type === 'DEPLOY')
+                ? 'BUILD_ONLY'
+                : (definition.defaultMode ?? 'DEPLOY')
+            }
+            onChange={(e) => field('defaultMode', e.target.value as ExecutionMode)}
+          >
+            <option value="BUILD_ONLY">仅构建</option>
+            {(!definition.nodes || definition.nodes.some((n) => n.type === 'DEPLOY')) && (
+              <option value="DEPLOY">构建并部署</option>
+            )}
+          </select>
+        </Field>
         <div className="pipeline-nodes-heading">
           <h3>流水线节点</h3>
           {!definition.nodes && (
@@ -745,8 +1074,8 @@ function PipelineEditor({
           <Suspense fallback={<Loading />}>
             <PipelineNodesEditor
               nodes={definition.nodes}
-              project={project.data}
-              primaryRepositoryId={definition.repositoryId}
+              project={orderedProject}
+              primaryRepositoryId={primaryRepositoryId}
               onChange={(nodes) => field('nodes', nodes)}
             />
           </Suspense>
@@ -1010,15 +1339,15 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
     `/pipelines/${pipeline.id}/versions`,
   );
   const [environmentId, setEnvironmentId] = useState('');
-  const environmentConfig = useResource<DeploymentSelection | null>(
-    environmentId ? `/services/${pipeline.serviceId}/environments/${environmentId}/config` : null,
-  );
+  const environmentConfig = useResource<
+    (DeploymentSelection & { executionMode?: ExecutionMode }) | null
+  >(environmentId ? `/services/${pipeline.serviceId}/environments/${environmentId}/config` : null);
   const [selection, setSelection] = useState<DeploymentSelection>(() => deploymentSelection());
   const [commitSha, setCommitSha] = useState('');
   const [version, setVersion] = useState(pipeline.currentVersion);
   const [browsing, setBrowsing] = useState(false);
   const [commitOrigin, setCommitOrigin] = useState<{ branch: string; subject: string }>();
-  const [mode, setMode] = useState<ExecutionMode>('BUILD_ONLY');
+  const [mode, setMode] = useState<ExecutionMode | ''>('');
   const [allowPartialDeploy, setAllowPartialDeploy] = useState(false);
   const [preview, setPreview] = useState<PipelinePreview>();
   const [copyNotice, setCopyNotice] = useState('');
@@ -1037,7 +1366,11 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
   const onlyBuild = Boolean(
     versionDefinition?.nodes && !versionDefinition.nodes.some(({ type }) => type === 'DEPLOY'),
   );
-  const requestedMode = onlyBuild ? 'BUILD_ONLY' : mode;
+  const inheritedMode =
+    environmentConfig.data?.executionMode ??
+    versionDefinition?.defaultMode ??
+    (onlyBuild ? 'BUILD_ONLY' : 'DEPLOY');
+  const requestedMode = mode || inheritedMode;
   const repositoryId = versionDefinition?.repositoryId;
   const repository = project.data?.repositories.find((entry) => entry.id === repositoryId);
   async function run(e: FormEvent) {
@@ -1056,7 +1389,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
           environmentId,
           commitSha: configuredBranch ? undefined : commitSha,
           version,
-          mode: requestedMode,
+          mode: mode || undefined,
           allowPartialDeploy: requestedMode === 'DEPLOY' && allowPartialDeploy,
           confirmed: true,
         });
@@ -1069,7 +1402,7 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
         environmentId: preview.environmentId,
         commitSha: configuredBranch ? undefined : preview.commitSha,
         version: preview.version,
-        mode: preview.mode,
+        mode: mode || undefined,
         allowPartialDeploy:
           preview.allowPartialDeploy ?? (preview.mode === 'DEPLOY' && allowPartialDeploy),
         expectedConfigurationHash: preview.configurationHash,
@@ -1128,10 +1461,10 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
         {!preview || !definition ? (
           <fieldset disabled={busy}>
             <Field label="运行模式" required>
-              <select
-                value={requestedMode}
-                onChange={(e) => setMode(e.target.value as ExecutionMode)}
-              >
+              <select value={mode} onChange={(e) => setMode(e.target.value as ExecutionMode)}>
+                <option value="">
+                  沿用配置（{inheritedMode === 'BUILD_ONLY' ? '仅构建' : '构建并部署'}）
+                </option>
                 {!onlyBuild && <option value="DEPLOY">构建并部署</option>}
                 <option value="BUILD_ONLY">仅构建</option>
               </select>
@@ -1183,6 +1516,8 @@ function RunPipeline({ pipeline, onClose }: { pipeline: Pipeline; onClose: () =>
                 value={version}
                 onChange={(e) => {
                   setVersion(Number(e.target.value));
+                  setMode('');
+                  setAllowPartialDeploy(false);
                   setCommitSha('');
                   setCommitOrigin(undefined);
                   setBrowsing(false);
@@ -1793,18 +2128,27 @@ function DeployArtifacts({
 export function DeliveryRecordsPage({
   type,
   user,
+  project,
+  query = '',
 }: {
   type: 'artifacts' | 'deployments';
   user: User;
+  project?: ProjectDetail;
+  query?: string;
 }) {
-  const records = useResource<(Artifact & DeploymentRecord)[]>(`/${type}`);
+  const records = useResource<(Artifact & DeploymentRecord)[]>(`/${type}?${query}`);
   const servers = useResource<Server[]>(type === 'deployments' ? '/servers' : null);
   const [selection, setSelection] = useState<DeployableArtifact>();
   const [rollback, setRollback] = useState<DeploymentRecord>();
   const [retention, setRetention] = useState<'policy' | 'cleanup'>();
   const [pinning, setPinning] = useState<string>();
   const [pinError, setPinError] = useState('');
-  const canWrite = user.role !== 'VIEWER';
+  const canWrite = user.role !== 'VIEWER' && !project?.archived;
+  const scopeParams = new URLSearchParams(query);
+  const serviceId = scopeParams.get('serviceId');
+  const environmentId = scopeParams.get('environmentId');
+  const retentionScope =
+    project && serviceId && environmentId ? { serviceId, environmentId } : undefined;
 
   async function togglePin(artifact: Artifact) {
     setPinning(artifact.id);
@@ -1824,7 +2168,8 @@ export function DeliveryRecordsPage({
 
   return (
     <>
-      <PageHeader
+      <DeliveryHeading
+        compact={Boolean(project)}
         eyebrow="DELIVERY TRACEABILITY"
         title={type === 'artifacts' ? '构建产物' : '部署记录'}
         description={
@@ -1834,33 +2179,39 @@ export function DeliveryRecordsPage({
         }
         action={
           <div className="row-actions">
-            {type === 'artifacts' && user.role === 'ADMIN' && (
+            {type === 'artifacts' && user.role === 'ADMIN' && canWrite && (
               <>
-                <button className="button secondary" onClick={() => setRetention('policy')}>
-                  保留策略
-                </button>
-                <button className="button secondary" onClick={() => setRetention('cleanup')}>
-                  清理预览
-                </button>
+                {(!project || retentionScope) && (
+                  <button className="button secondary" onClick={() => setRetention('policy')}>
+                    {retentionScope ? '服务环境保留策略' : '全局保留策略'}
+                  </button>
+                )}
+                {!project && (
+                  <button className="button secondary" onClick={() => setRetention('cleanup')}>
+                    全局清理预览
+                  </button>
+                )}
               </>
             )}
             <RefreshButton onClick={records.reload} />
           </div>
         }
       />
-      <div className="record-tabs">
-        <a className={type === 'artifacts' ? 'active' : ''} href="#/artifacts">
-          <Boxes size={16} />
-          产物
-        </a>
-        <a className={type === 'deployments' ? 'active' : ''} href="#/deployments">
-          <Layers3 size={16} />
-          部署
-        </a>
-      </div>
+      {!project && (
+        <div className="record-tabs">
+          <a className={type === 'artifacts' ? 'active' : ''} href="#/artifacts">
+            <Boxes size={16} />
+            产物
+          </a>
+          <a className={type === 'deployments' ? 'active' : ''} href="#/deployments">
+            <Layers3 size={16} />
+            部署
+          </a>
+        </div>
+      )}
       <ErrorBanner error={records.error} retry={records.reload} />
       {type === 'artifacts' && <ErrorBanner error={pinError} />}
-      {type === 'deployments' && user.role === 'ADMIN' && <ReleaseApprovals />}
+      {!project && type === 'deployments' && user.role === 'ADMIN' && <ReleaseApprovals />}
       <Section
         title={type === 'artifacts' ? '产物历史' : '部署历史'}
         subtitle="由 Pipeline 执行引擎生成"
@@ -1873,7 +2224,17 @@ export function DeliveryRecordsPage({
             title="暂无交付记录"
             description="完成首次 Pipeline 构建部署后，结果会出现在这里。"
             action={
-              <a className="button secondary" href="#/pipelines">
+              <a
+                className="button secondary"
+                href={
+                  project
+                    ? '#' +
+                      deliveryPath(project.id, 'pipelines', {
+                        serviceId: new URLSearchParams(query).get('serviceId'),
+                      })
+                    : '#/pipelines'
+                }
+              >
                 前往 Pipeline
               </a>
             }
@@ -1883,6 +2244,7 @@ export function DeliveryRecordsPage({
             <table>
               <thead>
                 <tr>
+                  <th>服务 / 环境</th>
                   {type === 'artifacts' ? (
                     <>
                       <th>产物</th>
@@ -1896,6 +2258,7 @@ export function DeliveryRecordsPage({
                     <>
                       <th>部署</th>
                       <th>服务器</th>
+                      <th>固定 Commit</th>
                       <th>部署目录</th>
                       <th>结果</th>
                       <th>健康检查</th>
@@ -1908,6 +2271,28 @@ export function DeliveryRecordsPage({
               <tbody>
                 {records.data.map((r) => (
                   <tr key={r.id}>
+                    <td>
+                      {r.projectId && (
+                        <a
+                          className="text-link"
+                          href={
+                            '#' +
+                            deliveryPath(r.projectId, type, {
+                              serviceId: r.serviceId,
+                              recordId: r.id,
+                            })
+                          }
+                        >
+                          {project?.services.find((s) => s.id === r.serviceId)?.name ||
+                            (project ? r.serviceId : '查看所属项目')}
+                        </a>
+                      )}
+                      <small className="cell-detail">
+                        {project?.environments.find((e) => e.id === r.environmentId)?.name ||
+                          r.environmentId ||
+                          '—'}
+                      </small>
+                    </td>
                     {type === 'artifacts' ? (
                       <>
                         <td>
@@ -1917,6 +2302,11 @@ export function DeliveryRecordsPage({
                           <small className="cell-detail mono" title={r.storageKey}>
                             {r.storageKey}
                           </small>
+                          {r.taskId && (
+                            <a className="text-link" href={`#/tasks/${r.taskId}`}>
+                              构建日志
+                            </a>
+                          )}
                         </td>
                         <td>
                           <span className="tag">
@@ -1942,9 +2332,10 @@ export function DeliveryRecordsPage({
                         <td>
                           <ArtifactActions
                             artifact={r}
-                            onDeploy={user.role === 'VIEWER' ? undefined : setSelection}
+                            onDeploy={canWrite ? setSelection : undefined}
                           />
                           {user.role === 'ADMIN' &&
+                            canWrite &&
                             r.prunedAt == null &&
                             (r.downloadAvailable || r.deployable || r.pinnedAt != null) && (
                               <button
@@ -1988,6 +2379,9 @@ export function DeliveryRecordsPage({
                           {servers.data?.find((server) => server.id === r.serverId)?.name ||
                             r.serverId ||
                             '—'}
+                        </td>
+                        <td className="mono" title={r.sourceCommit}>
+                          {r.sourceCommit?.slice(0, 12) || '—'}
                         </td>
                         <td className="mono truncate" title={r.deployPath}>
                           {r.deployPath || '—'}
@@ -2034,7 +2428,7 @@ export function DeliveryRecordsPage({
         <RollbackRelease record={rollback} onClose={() => setRollback(undefined)} />
       )}
       {type === 'artifacts' && retention === 'policy' && (
-        <ArtifactRetentionPolicy onClose={() => setRetention(undefined)} />
+        <ArtifactRetentionPolicy scope={retentionScope} onClose={() => setRetention(undefined)} />
       )}
       {type === 'artifacts' && retention === 'cleanup' && (
         <ArtifactCleanup onClose={() => setRetention(undefined)} onPruned={records.reload} />

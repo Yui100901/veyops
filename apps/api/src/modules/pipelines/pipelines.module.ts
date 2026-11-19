@@ -1,3 +1,5 @@
+import { PipelineTriggersController } from '../pipeline-triggers/pipeline-triggers.controller';
+import { PipelineTriggersService } from '../pipeline-triggers/pipeline-triggers.service';
 import { Global, Module } from '@nestjs/common';
 import { PipelinesController } from './pipelines.controller';
 import { PipelinesService } from './pipelines.service';
@@ -6,10 +8,14 @@ import { BuildsService } from '../builds/builds.service';
 import { ArtifactsController, ArtifactsService } from '../artifacts/artifacts.service';
 import { DeploymentsController, DeploymentsService } from '../deployments/deployments.service';
 import { RegistriesController, RegistriesService } from '../registries/registries.service';
-import { ReleaseRequestsController, ReleaseRequestsService } from '../deployments/release-requests.service';
+import {
+  ReleaseRequestsController,
+  ReleaseRequestsService,
+} from '../deployments/release-requests.service';
 @Global()
 @Module({
   controllers: [
+    PipelineTriggersController,
     PipelinesController,
     ArtifactsController,
     DeploymentsController,
@@ -17,6 +23,7 @@ import { ReleaseRequestsController, ReleaseRequestsService } from '../deployment
     RegistriesController,
   ],
   providers: [
+    PipelineTriggersService,
     PipelinesService,
     PipelineExecutor,
     BuildsService,
@@ -25,6 +32,12 @@ import { ReleaseRequestsController, ReleaseRequestsService } from '../deployment
     ReleaseRequestsService,
     RegistriesService,
   ],
-  exports: [PipelinesService, ArtifactsService, DeploymentsService, RegistriesService],
+  exports: [
+    PipelineTriggersService,
+    PipelinesService,
+    ArtifactsService,
+    DeploymentsService,
+    RegistriesService,
+  ],
 })
 export class PipelinesModule {}

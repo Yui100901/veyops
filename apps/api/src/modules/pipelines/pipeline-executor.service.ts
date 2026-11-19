@@ -97,14 +97,20 @@ export class PipelineExecutor {
     const nodes = snapshot.definition.nodes;
     const packageNode = nodes?.find((node) => node.type === 'PACKAGE');
     const deployNode = nodes?.find((node) => node.type === 'DEPLOY');
-    if (
-      snapshot.triggerType === 'WEBHOOK' &&
-      (!buildOnly ||
-        snapshot.definition.buildLocation !== 'MANAGER' ||
+    if (snapshot.triggerType && snapshot.triggerType !== 'MANUAL') {
+      if (snapshot.definition.buildLocation !== 'MANAGER')
+        throw new Error('自动任务必须使用隔离管理端构建环境');
+      if (
         Object.keys(snapshot.secretVariables).length ||
-        nodes?.some((node) => node.variables?.some((variable) => variable.credentialId)))
-    )
-      throw new Error('Webhook只允许在隔离管理端执行无敏感环境变量的仅构建任务');
+        nodes?.some((node) => node.variables?.some((v) => v.credentialId))
+      )
+        throw new Error('自动任务不能使用敏感环境变量');
+      if (
+        !buildOnly &&
+        !(deployArtifact && snapshot.sourceBuildTaskId && snapshot.deploymentArtifacts?.length)
+      )
+        throw new Error('自动发布必须引用已归档产物和来源构建任务');
+    }
     const siblingCancellation = new AbortController();
     context = { ...context, signal: AbortSignal.any([context.signal, siblingCancellation.signal]) };
     const lease = context.leaseOwner ? { taskId: task.id, owner: context.leaseOwner } : undefined;

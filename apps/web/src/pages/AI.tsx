@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Bot,
   Check,
@@ -32,6 +33,8 @@ import {
   Status,
 } from '../components';
 import type { Project, Server, Task, User } from '../models';
+import { deliveryPath } from './delivery-route';
+import { ActionRules, ModelRouting, type ActionRule } from './AIControls';
 
 interface AIProvider {
   id: string;
@@ -55,13 +58,15 @@ interface AIPolicy {
   allowedActions?: string[];
   deniedActions?: string[];
   requireConfirmActions?: string[];
+  actionRules?: ActionRule[];
 }
 interface Policies {
   system: AIPolicy;
   projects: AIPolicy[];
 }
-interface Proposal {
+export interface Proposal {
   id: string;
+  scopeRevoked?: boolean;
   actionType: string;
   payload: Record<string, unknown>;
   preview: Record<string, unknown>;
@@ -70,13 +75,21 @@ interface Proposal {
   expiresAt: number;
   taskId?: string;
   createdAt: number;
+  conversationId?: string | null;
 }
+export type AIContext =
+  | { kind: 'REPOSITORY'; repositoryId: string; commitSha?: string; serviceId?: string }
+  | { kind: 'PIPELINE'; pipelineId: string }
+  | { kind: 'SERVICE'; serviceId: string }
+  | { kind: 'TASK'; taskId: string }
+  | { kind: 'OPERATION_PLAN'; operationPlanId: string; version: number };
 interface Conversation {
   id: string;
   title: string;
   projectId?: string;
   createdAt: number;
   updatedAt: number;
+  context?: AIContext | null;
 }
 interface AIMessage {
   id: string;
@@ -107,6 +120,8 @@ type SourceChange =
   | { id: string; kind: 'PULL_REQUEST'; number: number; url: string };
 interface ChatResponse {
   conversationId: string;
+  projectId?: string | null;
+  serviceId?: string | null;
   message: string;
   proposals: Proposal[];
   tasks: Task[];
@@ -136,6 +151,7 @@ const actionLabels: Record<string, string> = {
 };
 const componentLabels: Record<string, string> = {
   docker: 'Docker',
+  compose: 'Docker Compose',
   node: 'Node.js',
   nginx: 'Nginx',
 };
@@ -220,8 +236,8 @@ export function AISettings({ user }: { user: User }) {
   return (
     <div className="ai-settings" id="ai-settings">
       <Section
-        title="AI 模型连接（可选）"
-        subtitle="兼容 OpenAI Chat Completions 协议；不配置 AI 也可使用全部手工运维功能。"
+        title="AI 模型连接"
+        subtitle="管理 OpenAI 兼容服务的模型和连接。"
         action={
           admin && (
             <button className="button primary small" onClick={() => setEditing({})}>
@@ -312,11 +328,10 @@ export function AISettings({ user }: { user: User }) {
               ))}
             </div>
           )}
-          <p className="field-note">
-            对话可选择 Provider；未指定时使用可用的默认连接。API Key 不会在列表、对话或日志中回显。
-          </p>
+          <p className="field-note">API Key 加密保存在凭据中心。</p>
         </div>
       </Section>
+      <ModelRouting providers={providers.data ?? []} admin={admin} />
       <PolicyEditor
         user={user}
         policies={policies.data}
@@ -347,6 +362,22 @@ export function AISettings({ user }: { user: User }) {
         />
       )}
     </div>
+  );
+}
+
+export function ProjectAISettings({ user, projectId }: { user: User; projectId: string }) {
+  const policies = useResource<Policies>('/ai/policies');
+  const servers = useResource<Server[]>('/servers');
+  return (
+    <PolicyEditor
+      key={projectId}
+      user={user}
+      projectId={projectId}
+      policies={policies.data}
+      error={policies.error || servers.error}
+      servers={servers.data ?? []}
+      onSaved={policies.reload}
+    />
   );
 }
 function ProviderEditor({
@@ -450,6 +481,7 @@ function ProviderEditor({
 }
 function PolicyEditor({
   user,
+  projectId,
   policies,
   error,
   projects,
@@ -457,13 +489,13 @@ function PolicyEditor({
   onSaved,
 }: {
   user: User;
+  projectId?: string;
   policies?: Policies;
   error?: string;
-  projects: Project[];
+  projects?: Project[];
   servers: Server[];
   onSaved: () => void;
 }) {
-  const [scope, setScope] = useState('');
   const [mode, setMode] = useState<AIMode>('CONFIRM');
   const [ids, setIds] = useState<string[]>([]);
   const [projectIds, setProjectIds] = useState<string[]>([]);
@@ -477,11 +509,17 @@ function PolicyEditor({
   const [allowed, setAllowed] = useState('');
   const [restrictActions, setRestrictActions] = useState(false);
   const [required, setRequired] = useState('');
+  const [actionRules, setActionRules] = useState<ActionRule[]>([]);
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState('');
   const [saved, setSaved] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const policy = projectId
+    ? policies?.projects.find((p) => p.projectId === projectId)
+    : policies?.system;
+  const effectiveMode = user.role === 'VIEWER' ? 'READ_ONLY' : (policy ?? policies?.system)?.mode;
   useEffect(() => {
-    const p = scope ? policies?.projects.find((p) => p.projectId === scope) : policies?.system;
+    const p = policy;
     setMode(p?.mode || policies?.system.mode || 'CONFIRM');
     setIds(p?.serverIds || []);
     setProjectIds(p?.projectIds || []);
@@ -495,8 +533,9 @@ function PolicyEditor({
     setAllowed(p?.allowedActions?.join(', ') || '');
     setRestrictActions(p?.allowedActions !== undefined);
     setRequired(p?.requireConfirmActions?.join(', ') || '');
+    setActionRules(p?.actionRules ?? []);
     setSaved(false);
-  }, [policies, scope]);
+  }, [policies?.system.mode, policy]);
   async function save(e: FormEvent) {
     e.preventDefault();
     if (mode === 'FULL_CONTROL' && !ids.length) {
@@ -511,7 +550,8 @@ function PolicyEditor({
         method: 'PATCH',
         body: JSON.stringify({
           mode,
-          projectId: scope || undefined,
+          projectId,
+          actionRules,
           serverIds: restrictServers || mode === 'FULL_CONTROL' ? ids : undefined,
           projectIds: restrictProjects ? projectIds : undefined,
           repositoryIds: restrictRepositories
@@ -550,24 +590,41 @@ function PolicyEditor({
       setBusy(false);
     }
   }
+  async function restoreDefaults() {
+    if (!projectId || busy) return;
+    setBusy(true);
+    setSaveError('');
+    setSaved(false);
+    try {
+      await remove(`/ai/policies/projects/${projectId}`);
+      await onSaved();
+      setRestoring(false);
+    } catch (err) {
+      setSaveError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
   return (
     <Section
-      title="AI 执行权限"
+      title={projectId ? '项目 AI 执行权限' : '系统默认 AI 执行权限'}
       subtitle="AI 始终继承发起用户的角色权限。系统禁止与强制确认规则优先于项目配置。"
     >
       <form className="section-body" onSubmit={save}>
         <ErrorBanner error={error || saveError} />
-        <fieldset disabled={user.role !== 'ADMIN' || busy}>
-          <Field label="策略作用范围">
-            <select value={scope} onChange={(e) => setScope(e.target.value)}>
-              <option value="">系统默认策略</option>
-              {projects.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name} · 项目覆盖
-                </option>
-              ))}
-            </select>
-          </Field>
+        {projectId && policies && (
+          <div className="confirmation-summary">
+            <ShieldCheck size={21} />
+            <div>
+              <strong>{policy ? '当前项目已自定义' : '当前项目继承系统默认'}</strong>
+              <p>生效模式 · {modes.find((item) => item.value === effectiveMode)?.name}</p>
+              <a className="text-link" href="#/settings">
+                查看系统默认与全局限制
+              </a>
+            </div>
+          </div>
+        )}
+        <fieldset disabled={user.role !== 'ADMIN' || busy || !policies}>
           <div className="ai-mode-options">
             {modes.map((m) => (
               <label
@@ -621,40 +678,43 @@ function PolicyEditor({
                 )}
               </div>
             </div>
-            <div>
-              <h3 className="field-title">允许的项目范围</h3>
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={restrictProjects}
-                  onChange={(e) => setRestrictProjects(e.target.checked)}
-                />
-                限定为选中的项目
-              </label>
-              <div className="scope-options">
-                {projects.map((p) => (
-                  <label className="checkbox-row" key={p.id}>
-                    <input
-                      type="checkbox"
-                      disabled={!restrictProjects}
-                      checked={projectIds.includes(p.id)}
-                      onChange={(e) =>
-                        setProjectIds(
-                          e.target.checked
-                            ? [...projectIds, p.id]
-                            : projectIds.filter((id) => id !== p.id),
-                        )
-                      }
-                    />
-                    {p.name}
-                  </label>
-                ))}
-                {!projects.length && <p className="muted">暂无项目。</p>}
+            {!projectId && projects && (
+              <div>
+                <h3 className="field-title">允许的项目范围</h3>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={restrictProjects}
+                    onChange={(e) => setRestrictProjects(e.target.checked)}
+                  />
+                  限定为选中的项目
+                </label>
+                <div className="scope-options">
+                  {projects.map((p) => (
+                    <label className="checkbox-row" key={p.id}>
+                      <input
+                        type="checkbox"
+                        disabled={!restrictProjects}
+                        checked={projectIds.includes(p.id)}
+                        onChange={(e) =>
+                          setProjectIds(
+                            e.target.checked
+                              ? [...projectIds, p.id]
+                              : projectIds.filter((id) => id !== p.id),
+                          )
+                        }
+                      />
+                      {p.name}
+                    </label>
+                  ))}
+                  {!projects.length && <p className="muted">暂无项目。</p>}
+                </div>
               </div>
-            </div>
+            )}
           </div>
           <details className="advanced-options">
             <summary>操作规则</summary>
+            <ActionRules rules={actionRules} onChange={setActionRules} servers={servers} />
             <label className="checkbox-row">
               <input
                 type="checkbox"
@@ -738,27 +798,148 @@ function PolicyEditor({
                 策略已保存
               </span>
             )}
-            <button className="button primary" disabled={busy} type="submit">
+            {projectId && policy && (
+              <button
+                className="button secondary"
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  setSaveError('');
+                  setRestoring(true);
+                }}
+              >
+                恢复继承
+              </button>
+            )}
+            <button className="button primary" disabled={busy || !policies} type="submit">
               {busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
               保存权限策略
             </button>
           </div>
         )}
       </form>
+      {restoring && (
+        <Confirm
+          title="恢复继承系统策略"
+          description={`当前项目的覆盖配置将被清除。继承后的模式为${modes.find((item) => item.value === policies?.system.mode)?.name ?? '系统默认'}。`}
+          onClose={() => {
+            if (!busy) setRestoring(false);
+          }}
+          onConfirm={restoreDefaults}
+          label="确认恢复继承"
+          busy={busy}
+          error={saveError}
+        />
+      )}
     </Section>
   );
 }
 
-export function AIPage({ user }: { user: User }) {
+const contextActions = {
+  REPOSITORY: {
+    title: 'AI 源码分析',
+    suggestion: '分析当前仓库，说明如何构建与部署，并根据仓库内容生成流水线草稿。',
+  },
+  PIPELINE: {
+    title: 'AI 流水线辅助',
+    suggestion: '检查当前流水线配置并给出改进意见。',
+  },
+  SERVICE: {
+    title: 'AI 生成流水线',
+    suggestion: '根据当前服务与关联仓库生成流水线草稿。',
+  },
+  TASK: {
+    title: 'AI 排查任务',
+    suggestion: '诊断当前失败任务并给出验证和修复步骤。',
+  },
+  OPERATION_PLAN: {
+    title: 'AI 运维方案',
+    suggestion: '帮我整理一份运维方案草稿，并说明必要的前置检查。',
+  },
+} satisfies Record<AIContext['kind'], { title: string; suggestion: string }>;
+
+function contextKey(context?: AIContext | null) {
+  switch (context?.kind) {
+    case 'REPOSITORY':
+      return [
+        context.kind,
+        context.repositoryId,
+        context.commitSha?.toLowerCase(),
+        context.serviceId,
+      ].join(':');
+    case 'PIPELINE':
+      return `${context.kind}:${context.pipelineId}`;
+    case 'SERVICE':
+      return `${context.kind}:${context.serviceId}`;
+    case 'TASK':
+      return `${context.kind}:${context.taskId}`;
+    case 'OPERATION_PLAN':
+      return `${context.kind}:${context.operationPlanId}:${context.version ?? ''}`;
+    default:
+      return '';
+  }
+}
+
+export function ContextAIButton({
+  user,
+  context,
+  projectId,
+  objectName,
+  label = contextActions[context.kind].title,
+}: {
+  user: User;
+  context: AIContext;
+  projectId?: string;
+  objectName?: string;
+  label?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button className="button secondary small" type="button" onClick={() => setOpen(true)}>
+        <Sparkles size={16} />
+        {label}
+      </button>
+      {open &&
+        createPortal(
+          <Modal title={label} description={objectName} wide onClose={() => setOpen(false)}>
+            <div className="section-body" onSubmit={(event) => event.stopPropagation()}>
+              <AIPage
+                key={contextKey(context)}
+                user={user}
+                context={context}
+                scopedProjectId={projectId}
+                onAdopt={() => setOpen(false)}
+              />
+            </div>
+          </Modal>,
+          document.body,
+        )}
+    </>
+  );
+}
+
+export function AIPage({
+  user,
+  context,
+  scopedProjectId,
+  onAdopt,
+}: {
+  user: User;
+  context?: AIContext;
+  scopedProjectId?: string;
+  onAdopt?: () => void;
+}) {
   const servers = useResource<Server[]>('/servers');
   const providers = useResource<AIProvider[]>('/ai/providers');
   const conversations = useResource<Conversation[]>('/ai/conversations');
-  const projects = useResource<Project[]>('/projects');
+  const projects = useResource<Project[]>(context ? null : '/projects');
   const proposals = useResource<Proposal[]>('/ai/proposals', 5000);
   const policies = useResource<Policies>('/ai/policies');
   const [conversationId, setConversationId] = useState('');
   const [providerId, setProviderId] = useState('');
-  const [projectId, setProjectId] = useState('');
+  const [projectId, setProjectId] = useState(scopedProjectId ?? '');
+  const [draftServiceId, setDraftServiceId] = useState<string>();
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -766,7 +947,8 @@ export function AIPage({ user }: { user: User }) {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [sourceChanges, setSourceChanges] = useState<SourceChange[]>([]);
-  const [proposal, setProposal] = useState<Proposal>();
+  const [proposalId, setProposalId] = useState('');
+  const proposal = proposals.data?.find((item) => item.id === proposalId);
   const [proposalBusy, setProposalBusy] = useState(false);
   const [proposalError, setProposalError] = useState('');
   const messages = useResource<AIMessage[]>(
@@ -774,6 +956,15 @@ export function AIPage({ user }: { user: User }) {
   );
   const bottom = useRef<HTMLDivElement>(null);
   const available = providers.data?.filter((p) => p.enabled && p.configured) || [];
+  const visibleConversations = context
+    ? (conversations.data ?? []).filter(
+        (item) =>
+          (!scopedProjectId || item.projectId === scopedProjectId) &&
+          contextKey(item.context) === contextKey(context),
+      )
+    : (conversations.data ?? []);
+  const activeContext =
+    context ?? visibleConversations.find((item) => item.id === conversationId)?.context;
   const currentPolicy = projectId
     ? policies.data?.projects.find((p) => p.projectId === projectId) || policies.data?.system
     : policies.data?.system;
@@ -788,19 +979,24 @@ export function AIPage({ user }: { user: User }) {
     if (busy) return;
     setConversationId(c.id);
     setProjectId(c.projectId || '');
+    setDraftServiceId(undefined);
     setOptimistic([]);
     setDrafts([]);
     setTasks([]);
     setSourceChanges([]);
+    setInput('');
     setError('');
   }
   function newConversation() {
     if (busy) return;
     setConversationId('');
+    if (context) setProjectId(scopedProjectId ?? '');
+    setDraftServiceId(undefined);
     setOptimistic([]);
     setDrafts([]);
     setTasks([]);
     setSourceChanges([]);
+    setInput('');
     setError('');
   }
   async function chat(e: FormEvent) {
@@ -817,8 +1013,11 @@ export function AIPage({ user }: { user: User }) {
         conversationId: conversationId || undefined,
         projectId: projectId || undefined,
         providerId: providerId || undefined,
+        context: conversationId ? undefined : context,
       });
       setConversationId(result.conversationId);
+      if (result.projectId !== undefined) setProjectId(result.projectId ?? '');
+      setDraftServiceId(result.serviceId ?? undefined);
       setDrafts(result.drafts || []);
       setTasks(result.tasks || []);
       setSourceChanges(result.sourceChanges || []);
@@ -835,7 +1034,12 @@ export function AIPage({ user }: { user: User }) {
     }
   }
   async function decide(approve: boolean) {
-    if (!proposal) return;
+    if (
+      !proposal ||
+      proposal.status !== 'PENDING' ||
+      (approve && (proposal.scopeRevoked || user.role === 'VIEWER'))
+    )
+      return;
     setProposalBusy(true);
     setProposalError('');
     try {
@@ -844,74 +1048,90 @@ export function AIPage({ user }: { user: User }) {
       );
       if (r.task) setTasks((v) => [...v, r.task!]);
       if (r.sourceChange) setSourceChanges((v) => [...v, r.sourceChange!]);
-      setProposal(undefined);
+      setProposalId('');
       void proposals.reload();
       if (conversationId) void messages.reload();
     } catch (err) {
       setProposalError(message(err));
+      void proposals.reload();
     } finally {
       setProposalBusy(false);
     }
   }
   const pending = (proposals.data || []).filter(
-    (p) => p.status === 'PENDING' && p.expiresAt > Date.now(),
+    (p) =>
+      p.status === 'PENDING' &&
+      p.expiresAt > Date.now() &&
+      (!context || (conversationId && p.conversationId === conversationId)),
   );
   return (
     <>
-      <PageHeader
-        eyebrow="INTELLIGENT OPERATIONS"
-        title="AI 运维助手"
-        description="基于可信业务工具分析资源、生成配置，在明确权限范围内辅助执行。"
-        action={
-          <a href="#/settings" className="button secondary">
-            <Settings2 size={16} />
-            模型与权限配置
-          </a>
-        }
+      {!context && (
+        <PageHeader
+          eyebrow="INTELLIGENT OPERATIONS"
+          title="AI 运维助手"
+          description="基于可信业务工具分析资源、生成配置，在明确权限范围内辅助执行。"
+          action={
+            <a href="#/settings" className="button secondary">
+              <Settings2 size={16} />
+              模型与权限配置
+            </a>
+          }
+        />
+      )}
+      <ErrorBanner
+        error={providers.error || conversations.error || policies.error || proposals.error}
       />
-      <ErrorBanner error={providers.error || conversations.error || policies.error} />
       {!providers.loading && !available.length ? (
         <div className="panel">
           <Empty
             icon={<PlugZap size={29} />}
             title="按需连接你的 AI 服务"
-            description="AI 是可选能力。配置兼容 OpenAI 的 Base URL、API Key 和模型后，即可开始对话；手工运维功能始终可用。"
+            description={
+              user.role === 'ADMIN'
+                ? '在系统设置中添加并启用 OpenAI 兼容连接后，即可开始对话。'
+                : '管理员在系统设置中启用模型连接后，即可开始对话。'
+            }
             action={
-              <a className="button primary" href="#/settings">
-                前往配置
-              </a>
+              user.role === 'ADMIN' && (
+                <a className="button primary" href="#/settings">
+                  前往配置
+                </a>
+              )
             }
           />
         </div>
       ) : (
-        <div className="ai-workspace">
-          <aside className="panel conversation-sidebar">
-            <button className="button secondary" onClick={newConversation} disabled={busy}>
-              <MessageSquarePlus size={16} />
-              新建对话
-            </button>
-            <div className="conversation-list">
-              {conversations.data?.map((c) => (
-                <button
-                  className={conversationId === c.id ? 'active' : ''}
-                  key={c.id}
-                  onClick={() => selectConversation(c)}
-                  disabled={busy}
-                >
-                  <span>{c.title}</span>
-                  <small>{formatTime(c.updatedAt)}</small>
-                </button>
-              ))}
-              {!conversations.data?.length && <p className="muted">你的对话会保存在这里。</p>}
-            </div>
-            <div className="ai-permission-chip">
-              <ShieldCheck size={16} />
-              <div>
-                <strong>{currentMode?.name}</strong>
-                <small>{currentMode?.description}</small>
+        <div className={context ? undefined : 'ai-workspace'}>
+          {!context && (
+            <aside className="panel conversation-sidebar">
+              <button className="button secondary" onClick={newConversation} disabled={busy}>
+                <MessageSquarePlus size={16} />
+                新建对话
+              </button>
+              <div className="conversation-list">
+                {visibleConversations.map((c) => (
+                  <button
+                    className={conversationId === c.id ? 'active' : ''}
+                    key={c.id}
+                    onClick={() => selectConversation(c)}
+                    disabled={busy}
+                  >
+                    <span>{c.title}</span>
+                    <small>{formatTime(c.updatedAt)}</small>
+                  </button>
+                ))}
+                {!visibleConversations.length && <p className="muted">你的对话会保存在这里。</p>}
               </div>
-            </div>
-          </aside>
+              <div className="ai-permission-chip">
+                <ShieldCheck size={16} />
+                <div>
+                  <strong>{currentMode?.name}</strong>
+                  <small>{currentMode?.description}</small>
+                </div>
+              </div>
+            </aside>
+          )}
           <section className="panel chat-panel">
             <div className="chat-toolbar">
               <Field label="模型连接">
@@ -920,7 +1140,7 @@ export function AIPage({ user }: { user: User }) {
                   onChange={(e) => setProviderId(e.target.value)}
                   disabled={busy || !!conversationId}
                 >
-                  <option value="">默认可用连接</option>
+                  <option value="">按用途路由</option>
                   {available.map((p) => (
                     <option value={p.id} key={p.id}>
                       {p.name} · {p.model}
@@ -928,20 +1148,47 @@ export function AIPage({ user }: { user: User }) {
                   ))}
                 </select>
               </Field>
-              <Field label="项目上下文">
-                <select
-                  value={projectId}
-                  onChange={(e) => setProjectId(e.target.value)}
-                  disabled={busy || !!conversationId}
-                >
-                  <option value="">全局资源</option>
-                  {projects.data?.map((p) => (
-                    <option value={p.id} key={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-                </select>
-              </Field>
+              {context ? (
+                <Field label="当前功能的对话">
+                  <select
+                    value={conversationId}
+                    disabled={busy}
+                    onChange={(e) => {
+                      const selected = visibleConversations.find(
+                        (item) => item.id === e.target.value,
+                      );
+                      if (selected) selectConversation(selected);
+                      else newConversation();
+                    }}
+                  >
+                    <option value="">新建对话</option>
+                    {conversationId &&
+                      !visibleConversations.some((item) => item.id === conversationId) && (
+                        <option value={conversationId}>当前对话</option>
+                      )}
+                    {visibleConversations.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.title}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              ) : (
+                <Field label="项目上下文">
+                  <select
+                    value={projectId}
+                    onChange={(e) => setProjectId(e.target.value)}
+                    disabled={busy || !!conversationId}
+                  >
+                    <option value="">全局资源</option>
+                    {projects.data?.map((p) => (
+                      <option value={p.id} key={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              )}
             </div>
             <div className="chat-history" aria-live="polite">
               {messages.loading && conversationId ? (
@@ -951,14 +1198,21 @@ export function AIPage({ user }: { user: User }) {
                   <span className="ai-orb">
                     <Sparkles size={28} />
                   </span>
-                  <h2>从一个运维问题开始</h2>
-                  <p>查询服务器、分析任务失败原因，或描述你想构建的部署流程。</p>
+                  {!activeContext && (
+                    <>
+                      <h2>从一个运维问题开始</h2>
+                      <p>查询服务器、分析任务失败原因，或描述你想构建的部署流程。</p>
+                    </>
+                  )}
                   <div className="prompt-suggestions">
-                    {[
-                      '列出当前服务器并总结最近连接状态',
-                      '帮我生成 Node.js 项目的文件部署 Pipeline 草稿',
-                      '查看最近失败的任务，给出排查建议',
-                    ].map((s) => (
+                    {(activeContext
+                      ? [contextActions[activeContext.kind].suggestion]
+                      : [
+                          '列出当前服务器并总结最近连接状态',
+                          '帮我生成 Node.js 项目的文件部署 Pipeline 草稿',
+                          '查看最近失败的任务，给出排查建议',
+                        ]
+                    ).map((s) => (
                       <button key={s} onClick={() => setInput(s)}>
                         {s}
                         <ChevronRight size={14} />
@@ -1012,9 +1266,16 @@ export function AIPage({ user }: { user: User }) {
                   key={i}
                   draft={draft}
                   projectId={projectId || undefined}
+                  serviceId={
+                    draftServiceId ??
+                    (activeContext && 'serviceId' in activeContext
+                      ? activeContext.serviceId
+                      : undefined)
+                  }
+                  onAdopt={onAdopt}
                   canAdopt={user.role !== 'VIEWER'}
                   onDismiss={() => setDrafts((items) => items.filter((item) => item !== draft))}
-                  onCopyError={() => setError('无法复制，请展开预览后手动复制。')}
+                  onError={setError}
                 />
               ))}
               {tasks.map((t) => (
@@ -1073,7 +1334,12 @@ export function AIPage({ user }: { user: User }) {
                 disabled={busy}
               />
               <div>
-                <small>请勿在对话中粘贴密码或 API Key。变更请求按当前策略执行或等待审批。</small>
+                <small>
+                  {context && currentMode && (projectId || context.kind === 'OPERATION_PLAN')
+                    ? `执行权限 · ${currentMode.name}。`
+                    : ''}
+                  请勿在对话中粘贴密码或 API Key。变更请求按当前策略执行或等待审批。
+                </small>
                 <button
                   className="button primary"
                   type="submit"
@@ -1097,6 +1363,7 @@ export function AIPage({ user }: { user: User }) {
                 <ShieldCheck size={21} />
                 <div>
                   <strong>{actionLabels[p.actionType] || p.actionType}</strong>
+                  {p.scopeRevoked && <small>授权范围已变化，须重新生成提案</small>}
                   <small>
                     {riskLabels[p.riskLevel] || p.riskLevel} · 有效至 {formatTime(p.expiresAt)}
                   </small>
@@ -1105,7 +1372,7 @@ export function AIPage({ user }: { user: User }) {
                   className="button secondary small"
                   onClick={() => {
                     setProposalError('');
-                    setProposal(p);
+                    setProposalId(p.id);
                   }}
                 >
                   预览操作
@@ -1120,7 +1387,7 @@ export function AIPage({ user }: { user: User }) {
           title="审批 AI 操作"
           description="批准仅对当前步骤有效。执行前会重新核对用户、权限策略和资源范围。"
           onClose={() => {
-            if (!proposalBusy) setProposal(undefined);
+            if (!proposalBusy) setProposalId('');
           }}
           wide
         >
@@ -1141,14 +1408,20 @@ export function AIPage({ user }: { user: User }) {
           <div className="modal-footer">
             <button
               className="button secondary"
-              disabled={proposalBusy}
+              disabled={proposalBusy || proposal.status !== 'PENDING'}
               onClick={() => decide(false)}
             >
               拒绝操作
             </button>
             <button
               className="button primary"
-              disabled={proposalBusy || user.role === 'VIEWER' || proposal.expiresAt <= Date.now()}
+              disabled={
+                proposalBusy ||
+                proposal.status !== 'PENDING' ||
+                proposal.scopeRevoked ||
+                user.role === 'VIEWER' ||
+                proposal.expiresAt <= Date.now()
+              }
               onClick={() => decide(true)}
             >
               {proposalBusy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
@@ -1164,23 +1437,27 @@ export function AIPage({ user }: { user: User }) {
 function DraftCard({
   draft,
   projectId,
+  serviceId,
   canAdopt,
+  onAdopt,
   onDismiss,
-  onCopyError,
+  onError,
 }: {
   draft: Draft;
   projectId?: string;
+  serviceId?: string;
   canAdopt: boolean;
+  onAdopt?: () => void;
   onDismiss: () => void;
-  onCopyError: () => void;
+  onError: (error: string) => void;
 }) {
   let title: string;
   let content: unknown;
-  let pipeline: unknown;
+  let pipeline: Record<string, unknown> | undefined;
   if ('source' in draft) {
     title = draft.draft.name;
     content = draft.draft;
-    pipeline = content;
+    pipeline = draft.draft;
   } else if ('type' in draft) {
     title = draft.type === 'PIPELINE' ? 'Pipeline 草稿' : '运维方案草稿';
     content = draft.definition;
@@ -1192,6 +1469,29 @@ function DraftCard({
   } else {
     title = draft.title || '源代码修改建议';
     content = draft;
+  }
+  function adoptPipeline() {
+    if (!pipeline) return;
+    const project =
+      projectId ?? (typeof pipeline.projectId === 'string' ? pipeline.projectId : undefined);
+    const service =
+      serviceId ?? (typeof pipeline.serviceId === 'string' ? pipeline.serviceId : undefined);
+    try {
+      sessionStorage.setItem(
+        'veyops:pipeline-draft',
+        JSON.stringify({ ...pipeline, projectId: project, serviceId: service }),
+      );
+    } catch {
+      onError('无法暂存草稿，请展开预览后手动复制。');
+      return;
+    }
+    onAdopt?.();
+    const path = project
+      ? deliveryPath(project, 'pipelines', { serviceId: service })
+      : '/pipelines';
+    if (window.location.hash.slice(1) === path)
+      window.dispatchEvent(new Event('veyops:pipeline-draft'));
+    else navigate(path);
   }
   return (
     <div className="ai-draft-card">
@@ -1220,22 +1520,20 @@ function DraftCard({
       </details>
       <div className="row-actions">
         {Boolean(pipeline) && canAdopt ? (
-          <button
-            className="button primary small"
-            onClick={() => {
-              sessionStorage.setItem('veyops:pipeline-draft', JSON.stringify(pipeline));
-              navigate('/pipelines');
-            }}
-          >
+          <button className="button primary small" onClick={adoptPipeline}>
             采用草稿
           </button>
         ) : (
           <button
             className="button secondary small"
             onClick={() => {
+              if (!navigator.clipboard) {
+                onError('无法复制，请展开预览后手动复制。');
+                return;
+              }
               void navigator.clipboard
                 .writeText(JSON.stringify(content, null, 2))
-                .catch(onCopyError);
+                .catch(() => onError('无法复制，请展开预览后手动复制。'));
             }}
           >
             复制草稿
@@ -1249,7 +1547,13 @@ function DraftCard({
   );
 }
 
-function ProposalPreview({ proposal, servers }: { proposal: Proposal; servers: Server[] }) {
+export function ProposalPreview({ proposal, servers }: { proposal: Proposal; servers: Server[] }) {
+  if (proposal.scopeRevoked)
+    return (
+      <p className="field-note" role="status">
+        授权范围已变化，须重新生成提案
+      </p>
+    );
   const preview = proposal.preview || proposal.payload;
   const targets = Array.isArray(preview.targets)
     ? (preview.targets as { id?: string; name?: string; host?: string }[])

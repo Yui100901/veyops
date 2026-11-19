@@ -13,8 +13,8 @@ import {
 @Controller('pipelines')
 export class PipelinesController {
   constructor(private readonly pipelines: PipelinesService) {}
-  @Get() list(@Query('projectId') projectId?: string) {
-    return this.pipelines.list(projectId);
+  @Get() list(@Query('projectId') projectId?: string, @Query('serviceId') serviceId?: string) {
+    return this.pipelines.list(projectId, serviceId);
   }
   @Get(':id') get(@Param('id') id: string) {
     return this.pipelines.get(id);

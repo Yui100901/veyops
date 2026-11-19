@@ -13,6 +13,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   Req,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
@@ -35,6 +36,7 @@ import { Roles } from '../auth/auth.decorators';
 import type { CurrentUser } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { recentDeployments } from '../deployments/deployment-history';
+import { DeliveryFilters } from './delivery-filters';
 import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
 import {
@@ -44,6 +46,7 @@ import {
   requireProject,
 } from './project-relations';
 import {
+  branchCache,
   httpCloneUrl,
   isGitCredentialType,
   RepositoryMetadataController,
@@ -59,6 +62,7 @@ class ProjectDto {
 class RepositoryDto {
   @IsString() @MinLength(1) @MaxLength(100) name!: string;
   @IsString() @MaxLength(2048) cloneUrl!: string;
+  // Accepted for older clients. The remote HEAD determines the recorded default branch.
   @IsOptional() @IsString() @MaxLength(100) defaultBranch?: string;
   @IsOptional() @IsUUID() credentialId?: string | null;
   @IsOptional() @IsIn(['GITHUB', 'GITLAB', 'GITEA', 'BITBUCKET', 'CUSTOM']) provider?: string;
@@ -79,12 +83,14 @@ class EnvironmentDto {
   @IsOptional() @IsString() @MaxLength(2000) description?: string;
 }
 
-const repositoryDto = (row: Selectable<Database['repositories']>) => ({
+const repositoryDto = (row: Selectable<Database['repositories']>, cache = branchCache(row)) => ({
   id: row.id,
   name: row.name,
   cloneUrl: row.clone_url,
   provider: row.provider,
-  defaultBranch: row.default_branch,
+  defaultBranch: cache.defaultBranch,
+  branchSyncStatus: cache.status,
+  branchCount: cache.branches.length,
   credentialId: row.credential_id,
   description: row.description,
 });
@@ -113,7 +119,29 @@ export class ProjectsService {
     private readonly database: DatabaseService,
     private readonly audit: AuditService,
     private readonly relations: ProjectRelationsService,
+    private readonly metadata: RepositoryMetadataService,
   ) {}
+  async runs(projectId: string, filters: DeliveryFilters) {
+    let query = this.database.db
+      .selectFrom('pipeline_runs as r')
+      .innerJoin('tasks as t', 't.id', 'r.task_id')
+      .select([
+        'r.id',
+        'r.service_id as serviceId',
+        'r.environment_id as environmentId',
+        'r.commit_sha as commitSha',
+        'r.task_id as taskId',
+        't.name',
+        't.status',
+        'r.created_at as createdAt',
+      ])
+      .where('r.project_id', '=', projectId);
+    if (filters.serviceId) query = query.where('r.service_id', '=', filters.serviceId);
+    if (filters.environmentId) query = query.where('r.environment_id', '=', filters.environmentId);
+    if (filters.commit)
+      query = query.where('r.commit_sha', 'like', filters.commit.toLowerCase() + '%');
+    return query.orderBy('r.created_at', 'desc').orderBy('r.id', 'desc').limit(200).execute();
+  }
   async list() {
     const rows = await this.database.db
       .selectFrom('projects')
@@ -135,14 +163,11 @@ export class ProjectsService {
       environmentCount: envs.filter((e) => e.project_id === r.id).length,
     }));
   }
-  async get(id: string) {
+  async get(id: string, includeArchived = false) {
     const db = this.database.db;
-    const project = await db
-      .selectFrom('projects')
-      .selectAll()
-      .where('id', '=', id)
-      .where('deleted_at', 'is', null)
-      .executeTakeFirst();
+    let query = db.selectFrom('projects').selectAll().where('id', '=', id);
+    if (!includeArchived) query = query.where('deleted_at', 'is', null);
+    const project = await query.executeTakeFirst();
     if (!project) throw new NotFoundException('项目不存在');
     const [repositories, services, environments] = await Promise.all([
       db
@@ -166,6 +191,7 @@ export class ProjectsService {
     ]);
     return {
       id: project.id,
+      ...(includeArchived && { archived: project.deleted_at !== null }),
       name: project.name,
       slug: project.slug,
       description: project.description,
@@ -174,7 +200,7 @@ export class ProjectsService {
       createdAt: project.created_at,
       serviceCount: services.length,
       environmentCount: environments.length,
-      repositories: repositories.map(repositoryDto),
+      repositories: repositories.map((row) => repositoryDto(row)),
       services: services.map(serviceDto),
       environments: environments.map(environmentDto),
     };
@@ -346,11 +372,19 @@ export class ProjectsService {
     }
     const now = current ? Math.max(Date.now(), current.updated_at + 1) : Date.now();
     const id = repositoryId ?? randomUUID();
+    const accessChanged =
+      !current || cloneUrl !== current.clone_url || credentialId !== current.credential_id;
     const values = {
       name: dto.name,
       clone_url: cloneUrl,
       credential_id: credentialId,
-      default_branch: dto.defaultBranch || current?.default_branch || 'main',
+      ...(accessChanged && {
+        default_branch: '',
+        branch_cache_json: null,
+        branch_request_id: null,
+        branch_error: null,
+        branch_checked_at: null,
+      }),
       provider: dto.provider ?? current?.provider ?? 'CUSTOM',
       description: dto.description ?? current?.description ?? '',
       updated_at: now,
@@ -377,7 +411,13 @@ export class ProjectsService {
       projectId,
       { repositoryId: id },
     );
-    return repositoryDto(row);
+    const cache = branchCache(row);
+    return repositoryDto(
+      row,
+      cache.status === 'CURRENT'
+        ? cache
+        : await this.metadata.refreshBranches(projectId, id, 5_000),
+    );
   }
   async service(projectId: string, dto: ServiceDto, userId: string, serviceId?: string) {
     const db = this.database.db;
@@ -564,6 +604,12 @@ class ProjectsController {
   }
   @Get(':id') get(@Param('id') id: string) {
     return this.service.detail(id);
+  }
+  @Get(':id/runs') runs(@Param('id') id: string, @Query() filters: DeliveryFilters) {
+    return this.service.runs(id, filters);
+  }
+  @Get(':id/delivery-context') deliveryContext(@Param('id') id: string) {
+    return this.service.get(id, true);
   }
   @Roles('ADMIN', 'OPERATOR') @Post() create(@Body() dto: ProjectDto, @Req() req: AuthRequest) {
     return this.service.create(dto, req.user.id);

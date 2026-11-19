@@ -266,6 +266,18 @@ test('Gitea signed push builds the pinned version once and keeps the build resul
     });
     assert.equal(duplicate.body.data.taskId, taskId);
     const db = app.get(DatabaseService).db;
+    // Replaying a pre-upgrade receipt must also reuse its original build.
+    const oldKey =
+      'gitea:' +
+      createHash('sha256')
+        .update(JSON.stringify([pipelineId, push.ref, commit.toLowerCase()]))
+        .digest('hex');
+    await db
+      .updateTable('tasks')
+      .set({ idempotency_key: oldKey })
+      .where('id', '=', taskId)
+      .execute();
+    assert.equal((await deliver(raw(push)).expect(200)).body.data.taskId, taskId);
     const runs = await db
       .selectFrom('pipeline_runs')
       .innerJoin('pipeline_versions', 'pipeline_versions.id', 'pipeline_runs.pipeline_version_id')

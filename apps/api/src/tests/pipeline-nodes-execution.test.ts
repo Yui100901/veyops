@@ -11,7 +11,7 @@ import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import type { ProcessRunnerService } from '../infrastructure/build-runner/process-runner.service';
 import type { SshService, SshTarget } from '../infrastructure/ssh/ssh.service';
-import { BuildsService, type BuildSession } from '../modules/builds/builds.service';
+import { BuildsService, checkoutScript, type BuildSession } from '../modules/builds/builds.service';
 import type { CredentialsService } from '../modules/credentials/credentials.service';
 import { PipelineDefinitionDto } from '../modules/pipelines/pipeline.dto';
 import type { PipelineNode, PipelineSnapshot } from '../modules/pipelines/pipeline.types';
@@ -78,6 +78,14 @@ test(
         '.env.test':
           "DEPLOY_GROUP=dotenv-test\nLEVEL=file\nLITERAL='$(printf unsafe)'\nSECRET=stale\nVEYOPS_PROJECT_NAME=from-file\n",
       });
+      const legacyWork = join(root, 'legacy').replaceAll('\\', '/');
+      await mkdir(legacyWork);
+      await run(shell!, ['-eu', '-c', checkoutScript(primary.url, primary.commitSha, legacyWork)]);
+      const legacyGit = (...args: string[]) =>
+        run('git', ['-C', join(legacyWork, 'repo'), ...args]);
+      assert.equal((await legacyGit('rev-parse', 'HEAD')).stdout.trim(), primary.commitSha);
+      assert.equal((await legacyGit('rev-list', '--count', 'HEAD')).stdout.trim(), '1');
+      assert.equal((await legacyGit('rev-parse', '--is-shallow-repository')).stdout.trim(), 'true');
       const extra = await fixtureRepo(join(root, 'extra'), { 'support.txt': 'from-second-repo' });
       await mkdir(work);
       const repositoryId = randomUUID();

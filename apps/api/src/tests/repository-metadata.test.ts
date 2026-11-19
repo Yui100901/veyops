@@ -7,7 +7,7 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import { promisify } from 'node:util';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
@@ -18,12 +18,23 @@ const exec = promisify(execFile);
 async function gitHttpFixture(directory: string, token: string) {
   const authorization = `Basic ${Buffer.from(`fixture-user:${token}`).toString('base64')}`;
   let authenticatedRequests = 0;
-  const server = createServer((req, res) => {
+  let available = true;
+  let pauseRequest: (() => Promise<void>) | undefined;
+  const server = createServer(async (req, res) => {
+    if (!available) {
+      res.writeHead(503).end();
+      return;
+    }
     if (req.headers.authorization !== authorization) {
       res.writeHead(401, { 'www-authenticate': 'Basic realm="fixture"' }).end();
       return;
     }
     authenticatedRequests++;
+    if (pauseRequest) {
+      const wait = pauseRequest;
+      pauseRequest = undefined;
+      await wait();
+    }
     const url = new URL(req.url!, 'http://127.0.0.1');
     if (url.pathname.startsWith('/redirect.git/')) {
       res.writeHead(302, { location: req.url!.replace('/redirect.git/', '/source.git/') }).end();
@@ -77,11 +88,27 @@ async function gitHttpFixture(directory: string, token: string) {
   return {
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     authenticatedRequests: () => authenticatedRequests,
+    holdNextRequest: () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const started = new Promise<void>((resolve) => {
+        pauseRequest = () => {
+          resolve();
+          return gate;
+        };
+      });
+      return { started, release };
+    },
+    setAvailable: (value: boolean) => {
+      available = value;
+    },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
 
-test('repository metadata uses authenticated smart HTTP and returns exact commits on the selected branch', async (t) => {
+async function checkMetadata(t: TestContext, databaseUrl?: string) {
   try {
     await exec('git', ['--version']);
   } catch (error) {
@@ -180,7 +207,8 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
   const initialPassword = 'fixture-metadata-password';
   const password = 'fixture-metadata-renewed-password';
   Object.assign(process.env, {
-    DATABASE_CLIENT: 'sqlite',
+    DATABASE_CLIENT: databaseUrl ? 'postgres' : 'sqlite',
+    ...(databaseUrl && { DATABASE_URL: databaseUrl }),
     DATABASE_PATH: join(directory, 'test.db'),
     DATA_DIR: directory,
     ENCRYPTION_KEY: randomBytes(32).toString('hex'),
@@ -265,17 +293,51 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
     .post(repositoryPath)
     .send({ ...create, name: 'Public fixture' })
     .expect(201);
-  const id = (
+  await git('--git-dir', bare, 'symbolic-ref', 'HEAD', 'refs/heads/feature/release');
+  const created = (
     await admin
       .post(repositoryPath)
       .send({ ...create, credentialId: credential })
       .expect(201)
-  ).body.data.id;
+  ).body.data;
+  const id = created.id;
+  assert.equal(created.defaultBranch, 'feature/release');
+  assert.equal(created.branchSyncStatus, 'CURRENT');
   const metadataPath = `${repositoryPath}/${id}`;
 
   await viewer.get(`${metadataPath}/connection`).expect(403);
   await admin.get(`/api/v1/projects/${other}/repositories/${id}/branches`).expect(404);
-  assert.equal(fixture.authenticatedRequests(), 0);
+  const cached = (await operator.get(`${metadataPath}/branch-cache`).expect(200)).body.data;
+  assert.deepEqual(cached.branches, [
+    { name: 'feature/release', sha: feature },
+    { name: 'main', sha: main },
+  ]);
+  assert.equal(cached.defaultBranch, 'feature/release');
+  assert.equal(cached.status, 'CURRENT');
+  await viewer.post(`${metadataPath}/branch-cache/refresh`).expect(403);
+  await admin.get(`/api/v1/projects/${other}/repositories/${id}/branch-cache`).expect(404);
+  await db
+    .updateTable('repositories')
+    .set({
+      branch_cache_json: JSON.stringify({ ...cached, syncedAt: Date.now() - 16 * 60_000 }),
+    })
+    .where('id', '=', id)
+    .execute();
+  assert.equal(
+    (await operator.get(`${metadataPath}/branch-cache`).expect(200)).body.data.status,
+    'STALE',
+  );
+  fixture.setAvailable(false);
+  const offline = (await operator.post(`${metadataPath}/branch-cache/refresh`).expect(201)).body
+    .data;
+  assert.equal(offline.status, 'ERROR');
+  assert.deepEqual(offline.branches, cached.branches);
+  fixture.setAvailable(true);
+  await git('--git-dir', bare, 'symbolic-ref', 'HEAD', 'refs/heads/main');
+  const recovered = (await operator.post(`${metadataPath}/branch-cache/refresh`).expect(201)).body
+    .data;
+  assert.equal(recovered.status, 'CURRENT');
+  assert.equal(recovered.defaultBranch, 'main');
   const metadata = app.get(RepositoryMetadataService);
   const access = { clone_url: create.cloneUrl, credential_id: credential };
   assert.deepEqual(
@@ -358,7 +420,8 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
     /普通文件/,
   );
 
-  const providerRequests: { messages: { content: string }[]; tools?: unknown }[] = [];
+  const providerRequests: { model: string; messages: { content: string }[]; tools?: unknown }[] =
+    [];
   const provider = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -400,6 +463,20 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
       apiKey: 'fixture-provider-key',
     })
     .expect(201);
+  const repositoryProvider = await admin
+    .post('/api/v1/ai/providers')
+    .send({
+      name: 'Repository route',
+      baseUrl: `http://127.0.0.1:${(provider.address() as AddressInfo).port}`,
+      model: 'repository-specialist',
+      apiKey: 'fixture-provider-key',
+    })
+    .expect(201);
+  const routing = { repository: repositoryProvider.body.data.id };
+  await operator.put('/api/v1/ai/routing').send(routing).expect(403);
+  await admin.put('/api/v1/ai/routing').send({ chat: 'invalid' }).expect(400);
+  await admin.put('/api/v1/ai/routing').send(routing).expect(200);
+  assert.deepEqual((await admin.get('/api/v1/ai/routing').expect(200)).body.data, routing);
   await admin.patch('/api/v1/ai/policies').send({ mode: 'READ_ONLY' }).expect(200);
   const analysisRequest = {
     projectId: project,
@@ -440,6 +517,7 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
   assert.ok(body.data.evidencePaths.includes('services/web/pnpm-lock.yaml'));
   const [providerRequest] = providerRequests;
   assert.ok(providerRequest);
+  assert.equal(providerRequest.model, 'repository-specialist');
   assert.equal(providerRequest.tools, undefined);
   const evidenceRequest = providerRequest.messages[1].content;
   assert.match(evidenceRequest, /first-source-entry/);
@@ -511,6 +589,59 @@ test('repository metadata uses authenticated smart HTTP and returns exact commit
       .expect(201)
   ).body.data.id;
   await operator.get(`${repositoryPath}/${redirect}/connection`).expect(502);
+  await git('init', '--bare', '--initial-branch=next', join(directory, 'empty.git'));
+  const held = fixture.holdNextRequest();
+  const lateProbe = operator
+    .post(`${metadataPath}/branch-cache/refresh`)
+    .expect(201)
+    .then((response) => response.body.data);
+  try {
+    await Promise.race([
+      held.started,
+      lateProbe.then(() => {
+        throw new Error('probe returned before Git request');
+      }),
+    ]);
+    const empty = (
+      await admin
+        .patch(metadataPath)
+        .send({ ...create, cloneUrl: `${fixture.url}/empty.git` })
+        .expect(200)
+    ).body.data;
+    assert.equal(empty.branchSyncStatus, 'CURRENT');
+    assert.equal(empty.defaultBranch, null);
+    assert.equal(empty.branchCount, 0);
+  } finally {
+    held.release();
+  }
+  assert.deepEqual((await lateProbe).branches, []);
+  const invalid = (
+    await admin
+      .patch(metadataPath)
+      .send({ ...create, cloneUrl: `${fixture.url}/absent.git` })
+      .expect(200)
+  ).body.data;
+  assert.equal(invalid.branchSyncStatus, 'ERROR');
+  const invalidCache = (await operator.get(`${metadataPath}/branch-cache`).expect(200)).body.data;
+  assert.deepEqual(invalidCache.branches, []);
+  assert.equal(invalidCache.syncedAt, null);
   await admin.delete(`/api/v1/projects/${project}`).expect(200);
   await operator.get(`${metadataPath}/connection`).expect(404);
-});
+}
+
+test('SQLite repository synchronization and authenticated smart HTTP metadata', (t) =>
+  checkMetadata(t));
+test(
+  'PostgreSQL repository synchronization and authenticated smart HTTP metadata',
+  {
+    skip: !process.env.VEYOPS_TEST_POSTGRES_URL,
+  },
+  async (t) => {
+    const { withIsolatedPostgres } = await import('./helpers/isolated-postgres.js');
+    await withIsolatedPostgres(process.env.VEYOPS_TEST_POSTGRES_URL!, async (url) => {
+      await t.test('persists branch snapshots and recovers after failed probes', (context) =>
+        checkMetadata(context, url),
+      );
+    });
+  },
+);

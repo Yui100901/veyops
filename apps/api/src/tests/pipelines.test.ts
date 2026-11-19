@@ -790,7 +790,7 @@ for (const location of ['TARGET', 'MANAGER'] as const)
               const mount = args.find((a) => a.endsWith(',dst=/workspace'))!;
               const workspace = mount.slice('type=bind,src='.length, -',dst=/workspace'.length);
               const script = args.at(-1)!;
-              if (script.includes('clone --no-checkout')) {
+              if (script.includes('fetch --no-recurse-submodules --no-tags --depth=1')) {
                 managers++;
                 await mkdir(join(workspace, 'repo'), { recursive: true });
                 await writeFile(join(workspace, 'repo', 'Dockerfile'), 'FROM scratch');

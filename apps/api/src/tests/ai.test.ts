@@ -22,6 +22,7 @@ import {
   sanitizeAiText,
 } from '../infrastructure/ai-provider/openai-compatible.service';
 import { ProjectsService } from '../modules/projects/projects.service';
+import { RepositoryMetadataService } from '../modules/projects/repository-metadata.service';
 import { ProjectRelationsService } from '../modules/projects/project-relations';
 import { ServersService } from '../modules/servers/servers.service';
 import { TasksService } from '../modules/tasks/tasks.service';
@@ -75,6 +76,7 @@ async function fixture() {
     database,
     audit,
     new ProjectRelationsService(database, audit),
+    new RepositoryMetadataService(database, credentials),
   );
   const wire = new OpenAiCompatibleService();
   const providers = new AiProvidersService(repository, credentials, wire, audit);
@@ -236,6 +238,104 @@ test('OpenAI compatibility normalizes roots and /v1, rejects embedded credential
     sanitizeAiText('password=abc api_key=xyz sk-1234567890abcdefgh'),
     'password=[REDACTED] api_key=[REDACTED] [REDACTED]',
   );
+});
+test('routes chat, repository analysis and failure diagnosis to configured providers and preserves explicit selection', async () => {
+  const f = await fixture();
+  const calls: string[] = [];
+  const http = await upstream((body) => {
+    calls.push(body.model);
+    return { body: { choices: [{ message: { content: 'OK' } }] } };
+  });
+  try {
+    async function provider(model: string) {
+      return f.providers.create(
+        {
+          name: model,
+          model,
+          baseUrl: http.url,
+          apiKey: 'local-fixture-key',
+          enabled: true,
+          timeoutSeconds: 8,
+        },
+        f.actor.id,
+      );
+    }
+    const first = await provider('general'),
+      second = await provider('analysis');
+    await f.providers.setRoutes(
+      { chat: second.id, repository: first.id, diagnosis: second.id },
+      f.actor.id,
+    );
+    await f.ai.chat({ message: 'test chat' }, f.actor);
+    await f.ai.chat({ message: 'explicit', providerId: first.id }, f.actor);
+    assert.deepEqual(calls, ['analysis', 'general']);
+    assert.equal((await f.providers.resolve(undefined, 'repository')).id, first.id);
+    assert.equal((await f.providers.resolve(undefined, 'diagnosis')).id, second.id);
+    await f.providers.update(second.id, { enabled: false }, f.actor.id);
+    await assert.rejects(f.ai.chat({ message: 'unavailable' }, f.actor), /禁用/);
+    await assert.rejects(f.providers.setRoutes({ repository: second.id }, f.actor.id), /启用/);
+    assert.equal((await f.providers.routes()).chat, second.id);
+    assert.equal(calls.length, 2);
+    await f.providers.setRoutes({}, f.actor.id);
+    assert.equal((await f.providers.resolve()).id, first.id);
+  } finally {
+    await http.close();
+    await f.close();
+  }
+});
+test('conditional AI rules intersect role, operation and distinct targets, deny a mixed batch and recheck a pending proposal', async () => {
+  const f = await fixture();
+  try {
+    const second = randomUUID();
+    const scope = { mode: 'FULL_CONTROL' as const, serverIds: [f.target.id, second] };
+    const action = {
+      action: 'initialize_component',
+      projectId: f.projectId,
+      serverIds: [f.target.id, second],
+    };
+    await f.policy.update(
+      {
+        ...scope,
+        actionRules: [
+          { action: 'initialize_component', effect: 'CONFIRM', minimumTargets: 2, role: 'ADMIN' },
+          { action: 'initialize_component', effect: 'DENY', serverId: second, role: 'OPERATOR' },
+        ],
+      },
+      f.actor,
+    );
+    await f.policy.update({ ...scope, projectId: f.projectId }, f.actor);
+    const snap = await f.policy.snapshot(f.projectId);
+    assert.equal(f.policy.evaluate(f.actor, action, snap), 'REQUIRE_CONFIRM');
+    assert.equal(
+      f.policy.evaluate(f.actor, { ...action, serverIds: [f.target.id, f.target.id] }, snap),
+      'ALLOW',
+    );
+    assert.throws(() => f.policy.evaluate({ ...f.actor, role: 'OPERATOR' }, action, snap), /禁止/);
+    const prepared = await f.tools.prepare('execute_command', {
+      serverIds: [f.target.id],
+      command: 'uname',
+    });
+    const proposal = await f.proposals.create(
+      { ...prepared, projectId: f.projectId },
+      snap,
+      f.actor,
+    );
+    await f.policy.update(
+      {
+        ...scope,
+        actionRules: [{ action: 'execute_command', effect: 'DENY', serverId: f.target.id }],
+      },
+      f.actor,
+    );
+    await f.policy.update(scope, f.actor);
+    await assert.rejects(f.proposals.confirm(proposal.id, f.actor), /禁止/);
+    assert.equal(f.executeCount(), 0);
+    await f.policy.update({ ...scope, actionRules: [] }, f.actor);
+    await f.proposals.confirm(proposal.id, f.actor);
+    assert.equal(f.executeCount(), 1);
+  } finally {
+    await f.close();
+  }
 });
 test('AI is optional; provider keys are encrypted and metadata never returns plaintext; disabled provider cannot run', async () => {
   const f = await fixture();
@@ -418,8 +518,248 @@ test('project-bound command proposals retain project policy when confirming', as
     );
     await f.policy.update({ mode: 'READ_ONLY', projectId: f.projectId }, f.actor);
     await assert.rejects(f.proposals.confirm(proposal.id, f.actor), /只读/);
+    await f.policy.update({ mode: 'CONFIRM', projectId: f.projectId, serverIds: [] }, f.actor);
+    const [withdrawn] = await f.proposals.list(f.actor);
+    assert.deepEqual(withdrawn?.preview, {});
+    assert.deepEqual(withdrawn?.payload, {});
+    assert.equal('scopeRevoked' in withdrawn! && withdrawn.scopeRevoked, true);
+    await assert.rejects(f.proposals.confirm(proposal.id, f.actor), /未授权/);
+    assert.deepEqual((await f.proposals.reject(proposal.id, f.actor)).proposal.preview, {});
     assert.equal(f.executeCount(), 0);
   } finally {
+    await f.close();
+  }
+});
+test('resetting one project AI policy restores inheritance without changing other overrides', async () => {
+  const f = await fixture();
+  try {
+    const otherProject = randomUUID();
+    await f.database.db
+      .insertInto('projects')
+      .values({
+        id: otherProject,
+        name: 'Other project',
+        slug: 'other',
+        created_by: f.actor.id,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      })
+      .execute();
+    await f.policy.update({ mode: 'READ_ONLY' }, f.actor);
+    await f.policy.update({ mode: 'CONFIRM', projectId: f.projectId }, f.actor);
+    await f.policy.update({ mode: 'CONFIRM', projectId: otherProject }, f.actor);
+    await assert.rejects(
+      f.policy.resetProject(f.projectId, { ...f.actor, role: 'OPERATOR' }),
+      /仅管理员/,
+    );
+    const result = await f.policy.resetProject(f.projectId, f.actor);
+    assert.equal(result.system.mode, 'READ_ONLY');
+    assert.deepEqual(
+      result.projects.map(({ projectId }) => projectId),
+      [otherProject],
+    );
+    assert.equal((await f.policy.snapshot(f.projectId)).mode, 'READ_ONLY');
+    assert.equal((await f.policy.snapshot(otherProject)).mode, 'CONFIRM');
+    await f.policy.update(
+      { mode: 'READ_ONLY', projectId: otherProject, deniedActions: ['list_projects'] },
+      f.actor,
+    );
+    const visible = await f.tools.read(
+      'list_projects',
+      {},
+      await f.policy.snapshot(),
+      undefined,
+      f.actor,
+    );
+    assert.deepEqual(
+      (visible as { id: string }[]).map(({ id }) => id),
+      [f.projectId],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test('AI page context is retained and refuses cross-service drafts and out-of-scope actions', async () => {
+  const f = await fixture();
+  const serviceId = randomUUID(),
+    siblingId = randomUUID(),
+    repositoryId = randomUUID();
+  let callCount = 0;
+  const server = await upstream((body) => {
+    callCount++;
+    assert.equal(
+      body.tools.some(
+        (entry: { function: { name: string } }) => entry.function.name === 'execute_command',
+      ),
+      false,
+    );
+    if (callCount !== 1) return { body: { choices: [{ message: { content: '分析完成' } }] } };
+    const draft = (id: string, service?: string) => ({
+      id,
+      type: 'function',
+      function: {
+        name: 'draft_pipeline',
+        arguments: JSON.stringify({
+          definition: JSON.stringify({
+            name: 'Page draft',
+            serviceId: service,
+            definition: { repositoryId },
+          }),
+        }),
+      },
+    });
+    return {
+      body: {
+        choices: [
+          {
+            message: {
+              content: null,
+              tool_calls: [
+                draft('drift', siblingId),
+                draft('bound'),
+                {
+                  id: 'command',
+                  type: 'function',
+                  function: {
+                    name: 'execute_command',
+                    arguments: JSON.stringify({ serverIds: [f.target.id], command: 'uname' }),
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    };
+  });
+  try {
+    await f.database.db
+      .insertInto('services')
+      .values(
+        [serviceId, siblingId].map((id, index) => ({
+          id,
+          project_id: f.projectId,
+          name: `Service ${index}`,
+          slug: `service-${index}`,
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        })),
+      )
+      .execute();
+    await f.database.db
+      .insertInto('repositories')
+      .values({
+        id: repositoryId,
+        project_id: f.projectId,
+        name: 'Repository',
+        clone_url: 'https://git.example.invalid/project.git',
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      })
+      .execute();
+    await f.providers.create(
+      {
+        name: 'Mock',
+        baseUrl: server.url,
+        model: 'test',
+        apiKey: 'fixture-key',
+        timeoutSeconds: 5,
+        enabled: true,
+      },
+      f.actor.id,
+    );
+    const context = { kind: 'SERVICE' as const, serviceId };
+    const scoped = await f.repository.resolveContext(context, f.projectId, f.actor);
+    const hiddenRepo = randomUUID();
+    await f.database.db
+      .insertInto('repositories')
+      .values({
+        id: hiddenRepo,
+        project_id: f.projectId,
+        name: 'Restricted',
+        clone_url: 'https://git.example.invalid/private.git',
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      })
+      .execute();
+    await f.policy.update(
+      { mode: 'READ_ONLY', projectId: f.projectId, repositoryIds: [repositoryId] },
+      f.actor,
+    );
+    const scopedPolicy = await f.policy.snapshot(f.projectId);
+    const metadata = await f.tools.read(
+      'get_project',
+      { projectId: f.projectId },
+      scopedPolicy,
+      f.projectId,
+      f.actor,
+      scoped,
+    );
+    assert.equal(JSON.stringify(metadata).includes(hiddenRepo), false);
+    assert.equal(JSON.stringify(metadata).includes(siblingId), false);
+    await assert.rejects(
+      f.tools.read(
+        'draft_pipeline',
+        {
+          definition: JSON.stringify({
+            definition: { repositoryId, nodes: [{ type: 'SOURCE', repositoryId: hiddenRepo }] },
+          }),
+        },
+        scopedPolicy,
+        f.projectId,
+        f.actor,
+        scoped,
+      ),
+      /授权范围/,
+    );
+    await assert.rejects(
+      f.ai.chat({ context, projectId: randomUUID(), message: '错误项目' }, f.actor),
+      /当前项目不一致/,
+    );
+    const reply = await f.ai.chat({ context, message: '生成流水线' }, f.actor);
+    assert.equal(reply.projectId, f.projectId);
+    assert.equal(reply.serviceId, serviceId);
+    assert.deepEqual(reply.drafts, [
+      {
+        type: 'PIPELINE',
+        definition: {
+          name: 'Page draft',
+          serviceId,
+          projectId: f.projectId,
+          definition: { repositoryId },
+        },
+        draftOnly: true,
+      },
+    ]);
+    assert.equal(reply.proposals.length, 0);
+    assert.equal(f.executeCount(), 0);
+    assert.deepEqual((await f.ai.conversations(f.actor.id))[0]?.context, context);
+    assert.ok(
+      (await f.ai.messages(reply.conversationId, f.actor)).every(
+        ({ role }) => role !== 'PAGE_CONTEXT',
+      ),
+    );
+    await assert.rejects(
+      f.ai.chat(
+        {
+          conversationId: reply.conversationId,
+          context: { kind: 'SERVICE', serviceId: siblingId },
+          message: '切换页面',
+        },
+        f.actor,
+      ),
+      /不能在运行时修改/,
+    );
+    assert.deepEqual(
+      (await f.ai.chat({ conversationId: reply.conversationId, message: '继续' }, f.actor)).context,
+      context,
+    );
+    await f.policy.update({ mode: 'READ_ONLY', projectIds: [] }, f.actor);
+    await assert.rejects(f.ai.messages(reply.conversationId, f.actor), /项目不在/);
+    assert.deepEqual(await f.ai.conversations(f.actor.id), []);
+  } finally {
+    await server.close();
     await f.close();
   }
 });
@@ -474,9 +814,9 @@ test('AI chat handles tool calls, saves only safe conversation content and never
     assert.equal(f.executeCount(), 0);
     assert.equal(callCount, 2);
     assert.equal(JSON.stringify(result).includes(key), false);
-    const stored = await f.ai.messages(result.conversationId, f.actor.id);
+    const stored = await f.ai.messages(result.conversationId, f.actor);
     assert.equal(JSON.stringify(stored).includes(key), false);
-    await assert.rejects(f.ai.messages(result.conversationId, f.other.id), /不存在/);
+    await assert.rejects(f.ai.messages(result.conversationId, f.other), /不存在/);
     await f.proposals.confirm(result.proposals[0]!.id, f.actor);
     assert.equal(f.executeCount(), 1);
   } finally {
@@ -539,7 +879,7 @@ test('all AI modes can inspect; READ_ONLY does not submit initialization, CONFIR
     assert.equal(denied.tasks.length, 0);
     assert.equal(denied.proposals.length, 0);
     assert.equal(f.executeCount(), 0);
-    const stored = await f.ai.messages(denied.conversationId, f.actor.id);
+    const stored = await f.ai.messages(denied.conversationId, f.actor);
     assert.ok(stored.some((m) => m.role === 'TOOL' && m.content.includes('只读模式')));
     assert.ok(stored.some((m) => m.role === 'TOOL' && m.content.includes('"git":"available"')));
 
@@ -777,7 +1117,7 @@ test('a consumed proposal with a submission failure cannot be replayed', async (
     await assert.rejects(f.proposals.confirm(proposal.id, f.actor), /不会自动重试/);
     await assert.rejects(f.proposals.confirm(proposal.id, f.actor), /已处理/);
     assert.equal(attempts, 1);
-    assert.equal((await f.proposals.list(f.actor.id))[0]!.status, 'APPROVED');
+    assert.equal((await f.proposals.list(f.actor))[0]!.status, 'APPROVED');
   } finally {
     await f.close();
   }

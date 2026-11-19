@@ -96,6 +96,10 @@ export interface RepositoriesTable {
   clone_url: string;
   credential_id: Generated<string | null>;
   default_branch: Generated<string>;
+  branch_cache_json: Generated<string | null>;
+  branch_checked_at: Generated<number | null>;
+  branch_error: Generated<string | null>;
+  branch_request_id: Generated<string | null>;
   description: Generated<string>;
   created_at: number;
   updated_at: number;
@@ -151,6 +155,7 @@ export interface DeploymentTargetServersTable {
 }
 
 export interface ServiceEnvironmentConfigsTable {
+  execution_mode: Generated<'BUILD_ONLY' | 'DEPLOY' | null>;
   id: string;
   service_id: string;
   environment_id: string;
@@ -237,6 +242,8 @@ export interface PipelineVersionsTable {
 }
 
 export interface PipelineWebhooksTable {
+  follow_mode: Generated<number>;
+  confirmed_mode: Generated<'BUILD_ONLY' | 'DEPLOY'>;
   pipeline_id: string;
   pipeline_version: number;
   configuration_hash: string;
@@ -617,7 +624,105 @@ export interface NotificationMailTable {
   error: Generated<string | null>;
 }
 
+export interface PipelineTriggersTable {
+  id: string;
+  pipeline_id: string;
+  kind: 'SCHEDULE' | 'POLL';
+  version: number;
+  environment_id: string;
+  branch: string;
+  repository_id: string;
+  owner_id: string;
+  configuration_hash: string;
+  timing_json: string;
+  repository_hash: string;
+  mode: 'BUILD_ONLY' | 'DEPLOY';
+  target_json: string | null;
+  build_current: number;
+  baseline_sha: string | null;
+  status: string;
+  reason: string | null;
+  next_at: number | null;
+  anchor_at: number;
+  lease_id: string | null;
+  lease_until: number | null;
+  failures: number;
+}
+export interface PipelineTriggerHistoryTable {
+  id: string;
+  pipeline_id: string;
+  kind: string;
+  status: string;
+  version: number | null;
+  environment_id: string | null;
+  branch: string | null;
+  commit_sha: string | null;
+  mode: string | null;
+  task_id: string | null;
+  reason: string | null;
+  scheduled_at: number | null;
+  trigger_id: string | null;
+  created_at: number;
+}
+
 export interface Database {
+  monitor_settings: {
+    id: number;
+    enabled: number;
+    interval_seconds: number;
+    retention_days: number;
+    concurrency: number;
+  };
+  monitor_hosts: {
+    server_id: string;
+    enabled: number;
+    interface_name: string | null;
+    next_at: number;
+    lease: string | null;
+    lease_until: number;
+    failures: number;
+    attempt_at: number | null;
+    sampled_at: number | null;
+    raw_json: string | null;
+    metrics_json: string | null;
+    error: string | null;
+  };
+  monitor_samples: {
+    id: string;
+    server_id: string;
+    at: number;
+    raw_json: string | null;
+    metrics_json: string | null;
+  };
+  ai_failure_settings: {
+    service_id: string;
+    environment_id: string;
+    revision: string;
+    enabled: number;
+    component: 'docker' | 'compose' | 'node' | 'nginx' | null;
+  };
+  ai_failure_incidents: {
+    task_id: string;
+    service_id: string;
+    environment_id: string;
+    revision: string;
+    status:
+      | 'PENDING'
+      | 'DIAGNOSING'
+      | 'ADVICE'
+      | 'AWAITING_APPROVAL'
+      | 'REPAIRING'
+      | 'VERIFIED'
+      | 'MANUAL';
+    summary: string;
+    findings_json: Generated<string>;
+    proposal_id: Generated<string | null>;
+    repair_task_id: Generated<string | null>;
+    created_at: number;
+    updated_at: number;
+  };
+  pipeline_triggers: PipelineTriggersTable;
+  pipeline_trigger_history: PipelineTriggerHistoryTable;
   users: UsersTable;
   auth_sessions: AuthSessionsTable;
   system_settings: SystemSettingsTable;

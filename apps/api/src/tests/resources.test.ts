@@ -134,7 +134,8 @@ async function checkResources(databaseUrl?: string) {
     ]);
     assert.equal(editedService.serviceType, 'API');
     assert.equal(editedEnvironment.environmentType, 'TESTING');
-    assert.equal(editedRepo.defaultBranch, 'develop');
+    assert.equal(editedRepo.defaultBranch, null);
+    assert.equal(editedRepo.branchSyncStatus, 'ERROR');
     const fixtureTarget = await create('/deployment-targets', {
       name: 'Fixture deploy',
       serverIds: [server.id],

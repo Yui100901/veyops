@@ -1,6 +1,7 @@
 import { useId, useState } from 'react';
 import { ArrowDown, ArrowUp, Plus, Trash2 } from 'lucide-react';
 import { useResource } from '../api';
+import { BranchSyncControls, useRepositoryBranches } from './RepositoryBranches';
 import { ErrorBanner, Field } from '../components';
 import type { Credential, ProjectDetail } from '../models';
 import { PipelineNodeGraph, pipelineNodeLabels, type PipelineNodeType } from './PipelineNodeGraph';
@@ -218,11 +219,6 @@ export default function PipelineNodesEditor({
   );
 }
 
-interface RepositoryBranches {
-  defaultBranch: string | null;
-  branches: { name: string; sha: string }[];
-}
-
 function repositoryPath(projectId?: string, repositoryId?: string) {
   return projectId && repositoryId
     ? `/projects/${encodeURIComponent(projectId)}/repositories/${encodeURIComponent(repositoryId)}`
@@ -246,7 +242,7 @@ function CheckoutNodeFields({
   const selectedRepository = node.repositoryId || primaryRepositoryId;
   const primaryName = project?.repositories.find(({ id }) => id === primaryRepositoryId)?.name;
   const path = repositoryPath(project?.id, selectedRepository);
-  const branches = useResource<RepositoryBranches>(path ? `${path}/branches` : null);
+  const branches = useRepositoryBranches(path);
   return (
     <>
       <div className="form-grid">
@@ -287,7 +283,7 @@ function CheckoutNodeFields({
           />
         </Field>
       </div>
-      <ErrorBanner error={branches.error} retry={branches.reload} />
+      <BranchSyncControls branches={branches} />
       <datalist id={listId}>
         {branches.data?.branches.map(({ name }) => (
           <option key={name} value={name} />
@@ -502,7 +498,7 @@ function EnvironmentFilePicker({
   const [selectedBranch, setSelectedBranch] = useState('');
   const source = sources.find(({ id }) => id === sourceId);
   const path = repositoryPath(project?.id, source?.repositoryId || primaryRepositoryId);
-  const branches = useResource<RepositoryBranches>(path ? `${path}/branches` : null);
+  const branches = useRepositoryBranches(path);
   const preferredBranch = source?.environmentBranches?.[environmentId] || source?.branch;
   const branch = preferredBranch || selectedBranch;
   const commitSha = branches.data?.branches.find(({ name }) => name === branch)?.sha;
@@ -571,7 +567,7 @@ function EnvironmentFilePicker({
           </select>
         </Field>
       )}
-      <ErrorBanner error={branches.error} retry={branches.reload} />
+      <BranchSyncControls branches={branches} />
       <ErrorBanner error={files.error} retry={files.reload} />
       {branch && branches.loading && <p className="field-note">正在读取分支…</p>}
       {branch && !branches.loading && !branches.error && !commitSha && (

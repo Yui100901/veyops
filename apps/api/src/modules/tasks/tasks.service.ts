@@ -24,6 +24,7 @@ import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
 const terminal = new Set<string>(terminalTaskStatuses);
 export const isTerminalStatus = (status: string) => terminal.has(status);
 function retryable(task: Selectable<TasksTable>, target: Selectable<TaskTargetsTable>) {
+  if (task.idempotency_key?.startsWith('ai-repair:')) return false;
   return (
     (task.task_type === 'COMMAND' || task.task_type === 'OPERATION_PLAN') &&
     isTerminalStatus(task.status) &&
@@ -48,6 +49,8 @@ function presentTask(task: Selectable<TasksTable>, payload: TaskPayload) {
     status: task.status,
     createdBy: task.created_by,
     projectId: task.project_id,
+    serviceId: task.service_id,
+    environmentId: task.environment_id,
     createdAt: task.created_at,
     startedAt: task.started_at,
     finishedAt: task.finished_at,
@@ -92,11 +95,14 @@ export class TasksService {
   async create(
     input: CreateTaskInput,
     userId: string,
-    beforeInsert?: (tx: Transaction<Database>) => Promise<void>,
+    beforeInsert?: (tx: Transaction<Database>) => Promise<string | void>,
+    afterInsert?: (tx: Transaction<Database>, taskId: string) => Promise<void>,
   ) {
     const taskId = await this.database.db.transaction().execute(async (tx) => {
-      await beforeInsert?.(tx);
-      return this.createInTransaction(tx, input, userId);
+      const existing = await beforeInsert?.(tx);
+      const id = existing || (await this.createInTransaction(tx, input, userId));
+      await afterInsert?.(tx, id);
+      return id;
     });
     return this.get(taskId);
   }
@@ -113,6 +119,25 @@ export class TasksService {
         pipeline.deploymentArtifacts.map((artifact) => artifact.id),
       );
     let payload = input.payload;
+    if (pipeline && targets.some((target) => target.credentialId && !target.credentialNonce)) {
+      const ids = [
+        ...new Set(targets.flatMap((target) => (target.credentialId ? [target.credentialId] : []))),
+      ];
+      const credentials = await tx
+        .selectFrom('credentials')
+        .select(['id', 'nonce'])
+        .where('id', 'in', ids)
+        .where('status', '=', 'ACTIVE')
+        .execute();
+      const versions = new Map(credentials.map((credential) => [credential.id, credential.nonce]));
+      payload = {
+        ...payload,
+        targets: targets.map((target) => ({
+          ...target,
+          credentialNonce: target.credentialNonce ?? versions.get(target.credentialId ?? ''),
+        })),
+      };
+    }
     let availableAt = now;
     if (input.type === 'PIPELINE' && pipeline && pipeline.mode !== 'BUILD_ONLY') {
       const { policy } = await serviceReleasePolicy(tx, pipeline.serviceId, pipeline.environmentId);
@@ -121,7 +146,7 @@ export class TasksService {
       const releasePolicy = pipeline.rollbackOfDeploymentId
         ? { ...(pipeline.releasePolicy ?? policy), requireApproval, rollbackMode: 'OFF' as const }
         : { ...policy, requireApproval };
-      payload = { ...input.payload, pipeline: { ...pipeline, releasePolicy } };
+      payload = { ...payload, pipeline: { ...pipeline, releasePolicy } };
       if (requireApproval) availableAt = pendingReleaseApprovalTime;
     }
     const inserted = await tx

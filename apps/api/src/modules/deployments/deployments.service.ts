@@ -7,6 +7,7 @@ import type { PipelineSnapshot, PipelineTarget } from '../pipelines/pipeline.typ
 import { lockTaskLease, TaskLeaseUnavailableError } from '../tasks/task-lease';
 import { assertCurrentTargets, serviceReleasePolicy } from './release-policy';
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
+import { DeliveryRecordFilters } from '../projects/delivery-filters';
 
 export type DeploymentHealth = 'NOT_CHECKED' | 'HEALTHY' | 'FAILED' | 'UNKNOWN';
 @Injectable()
@@ -30,14 +31,15 @@ export class DeploymentsService {
     const { policy } = await serviceReleasePolicy(db, snapshot.serviceId, snapshot.environmentId);
     const requiresApproval = policy.requireApproval || snapshot.releasePolicy?.requireApproval;
     if (!requiresApproval && snapshot.mode !== 'DEPLOY_ARTIFACT') return;
-    if (targets && (requiresApproval || snapshot.rollbackOfDeploymentId))
+    const automatic = snapshot.triggerType && snapshot.triggerType !== 'MANUAL';
+    if (targets && (automatic || requiresApproval || snapshot.rollbackOfDeploymentId))
       await assertCurrentTargets(db, snapshot, targets);
     let query = db
       .selectFrom('tasks')
       .innerJoin('users as requester', 'requester.id', 'tasks.created_by')
       .select('tasks.id')
       .where('tasks.id', '=', taskId)
-      .where('requester.role', 'in', ['ADMIN', 'OPERATOR'])
+      .where('requester.role', 'in', automatic ? ['ADMIN'] : ['ADMIN', 'OPERATOR'])
       .where('requester.status', '=', 'ACTIVE')
       .where('requester.must_change_password', '=', 0);
     if (requiresApproval) {
@@ -227,7 +229,7 @@ export class DeploymentsService {
       return Boolean(await update.returning('id').executeTakeFirst());
     });
   }
-  async list(projectId?: string) {
+  async list(projectId?: string, filters: DeliveryRecordFilters = {}) {
     let q = this.database.db
       .selectFrom('deployment_records')
       .innerJoin('pipeline_runs', 'pipeline_runs.id', 'deployment_records.pipeline_run_id')
@@ -235,6 +237,7 @@ export class DeploymentsService {
       .selectAll('deployment_records')
       .select([
         'pipeline_runs.project_id',
+        'pipeline_runs.commit_sha',
         'pipeline_runs.task_id',
         'artifacts.pruned_at',
         'artifacts.storage_type',
@@ -267,11 +270,20 @@ export class DeploymentsService {
           .as('rollback_status'),
       );
     if (projectId) q = q.where('pipeline_runs.project_id', '=', projectId);
+    if (filters.recordId) q = q.where('deployment_records.id', '=', filters.recordId);
+    if (filters.pipelineRunId) q = q.where('pipeline_runs.id', '=', filters.pipelineRunId);
+    if (filters.taskId) q = q.where('pipeline_runs.task_id', '=', filters.taskId);
+    if (filters.serviceId) q = q.where('deployment_records.service_id', '=', filters.serviceId);
+    if (filters.environmentId)
+      q = q.where('deployment_records.environment_id', '=', filters.environmentId);
+    if (filters.commit)
+      q = q.where('pipeline_runs.commit_sha', 'like', filters.commit.toLowerCase() + '%');
     return (await q.orderBy('deployment_records.started_at', 'desc').limit(200).execute()).map(
       (r) => ({
         id: r.id,
         projectId: r.project_id,
         taskId: r.task_id,
+        sourceCommit: r.commit_sha,
         pipelineRunId: r.pipeline_run_id,
         artifactId: r.artifact_id,
         serviceId: r.service_id,
@@ -297,7 +309,7 @@ export class DeploymentsService {
 @Controller('deployments')
 export class DeploymentsController {
   constructor(private readonly service: DeploymentsService) {}
-  @Get() list(@Query('projectId') projectId?: string) {
-    return this.service.list(projectId);
+  @Get() list(@Query() filters: DeliveryRecordFilters) {
+    return this.service.list(filters.projectId, filters);
   }
 }

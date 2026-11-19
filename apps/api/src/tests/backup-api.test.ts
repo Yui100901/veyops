@@ -80,9 +80,16 @@ async function checkManagedBackups(t: TestContext, databaseUrl?: string) {
     }
     await rm(root, { recursive: true, force: true });
   });
-  for (let attempt = 0; ; attempt += 1) {
+  // A fresh PostgreSQL schema may migrate over a remote database connection.
+  const startupDeadline = Date.now() + (client === 'postgres' ? 90000 : 15000);
+  for (;;) {
     if ((await fetch(origin + '/health').catch(() => null))?.ok) break;
-    if (child.exitCode !== null || attempt === 80) throw new Error('Backup API startup failed');
+    if (child.exitCode !== null || child.signalCode !== null)
+      throw new Error(
+        `Backup API exited before becoming ready (${child.exitCode ?? child.signalCode})`,
+      );
+    if (Date.now() >= startupDeadline)
+      throw new Error('Timed out waiting for backup API migrations and startup');
     await delay(150);
   }
 

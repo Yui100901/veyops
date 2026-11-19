@@ -143,14 +143,86 @@ test('versioned batch operations validate parameters, preserve snapshots and sto
     };
     const plan = await api.post('/api/v1/operation-plans').send(planDefinition).expect(201);
     const planPath = '/api/v1/operation-plans/' + plan.body.data.id;
+    const operator = request.agent(app.getHttpServer());
+    const operatorAccount = { username: 'plan-operator', password: initialPassword };
+    const user = await api
+      .post('/api/v1/users')
+      .send({ ...operatorAccount, role: 'OPERATOR' })
+      .expect(201);
+    await operator.post('/api/v1/auth/login').send(operatorAccount).expect(201);
+    await operator
+      .post('/api/v1/auth/change-password')
+      .send({ currentPassword: initialPassword, newPassword: password })
+      .expect(200);
+    await operator
+      .post('/api/v1/auth/login')
+      .send({ ...operatorAccount, password })
+      .expect(201);
+    const group = await api
+      .post('/api/v1/server-groups')
+      .send({ name: 'Maintenance group', serverIds: [server.body.data.id] })
+      .expect(201);
+    const selection = { groupIds: [group.body.data.id] };
+    const preview = await operator.post('/api/v1/commands/preview').send(selection).expect(201);
+    const confirmedPlan = {
+      ...selection,
+      confirmed: true,
+      parameters: { MESSAGE: 'fixture' },
+      version: 1,
+      expectedTargetHash: preview.body.data.targetHash,
+    };
+    const existingTaskCount = (await api.get('/api/v1/tasks').expect(200)).body.data.length;
+    await api
+      .patch('/api/v1/users/' + user.body.data.id)
+      .send({ role: 'VIEWER' })
+      .expect(200);
+    await operator
+      .post(planPath + '/run')
+      .send(confirmedPlan)
+      .expect(401);
+    await operator
+      .post('/api/v1/auth/login')
+      .send({ ...operatorAccount, password })
+      .expect(201);
+    await operator.get(planPath + '/versions').expect(200);
+    await operator
+      .post(planPath + '/run')
+      .send(confirmedPlan)
+      .expect(403);
+
+    const replacement = await api
+      .post('/api/v1/servers')
+      .send({
+        name: 'Replacement target',
+        host: 'replacement.test',
+        username: 'tester',
+        credentialId: credential.body.data.id,
+        hostKeyFingerprint: '1'.repeat(64),
+      })
+      .expect(201);
+    await api
+      .patch('/api/v1/server-groups/' + group.body.data.id)
+      .send({ name: 'Maintenance group', serverIds: [replacement.body.data.id] })
+      .expect(200);
+    await api
+      .post(planPath + '/run')
+      .send(confirmedPlan)
+      .expect(409);
+    assert.equal((await api.get('/api/v1/tasks').expect(200)).body.data.length, existingTaskCount);
+    const refreshed = await api.post('/api/v1/commands/preview').send(selection).expect(201);
+    assert.deepEqual(
+      refreshed.body.data.targets.map((target: { id: string }) => target.id),
+      [replacement.body.data.id],
+    );
     await api
       .patch(planPath)
-      .send({ ...planDefinition, preChecks: [] })
+      .send({ ...planDefinition, name: 'Updated maintenance', preChecks: [] })
       .expect(200);
     const task = await api
       .post(planPath + '/run')
-      .send({ ...execution, parameters: { MESSAGE: 'fixture' } })
+      .send({ ...confirmedPlan, expectedTargetHash: refreshed.body.data.targetHash })
       .expect(201);
+    assert.equal(task.body.data.name, 'Checked maintenance · v1');
     await api.delete(planPath).expect(200);
     const worker = app.get(TaskWorkerService);
     await worker.tick();
@@ -169,6 +241,10 @@ test('versioned batch operations validate parameters, preserve snapshots and sto
       .where('id', '=', task.body.data.id)
       .executeTakeFirstOrThrow();
     const planPayload = JSON.parse(savedPlanTask.payload_json) as TaskPayload;
+    assert.deepEqual(
+      planPayload.targets.map(({ id }) => id),
+      [replacement.body.data.id],
+    );
     assert.deepEqual(
       planPayload.steps.map(({ name }) => name),
       ['前置检查 · Ready', 'Maintenance', '执行后验证 · Verified'],

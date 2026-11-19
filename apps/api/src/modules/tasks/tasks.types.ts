@@ -35,7 +35,13 @@ export interface ExecutionStep {
   timeout?: number;
   failurePolicy?: 'STOP' | 'CONTINUE';
 }
+export interface AiRepairOrigin {
+  taskId: string;
+  proposalId: string;
+  automatic: boolean;
+}
 export interface TaskPayload {
+  aiRepair?: AiRepairOrigin;
   targets: SshTarget[];
   steps: ExecutionStep[];
   strategy: 'PARALLEL' | 'SEQUENTIAL';
@@ -103,6 +109,6 @@ export interface CreateTaskInput {
     commitSha: string;
     buildLocation: string;
     artifactType: string;
-    triggerType?: 'MANUAL' | 'WEBHOOK';
+    triggerType?: PipelineSnapshot['triggerType'];
   };
 }

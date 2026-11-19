@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { FormEvent } from 'react';
-import { ArrowLeft, Clock3, History, Pencil, Plus, Trash2 } from 'lucide-react';
+import { Clock3, History, Pencil, Plus, Trash2 } from 'lucide-react';
 import { api, message, post, remove, useResource } from '../api';
 import {
   Confirm,
@@ -10,7 +10,6 @@ import {
   Form,
   Loading,
   Modal,
-  PageHeader,
   RefreshButton,
   Section,
   Status,
@@ -107,7 +106,7 @@ const sourcePaths: Record<ScheduleKind, string> = {
   OPERATION_PLAN: '/operation-plans',
 };
 
-function civilTime(value: number, timeZone: string) {
+export function civilTime(value: number, timeZone: string) {
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat('en-CA', {
       timeZone,
@@ -124,7 +123,7 @@ function civilTime(value: number, timeZone: string) {
   return [parts.year, parts.month, parts.day].join('-') + 'T' + parts.hour + ':' + parts.minute;
 }
 
-function timestampInZone(value: string, timeZone: string) {
+export function timestampInZone(value: string, timeZone: string) {
   const wall = Date.parse(value + 'Z');
   const day = 86_400_000;
   const candidates = [-day, 0, day]
@@ -819,15 +818,13 @@ export function OperationSchedulesPage({ user }: { user: User }) {
 
   return (
     <>
-      <PageHeader
-        title="定时运维"
-        description="按计划运行已确认的命令模板和运维方案，查看每次执行记录。"
+      <ErrorBanner error={!deleting && !enabling ? error : ''} />
+      <ErrorBanner error={schedules.error} retry={schedules.reload} />
+      <Section
+        title="定时任务"
+        subtitle="按计划运行固定版本的模板和方案。"
         action={
-          <>
-            <a className="button secondary" href="#/tasks">
-              <ArrowLeft size={16} />
-              任务中心
-            </a>
+          <div className="row-actions">
             <RefreshButton onClick={schedules.reload} />
             {user.role !== 'VIEWER' && (
               <button
@@ -840,12 +837,9 @@ export function OperationSchedulesPage({ user }: { user: User }) {
                 新建定时任务
               </button>
             )}
-          </>
+          </div>
         }
-      />
-      <ErrorBanner error={!deleting && !enabling ? error : ''} />
-      <ErrorBanner error={schedules.error} retry={schedules.reload} />
-      <Section title="定时任务">
+      >
         {schedules.loading ? (
           <Loading />
         ) : !schedules.data?.length ? (

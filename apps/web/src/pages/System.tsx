@@ -28,7 +28,8 @@ import {
 } from '../components';
 import type { Audit, SystemRuntimeDefaults, User } from '../models';
 import { AISettings } from './AI';
-import { ArtifactRetentionPolicy } from './ArtifactRetention';
+import { ArtifactCleanup, ArtifactRetentionPolicy } from './ArtifactRetention';
+import { MonitoringSettings } from './ServerMonitoring';
 
 export function AuditPage() {
   const resource = useResource<Audit[]>('/audit');
@@ -111,6 +112,7 @@ export function SystemPage({ user }: { user: User }) {
   const resource = useResource<SystemInfo>('/system');
   const [editing, setEditing] = useState(false);
   const [editingRetention, setEditingRetention] = useState(false);
+  const [cleanup, setCleanup] = useState(false);
   const value = resource.data;
   const db =
     typeof value?.database === 'string'
@@ -227,9 +229,17 @@ export function SystemPage({ user }: { user: User }) {
                 >
                   保留策略
                 </button>
+                <button
+                  className="button secondary small"
+                  type="button"
+                  onClick={() => setCleanup(true)}
+                >
+                  全局清理预览
+                </button>
               </div>
             )}
           </Section>
+          <MonitoringSettings user={user} />
           <Section title="安全基础" subtitle="资源访问与执行的安全机制">
             <div className="security-feature">
               <span>
@@ -286,6 +296,7 @@ export function SystemPage({ user }: { user: User }) {
         />
       )}
       {editingRetention && <ArtifactRetentionPolicy onClose={() => setEditingRetention(false)} />}
+      {cleanup && <ArtifactCleanup onClose={() => setCleanup(false)} onPruned={resource.reload} />}
     </>
   );
 }

@@ -67,6 +67,7 @@ class ReleasePolicyDto implements ReleasePolicy {
 }
 
 class ServiceConfigDto extends DeploymentSelectionDto {
+  @IsOptional() @IsIn(['BUILD_ONLY', 'DEPLOY']) executionMode?: 'BUILD_ONLY' | 'DEPLOY' | null;
   @ValidateIf((_object, value) => value !== undefined)
   @IsIn(['TARGET', 'MANAGER'])
   buildLocation?: 'TARGET' | 'MANAGER';
@@ -115,6 +116,7 @@ const present = (r: Selectable<Database['service_environment_configs']>) => ({
   serviceId: r.service_id,
   environmentId: r.environment_id,
   targetId: r.target_id,
+  executionMode: r.execution_mode,
   ...storedDeploymentSelection(r.target_selection_json),
   targetSelection: storedDeploymentSelection(r.target_selection_json) ?? null,
   buildLocation: r.build_location,
@@ -221,6 +223,7 @@ export class ServiceConfigsService {
     const buildLocation = input.buildLocation ?? defaults.defaultBuildLocation;
     const now = Date.now(),
       values = {
+        ...(input.executionMode !== undefined && { execution_mode: input.executionMode }),
         target_id: input.targetId ?? null,
         target_selection_json: selection ? JSON.stringify(selection) : null,
         build_location: input.buildLocation,

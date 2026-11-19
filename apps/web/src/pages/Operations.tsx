@@ -23,12 +23,13 @@ import {
 } from '../components';
 import type { Task, TaskTarget, User } from '../models';
 import { TaskTable, taskTypeLabel } from './Dashboard';
+import { deliveryPath } from './delivery-route';
+import { ContextAIButton } from './AI';
+import { FailureHandling } from './FailureHandling';
 import { RunArtifacts } from './Delivery';
 import type { PipelineLogSelection, PipelineTaskStep } from './PipelineRunGraph';
 
 const PipelineRunGraph = lazy(() => import('./PipelineRunGraph'));
-
-export { CommandsPage, PlansPage } from './BatchOperations';
 
 function renderTaskLog(
   content: string,
@@ -76,7 +77,7 @@ export function TasksPage() {
         description="统一追踪执行进度，保留每一台服务器的独立结果。"
         action={
           <>
-            <a className="button secondary" href="#/tasks/schedules">
+            <a className="button secondary" href="#/operations/schedules">
               <Clock3 size={16} /> 定时运维
             </a>
             <RefreshButton onClick={resource.reload} />
@@ -121,11 +122,11 @@ export function TasksPage() {
           <Empty
             icon={<ListTodo size={25} />}
             title="还没有执行任务"
-            description="从命令中心提交命令，或运行一个可复用的运维方案。"
+            description="从运维中心提交命令，或运行一个可复用的运维方案。"
             action={
-              <a className="button primary" href="#/commands">
+              <a className="button primary" href="#/operations">
                 <Terminal size={16} />
-                打开命令中心
+                打开运维中心
               </a>
             }
           />
@@ -190,7 +191,14 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
   if (!task.data)
     return <ErrorBanner error={task.error || '找不到这个任务。'} retry={task.reload} />;
   const value = task.data;
+  const deliveryScope = { serviceId: value.serviceId, environmentId: value.environmentId };
   const analysis = value.result?.aiAnalysis;
+  const failed = ['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION'].includes(
+    value.status,
+  );
+  const canInspectFailure = Boolean(
+    value.projectId || user.role === 'ADMIN' || value.createdBy === user.id,
+  );
   const failedPhase = analysis?.status === 'SUCCESS' && analysis.failedPhase;
   const nodeTypes = new Map(
     value.pipelineGraph?.nodes.map((node) => [`node:${node.id}`, node.type]),
@@ -204,9 +212,16 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
     );
   return (
     <>
-      <a href="#/tasks" className="back-link">
+      <a
+        href={
+          value.type === 'PIPELINE' && value.projectId
+            ? '#' + deliveryPath(value.projectId, 'runs', deliveryScope)
+            : '#/tasks'
+        }
+        className="back-link"
+      >
         <ArrowLeft size={14} />
-        返回任务中心
+        {value.type === 'PIPELINE' && value.projectId ? '返回项目执行记录' : '返回任务中心'}
       </a>
       <PageHeader
         eyebrow="TASK DETAILS"
@@ -218,6 +233,14 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
               <span className="tag">待审批</span>
             ) : (
               <Status value={value.status} />
+            )}
+            {failed && canInspectFailure && (
+              <ContextAIButton
+                user={user}
+                projectId={value.projectId ?? undefined}
+                context={{ kind: 'TASK', taskId: id }}
+                objectName={value.name}
+              />
             )}
             {activeTask(value.status) && user.role !== 'VIEWER' && (
               <button
@@ -246,11 +269,35 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
         <span className="tag">{taskTypeLabel(value)}</span>
         {value.type === 'PIPELINE' && (
           <>
-            <a className="text-link" href="#/artifacts">
-              构建产物 →
-            </a>
+            {(value.executionMode !== 'DEPLOY_ARTIFACT' || value.sourceBuildTaskId) && (
+              <a
+                className="text-link"
+                href={
+                  value.projectId
+                    ? '#' +
+                      deliveryPath(value.projectId, 'artifacts', {
+                        ...deliveryScope,
+                        taskId: value.sourceBuildTaskId || value.id,
+                      })
+                    : '#/artifacts'
+                }
+              >
+                构建产物 →
+              </a>
+            )}
             {value.executionMode !== 'BUILD_ONLY' && (
-              <a className="text-link" href="#/deployments">
+              <a
+                className="text-link"
+                href={
+                  value.projectId
+                    ? '#' +
+                      deliveryPath(value.projectId, 'deployments', {
+                        ...deliveryScope,
+                        taskId: value.deploymentTaskId || value.id,
+                      })
+                    : '#/deployments'
+                }
+              >
                 部署记录 →
               </a>
             )}
@@ -271,7 +318,18 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
         <p className="field-note">
           此发布在管理员批准后开始执行。
           {user.role === 'ADMIN' && (
-            <a className="text-link" href="#/deployments">
+            <a
+              className="text-link"
+              href={
+                value.projectId
+                  ? '#' +
+                    deliveryPath(value.projectId, 'approvals', {
+                      ...deliveryScope,
+                      recordId: value.id,
+                    })
+                  : '#/deployments'
+              }
+            >
               查看待审批发布 →
             </a>
           )}
@@ -308,6 +366,14 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
           runId={value.pipelineRunId}
           polling={activeTask(value.status)}
           canDeploy={user.role !== 'VIEWER'}
+        />
+      )}
+      {value.type === 'PIPELINE' && value.serviceId && value.environmentId && failed && (
+        <FailureHandling
+          user={user}
+          serviceId={value.serviceId}
+          environmentId={value.environmentId}
+          taskId={id}
         />
       )}
       {analysis && (

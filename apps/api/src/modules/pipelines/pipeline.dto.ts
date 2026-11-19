@@ -55,6 +55,7 @@ class PipelineNodeDto implements PipelineNode {
   variables?: PipelineNodeVariableDto[];
 }
 export class PipelineDefinitionDto {
+  @IsOptional() @IsIn(['BUILD_ONLY', 'DEPLOY']) defaultMode?: PipelineExecutionMode;
   @IsUUID() repositoryId!: string;
   @IsIn(['TARGET', 'MANAGER']) buildLocation: 'TARGET' | 'MANAGER' = 'TARGET';
   @IsIn(['FILE', 'DOCKER_IMAGE']) artifactType: 'FILE' | 'DOCKER_IMAGE' = 'FILE';

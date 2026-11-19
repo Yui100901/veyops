@@ -35,6 +35,7 @@ import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { SshHostKeyMismatchError, SshService } from '../../infrastructure/ssh/ssh.service';
 import { summarizeProbe } from '../../infrastructure/ssh/server-probe';
+import { compareServerConfigurations } from './configuration-comparison';
 import { recentDeployments } from '../deployments/deployment-history';
 import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
 import type { Selectable } from 'kysely';
@@ -59,6 +60,11 @@ class HostKeyProbeDto extends SshEndpointDto {
 
 class AcceptHostKeyDto {
   @IsString() @Matches(hostKeyAcceptanceToken) hostKeyAcceptanceToken!: string;
+}
+
+class CompareConfigurationDto {
+  @IsUUID() baselineId!: string;
+  @IsUUID() comparisonId!: string;
 }
 
 class ServerDto extends SshEndpointDto {
@@ -127,6 +133,22 @@ export class ServersService {
     if (!unique.length || unique.length > 100)
       throw new BadRequestException('必须明确选择 1–100 台服务器');
     return Promise.all(unique.map((id) => this.get(id)));
+  }
+  async compareConfiguration(dto: CompareConfigurationDto, userId: string) {
+    const baselineId = dto.baselineId.toLowerCase();
+    const comparisonId = dto.comparisonId.toLowerCase();
+    if (baselineId === comparisonId) throw new BadRequestException('请选择两台不同的服务器');
+    const [baseline, comparison] = await Promise.all([
+      this.get(baselineId),
+      this.get(comparisonId),
+    ]);
+    const result = await compareServerConfigurations(this.ssh, baseline, comparison);
+    await this.audit.record(userId, 'server.configuration.compare', 'server', baselineId, {
+      comparisonId,
+      baselineStatus: result.baseline.status,
+      comparisonStatus: result.comparison.status,
+    });
+    return result;
   }
   async detail(id: string) {
     const server = await this.get(id);
@@ -446,6 +468,12 @@ export class ServersService {
 }
 @Controller('servers')
 class ServersController {
+  @Roles('ADMIN', 'OPERATOR') @Post('configuration/compare') compare(
+    @Body() dto: CompareConfigurationDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.compareConfiguration(dto, req.user.id);
+  }
   constructor(private readonly service: ServersService) {}
   @Get() list() {
     return this.service.list();

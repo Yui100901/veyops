@@ -139,20 +139,41 @@ export class AiPipelineAnalyzer {
     return process.env.AI_PIPELINE_ANALYSIS === 'true';
   }
 
-  async analyze(
+  async analyze(input: AiPipelineAnalysisInput, signal?: AbortSignal) {
+    return this.isEnabled() ? this.request(input, signal) : null;
+  }
+
+  async analyzeFailure(input: AiPipelineAnalysisInput, codes: string[], signal?: AbortSignal) {
+    const allowed = [
+      'MISSING_TOOL',
+      'MISSING_LIBRARY',
+      'IMAGE_PULL',
+      'DOWNLOAD',
+      'PACKAGE_BUSY',
+      'PORT_OCCUPIED',
+      'TIMEOUT',
+      'STATE_UNCERTAIN',
+    ];
+    return this.request(input, signal, [
+      ...new Set(codes.filter((code) => allowed.includes(code))),
+    ]);
+  }
+
+  private async request(
     input: AiPipelineAnalysisInput,
     signal?: AbortSignal,
+    findings?: string[],
   ): Promise<AiPipelineAnalysis | null> {
-    if (!this.isEnabled() || signal?.aborted || !terminalStatuses.has(input.status)) return null;
+    if (signal?.aborted || !terminalStatuses.has(input.status)) return null;
     try {
       const metadata = analysisMetadata(input);
-      const connection = await this.providers.resolve();
+      const connection = await this.providers.resolve(undefined, 'diagnosis');
       if (signal?.aborted) return null;
       const response = await this.wire.complete(
         { ...connection, timeoutSeconds: Math.min(connection.timeoutSeconds, maximumSeconds) },
         [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: JSON.stringify(metadata) },
+          { role: 'user', content: JSON.stringify({ ...metadata, ...(findings && { findings }) }) },
         ],
         [],
         { signal, maxTokens: 800, maxResponseBytes: 32 * 1024 },

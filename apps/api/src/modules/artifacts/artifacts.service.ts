@@ -24,6 +24,7 @@ import type { PipelineSnapshot, PipelineArtifact } from '../pipelines/pipeline.t
 import type { TaskPayload } from '../tasks/tasks.types';
 import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
 import { archiveKey, isLocalImage } from './artifact-availability';
+import { DeliveryRecordFilters } from '../projects/delivery-filters';
 
 const uuid = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
 const sha256 = /^[a-f0-9]{64}$/;
@@ -165,7 +166,7 @@ export class ArtifactsService {
       .execute();
     return { ...artifact, id };
   }
-  async list(projectId?: string, pipelineRunId?: string) {
+  async list(projectId?: string, pipelineRunId?: string, filters: DeliveryRecordFilters = {}) {
     let query = this.database.db
       .selectFrom('artifacts')
       .leftJoin('pipeline_runs', 'pipeline_runs.id', 'artifacts.pipeline_run_id')
@@ -174,6 +175,7 @@ export class ArtifactsService {
       .selectAll('artifacts')
       .select([
         'pipeline_runs.pipeline_id as pipelineId',
+        'pipeline_runs.task_id as taskId',
         'pipeline_versions.version as pipelineVersion',
         'pipeline_runs.environment_id as environmentId',
         'pipeline_runs.target_id as targetId',
@@ -183,11 +185,19 @@ export class ArtifactsService {
       ]);
     if (projectId) query = query.where('artifacts.project_id', '=', projectId);
     if (pipelineRunId) query = query.where('artifacts.pipeline_run_id', '=', pipelineRunId);
+    if (filters.taskId) query = query.where('pipeline_runs.task_id', '=', filters.taskId);
+    if (filters.recordId) query = query.where('artifacts.id', '=', filters.recordId);
+    if (filters.serviceId) query = query.where('artifacts.service_id', '=', filters.serviceId);
+    if (filters.environmentId)
+      query = query.where('pipeline_runs.environment_id', '=', filters.environmentId);
+    if (filters.commit)
+      query = query.where('artifacts.source_commit', 'like', filters.commit.toLowerCase() + '%');
     return (await query.orderBy('artifacts.created_at', 'desc').limit(200).execute()).map((r) => ({
       id: r.id,
       projectId: r.project_id,
       serviceId: r.service_id,
       pipelineRunId: r.pipeline_run_id,
+      taskId: r.taskId,
       pipelineId: r.pipelineId,
       pipelineVersion: r.pipelineVersion,
       environmentId: r.environmentId,
@@ -384,8 +394,8 @@ export class ArtifactsService {
 @Controller('artifacts')
 export class ArtifactsController {
   constructor(private readonly service: ArtifactsService) {}
-  @Get() list(@Query('projectId') projectId?: string, @Query('pipelineRunId') runId?: string) {
-    return this.service.list(projectId, runId);
+  @Get() list(@Query() filters: DeliveryRecordFilters) {
+    return this.service.list(filters.projectId, filters.pipelineRunId, filters);
   }
   @Get(':id/download')
   @Header('Cache-Control', 'private, no-store')

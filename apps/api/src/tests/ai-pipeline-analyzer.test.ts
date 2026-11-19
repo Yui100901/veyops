@@ -61,9 +61,9 @@ async function serve(context: TestContext, reply?: Record<string, unknown>, time
   );
   const port = (server.address() as { port: number }).port;
   const providers = {
-    resolve: async () => ({
+    resolve: async (_id?: string, purpose?: string) => ({
       apiKey,
-      model: 'test-model',
+      model: purpose === 'diagnosis' ? 'diagnosis-model' : 'generic-model',
       baseUrl: `http://127.0.0.1:${port}`,
       timeoutSeconds,
     }),
@@ -129,6 +129,7 @@ test('Pipeline AI analysis submits bounded metadata without tools or raw step/er
   assert.deepEqual(Object.keys(result).sort(), ['failedPhase', 'nextActions', 'summary']);
   assert.equal(captured.length, 1);
   assert.equal(captured[0]?.max_tokens, 800);
+  assert.equal(captured[0]?.model, 'diagnosis-model');
   assert.equal('tools' in captured[0]!, false);
   assert.equal('tool_choice' in captured[0]!, false);
   const sent = JSON.stringify(captured);

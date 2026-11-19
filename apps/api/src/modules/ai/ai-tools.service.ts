@@ -16,7 +16,11 @@ import { AiRepositoryAnalysisDto } from './ai.dto';
 import { AiRepositoryAnalysisService } from './ai-repository-analysis.service';
 import { AiSourceChangeService } from './ai-source-change.service';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { aiWriteActions } from './ai.dto';
+import { OperationPlansService } from '../operation-plans/operation-plans.service';
+import { assertAiPipelineScope, pinAiContextField, type ResolvedAiContext } from './ai-context';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
+import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
 
 function aiPipelineDefinition(definition: PipelineDefinition) {
   if (!definition.nodes) return definition;
@@ -31,6 +35,33 @@ function aiPipelineDefinition(definition: PipelineDefinition) {
         })),
       }),
     })),
+  };
+}
+
+function aiTaskSummary(task: Awaited<ReturnType<TasksService['get']>>) {
+  const {
+    id,
+    type,
+    name,
+    status,
+    projectId,
+    serviceId,
+    environmentId,
+    createdAt,
+    startedAt,
+    finishedAt,
+  } = task;
+  return {
+    id,
+    type,
+    name,
+    status,
+    projectId,
+    serviceId,
+    environmentId,
+    createdAt,
+    startedAt,
+    finishedAt,
   };
 }
 
@@ -78,6 +109,9 @@ export const aiToolDefinitions = [
     { definition: str },
     ['definition'],
   ),
+  tool('get_operation_plan', '读取当前页面已选运维方案的版本和步骤列表', {
+    operationPlanId: str,
+  }),
   tool(
     'inspect_servers',
     '只读检查明确目标的系统、磁盘、构建工具和版本、Docker/Compose 及包管理活动',
@@ -185,6 +219,7 @@ export const aiToolDefinitions = [
   ),
 ];
 export type PreparedAiAction = {
+  failureTaskId?: string;
   action:
     | 'execute_command'
     | 'inspect_servers'
@@ -203,13 +238,7 @@ export type PreparedAiAction = {
   bindingsHash: string;
 };
 export function isActionTool(name: string) {
-  return [
-    'execute_command',
-    'run_pipeline',
-    'initialize_component',
-    'publish_source_branch',
-    'open_pull_request',
-  ].includes(name);
+  return aiWriteActions.some((action) => action === name);
 }
 @Injectable()
 export class AiToolsService {
@@ -402,13 +431,18 @@ export class AiToolsService {
       )
       .digest('hex');
   }
-  async execute(prepared: PreparedAiAction, user: CurrentUser) {
+  async execute(
+    prepared: PreparedAiAction,
+    user: CurrentUser,
+    repair?: import('../tasks/tasks.types').AiRepairOrigin,
+  ) {
     if (prepared.action === 'initialize_component')
       return this.deploymentTools.initialize(
         prepared.payload.component as InitializationComponent,
         String(prepared.payload.targetHash),
         prepared.serverIds,
         user.id,
+        repair,
       );
     if (prepared.action === 'publish_source_branch' || prepared.action === 'open_pull_request') {
       const sourceChange = await this.sourceChange.execute(
@@ -430,14 +464,35 @@ export class AiToolsService {
     }
     return this.commands.execute(plainToInstance(ExecuteCommandDto, prepared.payload), user.id);
   }
-  async continuation(taskIds: string[]) {
+  async continuation(taskIds: string[], projectId: string | undefined, user: CurrentUser) {
+    if (!taskIds.length) return [];
+    const policies = await this.policy.projectSnapshots();
     const results = await Promise.all(
       taskIds.map(async (id) => {
         const task = await this.tasks.get(id);
+        if (
+          (projectId && task.projectId && projectId !== task.projectId) ||
+          (!task.projectId && task.createdBy !== user.id && user.role !== 'ADMIN')
+        )
+          throw new ForbiddenException('对话中的任务不在当前授权范围');
+        const scope = task.projectId ?? projectId;
+        const targets = await this.tasks.targets(id);
+        this.policy.assertRead(
+          'get_task',
+          policies(scope),
+          scope,
+          targets.map((target) => target.serverId ?? 'deleted'),
+        );
         return { taskId: id, status: task.status };
       }),
     );
     return results;
+  }
+  private canReadProject(action: string, projectId: string, policy: AiPolicySnapshot) {
+    return (
+      this.policy.allowedProject(projectId, policy) &&
+      this.policy.scopes(policy).every((scope) => !scope.deniedActions?.includes(action))
+    );
   }
   async read(
     name: string,
@@ -445,6 +500,7 @@ export class AiToolsService {
     snapshot: AiPolicySnapshot,
     projectId?: string,
     user?: CurrentUser,
+    context?: ResolvedAiContext,
   ) {
     this.policy.assertRead(name, snapshot, projectId);
     switch (name) {
@@ -452,25 +508,33 @@ export class AiToolsService {
         return (await this.servers.list())
           .filter((s) => this.policy.allowedServer(s.id, snapshot))
           .map((s) => ({ id: s.id, name: s.name, host: s.host, status: s.status, tags: s.tags }));
-      case 'list_projects':
-        return (await this.projects.list()).filter((p) =>
-          this.policy.allowedProject(p.id, snapshot),
+      case 'list_projects': {
+        const policies = projectId ? () => snapshot : await this.policy.projectSnapshots();
+        return (await this.projects.list()).filter(
+          (p) =>
+            (!projectId || p.id === projectId) && this.canReadProject(name, p.id, policies(p.id)),
         );
+      }
       case 'list_tasks': {
+        const policies = projectId ? () => snapshot : await this.policy.projectSnapshots();
         const tasks = (await this.tasks.list()).filter((task) =>
           task.projectId
             ? (!projectId || projectId === task.projectId) &&
-              this.policy.allowedProject(task.projectId, snapshot)
-            : !projectId || task.createdBy === user?.id,
+              this.canReadProject(name, task.projectId, policies(task.projectId))
+            : !projectId && (user?.role === 'ADMIN' || task.createdBy === user?.id),
         );
         const rows = await Promise.all(
           tasks.map(async (task) => ({ task, targets: await this.tasks.targets(task.id) })),
         );
         return rows
           .filter((r) =>
-            r.targets.every((t) => t.serverId && this.policy.allowedServer(t.serverId, snapshot)),
+            r.targets.every(
+              (t) =>
+                t.serverId &&
+                this.policy.allowedServer(t.serverId, policies(r.task.projectId ?? undefined)),
+            ),
           )
-          .map((r) => r.task);
+          .map((r) => aiTaskSummary(r.task));
       }
       case 'get_task':
       case 'diagnose_deployment': {
@@ -478,7 +542,7 @@ export class AiToolsService {
         let task = await this.tasks.get(id);
         if (
           (projectId && task.projectId && projectId !== task.projectId) ||
-          (projectId && !task.projectId && task.createdBy !== user?.id)
+          (!task.projectId && task.createdBy !== user?.id && (projectId || user?.role !== 'ADMIN'))
         )
           throw new ForbiddenException('任务不属于当前对话项目');
         let targets = await this.tasks.targets(id);
@@ -502,7 +566,16 @@ export class AiToolsService {
           }
           targets = await this.tasks.targets(id);
         }
-        return { task, targets };
+        return {
+          task: aiTaskSummary(task),
+          targets: targets.map(({ serverId, status, exitCode, startedAt, finishedAt }) => ({
+            serverId,
+            status,
+            exitCode,
+            startedAt,
+            finishedAt,
+          })),
+        };
       }
       case 'inspect_servers': {
         const serverIds = this.serverIds(data, 10);
@@ -512,8 +585,28 @@ export class AiToolsService {
       case 'get_project': {
         const id = this.string(data, 'projectId');
         if (projectId && id !== projectId) throw new ForbiddenException('项目与当前对话项目不一致');
-        this.policy.assertRead(name, projectId ? snapshot : await this.policy.snapshot(id), id);
-        return this.projects.get(id);
+        const actual = projectId ? snapshot : await this.policy.snapshot(id);
+        this.policy.assertRead(name, actual, id);
+        const project = await this.projects.get(id);
+        return {
+          ...project,
+          repositories: project.repositories
+            .filter(
+              (r) =>
+                (!context?.repositoryId || r.id === context.repositoryId) &&
+                this.policy.allowedRepository(r.id, actual),
+            )
+            .map(({ id, name, provider, defaultBranch, description }) => ({
+              id,
+              name,
+              provider,
+              defaultBranch,
+              description,
+            })),
+          services: project.services.filter(
+            (s) => !context?.serviceId || s.id === context.serviceId,
+          ),
+        };
       }
       case 'query_pipeline': {
         const service = await this.pipelines();
@@ -521,18 +614,23 @@ export class AiToolsService {
           const result = await service.get(this.string(data, 'pipelineId'));
           if (projectId && result.projectId !== projectId)
             throw new ForbiddenException('Pipeline 不属于当前对话项目');
-          this.policy.assertRead(
-            name,
-            projectId ? snapshot : await this.policy.snapshot(result.projectId),
-            result.projectId,
-          );
+          assertAiPipelineScope(context, result);
+          const actual = projectId ? snapshot : await this.policy.snapshot(result.projectId);
+          this.policy.assertRead(name, actual, result.projectId);
+          for (const id of pipelineSourceRepositories(result.definition))
+            this.policy.assertRepository(id, actual);
           return { ...result, definition: aiPipelineDefinition(result.definition) };
         }
-        return (await service.list())
+        const policies = projectId ? () => snapshot : await this.policy.projectSnapshots();
+        return (await service.list(projectId, context?.serviceId))
           .filter(
             (p) =>
               (!projectId || p.projectId === projectId) &&
-              this.policy.allowedProject(p.projectId, snapshot),
+              (!context?.serviceId || p.serviceId === context.serviceId) &&
+              this.canReadProject(name, p.projectId, policies(p.projectId)) &&
+              pipelineSourceRepositories(p.definition).every((id) =>
+                this.policy.allowedRepository(id, policies(p.projectId)),
+              ),
           )
           .map((pipeline) => ({
             ...pipeline,
@@ -559,9 +657,53 @@ export class AiToolsService {
         this.policy.assertRepository(this.string(data, 'repositoryId'), actual);
         return this.sourceChange.suggest(data);
       }
+      case 'get_operation_plan': {
+        if (context?.input.kind !== 'OPERATION_PLAN' || !context.input.operationPlanId)
+          throw new ForbiddenException('请先在页面选择需要读取的运维方案');
+        const plans = this.moduleRef.get(OperationPlansService, { strict: false });
+        const versions = await plans.versions(context.input.operationPlanId);
+        const plan =
+          context.input.version == null
+            ? versions[0]
+            : versions.find(({ version }) => version === context.input.version);
+        if (!plan) throw new BadRequestException('运维方案版本不存在');
+        return {
+          name: plan.name,
+          version: plan.version,
+          category: plan.category,
+          steps: plan.steps.map(({ name, timeout }) => ({ name, timeout })),
+        };
+      }
       case 'draft_pipeline':
       case 'draft_operation_plan': {
         const definition = this.parse(this.string(data, 'definition', 65536));
+        if (name === 'draft_pipeline' && (context || projectId)) {
+          pinAiContextField(definition, 'projectId', projectId);
+          pinAiContextField(definition, 'serviceId', context?.serviceId);
+          const config = definition.definition;
+          if (!config || typeof config !== 'object' || Array.isArray(config))
+            throw new BadRequestException('流水线草稿缺少构建配置');
+          const settings = config as Record<string, unknown>;
+          pinAiContextField(settings, 'repositoryId', context?.repositoryId);
+          const repositoryId = this.string(settings, 'repositoryId');
+          const serviceId = this.string(definition, 'serviceId');
+          const project = await this.projects.get(this.string(definition, 'projectId'));
+          if (
+            !project.services.some(({ id }) => id === serviceId) ||
+            !project.repositories.some(({ id }) => id === repositoryId)
+          )
+            throw new ForbiddenException('流水线草稿的服务或仓库不属于当前项目');
+          this.policy.assertRepository(repositoryId, snapshot);
+          if (Array.isArray(settings.nodes)) {
+            for (const node of settings.nodes) {
+              if (!node || typeof node !== 'object' || !('repositoryId' in node)) continue;
+              const sourceId = this.string(node, 'repositoryId');
+              if (!project.repositories.some(({ id }) => id === sourceId))
+                throw new ForbiddenException('源码节点的仓库不属于当前项目');
+              this.policy.assertRepository(sourceId, snapshot);
+            }
+          }
+        }
         return {
           type: name === 'draft_pipeline' ? 'PIPELINE' : 'OPERATION_PLAN',
           definition,

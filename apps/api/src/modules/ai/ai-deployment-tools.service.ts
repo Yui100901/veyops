@@ -5,8 +5,9 @@ import { TargetResolver } from '../command-center/target-resolver.service';
 import { OperationPlansService } from '../operation-plans/operation-plans.service';
 import { planTemplates } from '../operation-plans/plan-templates';
 import { isTerminalStatus, TasksService } from '../tasks/tasks.service';
+import type { AiRepairOrigin } from '../tasks/tasks.types';
 
-const initializationPlans = {
+export const initializationPlans = {
   docker: '41000000-0000-4000-8000-000000000002',
   node: '41000000-0000-4000-8000-000000000003',
   nginx: '41000000-0000-4000-8000-000000000004',
@@ -38,9 +39,11 @@ if command -v timeout >/dev/null 2>&1; then
     if timeout 3 docker compose version >/dev/null 2>&1; then printf 'compose=available\\n'; fi
   fi
 fi
+printf 'probeComplete=1\\n'
 exit 0`;
 
 const probeKeys = new Set([
+  'probeComplete',
   'uid',
   'os',
   'init',
@@ -99,7 +102,7 @@ const logFindings = [
   {
     code: 'MISSING_TOOL',
     match:
-      /command not found|executable file not found|缺少 (?:Git|Docker|构建工具)|\b(?:npm|node|docker|git): not found/i,
+      /command not found|executable file not found|缺少 (?:Git|Docker|构建工具)|目标主机找不到 Docker CLI|目标主机无法执行 docker compose|\b(?:npm|node|docker|git|nginx): not found/i,
     suggestion: '巡检目标工具和构建位置，按项目需要选择审核过的初始化方案或修正构建镜像。',
   },
   {
@@ -226,6 +229,7 @@ export class AiDeploymentToolsService {
     expectedHash: string,
     serverIds: string[],
     userId: string,
+    repair?: AiRepairOrigin,
   ) {
     const plan = await this.initialization(component, serverIds);
     if (plan.targetHash !== expectedHash)
@@ -236,6 +240,7 @@ export class AiDeploymentToolsService {
       const facts = report.facts;
       if (
         report.status !== 'OK' ||
+        (repair && facts.probeComplete !== '1') ||
         facts.uid !== '0' ||
         !['debian', 'ubuntu'].includes(facts.os ?? '') ||
         facts['apt-get'] !== 'available' ||
@@ -270,6 +275,7 @@ export class AiDeploymentToolsService {
         timeout: 900,
       },
       userId,
+      repair,
     );
   }
 

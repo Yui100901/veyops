@@ -117,7 +117,7 @@ export class AiRepositoryAnalysisService {
       (input.environmentId !== undefined && !environment)
     )
       throw new BadRequestException('服务和环境必须属于所选项目');
-    const connection = await this.providers.resolve();
+    const connection = await this.providers.resolve(undefined, 'repository');
     const context = await this.repositories.readAnalysisContext(
       input.projectId,
       input.repositoryId,

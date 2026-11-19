@@ -169,7 +169,12 @@ export function ProjectRelations({
                   <Network size={17} />
                 </span>
                 <div>
-                  <strong>{pipeline.name}</strong>
+                  <a
+                    className="text-link"
+                    href={`#/projects/${project.id}/pipelines?${new URLSearchParams({ serviceId: pipeline.serviceId, recordId: pipeline.id })}`}
+                  >
+                    {pipeline.name}
+                  </a>
                   <small>
                     {project.services.find(({ id }) => id === pipeline.serviceId)?.name}
                   </small>
