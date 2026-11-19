@@ -6,12 +6,14 @@ import type { ProjectDetail, User } from '../models';
 import { NodeMap } from './ExecutionGraphCanvas';
 import { FlowEditor } from './ExecutionGraphEditor';
 import { ExecutionGraphHistory, ExecutionGraphStart } from './ExecutionGraphRun';
+import { GraphVersionTools } from './ExecutionGraphVersions';
+import { ExecutionGraphTriggers } from './ExecutionGraphTriggers';
 import { graphKey, graphNodeLabels, sequence } from './execution-graph-definition';
 import type { GraphDocument, GraphFlow } from './execution-graph-definition';
 import { deliveryPath } from './delivery-route';
 import './execution-graph.css';
 
-type Pane = 'draft' | 'published' | 'history';
+type Pane = 'draft' | 'published' | 'triggers' | 'history';
 
 export default function ProjectExecutionGraph({
   id,
@@ -43,6 +45,7 @@ export default function ProjectExecutionGraph({
       initial={graph.data}
       path={base + '/execution-graph'}
       canEdit={user.role !== 'VIEWER' && !project.data.archived}
+      canApprove={user.role === 'ADMIN'}
       runId={runId}
     />
   );
@@ -53,12 +56,14 @@ function Workspace({
   initial,
   path,
   canEdit,
+  canApprove,
   runId,
 }: {
   project: ProjectDetail;
   initial: GraphDocument;
   path: string;
   canEdit: boolean;
+  canApprove: boolean;
   runId?: string;
 }) {
   const [graph, setGraph] = useState(initial);
@@ -179,6 +184,7 @@ function Workspace({
           [
             ['draft', '草稿画布'],
             ['published', '发布版本与运行'],
+            ['triggers', '触发器'],
             ['history', '运行记录'],
           ] as const
         ).map(([key, label]) => (
@@ -303,6 +309,8 @@ function Workspace({
           project={project}
           path={path}
           canRun={canEdit}
+          revision={graph.revision}
+          dirty={dirty || conflict}
           version={version ?? graph.publishedVersion}
           setVersion={setVersion}
           onRun={(id) => {
@@ -310,6 +318,16 @@ function Workspace({
             setPane('history');
             setNotice('');
           }}
+          onRestored={(saved, restored) => {
+            setUndo((history) => [...history.slice(-49), draft]);
+            setRedo([]);
+            setGraph(saved);
+            setDraft(saved.draft);
+            setPane('draft');
+            setError('');
+            setNotice('已将 v' + restored + ' 恢复到草稿');
+          }}
+          onConflict={() => setConflict(true)}
         />
       )}
       {pane === 'history' && (
@@ -317,8 +335,20 @@ function Workspace({
           path={path}
           projectId={project.id}
           canCancel={canEdit}
+          canApprove={canApprove}
           selected={selectedRun}
           onSelect={setSelectedRun}
+        />
+      )}
+      {pane === 'triggers' && (
+        <ExecutionGraphTriggers
+          path={path}
+          canManage={canEdit && canApprove}
+          canInvoke={canEdit}
+          onRun={(id) => {
+            setSelectedRun(id);
+            setPane('history');
+          }}
         />
       )}
     </div>
@@ -329,16 +359,24 @@ function PublishedVersions({
   project,
   path,
   canRun,
+  revision,
+  dirty,
   version,
   setVersion,
   onRun,
+  onRestored,
+  onConflict,
 }: {
   project: ProjectDetail;
   path: string;
   canRun: boolean;
+  revision: number;
+  dirty: boolean;
   version: number | null;
   setVersion: (v: number) => void;
   onRun: (id: string) => void;
+  onRestored: (graph: GraphDocument, version: number) => void;
+  onConflict: () => void;
 }) {
   const list = useResource<{ version: number; createdAt: number }[]>(path + '/versions');
   const activeVersion = version ?? list.data?.[0]?.version;
@@ -383,6 +421,17 @@ function PublishedVersions({
             </div>
             {flow && activeVersion && item.data?.version === activeVersion && (
               <>
+                <GraphVersionTools
+                  key={activeVersion}
+                  path={path}
+                  live={item.data}
+                  versions={list.data}
+                  revision={revision}
+                  canRestore={canRun}
+                  dirty={dirty}
+                  onRestored={onRestored}
+                  onConflict={onConflict}
+                />
                 <PublishedNodes
                   key={activeVersion + '-' + flow.id}
                   flow={flow}
@@ -433,6 +482,16 @@ function PublishedNodes({
             <p>
               {node.condition.key === 'input' ? '运行参数' : '提交 SHA'} 等于 {node.condition.value}
             </p>
+          )}
+          {node.switch && (
+            <p>
+              {node.switch.key === 'input' ? '运行参数' : '提交 SHA'} · 匹配项{' '}
+              {node.switch.cases.join('、')}
+            </p>
+          )}
+          {node.type === 'DELAY' && <p>等待 {node.delaySeconds} 秒</p>}
+          {node.type === 'APPROVAL' && (
+            <p>管理员审批 · {node.approval?.timeoutSeconds ?? 86400} 秒后超时</p>
           )}
           {node.flowId && (
             <p>子执行流 · {flows.find((item) => item.id === node.flowId)?.name ?? node.flowId}</p>

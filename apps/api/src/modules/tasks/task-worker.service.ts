@@ -147,6 +147,11 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         });
     }
     await this.recoverExpired();
+    if (!this.stopping) {
+      await this.registry
+        .tickGraphTriggers()
+        ?.catch(() => this.logger.warn('执行图触发器检查失败，将在下一轮重试'));
+    }
     if (!this.stopping) await this.advanceGraphRuns();
     if (this.failures && !this.stopping) {
       this.diagnosing ??= this.failures

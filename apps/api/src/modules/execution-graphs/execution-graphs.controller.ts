@@ -55,6 +55,16 @@ export class ExecutionGraphsController {
   ) {
     return this.graphs.version(projectId, version);
   }
+  @Post('versions/:version/restore')
+  @Roles('ADMIN', 'OPERATOR')
+  restore(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Param('version', ParseIntPipe) version: number,
+    @Body() input: ExpectedGraphRevisionDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.graphs.restore(projectId, version, input.expectedRevision, req.user.id);
+  }
   @Post('extract/preview')
   @Roles('ADMIN', 'OPERATOR')
   previewExtraction(

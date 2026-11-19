@@ -1,4 +1,5 @@
 import { executionGraphsMigration } from './execution-graphs-migration';
+import { executionGraphTriggersMigration } from './execution-graph-triggers-migration';
 import {
   sql,
   type Kysely,
@@ -1449,6 +1450,7 @@ export const migrationProvider: MigrationProvider = {
         },
       } satisfies Migration,
       '018_project_execution_graphs': executionGraphsMigration,
+      '019_execution_graph_triggers': executionGraphTriggersMigration,
     };
   },
 };

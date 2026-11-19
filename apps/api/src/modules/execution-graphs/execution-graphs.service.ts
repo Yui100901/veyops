@@ -210,13 +210,7 @@ export class ExecutionGraphsService {
 
   async version(projectId: string, version: number) {
     const graph = await this.graph(projectId);
-    const row = await this.database.db
-      .selectFrom('execution_graph_versions')
-      .selectAll()
-      .where('graph_id', '=', graph.id)
-      .where('version', '=', version)
-      .executeTakeFirst();
-    if (!row) throw new NotFoundException('执行图发布版本不存在');
+    const row = await this.publishedVersion(this.database.db, graph.id, version);
     return {
       version: row.version,
       sourceRevision: row.source_revision,
@@ -224,5 +218,35 @@ export class ExecutionGraphsService {
       createdBy: row.created_by,
       definition: JSON.parse(row.definition_json) as GraphDefinition,
     };
+  }
+
+  async restore(projectId: string, version: number, expectedRevision: number, userId: string) {
+    return this.database.db.transaction().execute(async (tx) => {
+      const graph = await this.lockDraft(tx, projectId, expectedRevision);
+      const published = await this.publishedVersion(tx, graph.id, version);
+      const definition = JSON.parse(published.definition_json) as GraphDefinition;
+      await this.validateReferences(tx, projectId, definition);
+      const row = await this.updateDraft(tx, graph, definition);
+      await this.audit.record(
+        userId,
+        'execution_graph.restore',
+        'execution_graph',
+        graph.id,
+        { projectId, version, revision: row.revision },
+        tx,
+      );
+      return graphResponse(row);
+    });
+  }
+
+  private async publishedVersion(db: Kysely<Database>, graphId: string, version: number) {
+    const row = await db
+      .selectFrom('execution_graph_versions')
+      .selectAll()
+      .where('graph_id', '=', graphId)
+      .where('version', '=', version)
+      .executeTakeFirst();
+    if (!row) throw new NotFoundException('执行图发布版本不存在');
+    return row;
   }
 }

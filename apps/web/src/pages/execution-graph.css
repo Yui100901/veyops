@@ -236,3 +236,30 @@ button.graph-node[aria-pressed='true'] {
 .graph-canvas-editing .graph-node:active {
   cursor: grabbing;
 }
+
+.graph-properties fieldset {
+  display: grid;
+  gap: 0.9rem;
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+.graph-version-diff h3 {
+  display: flex;
+  gap: 0.45rem;
+  align-items: center;
+}
+.graph-version-diff li,
+.graph-properties code {
+  overflow-wrap: anywhere;
+}
+.graph-version-diff ul {
+  margin-top: 0.5rem;
+}
+.graph-connectors .edge-case > path {
+  stroke: #39658e;
+}
+.graph-connectors .edge-default > path {
+  stroke: #7c648c;
+}

@@ -75,20 +75,18 @@ function reachableNodes(root: GraphFlow, flows: GraphFlow[], inputs: Inputs) {
       )
         autoArtifacts.add(node.id);
       if (node.type === 'BUILD') upstreamBuilds.add(node);
-      const value =
-        node.condition?.key === 'commitSha'
-          ? inputs.commitSha?.toLowerCase()
-          : (inputs.value ?? '');
-      const required =
-        node.condition?.key === 'commitSha'
-          ? node.condition.value.toLowerCase()
-          : node.condition?.value;
+      const source = node.condition?.key ?? node.switch?.key;
+      const value = source === 'commitSha' ? inputs.commitSha?.toLowerCase() : (inputs.value ?? '');
+      const matches = (expected: string) =>
+        value === (source === 'commitSha' ? expected.toLowerCase() : expected);
+      const caseIndex = node.switch?.cases.findIndex(matches) ?? -1;
+      const branch = node.switch
+        ? caseIndex < 0
+          ? 'DEFAULT'
+          : `CASE:${caseIndex}`
+        : node.condition && (matches(node.condition.value) ? 'TRUE' : 'FALSE');
       for (const edge of flow.edges) {
-        if (
-          edge.from !== node.id ||
-          (edge.when && edge.when !== (value === required ? 'TRUE' : 'FALSE'))
-        )
-          continue;
+        if (edge.from !== node.id || (edge.when && edge.when !== branch)) continue;
         reachable.add(edge.to);
         ancestors.set(edge.to, new Set([...(ancestors.get(edge.to) ?? []), ...upstreamBuilds]));
       }
@@ -116,8 +114,8 @@ export function ExecutionGraphStart({
   const [inputs, setInputs] = useState<Inputs>({});
   const { nodes, autoArtifacts } = reachableNodes(flow, flows, inputs);
   const actions = nodes.filter(isDeliveryNode);
-  const needsValue = nodes.some((n) => n.condition?.key === 'input');
-  const needsCommit = nodes.some((n) => n.condition?.key === 'commitSha');
+  const needsValue = nodes.some((n) => (n.condition?.key ?? n.switch?.key) === 'input');
+  const needsCommit = nodes.some((n) => (n.condition?.key ?? n.switch?.key) === 'commitSha');
   const build = actions.find((n) => n.type === 'BUILD');
   const deployments = actions.filter((n) => n.type === 'DEPLOY_ARTIFACT');
   const historyRequired = deployments.find((n) => !autoArtifacts.has(n.id));
@@ -517,17 +515,23 @@ function HistoryArtifacts({
   );
 }
 
+interface RunNode {
+  nodeId: string;
+  name: string;
+  type: string;
+  status: string;
+  log: string;
+  taskId?: string;
+  childRunId?: string | null;
+  output?: {
+    wakeAt?: number;
+    expiresAt?: number;
+    decision?: 'APPROVE' | 'REJECT';
+    decidedAt?: number;
+  };
+}
 interface RunDetail extends GraphRun {
-  nodes: {
-    nodeId: string;
-    name: string;
-    type: string;
-    status: string;
-    log: string;
-    taskId?: string;
-    childRunId?: string | null;
-    output?: { artifactIds?: string[] };
-  }[];
+  nodes: RunNode[];
   commitSha?: string;
   artifactIds?: string[];
 }
@@ -536,12 +540,14 @@ export function ExecutionGraphHistory({
   path,
   projectId,
   canCancel,
+  canApprove,
   selected,
   onSelect,
 }: {
   path: string;
   projectId: string;
   canCancel: boolean;
+  canApprove: boolean;
   selected?: string;
   onSelect: (id: string) => void;
 }) {
@@ -632,6 +638,7 @@ export function ExecutionGraphHistory({
           path={path + '/runs/' + encodeURIComponent(selected)}
           projectId={projectId}
           canCancel={canCancel}
+          canApprove={canApprove}
           onChange={list.reload}
         />
       )}
@@ -643,11 +650,13 @@ function RunDetails({
   path,
   projectId,
   canCancel,
+  canApprove,
   onChange,
 }: {
   path: string;
   projectId: string;
   canCancel: boolean;
+  canApprove: boolean;
   onChange: () => void;
 }) {
   const run = useResource<RunDetail>(path, 3000);
@@ -744,6 +753,20 @@ function RunDetails({
                       <Status value={n.status} />
                     </div>
                     {n.log && <pre>{n.log}</pre>}
+                    {n.type === 'DELAY' && n.status === 'WAITING' && n.output?.wakeAt && (
+                      <p>计划恢复 · {formatTime(n.output.wakeAt)}</p>
+                    )}
+                    {n.type === 'APPROVAL' && (
+                      <GraphApprovalActions
+                        node={n}
+                        path={path}
+                        canApprove={canApprove}
+                        onChange={() => {
+                          void run.reload();
+                          onChange();
+                        }}
+                      />
+                    )}
                     {n.taskId && (
                       <a className="text-link" href={'#/tasks/' + n.taskId}>
                         查看逐目标任务日志
@@ -795,5 +818,93 @@ function RunDetails({
         />
       )}
     </Section>
+  );
+}
+
+function GraphApprovalActions({
+  node,
+  path,
+  canApprove,
+  onChange,
+}: {
+  node: RunNode;
+  path: string;
+  canApprove: boolean;
+  onChange: () => void;
+}) {
+  const [decision, setDecision] = useState<'APPROVE' | 'REJECT'>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const waiting = node.status === 'WAITING';
+  async function decide() {
+    if (!waiting || !decision || busy) return;
+    setError('');
+    setBusy(true);
+    try {
+      await post(path + '/nodes/' + encodeURIComponent(node.nodeId) + '/decision', { decision });
+      setDecision(undefined);
+      onChange();
+    } catch (error) {
+      setError(message(error));
+      onChange();
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <>
+      {waiting && node.output?.expiresAt && <p>审批截止 · {formatTime(node.output.expiresAt)}</p>}
+      {node.output?.decision && (
+        <p>
+          {node.output.decision === 'APPROVE' ? '已批准' : '已拒绝'}
+          {node.output.decidedAt ? ' · ' + formatTime(node.output.decidedAt) : ''}
+        </p>
+      )}
+      {canApprove && waiting && (
+        <div className="heading-actions">
+          <button
+            type="button"
+            className="button primary small"
+            onClick={() => setDecision('APPROVE')}
+          >
+            批准节点
+          </button>
+          <button
+            type="button"
+            className="button secondary small"
+            onClick={() => setDecision('REJECT')}
+          >
+            拒绝节点
+          </button>
+        </div>
+      )}
+      {decision && (
+        <Confirm
+          title={decision === 'APPROVE' ? '批准审批节点' : '拒绝审批节点'}
+          description={
+            !waiting
+              ? '审批已结束。'
+              : decision === 'APPROVE'
+                ? '批准后恢复当前执行流。'
+                : '拒绝后停止当前执行路径。'
+          }
+          detail={<p>{node.name}</p>}
+          label={waiting ? (decision === 'APPROVE' ? '确认批准' : '确认拒绝') : '关闭'}
+          destructive={waiting && decision === 'REJECT'}
+          busy={busy}
+          error={error}
+          onClose={() => {
+            if (!busy) {
+              setDecision(undefined);
+              setError('');
+            }
+          }}
+          onConfirm={() => {
+            if (waiting) void decide();
+            else setDecision(undefined);
+          }}
+        />
+      )}
+    </>
   );
 }

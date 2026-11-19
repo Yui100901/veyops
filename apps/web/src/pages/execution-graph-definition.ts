@@ -4,6 +4,9 @@ export const graphNodeLabels = {
   BUILD: '构建并归档',
   DEPLOY_ARTIFACT: '部署历史产物',
   CONDITION: '条件判断',
+  SWITCH: '多路判断',
+  DELAY: '等待',
+  APPROVAL: '人工审批',
   PARALLEL: '并行分支',
   JOIN: '汇合',
   FLOW_CALL: '调用执行流',
@@ -12,7 +15,7 @@ export const graphNodeLabels = {
 export interface GraphEdge {
   from: string;
   to: string;
-  when?: 'TRUE' | 'FALSE';
+  when?: 'TRUE' | 'FALSE' | 'DEFAULT' | `CASE:${number}`;
 }
 export interface GraphNode {
   id: string;
@@ -22,6 +25,9 @@ export interface GraphNode {
   pipelineId?: string;
   pipelineVersion?: number;
   condition?: { key: 'input' | 'commitSha'; value: string };
+  switch?: { key: 'input' | 'commitSha'; cases: string[] };
+  delaySeconds?: number;
+  approval?: { timeoutSeconds?: number };
   flowId?: string;
   position?: { x: number; y: number };
 }
@@ -85,4 +91,27 @@ export function orderedNodes(flow: GraphFlow) {
 
 export function isDeliveryNode(node: GraphNode) {
   return node.type === 'BUILD' || node.type === 'DEPLOY_ARTIFACT';
+}
+
+export function branchOptions(
+  node?: GraphNode,
+): { value: NonNullable<GraphEdge['when']>; label: string }[] {
+  if (node?.type === 'CONDITION')
+    return [
+      { value: 'TRUE', label: '成立' },
+      { value: 'FALSE', label: '不成立' },
+    ];
+  if (node?.type === 'SWITCH')
+    return [
+      ...(node.switch?.cases ?? []).map((value, i) => ({
+        value: `CASE:${i}` as const,
+        label: value || `选项 ${i + 1}`,
+      })),
+      { value: 'DEFAULT', label: '默认' },
+    ];
+  return [];
+}
+
+export function branchLabel(when: GraphEdge['when'], node?: GraphNode) {
+  return branchOptions(node).find((item) => item.value === when)?.label ?? when;
 }

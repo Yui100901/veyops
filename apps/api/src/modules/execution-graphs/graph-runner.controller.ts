@@ -5,6 +5,7 @@ import {
   ArrayMinSize,
   ArrayUnique,
   IsArray,
+  IsIn,
   IsInt,
   IsObject,
   IsOptional,
@@ -39,6 +40,10 @@ export class GraphPreviewDto {
 export class GraphRunDto extends GraphPreviewDto {
   @Matches(/^[a-f0-9]{64}$/) expectedConfigurationHash!: string;
   @Matches(/^[a-zA-Z0-9_-]{1,120}$/) idempotencyKey!: string;
+}
+
+export class GraphApprovalDecisionDto {
+  @IsIn(['APPROVE', 'REJECT']) decision!: 'APPROVE' | 'REJECT';
 }
 
 @Controller('projects/:id/execution-graph')
@@ -77,6 +82,18 @@ export class GraphRunnerController {
   @Get('runs/:runId')
   get(@Param('id', ParseUUIDPipe) projectId: string, @Param('runId', ParseUUIDPipe) runId: string) {
     return this.runner.get(projectId, runId);
+  }
+
+  @Post('runs/:runId/nodes/:nodeId/decision')
+  @Roles('ADMIN')
+  decideApproval(
+    @Param('id', ParseUUIDPipe) projectId: string,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @Param('nodeId') nodeId: string,
+    @Body() body: GraphApprovalDecisionDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.runner.decideApproval(projectId, runId, nodeId, body.decision, req.user.id);
   }
 
   @Post('runs/:runId/cancel')

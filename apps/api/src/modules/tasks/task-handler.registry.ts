@@ -5,6 +5,13 @@ import { TaskHandler } from './tasks.types';
 export class TaskHandlerRegistry {
   private readonly handlers = new Map<string, TaskHandler>();
   private graphPump?: (taskId?: string) => Promise<void>;
+  private graphTriggerPump?: () => Promise<void>;
+  registerGraphTriggerPump(pump: () => Promise<void>): void {
+    this.graphTriggerPump = pump;
+  }
+  tickGraphTriggers(): Promise<void> | undefined {
+    return this.graphTriggerPump?.();
+  }
   registerGraphPump(pump: (taskId?: string) => Promise<void>): void {
     this.graphPump = pump;
   }

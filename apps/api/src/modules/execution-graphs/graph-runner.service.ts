@@ -20,7 +20,12 @@ import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { TasksService } from '../tasks/tasks.service';
 import type { TaskPayload } from '../tasks/tasks.types';
 import { redactTaskLog } from '../tasks/task-log.service';
-import type { GraphDefinition, GraphFlow, GraphNode } from './execution-graph-definition';
+import {
+  defaultApprovalSeconds,
+  type GraphDefinition,
+  type GraphFlow,
+  type GraphNode,
+} from './execution-graph-definition';
 import type { GraphInputsDto, GraphPreviewDto, GraphRunDto } from './graph-runner.controller';
 import {
   activeFlowStatuses,
@@ -56,6 +61,12 @@ interface RunSnapshot {
   inputs: GraphInputsDto;
   deliveries?: Record<string, Delivery>;
   rootId?: string;
+}
+
+interface AutomaticRunOrigin {
+  triggerType: 'CRON' | 'WEBHOOK' | 'API' | 'UPSTREAM';
+  beforeInsert?: (tx: Transaction<Database>) => Promise<void>;
+  afterInsert?: (tx: Transaction<Database>, runId: string) => Promise<void>;
 }
 
 function digest(value: unknown) {
@@ -338,23 +349,34 @@ export class GraphRunnerService implements OnModuleInit {
         flowId: row.flow_id,
         version: row.version,
         parentRunId: row.parent_run_id,
+        triggerType: row.trigger_type ?? (row.parent_run_id ? 'FLOW_CALL' : 'MANUAL'),
       },
       tx,
     );
     return row;
   }
 
-  private runValues(values: Omit<Run, 'created_at' | 'finished_at' | 'status' | 'task_id'>) {
+  private runValues(
+    values: Omit<Run, 'created_at' | 'finished_at' | 'status' | 'task_id' | 'trigger_type'> &
+      Pick<Partial<Run>, 'trigger_type'>,
+  ) {
     return { ...values, status: 'QUEUED', created_at: Date.now() };
   }
 
-  async run(projectId: string, flowId: string, request: GraphRunDto, userId: string) {
+  async run(
+    projectId: string,
+    flowId: string,
+    request: GraphRunDto,
+    userId: string,
+    origin?: AutomaticRunOrigin,
+  ) {
     const db = this.database.db;
     const requestHash = digest([
       flowId,
       request.version,
       request.inputs ?? {},
       request.expectedConfigurationHash,
+      ...(origin ? [origin.triggerType] : []),
     ]);
     await requireProject(db, projectId);
     const previous = () =>
@@ -377,7 +399,8 @@ export class GraphRunnerService implements OnModuleInit {
     const byNode = Object.fromEntries(deliveries.map((delivery) => [delivery.nodeId, delivery]));
     const row = await db.transaction().execute(async (tx) => {
       await this.lockProject(tx, projectId);
-      return this.insertRun(
+      await origin?.beforeInsert?.(tx);
+      const inserted = await this.insertRun(
         tx,
         {
           id: randomUUID(),
@@ -388,6 +411,7 @@ export class GraphRunnerService implements OnModuleInit {
           flow_name: flow.name,
           created_by: userId,
           parent_run_id: null,
+          trigger_type: origin?.triggerType ?? null,
           idempotency_key: request.idempotencyKey,
           request_hash: requestHash,
           configuration_hash: preview.configurationHash,
@@ -397,6 +421,8 @@ export class GraphRunnerService implements OnModuleInit {
         inputs,
         byNode,
       );
+      if (inserted) await origin?.afterInsert?.(tx, inserted.id);
+      return inserted;
     });
     if (!row) {
       const stored = (await previous())!;
@@ -452,6 +478,73 @@ export class GraphRunnerService implements OnModuleInit {
       .where('p.task_id', 'in', taskIds)
       .orderBy('a.id')
       .execute();
+  }
+
+  private async waitAtNode(tx: Transaction<Database>, row: NodeRun, node: GraphNode, now: number) {
+    const startedAt = row.started_at ?? now;
+    if (node.type === 'DELAY') {
+      const wakeAt = startedAt + node.delaySeconds! * 1000;
+      if (wakeAt <= now) {
+        await this.terminalNode(tx, row, 'SUCCESS', '延时已完成。', { wakeAt }, startedAt, now);
+        return;
+      }
+      if (row.status !== 'WAITING')
+        await this.markWaiting(tx, row, startedAt, '等待延时结束。', { wakeAt });
+      return;
+    }
+    const expiresAt = approvalDeadline(node, startedAt);
+    if (expiresAt <= now) {
+      await this.expireApproval(tx, row, expiresAt, now);
+    } else if (row.status !== 'WAITING') {
+      await this.markWaiting(tx, row, startedAt, '等待管理员审批。', { expiresAt });
+    }
+  }
+
+  private async markWaiting(
+    tx: Transaction<Database>,
+    row: NodeRun,
+    startedAt: number,
+    log: string,
+    output: { wakeAt: number } | { expiresAt: number },
+  ) {
+    await tx
+      .updateTable('execution_node_runs')
+      .set({ status: 'WAITING', started_at: startedAt, log, output_json: JSON.stringify(output) })
+      .where('id', '=', row.id)
+      .execute();
+    row.status = 'WAITING';
+  }
+
+  private async expireApproval(
+    tx: Transaction<Database>,
+    row: NodeRun,
+    expiresAt: number,
+    now: number,
+  ) {
+    await this.terminalNode(
+      tx,
+      row,
+      'TIMED_OUT',
+      '审批等待已超时。',
+      {
+        decision: 'EXPIRED',
+        expiresAt,
+        decidedAt: now,
+      },
+      row.started_at,
+      now,
+    );
+    await this.audit.record(
+      null,
+      'execution-flow.approval.expired',
+      'flow-run',
+      row.run_id,
+      {
+        nodeId: row.node_id,
+        expiresAt,
+      },
+      tx,
+    );
   }
 
   private async settle(runId: string) {
@@ -565,13 +658,20 @@ export class GraphRunnerService implements OnModuleInit {
           continue;
         }
         if (run.status === 'CANCEL_REQUESTED') {
-          await this.terminalNode(tx, row, 'SKIPPED', '执行流已请求取消。');
+          await this.terminalNode(
+            tx,
+            row,
+            row.status === 'WAITING' ? 'CANCELLED' : 'SKIPPED',
+            '执行流已请求取消。',
+          );
           continue;
         }
         const parents = (incoming.get(node.id) ?? []).map((edge) => byId.get(edge.from)!);
         if (parents.some((parent) => !isNodeTerminal(parent.status))) continue;
         if (parents.some((parent) => parent.status !== 'SUCCESS')) {
           await this.terminalNode(tx, row, 'SKIPPED', '上游节点未成功。');
+        } else if (node.type === 'DELAY' || node.type === 'APPROVAL') {
+          await this.waitAtNode(tx, row, node, now);
         } else if (isDelivery(node) || node.type === 'FLOW_CALL') {
           ready.push({ node: row, action: node });
         } else {
@@ -581,7 +681,9 @@ export class GraphRunnerService implements OnModuleInit {
             row,
             'SUCCESS',
             graphNodeOutput(node, match),
-            match === undefined ? undefined : { matched: match },
+            match === undefined
+              ? undefined
+              : { matched: node.type === 'CONDITION' ? match === 'TRUE' : match },
             now,
           );
         }
@@ -811,13 +913,18 @@ export class GraphRunnerService implements OnModuleInit {
   }
 
   private async taskChanged(taskId: string) {
-    let id = (
+    const id = (
       await this.database.db
         .selectFrom('execution_node_runs')
         .select('run_id')
         .where('task_id', '=', taskId)
         .executeTakeFirst()
     )?.run_id;
+    await this.advanceHierarchy(id);
+  }
+
+  private async advanceHierarchy(runId?: string) {
+    let id = runId;
     while (id) {
       await this.advance(id);
       const row: { parent_run_id: string | null } | undefined = await this.database.db
@@ -891,6 +998,77 @@ export class GraphRunnerService implements OnModuleInit {
     return this.get(projectId, id);
   }
 
+  async decideApproval(
+    projectId: string,
+    runId: string,
+    nodeId: string,
+    decision: 'APPROVE' | 'REJECT',
+    userId: string,
+  ) {
+    const expired = await this.database.db.transaction().execute(async (tx) => {
+      // Serialize the decision with cancellation, timeout, and worker advancement.
+      const run = await tx
+        .updateTable('execution_flow_runs')
+        .set((eb) => ({ status: eb.ref('status') }))
+        .where('id', '=', runId)
+        .where('project_id', '=', projectId)
+        .returningAll()
+        .executeTakeFirst();
+      if (!run) throw new NotFoundException('执行记录不存在');
+      if (isNodeTerminal(run.status) || run.status === 'CANCEL_REQUESTED')
+        throw new ConflictException('此执行流已结束或正在取消');
+      const row = await tx
+        .selectFrom('execution_node_runs')
+        .selectAll()
+        .where('run_id', '=', runId)
+        .where('node_id', '=', nodeId)
+        .where('node_type', '=', 'APPROVAL')
+        .executeTakeFirst();
+      if (!row) throw new NotFoundException('审批节点不存在');
+      if (row.status !== 'WAITING' || row.started_at === null)
+        throw new ConflictException('此节点没有等待审批');
+      const { definition } = await this.published(projectId, run.version, tx);
+      const node = this.flow(definition, run.flow_id).nodes.find(({ id }) => id === nodeId)!;
+      const now = Date.now();
+      const expiresAt = approvalDeadline(node, row.started_at);
+      if (now >= expiresAt) {
+        await this.expireApproval(tx, row, expiresAt, now);
+        return true;
+      }
+      const approved = decision === 'APPROVE';
+      await this.terminalNode(
+        tx,
+        row,
+        approved ? 'SUCCESS' : 'FAILED',
+        approved ? '管理员已批准。' : '管理员已拒绝。',
+        {
+          decision,
+          actorId: userId,
+          decidedAt: now,
+          expiresAt,
+        },
+        row.started_at,
+        now,
+      );
+      await this.audit.record(
+        userId,
+        'execution-flow.approval.decision',
+        'flow-run',
+        runId,
+        {
+          projectId,
+          nodeId,
+          decision,
+        },
+        tx,
+      );
+      return false;
+    });
+    await this.advanceHierarchy(runId);
+    if (expired) throw new ConflictException('此节点的审批等待已超时');
+    return this.get(projectId, runId);
+  }
+
   private runs(projectId: string) {
     return this.database.db
       .selectFrom('execution_flow_runs as r')
@@ -907,6 +1085,7 @@ export class GraphRunnerService implements OnModuleInit {
         'r.status',
         'r.task_id as taskId',
         'r.parent_run_id as parentRunId',
+        'r.trigger_type as triggerType',
       ])
       .where('r.project_id', '=', projectId);
   }
@@ -937,7 +1116,10 @@ export class GraphRunnerService implements OnModuleInit {
     }
     return (
       await query.orderBy('r.created_at', 'desc').orderBy('r.id', 'desc').limit(100).execute()
-    ).map((row) => ({ ...row, triggerType: row.parentRunId ? 'FLOW_CALL' : 'MANUAL' }));
+    ).map((row) => ({
+      ...row,
+      triggerType: row.triggerType ?? (row.parentRunId ? 'FLOW_CALL' : 'MANUAL'),
+    }));
   }
 
   async get(projectId: string, id: string) {
@@ -1013,7 +1195,7 @@ export class GraphRunnerService implements OnModuleInit {
       startedAt: row.createdAt,
       finishedAt: row.finishedAt,
       createdBy: row.createdBy,
-      triggerType: row.parentRunId ? 'FLOW_CALL' : 'MANUAL',
+      triggerType: row.triggerType ?? (row.parentRunId ? 'FLOW_CALL' : 'MANUAL'),
       definition: flow,
       inputs,
       deliveries,
@@ -1021,4 +1203,8 @@ export class GraphRunnerService implements OnModuleInit {
       nodes,
     };
   }
+}
+
+function approvalDeadline(node: GraphNode, startedAt: number) {
+  return startedAt + (node.approval?.timeoutSeconds ?? defaultApprovalSeconds) * 1000;
 }

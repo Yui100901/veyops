@@ -48,6 +48,41 @@ const dagDefinition = {
   ],
 };
 
+const advancedDefinition = {
+  flows: [
+    {
+      id: 'advanced',
+      name: '可控交付',
+      nodes: [
+        { id: 'start', type: 'START', name: '开始' },
+        {
+          id: 'switch',
+          type: 'SWITCH',
+          name: '选择执行路径',
+          switch: { key: 'input', cases: ['approve', 'delay'] },
+        },
+        { id: 'approve', type: 'APPROVAL', name: '发布确认', approval: { timeoutSeconds: 60 } },
+        { id: 'continue', type: 'LOG', name: '继续发布', message: 'approved-path' },
+        { id: 'delay', type: 'DELAY', name: '等待', delaySeconds: 60 },
+        { id: 'default', type: 'LOG', name: '普通检查', message: 'default-path' },
+        { id: 'join', type: 'JOIN', name: '汇合' },
+        { id: 'end', type: 'END', name: '结束' },
+      ],
+      edges: [
+        { from: 'start', to: 'switch' },
+        { from: 'switch', to: 'approve', when: 'CASE:0' },
+        { from: 'switch', to: 'delay', when: 'CASE:1' },
+        { from: 'switch', to: 'default', when: 'DEFAULT' },
+        { from: 'approve', to: 'continue' },
+        { from: 'continue', to: 'join' },
+        { from: 'delay', to: 'join' },
+        { from: 'default', to: 'join' },
+        { from: 'join', to: 'end' },
+      ],
+    },
+  ],
+};
+
 async function checkGraph(url?: string) {
   const dir = await mkdtemp(join(tmpdir(), 'veyops-graph-api-'));
   const initial = randomBytes(16).toString('hex');
@@ -376,6 +411,135 @@ async function checkGraph(url?: string) {
       .post(flow + '/run')
       .send(input)
       .expect(403);
+    const restored = (
+      await api
+        .post(path + '/versions/1/restore')
+        .send({ expectedRevision: nextRevision })
+        .expect(201)
+    ).body.data;
+    assert.deepEqual(restored.draft, old);
+    assert.equal(restored.revision, nextRevision + 1);
+    assert.equal(restored.publishedVersion, v2);
+    await api
+      .post(path + '/versions/1/restore')
+      .send({ expectedRevision: nextRevision })
+      .expect(409);
+    assert.deepEqual((await api.get(path + '/versions/2').expect(200)).body.data.definition, next);
+
+    const advancedProject = await project('advanced-graph');
+    const advancedPath = root + '/projects/' + advancedProject + '/execution-graph';
+    const savedAdvanced = (
+      await api
+        .put(advancedPath + '/draft')
+        .send({ expectedRevision: 1, definition: advancedDefinition })
+        .expect(200)
+    ).body.data;
+    await api
+      .post(advancedPath + '/publish')
+      .send({ expectedRevision: savedAdvanced.revision })
+      .expect(201);
+    const start = async (value: string) => {
+      const args = { version: 1, inputs: { value } };
+      const endpoint = advancedPath + '/flows/advanced';
+      const preview = (
+        await api
+          .post(endpoint + '/preview')
+          .send(args)
+          .expect(201)
+      ).body.data;
+      return (
+        await api
+          .post(endpoint + '/run')
+          .send({
+            ...args,
+            expectedConfigurationHash: preview.configurationHash,
+            idempotencyKey: randomUUID(),
+          })
+          .expect(201)
+      ).body.data;
+    };
+    const details = async (id: string) =>
+      (await api.get(advancedPath + '/runs/' + id).expect(200)).body.data;
+    const findNode = (
+      run: { nodes: { nodeId: string; status: string; output?: Record<string, unknown> }[] },
+      id: string,
+    ) => run.nodes.find(({ nodeId }) => nodeId === id)!;
+    const decisionPath = (id: string) => advancedPath + '/runs/' + id + '/nodes/approve/decision';
+    const automatic = await start('ordinary');
+    assert.equal(automatic.status, 'SUCCESS');
+    assert.equal(findNode(automatic, 'switch').output?.matched, 'DEFAULT');
+    assert.equal(findNode(automatic, 'approve').status, 'SKIPPED');
+    const pending = await start('approve');
+    assert.equal(pending.status, 'WAITING');
+    assert.equal(findNode(pending, 'switch').output?.matched, 'CASE:0');
+    assert.equal(findNode(pending, 'continue').status, 'PENDING');
+    assert.ok(Number(findNode(pending, 'approve').output?.expiresAt) > Date.now());
+    await db
+      .insertInto('users')
+      .values({
+        id: randomUUID(),
+        username: 'graph-operator',
+        password_hash: admin.password_hash,
+        role: 'OPERATOR',
+        status: 'ACTIVE',
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      })
+      .execute();
+    const operator = request.agent(app.getHttpServer());
+    await operator
+      .post(root + '/auth/login')
+      .send({ username: 'graph-operator', password })
+      .expect(201);
+    await operator.post(decisionPath(pending.id)).send({ decision: 'APPROVE' }).expect(403);
+    const competing = await Promise.all([
+      api.post(decisionPath(pending.id)).send({ decision: 'APPROVE' }),
+      api.post(decisionPath(pending.id)).send({ decision: 'APPROVE' }),
+    ]);
+    assert.deepEqual(competing.map(({ status }) => status).sort(), [201, 409]);
+    const approved = await details(pending.id);
+    assert.equal(approved.status, 'SUCCESS');
+    assert.equal(findNode(approved, 'approve').output?.decision, 'APPROVE');
+    assert.equal(findNode(approved, 'continue').status, 'SUCCESS');
+
+    const rejected = await start('approve');
+    const rejection = (
+      await api.post(decisionPath(rejected.id)).send({ decision: 'REJECT' }).expect(201)
+    ).body.data;
+    assert.equal(rejection.status, 'FAILED');
+    assert.equal(findNode(rejection, 'continue').status, 'SKIPPED');
+    assert.equal(findNode(rejection, 'approve').output?.decision, 'REJECT');
+    const late = await start('approve');
+    const waiting = await start('delay');
+    assert.equal(waiting.status, 'WAITING');
+    assert.equal(findNode(waiting, 'switch').output?.matched, 'CASE:1');
+    const wakeAt = Number(findNode(waiting, 'delay').output?.wakeAt);
+    assert.ok(wakeAt > Date.now());
+    const worker = app.get(TaskWorkerService);
+    await worker.tick();
+    const beforeWake = await details(waiting.id);
+    assert.equal(findNode(beforeWake, 'delay').output?.wakeAt, wakeAt);
+    assert.equal(beforeWake.status, 'WAITING');
+    await db
+      .updateTable('execution_node_runs')
+      .set({ started_at: Date.now() - 61_000 })
+      .where('run_id', 'in', [late.id, waiting.id])
+      .where('status', '=', 'WAITING')
+      .execute();
+    await api.post(decisionPath(late.id)).send({ decision: 'APPROVE' }).expect(409);
+    assert.equal((await details(late.id)).status, 'TIMED_OUT');
+    await worker.tick();
+    assert.equal((await details(waiting.id)).status, 'SUCCESS');
+    const cancelled = await start('approve');
+    const cancelledDetail = (
+      await api
+        .post(advancedPath + '/runs/' + cancelled.id + '/cancel')
+        .send({})
+        .expect(201)
+    ).body.data;
+    assert.equal(cancelledDetail.status, 'CANCELLED');
+    assert.equal(findNode(cancelledDetail, 'approve').status, 'CANCELLED');
+
     await api.delete(root + '/projects/' + id).expect(200);
     await api.get(path + '/runs/' + runId).expect(200);
     await submit(input).expect(404);

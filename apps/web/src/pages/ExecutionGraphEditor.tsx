@@ -5,7 +5,12 @@ import { ErrorBanner, Field } from '../components';
 import type { ProjectDetail } from '../models';
 import { NodeMap } from './ExecutionGraphCanvas';
 import { PipelineReference } from './ExecutionGraphPipelineReference';
-import { graphKey, graphNodeLabels } from './execution-graph-definition';
+import {
+  branchLabel,
+  branchOptions,
+  graphKey,
+  graphNodeLabels,
+} from './execution-graph-definition';
 import type { GraphDocument, GraphEdge, GraphFlow, GraphNode } from './execution-graph-definition';
 
 function makeNode(type: GraphNode['type'], name = graphNodeLabels[type]): GraphNode {
@@ -15,6 +20,9 @@ function makeNode(type: GraphNode['type'], name = graphNodeLabels[type]): GraphN
     name,
     ...(type === 'LOG' ? { message: name } : {}),
     ...(type === 'CONDITION' ? { condition: { key: 'input', value: 'yes' } } : {}),
+    ...(type === 'SWITCH' ? { switch: { key: 'input', cases: ['release'] } } : {}),
+    ...(type === 'DELAY' ? { delaySeconds: 5 } : {}),
+    ...(type === 'APPROVAL' ? { approval: { timeoutSeconds: 3600 } } : {}),
   };
 }
 
@@ -60,7 +68,8 @@ export function FlowEditor({
       ...flow,
       nodes: flow.nodes.map((n) => (n.id === node?.id ? { ...n, ...fields } : n)),
     });
-  const limit = (adding === 'CONDITION' || adding === 'PARALLEL') && edge ? 96 : 99;
+  const isSplit = adding === 'CONDITION' || adding === 'SWITCH' || adding === 'PARALLEL';
+  const limit = isSplit && edge ? 96 : 99;
 
   function add() {
     const item = makeNode(adding);
@@ -68,12 +77,11 @@ export function FlowEditor({
     const edges = flow.edges.flatMap((current) => {
       if (current !== edge) return [current];
       const before = { ...current, to: item.id };
-      if (adding !== 'CONDITION' && adding !== 'PARALLEL')
-        return [before, { from: item.id, to: current.to }];
-      const branches = [
-        makeNode('LOG', adding === 'CONDITION' ? '条件成立' : '并行路径 A'),
-        makeNode('LOG', adding === 'CONDITION' ? '条件不成立' : '并行路径 B'),
-      ];
+      if (!isSplit) return [before, { from: item.id, to: current.to }];
+      const options = branchOptions(item);
+      const branches = options.length
+        ? options.map(({ label }) => makeNode('LOG', label))
+        : [makeNode('LOG', '并行路径 A'), makeNode('LOG', '并行路径 B')];
       const join = makeNode('JOIN');
       newNodes.push(...branches, join);
       return [
@@ -82,7 +90,7 @@ export function FlowEditor({
           {
             from: item.id,
             to: branch.id,
-            ...(adding === 'CONDITION' ? { when: i === 0 ? 'TRUE' : 'FALSE' } : {}),
+            ...(options[i] ? { when: options[i].value } : {}),
           },
           { from: branch.id, to: join.id },
         ]),
@@ -272,6 +280,46 @@ export function FlowEditor({
               </Field>
             </div>
           )}
+          {node.type === 'SWITCH' && (
+            <SwitchFields
+              node={node}
+              flow={flow}
+              canEdit={canEdit}
+              patch={patch}
+              onChange={onChange}
+            />
+          )}
+          {node.type === 'DELAY' && (
+            <Field label="等待时间（秒）" hint="1–86400 秒。等待期间可继续查看或取消运行。">
+              <input
+                type="number"
+                readOnly={!canEdit}
+                min={1}
+                max={86400}
+                value={node.delaySeconds ?? ''}
+                onChange={(e) =>
+                  patch({ delaySeconds: e.target.value ? Number(e.target.value) : undefined })
+                }
+              />
+            </Field>
+          )}
+          {node.type === 'APPROVAL' && (
+            <Field label="审批超时（秒）" hint="管理员可在运行详情中审批。留空默认 86400 秒。">
+              <input
+                type="number"
+                readOnly={!canEdit}
+                min={1}
+                max={604800}
+                value={node.approval?.timeoutSeconds ?? ''}
+                onChange={(e) =>
+                  patch({
+                    approval:
+                      e.target.value === '' ? {} : { timeoutSeconds: Number(e.target.value) },
+                  })
+                }
+              />
+            </Field>
+          )}
           {node.type === 'FLOW_CALL' && (
             <Field label="子执行流">
               <select
@@ -329,8 +377,15 @@ export function FlowEditor({
                 {flow.edges.map((item, i) => (
                   <option key={i} value={i}>
                     {nameOf(item.from)}
-                    {item.when ? (item.when === 'TRUE' ? '（成立）' : '（不成立）') : ''} →{' '}
-                    {nameOf(item.to)}
+                    {item.when
+                      ? '（' +
+                        branchLabel(
+                          item.when,
+                          flow.nodes.find((n) => n.id === item.from),
+                        ) +
+                        '）'
+                      : ''}{' '}
+                    → {nameOf(item.to)}
                   </option>
                 ))}
               </select>
@@ -378,6 +433,121 @@ export function FlowEditor({
   );
 }
 
+function SwitchFields({
+  node,
+  flow,
+  canEdit,
+  patch,
+  onChange,
+}: {
+  node: GraphNode;
+  flow: GraphFlow;
+  canEdit: boolean;
+  patch: (fields: Partial<GraphNode>) => void;
+  onChange: (flow: GraphFlow) => void;
+}) {
+  const config = node.switch ?? { key: 'input', cases: [] };
+  const defaultTo = flow.edges.find((edge) => edge.from === node.id && edge.when === 'DEFAULT')?.to;
+  const nextJoin = flow.edges.find((edge) => edge.from === defaultTo)?.to;
+  const join = flow.nodes.find((item) => item.type === 'JOIN' && item.id === nextJoin);
+  const lastCase = `CASE:${config.cases.length - 1}` as const;
+  const lastBranch = flow.edges.find((edge) => edge.from === node.id && edge.when === lastCase)?.to;
+  const lastIsSimple =
+    lastBranch &&
+    join &&
+    flow.nodes.some((item) => item.id === lastBranch && item.type === 'LOG') &&
+    flow.edges.filter((edge) => edge.to === lastBranch).length === 1 &&
+    flow.edges.filter((edge) => edge.from === lastBranch).length === 1 &&
+    flow.edges.some((edge) => edge.from === lastBranch && edge.to === join.id);
+  function addCase() {
+    if (!canEdit || config.cases.length >= 10) return;
+    const value = config.key === 'input' ? `branch-${config.cases.length + 1}` : '';
+    const updated = { ...node, switch: { ...config, cases: [...config.cases, value] } };
+    const nodes = flow.nodes.map((item) => (item.id === node.id ? updated : item));
+    if (!join || flow.nodes.length >= 100) {
+      onChange({ ...flow, nodes });
+      return;
+    }
+    const branch = makeNode('LOG', `选项 ${config.cases.length + 1}`);
+    onChange({
+      ...flow,
+      nodes: [...nodes, branch],
+      edges: [
+        ...flow.edges,
+        { from: node.id, to: branch.id, when: `CASE:${config.cases.length}` },
+        { from: branch.id, to: join.id },
+      ],
+    });
+  }
+  function removeLastCase() {
+    if (!canEdit || config.cases.length <= 1 || (lastBranch && !lastIsSimple)) return;
+    const updated = { ...node, switch: { ...config, cases: config.cases.slice(0, -1) } };
+    onChange({
+      ...flow,
+      nodes: flow.nodes
+        .filter((item) => item.id !== lastBranch)
+        .map((item) => (item.id === node.id ? updated : item)),
+      edges: flow.edges.filter((edge) => edge.from !== lastBranch && edge.to !== lastBranch),
+    });
+  }
+  return (
+    <>
+      <div className="form-grid">
+        <Field label="多路判断依据">
+          <select
+            disabled={!canEdit}
+            value={config.key}
+            onChange={(e) =>
+              patch({ switch: { ...config, key: e.target.value as typeof config.key } })
+            }
+          >
+            <option value="input">运行参数</option>
+            <option value="commitSha">提交 SHA</option>
+          </select>
+        </Field>
+        {config.cases.map((value, index) => (
+          <Field
+            label={`选项 ${index + 1}`}
+            key={index}
+            hint={config.key === 'commitSha' ? '填写完整 Git 提交 SHA。' : undefined}
+          >
+            <input
+              readOnly={!canEdit}
+              maxLength={500}
+              value={value}
+              onChange={(e) =>
+                patch({
+                  switch: {
+                    ...config,
+                    cases: config.cases.map((item, i) => (i === index ? e.target.value : item)),
+                  },
+                })
+              }
+            />
+          </Field>
+        ))}
+      </div>
+      {canEdit && (
+        <div className="heading-actions">
+          <button
+            type="button"
+            className="button secondary small"
+            disabled={config.cases.length >= 10}
+            onClick={addCase}
+          >
+            添加匹配项
+          </button>
+          {config.cases.length > 1 && (!lastBranch || lastIsSimple) && (
+            <button type="button" className="button secondary small" onClick={removeLastCase}>
+              移除末尾匹配项
+            </button>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
 function EdgeEditor({
   flow,
   index,
@@ -393,12 +563,13 @@ function EdgeEditor({
   const [from, setFrom] = useState(edge?.from ?? '');
   const [to, setTo] = useState(edge?.to ?? '');
   const [when, setWhen] = useState<GraphEdge['when']>(edge?.when);
-  const conditional = flow.nodes.find((node) => node.id === from)?.type === 'CONDITION';
+  const conditionOptions = branchOptions(flow.nodes.find((node) => node.id === from));
+  const conditional = conditionOptions.length > 0;
   const eligible = Boolean(
     from &&
     to &&
     from !== to &&
-    (!conditional || when) &&
+    (!conditional || conditionOptions.some((option) => option.value === when)) &&
     !flow.edges.some((current, i) => i !== index && current.from === from && current.to === to),
   );
   function save() {
@@ -447,8 +618,11 @@ function EdgeEditor({
               onChange={(e) => setWhen((e.target.value || undefined) as GraphEdge['when'])}
             >
               <option value="">选择结果</option>
-              <option value="TRUE">成立</option>
-              <option value="FALSE">不成立</option>
+              {conditionOptions.map(({ value, label }) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
             </select>
           </Field>
         )}
@@ -483,11 +657,14 @@ function EdgeEditor({
                 onClick={() => choose(i)}
               >
                 {flow.nodes.find((n) => n.id === current.from)?.name}
-                {current.when === 'TRUE'
-                  ? '（成立）'
-                  : current.when === 'FALSE'
-                    ? '（不成立）'
-                    : ''}{' '}
+                {current.when
+                  ? '（' +
+                    branchLabel(
+                      current.when,
+                      flow.nodes.find((n) => n.id === current.from),
+                    ) +
+                    '）'
+                  : ''}{' '}
                 → {flow.nodes.find((n) => n.id === current.to)?.name}
               </button>
             </li>
@@ -544,7 +721,11 @@ function ExtractSelection({
             ? preview.createdFlowId
             : (graph.draft.flows.at(-1)?.id ?? flow.id),
         );
-      } else setReview({ revision, result: await post<ExtractPreview>(path + '/extract/preview', body) });
+      } else
+        setReview({
+          revision,
+          result: await post<ExtractPreview>(path + '/extract/preview', body),
+        });
     } catch (err) {
       setError(message(err));
     } finally {

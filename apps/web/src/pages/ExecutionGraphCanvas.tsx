@@ -4,14 +4,17 @@ import {
   Box,
   CheckCircle2,
   CirclePlay,
+  Clock3,
   FileText,
   GitBranch,
   GitFork,
   GitMerge,
+  ListTree,
+  ShieldCheck,
   Workflow,
   Upload,
 } from 'lucide-react';
-import { graphNodeLabels, orderedNodes } from './execution-graph-definition';
+import { branchLabel, graphNodeLabels, orderedNodes } from './execution-graph-definition';
 import type { GraphFlow } from './execution-graph-definition';
 
 const icons = {
@@ -20,6 +23,9 @@ const icons = {
   BUILD: Box,
   DEPLOY_ARTIFACT: Upload,
   CONDITION: GitBranch,
+  SWITCH: ListTree,
+  DELAY: Clock3,
+  APPROVAL: ShieldCheck,
   PARALLEL: GitFork,
   JOIN: GitMerge,
   FLOW_CALL: Workflow,
@@ -233,14 +239,22 @@ export function NodeMap({
                 const control = Math.max(25, (end - start) / 2);
                 const path = `M ${start} ${y} C ${start + control} ${y}, ${end - control} ${endY}, ${end} ${endY}`;
                 return (
-                  <g key={i} className={edge.when ? 'edge-' + edge.when.toLowerCase() : undefined}>
+                  <g
+                    key={i}
+                    className={
+                      edge.when ? 'edge-' + edge.when.split(':')[0].toLowerCase() : undefined
+                    }
+                  >
                     <path d={path} markerEnd={`url(#${marker})`} />
                     {onEdgeSelect && (
                       <path className="graph-edge-hit" d={path} onClick={() => onEdgeSelect(i)} />
                     )}
                     {edge.when && (
                       <text x={midpoint} y={(y + endY) / 2 - 7} textAnchor="middle">
-                        {edge.when === 'TRUE' ? '成立' : '不成立'}
+                        {branchLabel(
+                          edge.when,
+                          flow.nodes.find(({ id }) => id === edge.from),
+                        )?.slice(0, 30)}
                       </text>
                     )}
                   </g>

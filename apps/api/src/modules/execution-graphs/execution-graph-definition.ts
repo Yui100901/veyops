@@ -32,6 +32,9 @@ const nodeTypes = [
   'BUILD',
   'DEPLOY_ARTIFACT',
   'CONDITION',
+  'SWITCH',
+  'DELAY',
+  'APPROVAL',
   'PARALLEL',
   'JOIN',
   'FLOW_CALL',
@@ -41,6 +44,31 @@ const nodeTypes = [
 class GraphCondition {
   @IsIn(['input', 'commitSha']) key!: 'input' | 'commitSha';
   @IsString() @MaxLength(2000) value!: string;
+}
+
+const maxSwitchCases = 10;
+const maxDelaySeconds = 86_400;
+const maxApprovalSeconds = 604_800;
+export const defaultApprovalSeconds = 86_400;
+const commitFormat = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+
+class GraphSwitch {
+  @IsIn(['input', 'commitSha']) key!: 'input' | 'commitSha';
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(maxSwitchCases)
+  @ArrayUnique()
+  @IsString({ each: true })
+  @MaxLength(500, { each: true })
+  cases!: string[];
+}
+
+class GraphApproval {
+  @ValidateIf((_o, value) => value !== undefined)
+  @IsInt()
+  @Min(1)
+  @Max(maxApprovalSeconds)
+  timeoutSeconds?: number;
 }
 
 class GraphNodePosition {
@@ -68,6 +96,21 @@ export class GraphNode {
   @ValidateNested()
   @Type(() => GraphCondition)
   condition?: GraphCondition;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphSwitch)
+  switch?: GraphSwitch;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsInt()
+  @Min(1)
+  @Max(maxDelaySeconds)
+  delaySeconds?: number;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphApproval)
+  approval?: GraphApproval;
   @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) flowId?: string;
   @ValidateIf((_o, v) => v !== undefined)
   @IsObject()
@@ -78,7 +121,9 @@ export class GraphNode {
 export class GraphEdge {
   @Matches(idFormat) from!: string;
   @Matches(idFormat) to!: string;
-  @ValidateIf((_o, v) => v !== undefined) @IsIn(['TRUE', 'FALSE']) when?: 'TRUE' | 'FALSE';
+  @ValidateIf((_o, v) => v !== undefined)
+  @Matches(/^(?:TRUE|FALSE|DEFAULT|CASE:[0-9])$/)
+  when?: 'TRUE' | 'FALSE' | 'DEFAULT' | `CASE:${number}`;
 }
 export class GraphFlow {
   @Matches(idFormat) id!: string;
@@ -147,20 +192,9 @@ export function orderedFlowNodes(flow: GraphFlow): GraphNode[] {
     const count = incoming.get(node.id)!;
     const validInputs =
       node.type === 'START' ? count === 0 : node.type === 'JOIN' ? count >= 2 : count === 1;
-    const validOutputs =
-      node.type === 'CONDITION'
-        ? edges.length === 2 &&
-          new Set(edges.map(({ when }) => when)).size === 2 &&
-          edges.every(({ when }) => when === 'TRUE' || when === 'FALSE')
-        : edges.every(({ when }) => when === undefined) &&
-          (node.type === 'END'
-            ? edges.length === 0
-            : node.type === 'PARALLEL'
-              ? edges.length >= 2
-              : edges.length === 1);
-    if (!validInputs || !validOutputs)
+    if (!validInputs || !hasValidOutputs(node, edges))
       throw new BadRequestException(
-        `节点「${node.name}」的连线不完整。并行节点至少需要两个出口，汇合节点至少需要两个入口，条件节点必须各有一条真、假连线`,
+        `节点「${node.name}」的连线不完整。检查并行、汇合、条件或多分支节点的入口及出口，每个分支必须各有一条连线`,
       );
   }
   // A unique source and sink, plus a topological ordering of all nodes, makes
@@ -181,6 +215,71 @@ export function orderedFlowNodes(flow: GraphFlow): GraphNode[] {
   return ordered;
 }
 
+function hasValidOutputs(node: GraphNode, edges: GraphEdge[]) {
+  const labels = new Set(edges.map(({ when }) => when));
+  if (node.type === 'CONDITION')
+    return edges.length === 2 && labels.has('TRUE') && labels.has('FALSE');
+  if (node.type === 'SWITCH') {
+    const cases = node.switch?.cases;
+    return (
+      Array.isArray(cases) &&
+      edges.length === cases.length + 1 &&
+      labels.has('DEFAULT') &&
+      cases.every((_value, index) => labels.has(`CASE:${index}`))
+    );
+  }
+  if (edges.some(({ when }) => when !== undefined)) return false;
+  if (node.type === 'END') return !edges.length;
+  if (node.type === 'PARALLEL') return edges.length >= 2;
+  return edges.length === 1;
+}
+
+function validateAdvancedNode(node: GraphNode) {
+  const config = node.switch;
+  if (node.type === 'SWITCH') {
+    if (
+      !config ||
+      !['input', 'commitSha'].includes(config.key) ||
+      !Array.isArray(config.cases) ||
+      !config.cases.length ||
+      config.cases.length > maxSwitchCases ||
+      config.cases.some((value) => typeof value !== 'string' || value.length > 500)
+    )
+      throw new BadRequestException('多分支节点须配置比较字段及 1 到 10 个匹配值');
+    const cases =
+      config.key === 'commitSha' ? config.cases.map((value) => value.toLowerCase()) : config.cases;
+    if (new Set(cases).size !== cases.length)
+      throw new BadRequestException('多分支节点的匹配值不可重复');
+    if (config.key === 'commitSha' && cases.some((value) => !commitFormat.test(value)))
+      throw new BadRequestException('按提交判断的分支必须填写完整提交 SHA');
+    if (cases.some((value) => redactTaskLog(value) !== value))
+      throw new BadRequestException('多分支匹配值只接受普通文本，请移除凭据');
+  } else if (config !== undefined) {
+    throw new BadRequestException('仅多分支节点可配置匹配值');
+  }
+  if (node.type === 'DELAY') {
+    if (
+      !Number.isInteger(node.delaySeconds) ||
+      node.delaySeconds! < 1 ||
+      node.delaySeconds! > maxDelaySeconds
+    )
+      throw new BadRequestException('延时节点须配置 1 到 86400 秒');
+  } else if (node.delaySeconds !== undefined) {
+    throw new BadRequestException('仅延时节点可配置等待秒数');
+  }
+  if (node.type === 'APPROVAL') {
+    const timeout = node.approval?.timeoutSeconds;
+    if (
+      node.approval === null ||
+      (timeout !== undefined &&
+        (!Number.isInteger(timeout) || timeout < 1 || timeout > maxApprovalSeconds))
+    )
+      throw new BadRequestException('审批超时须在 1 到 604800 秒之间');
+  } else if (node.approval !== undefined) {
+    throw new BadRequestException('仅审批节点可配置审批超时');
+  }
+}
+
 export function validateGraphDefinition(definition: GraphDefinition) {
   if (!definition.flows.length || definition.flows.length > maxFlows)
     throw new BadRequestException(`每张图须包含 1 到 ${maxFlows} 个执行流`);
@@ -197,6 +296,7 @@ export function validateGraphDefinition(definition: GraphDefinition) {
     for (const node of orderedFlowNodes(flow)) {
       if (nodeIds.has(node.id)) throw new BadRequestException('同一图版本中的节点 ID 必须唯一');
       nodeIds.add(node.id);
+      validateAdvancedNode(node);
       const action = node.type === 'BUILD' || node.type === 'DEPLOY_ARTIFACT';
       if (action) {
         if (!node.pipelineId || !node.pipelineVersion)
