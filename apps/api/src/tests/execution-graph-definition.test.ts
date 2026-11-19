@@ -42,7 +42,7 @@ test('execution graph validates edges, branch labels and calls independently of 
     ['start', 'check', 'first', 'second', 'join', 'end'],
   );
   flow.edges[2]!.when = 'TRUE';
-  assert.throws(() => validateGraphDefinition({ flows: [flow] }), /真、假/);
+  assert.throws(() => validateGraphDefinition({ flows: [flow] }), /每个分支必须各有一条连线/);
 
   const cyclic = example();
   cyclic.nodes.push(
