@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Module, Patch, Req } from '@nestjs/common';
+import { Body, Controller, Get, Module, Param, ParseUUIDPipe, Patch, Req } from '@nestjs/common';
 import { DatabaseService } from '../../core/database/database.service';
 import { appVersion } from '../../core/version';
 import { Public, Roles } from '../auth/auth.decorators';
@@ -13,6 +13,7 @@ import {
   SystemSettingsModule,
   SystemSettingsService,
   UpdateSystemSettingsDto,
+  UpdateProjectSettingsDto,
 } from './system-settings.service';
 
 @Controller()
@@ -52,6 +53,16 @@ class SystemController {
     @Req() req: AuthRequest,
   ) {
     return this.settings.update(input, req.user.id);
+  }
+  @Get('projects/:id/execution-settings') projectSettings(@Param('id', ParseUUIDPipe) id: string) {
+    return this.settings.project(id);
+  }
+  @Roles('ADMIN') @Patch('projects/:id/execution-settings') updateProjectSettings(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() input: UpdateProjectSettingsDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.settings.updateProject(id, input, req.user.id);
   }
   @Get('dashboard') async dashboard() {
     const db = this.database.db;

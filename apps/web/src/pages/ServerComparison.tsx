@@ -1,6 +1,7 @@
+import { InlineEditor } from '../InlineEditor';
 import { useState } from 'react';
 import { post, formatTime, message } from '../api';
-import { Empty, ErrorBanner, Field, Modal } from '../components';
+import { Empty, ErrorBanner, Field } from '../components';
 import type { Server } from '../models';
 
 interface Source {
@@ -46,7 +47,7 @@ export function ServerComparison({ servers, onClose }: { servers: Server[]; onCl
   }
   const visible = result?.rows.filter((row) => !different || row.status !== 'EQUAL');
   return (
-    <Modal
+    <InlineEditor
       title="服务器配置对比"
       description="通过 SSH 读取两台服务器当前的配置。"
       onClose={onClose}
@@ -158,6 +159,6 @@ export function ServerComparison({ servers, onClose }: { servers: Server[]; onCl
           </>
         )}
       </div>
-    </Modal>
+    </InlineEditor>
   );
 }

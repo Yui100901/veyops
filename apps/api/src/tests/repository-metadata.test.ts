@@ -157,7 +157,10 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   await mkdir(join(web, 'src'), { recursive: true });
   await mkdir(join(web, 'secrets'));
   await mkdir(join(source, 'services', 'api'), { recursive: true });
-  await writeFile(join(web, 'package.json'), JSON.stringify({ scripts: { build: 'tsc' } }));
+  await writeFile(
+    join(web, 'package.json'),
+    JSON.stringify({ scripts: { build: 'tsc', test: 'node --test' } }),
+  );
   await writeFile(join(web, 'README.md'), '# Browser application\nUse pnpm and Node.js.\n');
   await writeFile(join(web, 'pnpm-lock.yaml'), 'lockfileVersion: 9\nignored-lock-data\n');
   await writeFile(join(web, 'src', 'index.ts'), 'export const version = "first-source-entry";\n');
@@ -422,6 +425,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
 
   const providerRequests: { model: string; messages: { content: string }[]; tools?: unknown }[] =
     [];
+  let conflictingDraft = false;
   const provider = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -433,12 +437,14 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
             message: {
               content: JSON.stringify({
                 name: 'Web build',
+                testCommand: 'corepack pnpm test',
                 technologies: ['Node.js', 'TypeScript'],
                 detectedServices: [
                   { name: 'Web', path: 'services/web', technology: 'TypeScript' },
                   { name: 'Invented', path: 'outside' },
                 ],
                 definition: {
+                  ...(conflictingDraft && { buildLocation: 'TARGET' }),
                   buildCommand: 'corepack pnpm run build',
                   installCommand: 'corepack pnpm install --frozen-lockfile',
                   outputPath: 'dist',
@@ -510,6 +516,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   assert.equal(body.data.draft.definition.repositoryId, id);
   assert.equal(body.data.draft.definition.repoPath, 'services/web');
   assert.equal(body.data.draft.definition.buildCommand, 'corepack pnpm run build');
+  assert.equal(body.data.draft.definition.nodes, undefined);
   assert.equal(body.data.draft.definition.registryId, undefined);
   assert.equal(body.data.draft.definition.deployPath, undefined);
   assert.equal(body.data.draft.serviceId, undefined);
@@ -533,8 +540,55 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     .expect(201);
   assert.deepEqual(repositoryOnly.data.source, { path: 'docs/DEPLOY.md', commitSha: main });
   assert.equal(repositoryOnly.data.draft.definition.repoPath, undefined);
+  assert.equal(repositoryOnly.data.draft.definition.nodes, undefined);
   assert.ok(repositoryOnly.data.missingFields.includes('repoPath'));
   assert.match(providerRequests[1].messages[1].content, /Second release/);
+  const pipeline = { buildLocation: 'MANAGER', artifactType: 'FILE', defaultMode: 'BUILD_ONLY' };
+  const nodeDraftRequest = {
+    projectId: project,
+    repositoryId: id,
+    repoPath: 'services/web',
+    branch: 'feature/release',
+    pipeline,
+  };
+  const { body: nodeDraft } = await operator
+    .post('/api/v1/ai/repository-analysis')
+    .send(nodeDraftRequest)
+    .expect(201);
+  assert.equal(nodeDraft.data.source.commitSha, feature);
+  const definition = nodeDraft.data.draft.definition;
+  assert.equal(definition.nodes[0].branch, 'feature/release');
+  assert.deepEqual(
+    definition.nodes.map((node: { type: string }) => node.type),
+    ['CHECKOUT', 'INSTALL', 'BUILD', 'TEST', 'PACKAGE'],
+  );
+  assert.equal(definition.nodes[1].command, 'corepack pnpm install --frozen-lockfile');
+  assert.equal(definition.nodes[2].command, 'corepack pnpm run build');
+  assert.equal(definition.nodes[3].command, 'corepack pnpm test');
+  assert.equal(definition.buildLocation, 'MANAGER');
+  assert.equal(nodeDraft.data.missingFields.includes('deployPath'), false);
+  assert.deepEqual(JSON.parse(providerRequests.at(-1)!.messages[1].content).pipeline, pipeline);
+  const deployDraft = await operator
+    .post('/api/v1/ai/repository-analysis')
+    .send({
+      ...nodeDraftRequest,
+      commitSha: first,
+      pipeline: { buildLocation: 'TARGET', artifactType: 'DOCKER_IMAGE', defaultMode: 'DEPLOY' },
+    })
+    .expect(201);
+  assert.equal(deployDraft.body.data.source.commitSha, first);
+  assert.equal(deployDraft.body.data.draft.definition.nodes.at(-1).type, 'DEPLOY');
+  assert.equal(deployDraft.body.data.draft.definition.outputPath, undefined);
+  assert.ok(deployDraft.body.data.missingFields.includes('dockerfilePath'));
+  const beforeInvalidBranch = providerRequests.length;
+  await operator
+    .post('/api/v1/ai/repository-analysis')
+    .send({ ...nodeDraftRequest, branch: 'missing' })
+    .expect(400);
+  assert.equal(providerRequests.length, beforeInvalidBranch);
+  conflictingDraft = true;
+  await operator.post('/api/v1/ai/repository-analysis').send(nodeDraftRequest).expect(502);
+  conflictingDraft = false;
   assert.equal((await db.selectFrom('pipelines').select('id').execute()).length, 0);
   assert.equal((await db.selectFrom('tasks').select('id').execute()).length, 0);
   assert.deepEqual((await operator.get(`${metadataPath}/connection`).expect(200)).body.data, {

@@ -22,6 +22,7 @@ import { TaskLeaseUnavailableError } from '../tasks/task-lease';
 import type { BuildOutput, PipelineArtifact, PipelineSnapshot } from './pipeline.types';
 import { deploymentGuard, shellQuote as q } from './pipeline.validation';
 import { serializeComposeEnvironment } from './environment.serialization';
+import { createTargetWorkspace, targetWorkspacePath } from './target-workspace';
 import { composeHealthCheck, httpHealthCheck, waitForReleaseHealth } from './release-health';
 
 type PipelinePhase =
@@ -263,7 +264,8 @@ export class PipelineExecutor {
           let status: TaskStatus = 'SUCCESS';
           let error: string | undefined;
           let targetExitCode: number | null = 0;
-          const work = `/tmp/veyops-${task.id}-${target.id}`;
+          const workName = `veyops-${task.id}-${target.id}`;
+          let work = `/tmp/${workName}`;
           let createdWork = false;
           let stepIndex = managerBuilt ? managerStepCount : 0;
           const phases = new Map<PipelinePhase, number>();
@@ -392,14 +394,29 @@ export class PipelineExecutor {
               await step('PREPARE', '检查目标主机 Docker 环境', () =>
                 this.builds.checkTargetDocker(target, session, !buildOnly),
               );
-            await step('PREPARE', '准备专用工作目录', () =>
-              this.builds.remote(
+            await step('PREPARE', '准备专用工作目录', async () => {
+              if (
+                !deployArtifact &&
+                snapshot.definition.buildLocation === 'TARGET' &&
+                snapshot.targetWorkspaceRoot
+              ) {
+                const output = await this.builds.remoteCapture(
+                  target,
+                  createTargetWorkspace(snapshot.targetWorkspaceRoot, workName),
+                  session,
+                  30,
+                  '创建目标端构建工作目录失败，请检查配置路径和 SSH 用户权限',
+                );
+                work = targetWorkspacePath(output, workName);
+                return;
+              }
+              await this.builds.remote(
                 target,
                 `set -eu; umask 077; test ! -e ${q(work)}; test ! -L ${q(work)}; mkdir -- ${q(work)}`,
                 session,
                 30,
-              ),
-            );
+              );
+            });
             createdWork = true;
             if (!deployArtifact && snapshot.definition.buildLocation === 'TARGET') {
               if (nodes) await this.builds.remoteNodes(target, work, session, runNode);
@@ -582,7 +599,11 @@ export class PipelineExecutor {
             // Only the platform-generated /tmp directory is cleaned, never a configured deploy path.
             if (createdWork && !retainLock)
               await this.ssh
-                .execute(target, `rm -rf -- ${q(work)}`, { timeout: 30 })
+                .execute(
+                  target,
+                  `test ! -L ${q(work)} && test "$(cd -P -- ${q(work)} && pwd -P)" = ${q(work)} && rm -rf -- ${q(work)}`,
+                  { timeout: 30 },
+                )
                 .catch(() => context.log('临时目录清理失败，需人工检查\n', target.id));
             if (retainLock) context.log(`已保留临时工作目录供核查：${work}\n`, target.id);
             try {

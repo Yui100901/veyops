@@ -409,6 +409,43 @@ async function checkApi(databaseUrl?: string) {
     assert.equal(savedSettings.body.data.defaultBuildLocation, 'MANAGER');
     assert.equal(savedSettings.body.data.defaultMaxParallelTargets, 6);
     assert.equal(savedSettings.body.data.logRetentionDays, 7);
+    assert.equal(savedSettings.body.data.targetWorkspaceRoot, '~/.veyops/workspace');
+    const executionPath = `/api/v1/projects/${projectId}/execution-settings`;
+    await viewer.patch(executionPath).send({ logRetentionDays: 4 }).expect(403);
+    const inherited = await viewer.get(executionPath).expect(200);
+    assert.deepEqual(inherited.body.data.overrides, {});
+    assert.equal(inherited.body.data.effective.defaultBuildLocation, 'MANAGER');
+    await Promise.all([
+      api
+        .patch(executionPath)
+        .send({ targetWorkspaceRoot: '/srv/team builds', defaultMaxParallelTargets: 2 })
+        .expect(200),
+      api
+        .patch(executionPath)
+        .send({ defaultBuildLocation: 'TARGET', logRetentionDays: 0 })
+        .expect(200),
+    ]);
+    for (const path of ['/', '~/../outside', 'relative/path', '/srv/./jobs']) {
+      await api.patch(executionPath).send({ targetWorkspaceRoot: path }).expect(400);
+    }
+    const overridden = (await viewer.get(executionPath).expect(200)).body.data;
+    assert.deepEqual(overridden.effective, {
+      targetWorkspaceRoot: '/srv/team builds',
+      defaultMaxParallelTargets: 2,
+      defaultBuildLocation: 'TARGET',
+      logRetentionDays: 0,
+    });
+    assert.equal(overridden.system.targetWorkspaceRoot, '~/.veyops/workspace');
+    const partialReset = (
+      await api.patch(executionPath).send({ targetWorkspaceRoot: null }).expect(200)
+    ).body.data;
+    assert.equal(partialReset.effective.targetWorkspaceRoot, '~/.veyops/workspace');
+    assert.equal(partialReset.effective.logRetentionDays, 0);
+    const reset = await api
+      .patch(executionPath)
+      .send({ logRetentionDays: null, defaultBuildLocation: null, defaultMaxParallelTargets: null })
+      .expect(200);
+    assert.deepEqual(reset.body.data.effective, reset.body.data.system);
 
     const targetWithDefaults = await api
       .post('/api/v1/deployment-targets')

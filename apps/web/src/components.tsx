@@ -111,6 +111,11 @@ export function Status({ value }: { value: string }) {
   );
 }
 
+function outsideDialog(dialog: HTMLDialogElement, x: number, y: number) {
+  const box = dialog.getBoundingClientRect();
+  return x < box.left || x > box.right || y < box.top || y > box.bottom;
+}
+
 export function Modal({
   title,
   description,
@@ -125,6 +130,7 @@ export function Modal({
   wide?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const backdropStart = useRef<{ x: number; y: number } | null>(null);
   const titleId = useId();
   const descriptionId = useId();
   useEffect(() => {
@@ -144,17 +150,29 @@ export function Modal({
         event.preventDefault();
         onClose();
       }}
+      onPointerDownCapture={(event) => {
+        backdropStart.current =
+          event.isPrimary &&
+          event.button === 0 &&
+          event.target === event.currentTarget &&
+          outsideDialog(event.currentTarget, event.clientX, event.clientY)
+            ? { x: event.clientX, y: event.clientY }
+            : null;
+      }}
+      onPointerCancel={() => {
+        backdropStart.current = null;
+      }}
       onClick={(event) => {
-        if (event.target === event.currentTarget) {
-          const box = event.currentTarget.getBoundingClientRect();
-          if (
-            event.clientX < box.left ||
-            event.clientX > box.right ||
-            event.clientY < box.top ||
-            event.clientY > box.bottom
-          )
-            onClose();
-        }
+        const start = backdropStart.current;
+        backdropStart.current = null;
+        if (
+          start &&
+          event.target === event.currentTarget &&
+          event.detail > 0 &&
+          Math.hypot(event.clientX - start.x, event.clientY - start.y) <= 5 &&
+          outsideDialog(event.currentTarget, event.clientX, event.clientY)
+        )
+          onClose();
       }}
     >
       <div className="modal-header">
@@ -193,22 +211,26 @@ export function Field({
   );
 }
 export function Form({
+  id,
   onSubmit,
   children,
   busy,
   submit = '保存',
+  submitDisabled = false,
   onCancel,
   error,
 }: {
+  id?: string;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   children: ReactNode;
   busy?: boolean;
   submit?: string;
+  submitDisabled?: boolean;
   onCancel: () => void;
   error?: string;
 }) {
   return (
-    <form onSubmit={onSubmit}>
+    <form id={id} onSubmit={onSubmit}>
       <div className="form-body">
         {children}
         <ErrorBanner error={error} />
@@ -217,7 +239,7 @@ export function Form({
         <button className="button secondary" type="button" onClick={onCancel} disabled={busy}>
           取消
         </button>
-        <button className="button primary" type="submit" disabled={busy}>
+        <button className="button primary" type="submit" disabled={busy || submitDisabled}>
           {busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
           {busy ? '正在处理…' : submit}
         </button>

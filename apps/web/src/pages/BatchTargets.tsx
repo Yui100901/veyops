@@ -1,14 +1,9 @@
+import { useExecutionDefaults } from './useExecutionDefaults';
 import { useState } from 'react';
 import { Server as ServerIcon } from 'lucide-react';
 import { useResource } from '../api';
 import { ErrorBanner, Field, Loading, Status } from '../components';
-import type {
-  Environment,
-  ProjectDetail,
-  Server,
-  ServerGroup,
-  SystemRuntimeDefaults,
-} from '../models';
+import type { Environment, ProjectDetail, Server, ServerGroup } from '../models';
 
 export interface TargetSelection {
   serverIds?: string[];
@@ -297,15 +292,17 @@ export function ResolvedTargets({ preview }: { preview: TargetPreview }) {
 }
 
 export function BatchStrategy({
+  projectId,
   options,
   onChange,
   disabled,
 }: {
+  projectId?: string;
   options: ExecutionOptions;
   onChange: (options: ExecutionOptions) => void;
   disabled?: boolean;
 }) {
-  const defaults = useResource<SystemRuntimeDefaults>('/system');
+  const defaults = useExecutionDefaults(projectId);
   return (
     <div className="form-grid">
       <Field label="执行方式">
@@ -320,7 +317,7 @@ export function BatchStrategy({
           <option value="SEQUENTIAL">顺序执行</option>
         </select>
       </Field>
-      <Field label="最大并发" hint="留空使用系统默认值。">
+      <Field label="最大并发" hint={projectId ? '留空使用项目生效值。' : '留空使用系统默认值。'}>
         <input
           type="number"
           min={1}

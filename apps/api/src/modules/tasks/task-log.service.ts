@@ -13,33 +13,49 @@ import { Subject } from 'rxjs';
 import type { Kysely } from 'kysely';
 import { dataDirectory } from '../../core/config';
 import type { Database } from '../../core/database/schema';
-import { missingLogFile, pruneTaskLogs, type LogRetentionResult } from './task-log-retention';
+import {
+  missingLogFile,
+  pruneTaskLogs,
+  type LogRetentionPolicies,
+  type LogRetentionResult,
+} from './task-log-retention';
 
 @Injectable()
 export class TaskLogService {
   readonly changes = new Subject<{ taskId: string }>();
   private readonly dataDir = dataDirectory;
-  private retentionCursor?: { days: number; id: string };
+  private retentionCursor?: { policy: string; id: string };
 
   async pruneExpired(
     database: Kysely<Database>,
-    days: number,
+    policy: number | LogRetentionPolicies,
     now = Date.now(),
+    reread?: (database: Kysely<Database>) => Promise<LogRetentionPolicies>,
   ): Promise<LogRetentionResult> {
-    if (!Number.isInteger(days) || days < 1 || !Number.isSafeInteger(now)) {
+    if (!Number.isSafeInteger(now)) {
       this.retentionCursor = undefined;
       return { removed: 0, missing: 0, skipped: 0, failed: 0, more: false };
     }
-    const cutoff = now - days * 86_400_000;
-    const current = this.retentionCursor?.days === days ? this.retentionCursor.id : undefined;
+    const policies =
+      typeof policy === 'number'
+        ? { systemDays: policy, projectDays: new Map<string, number>() }
+        : policy;
+    const signature = JSON.stringify([
+      policies.systemDays,
+      Array.from(policies.projectDays).sort(([a], [b]) => a.localeCompare(b)),
+    ]);
+    const current =
+      this.retentionCursor?.policy === signature ? this.retentionCursor.id : undefined;
     const { result, nextCursor } = await pruneTaskLogs(
       database,
       this.dataDir,
-      cutoff,
+      policies,
+      now,
       current,
       (id, createdAt) => this.key(id, createdAt),
+      reread,
     );
-    this.retentionCursor = nextCursor ? { days, id: nextCursor } : undefined;
+    this.retentionCursor = nextCursor ? { policy: signature, id: nextCursor } : undefined;
     return result;
   }
   key(taskId: string, at: number): string {

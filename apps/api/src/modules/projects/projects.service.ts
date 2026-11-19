@@ -37,6 +37,7 @@ import type { CurrentUser } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { recentDeployments } from '../deployments/deployment-history';
 import { DeliveryFilters } from './delivery-filters';
+import { byProject, projectAddressLinks } from './project-card-data';
 import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
 import {
@@ -142,15 +143,22 @@ export class ProjectsService {
       query = query.where('r.commit_sha', 'like', filters.commit.toLowerCase() + '%');
     return query.orderBy('r.created_at', 'desc').orderBy('r.id', 'desc').limit(200).execute();
   }
-  async list() {
-    const rows = await this.database.db
-      .selectFrom('projects')
-      .selectAll()
-      .where('deleted_at', 'is', null)
-      .orderBy('created_at', 'desc')
-      .execute();
-    const services = await this.database.db.selectFrom('services').select(['project_id']).execute();
-    const envs = await this.database.db.selectFrom('environments').select(['project_id']).execute();
+  async list(includeAddresses = false) {
+    const db = this.database.db;
+    const activeProjects = db.selectFrom('projects').where('deleted_at', 'is', null);
+    const [rows, services, envs, addresses] = await Promise.all([
+      activeProjects.selectAll().orderBy('created_at', 'desc').execute(),
+      db.selectFrom('services').select(['project_id']).execute(),
+      db.selectFrom('environments').select(['project_id']).execute(),
+      includeAddresses
+        ? projectAddressLinks(db)
+            .where('address.project_id', 'in', activeProjects.select('id'))
+            .orderBy('address.name')
+            .orderBy('address.id')
+            .execute()
+        : [],
+    ]);
+    const links = byProject(addresses);
     return rows.map((r) => ({
       id: r.id,
       name: r.name,
@@ -161,6 +169,7 @@ export class ProjectsService {
       createdAt: r.created_at,
       serviceCount: services.filter((s) => s.project_id === r.id).length,
       environmentCount: envs.filter((e) => e.project_id === r.id).length,
+      ...(includeAddresses && { addresses: links.get(r.id) ?? [] }),
     }));
   }
   async get(id: string, includeArchived = false) {
@@ -599,8 +608,8 @@ export class ProjectsService {
 @Controller('projects')
 class ProjectsController {
   constructor(private readonly service: ProjectsService) {}
-  @Get() list() {
-    return this.service.list();
+  @Get() list(@Query('include') include?: string) {
+    return this.service.list(include === 'addresses');
   }
   @Get(':id') get(@Param('id') id: string) {
     return this.service.detail(id);

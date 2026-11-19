@@ -5,6 +5,7 @@ import {
   IsBoolean,
   IsIn,
   IsInt,
+  IsObject,
   IsOptional,
   IsString,
   IsUUID,
@@ -111,6 +112,12 @@ export class AiChatDto {
   @IsOptional() @ValidateNested() @Type(() => AiContextDto) context?: AiContextDto;
 }
 
+class PipelineDraftPreferencesDto {
+  @IsIn(['TARGET', 'MANAGER']) buildLocation!: 'TARGET' | 'MANAGER';
+  @IsIn(['FILE', 'DOCKER_IMAGE']) artifactType!: 'FILE' | 'DOCKER_IMAGE';
+  @IsIn(['BUILD_ONLY', 'DEPLOY']) defaultMode!: 'BUILD_ONLY' | 'DEPLOY';
+}
+
 export class AiRepositoryAnalysisDto {
   @IsUUID() projectId!: string;
   @IsUUID() repositoryId!: string;
@@ -119,4 +126,10 @@ export class AiRepositoryAnalysisDto {
   @IsOptional() @IsString() @Matches(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i) commitSha?: string;
   @IsOptional() @IsString() @MaxLength(300) docPath?: string;
   @IsOptional() @IsString() @MaxLength(300) repoPath?: string;
+  @IsOptional() @IsString() @MaxLength(255) branch?: string;
+  @IsOptional()
+  @IsObject()
+  @ValidateNested()
+  @Type(() => PipelineDraftPreferencesDto)
+  pipeline?: PipelineDraftPreferencesDto;
 }

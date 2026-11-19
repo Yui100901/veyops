@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { Kysely, SelectQueryBuilder, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
+import { projectAddressLinks } from '../projects/project-card-data';
 import {
   deploymentRows,
   failedDeploymentStatuses,
@@ -111,15 +112,7 @@ export class ViewsRepository {
     if (environmentType)
       environments = environments.where('environment_type', '=', environmentType);
 
-    let addresses = this.db
-      .selectFrom('project_addresses as address')
-      .select([
-        'address.id as id',
-        'address.name as name',
-        'address.url as url',
-        'address.project_id as projectId',
-      ])
-      .where('address.project_id', 'in', projectIds);
+    let addresses = projectAddressLinks(this.db).where('address.project_id', 'in', projectIds);
     if (environmentType)
       addresses = addresses.where((eb) =>
         eb.or([
@@ -167,7 +160,7 @@ export class ViewsRepository {
         .orderBy('id')
         .execute(),
       environments.orderBy('name').orderBy('id').execute(),
-      addresses.orderBy('name').orderBy('id').execute(),
+      addresses.orderBy('address.name').orderBy('address.id').execute(),
       this.db
         .selectFrom(latestDeploymentTargets(this.db, projectIds, { environmentType }).as('latest'))
         .select(['projectId', 'status', 'healthStatus'])

@@ -5,11 +5,6 @@
   align-items: center;
 }
 .monitor-toolbar select {
-  background: #fff;
-  color: inherit;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.36rem 0.58rem;
   max-width: 100%;
 }
 .monitor-list-filters {

@@ -1,14 +1,14 @@
+import { InlineEditor, useInlineEditor } from '../InlineEditor';
 import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Check } from 'lucide-react';
 import { api, formatTime, message, useResource } from '../api';
-import { Empty, ErrorBanner, Field, Form, Loading, Modal, Section } from '../components';
+import { Empty, ErrorBanner, Field, Form, Loading, Section } from '../components';
 import type {
   DeploymentRecord,
   DeploymentSelection,
   ProjectDetail,
   ReleasePolicy,
-  SystemRuntimeDefaults,
   User,
 } from '../models';
 import { ArtifactRetentionPolicy } from './ArtifactRetention';
@@ -22,7 +22,7 @@ import {
 
 type EnvironmentConfig = DeploymentSelection & {
   executionMode?: 'DEPLOY' | 'BUILD_ONLY' | null;
-  buildLocation: string;
+  buildLocation: string | null;
   artifactType: string;
   deployMethod: string;
   deployPath?: string;
@@ -44,8 +44,8 @@ export function ProjectDeploymentConfig({
   user: User;
   reloadProject: () => Promise<void>;
 }) {
-  const [selected, setSelected] = useState<{ serviceId: string; environmentId: string }>();
-  const [binding, setBinding] = useState<string>();
+  const [selected, setSelected] = useInlineEditor<{ serviceId: string; environmentId: string }>();
+  const [binding, setBinding] = useInlineEditor<string>();
   return (
     <Section
       title="服务与部署配置"
@@ -56,39 +56,41 @@ export function ProjectDeploymentConfig({
         </a>
       }
     >
-      {!project.services.length ? (
-        <Empty
-          title="先创建服务"
-          description="创建服务与环境后，可在这里设置仓库关联和部署配置。"
-        />
-      ) : (
-        <div className="resource-list">
-          {project.services.map((s) => (
-            <div className="deployment-service-row" key={s.id}>
-              <div>
-                <strong>{s.name}</strong>
-                <span className="tag">{s.serviceType}</span>
+      <div hidden={Boolean(selected || binding)}>
+        {!project.services.length ? (
+          <Empty
+            title="先创建服务"
+            description="创建服务与环境后，可在这里设置仓库关联和部署配置。"
+          />
+        ) : (
+          <div className="resource-list">
+            {project.services.map((s) => (
+              <div className="deployment-service-row" key={s.id}>
+                <div>
+                  <strong>{s.name}</strong>
+                  <span className="tag">{s.serviceType}</span>
+                </div>
+                <div className="deployment-service-actions">
+                  {project.environments.map((e) => (
+                    <button
+                      className="button secondary small"
+                      key={e.id}
+                      onClick={() => setSelected({ serviceId: s.id, environmentId: e.id })}
+                    >
+                      {e.name} 配置
+                    </button>
+                  ))}
+                  {user.role !== 'VIEWER' && (
+                    <button className="text-button" onClick={() => setBinding(s.id)}>
+                      关联仓库
+                    </button>
+                  )}
+                </div>
               </div>
-              <div className="deployment-service-actions">
-                {project.environments.map((e) => (
-                  <button
-                    className="button secondary small"
-                    key={e.id}
-                    onClick={() => setSelected({ serviceId: s.id, environmentId: e.id })}
-                  >
-                    {e.name} 配置
-                  </button>
-                ))}
-                {user.role !== 'VIEWER' && (
-                  <button className="text-button" onClick={() => setBinding(s.id)}>
-                    关联仓库
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
+      </div>
       {selected && (
         <EnvironmentConfigEditor
           key={`${selected.serviceId}:${selected.environmentId}`}
@@ -132,7 +134,6 @@ function EnvironmentConfigEditor({
     `/services/${serviceId}/environments/${environmentId}/config`,
   );
   const inventory = useDeploymentInventory();
-  const defaults = useResource<SystemRuntimeDefaults>('/system');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [artifactType, setArtifactType] = useState('FILE');
@@ -158,7 +159,7 @@ function EnvironmentConfigEditor({
         method: 'PUT',
         body: JSON.stringify({
           ...selection,
-          buildLocation: f.get('buildLocation') || undefined,
+          buildLocation: f.get('buildLocation') || null,
           executionMode: f.get('executionMode') || null,
           artifactType: f.get('artifactType'),
           deployMethod: f.get('deployMethod'),
@@ -195,7 +196,8 @@ function EnvironmentConfigEditor({
     }
   }
   return (
-    <Modal
+    <InlineEditor
+      busy={busy}
       title={`${project.services.find((s) => s.id === serviceId)?.name} · ${project.environments.find((e) => e.id === environmentId)?.name}`}
       description="此处配置覆盖 Pipeline 对应字段；留空的命令或路径由流程配置提供。"
       onClose={onClose}
@@ -232,6 +234,7 @@ function EnvironmentConfigEditor({
                 <p className="field-note">请重新选择此环境的服务器或服务器分组。</p>
               )}
               <DeploymentSelectionPicker
+                projectId={project.id}
                 inventory={inventory}
                 value={selection}
                 onChange={setSelection}
@@ -240,13 +243,7 @@ function EnvironmentConfigEditor({
               <div className="form-grid">
                 <Field label="构建位置">
                   <select name="buildLocation" defaultValue={config.data?.buildLocation || ''}>
-                    <option value="">
-                      {config.data
-                        ? '保留当前构建位置'
-                        : defaults.data
-                          ? `使用系统默认（${defaults.data.defaultBuildLocation === 'MANAGER' ? '管理端隔离环境' : '目标服务器'}）`
-                          : '使用系统默认'}
-                    </option>
+                    <option value="">沿用流水线构建位置</option>
                     <option value="TARGET">目标服务器</option>
                     <option value="MANAGER">管理端隔离环境</option>
                   </select>
@@ -374,7 +371,7 @@ function EnvironmentConfigEditor({
           onClose={() => setEditRetention(false)}
         />
       )}
-    </Modal>
+    </InlineEditor>
   );
 }
 function ReleasePolicyFields({
@@ -557,7 +554,8 @@ function RepositoryBinding({
     }
   }
   return (
-    <Modal
+    <InlineEditor
+      busy={busy}
       title="设置服务仓库关联"
       description="保存将替换该服务的仓库关联。第一个选中的仓库作为主仓库。"
       onClose={onClose}
@@ -601,6 +599,6 @@ function RepositoryBinding({
         ))}
         {!project.repositories.length && <p className="muted">请先在项目中添加仓库。</p>}
       </Form>
-    </Modal>
+    </InlineEditor>
   );
 }

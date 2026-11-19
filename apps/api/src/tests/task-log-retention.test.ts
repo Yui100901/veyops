@@ -233,3 +233,74 @@ test('log retention continues the next batch past unsafe log rows', async () => 
     await database.onApplicationShutdown();
   }
 });
+
+for (const client of ['SQLite', 'PostgreSQL']) {
+  test(
+    `${client} rechecks project log retention and inherits the system policy for unscoped history`,
+    { skip: client === 'PostgreSQL' && !process.env.VEYOPS_TEST_POSTGRES_URL },
+    async (t) => {
+      const [{ DatabaseService }, { TaskLogService }, , { createPostgresTestDatabase }] =
+        await fixtures;
+      const database =
+        client === 'PostgreSQL' ? await createPostgresTestDatabase(t) : new DatabaseService();
+      if (client === 'SQLite') {
+        t.after(() => database.onApplicationShutdown());
+        await database.onModuleInit();
+      }
+      const { SystemSettingsService } =
+        await import('../modules/system/system-settings.service.js');
+      const { AuditService } = await import('../modules/audit/audit.service.js');
+      const settings = new SystemSettingsService(database, new AuditService(database));
+      const logs = new TaskLogService();
+      const creator = await user(database.db);
+      const projectId = randomUUID();
+      await database.db
+        .insertInto('projects')
+        .values({
+          id: projectId,
+          slug: projectId,
+          name: 'Project',
+          created_by: creator,
+          created_at: old,
+          updated_at: old,
+        })
+        .execute();
+      const projectTask = task(creator, { project_id: projectId });
+      const unscoped = task(creator);
+      for (const row of [projectTask, unscoped]) {
+        row.log_file_key = logs.key(row.id, old);
+        logs.append(row.id, row.log_file_key, 'saved');
+        await database.db.insertInto('tasks').values(row).execute();
+      }
+      await settings.updateProject(projectId, { logRetentionDays: 1 }, creator);
+      const previouslyExpired = await settings.logRetentionPolicies();
+      await settings.updateProject(projectId, { logRetentionDays: 0 }, creator);
+      const raced = await logs.pruneExpired(database.db, previouslyExpired, now, (tx) =>
+        settings.logRetentionPolicies(tx),
+      );
+      assert.equal(raced.removed, 0);
+      assert.equal(logs.read(projectTask.log_file_key!).content, 'saved');
+
+      await settings.updateProject(projectId, { logRetentionDays: 1 }, creator);
+      assert.equal(
+        (await logs.pruneExpired(database.db, await settings.logRetentionPolicies(), now)).removed,
+        1,
+      );
+      assert.equal(logs.read(projectTask.log_file_key!).content, '');
+      assert.equal(logs.read(unscoped.log_file_key!).content, 'saved');
+
+      const protectedTask = task(creator, { project_id: projectId });
+      protectedTask.log_file_key = logs.key(protectedTask.id, old);
+      await database.db.insertInto('tasks').values(protectedTask).execute();
+      logs.append(protectedTask.id, protectedTask.log_file_key, 'retained');
+      await settings.update({ logRetentionDays: 1 }, creator);
+      await settings.updateProject(projectId, { logRetentionDays: 0 }, creator);
+      assert.equal(
+        (await logs.pruneExpired(database.db, await settings.logRetentionPolicies(), now)).removed,
+        1,
+      );
+      assert.equal(logs.read(unscoped.log_file_key!).content, '');
+      assert.equal(logs.read(protectedTask.log_file_key).content, 'retained');
+    },
+  );
+}

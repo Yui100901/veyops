@@ -1,0 +1,28 @@
+.editor-origin:not([hidden]) {
+  display: contents;
+}
+
+.inline-editor {
+  clear: both;
+  min-width: 0;
+  width: 100%;
+  max-width: 54rem;
+  margin-block: 1rem;
+  scroll-margin-block: 1rem;
+}
+.inline-editor-wide {
+  max-width: 75rem;
+}
+.inline-editor > .panel-header {
+  align-items: flex-start;
+}
+.inline-editor > .panel-header .button {
+  flex-shrink: 0;
+}
+.inline-editor h2:focus {
+  outline: none;
+}
+.inline-editor > form,
+.inline-editor > .form-body {
+  min-width: 0;
+}

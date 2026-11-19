@@ -1,3 +1,4 @@
+import { InlineEditor, useInlineEditor } from '../InlineEditor';
 import { useState } from 'react';
 import { ContextAIButton } from './AI';
 import type { FormEvent, ReactNode } from 'react';
@@ -10,7 +11,6 @@ import {
   Field,
   Form,
   Loading,
-  Modal,
   PageHeader,
   Section,
 } from '../components';
@@ -173,7 +173,7 @@ function CommandsPage({ user }: { user: User }) {
   const canEdit = user.role !== 'VIEWER';
   const plans = useResource<Plan[]>(canEdit ? '/operation-plans' : null);
   const availablePlans = (plans.data ?? []).filter((plan) => plan.enabled !== false);
-  const [reference, setReference] = useState<Plan>();
+  const [reference, setReference] = useInlineEditor<Plan>();
 
   async function prepare(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -214,92 +214,98 @@ function CommandsPage({ user }: { user: User }) {
   return (
     <>
       <ErrorBanner error={plans.error} retry={plans.reload} />
-      <form className="command-layout" onSubmit={prepare}>
-        <div>
-          <Section title="执行目标" subtitle="可组合多种条件，预览会合并重复的服务器。">
-            <BatchTargetPicker
-              selection={selection}
-              onChange={setSelection}
-              disabled={!canEdit || busy}
-            />
-          </Section>
-          <Section title="执行策略">
-            <div className="form-body">
-              <BatchStrategy options={options} onChange={setOptions} disabled={!canEdit || busy} />
-              <Field label="单目标超时（秒）">
-                <input
-                  type="number"
-                  min={1}
-                  max={3600}
-                  value={timeout}
-                  required
-                  disabled={!canEdit || busy}
-                  onChange={(event) => setTimeoutValue(Number(event.target.value))}
-                />
-              </Field>
-            </div>
-          </Section>
-        </div>
-        <Section
-          title="临时命令"
-          subtitle="以服务器配置的 SSH 用户身份执行"
-          action={
-            canEdit && (
-              <select
-                className="button secondary"
-                aria-label="引用运维方案"
-                value=""
-                disabled={busy || !availablePlans.length}
-                onChange={(event) =>
-                  setReference(availablePlans.find((plan) => plan.id === event.target.value))
-                }
-              >
-                <option value="">
-                  {plans.loading || availablePlans.length ? '引用运维方案…' : '暂无可引用的方案'}
-                </option>
-                {availablePlans.map((plan) => (
-                  <option key={plan.id} value={plan.id}>
-                    {plan.name}
-                  </option>
-                ))}
-              </select>
-            )
-          }
-        >
-          <div className="command-editor">
-            <textarea
-              aria-label="Shell 命令"
-              value={command}
-              onChange={(event) => setCommand(event.target.value)}
-              disabled={!canEdit || busy}
-              maxLength={65536}
-              spellCheck={false}
-              required
-              placeholder="uname -a && uptime"
-            />
-          </div>
-          <div className="command-options">
-            <Field label="任务名称（可选）">
-              <input
-                value={name}
-                onChange={(event) => setName(event.target.value)}
-                maxLength={100}
+      <div hidden={Boolean(reference)}>
+        <form className="command-layout" onSubmit={prepare}>
+          <div>
+            <Section title="执行目标" subtitle="可组合多种条件，预览会合并重复的服务器。">
+              <BatchTargetPicker
+                selection={selection}
+                onChange={setSelection}
                 disabled={!canEdit || busy}
               />
-            </Field>
-            <ErrorBanner error={preview ? '' : error} />
-            <div className="row-actions">
-              <button
-                className="button primary"
-                disabled={!canEdit || busy || !hasTargets(selection) || !command.trim()}
-              >
-                <Play size={16} />
-                预览并执行
-              </button>
-            </div>
+            </Section>
+            <Section title="执行策略">
+              <div className="form-body">
+                <BatchStrategy
+                  options={options}
+                  onChange={setOptions}
+                  disabled={!canEdit || busy}
+                />
+                <Field label="单目标超时（秒）">
+                  <input
+                    type="number"
+                    min={1}
+                    max={3600}
+                    value={timeout}
+                    required
+                    disabled={!canEdit || busy}
+                    onChange={(event) => setTimeoutValue(Number(event.target.value))}
+                  />
+                </Field>
+              </div>
+            </Section>
           </div>
-        </Section>
-      </form>
+          <Section
+            title="临时命令"
+            subtitle="以服务器配置的 SSH 用户身份执行"
+            action={
+              canEdit && (
+                <select
+                  className="button secondary"
+                  aria-label="引用运维方案"
+                  value=""
+                  disabled={busy || !availablePlans.length}
+                  onChange={(event) =>
+                    setReference(availablePlans.find((plan) => plan.id === event.target.value))
+                  }
+                >
+                  <option value="">
+                    {plans.loading || availablePlans.length ? '引用运维方案…' : '暂无可引用的方案'}
+                  </option>
+                  {availablePlans.map((plan) => (
+                    <option key={plan.id} value={plan.id}>
+                      {plan.name}
+                    </option>
+                  ))}
+                </select>
+              )
+            }
+          >
+            <div className="command-editor">
+              <textarea
+                aria-label="Shell 命令"
+                value={command}
+                onChange={(event) => setCommand(event.target.value)}
+                disabled={!canEdit || busy}
+                maxLength={65536}
+                spellCheck={false}
+                required
+                placeholder="uname -a && uptime"
+              />
+            </div>
+            <div className="command-options">
+              <Field label="任务名称（可选）">
+                <input
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  maxLength={100}
+                  disabled={!canEdit || busy}
+                />
+              </Field>
+              <ErrorBanner error={preview ? '' : error} />
+              <div className="row-actions">
+                <button
+                  className="button primary"
+                  disabled={!canEdit || busy || !hasTargets(selection) || !command.trim()}
+                >
+                  <Play size={16} />
+                  预览并执行
+                </button>
+              </div>
+            </div>
+          </Section>
+        </form>
+      </div>
       {reference && (
         <OperationRun
           user={user}
@@ -342,8 +348,8 @@ function ReusableOperations({ mode, user }: { mode: 'plans' | 'templates'; user:
   const label = isPlan ? '运维方案' : '命令模板';
   const endpoint = isPlan ? '/operation-plans' : '/command-templates';
   const resource = useResource<(Plan | CommandTemplate)[]>(endpoint);
-  const [editing, setEditing] = useState<Plan | CommandTemplate | 'new'>();
-  const [viewing, setViewing] = useState<Plan | CommandTemplate>();
+  const [editing, setEditing] = useInlineEditor<Plan | CommandTemplate | 'new'>();
+  const [viewing, setViewing] = useInlineEditor<Plan | CommandTemplate>();
   const [deleting, setDeleting] = useState<Plan | CommandTemplate>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -367,69 +373,71 @@ function ReusableOperations({ mode, user }: { mode: 'plans' | 'templates'; user:
   return (
     <>
       <ErrorBanner error={resource.error} retry={resource.reload} />
-      <Section
-        title={label}
-        action={
-          canEdit && (
-            <button className="button secondary" onClick={() => setEditing('new')}>
-              <Plus size={16} />
-              创建{label}
-            </button>
-          )
-        }
-      >
-        {resource.loading ? (
-          <Loading />
-        ) : !resource.data?.length ? (
-          <Empty
-            title={`暂无${label}`}
-            description={canEdit ? `创建${label}后即可保存版本并批量执行。` : ''}
-          />
-        ) : (
-          <div className="resource-list">
-            {resource.data.map((entry) => (
-              <div key={entry.id}>
-                <span className="resource-avatar">
-                  {isPlan ? <FileCode2 size={18} /> : <Terminal size={18} />}
-                </span>
-                <div>
-                  <strong>{entry.name}</strong>
-                  <small>{entry.description}</small>
-                </div>
-                <span className="tag">v{entry.currentVersion}</span>
-                <span className="row-actions">
-                  <button className="button compact" onClick={() => setViewing(entry)}>
-                    {canEdit && entry.enabled !== false ? '查看并运行' : '查看版本'}
-                  </button>
-                  {canEdit && (
-                    <>
-                      <button
-                        className="icon-button bare muted"
-                        aria-label={`编辑${entry.name}`}
-                        onClick={() => setEditing(entry)}
-                      >
-                        <Pencil size={15} />
-                      </button>
-                      {entry.enabled !== false && (
+      <div hidden={Boolean(editing || viewing)}>
+        <Section
+          title={label}
+          action={
+            canEdit && (
+              <button className="button secondary" onClick={() => setEditing('new')}>
+                <Plus size={16} />
+                创建{label}
+              </button>
+            )
+          }
+        >
+          {resource.loading ? (
+            <Loading />
+          ) : !resource.data?.length ? (
+            <Empty
+              title={`暂无${label}`}
+              description={canEdit ? `创建${label}后即可保存版本并批量执行。` : ''}
+            />
+          ) : (
+            <div className="resource-list">
+              {resource.data.map((entry) => (
+                <div key={entry.id}>
+                  <span className="resource-avatar">
+                    {isPlan ? <FileCode2 size={18} /> : <Terminal size={18} />}
+                  </span>
+                  <div>
+                    <strong>{entry.name}</strong>
+                    <small>{entry.description}</small>
+                  </div>
+                  <span className="tag">v{entry.currentVersion}</span>
+                  <span className="row-actions">
+                    <button className="button compact" onClick={() => setViewing(entry)}>
+                      {canEdit && entry.enabled !== false ? '查看并运行' : '查看版本'}
+                    </button>
+                    {canEdit && (
+                      <>
                         <button
                           className="icon-button bare muted"
-                          aria-label={`归档${entry.name}`}
-                          onClick={() => {
-                            setError('');
-                            setDeleting(entry);
-                          }}
+                          aria-label={`编辑${entry.name}`}
+                          onClick={() => setEditing(entry)}
                         >
-                          <Trash2 size={15} />
+                          <Pencil size={15} />
                         </button>
-                      )}
-                    </>
-                  )}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
-      </Section>
+                        {entry.enabled !== false && (
+                          <button
+                            className="icon-button bare muted"
+                            aria-label={`归档${entry.name}`}
+                            onClick={() => {
+                              setError('');
+                              setDeleting(entry);
+                            }}
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </Section>
+      </div>
       {editing && (
         <DefinitionEditor
           endpoint={endpoint}
@@ -540,7 +548,7 @@ function OperationRun({
   }
 
   return (
-    <Modal title={entry.name} wide onClose={() => !busy && onClose()}>
+    <InlineEditor title={entry.name} wide busy={busy} onClose={onClose}>
       <form onSubmit={prepare}>
         <div className="form-body">
           <ErrorBanner
@@ -641,7 +649,7 @@ function OperationRun({
             ))}
         </div>
       </form>
-    </Modal>
+    </InlineEditor>
   );
 }
 
@@ -736,7 +744,7 @@ function DefinitionEditor({
     }
   }
   return (
-    <Modal title={`${entry ? '编辑' : '创建'}${label}`} wide onClose={() => !busy && onClose()}>
+    <InlineEditor title={`${entry ? '编辑' : '创建'}${label}`} wide busy={busy} onClose={onClose}>
       <Form
         onSubmit={save}
         busy={busy}
@@ -802,7 +810,7 @@ function DefinitionEditor({
             />
           ))}
       </Form>
-    </Modal>
+    </InlineEditor>
   );
 }
 

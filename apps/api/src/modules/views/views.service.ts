@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { AuditService } from '../audit/audit.service';
+import { byProject } from '../projects/project-card-data';
 import { SaveViewDto } from './views.dto';
 import { failedDeploymentStatuses, failedHealthStatuses } from '../deployments/deployment-history';
 import { type ViewScope, ViewsRepository } from './views.repository';
@@ -50,16 +51,6 @@ function deploymentStatus(rows: { status: string; healthStatus: string | null }[
   )
     ? 'HEALTHY'
     : 'UNVERIFIED';
-}
-
-function byProject<Row extends { projectId: string }>(rows: Row[]) {
-  const grouped = new Map<string, Omit<Row, 'projectId'>[]>();
-  for (const { projectId, ...row } of rows) {
-    const group = grouped.get(projectId);
-    if (group) group.push(row);
-    else grouped.set(projectId, [row]);
-  }
-  return grouped;
 }
 
 @Injectable()

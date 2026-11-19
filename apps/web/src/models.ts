@@ -19,6 +19,15 @@ export interface SystemRuntimeDefaults {
   defaultBuildLocation: 'TARGET' | 'MANAGER';
   defaultMaxParallelTargets: number;
   logRetentionDays: number;
+  targetWorkspaceRoot: string;
+}
+export type ProjectExecutionOverrides = {
+  [Key in keyof SystemRuntimeDefaults]?: SystemRuntimeDefaults[Key] | null;
+};
+export interface ProjectExecutionSettings {
+  system: SystemRuntimeDefaults;
+  overrides: ProjectExecutionOverrides;
+  effective: SystemRuntimeDefaults;
 }
 export interface Credential {
   id: string;

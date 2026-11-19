@@ -1,10 +1,20 @@
 import { lstatSync, realpathSync, unlinkSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import type { Kysely } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import { terminalTaskStatuses } from './tasks.types';
 
 export const logRetentionBatchSize = 100;
+const dayMs = 86_400_000;
+
+export interface LogRetentionPolicies {
+  systemDays: number;
+  projectDays: ReadonlyMap<string, number>;
+}
+
+function validDays(value: number) {
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
 
 export function missingLogFile(error: unknown) {
   return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT';
@@ -44,9 +54,11 @@ function removeOwnedLog(root: string, id: string, key: string, expectedKey: stri
 export async function pruneTaskLogs(
   database: Kysely<Database>,
   dataDirectory: string,
-  cutoff: number,
+  policies: LogRetentionPolicies,
+  now: number,
   cursor: string | undefined,
   logKey: (id: string, createdAt: number) => string,
+  reread?: (database: Kysely<Database>) => Promise<LogRetentionPolicies>,
 ) {
   const result: LogRetentionResult = { removed: 0, missing: 0, skipped: 0, failed: 0, more: false };
   let root: string;
@@ -57,6 +69,18 @@ export async function pruneTaskLogs(
     throw error;
   }
 
+  const systemDays = validDays(policies.systemDays);
+  if (!systemDays && !Array.from(policies.projectDays.values()).some(validDays))
+    return { result, nextCursor: undefined };
+  // Both supported engines accept a JSON object and the ->> field operator.
+  // A single bound value avoids a SQL parameter per project. NULL cutoff retains indefinitely.
+  const overrides = Object.fromEntries(
+    Array.from(policies.projectDays, ([id, days]) => [id, validDays(days)]),
+  );
+  const effectiveDays = sql<number>`nullif(coalesce(cast((json(cast(${JSON.stringify(overrides)} as text)) ->> project_id) as bigint), cast(${systemDays} as bigint)), 0)`;
+  const cutoff = policies.projectDays.size
+    ? sql<number>`cast(${now} as bigint) - ${effectiveDays} * ${dayMs}`
+    : now - systemDays * dayMs;
   let eligible = database
     .selectFrom('tasks')
     .select('id')
@@ -88,11 +112,14 @@ export async function pruneTaskLogs(
       .where('finished_at', '<', cutoff)
       .where('lease_owner', 'is', null)
       .where('log_file_key', 'is not', null)
-      .returning(['id', 'created_at', 'log_file_key'])
+      .returning(['id', 'created_at', 'log_file_key', 'finished_at', 'project_id'])
       .execute();
 
+    const current = reread ? await reread(tx) : policies;
     const cleared: string[] = [];
     for (const task of locked) {
+      const days = validDays(current.projectDays.get(task.project_id ?? '') ?? current.systemDays);
+      if (!days || task.finished_at === null || task.finished_at >= now - days * dayMs) continue;
       let outcome: 'removed' | 'missing' | 'skipped' | 'failed';
       try {
         outcome = removeOwnedLog(

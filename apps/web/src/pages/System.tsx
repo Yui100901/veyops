@@ -18,15 +18,15 @@ import { api, formatTime, message, useResource } from '../api';
 import {
   Empty,
   ErrorBanner,
-  Field,
   Form,
   Loading,
-  Modal,
   PageHeader,
   RefreshButton,
   Section,
 } from '../components';
 import type { Audit, SystemRuntimeDefaults, User } from '../models';
+import { InlineEditor, useInlineEditor } from '../InlineEditor';
+import { ExecutionSettingsFields, executionChanges } from './ProjectExecutionSettings';
 import { AISettings } from './AI';
 import { ArtifactCleanup, ArtifactRetentionPolicy } from './ArtifactRetention';
 import { MonitoringSettings } from './ServerMonitoring';
@@ -110,7 +110,7 @@ type SystemInfo = Partial<SystemRuntimeDefaults> & {
 };
 export function SystemPage({ user }: { user: User }) {
   const resource = useResource<SystemInfo>('/system');
-  const [editing, setEditing] = useState(false);
+  const [editing, setEditing] = useInlineEditor<true>();
   const [editingRetention, setEditingRetention] = useState(false);
   const [cleanup, setCleanup] = useState(false);
   const value = resource.data;
@@ -142,6 +142,16 @@ export function SystemPage({ user }: { user: User }) {
         }
       />
       <ErrorBanner error={resource.error} retry={resource.reload} />
+      {editing && value && (
+        <RuntimeDefaultsEditor
+          settings={value}
+          onClose={() => setEditing(undefined)}
+          onSaved={() => {
+            setEditing(undefined);
+            void resource.reload();
+          }}
+        />
+      )}
       {resource.loading ? (
         <Loading />
       ) : (
@@ -203,6 +213,12 @@ export function SystemPage({ user }: { user: User }) {
                     ? '管理端隔离环境'
                     : '—'}
               </strong>
+            </div>
+            <div className="setting-row">
+              <span>
+                <HardDrive size={17} /> 目标端工作目录
+              </span>
+              <strong className="mono">{value?.targetWorkspaceRoot ?? '—'}</strong>
             </div>
             <div className="setting-row">
               <span>
@@ -285,16 +301,6 @@ export function SystemPage({ user }: { user: User }) {
         <p>数据库连接、加密主密钥与 Worker 进程由服务端配置。</p>
       </div>
       <AISettings user={user} />
-      {editing && value && (
-        <RuntimeDefaultsEditor
-          settings={value}
-          onClose={() => setEditing(false)}
-          onSaved={() => {
-            setEditing(false);
-            void resource.reload();
-          }}
-        />
-      )}
       {editingRetention && <ArtifactRetentionPolicy onClose={() => setEditingRetention(false)} />}
       {cleanup && <ArtifactCleanup onClose={() => setCleanup(false)} onPruned={resource.reload} />}
     </>
@@ -312,25 +318,16 @@ function RuntimeDefaultsEditor({
 }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const initialBuildLocation = settings.defaultBuildLocation ?? 'TARGET';
-  const initialParallel = settings.defaultMaxParallelTargets ?? 3;
-  const initialRetention = settings.logRetentionDays ?? 0;
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const fields = new FormData(event.currentTarget);
-    const defaultBuildLocation = fields.get('defaultBuildLocation');
-    const defaultMaxParallelTargets = Number(fields.get('defaultMaxParallelTargets'));
-    const logRetentionDays = Number(fields.get('logRetentionDays'));
+    const changed = executionChanges(fields, settings);
     setSaving(true);
     setError('');
     try {
       await api('/system', {
         method: 'PATCH',
-        body: JSON.stringify({
-          ...(defaultBuildLocation !== initialBuildLocation && { defaultBuildLocation }),
-          ...(defaultMaxParallelTargets !== initialParallel && { defaultMaxParallelTargets }),
-          ...(logRetentionDays !== initialRetention && { logRetentionDays }),
-        }),
+        body: JSON.stringify(changed),
       });
       onSaved();
     } catch (err) {
@@ -340,40 +337,10 @@ function RuntimeDefaultsEditor({
     }
   }
   return (
-    <Modal
-      title="编辑运行设置"
-      onClose={() => {
-        if (!saving) onClose();
-      }}
-    >
+    <InlineEditor title="编辑运行设置" busy={saving} onClose={onClose}>
       <Form onSubmit={save} onCancel={onClose} busy={saving} error={error}>
-        <Field label="默认构建位置">
-          <select name="defaultBuildLocation" defaultValue={initialBuildLocation}>
-            <option value="TARGET">目标服务器</option>
-            <option value="MANAGER">管理端隔离环境</option>
-          </select>
-        </Field>
-        <Field label="默认目标并发" hint="适用于未指定并发数的任务和新部署目标。">
-          <input
-            name="defaultMaxParallelTargets"
-            type="number"
-            min={1}
-            max={10}
-            required
-            defaultValue={initialParallel}
-          />
-        </Field>
-        <Field label="任务日志保留天数" hint="超过期限的已结束任务日志会定期清理。填 0 一直保留。">
-          <input
-            name="logRetentionDays"
-            type="number"
-            min={0}
-            max={3650}
-            required
-            defaultValue={initialRetention}
-          />
-        </Field>
+        <ExecutionSettingsFields values={settings} />
       </Form>
-    </Modal>
+    </InlineEditor>
   );
 }

@@ -187,12 +187,15 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     if (!this.settings || this.stopping || Date.now() < this.nextLogPruneAt) return;
     this.nextLogPruneAt = Date.now() + LOG_PRUNE_INTERVAL_MS;
     try {
-      const { logRetentionDays } = await this.settings.get();
-      if (!logRetentionDays) {
+      const settings = this.settings;
+      const policies = await settings.logRetentionPolicies();
+      if (!policies.systemDays && ![...policies.projectDays.values()].some((days) => days > 0)) {
         this.nextLogPruneAt = Date.now() + 60_000;
         return;
       }
-      const result = await this.logs.pruneExpired(this.database.db, logRetentionDays);
+      const result = await this.logs.pruneExpired(this.database.db, policies, Date.now(), (tx) =>
+        settings.logRetentionPolicies(tx),
+      );
       if (result.more) this.nextLogPruneAt = Date.now() + 60_000;
       if (result.failed) this.logger.warn(`本轮有 ${result.failed} 份过期任务日志清理失败`);
     } catch {

@@ -105,6 +105,11 @@ async function checkDelivery(databaseUrl?: string) {
         options?: { onData?: (chunk: string) => void },
       ) => {
         remoteCommands.push({ serverId: target.id, command });
+        if (command.includes('VEYOPS_WORKSPACE=')) {
+          const leaf = /mkdir -- '(veyops-[\w-]+)'/.exec(command)?.[1];
+          assert.ok(leaf);
+          options?.onData?.(`VEYOPS_WORKSPACE=/home/fixture/.veyops/workspace/${leaf}\n`);
+        }
         if (failNextHealthCheck && command.includes('AUTO_HEALTH_CHECK')) {
           failNextHealthCheck = false;
           return { exitCode: 1 };
@@ -335,6 +340,21 @@ async function checkDelivery(databaseUrl?: string) {
     assert.equal(activations().length, 4);
 
     const targetPath = `/pipelines/${targetPipeline.id}`;
+    const settingsPath = `/api/v1/projects/${project.id}/execution-settings`;
+    const buildOnly = { ...base, mode: 'BUILD_ONLY', commitSha: successfulCommit };
+    const originalPreview = await create(`${targetPath}/preview`, buildOnly);
+    assert.equal(originalPreview.targetWorkspaceRoot, '~/.veyops/workspace');
+    await api.patch(settingsPath).send({ targetWorkspaceRoot: '/srv/ci builds' }).expect(200);
+    await api
+      .post(`/api/v1${targetPath}/run`)
+      .send({
+        ...buildOnly,
+        expectedConfigurationHash: originalPreview.configurationHash,
+      })
+      .expect(409);
+    const updatedPreview = await create(`${targetPath}/preview`, buildOnly);
+    assert.equal(updatedPreview.targetWorkspaceRoot, '/srv/ci builds');
+    await api.patch(settingsPath).send({ targetWorkspaceRoot: null }).expect(200);
     failedBuildServer = serverIds[1];
     const strict = await create(`${targetPath}/run`, { ...base, commitSha: successfulCommit });
     const strictBuild = await runTask(strict.id);

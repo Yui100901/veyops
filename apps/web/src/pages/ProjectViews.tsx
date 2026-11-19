@@ -1,15 +1,7 @@
 import { useState } from 'react';
+import { InlineEditor, useInlineEditor } from '../InlineEditor';
 import type { FormEvent } from 'react';
-import {
-  ArrowDown,
-  ArrowUp,
-  ArrowUpRight,
-  FolderGit2,
-  Pencil,
-  Plus,
-  Star,
-  Trash2,
-} from 'lucide-react';
+import { ArrowDown, ArrowUp, FolderGit2, Pencil, Plus, Star, Trash2 } from 'lucide-react';
 import { api, formatTime, message, navigate, post, remove, useResource } from '../api';
 import {
   Confirm,
@@ -18,13 +10,13 @@ import {
   Field,
   Form,
   Loading,
-  Modal,
   PageHeader,
   RefreshButton,
   Section,
   Status,
 } from '../components';
 import type { DeploymentSummary, Environment, Project, User } from '../models';
+import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
 
 interface ViewSummary {
   id: string;
@@ -56,29 +48,15 @@ interface ViewProject extends Pick<
     environmentName?: string | null;
     serverName?: string | null;
   })[];
-  addresses: { id: string; name: string; url: string }[];
+  addresses: ProjectAccessLink[];
 }
 
 interface ViewDetail extends ViewSummary {
   projects: ViewProject[];
 }
 
-function accessUrl(value: string) {
-  try {
-    const url = new URL(value);
-    if (['http:', 'https:'].includes(url.protocol) && !url.username && !url.password)
-      return url.href;
-  } catch {
-    return undefined;
-  }
-}
-
 function ProjectViewCard({ project, viewId }: { project: ViewProject; viewId: string }) {
   const deploymentState = deploymentStates[project.deploymentStatus];
-  const links = project.addresses.flatMap((address) => {
-    const href = accessUrl(address.url);
-    return href ? [{ ...address, href }] : [];
-  });
   return (
     <article className="project-view-card">
       <header className="project-view-card-header">
@@ -114,6 +92,7 @@ function ProjectViewCard({ project, viewId }: { project: ViewProject; viewId: st
           ))}
         </div>
       )}
+      <ProjectAccessLinks addresses={project.addresses} />
       <div className="project-view-card-section">
         <h4>最近部署</h4>
         {!project.recentDeployments.length ? (
@@ -154,25 +133,6 @@ function ProjectViewCard({ project, viewId }: { project: ViewProject; viewId: st
           </ul>
         )}
       </div>
-      {links.length > 0 && (
-        <div className="project-view-card-section">
-          <h4>快速访问</h4>
-          <div className="project-view-links">
-            {links.map((link) => (
-              <a
-                key={link.id}
-                className="text-link"
-                href={link.href}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                {link.name}
-                <ArrowUpRight size={13} aria-hidden="true" />
-              </a>
-            ))}
-          </div>
-        </div>
-      )}
     </article>
   );
 }
@@ -238,7 +198,12 @@ function ViewEditor({
   }
 
   return (
-    <Modal title={view ? '编辑项目视图' : '新建项目视图'} onClose={() => !busy && onClose()} wide>
+    <InlineEditor
+      busy={busy}
+      title={view ? '编辑项目视图' : '新建项目视图'}
+      onClose={() => !busy && onClose()}
+      wide
+    >
       {!projects.data ? (
         <div className="form-body">
           {projects.loading ? (
@@ -358,7 +323,7 @@ function ViewEditor({
           </div>
         </Form>
       )}
-    </Modal>
+    </InlineEditor>
   );
 }
 
@@ -369,7 +334,7 @@ export function ProjectViewsPage({ user, id }: { user: User; id?: string }) {
     selectedId ? `/views/${encodeURIComponent(selectedId)}` : null,
   );
   const selected = detail.data?.id === selectedId ? detail.data : undefined;
-  const [editor, setEditor] = useState<ViewSummary | 'new'>();
+  const [editor, setEditor] = useInlineEditor<ViewSummary | 'new'>();
   const [deleting, setDeleting] = useState<ViewSummary>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -427,6 +392,19 @@ export function ProjectViewsPage({ user, id }: { user: User; id?: string }) {
           </>
         }
       />
+      {editor && (
+        <ViewEditor
+          key={editor === 'new' ? 'new' : editor.id}
+          view={editor === 'new' ? undefined : editor}
+          onClose={() => setEditor(undefined)}
+          onSave={(viewId) => {
+            setEditor(undefined);
+            navigate(`/views/${encodeURIComponent(viewId)}`);
+            void catalog.reload();
+            if (selectedId === viewId) void detail.reload();
+          }}
+        />
+      )}
       <ErrorBanner error={catalog.error} retry={catalog.reload} />
       {catalog.loading ? (
         <Loading />
@@ -500,18 +478,6 @@ export function ProjectViewsPage({ user, id }: { user: User; id?: string }) {
             </div>
           </div>
         )
-      )}
-      {editor && (
-        <ViewEditor
-          view={editor === 'new' ? undefined : editor}
-          onClose={() => setEditor(undefined)}
-          onSave={(viewId) => {
-            setEditor(undefined);
-            navigate(`/views/${encodeURIComponent(viewId)}`);
-            void catalog.reload();
-            if (selectedId === viewId) void detail.reload();
-          }}
-        />
       )}
       {deleting && (
         <Confirm

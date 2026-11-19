@@ -59,6 +59,7 @@ export interface PipelineNodeSource {
   branch?: string;
 }
 export interface PipelineDefinition {
+  inheritBuildLocation?: boolean;
   defaultMode?: PipelineExecutionMode;
   repositoryId: string;
   buildLocation: 'TARGET' | 'MANAGER';
@@ -80,6 +81,7 @@ export interface PipelineDefinition {
   nodes?: PipelineNode[];
 }
 export interface PipelineSnapshot {
+  targetWorkspaceRoot?: string;
   releasePolicy?: ReleasePolicy;
   rollbackOfDeploymentId?: string;
   expectedCurrentDeploymentId?: string | null;

@@ -164,6 +164,33 @@ async function checkResources(databaseUrl?: string) {
       environmentId: environment.id,
       addressType: 'API',
     });
+    const docs = await create(root + '/addresses', {
+      name: 'Docs',
+      url: 'https://docs.example.invalid',
+    });
+    const cards: {
+      id: string;
+      addresses: {
+        id: string;
+        name: string;
+        url: string;
+        serviceName: string | null;
+        environmentName: string | null;
+      }[];
+    }[] = await fetch('/projects?include=addresses');
+    assert.deepEqual(cards.find((p) => p.id === project.id)?.addresses, [
+      {
+        id: address.id,
+        name: 'API',
+        url: address.url,
+        serviceName: editedService.name,
+        environmentName: editedEnvironment.name,
+      },
+      { id: docs.id, name: 'Docs', url: docs.url, serviceName: null, environmentName: null },
+    ]);
+    assert.deepEqual(cards.find((p) => p.id === peer.id)?.addresses, []);
+    assert.equal('addresses' in (await fetch('/projects'))[0], false);
+    await api.delete(base + root + '/addresses/' + docs.id).expect(200);
     await api
       .patch(base + '/projects/' + peer.id + '/services/' + service.id)
       .send({ name: 'Wrong project', slug: 'wrong' })

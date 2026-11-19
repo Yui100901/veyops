@@ -228,20 +228,24 @@ export class PipelinesService implements OnModuleInit {
     }
   }
   async create(input: CreatePipelineDto, userId: string) {
+    const inheritBuildLocation =
+      input.definition.inheritBuildLocation || !input.definition.buildLocation;
     const definition: PipelineDefinition = {
       ...input.definition,
-      buildLocation:
-        input.definition.buildLocation ?? (await this.settings.get()).defaultBuildLocation,
+      inheritBuildLocation,
+      buildLocation: inheritBuildLocation
+        ? (await this.settings.get(input.projectId)).defaultBuildLocation
+        : input.definition.buildLocation!,
     };
     await this.resources(input.projectId, input.serviceId, definition);
-    const id = randomUUID(),
+    const id = input.creationId ?? randomUUID(),
       now = Date.now();
-    await this.database.db.transaction().execute(async (tx) => {
+    const created = await this.database.db.transaction().execute(async (tx) => {
       for (const repositoryId of pipelineSourceRepositories(definition))
         await this.lockRepository(tx, input.projectId, repositoryId);
       await this.lockNodeCredentials(tx, definition);
       if (input.definition.registryId) await lockRegistry(tx, input.definition.registryId);
-      await tx
+      const inserted = await tx
         .insertInto('pipelines')
         .values({
           id,
@@ -252,7 +256,36 @@ export class PipelinesService implements OnModuleInit {
           created_at: now,
           updated_at: now,
         })
-        .execute();
+        .onConflict((conflict) => conflict.column('id').doNothing())
+        .returning('id')
+        .executeTakeFirst();
+      if (!inserted) {
+        const previous = await tx
+          .selectFrom('pipelines')
+          .innerJoin('pipeline_versions', 'pipeline_versions.pipeline_id', 'pipelines.id')
+          .select([
+            'pipelines.name',
+            'pipelines.enabled',
+            'pipelines.current_version',
+            'pipeline_versions.definition_json',
+          ])
+          .where('pipelines.id', '=', id)
+          .where('pipelines.project_id', '=', input.projectId)
+          .where('pipelines.service_id', '=', input.serviceId)
+          .where('pipeline_versions.created_by', '=', userId)
+          .where('pipeline_versions.version', '=', 1)
+          .executeTakeFirst();
+        if (
+          !input.creationId ||
+          !previous ||
+          previous.current_version !== 1 ||
+          previous.name !== input.name ||
+          previous.enabled !== Number(input.enabled) ||
+          previous.definition_json !== JSON.stringify(definition)
+        )
+          throw new ConflictException('流水线创建请求已被使用，请重新打开已保存的流水线。');
+        return false;
+      }
       await tx
         .insertInto('pipeline_versions')
         .values({
@@ -264,15 +297,21 @@ export class PipelinesService implements OnModuleInit {
           created_at: now,
         })
         .execute();
+      return true;
     });
-    await this.audit.record(userId, 'pipeline.create', 'pipeline', id);
+    if (created) await this.audit.record(userId, 'pipeline.create', 'pipeline', id);
     return this.get(id);
   }
   async update(id: string, input: UpdatePipelineDto, userId: string) {
     const current = await this.get(id);
     const definition: PipelineDefinition = {
       ...input.definition,
-      buildLocation: input.definition.buildLocation ?? current.definition.buildLocation ?? 'TARGET',
+      inheritBuildLocation:
+        input.definition.inheritBuildLocation ??
+        (!input.definition.buildLocation && Boolean(current.definition.inheritBuildLocation)),
+      buildLocation: input.definition.inheritBuildLocation
+        ? (await this.settings.get(current.projectId)).defaultBuildLocation
+        : (input.definition.buildLocation ?? current.definition.buildLocation ?? 'TARGET'),
     };
     await this.resources(current.projectId, current.serviceId, definition);
     await this.database.db.transaction().execute(async (tx) => {
@@ -349,11 +388,10 @@ export class PipelinesService implements OnModuleInit {
       input.targetId,
     );
     const configured = env.config?.targetSelection;
+    const defaults = await this.settings.get(pipeline.projectId);
     const defaultParallel =
       input.serverIds !== undefined || input.groupIds !== undefined
-        ? (input.maxParallel ??
-          configured?.maxParallel ??
-          (await this.settings.get()).defaultMaxParallelTargets)
+        ? (input.maxParallel ?? configured?.maxParallel ?? defaults.defaultMaxParallelTargets)
         : 1;
     const selection =
       directDeploymentSelection(
@@ -400,6 +438,7 @@ export class PipelinesService implements OnModuleInit {
     ) as PipelineDefinition;
     const buildOnlyNodes =
       definition.nodes && !definition.nodes.some((node) => node.type === 'DEPLOY');
+    if (definition.inheritBuildLocation) definition.buildLocation = defaults.defaultBuildLocation;
     const mode =
       input.mode ??
       env.config?.executionMode ??
@@ -468,6 +507,10 @@ export class PipelinesService implements OnModuleInit {
     }
     return {
       pipeline,
+      targetWorkspaceRoot:
+        !fromArtifact && definition.buildLocation === 'TARGET'
+          ? defaults.targetWorkspaceRoot
+          : undefined,
       version,
       environment,
       target,
@@ -503,6 +546,7 @@ export class PipelinesService implements OnModuleInit {
         JSON.stringify(
           canonical({
             definition: p.definition,
+            targetWorkspaceRoot: p.targetWorkspaceRoot,
             // Preserve existing deploy confirmations made before execution modes were introduced.
             ...(p.mode === 'BUILD_ONLY' ? { mode: p.mode } : {}),
             ...(p.mode === 'DEPLOY' &&
@@ -582,6 +626,7 @@ export class PipelinesService implements OnModuleInit {
       commitSha: p.commitSha,
       ...(p.sources && { nodeSources: p.sources.preview }),
       definition: p.definition,
+      targetWorkspaceRoot: p.targetWorkspaceRoot,
       configurationHash,
       ...(webhookBranch && { webhookConfigurationHash: this.configurationHash(p, false) }),
       aiApprovalHash,
@@ -602,6 +647,7 @@ export class PipelinesService implements OnModuleInit {
     commitSha: string,
   ): PipelineSnapshot {
     return {
+      ...(p.targetWorkspaceRoot && { targetWorkspaceRoot: p.targetWorkspaceRoot }),
       runId: randomUUID(),
       pipelineId: p.pipeline.id,
       pipelineVersionId: p.version.id,

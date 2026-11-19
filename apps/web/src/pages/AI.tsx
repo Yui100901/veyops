@@ -1,3 +1,4 @@
+import { InlineEditor, useInlineEditor } from '../InlineEditor';
 import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { createPortal } from 'react-dom';
@@ -185,7 +186,7 @@ export function AISettings({ user }: { user: User }) {
   const policies = useResource<Policies>('/ai/policies');
   const projects = useResource<Project[]>('/projects');
   const servers = useResource<Server[]>('/servers');
-  const [editing, setEditing] = useState<Partial<AIProvider>>();
+  const [editing, setEditing] = useInlineEditor<Partial<AIProvider>>();
   const [deleting, setDeleting] = useState<AIProvider>();
   const [busyId, setBusyId] = useState('');
   const [error, setError] = useState('');
@@ -235,111 +236,117 @@ export function AISettings({ user }: { user: User }) {
   }
   return (
     <div className="ai-settings" id="ai-settings">
-      <Section
-        title="AI 模型连接"
-        subtitle="管理 OpenAI 兼容服务的模型和连接。"
-        action={
-          admin && (
-            <button className="button primary small" onClick={() => setEditing({})}>
-              <Plus size={15} />
-              添加 Provider
-            </button>
-          )
-        }
-      >
-        <div className="section-body">
-          <ErrorBanner error={providers.error || error} />
-          {notice && (
-            <div className="success-notice" role="status">
-              <Check size={16} />
-              {notice}
-            </div>
-          )}
-          {providers.loading ? (
-            <Loading />
-          ) : !providers.data?.length ? (
-            <Empty
-              icon={<PlugZap size={25} />}
-              title="尚未配置 AI"
-              description={
-                admin
-                  ? '按需添加兼容服务的 Base URL、模型和 API Key。密钥将加密保存。'
-                  : '请联系管理员配置兼容的模型服务，手工运维不受影响。'
-              }
-            />
-          ) : (
-            <div className="provider-list">
-              {providers.data.map((p) => (
-                <div className="provider-card" key={p.id}>
-                  <div className="provider-main">
-                    <span className="resource-avatar">
-                      <Bot size={22} />
-                    </span>
-                    <div>
-                      <strong>{p.name}</strong>
-                      <small>
-                        {p.model} · {p.baseUrl}
-                      </small>
+      <div className="editor-origin" hidden={Boolean(editing)}>
+        <Section
+          title="AI 模型连接"
+          subtitle="管理 OpenAI 兼容服务的模型和连接。"
+          action={
+            admin && (
+              <button className="button primary small" onClick={() => setEditing({})}>
+                <Plus size={15} />
+                添加 Provider
+              </button>
+            )
+          }
+        >
+          <div className="section-body">
+            <ErrorBanner error={providers.error || error} />
+            {notice && (
+              <div className="success-notice" role="status">
+                <Check size={16} />
+                {notice}
+              </div>
+            )}
+            {providers.loading ? (
+              <Loading />
+            ) : !providers.data?.length ? (
+              <Empty
+                icon={<PlugZap size={25} />}
+                title="尚未配置 AI"
+                description={
+                  admin
+                    ? '按需添加兼容服务的 Base URL、模型和 API Key。密钥将加密保存。'
+                    : '请联系管理员配置兼容的模型服务，手工运维不受影响。'
+                }
+              />
+            ) : (
+              <div className="provider-list">
+                {providers.data.map((p) => (
+                  <div className="provider-card" key={p.id}>
+                    <div className="provider-main">
+                      <span className="resource-avatar">
+                        <Bot size={22} />
+                      </span>
+                      <div>
+                        <strong>{p.name}</strong>
+                        <small>
+                          {p.model} · {p.baseUrl}
+                        </small>
+                      </div>
+                      <Status value={p.enabled ? 'ACTIVE' : 'DISABLED'} />
                     </div>
-                    <Status value={p.enabled ? 'ACTIVE' : 'DISABLED'} />
-                  </div>
-                  <div className="provider-card-meta">
-                    <span>
-                      <KeyRound size={13} />
-                      {p.configured ? '已安全配置密钥' : '未配置密钥'}
-                    </span>
-                    <span>超时 {p.timeoutSeconds} 秒</span>
-                  </div>
-                  {admin && (
-                    <div className="provider-actions">
-                      <button
-                        className="text-button"
-                        disabled={!!busyId || !p.configured}
-                        onClick={() => testProvider(p)}
-                      >
-                        <PlugZap size={14} />
-                        {busyId === p.id ? '处理中…' : '测试连接'}
-                      </button>
-                      <button
-                        className="text-button"
-                        disabled={!!busyId}
-                        onClick={() => setEditing(p)}
-                      >
-                        <Pencil size={14} />
-                        编辑
-                      </button>
-                      <button className="text-button" disabled={!!busyId} onClick={() => toggle(p)}>
-                        {p.enabled ? '禁用' : '启用'}
-                      </button>
-                      <button
-                        className="text-button danger-text"
-                        aria-label={`删除 ${p.name}`}
-                        disabled={!!busyId}
-                        onClick={() => {
-                          setError('');
-                          setDeleting(p);
-                        }}
-                      >
-                        <Trash2 size={14} />
-                      </button>
+                    <div className="provider-card-meta">
+                      <span>
+                        <KeyRound size={13} />
+                        {p.configured ? '已安全配置密钥' : '未配置密钥'}
+                      </span>
+                      <span>超时 {p.timeoutSeconds} 秒</span>
                     </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-          <p className="field-note">API Key 加密保存在凭据中心。</p>
-        </div>
-      </Section>
-      <ModelRouting providers={providers.data ?? []} admin={admin} />
-      <PolicyEditor
-        user={user}
-        policies={policies.data}
-        error={policies.error}
-        projects={projects.data || []}
-        servers={servers.data || []}
-        onSaved={policies.reload}
-      />
+                    {admin && (
+                      <div className="provider-actions">
+                        <button
+                          className="text-button"
+                          disabled={!!busyId || !p.configured}
+                          onClick={() => testProvider(p)}
+                        >
+                          <PlugZap size={14} />
+                          {busyId === p.id ? '处理中…' : '测试连接'}
+                        </button>
+                        <button
+                          className="text-button"
+                          disabled={!!busyId}
+                          onClick={() => setEditing(p)}
+                        >
+                          <Pencil size={14} />
+                          编辑
+                        </button>
+                        <button
+                          className="text-button"
+                          disabled={!!busyId}
+                          onClick={() => toggle(p)}
+                        >
+                          {p.enabled ? '禁用' : '启用'}
+                        </button>
+                        <button
+                          className="text-button danger-text"
+                          aria-label={`删除 ${p.name}`}
+                          disabled={!!busyId}
+                          onClick={() => {
+                            setError('');
+                            setDeleting(p);
+                          }}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            <p className="field-note">API Key 加密保存在凭据中心。</p>
+          </div>
+        </Section>
+        <ModelRouting providers={providers.data ?? []} admin={admin} />
+        <PolicyEditor
+          user={user}
+          policies={policies.data}
+          error={policies.error}
+          projects={projects.data || []}
+          servers={servers.data || []}
+          onSaved={policies.reload}
+        />
+      </div>
       {editing && (
         <ProviderEditor
           provider={editing}
@@ -416,7 +423,8 @@ function ProviderEditor({
     }
   }
   return (
-    <Modal
+    <InlineEditor
+      busy={busy}
       title={provider.id ? '编辑 AI Provider' : '添加 AI Provider'}
       description="配置兼容 OpenAI 的服务地址与模型。密钥仅用于服务端请求，并加密存储。"
       onClose={onClose}
@@ -476,7 +484,7 @@ function ProviderEditor({
           启用此连接
         </label>
       </Form>
-    </Modal>
+    </InlineEditor>
   );
 }
 function PolicyEditor({

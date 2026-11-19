@@ -68,9 +68,9 @@ class ReleasePolicyDto implements ReleasePolicy {
 
 class ServiceConfigDto extends DeploymentSelectionDto {
   @IsOptional() @IsIn(['BUILD_ONLY', 'DEPLOY']) executionMode?: 'BUILD_ONLY' | 'DEPLOY' | null;
-  @ValidateIf((_object, value) => value !== undefined)
+  @IsOptional()
   @IsIn(['TARGET', 'MANAGER'])
-  buildLocation?: 'TARGET' | 'MANAGER';
+  buildLocation?: 'TARGET' | 'MANAGER' | null;
   @IsIn(['FILE', 'DOCKER_IMAGE']) artifactType = 'FILE';
   @IsIn(['FILE', 'DOCKER_COMPOSE']) deployMethod = 'FILE';
   @IsOptional() @IsString() @MaxLength(1024) deployPath = '';
@@ -167,6 +167,7 @@ export class ServiceConfigsService {
     const s = await this.service(serviceId),
       e = await this.environment(environmentId);
     if (s.project_id !== e.project_id) throw new BadRequestException('服务和环境必须属于同一项目');
+    return s.project_id;
   }
   async get(serviceId: string, environmentId: string) {
     await this.assertScope(serviceId, environmentId);
@@ -206,8 +207,8 @@ export class ServiceConfigsService {
       throw new BadRequestException('Compose 健康检查需要 Docker Compose 部署');
     if (policy?.rollbackMode === 'PINNED' && !policy.pinnedDeploymentId)
       throw new BadRequestException('请选择已健康验收的回滚版本');
-    await this.assertScope(serviceId, environmentId);
-    const defaults = await this.settings.get();
+    const projectId = await this.assertScope(serviceId, environmentId);
+    const defaults = await this.settings.get(projectId);
     const selection = directDeploymentSelection(input, defaults.defaultMaxParallelTargets);
     if (!selection && !input.targetId) throw new BadRequestException('请选择服务器或服务器分组');
     if (input.targetId) await this.targets.get(input.targetId);
@@ -220,7 +221,8 @@ export class ServiceConfigsService {
         input.deployPath.split('/').includes('..'))
     )
       throw new BadRequestException('部署目录必须为安全绝对路径');
-    const buildLocation = input.buildLocation ?? defaults.defaultBuildLocation;
+    const buildLocation =
+      input.buildLocation === undefined ? defaults.defaultBuildLocation : input.buildLocation;
     const now = Date.now(),
       values = {
         ...(input.executionMode !== undefined && { execution_mode: input.executionMode }),

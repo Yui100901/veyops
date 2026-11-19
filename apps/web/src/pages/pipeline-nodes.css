@@ -24,6 +24,61 @@
   min-width: 0;
 }
 
+.pipeline-ai-draft,
+.pipeline-ai-preview {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  padding: 14px;
+  border: 1px solid #bdd8d1;
+  border-radius: 8px;
+  background: #f3faf8;
+}
+
+.pipeline-ai-draft .pipeline-nodes-heading {
+  border: 0;
+  padding: 0;
+}
+
+.pipeline-ai-draft summary {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.pipeline-ai-draft details[open] .form-grid {
+  margin-top: 12px;
+}
+
+.pipeline-ai-preview {
+  background: #fff;
+  border-color: var(--border);
+}
+
+.pipeline-ai-draft :is(p, ol, ul, h4, pre, dl, dd) {
+  margin: 0;
+}
+
+.pipeline-ai-preview pre {
+  white-space: pre-wrap;
+  padding: 6px 10px;
+  background: #eef3f3;
+  border-radius: 4px;
+  margin-block: 4px 6px;
+}
+
+.pipeline-ai-preview dl > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.pipeline-ai-preview dt {
+  font-weight: 600;
+}
+
 .pipeline-node-editor-panel,
 .pipeline-node-file-picker {
   display: grid;

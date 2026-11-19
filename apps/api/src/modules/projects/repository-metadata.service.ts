@@ -427,11 +427,13 @@ export class RepositoryMetadataService {
   async readAnalysisContext(
     projectId: string,
     repositoryId: string,
-    options: { commitSha?: string; docPath?: string; repoPath?: string } = {},
+    options: { commitSha?: string; branch?: string; docPath?: string; repoPath?: string } = {},
   ) {
     const docPath = options.docPath;
     const repoPath = options.repoPath ?? '.';
     const explicitSha = options.commitSha?.toLowerCase();
+    if (options.branch !== undefined && !isBranchName(options.branch))
+      throw new BadRequestException('仓库分析的 Git 分支名称无效');
     if (explicitSha !== undefined && !shaPattern.test(explicitSha))
       throw new BadRequestException('仓库分析需要完整 Git Commit SHA');
     if (docPath !== undefined && (!isDeploymentDocPath(docPath) || !isAnalysisPath(docPath)))
@@ -441,10 +443,15 @@ export class RepositoryMetadataService {
 
     return this.withRepository(projectId, repositoryId, async (repository) => {
       let commitSha = explicitSha;
+      let branch = options.branch;
       if (commitSha === undefined) {
         const { defaultBranch, branches } = await this.listBranches(repository);
-        commitSha = branches.find((branch) => branch.name === defaultBranch)?.sha;
-        if (!commitSha) throw new BadRequestException('仓库没有可用的默认分支，请指定完整提交');
+        branch ??= defaultBranch ?? undefined;
+        commitSha = branches.find((entry) => entry.name === branch)?.sha;
+        if (!commitSha)
+          throw new BadRequestException(
+            '所选分支不存在或仓库没有默认分支，请指定有效分支或完整提交',
+          );
       }
       const gitDir = await this.fetchPinnedCommit(repository, commitSha);
       const scope = repoPath === '.' ? [] : [repoPath, ...(docPath ? [docPath] : [])];
@@ -513,7 +520,7 @@ export class RepositoryMetadataService {
         .map((entry) => entry.path);
       if (!files.length)
         throw new BadRequestException('未找到可分析的仓库文本，请选择包含部署文档或构建配置的目录');
-      return { commitSha, repoPath, files, lockfiles };
+      return { commitSha, branch, repoPath, files, lockfiles };
     });
   }
 

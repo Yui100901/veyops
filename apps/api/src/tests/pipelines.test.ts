@@ -566,9 +566,20 @@ test('Pipeline versions and commits are fixed atomically with task and run recor
         new CredentialsService(database, new AuditService(database)),
       ),
     );
-    const created = await pipelines.create(
-      { name: 'release', projectId: project, serviceId: service, definition: d, enabled: true },
-      user,
+    const createInput = {
+      creationId: randomUUID(),
+      name: 'release',
+      projectId: project,
+      serviceId: service,
+      definition: d,
+      enabled: true,
+    };
+    const created = await pipelines.create(createInput, user);
+    assert.equal((await pipelines.create(createInput, user)).id, created.id);
+    assert.equal((await pipelines.versions(created.id)).length, 1);
+    await assert.rejects(
+      () => pipelines.create({ ...createInput, name: 'different' }, user),
+      /创建请求/,
     );
     // Snapshot FK stores the server credential reference, so use no credential on the actual row and stub snapshot reference must be valid.
     await database.db

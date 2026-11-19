@@ -1,3 +1,4 @@
+import { InlineEditor, useInlineEditor } from '../InlineEditor';
 import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import {
@@ -25,6 +26,8 @@ import { MonitorSummary } from './ServerMonitoring';
 import { metricNames, metricValue } from './monitoring-data';
 import type { MetricKey, MonitorRow } from './monitoring-data';
 import { ProjectRelations } from './ProjectRelations';
+import { ProjectExecutionSettingsPanel } from './ProjectExecutionSettings';
+import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
 import { deliveryPath } from './delivery-route';
 import {
   Confirm,
@@ -71,17 +74,17 @@ export function ServersPage({ user }: { user: User }) {
   const metrics = useResource<MonitorRow[]>('/monitoring/servers?summary=true', 30000);
   const groups = useResource<ServerGroup[]>('/server-groups');
   const canEdit = user.role !== 'VIEWER';
-  const [compare, setCompare] = useState(false);
+  const [compare, setCompare] = useInlineEditor<true>();
   const [openMetrics, setOpenMetrics] = useState(false);
   const [groupId, setGroupId] = useState('');
   const [tag, setTag] = useState('');
   const [sortBy, setSortBy] = useState<MetricKey | ''>('');
   const [section, setSection] = useState<'servers' | 'groups'>('servers');
   const [search, setSearch] = useState('');
-  const [editor, setEditor] = useState<Server | 'new'>();
+  const [editor, setEditor] = useInlineEditor<Server | 'new'>();
   const [checkingKey, setCheckingKey] = useState<Server>();
   const [keyMismatch, setKeyMismatch] = useState<Server>();
-  const [inspecting, setInspecting] = useState<Server>();
+  const [inspecting, setInspecting] = useInlineEditor<Server>();
   const [deleting, setDeleting] = useState<Server>();
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState('');
@@ -104,6 +107,7 @@ export function ServersPage({ user }: { user: User }) {
     };
     list.sort((left, right) => value(right.id) - value(left.id));
   }
+  const panelOpen = Boolean(editor || inspecting || compare);
   function inspect(server: Server, showMetrics: boolean) {
     setOpenMetrics(showMetrics);
     setInspecting(server);
@@ -178,270 +182,274 @@ export function ServersPage({ user }: { user: User }) {
         title="服务器"
         description="管理 SSH 主机与服务器分组。"
         action={
-          <>
-            {section === 'servers' && <RefreshButton onClick={reloadServers} />}
-            {section === 'servers' && canEdit && (
-              <button
-                type="button"
-                className="button secondary"
-                disabled={(resource.data?.length ?? 0) < 2}
-                onClick={() => setCompare(true)}
-              >
-                配置对比
-              </button>
-            )}
-            {canEdit && section === 'servers' && (
-              <button
-                className="button primary"
-                onClick={() => {
-                  setError('');
-                  setEditor('new');
-                }}
-              >
-                <Plus size={17} />
-                接入服务器
-              </button>
-            )}
-          </>
+          <div hidden={panelOpen}>
+            <div className="row-actions">
+              {section === 'servers' && <RefreshButton onClick={reloadServers} />}
+              {section === 'servers' && canEdit && (
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={(resource.data?.length ?? 0) < 2}
+                  onClick={() => setCompare(true)}
+                >
+                  配置对比
+                </button>
+              )}
+              {canEdit && section === 'servers' && (
+                <button
+                  className="button primary"
+                  onClick={() => {
+                    setError('');
+                    setEditor('new');
+                  }}
+                >
+                  <Plus size={17} />
+                  接入服务器
+                </button>
+              )}
+            </div>
+          </div>
         }
       />
-      <nav className="resource-section-switcher" aria-label="服务器资源">
-        <button
-          type="button"
-          aria-pressed={section === 'servers'}
-          onClick={() => {
-            setSection('servers');
-            void groups.reload();
-          }}
-        >
-          服务器
-        </button>
-        <button
-          type="button"
-          aria-pressed={section === 'groups'}
-          onClick={() => setSection('groups')}
-        >
-          服务器分组
-        </button>
-      </nav>
-      <ErrorBanner
-        error={resource.error || (!editor && !deleting && !checkingKey ? error : '')}
-        retry={resource.error ? resource.reload : undefined}
-      />
-      {keyMismatch && section === 'servers' && (
-        <div className="server-key-action">
+      <div hidden={panelOpen}>
+        <nav className="resource-section-switcher" aria-label="服务器资源">
           <button
-            className="button secondary"
             type="button"
-            onClick={() => setCheckingKey(keyMismatch)}
+            aria-pressed={section === 'servers'}
+            onClick={() => {
+              setSection('servers');
+              void groups.reload();
+            }}
           >
-            <ShieldCheck size={18} /> 核对 {keyMismatch.name} 的 SSH 指纹
+            服务器
           </button>
-        </div>
-      )}
-      {notice && (
-        <div className="success-banner" role="status">
-          <CheckCheck size={17} />
-          {notice}
-        </div>
-      )}
-      {section === 'servers' ? (
-        <Section
-          title="服务器资源"
-          subtitle={`共 ${resource.data?.length ?? 0} 台服务器`}
-          action={
-            <div className="search-input">
-              <Search size={16} />
-              <input
-                aria-label="搜索服务器"
-                placeholder="搜索名称、地址或标签"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
+          <button
+            type="button"
+            aria-pressed={section === 'groups'}
+            onClick={() => setSection('groups')}
+          >
+            服务器分组
+          </button>
+        </nav>
+        <ErrorBanner
+          error={resource.error || (!editor && !deleting && !checkingKey ? error : '')}
+          retry={resource.error ? resource.reload : undefined}
+        />
+        {keyMismatch && section === 'servers' && (
+          <div className="server-key-action">
+            <button
+              className="button secondary"
+              type="button"
+              onClick={() => setCheckingKey(keyMismatch)}
+            >
+              <ShieldCheck size={18} /> 核对 {keyMismatch.name} 的 SSH 指纹
+            </button>
+          </div>
+        )}
+        {notice && (
+          <div className="success-banner" role="status">
+            <CheckCheck size={17} />
+            {notice}
+          </div>
+        )}
+        {section === 'servers' ? (
+          <Section
+            title="服务器资源"
+            subtitle={`共 ${resource.data?.length ?? 0} 台服务器`}
+            action={
+              <div className="search-input">
+                <Search size={16} />
+                <input
+                  aria-label="搜索服务器"
+                  placeholder="搜索名称、地址或标签"
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                />
+              </div>
+            }
+          >
+            {Boolean(resource.data?.length) && (
+              <div className="monitor-list-filters monitor-toolbar">
+                <select
+                  aria-label="筛选服务器分组"
+                  value={groupId}
+                  onChange={(e) => setGroupId(e.target.value)}
+                >
+                  <option value="">全部分组</option>
+                  {groups.data?.map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.name}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  aria-label="筛选服务器标签"
+                  value={tag}
+                  onChange={(e) => setTag(e.target.value)}
+                >
+                  <option value="">全部标签</option>
+                  {[...new Set(resource.data?.flatMap((s) => s.tags))].sort().map((t) => (
+                    <option key={t}>{t}</option>
+                  ))}
+                </select>
+                <select
+                  aria-label="按资源占用排序"
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value as MetricKey | '')}
+                >
+                  <option value="">默认排序</option>
+                  {Object.entries(metricNames).map(([k, v]) => (
+                    <option key={k} value={k}>
+                      {v}从高到低
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <ErrorBanner error={groups.error || metrics.error} retry={reloadServers} />
+            {resource.loading ? (
+              <Loading />
+            ) : !resource.data?.length ? (
+              <Empty
+                icon={<ServerIcon size={25} />}
+                title="接入你的第一台服务器"
+                description="填写服务器地址，探测并确认 SSH 主机指纹。"
+                action={
+                  canEdit && (
+                    <button className="button primary" onClick={() => setEditor('new')}>
+                      <Plus size={16} />
+                      接入服务器
+                    </button>
+                  )
+                }
               />
-            </div>
-          }
-        >
-          {Boolean(resource.data?.length) && (
-            <div className="monitor-list-filters monitor-toolbar">
-              <select
-                aria-label="筛选服务器分组"
-                value={groupId}
-                onChange={(e) => setGroupId(e.target.value)}
-              >
-                <option value="">全部分组</option>
-                {groups.data?.map((g) => (
-                  <option key={g.id} value={g.id}>
-                    {g.name}
-                  </option>
-                ))}
-              </select>
-              <select
-                aria-label="筛选服务器标签"
-                value={tag}
-                onChange={(e) => setTag(e.target.value)}
-              >
-                <option value="">全部标签</option>
-                {[...new Set(resource.data?.flatMap((s) => s.tags))].sort().map((t) => (
-                  <option key={t}>{t}</option>
-                ))}
-              </select>
-              <select
-                aria-label="按资源占用排序"
-                value={sortBy}
-                onChange={(e) => setSortBy(e.target.value as MetricKey | '')}
-              >
-                <option value="">默认排序</option>
-                {Object.entries(metricNames).map(([k, v]) => (
-                  <option key={k} value={k}>
-                    {v}从高到低
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          <ErrorBanner error={groups.error || metrics.error} retry={reloadServers} />
-          {resource.loading ? (
-            <Loading />
-          ) : !resource.data?.length ? (
-            <Empty
-              icon={<ServerIcon size={25} />}
-              title="接入你的第一台服务器"
-              description="填写服务器地址，探测并确认 SSH 主机指纹。"
-              action={
-                canEdit && (
-                  <button className="button primary" onClick={() => setEditor('new')}>
-                    <Plus size={16} />
-                    接入服务器
-                  </button>
-                )
-              }
-            />
-          ) : !list.length ? (
-            <Empty title="没有匹配的服务器" description="尝试其他名称、IP 地址或标签。" />
-          ) : (
-            <div className="table-scroll">
-              <table>
-                <thead>
-                  <tr>
-                    <th>服务器</th>
-                    <th>连接地址</th>
-                    <th>SSH 状态</th>
-                    <th>资源监控</th>
-                    <th>标签</th>
-                    <th>最近检测</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {list.map((server) => (
-                    <tr key={server.id}>
-                      <td>
-                        <div className="table-name">
-                          <span className="resource-avatar">
-                            <ServerIcon size={18} />
-                          </span>
-                          <div>
-                            <button
-                              className="text-button"
-                              type="button"
-                              onClick={() => inspect(server, false)}
-                            >
-                              {server.name}
-                            </button>
-                            <small>
-                              {server.osType ||
-                                (server.hostKeyFingerprint ? '操作系统待检测' : '主机指纹待确认')}
-                            </small>
-                          </div>
-                        </div>
-                      </td>
-                      <td>
-                        <span className="mono">
-                          {server.host}:{server.port}
-                        </span>
-                        <small className="cell-sub">{server.username}</small>
-                      </td>
-                      <td>
-                        <Status value={server.status} />
-                      </td>
-                      <td>
-                        <MonitorSummary
-                          row={byServer.get(server.id)}
-                          open={() => inspect(server, true)}
-                        />
-                      </td>
-                      <td>
-                        <div className="tags">
-                          {server.tags.length ? (
-                            server.tags.map((tag) => (
-                              <span className="tag" key={tag}>
-                                {tag}
-                              </span>
-                            ))
-                          ) : (
-                            <span className="muted">—</span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="muted nowrap">{formatTime(server.lastCheckedAt)}</td>
-                      <td>
-                        <div className="row-actions">
-                          {canEdit && (
-                            <>
+            ) : !list.length ? (
+              <Empty title="没有匹配的服务器" description="尝试其他名称、IP 地址或标签。" />
+            ) : (
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>服务器</th>
+                      <th>连接地址</th>
+                      <th>SSH 状态</th>
+                      <th>资源监控</th>
+                      <th>标签</th>
+                      <th>最近检测</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {list.map((server) => (
+                      <tr key={server.id}>
+                        <td>
+                          <div className="table-name">
+                            <span className="resource-avatar">
+                              <ServerIcon size={18} />
+                            </span>
+                            <div>
                               <button
                                 className="text-button"
-                                disabled={Boolean(testing) || !server.hostKeyFingerprint}
-                                onClick={() => test(server)}
+                                type="button"
+                                onClick={() => inspect(server, false)}
                               >
-                                <Wifi size={14} />
-                                {testing === server.id ? '检测中…' : '测试连接'}
+                                {server.name}
                               </button>
-                              <button
-                                className="icon-button bare muted"
-                                aria-label={`编辑服务器 ${server.name}`}
-                                onClick={() => {
-                                  setError('');
-                                  setEditor(server);
-                                }}
-                              >
-                                <Pencil size={15} />
-                              </button>
-                              <button
-                                className="icon-button bare muted"
-                                aria-label={`核对服务器 ${server.name} 的 SSH 指纹`}
-                                title="核对 SSH 指纹"
-                                onClick={() => setCheckingKey(server)}
-                              >
-                                <ShieldCheck size={17} />
-                              </button>
-                              <button
-                                className="icon-button bare muted"
-                                aria-label={`删除服务器 ${server.name}`}
-                                onClick={() => {
-                                  setError('');
-                                  setDeleting(server);
-                                }}
-                              >
-                                <Trash2 size={15} />
-                              </button>
-                            </>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Section>
-      ) : (
-        <ServerGroups
-          servers={resource.data ?? []}
-          canEdit={canEdit}
-          serversLoading={resource.loading}
-        />
-      )}
+                              <small>
+                                {server.osType ||
+                                  (server.hostKeyFingerprint ? '操作系统待检测' : '主机指纹待确认')}
+                              </small>
+                            </div>
+                          </div>
+                        </td>
+                        <td>
+                          <span className="mono">
+                            {server.host}:{server.port}
+                          </span>
+                          <small className="cell-sub">{server.username}</small>
+                        </td>
+                        <td>
+                          <Status value={server.status} />
+                        </td>
+                        <td>
+                          <MonitorSummary
+                            row={byServer.get(server.id)}
+                            open={() => inspect(server, true)}
+                          />
+                        </td>
+                        <td>
+                          <div className="tags">
+                            {server.tags.length ? (
+                              server.tags.map((tag) => (
+                                <span className="tag" key={tag}>
+                                  {tag}
+                                </span>
+                              ))
+                            ) : (
+                              <span className="muted">—</span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="muted nowrap">{formatTime(server.lastCheckedAt)}</td>
+                        <td>
+                          <div className="row-actions">
+                            {canEdit && (
+                              <>
+                                <button
+                                  className="text-button"
+                                  disabled={Boolean(testing) || !server.hostKeyFingerprint}
+                                  onClick={() => test(server)}
+                                >
+                                  <Wifi size={14} />
+                                  {testing === server.id ? '检测中…' : '测试连接'}
+                                </button>
+                                <button
+                                  className="icon-button bare muted"
+                                  aria-label={`编辑服务器 ${server.name}`}
+                                  onClick={() => {
+                                    setError('');
+                                    setEditor(server);
+                                  }}
+                                >
+                                  <Pencil size={15} />
+                                </button>
+                                <button
+                                  className="icon-button bare muted"
+                                  aria-label={`核对服务器 ${server.name} 的 SSH 指纹`}
+                                  title="核对 SSH 指纹"
+                                  onClick={() => setCheckingKey(server)}
+                                >
+                                  <ShieldCheck size={17} />
+                                </button>
+                                <button
+                                  className="icon-button bare muted"
+                                  aria-label={`删除服务器 ${server.name}`}
+                                  onClick={() => {
+                                    setError('');
+                                    setDeleting(server);
+                                  }}
+                                >
+                                  <Trash2 size={15} />
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Section>
+        ) : (
+          <ServerGroups
+            servers={resource.data ?? []}
+            canEdit={canEdit}
+            serversLoading={resource.loading}
+          />
+        )}
+      </div>
       {editor && (
         <ServerEditor
           editing={editor === 'new' ? undefined : editor}
@@ -480,7 +488,7 @@ export function ServersPage({ user }: { user: User }) {
         />
       )}
       {compare && (
-        <ServerComparison servers={resource.data ?? []} onClose={() => setCompare(false)} />
+        <ServerComparison servers={resource.data ?? []} onClose={() => setCompare(undefined)} />
       )}
     </>
   );
@@ -683,7 +691,7 @@ function ServerEditor({
     }
   }
   return (
-    <Modal title={editing ? '编辑服务器' : '接入服务器'} onClose={() => !busy && onClose()}>
+    <InlineEditor title={editing ? '编辑服务器' : '接入服务器'} busy={busy} onClose={onClose}>
       <form onSubmit={save}>
         <div className="form-body">
           <Field label="服务器名称" required>
@@ -815,7 +823,7 @@ function ServerEditor({
           </button>
         </div>
       </form>
-    </Modal>
+    </InlineEditor>
   );
 }
 
@@ -907,8 +915,8 @@ const credentialLabels: Record<string, string> = {
 };
 export function CredentialsPage({ user }: { user: User }) {
   const resource = useResource<Credential[]>('/credentials');
-  const [creating, setCreating] = useState(false);
-  const [managing, setManaging] = useState<Credential>();
+  const [creating, setCreating] = useInlineEditor<true>();
+  const [managing, setManaging] = useInlineEditor<Credential>();
   const [deleting, setDeleting] = useState<Credential>();
   const [type, setType] = useState('SSH_PASSWORD');
   const [error, setError] = useState('');
@@ -931,7 +939,7 @@ export function CredentialsPage({ user }: { user: User }) {
         String(form.get('secret') ?? '');
     try {
       await post('/credentials', { name: text(form, 'name'), type, secret, metadata: {} });
-      setCreating(false);
+      setCreating(undefined);
       await resource.reload();
     } catch (err) {
       setError(message(err));
@@ -997,126 +1005,129 @@ export function CredentialsPage({ user }: { user: User }) {
   }
   return (
     <>
-      <PageHeader
-        eyebrow="SECURITY"
-        title="凭据中心"
-        description="安全保存认证信息，让资源通过引用使用凭据。"
-        action={
-          user.role === 'ADMIN' && (
-            <button
-              className="button primary"
-              onClick={() => {
-                setError('');
-                setCreating(true);
-              }}
-            >
-              <Plus size={17} />
-              创建凭据
-            </button>
-          )
-        }
-      />
-      <ErrorBanner error={resource.error} retry={resource.reload} />
-      <div className="security-banner">
-        <span className="security-icon">
-          <ShieldCheck size={25} />
-        </span>
-        <div>
-          <h3>凭据在使用时解密，保存后不可查看明文</h3>
-          <p>AES-256-GCM 加密 · 密钥保存在数据库之外 · 凭据引用检查</p>
-        </div>
-        <span className="small-tag">加密存储</span>
-      </div>
-      <Section title="认证凭据" subtitle={`共 ${resource.data?.length ?? 0} 项凭据`}>
-        {resource.loading ? (
-          <Loading />
-        ) : !resource.data?.length ? (
-          <Empty
-            icon={<KeyRound size={25} />}
-            title="创建第一个安全凭据"
-            description="添加 SSH 密码或私钥，即可用于连接服务器。只有管理员可以管理凭据。"
-            action={
-              user.role === 'ADMIN' && (
-                <button className="button primary" onClick={() => setCreating(true)}>
-                  <Plus size={16} />
-                  创建凭据
-                </button>
-              )
-            }
-          />
-        ) : (
-          <div className="table-scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>凭据名称</th>
-                  <th>类型</th>
-                  <th>状态</th>
-                  <th>创建时间</th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {resource.data.map((item) => (
-                  <tr key={item.id}>
-                    <td>
-                      <div className="table-name">
-                        <span className="resource-avatar">
-                          <KeyRound size={18} />
-                        </span>
-                        <strong>{item.name}</strong>
-                      </div>
-                    </td>
-                    <td>{credentialLabels[item.type] ?? item.type}</td>
-                    <td>
-                      <Status value={item.status} />
-                    </td>
-                    <td className="muted">{formatTime(item.createdAt)}</td>
-                    <td>
-                      {user.role === 'ADMIN' && (
-                        <div className="row-actions">
-                          <button
-                            className="text-button"
-                            onClick={() => {
-                              setError('');
-                              setManaging(item);
-                            }}
-                          >
-                            <Pencil size={13} />
-                            管理
-                          </button>
-                          <button
-                            className="icon-button bare muted"
-                            aria-label={`删除凭据 ${item.name}`}
-                            onClick={() => {
-                              setError('');
-                              setDeleting(item);
-                            }}
-                          >
-                            <Trash2 size={16} />
-                          </button>
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      <div className="editor-origin" hidden={Boolean(creating || managing)}>
+        <PageHeader
+          eyebrow="SECURITY"
+          title="凭据中心"
+          description="安全保存认证信息，让资源通过引用使用凭据。"
+          action={
+            user.role === 'ADMIN' && (
+              <button
+                className="button primary"
+                onClick={() => {
+                  setError('');
+                  setCreating(true);
+                }}
+              >
+                <Plus size={17} />
+                创建凭据
+              </button>
+            )
+          }
+        />
+        <ErrorBanner error={resource.error} retry={resource.reload} />
+        <div className="security-banner">
+          <span className="security-icon">
+            <ShieldCheck size={25} />
+          </span>
+          <div>
+            <h3>凭据在使用时解密，保存后不可查看明文</h3>
+            <p>AES-256-GCM 加密 · 密钥保存在数据库之外 · 凭据引用检查</p>
           </div>
-        )}
-      </Section>
+          <span className="small-tag">加密存储</span>
+        </div>
+        <Section title="认证凭据" subtitle={`共 ${resource.data?.length ?? 0} 项凭据`}>
+          {resource.loading ? (
+            <Loading />
+          ) : !resource.data?.length ? (
+            <Empty
+              icon={<KeyRound size={25} />}
+              title="创建第一个安全凭据"
+              description="添加 SSH 密码或私钥，即可用于连接服务器。只有管理员可以管理凭据。"
+              action={
+                user.role === 'ADMIN' && (
+                  <button className="button primary" onClick={() => setCreating(true)}>
+                    <Plus size={16} />
+                    创建凭据
+                  </button>
+                )
+              }
+            />
+          ) : (
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>凭据名称</th>
+                    <th>类型</th>
+                    <th>状态</th>
+                    <th>创建时间</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {resource.data.map((item) => (
+                    <tr key={item.id}>
+                      <td>
+                        <div className="table-name">
+                          <span className="resource-avatar">
+                            <KeyRound size={18} />
+                          </span>
+                          <strong>{item.name}</strong>
+                        </div>
+                      </td>
+                      <td>{credentialLabels[item.type] ?? item.type}</td>
+                      <td>
+                        <Status value={item.status} />
+                      </td>
+                      <td className="muted">{formatTime(item.createdAt)}</td>
+                      <td>
+                        {user.role === 'ADMIN' && (
+                          <div className="row-actions">
+                            <button
+                              className="text-button"
+                              onClick={() => {
+                                setError('');
+                                setManaging(item);
+                              }}
+                            >
+                              <Pencil size={13} />
+                              管理
+                            </button>
+                            <button
+                              className="icon-button bare muted"
+                              aria-label={`删除凭据 ${item.name}`}
+                              onClick={() => {
+                                setError('');
+                                setDeleting(item);
+                              }}
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Section>
+      </div>
       {creating && (
-        <Modal
+        <InlineEditor
+          busy={busy}
           title="创建安全凭据"
           description="敏感内容只用于加密保存，API 不会返回明文。"
-          onClose={() => setCreating(false)}
+          onClose={() => setCreating(undefined)}
         >
           <Form
             onSubmit={create}
             busy={busy}
             error={error}
             submit="加密并保存"
-            onCancel={() => setCreating(false)}
+            onCancel={() => setCreating(undefined)}
           >
             <Field label="凭据名称" required>
               <input
@@ -1180,10 +1191,11 @@ export function CredentialsPage({ user }: { user: User }) {
               </Field>
             )}
           </Form>
-        </Modal>
+        </InlineEditor>
       )}
       {managing && (
-        <Modal
+        <InlineEditor
+          busy={busy}
           title="管理凭据"
           description="可以重命名、禁用或替换敏感内容，原有明文不会显示。"
           onClose={() => setManaging(undefined)}
@@ -1249,7 +1261,7 @@ export function CredentialsPage({ user }: { user: User }) {
               </>
             )}
           </Form>
-        </Modal>
+        </InlineEditor>
       )}
       {deleting && (
         <Confirm
@@ -1301,7 +1313,7 @@ function ProjectEditor({
     }
   }
   return (
-    <Modal title={title} onClose={() => !busy && onClose()}>
+    <InlineEditor title={title} onClose={onClose} busy={busy}>
       <Form
         onSubmit={save}
         error={error}
@@ -1338,14 +1350,16 @@ function ProjectEditor({
           />
         </Field>
       </Form>
-    </Modal>
+    </InlineEditor>
   );
 }
 
 export function ProjectsPage({ user }: { user: User }) {
-  const resource = useResource<Project[]>('/projects');
+  const resource = useResource<(Project & { addresses: ProjectAccessLink[] })[]>(
+    '/projects?include=addresses',
+  );
   const [search, setSearch] = useState('');
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useInlineEditor<true>();
   const list = (resource.data ?? []).filter((project) =>
     `${project.name} ${project.slug}`.toLowerCase().includes(search.toLowerCase()),
   );
@@ -1357,7 +1371,11 @@ export function ProjectsPage({ user }: { user: User }) {
         description="以项目组织代码仓库、应用服务与运行环境。"
         action={
           user.role !== 'VIEWER' && (
-            <button className="button primary" onClick={() => setCreating(true)}>
+            <button
+              className="button primary"
+              disabled={creating}
+              onClick={() => setCreating(true)}
+            >
               <Plus size={17} />
               创建项目
             </button>
@@ -1365,6 +1383,15 @@ export function ProjectsPage({ user }: { user: User }) {
         }
       />
       <ErrorBanner error={resource.error} retry={resource.reload} />
+      {creating && (
+        <ProjectEditor
+          onClose={() => setCreating(undefined)}
+          onSaved={() => {
+            setCreating(undefined);
+            void resource.reload();
+          }}
+        />
+      )}
       <div className="project-toolbar">
         <span>{resource.data?.length ?? 0} 个项目</span>
         <div className="search-input">
@@ -1387,7 +1414,11 @@ export function ProjectsPage({ user }: { user: User }) {
             description="创建项目后，可添加多个仓库、服务和独立环境。"
             action={
               user.role !== 'VIEWER' && (
-                <button className="button primary" onClick={() => setCreating(true)}>
+                <button
+                  className="button primary"
+                  disabled={creating}
+                  onClick={() => setCreating(true)}
+                >
                   <Plus size={16} />
                   创建项目
                 </button>
@@ -1398,45 +1429,43 @@ export function ProjectsPage({ user }: { user: User }) {
       ) : !list.length ? (
         <Empty title="没有匹配的项目" description="尝试其他项目名称或标识。" />
       ) : (
-        <div className="project-grid">
+        <div className="project-grid project-catalog">
           {list.map((project) => (
-            <a key={project.id} href={`#/projects/${project.id}`} className="project-card">
+            <article key={project.id} className="project-card">
               <div className="project-card-top">
-                <span className="project-avatar">
+                <span className="project-avatar" aria-hidden="true">
                   <FolderGit2 size={23} />
                 </span>
-                <span className="tag mono">{project.slug}</span>
-                <ArrowRight size={18} />
+                <div>
+                  <h2>{project.name}</h2>
+                  <span className="project-slug mono">{project.slug}</span>
+                </div>
               </div>
-              <h2>{project.name}</h2>
-              <p>{project.description || '这个项目还没有添加描述。'}</p>
-              <div className="tags">
-                {project.tags.map((tag) => (
-                  <span className="tag" key={tag}>
-                    {tag}
-                  </span>
-                ))}
-              </div>
+              {project.description && <p>{project.description}</p>}
+              {project.tags.length > 0 && (
+                <div className="tags">
+                  {project.tags.map((tag) => (
+                    <span className="tag" key={tag}>
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <ProjectAccessLinks addresses={project.addresses ?? []} />
               <div className="project-card-footer">
                 <span>{project.serviceCount ?? 0} 个服务</span>
                 <span>{project.environmentCount ?? 0} 个环境</span>
-                <span>
-                  查看项目
-                  <ArrowRight size={13} />
-                </span>
+                <a
+                  href={`#/projects/${encodeURIComponent(project.id)}`}
+                  className="button secondary small"
+                  aria-label={`查看项目：${project.name}`}
+                >
+                  项目详情 <ArrowRight size={15} aria-hidden="true" />
+                </a>
               </div>
-            </a>
+            </article>
           ))}
         </div>
-      )}
-      {creating && (
-        <ProjectEditor
-          onClose={() => setCreating(false)}
-          onSaved={() => {
-            setCreating(false);
-            void resource.reload();
-          }}
-        />
       )}
     </>
   );
@@ -1446,12 +1475,12 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
   const resource = useResource<ProjectDetail>(`/projects/${id}`);
   const backPath = viewId ? `/views/${viewId}` : '/projects';
   const credentials = useResource<Credential[]>('/credentials');
-  const [section, setSection] = useState<'resources' | 'relations' | 'deployment' | 'ai'>(
-    'resources',
-  );
-  const [editingProject, setEditingProject] = useState(false);
+  const [section, setSection] = useState<
+    'resources' | 'relations' | 'deployment' | 'ai' | 'settings'
+  >('resources');
+  const [editingProject, setEditingProject] = useInlineEditor<true>();
   const [deletingProject, setDeletingProject] = useState(false);
-  const [adding, setAdding] = useState<'repositories' | 'services' | 'environments'>();
+  const [adding, setAdding] = useInlineEditor<'repositories' | 'services' | 'environments'>();
   const [editingResource, setEditingResource] = useState<Repository | Service | Environment>();
   const [deletingResource, setDeletingResource] = useState<{
     key: 'repositories' | 'services' | 'environments';
@@ -1563,6 +1592,16 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
         }
       />
       <ErrorBanner error={resource.error} retry={resource.reload} />
+      {editingProject && (
+        <ProjectEditor
+          project={project}
+          onClose={() => setEditingProject(undefined)}
+          onSaved={() => {
+            setEditingProject(undefined);
+            void resource.reload();
+          }}
+        />
+      )}
       <div className="project-workspace-summary">
         <Status value={project.status} />
         <span>
@@ -1601,159 +1640,25 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
           aria-pressed={section === 'relations'}
           onClick={() => setSection('relations')}
         >
-          关系与记录
+          访问地址与项目关系
         </button>
         <button type="button" aria-pressed={section === 'ai'} onClick={() => setSection('ai')}>
           AI 执行权限
         </button>
+        <button
+          type="button"
+          aria-pressed={section === 'settings'}
+          onClick={() => setSection('settings')}
+        >
+          项目设置
+        </button>
       </nav>
+      {section === 'settings' && <ProjectExecutionSettingsPanel projectId={id} user={user} />}
       {section === 'ai' && <ProjectAISettings user={user} projectId={id} />}
-      {section === 'resources' && (
-        <div className="project-detail-grid">
-          {(['repositories', 'services', 'environments'] as const).map((key) => (
-            <Section
-              key={key}
-              title={labels[key]}
-              action={
-                user.role !== 'VIEWER' && (
-                  <button
-                    className="button secondary small"
-                    onClick={() => {
-                      setError('');
-                      setEditingResource(undefined);
-                      setAdding(key);
-                    }}
-                  >
-                    <Plus size={14} />
-                    添加{labels[key]}
-                  </button>
-                )
-              }
-            >
-              {!project[key]?.length ? (
-                <div className="mini-empty">尚未添加{labels[key]}</div>
-              ) : (
-                <div className="resource-list">
-                  {project[key].map((item: Repository | Service | Environment) => (
-                    <div key={item.id}>
-                      <span className="resource-avatar">
-                        <FolderGit2 size={17} />
-                      </span>
-                      <div>
-                        {key === 'repositories' && user.role !== 'VIEWER' ? (
-                          <button
-                            className="text-button repository-name"
-                            type="button"
-                            onClick={() => setInspectingRepository(item as Repository)}
-                            aria-label={`查看仓库 ${item.name} 的分支与提交`}
-                          >
-                            {item.name}
-                          </button>
-                        ) : key === 'services' ? (
-                          <a
-                            className="text-link"
-                            href={'#' + deliveryPath(id, 'pipelines', { serviceId: item.id })}
-                          >
-                            {item.name} · 流水线
-                          </a>
-                        ) : (
-                          <strong>{item.name}</strong>
-                        )}
-                        <small>
-                          {key === 'repositories'
-                            ? (item as Repository).cloneUrl
-                            : (item as Service | Environment).slug}
-                        </small>
-                      </div>
-                      <span className="tag">
-                        {key === 'repositories'
-                          ? repositoryBranchLabel(item as Repository)
-                          : key === 'services'
-                            ? (item as Service).serviceType
-                            : (item as Environment).environmentType}
-                      </span>
-                      {key === 'repositories' && user.role === 'VIEWER' && (
-                        <ContextAIButton
-                          user={user}
-                          projectId={id}
-                          context={{ kind: 'REPOSITORY', repositoryId: item.id }}
-                          objectName={item.name}
-                        />
-                      )}
-                      {user.role !== 'VIEWER' && (
-                        <span className="row-actions">
-                          <button
-                            className="icon-button bare muted"
-                            aria-label={`编辑${labels[key]} ${item.name}`}
-                            onClick={() => {
-                              setError('');
-                              setEditingResource(item);
-                              setAdding(key);
-                            }}
-                          >
-                            <Pencil size={15} />
-                          </button>
-                          <button
-                            className="icon-button bare muted"
-                            aria-label={`删除${labels[key]} ${item.name}`}
-                            onClick={() => {
-                              setError('');
-                              setDeletingResource({ key, item });
-                            }}
-                          >
-                            <Trash2 size={15} />
-                          </button>
-                        </span>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </Section>
-          ))}
-        </div>
-      )}
-      {section === 'relations' && (
-        <ProjectRelations project={project} user={user} reload={resource.reload} />
-      )}
-      {section === 'deployment' && (
-        <ProjectDeploymentConfig project={project} user={user} reloadProject={resource.reload} />
-      )}
-      {editingProject && (
-        <ProjectEditor
-          project={project}
-          onClose={() => setEditingProject(false)}
-          onSaved={() => {
-            setEditingProject(false);
-            void resource.reload();
-          }}
-        />
-      )}
-      {deletingProject && (
-        <Confirm
-          title="删除项目"
-          description={`将「${project.name}」从项目列表移除，保留已有任务和部署记录。`}
-          onClose={() => !busy && setDeletingProject(false)}
-          onConfirm={deleteProject}
+      {section === 'resources' && adding && (
+        <InlineEditor
+          key={editingResource?.id ?? adding}
           busy={busy}
-          error={error}
-          destructive
-          label="删除项目"
-        />
-      )}
-      {inspectingRepository && (
-        <RepositoryDetails
-          user={user}
-          projectId={id}
-          repository={inspectingRepository}
-          onSynced={resource.reload}
-          services={project.services}
-          environments={project.environments}
-          onClose={() => setInspectingRepository(undefined)}
-        />
-      )}
-      {adding && (
-        <Modal
           title={`${editingResource ? '编辑' : '添加'}${labels[adding]}`}
           onClose={() => !busy && setAdding(undefined)}
         >
@@ -1883,7 +1788,141 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
               />
             </Field>
           </Form>
-        </Modal>
+        </InlineEditor>
+      )}
+      {section === 'resources' && (
+        <div className="project-detail-grid">
+          {(['repositories', 'services', 'environments'] as const).map((key) => (
+            <Section
+              key={key}
+              title={labels[key]}
+              action={
+                user.role !== 'VIEWER' && (
+                  <button
+                    className="button secondary small"
+                    onClick={() => {
+                      setError('');
+                      setEditingResource(undefined);
+                      setAdding(key);
+                    }}
+                  >
+                    <Plus size={14} />
+                    添加{labels[key]}
+                  </button>
+                )
+              }
+            >
+              {!project[key]?.length ? (
+                <div className="mini-empty">尚未添加{labels[key]}</div>
+              ) : (
+                <div className="resource-list">
+                  {project[key].map((item: Repository | Service | Environment) => (
+                    <div key={item.id}>
+                      <span className="resource-avatar">
+                        <FolderGit2 size={17} />
+                      </span>
+                      <div>
+                        {key === 'repositories' && user.role !== 'VIEWER' ? (
+                          <button
+                            className="text-button repository-name"
+                            type="button"
+                            onClick={() => setInspectingRepository(item as Repository)}
+                            aria-label={`查看仓库 ${item.name} 的分支与提交`}
+                          >
+                            {item.name}
+                          </button>
+                        ) : key === 'services' ? (
+                          <a
+                            className="text-link"
+                            href={'#' + deliveryPath(id, 'pipelines', { serviceId: item.id })}
+                          >
+                            {item.name} · 流水线
+                          </a>
+                        ) : (
+                          <strong>{item.name}</strong>
+                        )}
+                        <small>
+                          {key === 'repositories'
+                            ? (item as Repository).cloneUrl
+                            : (item as Service | Environment).slug}
+                        </small>
+                      </div>
+                      <span className="tag">
+                        {key === 'repositories'
+                          ? repositoryBranchLabel(item as Repository)
+                          : key === 'services'
+                            ? (item as Service).serviceType
+                            : (item as Environment).environmentType}
+                      </span>
+                      {key === 'repositories' && user.role === 'VIEWER' && (
+                        <ContextAIButton
+                          user={user}
+                          projectId={id}
+                          context={{ kind: 'REPOSITORY', repositoryId: item.id }}
+                          objectName={item.name}
+                        />
+                      )}
+                      {user.role !== 'VIEWER' && (
+                        <span className="row-actions">
+                          <button
+                            className="icon-button bare muted"
+                            aria-label={`编辑${labels[key]} ${item.name}`}
+                            onClick={() => {
+                              setError('');
+                              setEditingResource(item);
+                              setAdding(key);
+                            }}
+                          >
+                            <Pencil size={15} />
+                          </button>
+                          <button
+                            className="icon-button bare muted"
+                            aria-label={`删除${labels[key]} ${item.name}`}
+                            onClick={() => {
+                              setError('');
+                              setDeletingResource({ key, item });
+                            }}
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Section>
+          ))}
+        </div>
+      )}
+      {section === 'relations' && (
+        <ProjectRelations project={project} user={user} reload={resource.reload} />
+      )}
+      {section === 'deployment' && (
+        <ProjectDeploymentConfig project={project} user={user} reloadProject={resource.reload} />
+      )}
+      {deletingProject && (
+        <Confirm
+          title="删除项目"
+          description={`将「${project.name}」从项目列表移除，保留已有任务和部署记录。`}
+          onClose={() => !busy && setDeletingProject(false)}
+          onConfirm={deleteProject}
+          busy={busy}
+          error={error}
+          destructive
+          label="删除项目"
+        />
+      )}
+      {inspectingRepository && (
+        <RepositoryDetails
+          user={user}
+          projectId={id}
+          repository={inspectingRepository}
+          onSynced={resource.reload}
+          services={project.services}
+          environments={project.environments}
+          onClose={() => setInspectingRepository(undefined)}
+        />
       )}
       {deletingResource && (
         <Confirm

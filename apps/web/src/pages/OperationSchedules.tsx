@@ -1,3 +1,4 @@
+import { InlineEditor, useInlineEditor } from '../InlineEditor';
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Clock3, History, Pencil, Plus, Trash2 } from 'lucide-react';
@@ -334,7 +335,12 @@ function ScheduleEditor({
   }
 
   return (
-    <Modal title={initial ? '编辑定时任务' : '新建定时任务'} onClose={onClose} wide>
+    <InlineEditor
+      title={initial ? '编辑定时任务' : '新建定时任务'}
+      busy={busy}
+      onClose={onClose}
+      wide
+    >
       <div hidden={!!preview}>
         <Form
           onSubmit={prepare}
@@ -599,7 +605,7 @@ function ScheduleEditor({
           </div>
         </>
       )}
-    </Modal>
+    </InlineEditor>
   );
 }
 
@@ -758,7 +764,7 @@ export function OperationSchedulesPage({ user }: { user: User }) {
   );
   const templates = useResource<ScheduleSource[]>(sourcePaths.COMMAND_TEMPLATE);
   const plans = useResource<ScheduleSource[]>(sourcePaths.OPERATION_PLAN);
-  const [editing, setEditing] = useState<OperationSchedule | 'new'>();
+  const [editing, setEditing] = useInlineEditor<OperationSchedule | 'new'>();
   const [viewing, setViewing] = useState<OperationSchedule>();
   const [deleting, setDeleting] = useState<OperationSchedule>();
   const [enabling, setEnabling] = useState<{
@@ -820,160 +826,162 @@ export function OperationSchedulesPage({ user }: { user: User }) {
     <>
       <ErrorBanner error={!deleting && !enabling ? error : ''} />
       <ErrorBanner error={schedules.error} retry={schedules.reload} />
-      <Section
-        title="定时任务"
-        subtitle="按计划运行固定版本的模板和方案。"
-        action={
-          <div className="row-actions">
-            <RefreshButton onClick={schedules.reload} />
-            {user.role !== 'VIEWER' && (
-              <button
-                className="button primary"
-                type="button"
-                disabled={systemZone.loading}
-                onClick={() => setEditing('new')}
-              >
-                <Plus size={16} />
-                新建定时任务
-              </button>
-            )}
-          </div>
-        }
-      >
-        {schedules.loading ? (
-          <Loading />
-        ) : !schedules.data?.length ? (
-          <Empty
-            title="暂无定时任务"
-            description="创建计划后，可在此查看下次执行时间。"
-            icon={<Clock3 size={25} />}
-          />
-        ) : (
-          <div className="table-scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>任务</th>
-                  <th>计划</th>
-                  <th>状态</th>
-                  <th>最近一次</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {schedules.data.map((schedule) => {
-                  const editable =
-                    user.role === 'ADMIN' ||
-                    (user.role === 'OPERATOR' && user.id === schedule.ownerId);
-                  return (
-                    <tr key={schedule.id}>
-                      <td>
-                        <strong>{schedule.name}</strong>
-                        <small className="schedule-secondary">
-                          {sourceNames.get(schedule.sourceId) ?? kinds[schedule.kind]} · v
-                          {schedule.sourceVersion} · {schedule.approvedTargetIds.length} 台
-                        </small>
-                      </td>
-                      <td>
-                        <strong>{timingLabel(schedule.timing)}</strong>
-                        <small className="schedule-secondary">
-                          {zoned(schedule.nextRunAt, schedule.timing.timeZone)} ·{' '}
-                          {schedule.timing.timeZone}
-                        </small>
-                      </td>
-                      <td>
-                        {schedule.status === 'PAUSED' ? (
-                          <span className="status amber">
-                            <span />
-                            已暂停
-                          </span>
-                        ) : (
-                          <Status value={schedule.status === 'ENABLED' ? 'ACTIVE' : 'DISABLED'} />
-                        )}
-                        {schedule.statusReason && (
-                          <small className="schedule-secondary">{schedule.statusReason}</small>
-                        )}
-                      </td>
-                      <td>
-                        {schedule.lastRun ? (
-                          <>
-                            <RunStatus value={schedule.lastRun.status} />
-                            <small className="schedule-secondary">
-                              {zoned(schedule.lastRun.scheduledAt, schedule.timing.timeZone)}
-                            </small>
-                          </>
-                        ) : (
-                          '—'
-                        )}
-                      </td>
-                      <td>
-                        <div className="schedule-actions">
-                          <button
-                            className="button secondary small"
-                            type="button"
-                            onClick={() => setViewing(schedule)}
-                          >
-                            <History size={15} />
-                            历史
-                          </button>
-                          {editable && (
-                            <>
-                              <button
-                                className="button secondary small"
-                                type="button"
-                                disabled={busy}
-                                onClick={() => setEditing(schedule)}
-                              >
-                                <Pencil size={15} />
-                                编辑
-                              </button>
-                              {schedule.status === 'ENABLED' ? (
-                                <button
-                                  className="button secondary small"
-                                  type="button"
-                                  disabled={busy}
-                                  onClick={() =>
-                                    void change(() =>
-                                      post(endpoint + '/' + schedule.id + '/disable'),
-                                    )
-                                  }
-                                >
-                                  关闭
-                                </button>
-                              ) : (
-                                <button
-                                  className="button secondary small"
-                                  type="button"
-                                  disabled={busy}
-                                  onClick={() => previewEnable(schedule)}
-                                >
-                                  启用
-                                </button>
-                              )}
-                              <button
-                                className="icon-button bare"
-                                type="button"
-                                disabled={busy}
-                                aria-label={'删除 ' + schedule.name}
-                                onClick={() => {
-                                  setError('');
-                                  setDeleting(schedule);
-                                }}
-                              >
-                                <Trash2 size={16} />
-                              </button>
-                            </>
+      <div hidden={Boolean(editing)}>
+        <Section
+          title="定时任务"
+          subtitle="按计划运行固定版本的模板和方案。"
+          action={
+            <div className="row-actions">
+              <RefreshButton onClick={schedules.reload} />
+              {user.role !== 'VIEWER' && (
+                <button
+                  className="button primary"
+                  type="button"
+                  disabled={systemZone.loading}
+                  onClick={() => setEditing('new')}
+                >
+                  <Plus size={16} />
+                  新建定时任务
+                </button>
+              )}
+            </div>
+          }
+        >
+          {schedules.loading ? (
+            <Loading />
+          ) : !schedules.data?.length ? (
+            <Empty
+              title="暂无定时任务"
+              description="创建计划后，可在此查看下次执行时间。"
+              icon={<Clock3 size={25} />}
+            />
+          ) : (
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>任务</th>
+                    <th>计划</th>
+                    <th>状态</th>
+                    <th>最近一次</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {schedules.data.map((schedule) => {
+                    const editable =
+                      user.role === 'ADMIN' ||
+                      (user.role === 'OPERATOR' && user.id === schedule.ownerId);
+                    return (
+                      <tr key={schedule.id}>
+                        <td>
+                          <strong>{schedule.name}</strong>
+                          <small className="schedule-secondary">
+                            {sourceNames.get(schedule.sourceId) ?? kinds[schedule.kind]} · v
+                            {schedule.sourceVersion} · {schedule.approvedTargetIds.length} 台
+                          </small>
+                        </td>
+                        <td>
+                          <strong>{timingLabel(schedule.timing)}</strong>
+                          <small className="schedule-secondary">
+                            {zoned(schedule.nextRunAt, schedule.timing.timeZone)} ·{' '}
+                            {schedule.timing.timeZone}
+                          </small>
+                        </td>
+                        <td>
+                          {schedule.status === 'PAUSED' ? (
+                            <span className="status amber">
+                              <span />
+                              已暂停
+                            </span>
+                          ) : (
+                            <Status value={schedule.status === 'ENABLED' ? 'ACTIVE' : 'DISABLED'} />
                           )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Section>
+                          {schedule.statusReason && (
+                            <small className="schedule-secondary">{schedule.statusReason}</small>
+                          )}
+                        </td>
+                        <td>
+                          {schedule.lastRun ? (
+                            <>
+                              <RunStatus value={schedule.lastRun.status} />
+                              <small className="schedule-secondary">
+                                {zoned(schedule.lastRun.scheduledAt, schedule.timing.timeZone)}
+                              </small>
+                            </>
+                          ) : (
+                            '—'
+                          )}
+                        </td>
+                        <td>
+                          <div className="schedule-actions">
+                            <button
+                              className="button secondary small"
+                              type="button"
+                              onClick={() => setViewing(schedule)}
+                            >
+                              <History size={15} />
+                              历史
+                            </button>
+                            {editable && (
+                              <>
+                                <button
+                                  className="button secondary small"
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => setEditing(schedule)}
+                                >
+                                  <Pencil size={15} />
+                                  编辑
+                                </button>
+                                {schedule.status === 'ENABLED' ? (
+                                  <button
+                                    className="button secondary small"
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      void change(() =>
+                                        post(endpoint + '/' + schedule.id + '/disable'),
+                                      )
+                                    }
+                                  >
+                                    关闭
+                                  </button>
+                                ) : (
+                                  <button
+                                    className="button secondary small"
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() => previewEnable(schedule)}
+                                  >
+                                    启用
+                                  </button>
+                                )}
+                                <button
+                                  className="icon-button bare"
+                                  type="button"
+                                  disabled={busy}
+                                  aria-label={'删除 ' + schedule.name}
+                                  onClick={() => {
+                                    setError('');
+                                    setDeleting(schedule);
+                                  }}
+                                >
+                                  <Trash2 size={16} />
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Section>
+      </div>
       {editing && (
         <ScheduleEditor
           key={editing === 'new' ? 'new' : editing.id}

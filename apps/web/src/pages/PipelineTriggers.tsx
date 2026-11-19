@@ -72,21 +72,28 @@ const labels: Record<string, string> = {
   DEPLOY: '构建后部署',
 };
 export function PipelineTriggers({
+  projectId,
   pipelineId,
   version,
+  versionReady = true,
   environmentId,
   branch,
   canManage,
 }: {
+  projectId: string;
   pipelineId: string;
   version: number;
+  versionReady?: boolean;
   environmentId: string;
   branch: string;
   canManage: boolean;
 }) {
   const path = '/pipelines/' + pipelineId + '/triggers';
-  const rules = useResource<Rule[]>(path, 10000);
-  const history = useResource<Event[]>(path + '/history', 10000);
+  const rules = useResource<Rule[]>(pipelineId ? path : null, pipelineId ? 10000 : 0);
+  const history = useResource<Event[]>(
+    pipelineId ? path + '/history' : null,
+    pipelineId ? 10000 : 0,
+  );
   const inventory = useDeploymentInventory();
   const [customTargets, setCustomTargets] = useState(false);
   const [selection, setSelection] = useState<DeploymentSelection>(deploymentSelection());
@@ -101,6 +108,7 @@ export function PipelineTriggers({
   const [buildCurrent, setBuildCurrent] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [preview, setPreview] = useState<Preview>();
   const current = {
     kind,
@@ -120,7 +128,7 @@ export function PipelineTriggers({
     at,
     buildCurrent,
   ]);
-  const confirmed = preview?.key === key ? preview : undefined;
+  const confirmed = versionReady && preview?.key === key ? preview : undefined;
   function edit(rule: Rule) {
     setCustomTargets(rule.target.serverIds !== undefined || rule.target.groupIds !== undefined);
     setSelection(deploymentSelection(rule.target));
@@ -137,11 +145,14 @@ export function PipelineTriggers({
     setError('');
   }
   async function execute(action: 'preview' | 'save' | 'disable', rule?: Rule) {
+    if (!pipelineId || busy || (action !== 'disable' && !versionReady)) return;
+    setNotice('');
     setError('');
     setBusy(true);
     try {
       if (action === 'disable' && rule) {
         await post(path + '/' + rule.id + '/disable');
+        setNotice('触发规则已停用。');
         setPreview(undefined);
       } else {
         const timing: Timing = { type, timeZone: zone };
@@ -159,6 +170,7 @@ export function PipelineTriggers({
           });
           setEditing(undefined);
           setPreview(undefined);
+          setNotice(`触发规则已启用，绑定 v${current.version}。`);
         }
       }
       await Promise.all([rules.reload(), history.reload()]);
@@ -172,7 +184,12 @@ export function PipelineTriggers({
   return (
     <div className="form-stack">
       <ErrorBanner error={error || rules.error || history.error} />
-      <h3>触发规则</h3>
+      {notice && (
+        <p className="success-notice" role="status">
+          {notice}
+        </p>
+      )}
+      {pipelineId && <h3>触发规则</h3>}
       {rules.data?.length === 0 && <p className="muted">尚未配置定时或轮询触发。</p>}
       {rules.data?.map((rule) => (
         <div className="subpanel" key={rule.id}>
@@ -304,6 +321,7 @@ export function PipelineTriggers({
           </Field>
           {customTargets && (
             <DeploymentSelectionPicker
+              projectId={projectId}
               inventory={inventory}
               value={selection}
               onChange={setSelection}
@@ -313,7 +331,7 @@ export function PipelineTriggers({
             <button
               className="button secondary"
               type="button"
-              disabled={!current.branch || !current.environmentId}
+              disabled={!versionReady || !current.branch || !current.environmentId}
               onClick={() => void execute('preview')}
             >
               预览规则
@@ -345,7 +363,7 @@ export function PipelineTriggers({
           )}
         </fieldset>
       )}
-      <h3>最近触发记录</h3>
+      {pipelineId && <h3>最近触发记录</h3>}
       {history.data?.length === 0 && <p className="muted">暂无触发记录。</p>}
       {Boolean(history.data?.length) && (
         <div className="table-wrap">

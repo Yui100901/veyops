@@ -1,3 +1,4 @@
+import { InlineEditor, useInlineEditor } from '../InlineEditor';
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Pencil, Plus, Trash2, Users } from 'lucide-react';
@@ -8,7 +9,6 @@ import {
   Field,
   Form,
   Loading,
-  Modal,
   RefreshButton,
   Section,
   Status,
@@ -28,7 +28,7 @@ export function ServerGroups({
   serversLoading: boolean;
 }) {
   const groups = useResource<ServerGroup[]>('/server-groups');
-  const [editing, setEditing] = useState<ServerGroup | 'new'>();
+  const [editing, setEditing] = useInlineEditor<ServerGroup | 'new'>();
   const [deleting, setDeleting] = useState<ServerGroup>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -48,70 +48,72 @@ export function ServerGroups({
   }
   return (
     <>
-      <Section
-        title="服务器分组"
-        action={
-          <>
-            <RefreshButton onClick={groups.reload} />
-            {canEdit && (
-              <button className="button primary" onClick={() => setEditing('new')}>
-                <Plus size={18} />
-                创建分组
-              </button>
-            )}
-          </>
-        }
-      >
-        <ErrorBanner error={groups.error} retry={groups.reload} />
-        {groups.loading ? (
-          <Loading />
-        ) : !groups.data?.length ? (
-          <p className="mini-empty">暂无服务器分组</p>
-        ) : (
-          <div className="resource-list">
-            {groups.data.map((group) => (
-              <div key={group.id}>
-                <span className="resource-avatar">
-                  <Users size={18} />
-                </span>
-                <div>
-                  <strong>{group.name}</strong>
-                  {group.description && <small>{group.description}</small>}
-                  <div className="tags">
-                    {group.serverIds.map((id) => (
-                      <span className="tag" key={id}>
-                        {servers.find((server) => server.id === id)?.name ?? id}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-                <span className="tag">{group.serverIds.length} 台</span>
-                {canEdit && (
-                  <span className="row-actions">
-                    <button
-                      className="icon-button bare muted"
-                      aria-label={`编辑分组 ${group.name}`}
-                      onClick={() => setEditing(group)}
-                    >
-                      <Pencil size={15} />
-                    </button>
-                    <button
-                      className="icon-button bare muted"
-                      aria-label={`删除分组 ${group.name}`}
-                      onClick={() => {
-                        setError('');
-                        setDeleting(group);
-                      }}
-                    >
-                      <Trash2 size={15} />
-                    </button>
+      <div hidden={Boolean(editing)}>
+        <Section
+          title="服务器分组"
+          action={
+            <>
+              <RefreshButton onClick={groups.reload} />
+              {canEdit && (
+                <button className="button primary" onClick={() => setEditing('new')}>
+                  <Plus size={18} />
+                  创建分组
+                </button>
+              )}
+            </>
+          }
+        >
+          <ErrorBanner error={groups.error} retry={groups.reload} />
+          {groups.loading ? (
+            <Loading />
+          ) : !groups.data?.length ? (
+            <p className="mini-empty">暂无服务器分组</p>
+          ) : (
+            <div className="resource-list">
+              {groups.data.map((group) => (
+                <div key={group.id}>
+                  <span className="resource-avatar">
+                    <Users size={18} />
                   </span>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </Section>
+                  <div>
+                    <strong>{group.name}</strong>
+                    {group.description && <small>{group.description}</small>}
+                    <div className="tags">
+                      {group.serverIds.map((id) => (
+                        <span className="tag" key={id}>
+                          {servers.find((server) => server.id === id)?.name ?? id}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <span className="tag">{group.serverIds.length} 台</span>
+                  {canEdit && (
+                    <span className="row-actions">
+                      <button
+                        className="icon-button bare muted"
+                        aria-label={`编辑分组 ${group.name}`}
+                        onClick={() => setEditing(group)}
+                      >
+                        <Pencil size={15} />
+                      </button>
+                      <button
+                        className="icon-button bare muted"
+                        aria-label={`删除分组 ${group.name}`}
+                        onClick={() => {
+                          setError('');
+                          setDeleting(group);
+                        }}
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </Section>
+      </div>
       {editing && (
         <GroupEditor
           group={editing === 'new' ? undefined : editing}
@@ -178,7 +180,11 @@ function GroupEditor({
     }
   }
   return (
-    <Modal title={group ? '编辑服务器分组' : '创建服务器分组'} onClose={() => !busy && onClose()}>
+    <InlineEditor
+      busy={busy}
+      title={group ? '编辑服务器分组' : '创建服务器分组'}
+      onClose={() => !busy && onClose()}
+    >
       <Form onSubmit={save} busy={busy} error={error} onCancel={onClose}>
         <Field label="名称" required>
           <input name="name" defaultValue={group?.name} maxLength={100} required autoFocus />
@@ -203,7 +209,7 @@ function GroupEditor({
           />
         )}
       </Form>
-    </Modal>
+    </InlineEditor>
   );
 }
 
@@ -272,7 +278,7 @@ export function ServerOverview({
   const entry = detail.data;
   const [metrics, setMetrics] = useState(initialMetrics);
   return (
-    <Modal
+    <InlineEditor
       title={server.name}
       description={`${server.username}@${server.host}:${server.port}`}
       onClose={onClose}
@@ -397,6 +403,6 @@ export function ServerOverview({
           </>
         )}
       </div>
-    </Modal>
+    </InlineEditor>
   );
 }

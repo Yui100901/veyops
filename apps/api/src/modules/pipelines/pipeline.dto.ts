@@ -55,6 +55,7 @@ class PipelineNodeDto implements PipelineNode {
   variables?: PipelineNodeVariableDto[];
 }
 export class PipelineDefinitionDto {
+  @IsOptional() @IsBoolean() inheritBuildLocation?: boolean;
   @IsOptional() @IsIn(['BUILD_ONLY', 'DEPLOY']) defaultMode?: PipelineExecutionMode;
   @IsUUID() repositoryId!: string;
   @IsIn(['TARGET', 'MANAGER']) buildLocation: 'TARGET' | 'MANAGER' = 'TARGET';
@@ -93,6 +94,7 @@ class PipelineDefinitionInputDto extends OmitType(PipelineDefinitionDto, [
   buildLocation?: PipelineDefinitionDto['buildLocation'];
 }
 export class CreatePipelineDto {
+  @IsOptional() @IsUUID('4') creationId?: string;
   @IsUUID() projectId!: string;
   @IsUUID() serviceId!: string;
   @IsString() @Length(1, 120) name!: string;

@@ -39,11 +39,13 @@ export function selectedDeploymentServers(selection: DeploymentSelection, groups
 type Inventory = ReturnType<typeof useDeploymentInventory>;
 
 export function DeploymentSelectionPicker({
+  projectId,
   inventory,
   value,
   onChange,
   disabled,
 }: {
+  projectId?: string;
   inventory: Inventory;
   value: DeploymentSelection;
   onChange: (value: DeploymentSelection) => void;
@@ -196,6 +198,7 @@ export function DeploymentSelectionPicker({
           </p>
         )}
         <BatchStrategy
+          projectId={projectId}
           disabled={disabled}
           options={{
             strategy: value.strategy ?? defaultExecutionOptions.strategy,

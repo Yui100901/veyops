@@ -1,0 +1,103 @@
+.project-grid.project-catalog {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr));
+  align-items: stretch;
+}
+.project-catalog .project-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 1.15rem;
+  gap: 0.8rem;
+}
+.project-catalog .project-card-top {
+  margin-bottom: 0;
+  align-items: center;
+}
+.project-catalog .project-avatar {
+  flex-shrink: 0;
+}
+.project-catalog .project-card-top > div {
+  min-width: 0;
+}
+.project-catalog .project-card-top h2,
+.project-catalog .project-card > p,
+.project-catalog .project-card > .tags {
+  min-height: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.project-catalog .project-card > p {
+  font-size: 0.9rem;
+}
+.project-catalog .project-card-footer {
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: auto;
+  padding: 0.8rem 0 0;
+  color: #526675;
+  font-size: 0.85rem;
+}
+.project-catalog .project-card-footer > a {
+  margin-inline-start: auto;
+}
+.project-catalog .project-slug {
+  display: block;
+  color: #526675;
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+.project-access h4 {
+  color: #3c5361;
+  font-size: 0.84rem;
+  font-weight: 600;
+  margin: 0 0 0.4rem;
+}
+.project-view-card > .project-access {
+  margin-top: 0.9rem;
+}
+.project-access ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.project-access li {
+  min-width: 0;
+  max-width: 100%;
+}
+.project-access li > a {
+  display: inline-flex;
+  gap: 0.6rem;
+  align-items: center;
+  min-height: 2.2rem;
+  max-width: 100%;
+  padding: 0.35rem 0.65rem;
+  background: #edf7f3;
+  border: 1px solid #b4d6c9;
+  border-radius: 6px;
+  color: #10604e;
+  font-size: 0.88rem;
+  font-weight: 600;
+  line-height: 1.35;
+  text-decoration: none;
+}
+.project-access a small {
+  display: block;
+  font-size: 0.78rem;
+  font-weight: 400;
+}
+.project-access a > span {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.project-access a > svg {
+  flex-shrink: 0;
+}
+.project-access a:hover,
+.project-access a:focus-visible {
+  background: #d9f1e8;
+  border-color: #518975;
+  text-decoration: underline;
+}

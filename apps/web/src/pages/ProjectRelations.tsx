@@ -1,8 +1,10 @@
+import { InlineEditor, useInlineEditor } from '../InlineEditor';
+import { projectAccessUrl } from './ProjectAccessLinks';
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link2, Network, Pencil, Plus, Trash2 } from 'lucide-react';
 import { api, message, post, remove, useResource } from '../api';
-import { Confirm, ErrorBanner, Field, Form, Modal, Section } from '../components';
+import { Confirm, ErrorBanner, Field, Form, Section } from '../components';
 import type { Project, ProjectAddress, ProjectDependency, ProjectDetail, User } from '../models';
 import { DeploymentHistory } from './ServerResources';
 
@@ -20,7 +22,7 @@ export function ProjectRelations({
   user: User;
   reload: () => Promise<void>;
 }) {
-  const [editing, setEditing] = useState<Relation>();
+  const [editing, setEditing] = useInlineEditor<Relation>();
   const [deleting, setDeleting] = useState<Relation>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -69,6 +71,18 @@ export function ProjectRelations({
 
   return (
     <>
+      {editing && (
+        <RelationEditor
+          key={editing.type + (editing.item?.id ?? 'new')}
+          project={project}
+          relation={editing}
+          onClose={() => setEditing(undefined)}
+          onSave={() => {
+            setEditing(undefined);
+            void reload();
+          }}
+        />
+      )}
       <Section
         title="访问地址"
         action={
@@ -86,6 +100,7 @@ export function ProjectRelations({
         {project.addresses?.length ? (
           <div className="resource-list">
             {project.addresses.map((item) => {
+              const href = projectAccessUrl(item.url);
               const scope = [
                 project.services.find(({ id }) => id === item.serviceId)?.name,
                 project.environments.find(({ id }) => id === item.environmentId)?.name,
@@ -98,9 +113,18 @@ export function ProjectRelations({
                     <Link2 size={17} />
                   </span>
                   <div>
-                    <a href={item.url} className="text-link" target="_blank" rel="noreferrer">
-                      {item.name}
-                    </a>
+                    {href ? (
+                      <a
+                        href={href}
+                        className="text-link"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {item.name} ↗
+                      </a>
+                    ) : (
+                      <strong>{item.name}</strong>
+                    )}
                     <small title={item.url}>{item.url}</small>
                     {item.description && <small>{item.description}</small>}
                   </div>
@@ -211,17 +235,6 @@ export function ProjectRelations({
           }
         />
       </Section>
-      {editing && (
-        <RelationEditor
-          project={project}
-          relation={editing}
-          onClose={() => setEditing(undefined)}
-          onSave={() => {
-            setEditing(undefined);
-            void reload();
-          }}
-        />
-      )}
       {deleting?.item && (
         <Confirm
           title={`删除${labels[deleting.type]}`}
@@ -289,7 +302,8 @@ function RelationEditor({
     }
   }
   return (
-    <Modal
+    <InlineEditor
+      busy={busy}
       title={`${relation.item ? '编辑' : '添加'}${labels[relation.type]}`}
       onClose={() => !busy && onClose()}
     >
@@ -385,6 +399,6 @@ function RelationEditor({
           />
         </Field>
       </Form>
-    </Modal>
+    </InlineEditor>
   );
 }

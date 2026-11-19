@@ -45,7 +45,7 @@
 | POST                 | /servers/:id/test          | 只读连接检查，返回 `{success,server,result:{exitCode,output}}`                                               |
 | GET / POST           | /server-groups             | 列表 / `{name,description?,serverIds:[]}`                                                                    |
 | PATCH / DELETE       | /server-groups/:id         | 更新分组和成员 / 删除分组关联                                                                                |
-| GET / POST           | /projects                  | 列表 / `{name,slug,description?,tags?}`                                                                      |
+| GET / POST           | /projects                  | 列表支持 `?include=addresses`，每个项目附带已配置的访问地址及服务、环境名称。创建时提交 `{name,slug,description?,tags?}` |
 | GET / PATCH / DELETE | /projects/:id              | 详情 / 完整基本配置 / 软删除                                                                                 |
 | POST                 | /projects/:id/repositories | `{name,cloneUrl,defaultBranch?,credentialId?}`                                                               |
 | POST                 | /projects/:id/services     | `{name,slug,serviceType:'WEB'\|'API'\|'WORKER'\|'SCHEDULED_JOB'\|'STATIC_SITE'\|'DOCKER_SERVICE'\|'CUSTOM'}` |
@@ -108,9 +108,11 @@
 
 ## 系统运行设置
 
-`PATCH /system` 接受 `{defaultBuildLocation?,defaultMaxParallelTargets?,logRetentionDays?}`。仅管理员可修改，省略的设置保留原值。构建位置为 `TARGET` 或 `MANAGER`，默认 `TARGET`。目标并发为 1–10，默认 3。新建配置或提交任务时省略对应字段可使用系统默认值，已经保存的版本和任务快照保留原配置。
+`GET /system` 返回系统执行默认值。`PATCH /system` 接受 `{defaultBuildLocation?,targetWorkspaceRoot?,defaultMaxParallelTargets?,logRetentionDays?}`。仅管理员可修改，省略字段保留原值。构建位置为 `TARGET` 或 `MANAGER`，默认 `TARGET`。目标端工作目录默认 `~/.veyops/workspace`，可设为绝对路径或以 `~/` 开头的子目录。目标并发为 1–10，默认 3。
 
-日志保留期为 0–3650 天，默认 0 表示长期保留。启用后 Worker 周期性清理已结束且超过保留期的任务日志，保留任务记录、子步骤、审计和产物。
+`GET /projects/:id/execution-settings` 返回 `{system,overrides,effective}`，分别为系统默认值、项目显式覆盖值和项目生效值。管理员可用 `PATCH` 修改同一路径，字段与系统设置一致。单项传 `null` 恢复继承，省略则保留原值。流水线定义设置 `inheritBuildLocation: true` 时，预览会解析项目当前的默认构建位置。目标端构建预览会返回 `targetWorkspaceRoot`，该值随运行快照保存。
+
+日志保留期为 0–3650 天，默认 0 表示长期保留。Worker 周期性清理已结束且超过所属项目保留期的任务日志，保留任务记录、子步骤、审计和产物。未关联项目的任务使用系统保留期。
 
 ## 运维中心与命令
 
@@ -230,7 +232,7 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 | GET/PUT          | /services/:serviceId/environments/:envId/config    | 读取/保存服务环境配置                                                                                    |
 | GET/PUT          | /environments/:envId/variables                     | 环境变量列表/替换：`{variables:[{key,value?或credentialId?}]}`                                           |
 | GET/PUT          | /services/:serviceId/environments/:envId/variables | 服务级变量覆盖同名环境变量                                                                               |
-| GET/POST         | /pipelines                                         | 列表/创建服务级Pipeline                                                                                  |
+| GET/POST         | /pipelines                                         | 列表或创建服务级流水线。创建可附带 UUID v4 `creationId`，首次响应丢失后可用相同请求重试以取得已创建的版本 |
 | GET/PATCH/DELETE | /pipelines/:id                                     | 查询/新增版本/禁用并保留历史                                                                             |
 | GET              | /pipelines/:id/versions                            | 不可变历史版本                                                                                           |
 | POST             | /pipelines/:id/preview                             | 固定版本、环境配置与目标的执行预览                                                                       |
@@ -312,7 +314,7 @@ Pipeline 和产物部署预览的 `requireApproval` 表示部署是否需要管�
 | POST         | /ai/chat                       | `{message,conversationId?,projectId?,providerId?,context?}`。响应包含生效的项目、服务、页面上下文、消息、提案、任务和草稿 |
 | GET          | /ai/services/:serviceId/environments/:environmentId/failure-handling | 返回该服务环境的配置及最近的故障记录。可用 `taskId` 限定到一次失败 |
 | PATCH        | /ai/services/:serviceId/environments/:environmentId/failure-handling | 管理员设置 `{enabled,component?}`。组件可选 `docker`、`compose`、`node`、`nginx`，省略或传 null 表示仅诊断 |
-| POST         | /ai/repository-analysis        | 管理员或操作员按 `{projectId,repositoryId,serviceId?,environmentId?,commitSha?,docPath?,repoPath?}` 读取仓库证据并生成草稿 |
+| POST         | /ai/repository-analysis        | 管理员或操作员按 `{projectId,repositoryId,serviceId?,environmentId?,branch?,commitSha?,docPath?,repoPath?,pipeline?}` 读取仓库证据并生成草稿。`pipeline` 可指定 `{buildLocation,artifactType,defaultMode}`。响应包含固定提交、证据路径、待补字段和节点草稿 |
 | GET          | /ai/conversations              | 仅当前用户的会话                                                                                                           |
 | GET          | /ai/conversations/:id/messages | 仅会话发起者可读                                                                                                           |
 | GET          | /ai/proposals                  | 当前用户的执行提案                                                                                                         |

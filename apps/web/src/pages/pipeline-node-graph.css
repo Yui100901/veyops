@@ -83,11 +83,6 @@ a.pipeline-node-graph-card:hover,
 
 .pipeline-run-scope select {
   max-width: min(34vw, 240px);
-  padding: 5px 8px;
-  border: 1px solid #d7e3e6;
-  border-radius: 6px;
-  background: white;
-  color: inherit;
 }
 
 .pipeline-run-graph .error-banner,

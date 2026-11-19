@@ -7,6 +7,8 @@ import {
 } from '../../infrastructure/ai-provider/openai-compatible.service';
 import { AuditService } from '../audit/audit.service';
 import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
+import { validatePipelineNodes } from '../pipelines/pipeline-node-config';
+import type { PipelineNode } from '../pipelines/pipeline.types';
 import { validateDefinition } from '../pipelines/pipeline.validation';
 import { ProjectsService } from '../projects/projects.service';
 import { RepositoryMetadataService } from '../projects/repository-metadata.service';
@@ -20,6 +22,7 @@ const systemPrompt = [
   'definition 可含 buildLocation (MANAGER/TARGET), artifactType (FILE/DOCKER_IMAGE), buildImage, repoPath, installCommand, buildCommand, outputPath, deployPath, startCommand, healthCheckCommand, dockerfilePath, composeFilePath, imageRepository。',
   '优先逐字提取对应环境的部署说明。没有部署说明时，根据清单里的实际脚本、锁文件、容器定义或入口推断安装和构建命令，并在 notes 说明依据。不要混用不同环境、服务或包管理器的设置。',
   '省略缺少证据的字段，在 notes 列出待用户补足的部署路径、产物、变量或基础设施。不要虚构路径、环境变量值、Registry ID 或凭据。MANAGER 表示隔离构建容器，FILE 的启动和健康检查在目标发布目录运行。',
+  '当提供 pipeline 时，其构建位置、产物类型和运行模式均为用户的固定选择。命令以 repoPath 为工作目录，按该模式给出安装和构建命令；如有明确的测试命令，使用 JSON 顶层 testCommand。打包、Docker 镜像构建/推送与发布由平台执行，不要在构建命令中重复执行这些操作。仅构建模式省略部署设置。',
 ].join('\n');
 
 const definitionFields = [
@@ -40,6 +43,7 @@ const definitionFields = [
 
 interface ModelDraft {
   name?: unknown;
+  testCommand?: unknown;
   definition?: Record<string, unknown>;
   notes?: unknown;
   technologies?: unknown;
@@ -121,7 +125,12 @@ export class AiRepositoryAnalysisService {
     const context = await this.repositories.readAnalysisContext(
       input.projectId,
       input.repositoryId,
-      { commitSha: input.commitSha, docPath: input.docPath, repoPath: input.repoPath },
+      {
+        commitSha: input.commitSha,
+        branch: input.branch,
+        docPath: input.docPath,
+        repoPath: input.repoPath,
+      },
     );
     const source = { path: context.files[0].path, commitSha: context.commitSha };
     const answer = await this.wire.complete(
@@ -141,6 +150,8 @@ export class AiRepositoryAnalysisService {
               type: environment.environmentType,
             },
             commitSha: context.commitSha,
+            branch: context.branch,
+            pipeline: input.pipeline,
             repoPath: sanitizeAiText(context.repoPath, [connection.apiKey]),
             lockfilePaths: context.lockfiles.map((path) =>
               sanitizeAiText(path, [connection.apiKey]),
@@ -178,7 +189,9 @@ export class AiRepositoryAnalysisService {
       definitionFields.flatMap((key) =>
         typeof result.definition?.[key] === 'string' &&
         result.definition[key].trim() &&
-        !/\[REDACTED\]/.test(result.definition[key])
+        !sanitizeRepositoryEvidence(result.definition[key], connection.apiKey).includes(
+          '[REDACTED]',
+        )
           ? [[key, result.definition[key]]]
           : [],
       ),
@@ -196,13 +209,62 @@ export class AiRepositoryAnalysisService {
     }
     if (input.repoPath) supplied.repoPath = input.repoPath;
     if (supplied.repoPath && !supportedDirectories.has(supplied.repoPath)) delete supplied.repoPath;
+    let nodes: PipelineNode[] | undefined;
+    if (input.pipeline) {
+      const { buildLocation, artifactType, defaultMode } = input.pipeline;
+      if (
+        (supplied.buildLocation && supplied.buildLocation !== buildLocation) ||
+        (supplied.artifactType && supplied.artifactType !== artifactType)
+      )
+        throw new BadGatewayException(
+          'AI 建议与所选构建位置或产物类型冲突，请重新生成或手动编辑。',
+        );
+      Object.assign(supplied, { buildLocation, artifactType, defaultMode });
+      const deployFields = ['deployPath', 'startCommand', 'healthCheckCommand', 'composeFilePath'];
+      if (defaultMode === 'BUILD_ONLY') for (const field of deployFields) delete supplied[field];
+      if (buildLocation === 'TARGET') delete supplied.buildImage;
+      for (const field of artifactType === 'FILE'
+        ? ['dockerfilePath', 'composeFilePath', 'imageRepository']
+        : ['outputPath', 'startCommand'])
+        delete supplied[field];
+      nodes = [{ id: 'ai-checkout', type: 'CHECKOUT', name: '获取源码', branch: context.branch }];
+      if (supplied.installCommand)
+        nodes.push({
+          id: 'ai-install',
+          type: 'INSTALL',
+          name: '安装依赖',
+          command: supplied.installCommand,
+        });
+      if (supplied.buildCommand)
+        nodes.push({ id: 'ai-build', type: 'BUILD', name: '构建', command: supplied.buildCommand });
+      if (
+        typeof result.testCommand === 'string' &&
+        result.testCommand.trim() &&
+        !sanitizeRepositoryEvidence(result.testCommand, connection.apiKey).includes('[REDACTED]')
+      )
+        nodes.push({
+          id: 'ai-test',
+          type: 'TEST',
+          name: '测试',
+          command: result.testCommand.trim(),
+        });
+      nodes.push({
+        id: 'ai-package',
+        type: 'PACKAGE',
+        name: artifactType === 'FILE' ? '归档文件产物' : '构建并归档镜像',
+      });
+      if (defaultMode === 'DEPLOY')
+        nodes.push({ id: 'ai-deploy', type: 'DEPLOY', name: '部署产物' });
+    }
     const definition = plainToInstance(PipelineDefinitionDto, {
       ...supplied,
       repositoryId: input.repositoryId,
+      nodes,
     });
     if ((await validate(definition)).length) throw invalid();
     try {
       validateDefinition(definition, false);
+      validatePipelineNodes(definition);
     } catch {
       throw invalid();
     }
@@ -218,9 +280,15 @@ export class AiRepositoryAnalysisService {
       'buildLocation',
       'artifactType',
       'repoPath',
-      'deployPath',
+      ...(input.pipeline?.buildLocation === 'MANAGER' ? ['buildImage'] : []),
+      ...(input.pipeline?.defaultMode === 'BUILD_ONLY' ? [] : ['deployPath']),
       ...(supplied.artifactType === 'DOCKER_IMAGE'
-        ? ['dockerfilePath', 'composeFilePath', 'registryId', 'imageRepository']
+        ? [
+            'dockerfilePath',
+            ...(input.pipeline?.defaultMode === 'BUILD_ONLY'
+              ? []
+              : ['composeFilePath', 'registryId', 'imageRepository']),
+          ]
         : ['outputPath']),
     ].filter((field) => !supplied[field]);
     if (!service) notes.push('保存 Pipeline 前需选择或创建项目服务。');
@@ -260,7 +328,7 @@ export class AiRepositoryAnalysisService {
         name,
         projectId: input.projectId,
         serviceId: service?.id,
-        definition: { ...supplied, repositoryId: input.repositoryId },
+        definition: { ...supplied, repositoryId: input.repositoryId, ...(nodes && { nodes }) },
       },
       environmentId: environment?.id,
       technologies: descriptions(result.technologies, connection.apiKey, 12, 120),
