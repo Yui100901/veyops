@@ -526,7 +526,7 @@ interface RunNode {
   output?: {
     wakeAt?: number;
     expiresAt?: number;
-    decision?: 'APPROVE' | 'REJECT';
+    decision?: 'APPROVE' | 'REJECT' | 'EXPIRED';
     decidedAt?: number;
   };
 }
@@ -856,7 +856,11 @@ function GraphApprovalActions({
       {waiting && node.output?.expiresAt && <p>审批截止 · {formatTime(node.output.expiresAt)}</p>}
       {node.output?.decision && (
         <p>
-          {node.output.decision === 'APPROVE' ? '已批准' : '已拒绝'}
+          {node.output.decision === 'APPROVE'
+            ? '已批准'
+            : node.output.decision === 'REJECT'
+              ? '已拒绝'
+              : '审批已超时'}
           {node.output.decidedAt ? ' · ' + formatTime(node.output.decidedAt) : ''}
         </p>
       )}
