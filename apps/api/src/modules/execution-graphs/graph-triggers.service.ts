@@ -193,7 +193,7 @@ export class GraphTriggersService implements OnModuleInit {
       for (const node of flow.nodes) {
         if (!safeNodes.has(node.type))
           throw new BadRequestException(
-            '原生触发器只允许图内控制、日志与等待节点，交付节点请手动运行',
+            '原生触发器只允许图内控制、日志与等待节点。源码拉取、Shell 与交付节点请手动运行',
           );
         if (node.condition?.key === 'commitSha' || node.switch?.key === 'commitSha')
           throw new BadRequestException('触发器仅能提供普通运行参数，需提交 SHA 的节点请手动运行');
@@ -290,6 +290,23 @@ export class GraphTriggersService implements OnModuleInit {
         .returning('id')
         .executeTakeFirst();
       if (!project) throw new NotFoundException('项目不存在或已归档');
+      if (input.enabled) {
+        const latest = await tx
+          .selectFrom('execution_graphs as graph')
+          .innerJoin('execution_graph_versions as version', (join) =>
+            join
+              .onRef('version.graph_id', '=', 'graph.id')
+              .onRef('version.version', '=', 'graph.published_version'),
+          )
+          .select('version.definition_json')
+          .where('graph.project_id', '=', projectId)
+          .executeTakeFirst();
+        if (latest) {
+          const current = JSON.parse(latest.definition_json) as GraphDefinition;
+          if (current.canvas && !current.flows.some(({ id }) => id === input.flowId))
+            throw new ConflictException('最新发布版已移除该开始节点，不能启用此触发器');
+        }
+      }
       if (triggerId) {
         const rule = await tx
           .updateTable('execution_graph_triggers')

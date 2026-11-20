@@ -6,15 +6,17 @@ import { GraphRunnerController } from './graph-runner.controller';
 import { GraphRunnerService } from './graph-runner.service';
 import { GraphTriggerHooksController, GraphTriggersController } from './graph-triggers.controller';
 import { GraphTriggersService } from './graph-triggers.service';
+import { CommandCenterModule } from '../command-center/command-center.module';
+import { GraphNodeTasks } from './graph-node-tasks';
 
 @Module({
-  imports: [PipelinesModule],
+  imports: [PipelinesModule, CommandCenterModule],
   controllers: [
     ExecutionGraphsController,
     GraphRunnerController,
     GraphTriggersController,
     GraphTriggerHooksController,
   ],
-  providers: [ExecutionGraphsService, GraphRunnerService, GraphTriggersService],
+  providers: [ExecutionGraphsService, GraphRunnerService, GraphTriggersService, GraphNodeTasks],
 })
 export class ExecutionGraphsModule {}

@@ -6,6 +6,7 @@ import {
   ArrayMinSize,
   ArrayUnique,
   IsArray,
+  IsBoolean,
   IsIn,
   IsInt,
   IsObject,
@@ -19,6 +20,7 @@ import {
   ValidateIf,
   ValidateNested,
 } from 'class-validator';
+import { isGitBranchName } from '../projects/git-ref';
 import { redactTaskLog } from '../tasks/task-log.service';
 
 const idFormat = /^[A-Za-z0-9_-]{1,64}$/;
@@ -29,6 +31,8 @@ const maxExpandedNodes = 1000;
 const nodeTypes = [
   'START',
   'LOG',
+  'CHECKOUT',
+  'SHELL',
   'BUILD',
   'DEPLOY_ARTIFACT',
   'CONDITION',
@@ -76,6 +80,19 @@ class GraphNodePosition {
   @IsInt() @Min(0) @Max(30000) y!: number;
 }
 
+class GraphCheckout {
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() repositoryId?: string;
+  @IsIn(['BRANCH', 'COMMIT']) mode!: 'BRANCH' | 'COMMIT';
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @Length(1, 255) branch?: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(commitFormat) commitSha?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() fullClone?: boolean;
+}
+
+class GraphShell {
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() serverId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(10_000) command?: string;
+}
+
 export class GraphNode {
   @Matches(idFormat) id!: string;
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
@@ -111,6 +128,16 @@ export class GraphNode {
   @ValidateNested()
   @Type(() => GraphApproval)
   approval?: GraphApproval;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphCheckout)
+  checkout?: GraphCheckout;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphShell)
+  shell?: GraphShell;
   @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) flowId?: string;
   @ValidateIf((_o, v) => v !== undefined)
   @IsObject()
@@ -143,7 +170,40 @@ export class GraphFlow {
   @Type(() => GraphEdge)
   edges!: GraphEdge[];
 }
+export class GraphEndpoint {
+  @Matches(idFormat) startId!: string;
+  @Matches(idFormat) endId!: string;
+}
+
+export class GraphCanvas {
+  @IsArray()
+  @IsObject({ each: true })
+  @ArrayMaxSize(500)
+  @ValidateNested({ each: true })
+  @Type(() => GraphNode)
+  nodes!: GraphNode[];
+  @IsArray()
+  @IsObject({ each: true })
+  @ArrayMaxSize(1500)
+  @ValidateNested({ each: true })
+  @Type(() => GraphEdge)
+  edges!: GraphEdge[];
+  @IsArray()
+  @IsObject({ each: true })
+  @ArrayMaxSize(maxFlows)
+  @ValidateNested({ each: true })
+  @Type(() => GraphEndpoint)
+  endpoints!: GraphEndpoint[];
+  @IsArray()
+  @IsObject({ each: true })
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => GraphNode)
+  templates!: GraphNode[];
+}
+
 export class GraphDefinition {
+  @ValidateIf((o: GraphDefinition) => o.canvas === undefined)
   @IsArray()
   @IsObject({ each: true })
   @ArrayMinSize(1)
@@ -151,6 +211,11 @@ export class GraphDefinition {
   @ValidateNested({ each: true })
   @Type(() => GraphFlow)
   flows!: GraphFlow[];
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphCanvas)
+  canvas?: GraphCanvas;
 }
 export class ExpectedGraphRevisionDto {
   @IsInt() @Min(1) @Max(2147483647) expectedRevision!: number;
@@ -191,7 +256,11 @@ export function orderedFlowNodes(flow: GraphFlow): GraphNode[] {
     const edges = outgoing.get(node.id)!;
     const count = incoming.get(node.id)!;
     const validInputs =
-      node.type === 'START' ? count === 0 : node.type === 'JOIN' ? count >= 2 : count === 1;
+      node.type === 'START'
+        ? count === 0
+        : node.type === 'JOIN' || node.type === 'END'
+          ? count >= 1
+          : count === 1;
     if (!validInputs || !hasValidOutputs(node, edges))
       throw new BadRequestException(
         `节点「${node.name}」的连线不完整。检查并行、汇合、条件或多分支节点的入口及出口，每个分支必须各有一条连线`,
@@ -278,6 +347,32 @@ function validateAdvancedNode(node: GraphNode) {
   } else if (node.approval !== undefined) {
     throw new BadRequestException('仅审批节点可配置审批超时');
   }
+  if (node.type === 'CHECKOUT') {
+    const checkout = node.checkout;
+    if (
+      !checkout?.repositoryId ||
+      !['BRANCH', 'COMMIT'].includes(checkout.mode) ||
+      (checkout.mode === 'BRANCH' && (!checkout.branch || !isGitBranchName(checkout.branch))) ||
+      (checkout.mode === 'COMMIT' &&
+        (!checkout.commitSha || !commitFormat.test(checkout.commitSha)))
+    )
+      throw new BadRequestException('源码拉取节点须选择仓库并填写有效分支或完整提交 SHA');
+    if (
+      (checkout.mode === 'BRANCH' && checkout.commitSha) ||
+      (checkout.mode === 'COMMIT' && checkout.branch)
+    )
+      throw new BadRequestException('源码拉取节点只能设置一个有效的代码引用');
+  } else if (node.checkout !== undefined) {
+    throw new BadRequestException('仅源码拉取节点可配置仓库');
+  }
+  if (node.type === 'SHELL') {
+    if (!node.shell?.serverId || !node.shell.command?.trim())
+      throw new BadRequestException('Shell 节点须选择服务器并填写命令');
+    if (redactTaskLog(node.shell.command) !== node.shell.command)
+      throw new BadRequestException('Shell 命令包含明文凭据，请移除敏感值');
+  } else if (node.shell !== undefined) {
+    throw new BadRequestException('仅 Shell 节点可配置命令');
+  }
 }
 
 export function validateGraphDefinition(definition: GraphDefinition) {
@@ -294,7 +389,8 @@ export function validateGraphDefinition(definition: GraphDefinition) {
     const references = { nodeCount: flow.nodes.length, children: [] as string[] };
     calls.set(flow.id, references);
     for (const node of orderedFlowNodes(flow)) {
-      if (nodeIds.has(node.id)) throw new BadRequestException('同一图版本中的节点 ID 必须唯一');
+      if (!definition.canvas && nodeIds.has(node.id))
+        throw new BadRequestException('同一图版本中的节点 ID 必须唯一');
       nodeIds.add(node.id);
       validateAdvancedNode(node);
       const action = node.type === 'BUILD' || node.type === 'DEPLOY_ARTIFACT';

@@ -343,6 +343,27 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   assert.equal(recovered.defaultBranch, 'main');
   const metadata = app.get(RepositoryMetadataService);
   const access = { clone_url: create.cloneUrl, credential_id: credential };
+  const shallow = await metadata.planGraphCheckout(project, {
+    repositoryId: id,
+    mode: 'BRANCH',
+    branch: 'feature/release',
+  });
+  assert.equal(shallow.commitSha, feature);
+  assert.deepEqual(await metadata.checkoutGraphSource(project, shallow), {
+    commitSha: feature,
+    shallow: true,
+  });
+  const history = await metadata.planGraphCheckout(project, {
+    repositoryId: id,
+    mode: 'COMMIT',
+    commitSha: second,
+    fullClone: true,
+  });
+  assert.deepEqual(await metadata.checkoutGraphSource(project, history), {
+    commitSha: second,
+    shallow: false,
+  });
+  await assert.rejects(metadata.checkoutGraphSource(other, shallow), /仓库不存在/);
   assert.deepEqual(
     await metadata.branchHeads(project, id, ['main', 'feature/release', 'not-found'], access),
     new Map([

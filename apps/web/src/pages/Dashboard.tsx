@@ -15,6 +15,7 @@ const taskTypeNames: Record<string, string> = {
   COMMAND: '临时命令',
   OPERATION_PLAN: '运维方案',
   PIPELINE: 'Pipeline',
+  GRAPH_CHECKOUT: '执行图源码拉取',
 };
 
 export function taskTypeLabel(task: Task) {

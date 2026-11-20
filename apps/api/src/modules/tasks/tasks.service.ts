@@ -112,7 +112,10 @@ export class TasksService {
   }
   async createInTransaction(tx: Transaction<Database>, input: CreateTaskInput, userId: string) {
     const targets = input.payload.targets;
-    if (!targets.length || new Set(targets.map((target) => target.id)).size !== targets.length)
+    if (
+      (!targets.length && input.type !== 'GRAPH_CHECKOUT') ||
+      new Set(targets.map((target) => target.id)).size !== targets.length
+    )
       throw new BadRequestException('任务目标必须明确指定且不能重复');
     const id = randomUUID();
     const now = Date.now();
@@ -183,22 +186,23 @@ export class TasksService {
         .executeTakeFirstOrThrow();
       return existing.id;
     }
-    await tx
-      .insertInto('task_targets')
-      .values(
-        targets.map((target) => ({
-          id: randomUUID(),
-          task_id: id,
-          server_id: target.id,
-          server_name_snapshot: target.name,
-          host_snapshot: target.host,
-          port_snapshot: target.port,
-          username_snapshot: target.username,
-          credential_id_snapshot: target.credentialId,
-          fingerprint_snapshot: target.hostKeyFingerprint,
-        })),
-      )
-      .execute();
+    if (targets.length)
+      await tx
+        .insertInto('task_targets')
+        .values(
+          targets.map((target) => ({
+            id: randomUUID(),
+            task_id: id,
+            server_id: target.id,
+            server_name_snapshot: target.name,
+            host_snapshot: target.host,
+            port_snapshot: target.port,
+            username_snapshot: target.username,
+            credential_id_snapshot: target.credentialId,
+            fingerprint_snapshot: target.hostKeyFingerprint,
+          })),
+        )
+        .execute();
     if (
       input.pipelineRun &&
       input.scope?.projectId &&

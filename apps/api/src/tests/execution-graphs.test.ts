@@ -236,7 +236,7 @@ async function checkGraph(url?: string) {
     const nextChild = calledAgain.nodes.find((n: { type: string }) => n.type === 'FLOW_CALL');
     assert.notEqual(nextChild.childRunId, call.childRunId);
     assert.equal(nextChild.status, 'SUCCESS');
-    const cycle = structuredClone(replaced.draft);
+    const cycle = { flows: structuredClone(replaced.draft.flows) };
     const recursive = cycle.flows.find((item: { id: string }) => item.id === child.flowId);
     const outgoing = recursive.edges.find((edge: { from: string }) => edge.from === 'branch-join');
     recursive.nodes.push({
@@ -417,7 +417,8 @@ async function checkGraph(url?: string) {
         .send({ expectedRevision: nextRevision })
         .expect(201)
     ).body.data;
-    assert.deepEqual(restored.draft, old);
+    assert.deepEqual(restored.draft.flows, old.flows);
+    assert.equal(restored.draft.canvas.endpoints[0].startId, old.flows[0]!.id);
     assert.equal(restored.revision, nextRevision + 1);
     assert.equal(restored.publishedVersion, v2);
     await api

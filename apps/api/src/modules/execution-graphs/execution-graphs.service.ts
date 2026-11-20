@@ -10,6 +10,7 @@ import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
 import { requireProject } from '../projects/project-relations';
+import { compileCanvas, withDraftCanvas } from './execution-graph-canvas';
 import {
   extractGraphFlow,
   type ExtractGraphFlowDto,
@@ -24,7 +25,7 @@ function graphResponse(row: Selectable<Database['execution_graphs']>) {
     projectId: row.project_id,
     revision: row.revision,
     publishedVersion: row.published_version,
-    draft: JSON.parse(row.draft_json) as GraphDefinition,
+    draft: withDraftCanvas(JSON.parse(row.draft_json) as GraphDefinition),
   };
 }
 
@@ -74,8 +75,19 @@ export class ExecutionGraphsService {
     projectId: string,
     definition: GraphDefinition,
   ) {
-    validateGraphDefinition(definition);
-    const nodes = definition.flows.flatMap((flow) => flow.nodes.filter((node) => node.pipelineId));
+    const flowNodes = definition.flows.flatMap((flow) => flow.nodes);
+    const repos = [...new Set(flowNodes.flatMap((node) => node.checkout?.repositoryId ?? []))];
+    if (repos.length) {
+      const rows = await tx
+        .selectFrom('repositories')
+        .select('id')
+        .where('project_id', '=', projectId)
+        .where('id', 'in', repos)
+        .execute();
+      if (rows.length !== repos.length)
+        throw new BadRequestException('源码拉取节点引用的仓库不存在或不属于当前项目');
+    }
+    const nodes = flowNodes.filter((node) => node.pipelineId);
     if (!nodes.length) return;
     const ids = [...new Set(nodes.map((node) => node.pipelineId!))];
     const rows = await tx
@@ -94,8 +106,14 @@ export class ExecutionGraphsService {
   async save(projectId: string, input: SaveGraphDraftDto, userId: string) {
     return this.database.db.transaction().execute(async (tx) => {
       const graph = await this.lockDraft(tx, projectId, input.expectedRevision);
-      await this.validateReferences(tx, projectId, input.definition);
-      const row = await this.updateDraft(tx, graph, input.definition);
+      const definition = input.definition.canvas
+        ? compileCanvas(input.definition.canvas, false)
+        : input.definition;
+      if (!definition.canvas) {
+        validateGraphDefinition(definition);
+        await this.validateReferences(tx, projectId, definition);
+      }
+      const row = await this.updateDraft(tx, graph, definition);
       await this.audit.record(
         userId,
         'execution_graph.save',
@@ -129,13 +147,16 @@ export class ExecutionGraphsService {
     await requireProject(this.database.db, projectId);
     const graph = await this.graph(projectId);
     this.checkRevision(graph.revision, input.expectedRevision);
-    return extractGraphFlow(graphResponse(graph).draft, input).preview;
+    return extractGraphFlow(this.extractableDraft(graph.draft_json), input).preview;
   }
 
   async extract(projectId: string, input: ExtractGraphFlowDto, userId: string) {
     return this.database.db.transaction().execute(async (tx) => {
       const graph = await this.lockDraft(tx, projectId, input.expectedRevision);
-      const { definition, preview } = extractGraphFlow(graphResponse(graph).draft, input);
+      const { definition, preview } = extractGraphFlow(
+        this.extractableDraft(graph.draft_json),
+        input,
+      );
       await this.validateReferences(tx, projectId, definition);
       const row = await this.updateDraft(tx, graph, definition);
       await this.audit.record(
@@ -150,6 +171,13 @@ export class ExecutionGraphsService {
     });
   }
 
+  private extractableDraft(draft: string) {
+    const definition = JSON.parse(draft) as GraphDefinition;
+    if (definition.canvas)
+      throw new BadRequestException('在画布中配对开始节点和结束节点即可生成执行流');
+    return definition;
+  }
+
   async publish(projectId: string, expectedRevision: number, userId: string) {
     return this.database.db.transaction().execute(async (tx) => {
       const graph = await this.lockDraft(tx, projectId, expectedRevision);
@@ -162,7 +190,10 @@ export class ExecutionGraphsService {
       if (existing) return graphResponse(graph);
       const version = (graph.published_version ?? 0) + 1;
       const now = Date.now();
-      await this.validateReferences(tx, projectId, JSON.parse(graph.draft_json) as GraphDefinition);
+      const draft = JSON.parse(graph.draft_json) as GraphDefinition;
+      const definition = draft.canvas ? compileCanvas(draft.canvas, true) : draft;
+      if (!definition.canvas) validateGraphDefinition(definition);
+      await this.validateReferences(tx, projectId, definition);
       await tx
         .insertInto('execution_graph_versions')
         .values({
@@ -170,7 +201,7 @@ export class ExecutionGraphsService {
           graph_id: graph.id,
           version,
           source_revision: expectedRevision,
-          definition_json: graph.draft_json,
+          definition_json: JSON.stringify(definition),
           created_at: now,
           created_by: userId,
         })
@@ -181,6 +212,19 @@ export class ExecutionGraphsService {
         .where('id', '=', graph.id)
         .returningAll()
         .executeTakeFirstOrThrow();
+      if (definition.canvas) {
+        await tx
+          .updateTable('execution_graph_triggers')
+          .set({ enabled: 0, next_at: null, updated_at: now })
+          .where('project_id', '=', projectId)
+          .where('enabled', '=', 1)
+          .where(
+            'flow_id',
+            'not in',
+            definition.flows.map(({ id }) => id),
+          )
+          .execute();
+      }
       await this.audit.record(
         userId,
         'execution_graph.publish',
@@ -225,6 +269,7 @@ export class ExecutionGraphsService {
       const graph = await this.lockDraft(tx, projectId, expectedRevision);
       const published = await this.publishedVersion(tx, graph.id, version);
       const definition = JSON.parse(published.definition_json) as GraphDefinition;
+      validateGraphDefinition(definition);
       await this.validateReferences(tx, projectId, definition);
       const row = await this.updateDraft(tx, graph, definition);
       await this.audit.record(

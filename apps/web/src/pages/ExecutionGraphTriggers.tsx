@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Plus, Radio } from 'lucide-react';
 import { api, formatTime, message, post, useResource } from '../api';
-import { ErrorBanner, Field, Loading, RefreshButton, Section, Status } from '../components';
+import { ErrorBanner, Field, Loading, RefreshButton, Status } from '../components';
 import type { Credential } from '../models';
 import type { GraphDocument, GraphFlow } from './execution-graph-definition';
 import { graphKey, isDeliveryNode } from './execution-graph-definition';
@@ -46,9 +46,14 @@ function unavailableReason(flow: GraphFlow, flows: GraphFlow[]) {
   for (const item of pending) {
     if (visited.has(item.id)) continue;
     visited.add(item.id);
-    if (item.nodes.some(isDeliveryNode)) return '含交付节点';
+    if (
+      item.nodes.some(
+        (node) => node.type === 'CHECKOUT' || node.type === 'SHELL' || isDeliveryNode(node),
+      )
+    )
+      return '源码拉取、Shell 和交付节点需要手动运行。';
     if (item.nodes.some((node) => (node.condition?.key ?? node.switch?.key) === 'commitSha'))
-      return '需要指定提交';
+      return '需要指定提交 SHA 的流程需要手动运行。';
     pending.push(
       ...flows.filter((candidate) =>
         item.nodes.some((node) => node.type === 'FLOW_CALL' && node.flowId === candidate.id),
@@ -60,11 +65,15 @@ function unavailableReason(flow: GraphFlow, flows: GraphFlow[]) {
 
 export function ExecutionGraphTriggers({
   path,
+  startId,
+  latestVersion,
   canManage,
   canInvoke,
   onRun,
 }: {
   path: string;
+  startId: string;
+  latestVersion: number | null;
   canManage: boolean;
   canInvoke: boolean;
   onRun: (id: string) => void;
@@ -74,17 +83,18 @@ export function ExecutionGraphTriggers({
   const versions = useResource<{ version: number }[]>(path + '/versions');
   const [editing, setEditing] = useState<TriggerRule | 'create'>();
   const [selected, setSelected] = useState<string>();
-  const rule = rules.data?.find(({ id }) => id === selected);
+  const scopedRules = rules.data?.filter(({ flowId }) => flowId === startId) ?? [];
+  const rule = scopedRules.find(({ id }) => id === selected);
   return (
-    <Section
-      title="执行流触发器"
-      action={
+    <section className="graph-start-rules" aria-label="开始节点的附加触发器">
+      <div className="heading-actions">
+        <h4>附加触发器</h4>
         <div className="heading-actions">
           <RefreshButton onClick={rules.reload} />
-          {canManage && !editing && (
+          {canManage && latestVersion && !editing && (
             <button
               type="button"
-              className="button primary"
+              className="button primary small"
               onClick={() => setEditing('create')}
               disabled={!versions.data?.length}
             >
@@ -92,21 +102,18 @@ export function ExecutionGraphTriggers({
             </button>
           )}
         </div>
-      }
-    >
+      </div>
       <div className="graph-fields">
         <ErrorBanner error={rules.error || versions.error} />
-        {!versions.loading && !versions.data?.length && <p>发布执行图后可配置触发器。</p>}
         {Boolean(versions.data?.length) && (
-          <p className="field-note">
-            自动触发固定已发布版本。含交付节点或需要提交 SHA
-            的执行流可在「发布版本与运行」手动启动。
-          </p>
+          <p className="field-note">触发器绑定此开始节点及指定发布版本。</p>
         )}
         {editing && versions.data && versions.data.length > 0 && (
           <TriggerEditor
             key={editing === 'create' ? 'create' : editing.id}
             path={path}
+            startId={startId}
+            latestVersion={latestVersion}
             rule={editing === 'create' ? undefined : editing}
             versions={versions.data}
             onCancel={() => setEditing(undefined)}
@@ -119,59 +126,44 @@ export function ExecutionGraphTriggers({
         )}
         {rules.loading ? (
           <Loading />
-        ) : rules.data?.length ? (
-          <div className="table-scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>触发器</th>
-                  <th>执行流</th>
-                  <th>状态</th>
-                  <th>下次触发</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rules.data.map((item) => (
-                  <tr key={item.id}>
-                    <td>
-                      <strong>{item.name}</strong>
-                      <small className="cell-detail">{kindNames[item.kind]}</small>
-                    </td>
-                    <td>
-                      {item.flowId} · v{item.version}
-                    </td>
-                    <td>
-                      <Status value={item.enabled ? 'ACTIVE' : 'DISABLED'} />
-                    </td>
-                    <td>{formatTime(item.nextAt)}</td>
-                    <td>
-                      <div className="heading-actions">
-                        <button
-                          type="button"
-                          className="button secondary small"
-                          onClick={() => setSelected(item.id)}
-                        >
-                          查看触发
-                        </button>
-                        {canManage && (
-                          <button
-                            type="button"
-                            className="button secondary small"
-                            onClick={() => setEditing(item)}
-                          >
-                            编辑
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        ) : scopedRules.length ? (
+          <ul className="graph-start-rule-list">
+            {scopedRules.map((item) => (
+              <li key={item.id} className="graph-properties">
+                <div className="heading-actions">
+                  <strong>{item.name}</strong>
+                  <Status value={item.enabled ? 'ACTIVE' : 'DISABLED'} />
+                </div>
+                <small className="cell-detail">
+                  {kindNames[item.kind]} · v{item.version}
+                </small>
+                {item.nextAt !== null && (
+                  <small className="cell-detail">下次触发 · {formatTime(item.nextAt)}</small>
+                )}
+                <div className="heading-actions">
+                  <button
+                    type="button"
+                    className="button secondary small"
+                    aria-expanded={selected === item.id}
+                    onClick={() => setSelected(selected === item.id ? undefined : item.id)}
+                  >
+                    查看触发
+                  </button>
+                  {canManage && (
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      onClick={() => setEditing(item)}
+                    >
+                      编辑
+                    </button>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
         ) : (
-          !editing && <div className="mini-empty">尚无触发规则。</div>
+          !editing && <div className="mini-empty">此开始节点尚无触发规则。</div>
         )}
         {rule && (
           <TriggerDetails
@@ -183,18 +175,22 @@ export function ExecutionGraphTriggers({
           />
         )}
       </div>
-    </Section>
+    </section>
   );
 }
 
 function TriggerEditor({
   path,
+  startId,
+  latestVersion,
   rule,
   versions,
   onCancel,
   onSaved,
 }: {
   path: string;
+  startId: string;
+  latestVersion: number | null;
   rule?: TriggerRule;
   versions: { version: number }[];
   onCancel: () => void;
@@ -203,8 +199,8 @@ function TriggerEditor({
   const [form, setForm] = useState<TriggerConfig>(() => ({
     name: '',
     kind: 'API',
-    flowId: '',
-    version: versions[0].version,
+    flowId: startId,
+    version: latestVersion ?? versions[0].version,
     enabled: true,
     cron: '0 * * * *',
     timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
@@ -218,15 +214,18 @@ function TriggerEditor({
   );
   const credentials = useResource<Credential[]>(form.kind === 'WEBHOOK' ? '/credentials' : null);
   const flows = definition.data?.version === form.version ? definition.data.definition.flows : [];
-  const blocked = new Map(flows.map((flow) => [flow.id, unavailableReason(flow, flows)]));
+  const target = flows.find(({ id }) => id === startId);
+  const blocked = target
+    ? unavailableReason(target, flows)
+    : '此发布版本没有由该开始节点定义的执行流。';
   const valid = Boolean(
     form.name.trim() &&
-    blocked.has(form.flowId) &&
-    !blocked.get(form.flowId) &&
+    target &&
+    !blocked &&
     (form.kind !== 'WEBHOOK' || form.credentialId) &&
     (form.kind !== 'CRON' || (form.cron?.trim() && form.timeZone?.trim())) &&
     (form.kind !== 'UPSTREAM' ||
-      (form.upstreamFlowId && form.upstreamFlowId !== form.flowId && form.upstreamStatus)),
+      (form.upstreamFlowId && form.upstreamFlowId !== startId && form.upstreamStatus)),
   );
   const patch = (value: Partial<TriggerConfig>) =>
     setForm((previous) => ({ ...previous, ...value }));
@@ -237,7 +236,7 @@ function TriggerEditor({
       name: form.name.trim(),
       kind: form.kind,
       version: form.version,
-      flowId: form.flowId,
+      flowId: startId,
       enabled: form.enabled,
       ...(form.inputValue ? { inputValue: form.inputValue } : {}),
       ...(form.kind === 'CRON' ? { cron: form.cron?.trim(), timeZone: form.timeZone?.trim() } : {}),
@@ -291,33 +290,11 @@ function TriggerEditor({
           <Field label="固定发布版本">
             <select
               value={form.version}
-              onChange={(e) =>
-                patch({ version: Number(e.target.value), flowId: '', upstreamFlowId: '' })
-              }
+              onChange={(e) => patch({ version: Number(e.target.value), upstreamFlowId: '' })}
             >
               {versions.map(({ version }) => (
                 <option key={version} value={version}>
                   v{version}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="目标执行流">
-            <select
-              required
-              value={form.flowId}
-              onChange={(e) =>
-                patch({
-                  flowId: e.target.value,
-                  ...(e.target.value === form.upstreamFlowId && { upstreamFlowId: '' }),
-                })
-              }
-            >
-              <option value="">请选择</option>
-              {flows.map((flow) => (
-                <option key={flow.id} value={flow.id} disabled={Boolean(blocked.get(flow.id))}>
-                  {flow.name}
-                  {blocked.get(flow.id) ? ' · ' + blocked.get(flow.id) : ''}
                 </option>
               ))}
             </select>
@@ -377,7 +354,7 @@ function TriggerEditor({
                 >
                   <option value="">请选择</option>
                   {flows
-                    .filter(({ id }) => id !== form.flowId)
+                    .filter(({ id }) => id !== startId)
                     .map(({ id, name }) => (
                       <option key={id} value={id}>
                         {name}
@@ -400,6 +377,7 @@ function TriggerEditor({
             </>
           )}
         </div>
+        {!definition.loading && blocked && <p className="field-note">{blocked}</p>}
         <label className="checkbox-row">
           <input
             type="checkbox"

@@ -286,6 +286,49 @@ async function verify(databaseUrl?: string) {
     ).length;
     assert.equal(projectRuns, 6);
     assert.equal(JSON.stringify(await events(signed.id)).includes(credentialValue), false);
+
+    // A deleted START no longer owns an active trigger. Rules for retained STARTs stay pinned.
+    const adapted = (await admin.get(path).expect(200)).body.data;
+    const canvas = adapted.draft.canvas;
+    const withoutSource = {
+      ...canvas,
+      nodes: canvas.nodes.filter(({ id }: { id: string }) => id !== 'source'),
+      edges: canvas.edges.filter(({ from }: { from: string }) => from !== 'source'),
+      endpoints: canvas.endpoints.filter(
+        ({ startId }: { startId: string }) => startId !== 'source',
+      ),
+    };
+    const saved = (
+      await admin
+        .put(path + '/draft')
+        .send({
+          expectedRevision: adapted.revision,
+          definition: { flows: [], canvas: withoutSource },
+        })
+        .expect(200)
+    ).body.data;
+    assert.deepEqual(
+      saved.draft.flows.map(({ id }: { id: string }) => id),
+      ['target'],
+    );
+    await admin
+      .post(path + '/publish')
+      .send({ expectedRevision: saved.revision })
+      .expect(201);
+    const rules = (await admin.get(triggers).expect(200)).body.data;
+    assert.equal(rules.find(({ id }: { id: string }) => id === scheduled.id).enabled, false);
+    const retained = rules.find(({ id }: { id: string }) => id === upstream.id);
+    assert.equal(retained.enabled, true);
+    assert.equal(retained.version, version);
+    await admin
+      .patch(triggers + '/' + manual.id)
+      .send({ name: 'Enable orphan', kind: 'API', flowId: 'source', version, enabled: true })
+      .expect(409);
+    const keptHistory = (
+      await admin.get(path + '/runs/' + (await events(signed.id))[0].runId).expect(200)
+    ).body.data;
+    assert.equal(keptHistory.version, version);
+    assert.equal(keptHistory.nodes[1].log, 'pinned old rule version');
   } finally {
     await app.close();
     await rm(dir, { recursive: true, force: true });

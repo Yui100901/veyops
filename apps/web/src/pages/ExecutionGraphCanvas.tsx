@@ -1,10 +1,12 @@
 import { useId, useRef, useState } from 'react';
-import type { PointerEvent } from 'react';
+import type { DragEvent, PointerEvent } from 'react';
 import {
   Box,
   CheckCircle2,
   CirclePlay,
   Clock3,
+  Code2,
+  Download,
   FileText,
   GitBranch,
   GitFork,
@@ -13,6 +15,7 @@ import {
   ShieldCheck,
   Workflow,
   Upload,
+  X,
 } from 'lucide-react';
 import { branchLabel, graphNodeLabels, orderedNodes } from './execution-graph-definition';
 import type { GraphFlow } from './execution-graph-definition';
@@ -29,6 +32,8 @@ const icons = {
   PARALLEL: GitFork,
   JOIN: GitMerge,
   FLOW_CALL: Workflow,
+  CHECKOUT: Download,
+  SHELL: Code2,
   END: CheckCircle2,
 };
 const columnGap = 85;
@@ -85,6 +90,8 @@ interface Point {
   x: number;
   y: number;
 }
+export const graphDragType = 'application/x-veyops-graph-node';
+
 function bounds(start: Point, end: Point) {
   return {
     left: Math.min(start.x, end.x),
@@ -102,6 +109,15 @@ export function NodeMap({
   onBox,
   onEdgeSelect,
   onMove,
+  onDropNode,
+  onEdgeDelete,
+  selectedEdge,
+  onHighlight,
+  highlighted,
+  highlightEdges,
+  connecting,
+  onConnectSource,
+  onConnectTarget,
 }: {
   flow: GraphFlow;
   selected?: string[];
@@ -110,6 +126,15 @@ export function NodeMap({
   onBox?: (ids: string[]) => void;
   onEdgeSelect?: (index: number) => void;
   onMove?: (id: string, point: Point) => void;
+  onDropNode?: (payload: string, point: Point) => void;
+  onEdgeDelete?: (index: number) => void;
+  selectedEdge?: number;
+  onHighlight?: (id?: string) => void;
+  highlighted?: Set<string>;
+  highlightEdges?: Set<number>;
+  connecting?: string;
+  onConnectSource?: (id: string) => void;
+  onConnectTarget?: (id: string) => void;
 }) {
   const marker = useId();
   const [zoom, setZoom] = useState(100);
@@ -117,7 +142,9 @@ export function NodeMap({
   const [drag, setDrag] = useState<{ start: Point; end: Point }>();
   const [manual, setManual] = useState<{ id: string; point: Point }>();
   const moving = useRef<{ id: string; pointer: Point; position: Point } | null>(null);
-  const { points, width, height } = layout(flow, manual);
+  const { points, width: layoutWidth, height: layoutHeight } = layout(flow, manual);
+  const width = onDropNode ? Math.max(layoutWidth + 170, 640) : layoutWidth;
+  const height = onDropNode ? Math.max(layoutHeight + 100, 360) : layoutHeight;
   function nodePosition(
     event: PointerEvent<HTMLDivElement>,
     origin: NonNullable<typeof moving.current>,
@@ -133,7 +160,7 @@ export function NodeMap({
       ),
     };
   }
-  const point = (event: PointerEvent<HTMLDivElement>) => {
+  const point = (event: PointerEvent<HTMLDivElement> | DragEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     return {
       x: Math.min(width, Math.max(0, (event.clientX - rect.left) / scale)),
@@ -143,7 +170,7 @@ export function NodeMap({
   return (
     <div className="graph-canvas">
       <div className="graph-canvas-controls">
-        <span>执行流画布</span>
+        <span>{onDropNode ? '项目画布' : '执行流画布'}</span>
         <label>
           缩放{' '}
           <select
@@ -166,6 +193,29 @@ export function NodeMap({
           <div
             className={`graph-canvas-content${onMove || multiple ? ' graph-canvas-editing' : ''}`}
             style={{ width, height, transform: `scale(${scale})` }}
+            onDragOver={
+              onDropNode
+                ? (event) => {
+                    if (!event.dataTransfer.types.includes(graphDragType)) return;
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = 'copy';
+                  }
+                : undefined
+            }
+            onDrop={
+              onDropNode
+                ? (event) => {
+                    const payload = event.dataTransfer.getData(graphDragType);
+                    if (!payload) return;
+                    event.preventDefault();
+                    const target = point(event);
+                    onDropNode(payload, {
+                      x: Math.min(30000, Math.max(0, Math.round(target.x - cardWidth / 2))),
+                      y: Math.min(30000, Math.max(0, Math.round(target.y - cardHeight / 2))),
+                    });
+                  }
+                : undefined
+            }
             onPointerDown={(event) => {
               if (!onBox || event.button !== 0 || !multiple || event.target !== event.currentTarget)
                 return;
@@ -187,6 +237,11 @@ export function NodeMap({
                   3
                 )
                   onMove?.(moving.current.id, next);
+                else
+                  onSelect?.(
+                    moving.current.id,
+                    Boolean(multiple || event.ctrlKey || event.metaKey || event.shiftKey),
+                  );
                 moving.current = null;
                 setManual(undefined);
                 return;
@@ -213,7 +268,12 @@ export function NodeMap({
               setDrag(undefined);
             }}
           >
-            <svg className="graph-connectors" width={width} height={height} aria-hidden="true">
+            <svg
+              className="graph-connectors"
+              width={width}
+              height={height}
+              aria-hidden={onEdgeSelect ? undefined : true}
+            >
               <defs>
                 <marker
                   id={marker}
@@ -241,13 +301,30 @@ export function NodeMap({
                 return (
                   <g
                     key={i}
-                    className={
-                      edge.when ? 'edge-' + edge.when.split(':')[0].toLowerCase() : undefined
-                    }
+                    className={[
+                      edge.when && 'edge-' + edge.when.split(':')[0].toLowerCase(),
+                      highlightEdges?.has(i) && 'graph-edge-highlighted',
+                      selectedEdge === i && 'graph-edge-selected',
+                    ]
+                      .filter(Boolean)
+                      .join(' ')}
                   >
                     <path d={path} markerEnd={`url(#${marker})`} />
                     {onEdgeSelect && (
-                      <path className="graph-edge-hit" d={path} onClick={() => onEdgeSelect(i)} />
+                      <path
+                        className="graph-edge-hit"
+                        d={path}
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`连线 ${flow.nodes.find((n) => n.id === edge.from)?.name} → ${flow.nodes.find((n) => n.id === edge.to)?.name}`}
+                        aria-pressed={selectedEdge === i}
+                        onClick={() => onEdgeSelect(i)}
+                        onKeyDown={(event) => {
+                          if (event.key !== 'Enter' && event.key !== ' ') return;
+                          event.preventDefault();
+                          onEdgeSelect(i);
+                        }}
+                      />
                     )}
                     {edge.when && (
                       <text x={midpoint} y={(y + endY) / 2 - 7} textAnchor="middle">
@@ -261,6 +338,31 @@ export function NodeMap({
                 );
               })}
             </svg>
+            {onEdgeDelete &&
+              selectedEdge !== undefined &&
+              (() => {
+                const edge = flow.edges[selectedEdge];
+                const from = edge && points.get(edge.from),
+                  to = edge && points.get(edge.to);
+                return (
+                  from &&
+                  to && (
+                    <button
+                      type="button"
+                      className="graph-edge-remove"
+                      aria-label="删除所选连线"
+                      title="删除连线"
+                      style={{
+                        left: (from.x + cardWidth + to.x) / 2,
+                        top: (from.y + to.y + cardHeight) / 2 + 9,
+                      }}
+                      onClick={() => onEdgeDelete(selectedEdge)}
+                    >
+                      <X size={16} />
+                    </button>
+                  )
+                );
+              })()}
             {flow.nodes.map((node) => {
               const Icon = icons[node.type];
               const location = points.get(node.id)!;
@@ -270,6 +372,7 @@ export function NodeMap({
                 width: cardWidth,
                 height: cardHeight,
               };
+              const className = `graph-node${highlighted?.has(node.id) ? ' graph-node-highlighted' : ''}`;
               const label = (
                 <>
                   <Icon size={18} />
@@ -280,34 +383,69 @@ export function NodeMap({
                 </>
               );
               return onSelect ? (
-                <button
-                  type="button"
-                  key={node.id}
-                  className="graph-node"
-                  style={style}
-                  aria-pressed={selected.includes(node.id)}
-                  onPointerDown={
-                    onMove
-                      ? (event) => {
-                          if (event.button !== 0) return;
-                          event.currentTarget.setPointerCapture(event.pointerId);
-                          moving.current = {
-                            id: node.id,
-                            pointer: { x: event.clientX, y: event.clientY },
-                            position: location,
-                          };
-                        }
-                      : undefined
-                  }
-                  onClick={(e) => {
-                    if (!onMove || !e.detail)
-                      onSelect(node.id, Boolean(multiple || e.ctrlKey || e.metaKey || e.shiftKey));
-                  }}
-                >
-                  {label}
-                </button>
+                <div key={node.id}>
+                  <button
+                    type="button"
+                    className={className}
+                    data-node-type={node.type}
+                    style={style}
+                    aria-pressed={selected.includes(node.id)}
+                    onPointerEnter={() =>
+                      onHighlight?.(node.type === 'START' ? node.id : undefined)
+                    }
+                    onPointerLeave={() => onHighlight?.()}
+                    onFocus={() => onHighlight?.(node.type === 'START' ? node.id : undefined)}
+                    onBlur={() => onHighlight?.()}
+                    onPointerDown={
+                      onMove
+                        ? (event) => {
+                            if (event.button !== 0) return;
+                            event.currentTarget.setPointerCapture(event.pointerId);
+                            moving.current = {
+                              id: node.id,
+                              pointer: { x: event.clientX, y: event.clientY },
+                              position: location,
+                            };
+                          }
+                        : undefined
+                    }
+                    onClick={(e) => {
+                      if (!onMove || !e.detail)
+                        onSelect(
+                          node.id,
+                          Boolean(multiple || e.ctrlKey || e.metaKey || e.shiftKey),
+                        );
+                    }}
+                  >
+                    {label}
+                  </button>
+                  {onConnectSource && node.type !== 'END' && (
+                    <button
+                      type="button"
+                      className="graph-port graph-port-out"
+                      title="从此节点连线"
+                      aria-label={`从 ${node.name} 开始连线`}
+                      aria-pressed={connecting === node.id}
+                      style={{ left: location.x + cardWidth, top: location.y + cardHeight / 2 }}
+                      onClick={() => onConnectSource(node.id)}
+                    />
+                  )}
+                  {onConnectTarget &&
+                    connecting &&
+                    connecting !== node.id &&
+                    node.type !== 'START' && (
+                      <button
+                        type="button"
+                        className="graph-port graph-port-in"
+                        title="连接到此节点"
+                        aria-label={`连接到 ${node.name}`}
+                        style={{ left: location.x, top: location.y + cardHeight / 2 }}
+                        onClick={() => onConnectTarget(node.id)}
+                      />
+                    )}
+                </div>
               ) : (
-                <div key={node.id} className="graph-node" style={style}>
+                <div key={node.id} className={className} data-node-type={node.type} style={style}>
                   {label}
                 </div>
               );

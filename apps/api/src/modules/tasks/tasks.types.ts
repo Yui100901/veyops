@@ -2,6 +2,7 @@ import { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
 import type { Transaction } from 'kysely';
 import type { Database } from '../../core/database/schema';
+import type { GraphCheckoutSnapshot } from '../projects/repository-metadata.service';
 
 export type TaskStatus =
   | 'PENDING'
@@ -41,6 +42,7 @@ export interface AiRepairOrigin {
   automatic: boolean;
 }
 export interface TaskPayload {
+  sourceCheckout?: { projectId: string; source: GraphCheckoutSnapshot };
   aiRepair?: AiRepairOrigin;
   targets: SshTarget[];
   steps: ExecutionStep[];
@@ -95,7 +97,7 @@ export interface TaskHandler {
 }
 
 export interface CreateTaskInput {
-  type: 'COMMAND' | 'OPERATION_PLAN' | 'PIPELINE';
+  type: 'COMMAND' | 'OPERATION_PLAN' | 'PIPELINE' | 'GRAPH_CHECKOUT';
   name: string;
   payload: TaskPayload;
   operationPlanVersionId?: string;

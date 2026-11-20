@@ -1,6 +1,8 @@
 export const graphNodeLabels = {
   START: '开始',
   LOG: '记录日志',
+  CHECKOUT: '代码拉取',
+  SHELL: 'Shell 脚本',
   BUILD: '构建并归档',
   DEPLOY_ARTIFACT: '部署历史产物',
   CONDITION: '条件判断',
@@ -22,6 +24,14 @@ export interface GraphNode {
   type: keyof typeof graphNodeLabels;
   name: string;
   message?: string;
+  checkout?: {
+    repositoryId?: string;
+    mode: 'BRANCH' | 'COMMIT';
+    branch?: string;
+    commitSha?: string;
+    fullClone?: boolean;
+  };
+  shell?: { command?: string; serverId?: string };
   pipelineId?: string;
   pipelineVersion?: number;
   condition?: { key: 'input' | 'commitSha'; value: string };
@@ -37,10 +47,16 @@ export interface GraphFlow {
   nodes: GraphNode[];
   edges: GraphEdge[];
 }
+export interface GraphCanvas {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  endpoints: { startId: string; endId: string }[];
+  templates: GraphNode[];
+}
 export interface GraphDocument {
   revision: number;
   publishedVersion: number | null;
-  draft: { flows: GraphFlow[] };
+  draft: { flows: GraphFlow[]; canvas?: GraphCanvas };
 }
 export interface GraphRun {
   id: string;

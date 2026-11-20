@@ -99,12 +99,11 @@
 | 方法与相对路径 | 请求与结果 |
 | --- | --- |
 | `GET /` | 返回 `id, projectId, revision, publishedVersion, draft`。新项目带一条“开始 → 结束”的示例流，首次发布前版本为 null。 |
-| `PUT /draft` | 提交 `{expectedRevision, definition:{flows:[...]}}`。保存后返回新的修订号。其他人已保存时返回 409。流有稳定 ID、名称、节点列表及显式的 `{from,to}` 连线。 |
+| `PUT /draft` | 提交 `{expectedRevision, definition:{flows:[],canvas:{nodes,edges,endpoints,templates}}}`。每条 `endpoints` 记录 `{startId,endId}`。服务端根据画布派生执行流，ID 与名称取自开始节点。保存后返回新修订号，其他人已保存时返回 409。 |
 | `POST /publish` | 提交 `{expectedRevision}`，将已保存草稿发布为不可变的完整图版本。重复发布同一修订返回原版本。 |
 | `GET /versions`、`GET /versions/:version` | 列出发布历史，或读取指定版本当时的完整定义。 |
 | `POST /versions/:version/restore` | 管理员或操作员提交 `{expectedRevision}`，将指定已发布版本载入新草稿，确认后可发布新版本。 |
-| `POST /extract/preview`、`POST /extract` | 提交 `{expectedRevision,flowId,nodeIds,name,mode}`，其中 `mode` 为 `REPLACE` 或 `COPY`。预览返回入口、出口和节点数量；提交更新草稿。选区须连通，具有一条进入连线及一条无条件离开连线。 |
-| `POST /flows/:flowId/preview` | 提交 `{version, inputs?}`。返回实际节点、配置摘要；交付流额外返回固定提交、服务、环境、目标及审批要求。 |
+| `POST /flows/:flowId/preview` | 提交 `{version, inputs?}`。返回实际节点、配置摘要，按需返回 `checkouts` 中的固定提交和拉取深度、`scripts` 中的 SSH 目标，以及交付服务、环境、目标和审批要求。 |
 | `POST /flows/:flowId/run` | 使用与预览相同的版本和输入，附 `expectedConfigurationHash`、`idempotencyKey`。同一用户在同一项目重试同一请求可取回原运行；换参数复用同一键返回 409。 |
 | `GET /runs`、`GET /runs/:runId` | 按时间倒序返回运行，每页最多 100 条。传 `?before=<上一页最后一个运行 ID>` 查看更早记录。详情返回当时的图版本、流定义、输入及节点结果。交付节点包含关联任务 ID，可查逐台服务器、步骤、日志和产物。 |
 | `POST /runs/:runId/cancel` | 取消尚未完成的运行，并将取消传给相关任务和子流。等待中和已经开始的外部操作使用各自的任务状态。 |
@@ -116,9 +115,11 @@
 
 多路选择 `SWITCH.switch` 指定 `key` 和按顺序比较的 `cases`。对应出边分别使用 `CASE:0`、`CASE:1` 等以及 `DEFAULT`。延迟节点 `DELAY.delaySeconds` 使用秒数。人工审批 `APPROVAL.approval.timeoutSeconds` 可设等待时限。等待状态、唤醒或过期时间及管理员决定都随运行保存。
 
+多个开始节点可共享可达的结束节点和功能节点。每个开始节点只能配对一个结束节点，发布时会逐条校验路径。源码拉取节点 `CHECKOUT.checkout` 接受 `repositoryId` 及 `mode: BRANCH` 和 `branch`，或 `mode: COMMIT` 和完整 `commitSha`。默认浅拉取，设置 `fullClone: true` 获取该提交的完整历史。预览锁定实际 SHA，Worker 在管理端临时目录检出并记录结果。Shell 节点 `SHELL.shell` 使用 `command` 与 `serverId` 创建 SSH 任务。
+
 ### 执行图触发器
 
-管理员可使用同一项目前缀下的 `GET /triggers` 查询规则，通过 `POST /triggers` 创建绑定已发布版本的规则。请求包含规则名称、类型、执行流、版本及启用状态。触发运行仅覆盖由本地控制节点组成的流及子流，包含交付节点的流程请从运行页面预览并确认。
+管理员在开始节点属性配置触发器。使用 `GET /triggers` 查询规则，通过 `POST /triggers` 创建规则，`flowId` 取开始节点 ID，版本固定为已发布版本。删除开始节点并发布时自动停用其规则。自动触发覆盖本地控制节点，源码拉取、SSH 和交付节点通过开始节点手动预览并确认。
 
 - `CRON` 使用 `cron` 和 IANA `timeZone`。
 - `API` 使用平台身份通过 `POST /triggers/:triggerId/invoke` 提交 `{eventId,inputValue?}`。

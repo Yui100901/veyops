@@ -27,6 +27,7 @@ import {
   type GraphNode,
 } from './execution-graph-definition';
 import type { GraphInputsDto, GraphPreviewDto, GraphRunDto } from './graph-runner.controller';
+import { GraphNodeTasks, type GraphNodePlan } from './graph-node-tasks';
 import {
   activeFlowStatuses,
   failureStatus,
@@ -59,8 +60,13 @@ interface Delivery {
 }
 interface RunSnapshot {
   inputs: GraphInputsDto;
-  deliveries?: Record<string, Delivery>;
+  deliveries?: Record<string, Delivery | GraphNodePlan>;
   rootId?: string;
+}
+
+const planKey = (flowId: string, nodeId: string) => `${flowId}:${nodeId}`;
+function isNativeTask(node: Pick<GraphNode, 'type'>) {
+  return node.type === 'CHECKOUT' || node.type === 'SHELL';
 }
 
 interface AutomaticRunOrigin {
@@ -98,6 +104,7 @@ export class GraphRunnerService implements OnModuleInit {
     private readonly audit: AuditService,
     @Optional() private readonly registry?: TaskHandlerRegistry,
     @Optional() private readonly tasks?: TasksService,
+    @Optional() private readonly nodeTasks?: GraphNodeTasks,
   ) {}
 
   onModuleInit() {
@@ -219,6 +226,7 @@ export class GraphRunnerService implements OnModuleInit {
       { flowId: string; node: GraphNode; upstreamNodeId?: string }
     >();
     const seen = new Set<string>();
+    const nativeNodes = new Map<string, { flowId: string; node: GraphNode }>();
     const gather = (current: GraphFlow) => {
       if (seen.has(current.id)) return;
       seen.add(current.id);
@@ -247,22 +255,47 @@ export class GraphRunnerService implements OnModuleInit {
             throw new BadRequestException(
               '部署节点包含多个同一流水线的上游构建，请指定历史产物或调整连线',
             );
-          actionNodes.set(node.id, { flowId: current.id, node, upstreamNodeId: builds[0]?.id });
+          actionNodes.set(planKey(current.id, node.id), {
+            flowId: current.id,
+            node,
+            upstreamNodeId: builds[0]?.id,
+          });
         }
+        if (isNativeTask(node))
+          nativeNodes.set(planKey(current.id, node.id), { flowId: current.id, node });
         if (node.type === 'FLOW_CALL') gather(this.flow(definition, node.flowId!));
       }
     };
     gather(flow);
+    const nativePlans = new Map<string, GraphNodePlan>();
+    const checkouts = [];
+    const scripts = [];
+    for (const [key, { flowId, node }] of nativeNodes) {
+      if (!this.nodeTasks) throw new BadRequestException('执行节点服务不可用');
+      const plan = await this.nodeTasks.prepare(projectId, node);
+      nativePlans.set(key, plan);
+      if (plan.type === 'CHECKOUT') {
+        const { repositoryId, branch, commitSha, fullClone } = plan.source;
+        checkouts.push({ nodeId: node.id, flowId, repositoryId, branch, commitSha, fullClone });
+      } else {
+        scripts.push({
+          nodeId: node.id,
+          flowId,
+          serverId: plan.serverId,
+          serverName: plan.serverName,
+        });
+      }
+    }
     const approved = new Map<string, Delivery>();
     for (const { flowId: origin, node, upstreamNodeId } of actionNodes.values())
       approved.set(
-        node.id,
+        planKey(origin, node.id),
         await this.delivery(
           projectId,
           origin,
           node,
           inputs,
-          upstreamNodeId ? approved.get(upstreamNodeId) : undefined,
+          upstreamNodeId ? approved.get(planKey(origin, upstreamNodeId)) : undefined,
         ),
       );
     const deliveries = [...approved.values()];
@@ -270,7 +303,15 @@ export class GraphRunnerService implements OnModuleInit {
       ...delivery,
       pipelineHash: undefined,
     }));
-    const configurationHash = digest([graphId, request.version, flowId, inputs, deliveries]);
+    const plans = Object.fromEntries<Delivery | GraphNodePlan>([...approved, ...nativePlans]);
+    const configurationHash = digest([
+      graphId,
+      request.version,
+      flowId,
+      inputs,
+      deliveries,
+      [...nativePlans],
+    ]);
     const preview = {
       ...publicDeliveries[0],
       projectId,
@@ -286,8 +327,10 @@ export class GraphRunnerService implements OnModuleInit {
         selected: root.selected.has(id),
       })),
       deliveries: publicDeliveries,
+      checkouts,
+      scripts,
     };
-    return { preview, flow, inputs, deliveries };
+    return { preview, flow, inputs, plans };
   }
 
   async preview(projectId: string, flowId: string, request: GraphPreviewDto) {
@@ -310,7 +353,7 @@ export class GraphRunnerService implements OnModuleInit {
     values: Parameters<typeof this.runValues>[0],
     flow: GraphFlow,
     inputs: GraphInputsDto,
-    deliveries: Record<string, Delivery>,
+    deliveries: Record<string, Delivery | GraphNodePlan>,
   ) {
     const row = await tx
       .insertInto('execution_flow_runs')
@@ -332,9 +375,11 @@ export class GraphRunnerService implements OnModuleInit {
           position,
           status: selected.has(node.id) ? 'PENDING' : 'SKIPPED',
           finished_at: selected.has(node.id) ? null : row.created_at,
-          dispatch_json: Object.hasOwn(deliveries, node.id)
-            ? JSON.stringify(deliveries[node.id])
-            : null,
+          dispatch_json: Object.hasOwn(deliveries, planKey(flow.id, node.id))
+            ? JSON.stringify(deliveries[planKey(flow.id, node.id)])
+            : Object.hasOwn(deliveries, node.id)
+              ? JSON.stringify(deliveries[node.id])
+              : null,
           log: selected.has(node.id) ? '' : '条件分支未被选中。',
         })),
       )
@@ -393,10 +438,9 @@ export class GraphRunnerService implements OnModuleInit {
       await this.advance(old.id);
       return this.get(projectId, old.id);
     }
-    const { preview, flow, deliveries, inputs } = await this.prepare(projectId, flowId, request);
+    const { preview, flow, plans, inputs } = await this.prepare(projectId, flowId, request);
     if (request.expectedConfigurationHash !== preview.configurationHash)
       throw new ConflictException('版本、运行参数或实际执行配置已变化，请重新预览');
-    const byNode = Object.fromEntries(deliveries.map((delivery) => [delivery.nodeId, delivery]));
     const row = await db.transaction().execute(async (tx) => {
       await this.lockProject(tx, projectId);
       await origin?.beforeInsert?.(tx);
@@ -415,11 +459,11 @@ export class GraphRunnerService implements OnModuleInit {
           idempotency_key: request.idempotencyKey,
           request_hash: requestHash,
           configuration_hash: preview.configurationHash,
-          inputs_json: JSON.stringify({ inputs, deliveries: byNode }),
+          inputs_json: JSON.stringify({ inputs, deliveries: plans }),
         },
         flow,
         inputs,
-        byNode,
+        plans,
       );
       if (inserted) await origin?.afterInsert?.(tx, inserted.id);
       return inserted;
@@ -598,7 +642,16 @@ export class GraphRunnerService implements OnModuleInit {
           const task = byTask.get(row.task_id)!;
           const status = taskStatus(task.status, task.available_at);
           if (isNodeTerminal(status)) {
-            let output: { artifactIds: string[] } | undefined;
+            let output: Record<string, unknown> | undefined;
+            if (node.type === 'CHECKOUT' && status === 'SUCCESS') {
+              const source = (JSON.parse(task.payload_json) as TaskPayload).sourceCheckout!.source;
+              output = {
+                repositoryId: source.repositoryId,
+                branch: source.branch,
+                commitSha: source.commitSha,
+                fullClone: source.fullClone,
+              };
+            }
             if (node.type === 'BUILD' && status === 'SUCCESS')
               output = {
                 artifactIds: (await this.taskArtifacts([task.id], tx)).map(
@@ -617,8 +670,8 @@ export class GraphRunnerService implements OnModuleInit {
               status,
               task.error_summary ??
                 (status === 'SUCCESS'
-                  ? '交付任务已完成，详情见关联任务。'
-                  : '交付任务已结束，详情见关联任务。'),
+                  ? '节点任务已完成，详情见关联任务。'
+                  : '节点任务已结束，详情见关联任务。'),
               output,
               task.started_at,
               task.finished_at ?? now,
@@ -672,7 +725,7 @@ export class GraphRunnerService implements OnModuleInit {
           await this.terminalNode(tx, row, 'SKIPPED', '上游节点未成功。');
         } else if (node.type === 'DELAY' || node.type === 'APPROVAL') {
           await this.waitAtNode(tx, row, node, now);
-        } else if (isDelivery(node) || node.type === 'FLOW_CALL') {
+        } else if (isDelivery(node) || isNativeTask(node) || node.type === 'FLOW_CALL') {
           ready.push({ node: row, action: node });
         } else {
           const match = matches.get(node.id);
@@ -761,6 +814,72 @@ export class GraphRunnerService implements OnModuleInit {
     });
   }
 
+  private async linkTask(
+    tx: Transaction<Database>,
+    run: Run,
+    node: NodeRun,
+    taskId: string,
+    pipelineId?: string,
+  ) {
+    await this.lockProject(tx, run.project_id);
+    const locked = await this.lockRun(tx, run.id);
+    if (!locked || locked.status === 'CANCEL_REQUESTED')
+      throw new ConflictException('执行流已停止');
+    const user = await tx
+      .selectFrom('users')
+      .select('id')
+      .where('id', '=', run.created_by)
+      .where('status', '=', 'ACTIVE')
+      .where('must_change_password', '=', 0)
+      .where('role', 'in', ['ADMIN', 'OPERATOR'])
+      .executeTakeFirst();
+    if (!user) throw new ConflictException('发起人已失去执行权限');
+    if (pipelineId) {
+      const pipeline = await tx
+        .updateTable('pipelines')
+        .set((eb) => ({ updated_at: eb.ref('updated_at') }))
+        .where('id', '=', pipelineId)
+        .where('project_id', '=', run.project_id)
+        .where('enabled', '=', 1)
+        .returning('id')
+        .executeTakeFirst();
+      if (!pipeline) throw new ConflictException('流水线已停用，请重新预览');
+    }
+    const current = await tx
+      .selectFrom('execution_node_runs')
+      .select(['status', 'task_id'])
+      .where('id', '=', node.id)
+      .executeTakeFirstOrThrow();
+    if (current.task_id === taskId) return;
+    if (current.status !== 'PENDING') throw new ConflictException('节点已停止等待');
+    await tx
+      .updateTable('execution_node_runs')
+      .set({ task_id: taskId, status: 'QUEUED' })
+      .where('id', '=', node.id)
+      .execute();
+    await tx
+      .updateTable('execution_flow_runs')
+      .set({ task_id: taskId })
+      .where('id', '=', run.id)
+      .where('task_id', 'is', null)
+      .execute();
+  }
+
+  private async dispatchNative(run: Run, row: NodeRun, action: GraphNode) {
+    if (!this.nodeTasks || !this.tasks || !row.dispatch_json)
+      throw new BadRequestException('执行节点服务不可用');
+    const plan = JSON.parse(row.dispatch_json) as GraphNodePlan;
+    const task = await this.nodeTasks.task(
+      run.project_id,
+      action,
+      plan,
+      graphTaskKeyPrefix + row.id,
+    );
+    await this.tasks.create(task, run.created_by, undefined, (tx, id) =>
+      this.linkTask(tx, run, row, id),
+    );
+  }
+
   private async dispatch(run: Run, node: NodeRun, inputs: GraphInputsDto) {
     const delivery = JSON.parse(node.dispatch_json!) as Delivery;
     const { targetId, serverIds, groupIds, strategy, maxParallel, failurePolicy } = inputs;
@@ -779,48 +898,8 @@ export class GraphRunnerService implements OnModuleInit {
     };
     const options = {
       idempotencyKey: graphTaskKeyPrefix + node.id,
-      afterInsert: async (tx: Transaction<Database>, taskId: string) => {
-        await this.lockProject(tx, run.project_id);
-        const locked = await this.lockRun(tx, run.id);
-        if (!locked || locked.status === 'CANCEL_REQUESTED')
-          throw new ConflictException('执行流已停止');
-        const user = await tx
-          .selectFrom('users')
-          .select('id')
-          .where('id', '=', run.created_by)
-          .where('status', '=', 'ACTIVE')
-          .where('must_change_password', '=', 0)
-          .where('role', 'in', ['ADMIN', 'OPERATOR'])
-          .executeTakeFirst();
-        if (!user) throw new ConflictException('发起人已失去执行权限');
-        const pipeline = await tx
-          .updateTable('pipelines')
-          .set((eb) => ({ updated_at: eb.ref('updated_at') }))
-          .where('id', '=', delivery.pipelineId)
-          .where('project_id', '=', run.project_id)
-          .where('enabled', '=', 1)
-          .returning('id')
-          .executeTakeFirst();
-        if (!pipeline) throw new ConflictException('流水线已停用，请重新预览');
-        const current = await tx
-          .selectFrom('execution_node_runs')
-          .select(['status', 'task_id'])
-          .where('id', '=', node.id)
-          .executeTakeFirstOrThrow();
-        if (current.task_id === taskId) return;
-        if (current.status !== 'PENDING') throw new ConflictException('节点已停止等待');
-        await tx
-          .updateTable('execution_node_runs')
-          .set({ task_id: taskId, status: 'QUEUED' })
-          .where('id', '=', node.id)
-          .execute();
-        await tx
-          .updateTable('execution_flow_runs')
-          .set({ task_id: taskId })
-          .where('id', '=', run.id)
-          .where('task_id', 'is', null)
-          .execute();
-      },
+      afterInsert: (tx: Transaction<Database>, taskId: string) =>
+        this.linkTask(tx, run, node, taskId, delivery.pipelineId),
     };
     if (node.node_type === 'BUILD')
       await this.pipelines.run(
@@ -888,6 +967,8 @@ export class GraphRunnerService implements OnModuleInit {
             state.snapshot,
           );
           if (childId && depth < 10) await this.advance(childId, depth + 1);
+        } else if (isNativeTask(action)) {
+          await this.dispatchNative(state.run, node, action);
         } else {
           await this.dispatch(state.run, node, state.snapshot.inputs);
         }
@@ -1151,8 +1232,8 @@ export class GraphRunnerService implements OnModuleInit {
     const { definition } = await this.published(projectId, row.version);
     const flow = this.flow(definition, row.flowId);
     const { inputs } = JSON.parse(row.inputs_json) as RunSnapshot;
-    const deliveries = rows.flatMap(({ dispatch }) => {
-      if (!dispatch) return [];
+    const deliveries = rows.flatMap(({ dispatch, type }) => {
+      if (!dispatch || type === 'CHECKOUT' || type === 'SHELL') return [];
       const delivery = JSON.parse(dispatch) as Delivery;
       return [{ ...delivery, pipelineHash: undefined }];
     });

@@ -52,6 +52,13 @@ const gitEnvironmentKeys = new Set([
 ]);
 const gitCredentialTypes = new Set(['GIT_TOKEN', 'GIT_PASSWORD', 'USERNAME_PASSWORD']);
 type RepositoryAccess = { clone_url: string; credential_id: string | null };
+export interface GraphCheckoutSnapshot {
+  repositoryId: string;
+  branch?: string;
+  commitSha: string;
+  fullClone: boolean;
+  access: RepositoryAccess;
+}
 type BranchCacheRow = Pick<
   Selectable<RepositoriesTable>,
   'branch_cache_json' | 'branch_error' | 'branch_checked_at'
@@ -288,6 +295,80 @@ export class RepositoryMetadataService {
         return heads;
       },
       expected,
+    );
+  }
+
+  async planGraphCheckout(
+    projectId: string,
+    input: {
+      repositoryId: string;
+      mode: 'BRANCH' | 'COMMIT';
+      branch?: string;
+      commitSha?: string;
+      fullClone?: boolean;
+    },
+  ): Promise<GraphCheckoutSnapshot> {
+    const row = await this.repositoryRow(projectId, input.repositoryId);
+    if (!row) throw new NotFoundException('仓库不存在');
+    const access = { clone_url: row.clone_url, credential_id: row.credential_id };
+    let branch: string | undefined;
+    let commitSha = input.commitSha?.toLowerCase();
+    if (input.mode === 'BRANCH') {
+      const remote = await this.withRepository(
+        projectId,
+        input.repositoryId,
+        (git) => this.listBranches(git),
+        access,
+      );
+      branch = input.branch ?? remote.defaultBranch ?? undefined;
+      commitSha = remote.branches.find((item) => item.name === branch)?.sha;
+    }
+    if (!commitSha || !shaPattern.test(commitSha))
+      throw new BadRequestException('请选择存在的仓库分支或完整 Git 提交 SHA');
+    return {
+      repositoryId: input.repositoryId,
+      branch,
+      commitSha,
+      fullClone: input.fullClone === true,
+      access,
+    };
+  }
+
+  checkoutGraphSource(projectId: string, snapshot: GraphCheckoutSnapshot, signal?: AbortSignal) {
+    return this.withRepository(
+      projectId,
+      snapshot.repositoryId,
+      async (git) => {
+        const worktree = join(git.workspace, 'src');
+        await git.run([
+          'init',
+          '--template=',
+          ...(snapshot.commitSha.length === 64 ? ['--object-format=sha256'] : []),
+          '--',
+          worktree,
+        ]);
+        const repo = ['-C', worktree];
+        await git.run([
+          ...repo,
+          'fetch',
+          '--no-tags',
+          ...(snapshot.fullClone ? [] : ['--depth=1']),
+          '--',
+          git.url,
+          snapshot.commitSha,
+        ]);
+        await git.run([...repo, 'checkout', '--detach', 'FETCH_HEAD']);
+        const actual = (await git.run([...repo, 'rev-parse', 'HEAD'])).trim();
+        if (actual !== snapshot.commitSha) throw new ConflictException('实际检出提交与预览不一致');
+        return {
+          commitSha: actual,
+          shallow:
+            (await git.run([...repo, 'rev-parse', '--is-shallow-repository'])).trim() === 'true',
+        };
+      },
+      snapshot.access,
+      180_000,
+      signal,
     );
   }
 
@@ -607,6 +688,7 @@ export class RepositoryMetadataService {
     callback: (repository: GitRepository) => Promise<T>,
     expected?: RepositoryAccess,
     timeoutMs = 25_000,
+    cancellation?: AbortSignal,
   ): Promise<T> {
     const repository = await this.database.db
       .selectFrom('repositories')
@@ -680,7 +762,8 @@ export class RepositoryMetadataService {
         GIT_CEILING_DIRECTORIES: dirname(workspace),
         GIT_NO_LAZY_FETCH: '1',
       });
-      const signal = AbortSignal.timeout(timeoutMs);
+      const timeout = AbortSignal.timeout(timeoutMs);
+      const signal = cancellation ? AbortSignal.any([timeout, cancellation]) : timeout;
       const runBytes = async (args: string[], maxBuffer = 1024 * 1024) => {
         try {
           const { stdout } = await exec('git', [...options, ...args], {

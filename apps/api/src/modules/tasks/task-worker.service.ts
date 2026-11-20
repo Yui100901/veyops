@@ -460,18 +460,25 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       const executionFailed = Boolean(
         failure && !(cancelled && failure.cause instanceof TaskLeaseUnavailableError),
       );
+      const checkout = task.task_type === 'GRAPH_CHECKOUT';
       const abandoned =
         !cancelled &&
         (Boolean(activeStep || activeDeployment) ||
           targets.some((target) => target.status === 'RUNNING'));
       const workerInterrupted = interrupted || this.stopping || this.sqliteLeaseLost;
-      let uncertain = workerInterrupted || executionFailed || abandoned;
+      let uncertain = workerInterrupted || (executionFailed && !checkout) || abandoned;
       let status = uncertain
         ? 'NEEDS_ATTENTION'
-        : aggregateStatus(
-            targets.map((target) => target.status),
-            cancelled,
-          );
+        : checkout
+          ? cancelled
+            ? 'CANCELLED'
+            : executionFailed
+              ? 'FAILED'
+              : 'SUCCESS'
+          : aggregateStatus(
+              targets.map((target) => target.status),
+              cancelled,
+            );
       const targetError = targets.find(
         (target) => target.status === status && target.error_summary,
       )?.error_summary;
@@ -479,6 +486,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       if (workerInterrupted) error = EXECUTION_INTERRUPTED;
       else if (uncertain) error = EXECUTION_FAILED;
       else if (status === 'CANCELLED') error = targetError ?? CANCELLED;
+      else if (checkout && executionFailed) error = '源码检出失败，请查看任务日志';
       else if (status !== 'SUCCESS') {
         error =
           targetError ??

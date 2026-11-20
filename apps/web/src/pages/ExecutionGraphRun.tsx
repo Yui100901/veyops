@@ -48,6 +48,15 @@ interface Preview extends DeliveryPreview {
   flowId: string;
   nodes: { nodeId: string; name: string; type: GraphNode['type']; selected?: boolean }[];
   deliveries?: DeliveryPreview[];
+  checkouts?: {
+    nodeId: string;
+    flowId: string;
+    repositoryId: string;
+    branch?: string;
+    commitSha: string;
+    fullClone: boolean;
+  }[];
+  scripts?: { nodeId: string; flowId: string; serverId: string; serverName: string }[];
 }
 
 function reachableNodes(root: GraphFlow, flows: GraphFlow[], inputs: Inputs) {
@@ -217,7 +226,7 @@ export function ExecutionGraphStart({
             override={manualTargets}
             setOverride={setManualTargets}
           />
-        ) : !needsValue && !needsCommit ? (
+        ) : !needsValue && !needsCommit && !nodes.some((node) => node.type === 'SHELL') ? (
           <p className="field-note">这条执行流可直接运行，无需选择环境和服务器。</p>
         ) : null}
       </fieldset>
@@ -234,6 +243,25 @@ export function ExecutionGraphStart({
               </li>
             ))}
           </ul>
+          {preview.checkouts?.map((checkout) => (
+            <div key={checkout.nodeId} className="graph-delivery-preview">
+              <p>
+                {project.repositories.find(({ id }) => id === checkout.repositoryId)?.name ??
+                  checkout.repositoryId}
+                {checkout.branch && ' · ' + checkout.branch}
+                {' · '}
+                {checkout.fullClone ? '完整历史' : '浅拉取'}
+              </p>
+              <p>
+                源码固定提交 · <code>{checkout.commitSha}</code>
+              </p>
+            </div>
+          ))}
+          {preview.scripts?.map((script) => (
+            <p key={script.nodeId} className="graph-delivery-preview">
+              Shell 执行服务器 · {script.serverName || script.serverId}
+            </p>
+          ))}
           {(preview.deliveries ?? (preview.serviceId ? [preview] : [])).map((delivery, i) => (
             <div key={delivery.nodeId ?? i} className="graph-delivery-preview">
               {delivery.serviceId && (
