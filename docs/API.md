@@ -71,7 +71,7 @@
 
 凭据 `type` 包括 SSH_PASSWORD、SSH_KEY、GIT_TOKEN、GIT_PASSWORD、API_KEY、API_SECRET、DOCKER_REGISTRY、USERNAME_PASSWORD、CUSTOM_SECRET。SSH_PASSWORD 使用 `secret:{password}`；SSH_KEY 使用 `{privateKey,passphrase?}`；GIT_TOKEN 使用 `{token}`；API_KEY 使用 `{apiKey}`。GET 永不返回 secret、ciphertext、nonce、auth_tag。
 
-仓库、服务和环境可通过 `PATCH /projects/:id/{repositories,services,environments}/:resourceId` 更新，或通过同路径的 `DELETE` 删除。更新请求沿用创建字段。仓库凭据传 `null` 可解除关联。资源仍被部署、任务历史或其他资源引用时，删除返回 409。
+仓库、服务和环境可通过 `PATCH /projects/:id/{repositories,services,environments}/:resourceId` 更新，或通过同路径的 `DELETE` 归档。仓库凭据传 `null` 可解除关联。有效配置、可运行版本或在途任务仍引用资源时返回 409。只有已完成历史引用的资源可归档，历史继续使用原 ID 和快照。
 
 项目详情返回 `addresses`、`dependencies`、`deploymentTargets` 和 `recentDeployments`。通过 `POST /projects/:id/addresses` 或 `POST /projects/:id/dependencies` 新增记录，带记录 ID 的路径支持 `PATCH` 和 `DELETE`。地址可关联项目内的服务和环境，依赖提交时会检查循环引用。
 
