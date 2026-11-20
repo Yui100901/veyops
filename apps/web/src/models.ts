@@ -89,6 +89,7 @@ export interface DeploymentRecord extends DeploymentSummary {
 }
 export interface ReleasePolicy {
   requireApproval: boolean;
+  requireCodeReview?: boolean;
   rollbackMode: 'OFF' | 'PREVIOUS_HEALTHY' | 'PINNED';
   pinnedDeploymentId?: string | null;
   archivePushedImage?: boolean;
@@ -163,6 +164,7 @@ export interface Environment {
   name: string;
   slug: string;
   environmentType: string;
+  repositoryEnvFile?: string | null;
   description?: string;
 }
 export interface ProjectDetail extends Project {

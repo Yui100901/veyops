@@ -26,6 +26,7 @@ import { ViewsModule } from './modules/views/views.module';
 import { OperationSchedulesModule } from './modules/operation-schedules/operation-schedules.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { MonitoringModule } from './modules/monitoring/monitoring.module';
+import { SourceReviewModule } from './modules/deployments/source-review.service';
 
 @Module({
   imports: [
@@ -54,6 +55,7 @@ import { MonitoringModule } from './modules/monitoring/monitoring.module';
     OperationSchedulesModule,
     NotificationsModule,
     MonitoringModule,
+    SourceReviewModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: AuthGuard }],
 })

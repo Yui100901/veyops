@@ -23,6 +23,8 @@ import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
 import type { CurrentUser } from '../auth/auth.decorators';
 import { pendingReleaseApprovalTime, serviceReleasePolicy } from '../deployments/release-policy';
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
+import { storeDeliveryProfile } from '../pipelines/delivery-execution-profile';
+import { isStandaloneGraphBuild } from '../pipelines/pipeline.types';
 
 const terminal = new Set<string>(terminalTaskStatuses);
 export const isTerminalStatus = (status: string) => terminal.has(status);
@@ -113,12 +115,16 @@ export class TasksService {
   async createInTransaction(tx: Transaction<Database>, input: CreateTaskInput, userId: string) {
     const targets = input.payload.targets;
     if (
-      (!targets.length && input.type !== 'GRAPH_CHECKOUT') ||
+      (!targets.length &&
+        input.type !== 'GRAPH_MODULE' &&
+        !isStandaloneGraphBuild(input.payload.pipeline)) ||
       new Set(targets.map((target) => target.id)).size !== targets.length
     )
       throw new BadRequestException('任务目标必须明确指定且不能重复');
     const id = randomUUID();
     const now = Date.now();
+    if (input.registrationProfile)
+      await storeDeliveryProfile(tx, input.registrationProfile, userId);
     const pipeline = input.payload.pipeline;
     if (pipeline?.deploymentArtifacts?.length)
       await lockAvailableArtifacts(
@@ -150,9 +156,17 @@ export class TasksService {
       const { policy } = await serviceReleasePolicy(tx, pipeline.serviceId, pipeline.environmentId);
       const requireApproval =
         policy.requireApproval || Boolean(pipeline.releasePolicy?.requireApproval);
+      const requireCodeReview = Boolean(
+        policy.requireCodeReview || pipeline.releasePolicy?.requireCodeReview,
+      );
       const releasePolicy = pipeline.rollbackOfDeploymentId
-        ? { ...(pipeline.releasePolicy ?? policy), requireApproval, rollbackMode: 'OFF' as const }
-        : { ...policy, requireApproval };
+        ? {
+            ...(pipeline.releasePolicy ?? policy),
+            requireApproval,
+            requireCodeReview,
+            rollbackMode: 'OFF' as const,
+          }
+        : { ...policy, requireApproval, requireCodeReview };
       payload = { ...payload, pipeline: { ...pipeline, releasePolicy } };
       if (requireApproval) availableAt = pendingReleaseApprovalTime;
     }

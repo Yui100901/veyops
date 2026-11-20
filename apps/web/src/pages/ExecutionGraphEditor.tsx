@@ -5,10 +5,30 @@ import { useResource } from '../api';
 import { ErrorBanner, Field } from '../components';
 import type { ProjectDetail, Server } from '../models';
 import { graphDragType, NodeMap } from './ExecutionGraphCanvas';
-import { StartDeliveryFields } from './ExecutionGraphPresets';
+import {
+  ArtifactOutputEditor,
+  BuildFields,
+  DeployFields,
+  graphTemplates,
+} from './ExecutionGraphPresets';
+import { GraphFieldEditor } from './ExecutionGraphFields';
+import {
+  ExecutionGraphBindings,
+  GraphFlowBranches,
+  GraphTemplatePicker,
+} from './ExecutionGraphBindings';
 import { BranchSyncControls, useRepositoryBranches } from './RepositoryBranches';
 import { branchOptions, graphKey, graphNodeLabels } from './execution-graph-definition';
-import type { GraphCanvas, GraphEdge, GraphNode } from './execution-graph-definition';
+import type {
+  GraphBinding,
+  GraphCanvas,
+  GraphCatalog,
+  GraphEdge,
+  GraphEndpoint,
+  GraphField,
+  GraphIssue,
+  GraphNode,
+} from './execution-graph-definition';
 import './execution-graph-editor.css';
 
 type NodeType = GraphNode['type'];
@@ -18,7 +38,19 @@ type Connector = Pick<GraphEdge, 'from' | 'to'>;
 
 const palette: { name: string; types: NodeType[] }[] = [
   { name: '开始与结束', types: ['START', 'END'] },
-  { name: '功能节点', types: ['CHECKOUT', 'SHELL', 'BUILD', 'DEPLOY_ARTIFACT', 'LOG'] },
+  {
+    name: '功能节点',
+    types: [
+      'CHECKOUT',
+      'LOAD_ENV',
+      'SHELL',
+      'CHECK',
+      'BUILD',
+      'REGISTER_ARTIFACT',
+      'DEPLOY_ARTIFACT',
+      'LOG',
+    ],
+  },
   {
     name: '流程控制',
     types: ['CONDITION', 'SWITCH', 'PARALLEL', 'JOIN', 'DELAY', 'APPROVAL', 'FLOW_CALL'],
@@ -44,6 +76,11 @@ function makeNode(type: NodeType, project: ProjectDetail): GraphNode {
           ...(repo.defaultBranch && { branch: repo.defaultBranch }),
         },
       }),
+    ...(type === 'SHELL' || type === 'CHECK'
+      ? { shell: { location: 'TARGET' as const, timeout: 180 } }
+      : {}),
+    ...(type === 'BUILD' ? { build: { repositoryId: repo?.id } } : {}),
+    ...(type === 'DEPLOY_ARTIFACT' ? { deploy: {} } : {}),
     ...(type === 'CONDITION' && { condition: { key: 'input', value: 'yes' } }),
     ...(type === 'SWITCH' && { switch: { key: 'input', cases: ['release'] } }),
     ...(type === 'DELAY' && { delaySeconds: 5 }),
@@ -79,9 +116,12 @@ function reachable(canvas: GraphCanvas, origin: string, reversed = false, stopAt
 function pathHighlight(canvas: GraphCanvas, startId?: string) {
   const pair = canvas.endpoints.find((value) => value.startId === startId);
   if (!pair) return undefined;
-  const forward = reachable(canvas, pair.startId);
+  const accepts = (edge: GraphEdge) =>
+    !pair.edgeSelections?.[edge.from]?.length || pair.edgeSelections[edge.from].includes(edge.to);
+  const pathCanvas = { ...canvas, edges: canvas.edges.filter(accepts) };
+  const forward = reachable(pathCanvas, pair.startId);
   if (!forward.has(pair.endId)) return undefined;
-  const ancestors = reachable(canvas, pair.endId, true);
+  const ancestors = reachable(pathCanvas, pair.endId, true);
   const nodes = new Set([...forward].filter((id) => ancestors.has(id)));
   const edges = new Set<number>();
   canvas.edges.forEach((edge, index) => {
@@ -89,7 +129,8 @@ function pathHighlight(canvas: GraphCanvas, startId?: string) {
       nodes.has(edge.from) &&
       nodes.has(edge.to) &&
       edge.from !== pair.endId &&
-      edge.to !== pair.startId
+      edge.to !== pair.startId &&
+      accepts(edge)
     )
       edges.add(index);
   });
@@ -102,19 +143,23 @@ export function ProjectGraphEditor({
   canEdit,
   onChange,
   renderStart,
+  issues = [],
 }: {
   canvas: GraphCanvas;
   project: ProjectDetail;
   canEdit: boolean;
   onChange: (canvas: GraphCanvas) => void;
   renderStart?: (startId: string) => ReactNode;
+  issues?: GraphIssue[];
 }) {
   const [selection, select] = useState<Selection>();
   const [hovered, hover] = useState<string>();
   const [source, setSource] = useState<string>();
   const [connector, setConnector] = useState<Connector>();
+  const [startId, setStartId] = useState<string>();
   const [templateType, setTemplateType] = useState<NodeType>('CHECKOUT');
   const [error, setError] = useState('');
+  const catalog = useResource<GraphCatalog>('/projects/' + project.id + '/execution-graph/catalog');
   const activeNode =
     selection?.kind === 'node' ? canvas.nodes.find(({ id }) => id === selection.id) : undefined;
   const template =
@@ -123,15 +168,50 @@ export function ProjectGraphEditor({
       : undefined;
   const inspected = activeNode ?? template;
   const activeEdge = selection?.kind === 'edge' ? canvas.edges[selection.index] : undefined;
-  const highlight = pathHighlight(canvas, hovered);
+  const selectedPair = canvas.endpoints.find((pair) => pair.startId === startId);
+  const selectedPath = pathHighlight(canvas, selectedPair?.startId);
+  const highlight = pathHighlight(canvas, hovered) ?? selectedPath;
   const flow = { id: project.id, name: project.name, nodes: canvas.nodes, edges: canvas.edges };
   function patch(fields: Partial<GraphNode>) {
     if (!inspected || !canEdit) return;
     const change = (item: GraphNode) => (item.id === inspected.id ? { ...item, ...fields } : item);
+    const nextOutputs =
+      inspected.type === 'END' && fields.outputs
+        ? new Set(fields.outputs.map(({ id }) => id))
+        : undefined;
+    const removedParameters = new Set(
+      fields.shell?.params
+        ? (inspected.shell?.params ?? [])
+            .filter(({ id }) => !fields.shell?.params?.some((field) => field.id === id))
+            .map(({ id }) => id)
+        : [],
+    );
+    const endpoints = canvas.endpoints.map((pair) => {
+      if (nextOutputs && pair.endId === inspected.id)
+        return {
+          ...pair,
+          outputBindings: Object.fromEntries(
+            Object.entries(pair.outputBindings ?? {}).filter(([id]) => nextOutputs.has(id)),
+          ),
+        };
+      if (removedParameters.size && pair.inputBindings?.[inspected.id])
+        return {
+          ...pair,
+          inputBindings: {
+            ...pair.inputBindings,
+            [inspected.id]: Object.fromEntries(
+              Object.entries(pair.inputBindings[inspected.id]).filter(
+                ([id]) => !removedParameters.has(id),
+              ),
+            ),
+          },
+        };
+      return pair;
+    });
     onChange(
       template
         ? { ...canvas, templates: canvas.templates.map(change) }
-        : { ...canvas, nodes: canvas.nodes.map(change) },
+        : { ...canvas, nodes: canvas.nodes.map(change), endpoints },
     );
   }
   function addNode(raw: GraphNode, position?: Position) {
@@ -156,12 +236,28 @@ export function ProjectGraphEditor({
   function assignEnd(startId: string, endId?: string) {
     if (!canEdit) return;
     if (endId && !reachable(canvas, startId).has(endId)) return;
+    const previous = canvas.endpoints.find((pair) => pair.startId === startId);
+    const retained =
+      previous?.endId === endId
+        ? previous
+        : {
+            ...previous,
+            outputBindings: undefined,
+            edgeSelections: undefined,
+          };
     onChange({
       ...canvas,
       endpoints: [
         ...canvas.endpoints.filter((pair) => pair.startId !== startId),
-        ...(endId ? [{ startId, endId }] : []),
+        ...(endId ? [{ ...retained, startId, endId }] : []),
       ],
+    });
+    if (endId) setStartId(startId);
+  }
+  function updatePair(next: GraphEndpoint) {
+    onChange({
+      ...canvas,
+      endpoints: canvas.endpoints.map((pair) => (pair.startId === next.startId ? next : pair)),
     });
   }
   const presetEnd =
@@ -173,11 +269,111 @@ export function ProjectGraphEditor({
     canvas.edges.some(({ from, to }) => from === activeNode.id && to === presetEnd);
   function insertPreset(types: NodeType[]) {
     if (!activeNode || !presetEnd || !canInsertPreset || !canEdit) return;
+    const start = activeNode;
     const nodes = types.map((type) => makeNode(type, project));
+    const build = nodes.find((node) => node.type === 'BUILD');
+    const deploy = nodes.find((node) => node.type === 'DEPLOY_ARTIFACT');
+    const end = canvas.nodes.find((node) => node.id === presetEnd)!;
+    const inputs = [...(start.inputs ?? [])];
+    const outputs = [...(end.outputs ?? [])];
+    const pair = canvas.endpoints.find(({ startId }) => startId === start.id)!;
+    const addField = (fields: GraphField[], next: GraphField) => {
+      const existing = fields.find(({ id }) => id === next.id);
+      if (existing?.type === next.type) return existing.id;
+      const id = existing ? graphKey('field') : next.id;
+      fields.push({ ...next, id });
+      return id;
+    };
+    const inputBindings = { ...pair.inputBindings };
+    const outputBindings = { ...pair.outputBindings };
+    if (build || deploy) {
+      const environment = addField(inputs, {
+        id: 'environment',
+        name: '环境',
+        type: 'ENVIRONMENT',
+        required: true,
+      });
+      const targets = addField(inputs, {
+        id: 'targets',
+        name: '部署目标',
+        type: 'TARGETS',
+        required: false,
+      });
+      const service = pair.serviceId
+        ? undefined
+        : addField(inputs, { id: 'service', name: '服务', type: 'SERVICE', required: true });
+      for (const node of nodes.filter(
+        ({ type }) => type === 'BUILD' || type === 'DEPLOY_ARTIFACT',
+      )) {
+        const bindings: Record<string, GraphBinding> = {
+          environment: { kind: 'INPUT', fieldId: environment },
+          targets: { kind: 'INPUT', fieldId: targets },
+        };
+        if (service) bindings.service = { kind: 'INPUT', fieldId: service };
+        inputBindings[node.id] = bindings;
+      }
+    }
+    if (build) {
+      if (!build.build?.repositoryId) {
+        const repo = addField(inputs, {
+          id: 'repository',
+          name: '仓库',
+          type: 'REPOSITORY',
+          required: true,
+        });
+        inputBindings[build.id].repository = { kind: 'INPUT', fieldId: repo };
+      }
+      const id = addField(outputs, {
+        id: 'buildArtifacts',
+        name: '构建产物',
+        type: 'ARTIFACT',
+        multiple: true,
+        source: 'CURRENT_RUN',
+        required: true,
+      });
+      outputBindings[id] = { kind: 'OUTPUT', nodeId: build.id, fieldId: 'artifacts' };
+    }
+    if (deploy) {
+      if (build)
+        inputBindings[deploy.id].artifact = {
+          kind: 'OUTPUT',
+          nodeId: build.id,
+          fieldId: 'artifacts',
+        };
+      else {
+        const id = addField(inputs, {
+          id: 'artifact',
+          name: '构建产物',
+          type: 'ARTIFACT',
+          multiple: true,
+          required: true,
+        });
+        inputBindings[deploy.id].artifact = { kind: 'INPUT', fieldId: id };
+      }
+      const id = addField(outputs, {
+        id: 'release',
+        name: '服务发布结果',
+        type: 'RELEASE',
+        required: true,
+      });
+      outputBindings[id] = { kind: 'OUTPUT', nodeId: deploy.id, fieldId: 'release' };
+    }
     const path = [activeNode.id, ...nodes.map(({ id }) => id), presetEnd];
     onChange({
       ...canvas,
-      nodes: [...canvas.nodes, ...nodes],
+      nodes: [
+        ...canvas.nodes.map((node) =>
+          node.id === start.id
+            ? { ...node, inputs }
+            : node.id === end.id
+              ? { ...node, outputs }
+              : node,
+        ),
+        ...nodes,
+      ],
+      endpoints: canvas.endpoints.map((item) =>
+        item.startId === start.id ? { ...item, inputBindings, outputBindings } : item,
+      ),
       edges: [
         ...canvas.edges.filter(({ from, to }) => from !== activeNode.id || to !== presetEnd),
         ...path.slice(1).map((to, i) => ({ from: path[i]!, to })),
@@ -186,22 +382,52 @@ export function ProjectGraphEditor({
   }
   function detachEdge(index: number) {
     if (!canEdit) return;
-    onChange({ ...canvas, edges: canvas.edges.filter((_, i) => index !== i) });
+    const edge = canvas.edges[index];
+    if (!edge) return;
+    const affected = canvas.endpoints.filter((pair) =>
+      pathHighlight(canvas, pair.startId)?.edges.has(index),
+    );
+    onChange({
+      ...canvas,
+      edges: canvas.edges.filter((_, i) => index !== i),
+      endpoints: canvas.endpoints.map((pair) => {
+        if (!pair.edgeSelections?.[edge.from]?.includes(edge.to)) return pair;
+        const selected = { ...pair.edgeSelections };
+        delete selected[edge.from];
+        return { ...pair, edgeSelections: selected };
+      }),
+    });
     select(undefined);
-    setError('');
+    if (affected.length)
+      setError('连线变更影响 ' + affected.length + ' 条执行流，请重新检查数据来源。');
   }
   function deleteNode(id: string) {
     if (!canEdit) return;
+    const affected = canvas.endpoints.filter((pair) =>
+      pathHighlight(canvas, pair.startId)?.nodes.has(id),
+    );
     onChange({
       ...canvas,
       nodes: canvas.nodes.filter((item) => item.id !== id),
       edges: canvas.edges.filter((edge) => edge.from !== id && edge.to !== id),
-      endpoints: canvas.endpoints.filter((pair) => pair.startId !== id && pair.endId !== id),
+      endpoints: canvas.endpoints
+        .filter((pair) => pair.startId !== id && pair.endId !== id)
+        .map((pair) => {
+          const inputBindings = { ...pair.inputBindings };
+          delete inputBindings[id];
+          const edgeSelections = Object.fromEntries(
+            Object.entries(pair.edgeSelections ?? {}).filter(
+              ([from, targets]) => from !== id && !targets.includes(id),
+            ),
+          );
+          return { ...pair, inputBindings, edgeSelections };
+        }),
     });
     select(undefined);
     setSource(undefined);
     setConnector(undefined);
-    setError('');
+    if (affected.length)
+      setError('节点变更影响 ' + affected.length + ' 条执行流，请重新检查数据来源。');
   }
   function removeSelection() {
     if (!canEdit) return;
@@ -264,6 +490,7 @@ export function ProjectGraphEditor({
   }
   function selectNode(id: string) {
     select({ kind: 'node', id });
+    if (canvas.endpoints.some((pair) => pair.startId === id)) setStartId(id);
     setConnector(undefined);
     setSource(undefined);
     setError('');
@@ -393,6 +620,57 @@ export function ProjectGraphEditor({
             </p>
           )}
         </div>
+        {!!canvas.endpoints.length && (
+          <Field label="查看执行流">
+            <select
+              value={selectedPair?.startId ?? ''}
+              onChange={(event) => setStartId(event.target.value || undefined)}
+            >
+              <option value="">查看完整执行图</option>
+              {canvas.endpoints.map((pair) => (
+                <option value={pair.startId} key={pair.startId}>
+                  {canvas.nodes.find(({ id }) => id === pair.startId)?.name ?? pair.startId}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
+        {!!issues.length && (
+          <section className="graph-fields graph-validation" aria-label="发布检查问题">
+            <h4>发布检查</h4>
+            <ul className="graph-edge-list">
+              {issues.map((issue, index) => (
+                <li key={index}>
+                  <button
+                    type="button"
+                    className="button secondary small"
+                    onClick={() => {
+                      const nodeId = issue.nodeId ?? issue.flowId;
+                      if (nodeId && canvas.nodes.some(({ id }) => id === nodeId))
+                        selectNode(nodeId);
+                      if (issue.flowId) setStartId(issue.flowId);
+                      if (issue.fieldId) {
+                        const fieldId = CSS.escape(issue.fieldId);
+                        window.requestAnimationFrame(() => {
+                          document
+                            .querySelector<HTMLElement>(
+                              '.graph-inspector [data-graph-field="' + fieldId + '"] select',
+                            )
+                            ?.focus();
+                        });
+                      }
+                    }}
+                  >
+                    {issue.flowId &&
+                      canvas.nodes.find(({ id }) => id === issue.flowId)?.name + ' · '}
+                    {issue.message}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+        <ErrorBanner error={catalog.error} retry={catalog.reload} />
         <ErrorBanner error={error} />
         <NodeMap
           flow={flow}
@@ -460,6 +738,7 @@ export function ProjectGraphEditor({
                 canvas={canvas}
                 canEdit={canEdit}
                 patch={patch}
+                catalog={catalog.data}
               />
               {activeNode?.type === 'START' && (
                 <>
@@ -469,24 +748,89 @@ export function ProjectGraphEditor({
                     canEdit={canEdit}
                     assign={assignEnd}
                   />
-                  <StartDeliveryFields
+                  <GraphFieldEditor
                     project={project}
-                    value={activeNode.delivery}
-                    canEdit={canEdit}
-                    change={(delivery) => patch({ delivery })}
-                    insert={canInsertPreset ? insertPreset : undefined}
+                    catalog={catalog.data}
+                    type="input"
+                    disabled={!canEdit}
+                    fields={activeNode.inputs ?? []}
+                    change={(inputs) => patch({ inputs })}
                   />
+                  {selectedPair?.startId === activeNode.id && (
+                    <Field label="此流关联发布的服务（可选）">
+                      <select
+                        value={selectedPair.serviceId ?? ''}
+                        disabled={!canEdit}
+                        onChange={(event) =>
+                          updatePair({
+                            ...selectedPair,
+                            serviceId: event.target.value || undefined,
+                          })
+                        }
+                      >
+                        <option value="">无固定关联</option>
+                        {project.services.map(({ id, name }) => (
+                          <option value={id} key={id}>
+                            {name}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                  )}
+                  {canEdit && canInsertPreset && (
+                    <GraphTemplatePicker templates={graphTemplates} add={insertPreset} />
+                  )}
                   {renderStart?.(activeNode.id)}
                 </>
               )}
               {activeNode?.type === 'END' && (
-                <EndPairs
-                  key={activeNode.id}
-                  canvas={canvas}
-                  node={activeNode}
-                  canEdit={canEdit}
-                  assign={assignEnd}
-                />
+                <>
+                  <EndPairs
+                    key={activeNode.id}
+                    canvas={canvas}
+                    node={activeNode}
+                    canEdit={canEdit}
+                    assign={assignEnd}
+                  />
+                  <GraphFieldEditor
+                    project={project}
+                    catalog={catalog.data}
+                    type="output"
+                    disabled={!canEdit}
+                    fields={activeNode.outputs ?? []}
+                    change={(outputs) => patch({ outputs })}
+                  />
+                </>
+              )}
+              {activeNode && selectedPair && (
+                <>
+                  <GraphFlowBranches
+                    node={activeNode}
+                    canvas={canvas}
+                    outgoing={canvas.edges
+                      .filter(
+                        ({ from, to }) =>
+                          from === activeNode.id &&
+                          reachable(canvas, to, false).has(selectedPair.endId),
+                      )
+                      .map(({ to }) => to)}
+                    endpoint={selectedPair}
+                    update={updatePair}
+                    canEdit={canEdit}
+                  />
+                  {selectedPath?.nodes.has(activeNode.id) && (
+                    <ExecutionGraphBindings
+                      canvas={canvas}
+                      node={activeNode}
+                      endpoint={selectedPair}
+                      flowEdgeIndexes={selectedPath.edges}
+                      catalog={catalog.data}
+                      project={project}
+                      canEdit={canEdit}
+                      update={updatePair}
+                    />
+                  )}
+                </>
               )}
               {canEdit && (
                 <div className="heading-actions">
@@ -723,9 +1067,10 @@ interface FieldsProps {
   canvas: GraphCanvas;
   canEdit: boolean;
   patch: (fields: Partial<GraphNode>) => void;
+  catalog?: GraphCatalog;
 }
 
-function NodeFields({ node, project, canvas, canEdit, patch }: FieldsProps) {
+function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsProps) {
   return (
     <>
       <Field label="节点名称">
@@ -749,30 +1094,94 @@ function NodeFields({ node, project, canvas, canEdit, patch }: FieldsProps) {
       {node.type === 'CHECKOUT' && (
         <CheckoutFields project={project} node={node} canEdit={canEdit} patch={patch} />
       )}
-      {node.type === 'SHELL' && <ShellFields node={node} canEdit={canEdit} patch={patch} />}
-      {(node.type === 'BUILD' || node.type === 'DEPLOY_ARTIFACT') && (
-        <p className="field-note">此节点使用开始节点配置的服务和执行流预设。</p>
+      {(node.type === 'SHELL' || node.type === 'CHECK') && (
+        <>
+          <ShellFields node={node} canEdit={canEdit} patch={patch} />
+          <p className="field-note">
+            用端口标识读取环境变量。脚本可按 <code>{'VEYOPS_OUTPUT={"REPORT_CODE":"ok"}'}</code>{' '}
+            输出结构化值。
+          </p>
+          <GraphFieldEditor
+            title="脚本输入端口"
+            scriptPort
+            project={project}
+            catalog={catalog}
+            type="input"
+            disabled={!canEdit}
+            fields={node.shell?.params ?? []}
+            change={(params) => patch({ shell: { ...node.shell, params } })}
+          />
+          <GraphFieldEditor
+            title="脚本输出端口"
+            scriptPort
+            project={project}
+            catalog={catalog}
+            type="output"
+            disabled={!canEdit}
+            fields={node.outputs ?? []}
+            change={(outputs) => patch({ outputs })}
+          />
+        </>
       )}
-      {node.type === 'CONDITION' && (
-        <div className="form-grid">
-          <Field label="判断依据">
-            <select
+      {node.type === 'BUILD' && (
+        <BuildFields
+          project={project}
+          value={node.build ?? {}}
+          canEdit={canEdit}
+          change={(build) => patch({ build })}
+        />
+      )}
+      {node.type === 'DEPLOY_ARTIFACT' && (
+        <DeployFields
+          value={node.deploy ?? {}}
+          canEdit={canEdit}
+          change={(deploy) => patch({ deploy })}
+        />
+      )}
+      {node.type === 'REGISTER_ARTIFACT' && (
+        <ArtifactOutputEditor
+          value={node.registerArtifacts?.artifacts ?? []}
+          canEdit={canEdit}
+          onChange={(artifacts) => patch({ registerArtifacts: { artifacts } })}
+        />
+      )}
+      {node.type === 'LOAD_ENV' && (
+        <>
+          <Field label="环境文件（可选）" hint="留空沿用环境配置。">
+            <input
               disabled={!canEdit}
-              value={node.condition?.key ?? 'input'}
+              value={node.loadEnvironment?.envFile ?? ''}
               onChange={(event) =>
                 patch({
-                  condition: {
-                    key: event.target.value as 'input' | 'commitSha',
-                    value: node.condition?.value ?? '',
+                  loadEnvironment: {
+                    ...node.loadEnvironment,
+                    envFile: event.target.value || undefined,
                   },
                 })
               }
-            >
-              <option value="input">运行参数</option>
-              <option value="commitSha">提交 SHA</option>
-            </select>
+              placeholder=".env.test"
+            />
           </Field>
-          <Field label="等于">
+          <Field label="工作区相对目录（可选）">
+            <input
+              disabled={!canEdit}
+              value={node.loadEnvironment?.directory ?? ''}
+              onChange={(event) =>
+                patch({
+                  loadEnvironment: {
+                    ...node.loadEnvironment,
+                    directory: event.target.value || undefined,
+                  },
+                })
+              }
+              placeholder="."
+            />
+          </Field>
+        </>
+      )}
+      {node.type === 'CONDITION' && (
+        <div className="form-grid">
+          <Field label="等于" hint="在当前流绑定比较值。">
             <input
               readOnly={!canEdit}
               value={node.condition?.value ?? ''}
@@ -847,18 +1256,7 @@ function SwitchFields({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canE
   const config = node.switch ?? { key: 'input', cases: [] };
   return (
     <>
-      <Field label="多路判断依据">
-        <select
-          disabled={!canEdit}
-          value={config.key}
-          onChange={(event) =>
-            patch({ switch: { ...config, key: event.target.value as typeof config.key } })
-          }
-        >
-          <option value="input">运行参数</option>
-          <option value="commitSha">提交 SHA</option>
-        </select>
-      </Field>
+      <p className="field-note">设置下面的匹配项，并在当前流绑定比较值。</p>
       {config.cases.map((value, index) => (
         <Field label={'选项 ' + (index + 1)} key={index}>
           <input
@@ -954,7 +1352,7 @@ function CheckoutFields({ project, node, canEdit, patch }: Omit<FieldsProps, 'ca
       </Field>
       <Field label="代码版本">
         <select
-          disabled={!canEdit || !repo}
+          disabled={!canEdit}
           value={settings.mode}
           onChange={(event) =>
             patch({
@@ -970,6 +1368,7 @@ function CheckoutFields({ project, node, canEdit, patch }: Omit<FieldsProps, 'ca
           }
         >
           <option value="BRANCH">分支最新提交</option>
+          <option value="TAG">Git 标签</option>
           <option value="COMMIT">指定提交哈希</option>
         </select>
       </Field>
@@ -994,7 +1393,18 @@ function CheckoutFields({ project, node, canEdit, patch }: Omit<FieldsProps, 'ca
           {canEdit && <BranchSyncControls branches={branches} />}
         </>
       )}
-      {repo && settings.mode === 'COMMIT' && (
+      {settings.mode === 'TAG' && (
+        <Field label="Git 标签">
+          <input
+            readOnly={!canEdit}
+            value={settings.tag ?? ''}
+            onChange={(event) =>
+              patch({ checkout: { ...settings, tag: event.target.value.trim() || undefined } })
+            }
+          />
+        </Field>
+      )}
+      {settings.mode === 'COMMIT' && (
         <Field label="Git 提交哈希" hint="填写完整 SHA。">
           <input
             readOnly={!canEdit}
@@ -1008,7 +1418,7 @@ function CheckoutFields({ project, node, canEdit, patch }: Omit<FieldsProps, 'ca
           />
         </Field>
       )}
-      {repo && (
+      {
         <label className="checkbox-row">
           <input
             type="checkbox"
@@ -1020,7 +1430,7 @@ function CheckoutFields({ project, node, canEdit, patch }: Omit<FieldsProps, 'ca
           />{' '}
           拉取完整历史
         </label>
-      )}
+      }
     </>
   );
 }
@@ -1031,22 +1441,76 @@ function ShellFields({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canEd
   return (
     <>
       <ErrorBanner error={servers.error} retry={servers.reload} />
-      <Field label="执行服务器">
+      <Field label="执行位置">
         <select
           disabled={!canEdit}
-          value={shell.serverId ?? ''}
+          value={shell.location ?? 'TARGET'}
           onChange={(event) =>
-            patch({ shell: { ...shell, serverId: event.target.value || undefined } })
+            patch({ shell: { ...shell, location: event.target.value as 'MANAGER' | 'TARGET' } })
           }
         >
-          <option value="">{servers.loading ? '读取服务器…' : '选择服务器'}</option>
-          {servers.data?.map(({ id, name, host }) => (
-            <option key={id} value={id}>
-              {name} · {host}
-            </option>
-          ))}
+          <option value="MANAGER">管理端</option>
+          <option value="TARGET">目标服务器</option>
         </select>
       </Field>
+      {shell.location !== 'MANAGER' && (
+        <Field label="执行服务器" hint="可在当前流绑定目标。">
+          <select
+            disabled={!canEdit}
+            value={shell.serverId ?? ''}
+            onChange={(event) =>
+              patch({ shell: { ...shell, serverId: event.target.value || undefined } })
+            }
+          >
+            <option value="">{servers.loading ? '读取服务器…' : '选择服务器'}</option>
+            {servers.data?.map(({ id, name, host }) => (
+              <option key={id} value={id}>
+                {name} · {host}
+              </option>
+            ))}
+          </select>
+        </Field>
+      )}
+      <Field label="工作区相对目录">
+        <input
+          disabled={!canEdit}
+          placeholder="."
+          value={shell.directory ?? ''}
+          onChange={(event) =>
+            patch({ shell: { ...shell, directory: event.target.value || undefined } })
+          }
+        />
+      </Field>
+      <Field label="超时（秒）">
+        <input
+          type="number"
+          min={1}
+          max={86400}
+          disabled={!canEdit}
+          value={shell.timeout ?? ''}
+          onChange={(event) =>
+            patch({
+              shell: {
+                ...shell,
+                timeout: event.target.value ? Number(event.target.value) : undefined,
+              },
+            })
+          }
+        />
+      </Field>
+      {node.type === 'CHECK' && (
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            disabled={!canEdit}
+            checked={Boolean(shell.continueOnFailure)}
+            onChange={(event) =>
+              patch({ shell: { ...shell, continueOnFailure: event.target.checked } })
+            }
+          />{' '}
+          检查失败时由后续节点判断
+        </label>
+      )}
       <Field label="Shell 脚本">
         <textarea
           readOnly={!canEdit}

@@ -49,6 +49,10 @@ export type Artifact = {
   id: string;
   projectId?: string;
   artifactType: string;
+  name?: string | null;
+  kind?: string;
+  graphRunId?: string | null;
+  graphNodeRunId?: string | null;
   storageType: string;
   storageKey: string;
   downloadAvailable: boolean;

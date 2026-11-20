@@ -21,6 +21,8 @@ import { SystemSettingsService } from '../system/system-settings.service';
 import { ArtifactRetentionService } from '../artifacts/artifact-retention.service';
 import { OperationSchedulesService } from '../operation-schedules/operation-schedules.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { SshExecutionError } from '../../infrastructure/ssh/ssh.service';
+import { isStandaloneGraphBuild } from '../pipelines/pipeline.types';
 
 const TASK_LEASE_MS = 60_000;
 const SQLITE_LEASE_MS = 45_000;
@@ -339,6 +341,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     let handler: TaskHandler | undefined;
     let failure: { cause: unknown } | undefined;
     let finalized = false;
+    let result: Awaited<ReturnType<TaskHandler['execute']>> = undefined;
     try {
       try {
         await this.heartbeat(task.id, controller);
@@ -364,7 +367,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
           context.log(
             `任务开始：${task.name}\n目标快照已固定，${record.payload.targets.length} 台服务器\n`,
           );
-          await handler.execute(record, context);
+          result = await handler.execute(record, context);
         }
       } catch (cause) {
         failure = { cause };
@@ -378,6 +381,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         completedRecord && onFinalize
           ? (tx, status) => onFinalize(tx, completedRecord, task.created_by, status)
           : undefined,
+        result,
       );
     } finally {
       clearInterval(heartbeat);
@@ -425,6 +429,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       tx: Transaction<Database>,
       status: TaskStatus,
     ) => Promise<{ deploymentTaskId?: string; deploymentSkippedReason?: string } | undefined>,
+    result?: void | { graphOutputs: Record<string, unknown> },
   ) {
     return this.database.db.transaction().execute(async (tx) => {
       if (!(await lockTaskLease(tx, task.id, this.owner, true))) return false;
@@ -460,20 +465,30 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       const executionFailed = Boolean(
         failure && !(cancelled && failure.cause instanceof TaskLeaseUnavailableError),
       );
-      const checkout = task.task_type === 'GRAPH_CHECKOUT';
+      const graphModule =
+        task.task_type === 'GRAPH_MODULE' ||
+        (task.task_type === 'PIPELINE' &&
+          !targets.length &&
+          isStandaloneGraphBuild((JSON.parse(task.payload_json) as TaskPayload).pipeline));
       const abandoned =
         !cancelled &&
         (Boolean(activeStep || activeDeployment) ||
           targets.some((target) => target.status === 'RUNNING'));
       const workerInterrupted = interrupted || this.stopping || this.sqliteLeaseLost;
-      let uncertain = workerInterrupted || (executionFailed && !checkout) || abandoned;
+      const sshError =
+        graphModule && failure?.cause instanceof SshExecutionError ? failure.cause : undefined;
+      let uncertain =
+        workerInterrupted ||
+        (executionFailed && !graphModule) ||
+        abandoned ||
+        sshError?.kind === 'NEEDS_ATTENTION';
       let status = uncertain
         ? 'NEEDS_ATTENTION'
-        : checkout
+        : graphModule
           ? cancelled
             ? 'CANCELLED'
             : executionFailed
-              ? 'FAILED'
+              ? (sshError?.kind ?? 'FAILED')
               : 'SUCCESS'
           : aggregateStatus(
               targets.map((target) => target.status),
@@ -486,7 +501,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       if (workerInterrupted) error = EXECUTION_INTERRUPTED;
       else if (uncertain) error = EXECUTION_FAILED;
       else if (status === 'CANCELLED') error = targetError ?? CANCELLED;
-      else if (checkout && executionFailed) error = '源码检出失败，请查看任务日志';
+      else if (graphModule && executionFailed) error = '执行图功能节点失败，请查看任务日志';
       else if (status !== 'SUCCESS') {
         error =
           targetError ??
@@ -530,6 +545,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
           result_json: JSON.stringify({
             total: targets.length,
             success: targets.filter((target) => target.status === 'SUCCESS').length,
+            ...(graphModule && status === 'SUCCESS' && result),
             ...continuation,
           }),
           finished_at: now,

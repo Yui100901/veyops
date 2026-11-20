@@ -2,9 +2,12 @@ export const graphNodeLabels = {
   START: '开始',
   LOG: '记录日志',
   CHECKOUT: '代码拉取',
+  LOAD_ENV: '加载环境',
   SHELL: 'Shell 脚本',
+  CHECK: '代码检查',
   BUILD: '构建并归档',
-  DEPLOY_ARTIFACT: '部署历史产物',
+  REGISTER_ARTIFACT: '登记产物',
+  DEPLOY_ARTIFACT: '部署产物',
   CONDITION: '条件判断',
   SWITCH: '多路判断',
   DELAY: '等待',
@@ -19,16 +22,70 @@ export interface GraphEdge {
   to: string;
   when?: 'TRUE' | 'FALSE' | 'DEFAULT' | `CASE:${number}`;
 }
-export const flowPresetLabels = {
-  CUSTOM: '自定义',
-  BUILD: '构建归档',
-  DEPLOY: '部署构建产物',
-  BUILD_DEPLOY: '构建并部署',
-  VERIFY: '验证',
-  MAINTENANCE: '维护',
-  RELEASE_REVIEW: '发布审核',
-} as const;
-export type FlowPreset = keyof typeof flowPresetLabels;
+export type GraphFieldType =
+  | 'TEXT'
+  | 'NUMBER'
+  | 'BOOLEAN'
+  | 'REPOSITORY'
+  | 'GIT_REF'
+  | 'ENVIRONMENT'
+  | 'SERVICE'
+  | 'TARGETS'
+  | 'ARTIFACT'
+  | 'PATH'
+  | 'IMAGE'
+  | 'WORKSPACE'
+  | 'SOURCE'
+  | 'RELEASE'
+  | 'REPORT'
+  | 'CREDENTIAL'
+  | 'VARIABLES';
+export type GraphArtifactType = 'FILE' | 'DIRECTORY' | 'DOCKER_IMAGE';
+export interface GraphField {
+  id: string;
+  name: string;
+  type: GraphFieldType;
+  required?: boolean;
+  multiple?: boolean;
+  defaultValue?: unknown;
+  selection?: 'LATEST_COMPATIBLE';
+  artifactType?: GraphArtifactType;
+  source?: 'CURRENT_RUN';
+  options?: (string | number | boolean)[];
+  acceptedTypes?: GraphFieldType[];
+}
+export type GraphBinding =
+  | { kind: 'INPUT' | 'CONTEXT'; fieldId: string }
+  | { kind: 'OUTPUT'; nodeId: string; fieldId: string }
+  | { kind: 'VALUE'; value: unknown }
+  | { kind: 'FIRST_AVAILABLE'; sources: GraphBinding[] };
+export interface GraphModule {
+  id: string;
+  version: number;
+  inputs: GraphField[];
+  outputs: GraphField[];
+}
+export interface GraphCatalog {
+  fieldTypes: Record<GraphFieldType, string>;
+  inputPresets: GraphField[];
+  outputPresets: GraphField[];
+  contextFields?: GraphField[];
+  modules: Partial<Record<GraphNode['type'], GraphModule>>;
+}
+export interface GraphIssue {
+  flowId?: string;
+  nodeId?: string;
+  fieldId?: string;
+  message: string;
+}
+export interface GraphArtifactOutput {
+  name: string;
+  type: GraphArtifactType;
+  path?: string;
+  imageReference?: string;
+  composeFilePath?: string;
+  required?: boolean;
+}
 export interface FlowBuildDefinition {
   repositoryId?: string;
   branch?: string;
@@ -43,6 +100,7 @@ export interface FlowBuildDefinition {
   dockerfilePath?: string;
   imageRepository?: string;
   registryId?: string;
+  artifacts?: GraphArtifactOutput[];
 }
 export interface FlowDeployDefinition {
   deployPath?: string;
@@ -51,11 +109,14 @@ export interface FlowDeployDefinition {
   healthCheckCommand?: string;
   composeFilePath?: string;
 }
-export interface FlowDelivery {
-  kind: FlowPreset;
-  serviceId?: string;
-  build?: FlowBuildDefinition;
-  deploy?: FlowDeployDefinition;
+interface GraphShell {
+  command?: string;
+  serverId?: string;
+  timeout?: number;
+  location?: 'MANAGER' | 'TARGET';
+  directory?: string;
+  continueOnFailure?: boolean;
+  params?: GraphField[];
 }
 export interface GraphNode {
   id: string;
@@ -64,13 +125,21 @@ export interface GraphNode {
   message?: string;
   checkout?: {
     repositoryId?: string;
-    mode: 'BRANCH' | 'COMMIT';
+    mode: 'BRANCH' | 'TAG' | 'COMMIT';
     branch?: string;
+    tag?: string;
     commitSha?: string;
     fullClone?: boolean;
   };
-  shell?: { command?: string; serverId?: string };
-  delivery?: FlowDelivery;
+  shell?: GraphShell;
+  loadEnvironment?: { envFile?: string; directory?: string };
+  registerArtifacts?: { artifacts?: GraphArtifactOutput[] };
+  build?: FlowBuildDefinition;
+  deploy?: FlowDeployDefinition;
+  inputs?: GraphField[];
+  outputs?: GraphField[];
+  moduleId?: string;
+  moduleVersion?: number;
   condition?: { key: 'input' | 'commitSha'; value: string };
   switch?: { key: 'input' | 'commitSha'; cases: string[] };
   delaySeconds?: number;
@@ -78,16 +147,26 @@ export interface GraphNode {
   flowId?: string;
   position?: { x: number; y: number };
 }
-export interface GraphFlow {
+export interface FlowBindings {
+  serviceId?: string;
+  inputBindings?: Record<string, Record<string, GraphBinding>>;
+  outputBindings?: Record<string, GraphBinding>;
+  edgeSelections?: Record<string, string[]>;
+}
+export interface GraphFlow extends FlowBindings {
   id: string;
   name: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
 }
+export interface GraphEndpoint extends FlowBindings {
+  startId: string;
+  endId: string;
+}
 export interface GraphCanvas {
   nodes: GraphNode[];
   edges: GraphEdge[];
-  endpoints: { startId: string; endId: string }[];
+  endpoints: GraphEndpoint[];
   templates: GraphNode[];
 }
 export interface GraphDocument {
@@ -103,6 +182,7 @@ export interface GraphRun {
   status: string;
   taskId?: string;
   parentRunId?: string | null;
+  outputs?: Record<string, unknown>;
   createdAt: number;
   finishedAt: number | null;
 }

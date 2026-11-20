@@ -40,6 +40,7 @@ import { recentDeployments } from '../deployments/deployment-history';
 import { byProject, projectAddressLinks } from './project-card-data';
 import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
+import { relativePath } from '../pipelines/pipeline.validation';
 import {
   lockProjectGraph,
   ProjectRelationsController,
@@ -82,6 +83,7 @@ class EnvironmentDto {
   @IsIn(['DEVELOPMENT', 'TESTING', 'STAGING', 'PRODUCTION', 'CUSTOM']) environmentType =
     'DEVELOPMENT';
   @IsOptional() @IsString() @MaxLength(2000) description?: string;
+  @IsOptional() @IsString() @MaxLength(300) repositoryEnvFile?: string | null;
 }
 
 const repositoryDto = (row: Selectable<Database['repositories']>, cache = branchCache(row)) => ({
@@ -107,6 +109,7 @@ const environmentDto = (row: Selectable<Database['environments']>) => ({
   name: row.name,
   slug: row.slug,
   environmentType: row.environment_type,
+  repositoryEnvFile: row.repository_env_file,
   description: row.description,
 });
 
@@ -469,6 +472,12 @@ export class ProjectsService {
       name: dto.name,
       slug: dto.slug,
       environment_type: dto.environmentType,
+      repository_env_file:
+        dto.repositoryEnvFile === undefined
+          ? undefined
+          : dto.repositoryEnvFile
+            ? relativePath(dto.repositoryEnvFile)
+            : null,
       description: dto.description ?? undefined,
       updated_at: now,
     };

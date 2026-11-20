@@ -67,6 +67,7 @@ class HealthCheckDto {
 
 class ReleasePolicyDto implements ReleasePolicy {
   @IsBoolean() requireApproval = false;
+  @IsBoolean() requireCodeReview = false;
   @IsBoolean() archivePushedImage = false;
   @IsIn(['OFF', 'PREVIOUS_HEALTHY', 'PINNED']) rollbackMode: ReleasePolicy['rollbackMode'] = 'OFF';
   @IsOptional() @IsUUID() pinnedDeploymentId?: string;

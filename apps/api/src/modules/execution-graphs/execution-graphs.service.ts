@@ -1,23 +1,25 @@
-import {
-  BadRequestException,
-  ConflictException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Kysely, Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
 import { requireProject } from '../projects/project-relations';
-import { compileCanvas, withDraftCanvas } from './execution-graph-canvas';
+import { canvasIssues, compileCanvas, withDraftCanvas } from './execution-graph-canvas';
 import {
-  extractGraphFlow,
-  type ExtractGraphFlowDto,
   type GraphDefinition,
+  type GraphFlow,
+  type GraphNode,
   type SaveGraphDraftDto,
   validateGraphDefinition,
 } from './execution-graph-definition';
+import {
+  GraphCompileError,
+  graphModulePorts,
+  type GraphBinding,
+  type GraphDiagnostic,
+  type GraphField,
+} from './graph-fields';
 
 function graphResponse(row: Selectable<Database['execution_graphs']>) {
   return {
@@ -75,51 +77,113 @@ export class ExecutionGraphsService {
     projectId: string,
     definition: GraphDefinition,
   ) {
-    const flowNodes = definition.flows.flatMap((flow) => flow.nodes);
-    const repos = [
-      ...new Set(
-        flowNodes.flatMap((node) =>
-          [node.checkout?.repositoryId, node.delivery?.build?.repositoryId].filter(
-            (id): id is string => Boolean(id),
-          ),
-        ),
-      ),
-    ];
-    if (repos.length) {
+    const tables = {
+      REPOSITORY: 'repositories',
+      ENVIRONMENT: 'environments',
+      SERVICE: 'services',
+      ARTIFACT: 'artifacts',
+    } as const;
+    type ResourceType = keyof typeof tables;
+    type Reference = { flow: GraphFlow; node: GraphNode; field: GraphField };
+    const refs = new Map<ResourceType, Map<string, Reference>>();
+    function addReference(flow: GraphFlow, node: GraphNode, field: GraphField, value: unknown) {
+      if (!Object.hasOwn(tables, field.type)) return;
+      const type = field.type as ResourceType;
+      const layer = refs.get(type) ?? new Map<string, Reference>();
+      for (const item of Array.isArray(value) ? value : [value]) {
+        const id =
+          typeof item === 'string'
+            ? item
+            : item && typeof item === 'object' && 'id' in item && typeof item.id === 'string'
+              ? item.id
+              : undefined;
+        if (id) layer.set(id, { flow, node, field });
+      }
+      if (layer.size) refs.set(type, layer);
+    }
+    function fromBinding(
+      flow: GraphFlow,
+      node: GraphNode,
+      field: GraphField,
+      binding: GraphBinding,
+    ) {
+      if (binding.kind === 'VALUE') addReference(flow, node, field, binding.value);
+      if (binding.kind === 'FIRST_AVAILABLE')
+        for (const item of binding.sources) fromBinding(flow, node, field, item);
+    }
+    const flows = new Map(definition.flows.map((flow) => [flow.id, flow]));
+    for (const flow of definition.flows) {
+      const start = flow.nodes.find((node) => node.type === 'START')!;
+      const end = flow.nodes.find((node) => node.type === 'END')!;
+      if (flow.serviceId)
+        addReference(
+          flow,
+          start,
+          { id: 'service', name: '项目服务', type: 'SERVICE' },
+          flow.serviceId,
+        );
+      for (const input of start.inputs ?? []) addReference(flow, start, input, input.defaultValue);
+      for (const node of flow.nodes) {
+        const repository = node.checkout?.repositoryId ?? node.build?.repositoryId;
+        if (repository)
+          addReference(
+            flow,
+            node,
+            { id: 'repository', name: '项目仓库', type: 'REPOSITORY' },
+            repository,
+          );
+        const ports = graphModulePorts(node, flows.get(node.flowId ?? ''))?.inputs ?? [];
+        for (const field of ports) {
+          const binding = flow.inputBindings?.[node.id]?.[field.id];
+          if (binding) fromBinding(flow, node, field, binding);
+        }
+      }
+      for (const field of end.outputs ?? []) {
+        const binding = flow.outputBindings?.[field.id];
+        if (binding) fromBinding(flow, end, field, binding);
+      }
+    }
+    for (const [type, bindings] of refs) {
+      const ids = [...bindings.keys()];
       const rows = await tx
-        .selectFrom('repositories')
+        .selectFrom(tables[type])
         .select('id')
         .where('project_id', '=', projectId)
-        .where('id', 'in', repos)
+        .where('id', 'in', ids)
         .execute();
-      if (rows.length !== repos.length)
-        throw new BadRequestException('引用的源码仓库不存在或不属于当前项目');
+      const available = new Set(rows.map((row) => row.id));
+      const missing = ids.find((id) => !available.has(id));
+      if (missing) {
+        const { flow, node, field } = bindings.get(missing)!;
+        throw new GraphCompileError({
+          flowId: flow.id,
+          nodeId: node.id,
+          fieldId: field.id,
+          message: `「${flow.name}」 → 「${node.name}」 → 「${field.name}」 · 引用的资源不存在或不属于当前项目`,
+        });
+      }
     }
-    const services = [...new Set(flowNodes.flatMap(({ delivery }) => delivery?.serviceId ?? []))];
-    if (services.length) {
-      const rows = await tx
-        .selectFrom('services')
-        .select('id')
-        .where('project_id', '=', projectId)
-        .where('id', 'in', services)
-        .execute();
-      if (rows.length !== services.length)
-        throw new BadRequestException('构建或部署绑定的服务不存在或不属于当前项目');
+  }
+
+  async validate(
+    projectId: string,
+    definition: GraphDefinition,
+  ): Promise<{ issues: GraphDiagnostic[] }> {
+    await requireProject(this.database.db, projectId);
+    if (!definition.canvas) return { issues: [{ message: '请提交执行图画布' }] };
+    const issues = canvasIssues(definition.canvas);
+    if (issues.length) return { issues };
+    try {
+      await this.validateReferences(
+        this.database.db,
+        projectId,
+        compileCanvas(definition.canvas, true),
+      );
+      return { issues: [] };
+    } catch (error) {
+      if (error instanceof GraphCompileError) return { issues: [error.issue] };
+      throw error;
     }
-    const nodes = flowNodes.filter((node) => node.pipelineId);
-    if (!nodes.length) return;
-    const ids = [...new Set(nodes.map((node) => node.pipelineId!))];
-    const rows = await tx
-      .selectFrom('pipelines as p')
-      .innerJoin('pipeline_versions as v', 'v.pipeline_id', 'p.id')
-      .select(['p.id', 'v.version'])
-      .where('p.project_id', '=', projectId)
-      .where('p.id', 'in', ids)
-      .where('v.version', 'in', [...new Set(nodes.map((node) => node.pipelineVersion!))])
-      .execute();
-    const available = new Set(rows.map((row) => `${row.id}/${row.version}`));
-    if (nodes.some((node) => !available.has(`${node.pipelineId}/${node.pipelineVersion}`)))
-      throw new BadRequestException('节点引用的固定流水线版本不存在或不属于当前项目');
   }
 
   async save(projectId: string, input: SaveGraphDraftDto, userId: string) {
@@ -160,41 +224,6 @@ export class ExecutionGraphsService {
       .where('id', '=', graph.id)
       .returningAll()
       .executeTakeFirstOrThrow();
-  }
-
-  async previewExtraction(projectId: string, input: ExtractGraphFlowDto) {
-    await requireProject(this.database.db, projectId);
-    const graph = await this.graph(projectId);
-    this.checkRevision(graph.revision, input.expectedRevision);
-    return extractGraphFlow(this.extractableDraft(graph.draft_json), input).preview;
-  }
-
-  async extract(projectId: string, input: ExtractGraphFlowDto, userId: string) {
-    return this.database.db.transaction().execute(async (tx) => {
-      const graph = await this.lockDraft(tx, projectId, input.expectedRevision);
-      const { definition, preview } = extractGraphFlow(
-        this.extractableDraft(graph.draft_json),
-        input,
-      );
-      await this.validateReferences(tx, projectId, definition);
-      const row = await this.updateDraft(tx, graph, definition);
-      await this.audit.record(
-        userId,
-        'execution_graph.extract',
-        'execution_graph',
-        graph.id,
-        { projectId, revision: row.revision, mode: input.mode, ...preview },
-        tx,
-      );
-      return graphResponse(row);
-    });
-  }
-
-  private extractableDraft(draft: string) {
-    const definition = JSON.parse(draft) as GraphDefinition;
-    if (definition.canvas)
-      throw new BadRequestException('在画布中配对开始节点和结束节点即可生成执行流');
-    return definition;
   }
 
   async publish(projectId: string, expectedRevision: number, userId: string) {

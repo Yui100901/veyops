@@ -4,6 +4,7 @@ import {
   Injectable,
   NotFoundException,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { findLegacyWebhookTask } from './legacy-webhook-task';
@@ -52,7 +53,9 @@ import {
   validatePipelineNodes,
 } from './pipeline-node-config';
 import { safeDeployPath, validateDefinition, validateGitUrl } from './pipeline.validation';
-import type { DeliveryExecutionProfile } from './delivery-execution-profile';
+import { storeDeliveryProfile, type DeliveryExecutionProfile } from './delivery-execution-profile';
+import { ownedGraphWorkspace, type GraphExecutionScope } from '../execution-graphs/graph-workspace';
+import { SourceReviewService } from '../deployments/source-review.service';
 
 @Injectable()
 export class PipelinesService implements OnModuleInit {
@@ -69,6 +72,7 @@ export class PipelinesService implements OnModuleInit {
     private readonly settings: SystemSettingsService,
     private readonly artifacts: ArtifactsService,
     private readonly metadata: RepositoryMetadataService,
+    @Optional() private readonly sourceReviews?: SourceReviewService,
   ) {}
   onModuleInit() {
     this.handlers.register({
@@ -210,39 +214,6 @@ export class PipelinesService implements OnModuleInit {
     };
   }
 
-  private async storeDeliveryProfile(
-    tx: Transaction<Database>,
-    profile: DeliveryExecutionProfile,
-    userId: string,
-  ) {
-    const now = Date.now();
-    await tx
-      .insertInto('pipelines')
-      .values({
-        id: profile.id,
-        project_id: profile.projectId,
-        service_id: profile.serviceId,
-        name: profile.name,
-        enabled: 1,
-        current_version: 1,
-        created_at: now,
-        updated_at: now,
-      })
-      .onConflict((conflict) => conflict.column('id').doNothing())
-      .execute();
-    await tx
-      .insertInto('pipeline_versions')
-      .values({
-        id: profile.versionId,
-        pipeline_id: profile.id,
-        version: 1,
-        definition_json: JSON.stringify(profile.definition),
-        created_by: userId,
-        created_at: now,
-      })
-      .onConflict((conflict) => conflict.column('id').doNothing())
-      .execute();
-  }
   private async lockRepository(tx: Transaction<Database>, projectId: string, repositoryId: string) {
     const row = await tx
       .updateTable('repositories')
@@ -438,51 +409,7 @@ export class PipelinesService implements OnModuleInit {
       input.environmentId,
       input.targetId,
     );
-    const configured = env.config?.targetSelection;
     const defaults = await this.settings.get(pipeline.projectId);
-    const defaultParallel =
-      input.serverIds !== undefined || input.groupIds !== undefined
-        ? (input.maxParallel ?? configured?.maxParallel ?? defaults.defaultMaxParallelTargets)
-        : 1;
-    const selection =
-      directDeploymentSelection(
-        {
-          ...input,
-          strategy: input.strategy ?? configured?.strategy,
-          failurePolicy: input.failurePolicy ?? configured?.failurePolicy,
-        },
-        defaultParallel,
-      ) ?? (input.targetId ? undefined : (configured ?? undefined));
-    const legacyId =
-      input.targetId ?? (selection ? undefined : (env.config?.targetId ?? undefined));
-    const legacy = legacyId
-      ? await this.database.db
-          .selectFrom('deployment_targets')
-          .selectAll()
-          .where('id', '=', legacyId)
-          .executeTakeFirst()
-      : undefined;
-    if (!selection && !legacy) throw new BadRequestException('请选择服务器或服务器分组');
-    const members = selection
-      ? await selectedServerIds(this.database.db, selection)
-      : (
-          await this.database.db
-            .selectFrom('deployment_target_servers')
-            .select('server_id')
-            .where('target_id', '=', legacy!.id)
-            .orderBy('sort_order')
-            .execute()
-        ).map((member) => member.server_id);
-    const servers = await this.servers.snapshot(members);
-    const target = selection
-      ? {
-          id: undefined,
-          selection,
-          strategy: selection.strategy,
-          max_parallel: selection.maxParallel,
-          failure_policy: selection.failurePolicy,
-        }
-      : { ...legacy!, selection: undefined };
     const definition = plainToInstance(
       PipelineDefinitionDto,
       JSON.parse(version.definition_json),
@@ -531,6 +458,65 @@ export class PipelinesService implements OnModuleInit {
     }
     const errors = await validate(plainToInstance(PipelineDefinitionDto, definition));
     if (errors.length) throw new BadRequestException('当前交付配置无效');
+    const configured = env.config?.targetSelection;
+    const defaultParallel =
+      input.serverIds !== undefined || input.groupIds !== undefined
+        ? (input.maxParallel ?? configured?.maxParallel ?? defaults.defaultMaxParallelTargets)
+        : 1;
+    const selection =
+      directDeploymentSelection(
+        {
+          ...input,
+          strategy: input.strategy ?? configured?.strategy,
+          failurePolicy: input.failurePolicy ?? configured?.failurePolicy,
+        },
+        defaultParallel,
+      ) ?? (input.targetId ? undefined : (configured ?? undefined));
+    const legacyId =
+      input.targetId ?? (selection ? undefined : (env.config?.targetId ?? undefined));
+    const legacy = legacyId
+      ? await this.database.db
+          .selectFrom('deployment_targets')
+          .selectAll()
+          .where('id', '=', legacyId)
+          .executeTakeFirst()
+      : undefined;
+    const targetless =
+      !selection &&
+      !legacyId &&
+      profile &&
+      mode === 'BUILD_ONLY' &&
+      definition.buildLocation === 'MANAGER';
+    if (!selection && !legacy && !targetless)
+      throw new BadRequestException('请选择服务器或服务器分组');
+    const members = selection
+      ? await selectedServerIds(this.database.db, selection)
+      : !legacy
+        ? []
+        : (
+            await this.database.db
+              .selectFrom('deployment_target_servers')
+              .select('server_id')
+              .where('target_id', '=', legacy.id)
+              .orderBy('sort_order')
+              .execute()
+          ).map((member) => member.server_id);
+    const servers = targetless ? [] : await this.servers.snapshot(members);
+    const target = selection
+      ? {
+          id: undefined,
+          selection,
+          strategy: selection.strategy,
+          max_parallel: selection.maxParallel,
+          failure_policy: selection.failurePolicy,
+        }
+      : {
+          id: legacy?.id,
+          selection: undefined,
+          strategy: legacy?.strategy ?? 'SEQUENTIAL',
+          max_parallel: legacy?.max_parallel ?? 1,
+          failure_policy: legacy?.failure_policy ?? 'STOP',
+        };
     if (
       (mode === 'DEPLOY' || definition.buildLocation === 'TARGET') &&
       servers.some((s) => !s.credentialId || !s.hostKeyFingerprint)
@@ -896,7 +882,14 @@ export class PipelinesService implements OnModuleInit {
       .selectFrom('artifacts')
       .innerJoin('pipeline_runs as build', 'build.id', 'artifacts.pipeline_run_id')
       .innerJoin('tasks as task', 'task.id', 'build.task_id')
-      .select(['build.id', 'task.payload_json', 'build.commit_sha'])
+      .select([
+        'build.id',
+        'task.payload_json',
+        'build.commit_sha',
+        'artifacts.artifact_type',
+        'artifacts.artifact_name',
+        'artifacts.registry_id',
+      ])
       .where('artifacts.id', 'in', artifactIds)
       .where('artifacts.project_id', '=', projectId)
       .where('artifacts.service_id', '=', serviceId)
@@ -909,13 +902,25 @@ export class PipelinesService implements OnModuleInit {
     if (
       !row ||
       rows.length !== artifactIds.length ||
-      rows.some((candidate) => candidate.id !== row.id)
+      rows.some(
+        (candidate) =>
+          candidate.id !== row.id ||
+          candidate.artifact_type !== row.artifact_type ||
+          candidate.artifact_name !== row.artifact_name,
+      )
     )
       throw new BadRequestException('请选择该服务和环境下同一次成功构建的产物');
     const build = (JSON.parse(row.payload_json) as TaskPayload).pipeline;
     if (!build || build.mode === 'DEPLOY_ARTIFACT')
       throw new BadRequestException('产物没有可用的构建记录');
-    return { definition: build.definition, commitSha: row.commit_sha };
+    return {
+      definition: {
+        ...build.definition,
+        artifactType: row.artifact_type as PipelineDefinition['artifactType'],
+        registryId: row.registry_id ?? undefined,
+      },
+      commitSha: row.commit_sha,
+    };
   }
 
   async deliveryArtifactCandidates(projectId: string, serviceId: string, environmentId: string) {
@@ -936,13 +941,32 @@ export class PipelinesService implements OnModuleInit {
       .execute();
   }
 
-  async deliveryArtifactIds(runId: string, targetIds: string[]) {
+  async deliveryArtifactIds(
+    runId: string,
+    targetIds: string[],
+    artifactKind?: string,
+    name?: string,
+  ) {
     const artifacts = await this.artifacts.deployableIn(this.database.db, runId);
-    const managedArchive = artifacts.find((artifact) => artifact.serverId === null);
-    const selected = managedArchive
-      ? [managedArchive]
-      : artifacts.filter((artifact) => artifact.serverId && targetIds.includes(artifact.serverId));
-    return this.artifactsMatchTargets(selected, targetIds) ? selected.map(({ id }) => id) : [];
+    const groups = new Map<string, typeof artifacts>();
+    for (const artifact of artifacts) {
+      if ((artifactKind && artifact.kind !== artifactKind) || (name && artifact.name !== name))
+        continue;
+      const key = artifact.name ?? '';
+      const group = groups.get(key);
+      if (group) group.push(artifact);
+      else groups.set(key, [artifact]);
+    }
+    for (const candidates of groups.values()) {
+      const managedArchive = candidates.find((artifact) => artifact.serverId === null);
+      const selected = managedArchive
+        ? [managedArchive]
+        : candidates.filter(
+            (artifact) => artifact.serverId && targetIds.includes(artifact.serverId),
+          );
+      if (this.artifactsMatchTargets(selected, targetIds)) return selected.map(({ id }) => id);
+    }
+    return [];
   }
 
   resolveDeliveryBranch(projectId: string, repositoryId: string, branch?: string) {
@@ -966,6 +990,8 @@ export class PipelinesService implements OnModuleInit {
       .select([
         'artifacts.id',
         'artifacts.artifact_type',
+        'artifacts.artifact_name',
+        'artifacts.artifact_kind',
         'artifacts.checksum',
         'artifacts.compose_checksum',
         'artifacts.image_digest',
@@ -973,6 +999,7 @@ export class PipelinesService implements OnModuleInit {
         'artifacts.server_id',
         'artifacts.storage_type',
         'artifacts.registry_id',
+        'artifacts.source_commit as artifact_commit',
         'pipeline_runs.commit_sha',
         'pipeline_runs.id as run_id',
         'pipeline_runs.task_id',
@@ -993,7 +1020,13 @@ export class PipelinesService implements OnModuleInit {
     if (
       !source ||
       rows.length !== artifactIds.length ||
-      rows.some((row) => row.run_id !== source.run_id)
+      rows.some(
+        (row) =>
+          row.run_id !== source.run_id ||
+          row.artifact_name !== source.artifact_name ||
+          row.artifact_kind !== source.artifact_kind ||
+          (row.artifact_commit !== null && row.artifact_commit !== source.commit_sha),
+      )
     )
       throw new BadRequestException('产物必须来自相同服务和环境的一次构建');
     if (source.status !== 'SUCCESS' && source.status !== 'PARTIAL_FAILED')
@@ -1040,6 +1073,17 @@ export class PipelinesService implements OnModuleInit {
     const targets = p.servers.map((server) => server.id);
     if (!this.artifactsMatchTargets(references, targets))
       throw new BadRequestException('目标端构建产物须与所选部署目标逐一匹配');
+    const reviewRequired = p.env.config?.releasePolicy?.requireCodeReview;
+    if (reviewRequired && !this.sourceReviews) throw new ConflictException('代码审核服务不可用');
+    const sourceReview = reviewRequired
+      ? await this.sourceReviews?.requireReviewed(
+          p.pipeline.projectId,
+          p.pipeline.serviceId,
+          p.environment.id,
+          source.commit_sha,
+          { force: true },
+        )
+      : undefined;
     const configurationHash = createHash('sha256')
       .update(
         JSON.stringify([
@@ -1050,6 +1094,7 @@ export class PipelinesService implements OnModuleInit {
           this.configurationHash(p),
           rows,
           references,
+          sourceReview,
         ]),
       )
       .digest('hex');
@@ -1095,6 +1140,7 @@ export class PipelinesService implements OnModuleInit {
       serverIds: targets,
       mode: 'DEPLOY_ARTIFACT' as const,
       requireApproval: Boolean(p.env.config?.releasePolicy?.requireApproval),
+      requireCodeReview: Boolean(p.env.config?.releasePolicy?.requireCodeReview),
       version: p.version.version,
       commitSha: source.commit_sha,
       sourceBuildTaskId: source.task_id,
@@ -1119,6 +1165,16 @@ export class PipelinesService implements OnModuleInit {
       undefined,
       profile,
     );
+    const requireCodeReview = Boolean(p.env.config?.releasePolicy?.requireCodeReview);
+    if (requireCodeReview && !this.sourceReviews) throw new ConflictException('代码审核服务不可用');
+    if (requireCodeReview)
+      await this.sourceReviews?.requireReviewed(
+        p.pipeline.projectId,
+        p.pipeline.serviceId,
+        p.environment.id,
+        p.commitSha,
+        { force: true },
+      );
     return {
       version: p.version.version,
       serviceId: p.pipeline.serviceId,
@@ -1126,6 +1182,7 @@ export class PipelinesService implements OnModuleInit {
       commitSha: p.commitSha,
       serverIds: p.servers.map(({ id }) => id),
       requireApproval: Boolean(p.env.config?.releasePolicy?.requireApproval),
+      requireCodeReview,
       configurationHash: this.configurationHash(p),
     };
   }
@@ -1167,7 +1224,7 @@ export class PipelinesService implements OnModuleInit {
       ),
       userId,
       async (tx) => {
-        if (options.profile) await this.storeDeliveryProfile(tx, options.profile, userId);
+        if (options.profile) await storeDeliveryProfile(tx, options.profile, userId);
         if (snapshot.targetSelection)
           await confirmDeploymentMembers(tx, snapshot.targetSelection, targets);
       },
@@ -1192,6 +1249,7 @@ export class PipelinesService implements OnModuleInit {
       gitRef?: string;
       beforeInsert?: (tx: Transaction<Database>) => Promise<void>;
       profile?: DeliveryExecutionProfile;
+      graph?: GraphExecutionScope;
       afterInsert?: (tx: Transaction<Database>, taskId: string, created: boolean) => Promise<void>;
     } = {},
   ) {
@@ -1229,6 +1287,21 @@ export class PipelinesService implements OnModuleInit {
     )
       throw new ConflictException('执行配置已变化，请重新确认');
     const commit = p.commitSha;
+    if (options.graph?.workspace) {
+      const workspace = await ownedGraphWorkspace(
+        this.database.db,
+        p.pipeline.projectId,
+        options.graph.workspace,
+      );
+      if (workspace.repositoryId !== p.definition.repositoryId || workspace.commitSha !== commit)
+        throw new ConflictException('构建工作区与已确认的源码版本不一致');
+    }
+    if (options.graph?.variables?.workspace)
+      await ownedGraphWorkspace(
+        this.database.db,
+        p.pipeline.projectId,
+        options.graph.variables.workspace,
+      );
     const snapshot: PipelineSnapshot = {
       ...this.snapshot(p, commit),
       mode: 'BUILD_ONLY',
@@ -1237,6 +1310,7 @@ export class PipelinesService implements OnModuleInit {
         allowPartialDeploy: p.allowPartialDeploy,
       }),
       triggerType: options.triggerType ?? 'MANUAL',
+      graph: options.graph,
     };
     const task = await this.tasks.create(
       this.taskInput(
@@ -1248,7 +1322,7 @@ export class PipelinesService implements OnModuleInit {
       ),
       userId,
       async (tx) => {
-        if (options.profile) await this.storeDeliveryProfile(tx, options.profile, userId);
+        if (options.profile) await storeDeliveryProfile(tx, options.profile, userId);
         await options.beforeInsert?.(tx);
         if (snapshot.targetSelection)
           await confirmDeploymentMembers(tx, snapshot.targetSelection, snapshot.targetMemberIds!);

@@ -24,8 +24,12 @@ import { requireProject } from '../projects/project-relations';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { redactTaskLog } from '../tasks/task-log.service';
 import type { GraphDefinition } from './execution-graph-definition';
+import { flowStart, type Values } from './graph-run-bindings';
+import { validateGraphValue, type GraphField } from './graph-fields';
 import {
   graphDeliveryId,
+  triggerEventFields,
+  type GraphParameterMapping,
   type GraphTriggerDto,
   type GraphTriggerKind,
   type InvokeGraphTriggerDto,
@@ -46,20 +50,64 @@ interface TriggerConfig {
   credentialNonce?: string;
   upstreamFlowId?: string;
   upstreamStatus?: UpstreamResult;
+  parameterMappings?: Record<string, GraphParameterMapping>;
+  repositoryId?: string;
+  refPrefix?: string;
 }
 
-const safeNodes = new Set([
-  'START',
-  'END',
-  'LOG',
-  'CONDITION',
-  'SWITCH',
-  'PARALLEL',
-  'JOIN',
-  'FLOW_CALL',
-  'DELAY',
-  'APPROVAL',
-]);
+interface TriggerEventInput {
+  value?: string | null;
+  repositoryId?: string;
+  ref?: string;
+  commitSha?: string;
+  scheduledAt?: number;
+  upstreamRunId?: string;
+  upstreamStatus?: string;
+}
+
+function eventFields(row: Event): TriggerEventInput {
+  if (!row.input_value) return {};
+  const input = JSON.parse(row.input_value) as TriggerEventInput;
+  return input;
+}
+
+function mappedValue(
+  field: GraphField,
+  mapping: GraphParameterMapping,
+  event: TriggerEventInput,
+  eventId: string,
+) {
+  if (mapping.source === 'VALUE') return mapping.value;
+  switch (mapping.field) {
+    case 'repository':
+      return event.repositoryId;
+    case 'commit':
+      return (
+        event.commitSha &&
+        (field.type === 'GIT_REF' ? { kind: 'COMMIT', value: event.commitSha } : event.commitSha)
+      );
+    case 'ref':
+      return (
+        event.ref &&
+        (field.type === 'GIT_REF'
+          ? {
+              kind: event.ref.startsWith('refs/tags/') ? 'TAG' : 'BRANCH',
+              value: event.ref.replace(/^refs\/(heads|tags)\//, ''),
+            }
+          : event.ref)
+      );
+    case 'eventId':
+      return eventId;
+    case 'scheduledAt':
+      return field.type === 'TEXT' && event.scheduledAt !== undefined
+        ? new Date(event.scheduledAt).toISOString()
+        : event.scheduledAt;
+    case 'upstreamRunId':
+      return event.upstreamRunId;
+    case 'upstreamStatus':
+      return event.upstreamStatus;
+  }
+}
 const failed = ['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION'];
 const completed = ['SUCCESS', 'CANCELLED', ...failed];
 const batchSize = 50;
@@ -69,7 +117,17 @@ function config(row: Rule) {
 }
 
 function visibleRule(row: Rule) {
-  const { inputValue, cron, timeZone, credentialId, upstreamFlowId, upstreamStatus } = config(row);
+  const {
+    inputValue,
+    cron,
+    timeZone,
+    credentialId,
+    upstreamFlowId,
+    upstreamStatus,
+    parameterMappings,
+    repositoryId,
+    refPrefix,
+  } = config(row);
   return {
     id: row.id,
     name: row.name,
@@ -84,6 +142,9 @@ function visibleRule(row: Rule) {
     credentialId,
     upstreamFlowId,
     upstreamStatus,
+    parameterMappings,
+    repositoryId,
+    refPrefix,
   };
 }
 
@@ -96,6 +157,7 @@ function visibleEvent(row: Event) {
     error: row.error,
     createdAt: row.created_at,
     finishedAt: row.finished_at,
+    metadata: eventFields(row),
   };
 }
 
@@ -183,26 +245,57 @@ export class GraphTriggersService implements OnModuleInit {
     return JSON.parse(row.definition_json) as GraphDefinition;
   }
 
-  private ensureSafe(definition: GraphDefinition, flowId: string) {
-    const visited = new Set<string>();
-    const visit = (id: string) => {
-      if (visited.has(id)) return;
-      visited.add(id);
-      const flow = definition.flows.find((candidate) => candidate.id === id);
-      if (!flow) throw new NotFoundException('该版本中不存在选中的执行流');
-      for (const node of flow.nodes) {
-        if (!safeNodes.has(node.type))
-          throw new BadRequestException(
-            '原生触发器只允许图内控制、日志与等待节点。源码拉取、Shell 与交付节点请手动运行',
-          );
-        if (node.condition?.key === 'commitSha' || node.switch?.key === 'commitSha')
-          throw new BadRequestException('触发器仅能提供普通运行参数，需提交 SHA 的节点请手动运行');
-        if (node.type === 'FLOW_CALL') visit(node.flowId!);
-      }
-    };
-    visit(flowId);
+  private startFields(definition: GraphDefinition, flowId: string) {
+    const flow = definition.flows.find((candidate) => candidate.id === flowId);
+    if (!flow) throw new NotFoundException('该版本中不存在选中的执行流');
+    return flowStart(flow).inputs ?? [];
   }
 
+  private validateMappings(fields: GraphField[], input: GraphTriggerDto) {
+    const mappings = Object.entries(input.parameterMappings ?? {});
+    if (mappings.length > 64 || JSON.stringify(mappings).length > 32768)
+      throw new BadRequestException('触发参数映射过大');
+    const samples: TriggerEventInput = {
+      ...(input.kind === 'WEBHOOK' || input.kind === 'API'
+        ? {
+            repositoryId: '00000000-0000-4000-a000-000000000001',
+            ref: 'refs/heads/main',
+            commitSha: 'a'.repeat(40),
+          }
+        : {}),
+      ...(input.kind === 'CRON' && { scheduledAt: 1 }),
+      ...(input.kind === 'UPSTREAM' && { upstreamRunId: 'example', upstreamStatus: 'SUCCESS' }),
+    };
+    for (const [id, mapping] of mappings) {
+      const field = fields.find((candidate) => candidate.id === id);
+      if (!field || !mapping || !['VALUE', 'EVENT'].includes(mapping.source))
+        throw new BadRequestException('触发参数映射未引用有效的开始参数');
+      if (mapping.source === 'EVENT' && !triggerEventFields.includes(mapping.field))
+        throw new BadRequestException('触发参数引用了未知事件字段');
+      const sample = mappedValue(field, mapping, samples, 'example');
+      if (
+        sample === undefined ||
+        (mapping.source === 'VALUE' && !validateGraphValue(field, sample)) ||
+        (mapping.source === 'EVENT' &&
+          (field.multiple || !validateGraphValue({ ...field, options: undefined }, sample)))
+      )
+        throw new BadRequestException('触发事件无法提供参数「' + field.name + '」所需的值');
+      const encoded = JSON.stringify(sample);
+      if (redactTaskLog(encoded) !== encoded)
+        throw new BadRequestException('触发映射不能包含明文凭据');
+    }
+    if (input.enabled)
+      for (const field of fields)
+        if (
+          field.required !== false &&
+          field.defaultValue === undefined &&
+          field.selection !== 'LATEST_COMPATIBLE' &&
+          !Object.hasOwn(input.parameterMappings ?? {}, field.id)
+        )
+          throw new BadRequestException(
+            '启用前请为必填参数「' + field.name + '」指定事件映射或默认值',
+          );
+  }
   private getRule(projectId: string, triggerId: string) {
     return this.database.db
       .selectFrom('execution_graph_triggers')
@@ -244,11 +337,12 @@ export class GraphTriggersService implements OnModuleInit {
     if (!name) throw new BadRequestException('请填写触发器名称');
     await requireProject(this.database.db, projectId);
     const definition = await this.published(projectId, input.version);
-    this.ensureSafe(definition, input.flowId);
+    this.validateMappings(this.startFields(definition, input.flowId), input);
     const now = Date.now();
     const settings: TriggerConfig = {
       revision: randomUUID(),
       inputValue: plainValue(input.inputValue),
+      parameterMappings: input.parameterMappings,
     };
     let nextAt: number | null = null;
     if (input.kind === 'CRON') {
@@ -268,6 +362,18 @@ export class GraphTriggersService implements OnModuleInit {
       const { nonce } = await this.checkCredential(input.credentialId);
       settings.credentialId = input.credentialId;
       settings.credentialNonce = nonce;
+      settings.repositoryId = input.repositoryId;
+      settings.refPrefix = input.refPrefix;
+      if (
+        input.repositoryId &&
+        !(await this.database.db
+          .selectFrom('repositories')
+          .select('id')
+          .where('id', '=', input.repositoryId)
+          .where('project_id', '=', projectId)
+          .executeTakeFirst())
+      )
+        throw new BadRequestException('Webhook 仓库过滤必须引用当前项目中的仓库');
     }
     if (input.kind === 'UPSTREAM') {
       if (
@@ -419,8 +525,9 @@ export class GraphTriggersService implements OnModuleInit {
     tx: Transaction<Database>,
     rule: Rule,
     eventId: string,
-    value: string | null,
+    fields: TriggerEventInput,
   ) {
+    const value = JSON.stringify(fields);
     const hash = requestHash(rule, eventId, value);
     const row = await tx
       .insertInto('execution_graph_trigger_events')
@@ -455,12 +562,12 @@ export class GraphTriggersService implements OnModuleInit {
       throw new NotFoundException('已启用的 API 触发器不存在');
     return this.database.db.transaction().execute(async (tx) => {
       await this.lockRule(tx, rule);
-      const event = await this.recordEvent(
-        tx,
-        rule,
-        input.eventId,
-        plainValue(input.inputValue ?? config(rule).inputValue),
-      );
+      const event = await this.recordEvent(tx, rule, input.eventId, {
+        value: plainValue(input.inputValue ?? config(rule).inputValue),
+        repositoryId: input.repositoryId,
+        ref: input.ref,
+        commitSha: input.commitSha?.toLowerCase(),
+      });
       await this.audit.record(
         userId,
         'execution-graph.trigger.invoke',
@@ -481,6 +588,9 @@ export class GraphTriggersService implements OnModuleInit {
       eventId?: string;
       signature?: string;
       inputValue?: string;
+      repositoryId?: string;
+      ref?: string;
+      commitSha?: string;
     },
   ) {
     const { raw, timestamp, eventId, signature } = input;
@@ -518,15 +628,20 @@ export class GraphTriggersService implements OnModuleInit {
     )
       throw new UnauthorizedException('Webhook 认证失败');
     await requireProject(this.database.db, rule.project_id);
+    if (
+      (settings.repositoryId && settings.repositoryId !== input.repositoryId) ||
+      (settings.refPrefix && !input.ref?.startsWith(settings.refPrefix))
+    )
+      return { status: 'IGNORED' };
     return this.database.db.transaction().execute(async (tx) => {
       await this.lockRule(tx, rule);
       await this.lockCredential(tx, settings);
-      const event = await this.recordEvent(
-        tx,
-        rule,
-        eventId,
-        plainValue(input.inputValue ?? settings.inputValue),
-      );
+      const event = await this.recordEvent(tx, rule, eventId, {
+        value: plainValue(input.inputValue ?? settings.inputValue),
+        repositoryId: input.repositoryId,
+        ref: input.ref,
+        commitSha: input.commitSha?.toLowerCase(),
+      });
       return visibleEvent(event);
     });
   }
@@ -567,7 +682,10 @@ export class GraphTriggersService implements OnModuleInit {
           .returning('id')
           .executeTakeFirst();
         if (scheduled)
-          await this.recordEvent(tx, rule, String(rule.next_at), settings.inputValue ?? null);
+          await this.recordEvent(tx, rule, String(rule.next_at), {
+            value: settings.inputValue,
+            scheduledAt: rule.next_at!,
+          });
       });
     }
   }
@@ -589,7 +707,7 @@ export class GraphTriggersService implements OnModuleInit {
             : completed;
       const runs = await this.database.db
         .selectFrom('execution_flow_runs as run')
-        .select('run.id')
+        .select(['run.id', 'run.status'])
         .where('run.project_id', '=', rule.project_id)
         .where('run.version', '=', rule.version)
         .where('run.flow_id', '=', settings.upstreamFlowId!)
@@ -617,7 +735,11 @@ export class GraphTriggersService implements OnModuleInit {
         .execute(async (tx) => {
           await this.lockRule(tx, rule);
           for (const run of runs)
-            await this.recordEvent(tx, rule, run.id, settings.inputValue ?? null);
+            await this.recordEvent(tx, rule, run.id, {
+              value: settings.inputValue,
+              upstreamRunId: run.id,
+              upstreamStatus: run.status,
+            });
         })
         .catch((error: unknown) => {
           if (!(error instanceof ConflictException)) throw error;
@@ -638,12 +760,38 @@ export class GraphTriggersService implements OnModuleInit {
       )
         throw new ConflictException('触发器已停用或配置已变更');
       const definition = await this.published(rule.project_id, rule.version);
-      this.ensureSafe(definition, rule.flow_id);
-      const inputs = event.input_value == null ? {} : { value: event.input_value };
-      const preview = await this.runner.preview(rule.project_id, rule.flow_id, {
-        version: rule.version,
-        inputs,
-      });
+      const fields = this.startFields(definition, rule.flow_id);
+      const eventInput = eventFields(event);
+      const mappings = config(rule).parameterMappings ?? {};
+      const parameters = Object.fromEntries(
+        fields.flatMap((field) => {
+          const mapping = Object.hasOwn(mappings, field.id) ? mappings[field.id] : undefined;
+          if (!mapping) return [];
+          const value = mappedValue(field, mapping, eventInput, event.event_key);
+          return value === undefined ? [] : [[field.id, value]];
+        }),
+      );
+      const inputs = {
+        value: eventInput.value ?? undefined,
+        commitSha: eventInput.commitSha,
+        parameters,
+      };
+      const metadata: Values = {
+        ...eventInput,
+        value: undefined,
+        eventId: event.event_key,
+        kind: rule.kind,
+        triggeredAt: eventInput.scheduledAt ?? event.created_at,
+      };
+      const preview = await this.runner.preview(
+        rule.project_id,
+        rule.flow_id,
+        {
+          version: rule.version,
+          inputs,
+        },
+        metadata,
+      );
       await this.runner.run(
         rule.project_id,
         rule.flow_id,
@@ -656,6 +804,7 @@ export class GraphTriggersService implements OnModuleInit {
         rule.created_by,
         {
           triggerType: rule.kind as GraphTriggerKind,
+          metadata,
           beforeInsert: async (tx) => {
             await this.lockRule(tx, rule);
             await this.requireAdmin(tx, rule.created_by);

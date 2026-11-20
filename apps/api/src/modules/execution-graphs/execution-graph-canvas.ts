@@ -2,14 +2,23 @@ import { BadRequestException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { redactTaskLog } from '../tasks/task-log.service';
 import {
+  annotateGraphIssue,
   orderedFlowNodes,
   validateGraphDefinition,
   type GraphCanvas,
   type GraphDefinition,
   type GraphEdge,
+  type GraphEndpoint,
   type GraphFlow,
   type GraphNode,
 } from './execution-graph-definition';
+import {
+  GraphCompileError,
+  graphModulePorts,
+  graphRecord,
+  safeGraphId,
+  type GraphDiagnostic,
+} from './graph-fields';
 
 /** Present older drafts as one canvas while keeping the published flow IDs addressable. */
 export function withDraftCanvas(
@@ -81,6 +90,11 @@ function validateCanvas(canvas: GraphCanvas) {
       node.message,
       node.condition?.value,
       node.shell?.command,
+      node.build?.installCommand,
+      node.build?.buildCommand,
+      node.deploy?.startCommand,
+      node.deploy?.stopCommand,
+      node.deploy?.healthCheckCommand,
       ...(node.switch?.cases ?? []),
     ];
     if (text.some((value) => value && redactTaskLog(value) !== value))
@@ -89,32 +103,97 @@ function validateCanvas(canvas: GraphCanvas) {
   return { byId, edges };
 }
 
+const dynamicBranch = (node: GraphNode) =>
+  node.type === 'CONDITION' || node.type === 'SWITCH' || node.type === 'PARALLEL';
+
 function deriveFlow(
   start: GraphNode,
-  endId: string,
+  endpoint: GraphEndpoint,
   byId: ReadonlyMap<string, GraphNode>,
   edges: ReadonlyMap<string, GraphEdge[]>,
 ) {
+  const { endId, inputBindings, outputBindings, edgeSelections, serviceId } = endpoint;
+  const flow: GraphFlow = {
+    id: start.id,
+    name: start.name,
+    nodes: [],
+    edges: [],
+    ...(serviceId !== undefined && { serviceId }),
+    ...(inputBindings !== undefined && { inputBindings }),
+    ...(outputBindings !== undefined && { outputBindings }),
+    ...(edgeSelections !== undefined && { edgeSelections }),
+  };
+  // Sibling paths can lead to other flows' END nodes. Fixed selections further
+  // constrain ordinary branches; control nodes retain all declared outcomes.
+  const selections = edgeSelections ?? {};
+  const issue = (node: GraphNode, message: string): never => {
+    throw new GraphCompileError({
+      flowId: flow.id,
+      nodeId: node.id,
+      message: `「${flow.name}」 → 「${node.name}」 · ${message}`,
+    });
+  };
+  if (!graphRecord(selections)) issue(start, '选线配置无效');
+  for (const [id, targets] of Object.entries(selections)) {
+    const node = byId.get(id);
+    if (
+      !safeGraphId(id) ||
+      !node ||
+      dynamicBranch(node) ||
+      node.type === 'END' ||
+      !Array.isArray(targets) ||
+      targets.length !== 1 ||
+      !edges.get(id)?.some((edge) => edge.to === targets[0])
+    )
+      issue(node ?? start, '固定选线必须指向已有的一条普通出线');
+  }
+  const allowed = (id: string) =>
+    Object.hasOwn(selections, id)
+      ? (edges.get(id) ?? []).filter((edge) => edge.to === selections[id]?.[0])
+      : (edges.get(id) ?? []);
+  const reverse = new Map<string, string[]>();
+  for (const id of byId.keys())
+    for (const { to } of allowed(id)) {
+      const predecessors = reverse.get(to) ?? [];
+      predecessors.push(id);
+      reverse.set(to, predecessors);
+    }
+  const toEnd = new Set([endId]);
+  const incoming = [endId];
+  for (const id of incoming)
+    for (const source of reverse.get(id) ?? []) {
+      if (!toEnd.has(source)) {
+        toEnd.add(source);
+        incoming.push(source);
+      }
+    }
   const visited = new Set<string>();
   const pending = [start.id];
-  const flow: GraphFlow = { id: start.id, name: start.name, nodes: [], edges: [] };
   for (const id of pending) {
     if (visited.has(id)) continue;
     visited.add(id);
     const node = byId.get(id)!;
     flow.nodes.push(node);
     if (id === endId) continue;
-    const outgoing = edges.get(id);
-    if (node.type === 'END' || !outgoing?.length)
-      throw new BadRequestException(
-        `「${start.name}」的路径必须全部到达已配对的结束节点，请检查「${node.name}」`,
-      );
+    const outgoing = dynamicBranch(node)
+      ? allowed(id)
+      : allowed(id).filter((edge) => toEnd.has(edge.to));
+    if (node.type === 'END' || !outgoing.length)
+      issue(node, '路径必须全部到达已配对的结束节点，请检查连线');
+    if (!dynamicBranch(node) && outgoing.length > 1)
+      issue(node, '多条出线均可到达所选结束节点，请在此执行流明确选择出线');
     flow.edges.push(...outgoing);
     pending.push(...outgoing.map(({ to }) => to));
   }
   if (!visited.has(endId))
     throw new BadRequestException(`「${start.name}」没有通往所选结束节点的路径`);
-  orderedFlowNodes(flow);
+  for (const id of Object.keys(selections))
+    if (!visited.has(id)) issue(byId.get(id)!, '固定选线所属节点不在此执行流的有效路径中');
+  try {
+    orderedFlowNodes(flow);
+  } catch (error) {
+    annotateGraphIssue(error, flow);
+  }
   return flow;
 }
 
@@ -122,14 +201,33 @@ function deriveFlow(
 export function compileCanvas(canvas: GraphCanvas, publish: boolean): GraphDefinition {
   const { byId, edges } = validateCanvas(canvas);
   const flows: GraphFlow[] = [];
-  for (const { startId, endId } of canvas.endpoints) {
+  for (const endpoint of canvas.endpoints) {
     try {
-      flows.push(deriveFlow(byId.get(startId)!, endId, byId, edges));
+      flows.push(deriveFlow(byId.get(endpoint.startId)!, endpoint, byId, edges));
     } catch (error) {
       if (publish || !(error instanceof BadRequestException)) throw error;
     }
   }
   const definition = { canvas, flows };
-  if (publish) validateGraphDefinition(definition);
+  if (publish) {
+    validateGraphDefinition(definition);
+    for (const flow of flows) {
+      flow.nodes = flow.nodes.map((node) => {
+        const module = graphModulePorts(node);
+        return module ? { ...node, moduleId: module.id, moduleVersion: module.version } : node;
+      });
+    }
+  }
   return definition;
+}
+
+export function canvasIssues(canvas: GraphCanvas): GraphDiagnostic[] {
+  try {
+    compileCanvas(canvas, true);
+    return [];
+  } catch (error) {
+    if (error instanceof GraphCompileError) return [error.issue];
+    if (!(error instanceof BadRequestException)) throw error;
+    return [{ message: error.message }];
+  }
 }

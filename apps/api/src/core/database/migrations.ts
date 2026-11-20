@@ -1504,6 +1504,76 @@ export const migrationProvider: MigrationProvider = {
           await db.schema.dropTable('project_variables').execute();
         },
       } satisfies Migration,
+      '021_graph_artifact_provenance': {
+        async up(db) {
+          await db.schema
+            .alterTable('environments')
+            .addColumn('repository_env_file', 'text')
+            .execute();
+          for (const column of [
+            'artifact_name',
+            'artifact_kind',
+            'graph_run_id',
+            'graph_node_run_id',
+          ])
+            await db.schema.alterTable('artifacts').addColumn(column, 'text').execute();
+          await db.schema
+            .createIndex('artifacts_graph_node_idx')
+            .on('artifacts')
+            .columns(['graph_run_id', 'graph_node_run_id'])
+            .execute();
+        },
+        async down(db) {
+          await db.schema.alterTable('environments').dropColumn('repository_env_file').execute();
+          await db.schema.dropIndex('artifacts_graph_node_idx').execute();
+          for (const column of [
+            'artifact_name',
+            'artifact_kind',
+            'graph_run_id',
+            'graph_node_run_id',
+          ])
+            await db.schema.alterTable('artifacts').dropColumn(column).execute();
+        },
+      } satisfies Migration,
+      '022_service_source_reviews': {
+        async up(db) {
+          await createTables(
+            db,
+            [
+              {
+                name: 'service_source_reviews',
+                columns: [
+                  ['id', 'text', { primaryKey: true }],
+                  ['project_id', 'text', { references: 'projects.id', onDelete: 'cascade' }],
+                  ['service_id', 'text', { references: 'services.id', onDelete: 'cascade' }],
+                  [
+                    'environment_id',
+                    'text',
+                    { references: 'environments.id', onDelete: 'cascade' },
+                  ],
+                  ['commit_sha', 'text'],
+                  ['decision', 'text'],
+                  ['reason', 'text', { nullable: true }],
+                  ['reviewed_by', 'text', { references: 'users.id', onDelete: 'restrict' }],
+                  ['created_at', 'bigint'],
+                  ['updated_at', 'bigint'],
+                ],
+                unique: [['project_id', 'service_id', 'environment_id', 'commit_sha']],
+                checks: ["decision in ('APPROVED', 'REVOKED')", 'length(commit_sha) in (40, 64)'],
+              },
+            ],
+            [],
+          );
+          await db.schema
+            .createIndex('service_source_reviews_scope_idx')
+            .on('service_source_reviews')
+            .columns(['service_id', 'environment_id', 'updated_at'])
+            .execute();
+        },
+        async down(db) {
+          await db.schema.dropTable('service_source_reviews').execute();
+        },
+      } satisfies Migration,
     };
   },
 };

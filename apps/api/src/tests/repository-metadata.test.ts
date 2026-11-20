@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -197,6 +197,8 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   await git('-C', source, 'add', 'docs/DEPLOY.md', 'services/web/src/index.ts');
   const second = await commit('Second change');
   const main = await commit('Third change');
+  await git('-C', source, 'tag', '-a', 'release/v1', '-m', 'annotated release', second);
+  await git('-C', source, 'tag', 'release/lightweight', first);
   await git('-C', source, 'switch', '-c', 'feature/release', first);
   const feature = await commit(`Branch change with ${token}`);
   await git('-C', source, 'switch', 'main');
@@ -353,6 +355,33 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     commitSha: feature,
     shallow: true,
   });
+  const tag = await metadata.planGraphCheckout(project, {
+    repositoryId: id,
+    mode: 'TAG',
+    tag: 'release/v1',
+  });
+  assert.equal(tag.commitSha, second);
+  assert.equal(tag.tag, 'release/v1');
+  assert.equal(
+    (
+      await metadata.planGraphCheckout(project, {
+        repositoryId: id,
+        mode: 'TAG',
+        tag: 'release/lightweight',
+      })
+    ).commitSha,
+    first,
+  );
+  await git('--git-dir', bare, 'tag', '-f', 'release/v1', main);
+  const persistedWorktree = join(directory, 'persisted-worktree');
+  assert.equal(
+    (await metadata.checkoutGraphSource(project, tag, undefined, persistedWorktree)).commitSha,
+    second,
+  );
+  assert.equal(
+    (await readFile(join(persistedWorktree, 'docs', 'DEPLOY.md'), 'utf8')).trim(),
+    '# Second release',
+  );
   const history = await metadata.planGraphCheckout(project, {
     repositoryId: id,
     mode: 'COMMIT',

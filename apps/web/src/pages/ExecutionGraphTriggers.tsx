@@ -3,9 +3,10 @@ import type { FormEvent } from 'react';
 import { Plus, Radio } from 'lucide-react';
 import { api, formatTime, message, post, useResource } from '../api';
 import { ErrorBanner, Field, Loading, RefreshButton, Status } from '../components';
-import type { Credential } from '../models';
-import type { GraphDocument, GraphFlow } from './execution-graph-definition';
-import { graphKey, isDeliveryNode } from './execution-graph-definition';
+import type { Credential, ProjectDetail } from '../models';
+import { GraphFieldValue } from './ExecutionGraphFields';
+import type { GraphDocument, GraphField } from './execution-graph-definition';
+import { graphKey } from './execution-graph-definition';
 
 const kindNames = {
   CRON: '定时',
@@ -13,13 +14,28 @@ const kindNames = {
   API: '认证 API',
   UPSTREAM: '上游执行流',
 };
+const events = {
+  repository: '仓库',
+  commit: '实际提交 SHA',
+  ref: '推送引用',
+  eventId: '事件 ID',
+  scheduledAt: '计划触发时间',
+  upstreamRunId: '上游运行 ID',
+  upstreamStatus: '上游状态',
+} as const;
+type EventField = keyof typeof events;
+type ParameterMapping =
+  { source: 'EVENT'; field: EventField } | { source: 'VALUE'; value: unknown };
+
 interface TriggerConfig {
   name: string;
   kind: keyof typeof kindNames;
   flowId: string;
   version: number;
   enabled: boolean;
-  inputValue?: string | null;
+  parameterMappings?: Record<string, ParameterMapping>;
+  repositoryId?: string;
+  refPrefix?: string;
   cron?: string | null;
   timeZone?: string | null;
   credentialId?: string | null;
@@ -40,31 +56,9 @@ interface TriggerEvent {
   finishedAt?: number | null;
 }
 
-function unavailableReason(flow: GraphFlow, flows: GraphFlow[]) {
-  const visited = new Set<string>();
-  const pending = [flow];
-  for (const item of pending) {
-    if (visited.has(item.id)) continue;
-    visited.add(item.id);
-    if (
-      item.nodes.some(
-        (node) => node.type === 'CHECKOUT' || node.type === 'SHELL' || isDeliveryNode(node),
-      )
-    )
-      return '源码拉取、Shell 和交付节点需要手动运行。';
-    if (item.nodes.some((node) => (node.condition?.key ?? node.switch?.key) === 'commitSha'))
-      return '需要指定提交 SHA 的流程需要手动运行。';
-    pending.push(
-      ...flows.filter((candidate) =>
-        item.nodes.some((node) => node.type === 'FLOW_CALL' && node.flowId === candidate.id),
-      ),
-    );
-  }
-  return '';
-}
-
 export function ExecutionGraphTriggers({
   path,
+  project,
   startId,
   latestVersion,
   canManage,
@@ -72,6 +66,7 @@ export function ExecutionGraphTriggers({
   onRun,
 }: {
   path: string;
+  project: ProjectDetail;
   startId: string;
   latestVersion: number | null;
   canManage: boolean;
@@ -112,6 +107,7 @@ export function ExecutionGraphTriggers({
           <TriggerEditor
             key={editing === 'create' ? 'create' : editing.id}
             path={path}
+            project={project}
             startId={startId}
             latestVersion={latestVersion}
             rule={editing === 'create' ? undefined : editing}
@@ -181,6 +177,7 @@ export function ExecutionGraphTriggers({
 
 function TriggerEditor({
   path,
+  project,
   startId,
   latestVersion,
   rule,
@@ -189,6 +186,7 @@ function TriggerEditor({
   onSaved,
 }: {
   path: string;
+  project: ProjectDetail;
   startId: string;
   latestVersion: number | null;
   rule?: TriggerRule;
@@ -215,9 +213,19 @@ function TriggerEditor({
   const credentials = useResource<Credential[]>(form.kind === 'WEBHOOK' ? '/credentials' : null);
   const flows = definition.data?.version === form.version ? definition.data.definition.flows : [];
   const target = flows.find(({ id }) => id === startId);
-  const blocked = target
-    ? unavailableReason(target, flows)
-    : '此发布版本没有由该开始节点定义的执行流。';
+  const fields = target?.nodes.find(({ type }) => type === 'START')?.inputs ?? [];
+  const missing = fields.filter(
+    (field) =>
+      field.required &&
+      field.defaultValue === undefined &&
+      !field.selection &&
+      !form.parameterMappings?.[field.id],
+  );
+  const blocked = !target
+    ? '此发布版本没有由该开始节点定义的执行流。'
+    : form.enabled && missing.length
+      ? '请为必填参数配置来源 · ' + missing.map(({ name }) => name).join('、')
+      : '';
   const valid = Boolean(
     form.name.trim() &&
     target &&
@@ -238,9 +246,15 @@ function TriggerEditor({
       version: form.version,
       flowId: startId,
       enabled: form.enabled,
-      ...(form.inputValue ? { inputValue: form.inputValue } : {}),
+      ...(form.parameterMappings && { parameterMappings: form.parameterMappings }),
       ...(form.kind === 'CRON' ? { cron: form.cron?.trim(), timeZone: form.timeZone?.trim() } : {}),
-      ...(form.kind === 'WEBHOOK' ? { credentialId: form.credentialId } : {}),
+      ...(form.kind === 'WEBHOOK'
+        ? {
+            credentialId: form.credentialId,
+            ...(form.repositoryId && { repositoryId: form.repositoryId }),
+            ...(form.refPrefix?.trim() && { refPrefix: form.refPrefix.trim() }),
+          }
+        : {}),
       ...(form.kind === 'UPSTREAM'
         ? { upstreamFlowId: form.upstreamFlowId, upstreamStatus: form.upstreamStatus }
         : {}),
@@ -278,7 +292,9 @@ function TriggerEditor({
           <Field label="触发类型">
             <select
               value={form.kind}
-              onChange={(e) => patch({ kind: e.target.value as TriggerConfig['kind'] })}
+              onChange={(e) =>
+                patch({ kind: e.target.value as TriggerConfig['kind'], parameterMappings: {} })
+              }
             >
               {Object.entries(kindNames).map(([value, label]) => (
                 <option key={value} value={value}>
@@ -290,7 +306,13 @@ function TriggerEditor({
           <Field label="固定发布版本">
             <select
               value={form.version}
-              onChange={(e) => patch({ version: Number(e.target.value), upstreamFlowId: '' })}
+              onChange={(e) =>
+                patch({
+                  version: Number(e.target.value),
+                  upstreamFlowId: '',
+                  parameterMappings: {},
+                })
+              }
             >
               {versions.map(({ version }) => (
                 <option key={version} value={version}>
@@ -298,13 +320,6 @@ function TriggerEditor({
                 </option>
               ))}
             </select>
-          </Field>
-          <Field label="默认运行参数">
-            <input
-              maxLength={500}
-              value={form.inputValue ?? ''}
-              onChange={(e) => patch({ inputValue: e.target.value })}
-            />
           </Field>
           {form.kind === 'CRON' && (
             <>
@@ -377,6 +392,50 @@ function TriggerEditor({
             </>
           )}
         </div>
+        {form.kind === 'WEBHOOK' && (
+          <div className="form-grid">
+            <Field label="仅接收指定仓库（可选）">
+              <select
+                value={form.repositoryId ?? ''}
+                onChange={(event) => patch({ repositoryId: event.target.value || undefined })}
+              >
+                <option value="">允许任意已登记仓库</option>
+                {project.repositories.map(({ id, name }) => (
+                  <option value={id} key={id}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="推送引用前缀（可选）">
+              <input
+                value={form.refPrefix ?? ''}
+                placeholder="refs/heads/main"
+                onChange={(event) => patch({ refPrefix: event.target.value || undefined })}
+              />
+            </Field>
+          </div>
+        )}
+        {!!fields.length && (
+          <section className="graph-fields">
+            <h4>触发参数映射</h4>
+            {fields.map((field) => (
+              <TriggerParameterField
+                key={field.id}
+                field={field}
+                project={project}
+                kind={form.kind}
+                value={form.parameterMappings?.[field.id]}
+                change={(mapping) => {
+                  const next = { ...form.parameterMappings };
+                  if (mapping) next[field.id] = mapping;
+                  else delete next[field.id];
+                  patch({ parameterMappings: next });
+                }}
+              />
+            ))}
+          </section>
+        )}
         {!definition.loading && blocked && <p className="field-note">{blocked}</p>}
         <label className="checkbox-row">
           <input
@@ -399,6 +458,67 @@ function TriggerEditor({
   );
 }
 
+function TriggerParameterField({
+  project,
+  field,
+  kind,
+  value,
+  change,
+}: {
+  project: ProjectDetail;
+  field: GraphField;
+  kind: TriggerConfig['kind'];
+  value?: ParameterMapping;
+  change: (value?: ParameterMapping) => void;
+}) {
+  const supported: EventField[] = [];
+  if (!field.multiple) {
+    if (field.type === 'NUMBER' && kind === 'CRON') supported.push('scheduledAt');
+    if (field.type === 'TEXT') {
+      supported.push('eventId');
+      if (kind === 'WEBHOOK') supported.push('commit', 'ref');
+      if (kind === 'UPSTREAM') supported.push('upstreamRunId', 'upstreamStatus');
+    }
+    if (kind === 'WEBHOOK' && field.type === 'REPOSITORY') supported.push('repository');
+    if (kind === 'WEBHOOK' && field.type === 'GIT_REF') supported.push('commit', 'ref');
+  }
+  const selected =
+    value?.source === 'EVENT' ? value.field : value?.source === 'VALUE' ? 'constant' : '';
+  return (
+    <div className="graph-field-card graph-fields">
+      <Field label={field.name + (field.required ? '（必填）' : '')}>
+        <select
+          value={selected}
+          onChange={(event) => {
+            const id = event.target.value;
+            if (id === 'constant') change({ source: 'VALUE', value: field.defaultValue ?? '' });
+            else if (supported.includes(id as EventField))
+              change({ source: 'EVENT', field: id as EventField });
+            else change(undefined);
+          }}
+        >
+          <option value="">采用开始节点默认规则</option>
+          <option value="constant">设置固定值</option>
+          {supported.map((name) => (
+            <option value={name} key={name}>
+              {events[name]}
+            </option>
+          ))}
+        </select>
+      </Field>
+      {value?.source === 'VALUE' && (
+        <GraphFieldValue
+          project={project}
+          field={{ ...field, name: '触发参数值' }}
+          value={value.value}
+          change={(next) => change({ source: 'VALUE', value: next })}
+          checkRequired
+        />
+      )}
+    </div>
+  );
+}
+
 function TriggerDetails({
   path,
   rule,
@@ -412,7 +532,6 @@ function TriggerDetails({
 }) {
   const events = useResource<TriggerEvent[]>(path + '/events', 5000);
   const [eventId, setEventId] = useState(() => graphKey('event'));
-  const [inputValue, setInputValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [invoked, setInvoked] = useState<TriggerEvent>();
@@ -426,7 +545,6 @@ function TriggerDetails({
       setInvoked(
         await post<TriggerEvent>(path + '/invoke', {
           eventId: eventId.trim(),
-          ...(inputValue && { inputValue }),
         }),
       );
       await events.reload();
@@ -472,14 +590,6 @@ function TriggerDetails({
                 maxLength={120}
                 value={eventId}
                 onChange={(e) => setEventId(e.target.value)}
-              />
-            </Field>
-            <Field label="本次运行参数">
-              <input
-                maxLength={500}
-                value={inputValue}
-                placeholder="沿用规则默认值"
-                onChange={(e) => setInputValue(e.target.value)}
               />
             </Field>
           </div>

@@ -139,7 +139,7 @@ function EnvironmentConfigEditor({
   const [artifactType, setArtifactType] = useState('FILE');
   const [selection, setSelection] = useState<DeploymentSelection>(() => deploymentSelection());
   const [editRetention, setEditRetention] = useState(false);
-  const [tab, setTab] = useState<'settings' | 'failure'>('settings');
+  const [tab, setTab] = useState<'settings' | 'reviews' | 'failure'>('settings');
   useEffect(() => {
     setArtifactType(config.data?.artifactType || 'FILE');
     setSelection(deploymentSelection(config.data));
@@ -174,6 +174,7 @@ function EnvironmentConfigEditor({
           ...(user.role === 'ADMIN' && {
             releasePolicy: {
               requireApproval: f.has('requireReleaseApproval'),
+              requireCodeReview: f.has('requireCodeReview'),
               rollbackMode: f.get('rollbackMode'),
               pinnedDeploymentId: f.get('pinnedDeploymentId') || undefined,
               archivePushedImage: f.has('archivePushedImage'),
@@ -207,12 +208,24 @@ function EnvironmentConfigEditor({
         <button type="button" aria-pressed={tab === 'settings'} onClick={() => setTab('settings')}>
           部署设置
         </button>
+        <button type="button" aria-pressed={tab === 'reviews'} onClick={() => setTab('reviews')}>
+          代码审核
+        </button>
         <button type="button" aria-pressed={tab === 'failure'} onClick={() => setTab('failure')}>
           故障处理
         </button>
       </nav>
       {tab === 'failure' && (
         <FailureHandling user={user} serviceId={serviceId} environmentId={environmentId} />
+      )}
+      {tab === 'reviews' && (
+        <SourceReviews
+          projectId={project.id}
+          serviceId={serviceId}
+          environmentId={environmentId}
+          canReview={user.role === 'ADMIN'}
+          required={config.data?.releasePolicy?.requireCodeReview === true}
+        />
       )}
       <div hidden={tab !== 'settings'}>
         {config.loading ? (
@@ -410,6 +423,14 @@ function ReleasePolicyFields({
         />
         <span>部署前需要审批</span>
       </label>
+      <label className="checkbox-row">
+        <input
+          name="requireCodeReview"
+          type="checkbox"
+          defaultChecked={policy?.requireCodeReview}
+        />
+        <span>要求产物的 Git 提交通过代码审核</span>
+      </label>
       {composeDeployment && (
         <label className="checkbox-row">
           <input
@@ -504,6 +525,131 @@ function ReleasePolicyFields({
     </>
   );
 }
+interface SourceReview {
+  id: string;
+  commitSha: string;
+  decision: 'APPROVED' | 'REVOKED';
+  reason?: string | null;
+  reviewer?: string;
+  updatedAt: number;
+}
+
+function SourceReviews({
+  projectId,
+  serviceId,
+  environmentId,
+  canReview,
+  required,
+}: {
+  projectId: string;
+  serviceId: string;
+  environmentId: string;
+  canReview: boolean;
+  required: boolean;
+}) {
+  const path = `/projects/${projectId}/services/${serviceId}/environments/${environmentId}/source-reviews`;
+  const reviews = useResource<SourceReview[]>(path);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy || !canReview) return;
+    const form = event.currentTarget;
+    const values = new FormData(form);
+    const sha = String(values.get('commitSha') || '')
+      .trim()
+      .toLowerCase();
+    const decision = values.get('decision');
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const saved = await api<SourceReview>(path + '/' + encodeURIComponent(sha), {
+        method: 'PUT',
+        body: JSON.stringify({ decision, reason: String(values.get('reason') || '').trim() }),
+      });
+      form.reset();
+      setNotice(saved.decision === 'APPROVED' ? '已记录代码审核通过。' : '已撤销代码审核。');
+      await reviews.reload();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="form-body">
+      <p className="field-note">
+        {required
+          ? '本服务环境只允许发布已通过代码审核的 Git 提交。'
+          : '可预先记录审核结论。在部署设置启用代码审核后，系统会按产物的 Git 提交检查。'}
+      </p>
+      {canReview && (
+        <form onSubmit={(event) => void save(event)} className="resource-form">
+          <fieldset disabled={busy}>
+            <Field label="已审核的完整 Git 提交 SHA" required>
+              <input
+                name="commitSha"
+                className="mono"
+                pattern="[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}"
+                maxLength={64}
+                spellCheck={false}
+                required
+              />
+            </Field>
+            <Field label="审核结论">
+              <select name="decision">
+                <option value="APPROVED">审核通过</option>
+                <option value="REVOKED">撤销审核通过</option>
+              </select>
+            </Field>
+            <Field label="审核说明">
+              <textarea name="reason" rows={2} maxLength={1000} />
+            </Field>
+            <button type="submit" className="button primary small">
+              <Check size={16} /> 保存审核结论
+            </button>
+          </fieldset>
+        </form>
+      )}
+      <ErrorBanner error={error} />
+      {notice && <p role="status">{notice}</p>}
+      <ErrorBanner error={reviews.error} retry={reviews.reload} />
+      {reviews.loading && <Loading />}
+      {reviews.data?.length === 0 && <p className="muted">暂无代码审核记录。</p>}
+      {!!reviews.data?.length && (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Git 提交</th>
+                <th>结论</th>
+                <th>审核人</th>
+                <th>更新时间</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              {reviews.data.map((row) => (
+                <tr key={row.id}>
+                  <td>
+                    <code>{row.commitSha}</code>
+                  </td>
+                  <td>{row.decision === 'APPROVED' ? '已通过' : '已撤销'}</td>
+                  <td>{row.reviewer || '—'}</td>
+                  <td>{formatTime(row.updatedAt)}</td>
+                  <td>{row.reason || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RepositoryBinding({
   project,
   serviceId,

@@ -26,9 +26,21 @@ import {
 import { CredentialsService } from '../credentials/credentials.service';
 import { maxComposeBytes } from '../artifacts/artifacts.service';
 import { RegistriesService } from '../registries/registries.service';
-import type { PipelineSnapshot, PipelineNode, BuildOutput } from '../pipelines/pipeline.types';
+import type {
+  PipelineSnapshot,
+  PipelineNode,
+  BuildOutput,
+  NamedArtifactDefinition,
+} from '../pipelines/pipeline.types';
 import { relativePath, shellQuote as q } from '../pipelines/pipeline.validation';
 import type { TaskExecutionContext } from '../tasks/tasks.types';
+import {
+  copyGraphRepository,
+  graphTriggerVariables,
+  graphWorkspaceEntry,
+  openGraphWorkspace,
+  type GraphWorkspaceRef,
+} from '../execution-graphs/graph-workspace';
 import {
   credentialSecrets,
   executionVariableName as envName,
@@ -57,6 +69,30 @@ export interface BuildSession {
   webhookDocker?: { socket: string; config: string };
 }
 export type RunPipelineNode = <T>(node: PipelineNode, run: () => Promise<T>) => Promise<T>;
+
+export function namedArtifactSession(
+  session: BuildSession,
+  artifact: NamedArtifactDefinition,
+): BuildSession {
+  const definition = session.snapshot.definition;
+  return {
+    ...session,
+    taskId: randomUUID(),
+    snapshot: {
+      ...session.snapshot,
+      definition: {
+        ...definition,
+        artifactType: artifact.type === 'DOCKER_IMAGE' ? 'DOCKER_IMAGE' : 'FILE',
+        outputPath: artifact.path ?? definition.outputPath,
+        dockerfilePath:
+          artifact.type === 'DOCKER_IMAGE'
+            ? (artifact.path ?? definition.dockerfilePath)
+            : definition.dockerfilePath,
+        composeFilePath: artifact.composeFilePath ?? definition.composeFilePath,
+      },
+    },
+  };
+}
 
 const maxEnvironmentFileBytes = 64 * 1024;
 const helperImage = () => process.env.BUILD_HELPER_IMAGE || 'node:22-bookworm';
@@ -156,8 +192,14 @@ ${git} checkout --detach FETCH_HEAD
 test "$(${git} rev-parse HEAD)" = ${q(source.commitSha)}
 `;
 }
-export const packScript = (work: string, repoPath: string, outputPath: string, archive: string) =>
-  `set -eu\n${enterRepositoryDirectory(work, repoPath)}\noutput=$(realpath -- ${q(outputPath)})\ncase "$output" in "$veyops_repo"/*) ;; *) echo '产物路径超出工作目录' >&2; exit 1;; esac\ntest -z "$(find "$output" -type l -print -quit)"\nif test -d "$output"; then tar -czf ${q(archive)} -C "$output" .; elif test -f "$output"; then tar -czf ${q(archive)} -C "$(dirname "$output")" "$(basename "$output")"; else echo '产物不存在或不是普通文件/目录' >&2; exit 1; fi\nprintf 'VEYOPS_ARTIFACT:%s:%s\\n' "$(sha256sum ${q(archive)} | cut -d' ' -f1)" "$(wc -c < ${q(archive)})"\n`;
+export const packScript = (
+  work: string,
+  repoPath: string,
+  outputPath: string,
+  archive: string,
+  type?: 'FILE' | 'DIRECTORY',
+) =>
+  `set -eu\n${enterRepositoryDirectory(work, repoPath)}\nrequested=${q('./' + relativePath(outputPath))}\nif ! test -e "$requested" && ! test -L "$requested"; then exit 44; fi\ntest ! -L "$requested"\noutput=$(realpath -- "$requested")\ncase "$output" in "$veyops_repo"/*) ;; *) echo '产物路径超出工作目录' >&2; exit 1;; esac\n${type === 'FILE' ? 'test -f "$output"' : type === 'DIRECTORY' ? 'test -d "$output"' : ':'}\ntest -z "$(find "$output" ! -type f ! -type d -print -quit)"\nif test -d "$output"; then tar -czf ${q(archive)} -C "$output" .; elif test -f "$output"; then tar -czf ${q(archive)} -C "$(dirname "$output")" "$(basename "$output")"; else echo '产物不是普通文件/目录' >&2; exit 1; fi\nprintf 'VEYOPS_ARTIFACT:%s:%s\\n' "$(sha256sum ${q(archive)} | cut -d' ' -f1)" "$(wc -c < ${q(archive)})"\n`;
 
 export function enterRepositoryDirectory(work: string, repoPath: string) {
   return `cd -P ${q(work)}; veyops_repo=$PWD/repo; test ! -L "$veyops_repo"; cd -P "$veyops_repo"/${q(repoPath)}; case "$PWD" in "$veyops_repo"|"$veyops_repo"/*) ;; *) echo '构建工作目录超出仓库' >&2; exit 1 ;; esac`;
@@ -168,6 +210,12 @@ export function resolveRepositoryFile(path: string) {
 }
 
 const maxArchiveBytes = 1024 * 1024 * 1024;
+
+export function checkedImageReference(ref: string) {
+  if (!/^[a-z0-9][a-zA-Z0-9._:/-]{0,350}(?:@sha256:[0-9a-f]{64})?$/.test(ref))
+    throw new Error('无效的镜像来源地址');
+  return ref;
+}
 
 export function archiveMetadata(output: string) {
   const match = /^VEYOPS_ARTIFACT:([a-f0-9]{64}):([0-9]+)$/m.exec(output);
@@ -252,6 +300,24 @@ export class BuildsService {
     values.VEYOPS_SERVICE_ID = snapshot.serviceId;
     if (snapshot.projectName !== undefined) values.VEYOPS_PROJECT_NAME = snapshot.projectName;
     if (snapshot.serviceName !== undefined) values.VEYOPS_SERVICE_NAME = snapshot.serviceName;
+    if (snapshot.graph) {
+      const { variables, trigger } = snapshot.graph;
+      if (variables?.workspace && variables.envFile) {
+        const file = await graphWorkspaceEntry(
+          variables.workspace,
+          relativePath(variables.envFile),
+        );
+        for (const [name, value] of Object.entries(await readEnvironmentFile(file))) {
+          if (!/^VEYOPS_/i.test(name) && !Object.hasOwn(values, name)) {
+            values[name] = value;
+            secrets.push(value);
+          }
+        }
+      }
+      Object.assign(values, graphTriggerVariables(trigger), {
+        VEYOPS_GIT_COMMIT_SHA: snapshot.commitSha,
+      });
+    }
     return { values, secrets };
   }
 
@@ -377,6 +443,35 @@ export class BuildsService {
     session: BuildSession,
     node?: PipelineNode,
   ) {
+    if (session.snapshot.graph?.workspace) {
+      const directory = await openGraphWorkspace(session.snapshot.graph.workspace);
+      const temporary = await mkdtemp(join(tmpdir(), 'veyops-workspace-'));
+      try {
+        const archive = join(temporary, 'checkout.tar.gz');
+        const packaged = await this.runner.run('tar', ['-czf', archive, '-C', directory, 'repo'], {
+          timeout: 300,
+          signal: session.context.signal,
+        });
+        const details = await lstat(archive).catch(() => undefined);
+        if (packaged.exitCode !== 0 || !details?.isFile() || details.size > maxArchiveBytes)
+          throw new Error('工作区打包失败或超过 1GiB');
+        const remoteArchive = work + '/checkout.tar.gz';
+        await this.ssh.upload(target, archive, remoteArchive, {
+          timeout: 300,
+          signal: session.context.signal,
+        });
+        await this.remote(
+          target,
+          `set -eu; tar -xzf ${q(remoteArchive)} --no-same-owner --no-same-permissions -C ${q(work)}; rm -- ${q(remoteArchive)}`,
+          session,
+          300,
+          '目标无法解包绑定工作区',
+        );
+      } finally {
+        await rm(temporary, { recursive: true, force: true });
+      }
+      return;
+    }
     const source = node ? this.nodeSource(session.snapshot, node) : undefined;
     const secret = await this.gitSecret(
       source ? source.credentialId : session.snapshot.repository.credentialId,
@@ -526,12 +621,20 @@ export class BuildsService {
       );
   }
 
-  async remoteBuildOnlyImage(target: SshTarget, work: string, session: BuildSession) {
+  async remoteBuildOnlyImage(
+    target: SshTarget,
+    work: string,
+    session: BuildSession,
+    declaration?: NamedArtifactDefinition,
+  ) {
     const definition = session.snapshot.definition;
     const imageReference = localImageTag(session, target.id);
+    const source = declaration?.imageReference && checkedImageReference(declaration.imageReference);
     await this.remote(
       target,
-      `set -eu; ${enterRepositoryDirectory(work, definition.repoPath)}; ${resolveRepositoryFile(definition.dockerfilePath)}; DOCKER_BUILDKIT=1 docker build -f "$veyops_file" -t ${q(imageReference)} .`,
+      source
+        ? `set -eu; ${source.includes('@sha256:') ? `docker image inspect ${q(source)} >/dev/null 2>&1 || docker pull ${q(source)};` : ''} docker image tag ${q(source)} ${q(imageReference)}`
+        : `set -eu; ${enterRepositoryDirectory(work, definition.repoPath)}; ${declaration?.required === false ? `if ! test -e ${q('./' + definition.dockerfilePath)} && ! test -L ${q('./' + definition.dockerfilePath)}; then exit 44; fi;` : ''} ${resolveRepositoryFile(definition.dockerfilePath)}; DOCKER_BUILDKIT=1 docker build -f "$veyops_file" -t ${q(imageReference)} .`,
       session,
       1200,
       'Docker 镜像构建失败。请检查 Dockerfile、基础镜像及依赖源的网络和权限',
@@ -546,7 +649,14 @@ export class BuildsService {
     return {
       imageReference,
       imageId,
-      ...(await this.retainRemoteImageArchive(target, work, session, 'docker', imageReference)),
+      ...(await this.retainRemoteImageArchive(
+        target,
+        work,
+        session,
+        'docker',
+        imageReference,
+        Boolean(declaration),
+      )),
     };
   }
 
@@ -576,8 +686,9 @@ export class BuildsService {
     session: BuildSession,
     docker: string,
     imageReference: string,
+    named = false,
   ) {
-    const archive = work + '/image.tar.gz';
+    const archive = work + (named ? `/image-${session.taskId}.tar.gz` : '/image.tar.gz');
     const save = `ulimit -f ${maxArchiveBytes / 1024}; ${docker} image save ${q(imageReference)} | gzip -1 > ${q(archive)}`;
     const metadata = archiveMetadata(
       await this.remoteCapture(
@@ -596,9 +707,15 @@ export class BuildsService {
     );
     return { archiveKey: basename(storagePath), ...metadata };
   }
-  async remoteComposeSnapshot(target: SshTarget, work: string, session: BuildSession) {
+  async remoteComposeSnapshot(
+    target: SshTarget,
+    work: string,
+    session: BuildSession,
+    named = false,
+  ) {
     const d = session.snapshot.definition;
-    const path = work + '/compose.snapshot.yaml';
+    const path =
+      work + (named ? `/compose-${session.taskId}.snapshot.yaml` : '/compose.snapshot.yaml');
     try {
       await this.remote(
         target,
@@ -744,6 +861,7 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
       await rm(root, { recursive: true, force: true });
     };
     const d = session.snapshot.definition;
+    const boundWorkspace = session.snapshot.graph?.workspace;
     try {
       if (session.snapshot.triggerType && session.snapshot.triggerType !== 'MANUAL')
         await this.configureWebhookDocker(session, root);
@@ -754,47 +872,56 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
           15,
           '管理端 Docker 守护进程不可用。请检查 Docker 服务和平台进程的访问权限',
         );
+      if (boundWorkspace) await copyGraphRepository(boundWorkspace, join(workspace, 'repo'));
       if (d.nodes) await this.managerNodes(session, workspace, secretDir, runNode);
       else {
-        const secret = await this.gitSecret(session.snapshot.repository.credentialId);
-        if (secret) session.secrets.push(...secret.values);
-        // Three separate containers: checkout can read credentials; untrusted build cannot.
-        if (secret)
-          await writeFile(join(secretDir, 'git-credentials'), secret.response, { mode: 0o600 });
-        await this.container(
-          session,
-          workspace,
-          checkoutScript(
-            session.snapshot.repository.url,
-            session.snapshot.commitSha,
-            '/workspace',
-            secret ? '/run/veyops/git-credentials' : undefined,
-          ),
-          secret ? secretDir : undefined,
-          undefined,
-          process.env.BUILD_HELPER_IMAGE || 'node:22-bookworm',
-          300,
-          '管理端检出失败。请检查辅助镜像是否可拉取，以及镜像内的 Git、仓库网络、凭据和固定提交',
-        );
+        if (!boundWorkspace) {
+          const secret = await this.gitSecret(session.snapshot.repository.credentialId);
+          if (secret) session.secrets.push(...secret.values);
+          if (secret)
+            await writeFile(join(secretDir, 'git-credentials'), secret.response, { mode: 0o600 });
+          await this.container(
+            session,
+            workspace,
+            checkoutScript(
+              session.snapshot.repository.url,
+              session.snapshot.commitSha,
+              '/workspace',
+              secret ? '/run/veyops/git-credentials' : undefined,
+            ),
+            secret ? secretDir : undefined,
+            undefined,
+            helperImage(),
+            300,
+            '管理端检出失败。请检查辅助镜像、Git、仓库网络、凭据和固定提交',
+          );
+        }
         await rm(secretDir, { recursive: true, force: true });
-        const envPath = join(root, 'build.env');
+        const graphEnvironment = Boolean(session.snapshot.graph);
+        if (graphEnvironment) await mkdir(secretDir, { recursive: true, mode: 0o700 });
+        const envPath = join(graphEnvironment ? secretDir : root, 'build.env');
         await writeFile(
           envPath,
-          Object.entries(session.variables)
-            .map(([k, v]) => `${k}=${v}`)
-            .join('\n'),
+          graphEnvironment
+            ? exportedVariables(session.variables)
+            : Object.entries(session.variables)
+                .map(([key, value]) => `${key}=${value}`)
+                .join('\n'),
           { mode: 0o600 },
         );
-        if (Object.values(session.variables).some((v) => /[\r\n]/.test(v)))
+        if (
+          !graphEnvironment &&
+          Object.values(session.variables).some((value) => /[\r\n]/.test(value))
+        )
           throw new Error('管理端容器环境变量暂不支持换行值');
         for (const step of configuredCommands(d)) {
           session.context.log(`${step.name}\n`);
           await this.container(
             session,
             workspace,
-            `set -eu\n${enterRepositoryDirectory('/workspace', d.repoPath)}\n${step.command}\n`,
-            undefined,
-            envPath,
+            `set -eu\n${enterRepositoryDirectory('/workspace', d.repoPath)}\n${graphEnvironment ? '. /run/veyops/build.env\n' : ''}${step.command}\n`,
+            graphEnvironment ? secretDir : undefined,
+            graphEnvironment ? undefined : envPath,
             undefined,
             step.timeout,
             `${step.name}失败。请确认构建镜像可拉取。${step.check}`,
@@ -803,17 +930,92 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
         await rm(envPath, { force: true });
       }
       const packageNode = d.nodes?.find((node) => node.type === 'PACKAGE');
+      const packageOutputs = () =>
+        d.artifacts
+          ? this.managerNamedArtifacts(session, root, workspace, cleanup)
+          : this.managerPackage(session, root, workspace, cleanup);
       return packageNode
         ? await runNode(packageNode, async () => {
-            const output = await this.managerPackage(session, root, workspace, cleanup);
+            const output = await packageOutputs();
             await onPackage?.(output);
             return output;
           })
-        : await this.managerPackage(session, root, workspace, cleanup);
+        : await packageOutputs();
     } catch (error) {
       await cleanup();
       throw error;
     }
+  }
+
+  async registerManagerArtifacts(session: BuildSession, workspace: GraphWorkspaceRef) {
+    const root = resolve(dataDirectory, 'builds', session.taskId);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const cleanup = () => rm(root, { recursive: true, force: true });
+    try {
+      return await this.managerNamedArtifacts(
+        session,
+        root,
+        await openGraphWorkspace(workspace),
+        cleanup,
+      );
+    } catch (error) {
+      await cleanup();
+      throw error;
+    }
+  }
+
+  async managerGraphShell(
+    session: BuildSession,
+    workspace: string,
+    command: string,
+    directory: string,
+    timeout: number,
+  ) {
+    const secrets = await mkdtemp(join(tmpdir(), 'veyops-graph-shell-'));
+    try {
+      await writeFile(join(secrets, 'shell.env'), exportedVariables(session.variables), {
+        mode: 0o600,
+      });
+      return await this.container(
+        session,
+        workspace,
+        `set +e\n( set -e; ${enterRepositoryDirectory('/workspace', relativePath(directory))}; . /run/veyops/shell.env\n${command}\n)\ncode=$?\nprintf '\\nVEYOPS_EXIT_CODE=%s\\n' "$code"`,
+        secrets,
+        undefined,
+        undefined,
+        timeout,
+        'Shell 容器无法执行',
+      );
+    } finally {
+      await rm(secrets, { recursive: true, force: true });
+    }
+  }
+
+  private async managerNamedArtifacts(
+    session: BuildSession,
+    root: string,
+    workspace: string,
+    cleanup: () => Promise<void>,
+  ): Promise<BuildOutput> {
+    const artifacts: NonNullable<BuildOutput['artifacts']> = [];
+    for (const declaration of session.snapshot.definition.artifacts ?? []) {
+      const scoped = namedArtifactSession(session, declaration);
+      try {
+        artifacts.push({
+          declaration,
+          output: await this.managerPackage(scoped, root, workspace, cleanup, declaration),
+        });
+      } catch (error) {
+        if (
+          declaration.required !== false ||
+          !(error instanceof BuildCommandError) ||
+          error.exitCode !== 44
+        )
+          throw error;
+        session.context.log(`可选产物 ${declaration.name} 不存在，已略过\n`);
+      }
+    }
+    return { ...artifacts[0]?.output, artifacts, cleanup };
   }
 
   private async managerPackage(
@@ -821,21 +1023,34 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     root: string,
     workspace: string,
     cleanup: () => Promise<void>,
+    declaration?: NamedArtifactDefinition,
   ): Promise<BuildOutput> {
     const d = session.snapshot.definition;
     if (d.artifactType === 'FILE') {
-      const archive = join(workspace, 'artifact.tar.gz');
+      const archiveName = declaration ? `artifact-${session.taskId}.tar.gz` : 'artifact.tar.gz';
+      const archive = join(workspace, archiveName);
       // Reserve the output after repository containers have finished writing the workspace.
       await writeFile(archive, '', { flag: 'wx', mode: 0o600 });
-      await this.container(
-        session,
-        workspace,
-        packScript('/workspace', d.repoPath, d.outputPath, '/workspace/artifact.tar.gz'),
-        undefined,
-        undefined,
-        process.env.BUILD_HELPER_IMAGE || 'node:22-bookworm',
-      );
-      const stored = await this.retainManagerArchive(archive, `${session.taskId}.tar.gz`, session);
+      let stored;
+      try {
+        await this.container(
+          session,
+          workspace,
+          packScript(
+            '/workspace',
+            d.repoPath,
+            d.outputPath,
+            '/workspace/' + archiveName,
+            declaration?.type === 'DOCKER_IMAGE' ? undefined : declaration?.type,
+          ),
+          undefined,
+          undefined,
+          helperImage(),
+        );
+        stored = await this.retainManagerArchive(archive, `${session.taskId}.tar.gz`, session);
+      } finally {
+        if (declaration) await rm(archive, { force: true });
+      }
       return {
         localArchive: stored.path,
         checksum: stored.checksum,
@@ -848,7 +1063,16 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     const repoRoot = await realpath(join(workspace, 'repo'));
     if (repoRoot !== join(await realpath(workspace), 'repo'))
       throw new Error('拒绝将符号链接仓库用作 Docker 构建目录');
-    for (const checked of [await realpath(dockerfile), await realpath(buildContext)])
+    for (const checked of [
+      declaration?.imageReference
+        ? await realpath(buildContext)
+        : await realpath(dockerfile).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT' && declaration?.required === false)
+              throw new BuildCommandError(44, '可选产物的 Dockerfile 不存在');
+            throw error;
+          }),
+      await realpath(buildContext),
+    ])
       if (relative(repoRoot, checked).startsWith('..') || isAbsolute(relative(repoRoot, checked)))
         throw new Error('Docker构建路径超出仓库');
     const buildOnly = session.snapshot.mode === 'BUILD_ONLY';
@@ -869,12 +1093,31 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     }
     if (buildOnly && !(session.snapshot.deployAfterBuild && d.registryId && d.imageRepository)) {
       const imageReference = localImageTag(session);
-      await this.local(
-        session,
-        ['build', '--tag', imageReference, '--file', dockerfile, buildContext],
-        1200,
-        'Docker 镜像构建失败。请检查 Dockerfile、基础镜像及依赖源的网络和权限',
-      );
+      if (declaration?.imageReference) {
+        const source = checkedImageReference(declaration.imageReference);
+        if (
+          source.includes('@sha256:') &&
+          (
+            await this.runDocker(session, ['image', 'inspect', source], 30, {
+              signal: session.context.signal,
+            })
+          ).exitCode !== 0
+        )
+          await this.local(session, ['pull', source], 600, '无法拉取固定 Digest 的镜像');
+        await this.local(
+          session,
+          ['image', 'tag', source, imageReference],
+          30,
+          '本地镜像不存在或无法登记',
+        );
+      } else {
+        await this.local(
+          session,
+          ['build', '--tag', imageReference, '--file', dockerfile, buildContext],
+          1200,
+          'Docker 镜像构建失败。请检查 Dockerfile、基础镜像及依赖源的网络和权限',
+        );
+      }
       const inspected = await this.local(
         session,
         ['image', 'inspect', '--format', '{{.Id}}', imageReference],
@@ -1069,7 +1312,7 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     if (envFile) args.push('--env-file', envFile);
     args.push(image ?? session.snapshot.definition.buildImage, 'sh', '-eu', '-c', script);
     try {
-      await this.local(session, args, timeout, failureMessage);
+      return await this.local(session, args, timeout, failureMessage);
     } finally {
       await this.runDocker(session, ['rm', '-f', name], 30).catch(() => undefined);
     }

@@ -13,10 +13,11 @@ import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import {
   ExpectedGraphRevisionDto,
-  ExtractGraphFlowDto,
   SaveGraphDraftDto,
+  ValidateGraphDraftDto,
 } from './execution-graph-definition';
 import { ExecutionGraphsService } from './execution-graphs.service';
+import { graphCatalog } from './graph-fields';
 
 @Controller('projects/:projectId/execution-graph')
 export class ExecutionGraphsController {
@@ -25,6 +26,19 @@ export class ExecutionGraphsController {
   @Get()
   get(@Param('projectId', ParseUUIDPipe) projectId: string) {
     return this.graphs.get(projectId);
+  }
+  @Get('catalog')
+  async catalog(@Param('projectId', ParseUUIDPipe) projectId: string) {
+    await this.graphs.get(projectId);
+    return graphCatalog;
+  }
+  @Post('validate')
+  @Roles('ADMIN', 'OPERATOR')
+  validate(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Body() input: ValidateGraphDraftDto,
+  ) {
+    return this.graphs.validate(projectId, input.definition);
   }
   @Put('draft')
   @Roles('ADMIN', 'OPERATOR')
@@ -64,22 +78,5 @@ export class ExecutionGraphsController {
     @Req() req: AuthRequest,
   ) {
     return this.graphs.restore(projectId, version, input.expectedRevision, req.user.id);
-  }
-  @Post('extract/preview')
-  @Roles('ADMIN', 'OPERATOR')
-  previewExtraction(
-    @Param('projectId', ParseUUIDPipe) projectId: string,
-    @Body() input: ExtractGraphFlowDto,
-  ) {
-    return this.graphs.previewExtraction(projectId, input);
-  }
-  @Post('extract')
-  @Roles('ADMIN', 'OPERATOR')
-  extract(
-    @Param('projectId', ParseUUIDPipe) projectId: string,
-    @Body() input: ExtractGraphFlowDto,
-    @Req() req: AuthRequest,
-  ) {
-    return this.graphs.extract(projectId, input, req.user.id);
   }
 }

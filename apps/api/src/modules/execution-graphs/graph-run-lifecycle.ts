@@ -8,6 +8,7 @@ import {
   type GraphNode,
 } from './execution-graph-definition';
 import type { GraphInputsDto } from './graph-runner.controller';
+import { nodeBindings, type GraphBindingContext } from './graph-run-bindings';
 
 export const graphTaskKeyPrefix = 'execution-flow:';
 export const activeFlowStatuses = ['QUEUED', 'RUNNING', 'WAITING', 'CANCEL_REQUESTED'];
@@ -15,7 +16,11 @@ export const isNodeTerminal = (status: string) =>
   status === 'SKIPPED' || (terminalTaskStatuses as readonly string[]).includes(status);
 export const isDelivery = ({ type }: GraphNode) => type === 'BUILD' || type === 'DEPLOY_ARTIFACT';
 
-export function flowSelection(flow: GraphFlow, inputs: GraphInputsDto) {
+export function flowSelection(
+  flow: GraphFlow,
+  inputs: GraphInputsDto,
+  state?: GraphBindingContext,
+) {
   const selected = new Set<string>();
   const matches = new Map<string, NonNullable<GraphEdge['when']>>();
   const incoming = new Map<string, GraphFlow['edges']>();
@@ -27,29 +32,46 @@ export function flowSelection(flow: GraphFlow, inputs: GraphInputsDto) {
   const ordered = orderedFlowNodes(flow);
   for (const node of ordered) {
     const relevant = (incoming.get(node.id) ?? []).filter(
-      ({ from, when }) => selected.has(from) && (when === undefined || matches.get(from) === when),
+      ({ from, when }) =>
+        selected.has(from) &&
+        (when === undefined || !matches.has(from) || matches.get(from) === when),
     );
     incoming.set(node.id, relevant);
     if (node.type !== 'START' && !relevant.length) continue;
     selected.add(node.id);
-    if (node.type === 'CONDITION' && node.condition) {
-      const { key, value } = node.condition;
-      const expected = key === 'commitSha' ? value.toLowerCase() : value;
-      matches.set(node.id, branchInput(inputs, key) === expected ? 'TRUE' : 'FALSE');
-    }
-    if (node.type === 'SWITCH' && node.switch) {
-      const { key, cases } = node.switch;
-      const input = branchInput(inputs, key);
-      const index = cases.findIndex(
-        (value) => (key === 'commitSha' ? value.toLowerCase() : value) === input,
-      );
-      matches.set(node.id, index === -1 ? 'DEFAULT' : `CASE:${index}`);
-    }
+    const match = branchMatch(flow, node, inputs, state);
+    if (match !== undefined) matches.set(node.id, match);
   }
   return { ordered, selected, matches, incoming };
 }
 
-function branchInput(inputs: GraphInputsDto, key: 'input' | 'commitSha') {
+export function branchMatch(
+  flow: GraphFlow,
+  node: GraphNode,
+  inputs: GraphInputsDto,
+  state?: GraphBindingContext,
+): GraphEdge['when'] {
+  const configuration = node.condition ?? node.switch;
+  if (!configuration) return undefined;
+  const explicit = flow.inputBindings?.[node.id]?.value;
+  const settled = state?.outputs?.get(node.id)?.matched;
+  if (typeof settled === 'boolean') return settled ? 'TRUE' : 'FALSE';
+  if (typeof settled === 'string') return settled as GraphEdge['when'];
+  const value = explicit
+    ? state && nodeBindings(flow, node, state, ['value']).value
+    : branchInput(inputs, configuration.key);
+  if (explicit && value === undefined) return undefined;
+  const commit = !explicit && configuration.key === 'commitSha';
+  const matches = (candidate: string) =>
+    (commit ? candidate.toLowerCase() : candidate) ===
+    (value === undefined ? undefined : String(value));
+  if (node.condition) return matches(node.condition.value) ? 'TRUE' : 'FALSE';
+  const index = node.switch!.cases.findIndex(matches);
+  return index === -1 ? 'DEFAULT' : `CASE:${index}`;
+}
+
+function branchInput(inputs: GraphInputsDto, key?: 'input' | 'commitSha') {
+  if (!key) return inputs.value;
   if (key === 'input') return inputs.value;
   if (!inputs.commitSha) throw new BadRequestException('按提交判断的流程必须提供完整提交 SHA');
   return inputs.commitSha.toLowerCase();

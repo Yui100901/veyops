@@ -9,6 +9,7 @@ import test from 'node:test';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import type { GraphFlow } from '../modules/execution-graphs/execution-graph-definition';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
 
 const dagDefinition = {
@@ -192,31 +193,44 @@ async function checkGraph(url?: string) {
     assert.equal(state(dagRun, 'no'), 'SKIPPED');
     assert.equal(state(dagRun, 'parallel-log'), 'SUCCESS');
     assert.equal(state(dagRun, 'all-join'), 'SUCCESS');
-    const extract = {
-      expectedRevision: dagDraft.revision,
-      flowId: 'orchestrate',
-      nodeIds: ['choose', 'yes', 'no', 'branch-join'],
+    const original = dagDefinition.flows[0] as GraphFlow;
+    const calls = new Set(['choose', 'yes', 'no', 'branch-join']);
+    const reusable: GraphFlow = {
+      id: 'reusable-check',
       name: '可复用的判断',
-      mode: 'REPLACE',
+      nodes: [
+        { id: 'child-start', type: 'START', name: '开始子流' },
+        ...original.nodes.filter((node) => calls.has(node.id)),
+        { id: 'child-end', type: 'END', name: '子流结束' },
+      ],
+      edges: [
+        { from: 'child-start', to: 'choose' },
+        ...original.edges.filter((edge) => calls.has(edge.from) && calls.has(edge.to)),
+        { from: 'branch-join', to: 'child-end' },
+      ],
     };
-    const proposed = (
-      await api
-        .post(otherPath + '/extract/preview')
-        .send(extract)
-        .expect(201)
-    ).body.data;
-    assert.deepEqual(proposed.entryNodeIds, ['choose']);
-    assert.deepEqual(proposed.exitNodeIds, ['branch-join']);
+    const parent: GraphFlow = {
+      ...original,
+      nodes: [
+        ...original.nodes.filter((node) => !calls.has(node.id)),
+        { id: 'call-branch', name: '执行子流', type: 'FLOW_CALL', flowId: reusable.id },
+      ],
+      edges: [
+        ...original.edges.filter((edge) => !calls.has(edge.from) && !calls.has(edge.to)),
+        { from: 'split', to: 'call-branch' },
+        { from: 'call-branch', to: 'all-join' },
+      ],
+    };
     const replaced = (
       await api
-        .post(otherPath + '/extract')
-        .send(extract)
-        .expect(201)
+        .put(otherPath + '/draft')
+        .send({ expectedRevision: dagDraft.revision, definition: { flows: [parent, reusable] } })
+        .expect(200)
     ).body.data;
     await api
       .post(otherPath + '/extract')
-      .send(extract)
-      .expect(409);
+      .send({})
+      .expect(404);
     const dagV2 = (
       await api
         .post(otherPath + '/publish')

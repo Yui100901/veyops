@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import type { Transaction } from 'kysely';
+import type { Database } from '../../core/database/schema';
 import type { PipelineDefinition } from './pipeline.types';
 
 /**
@@ -41,4 +43,38 @@ export function deliveryExecutionProfile(
   ]);
   const versionId = engineId([id, 'definition']);
   return { id, versionId, projectId, serviceId, name, definition, authoredFields };
+}
+
+export async function storeDeliveryProfile(
+  tx: Transaction<Database>,
+  profile: DeliveryExecutionProfile,
+  userId: string,
+) {
+  const now = Date.now();
+  await tx
+    .insertInto('pipelines')
+    .values({
+      id: profile.id,
+      project_id: profile.projectId,
+      service_id: profile.serviceId,
+      name: profile.name,
+      enabled: 1,
+      current_version: 1,
+      created_at: now,
+      updated_at: now,
+    })
+    .onConflict((conflict) => conflict.column('id').doNothing())
+    .execute();
+  await tx
+    .insertInto('pipeline_versions')
+    .values({
+      id: profile.versionId,
+      pipeline_id: profile.id,
+      version: 1,
+      definition_json: JSON.stringify(profile.definition),
+      created_by: userId,
+      created_at: now,
+    })
+    .onConflict((conflict) => conflict.column('id').doNothing())
+    .execute();
 }

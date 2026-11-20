@@ -310,3 +310,65 @@ button.graph-node[aria-pressed='true'] {
 .graph-connectors .edge-default > path {
   stroke: #7c648c;
 }
+.graph-field-card,
+.graph-binding-field {
+  border: 1px solid var(--line, #dce4ee);
+  border-radius: 0.55rem;
+  min-width: 0;
+  padding: 0.65rem;
+}
+
+.graph-field-card > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.graph-field-card[open] > summary {
+  margin-bottom: 0.65rem;
+}
+
+.graph-field-pair,
+.graph-variable-actions,
+.graph-field-values {
+  display: flex;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  align-items: end;
+}
+
+.graph-variable-actions {
+  align-items: start;
+}
+
+.graph-field-pair > label,
+.graph-variable-actions > label {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+
+.graph-field-values {
+  flex-direction: column;
+  align-items: stretch;
+  margin: 0;
+}
+
+.graph-field-values dt {
+  font-weight: 600;
+}
+
+.graph-field-values dd {
+  margin: 0.25rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.graph-field-values pre {
+  max-height: 20rem;
+  overflow: auto;
+  margin: 0;
+}
+
+.graph-validation .button {
+  height: auto;
+  text-align: left;
+  white-space: normal;
+}

@@ -14,6 +14,7 @@ export function readReleasePolicy(value?: string): ReleasePolicy {
   const saved = JSON.parse(value ?? '{}') as Partial<ReleasePolicy>;
   return {
     requireApproval: saved.requireApproval ?? false,
+    requireCodeReview: saved.requireCodeReview === true,
     archivePushedImage: saved.archivePushedImage ?? false,
     rollbackMode: saved.rollbackMode ?? 'OFF',
     ...(saved.pinnedDeploymentId && { pinnedDeploymentId: saved.pinnedDeploymentId }),

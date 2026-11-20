@@ -18,7 +18,14 @@ const nodeProperties: [keyof GraphNode, string][] = [
   ['switch', '匹配项'],
   ['delaySeconds', '等待时间'],
   ['approval', '审批设置'],
-  ['delivery', '执行流预设'],
+  ['inputs', '运行输入'],
+  ['outputs', '结果输出'],
+  ['build', '构建配置'],
+  ['deploy', '部署配置'],
+  ['checkout', '拉取配置'],
+  ['shell', '脚本配置'],
+  ['registerArtifacts', '登记配置'],
+  ['loadEnvironment', '环境配置'],
   ['flowId', '子流'],
   ['position', '位置'],
 ];
@@ -62,6 +69,16 @@ function compareFlows(before: GraphFlow[], after: GraphFlow[]) {
     const newNodes = new Map(current.nodes.map((node) => [node.id, node]));
     const notes = [
       ...(old.name !== current.name ? ['改名 · ' + old.name + ' → ' + current.name] : []),
+      ...(old.serviceId !== current.serviceId ? ['调整关联发布服务'] : []),
+      ...(JSON.stringify(old.inputBindings) !== JSON.stringify(current.inputBindings)
+        ? ['调整输入绑定']
+        : []),
+      ...(JSON.stringify(old.outputBindings) !== JSON.stringify(current.outputBindings)
+        ? ['调整输出绑定']
+        : []),
+      ...(JSON.stringify(old.edgeSelections) !== JSON.stringify(current.edgeSelections)
+        ? ['调整选线']
+        : []),
       ...old.nodes
         .filter((node) => !newNodes.has(node.id))
         .map((node) => '移除节点 · ' + node.name),

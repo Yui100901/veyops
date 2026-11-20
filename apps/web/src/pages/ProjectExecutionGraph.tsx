@@ -8,12 +8,13 @@ import { ProjectGraphEditor } from './ExecutionGraphEditor';
 import { ExecutionGraphHistory, ExecutionGraphStart } from './ExecutionGraphRun';
 import { ExecutionGraphTriggers } from './ExecutionGraphTriggers';
 import { GraphVersionTools } from './ExecutionGraphVersions';
-import { flowPresetLabels, graphNodeLabels } from './execution-graph-definition';
+import { graphNodeLabels } from './execution-graph-definition';
 import type {
   GraphCanvas,
   GraphDocument,
   GraphEdge,
   GraphFlow,
+  GraphIssue,
 } from './execution-graph-definition';
 import './execution-graph.css';
 import './graph-start.css';
@@ -87,6 +88,7 @@ function Workspace({
   const [selectedRun, setSelectedRun] = useState(runId);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [issues, setIssues] = useState<GraphIssue[]>([]);
   const [conflict, setConflict] = useState(false);
   const [busy, setBusy] = useState(false);
   const saving = useRef(false);
@@ -102,13 +104,24 @@ function Workspace({
     }
   }, [runId]);
 
-  async function persist(action: 'save' | 'publish' | 'reload') {
+  async function persist(action: 'save' | 'publish' | 'reload' | 'validate') {
     if (saving.current) return;
     saving.current = true;
     setBusy(true);
     setError('');
     setNotice('');
     try {
+      if (action === 'publish' || action === 'validate') {
+        const result = await post<{ issues: GraphIssue[] }>(path + '/validate', {
+          definition: { flows: [], canvas },
+        });
+        setIssues(result.issues);
+        if (result.issues.length) return;
+        if (action === 'validate') {
+          setNotice('发布检查通过');
+          return;
+        }
+      }
       let saved: GraphDocument;
       if (action === 'save')
         saved = await api(path + '/draft', {
@@ -123,6 +136,7 @@ function Workspace({
       else saved = await api(path);
       setGraph(saved);
       setCanvas(saved.draft.canvas ?? emptyCanvas);
+      setIssues([]);
       if (action === 'reload') {
         setUndo([]);
         setRedo([]);
@@ -150,6 +164,7 @@ function Workspace({
     setUndo((history) => [...history.slice(-49), canvas]);
     setRedo([]);
     setCanvas(next);
+    setIssues([]);
     setNotice('');
   }
 
@@ -229,6 +244,9 @@ function Workspace({
                 project={project}
                 path={path}
                 canRun={canEdit}
+                startId={
+                  new URLSearchParams(window.location.hash.split('?')[1]).get('start') ?? undefined
+                }
                 onRun={openRun}
               />
             ) : (
@@ -285,6 +303,14 @@ function Workspace({
                 </button>
                 <button
                   type="button"
+                  className="button secondary"
+                  disabled={busy || conflict}
+                  onClick={() => void persist('validate')}
+                >
+                  检查发布条件
+                </button>
+                <button
+                  type="button"
                   className="button primary"
                   disabled={dirty || busy || conflict}
                   onClick={() => void persist('publish')}
@@ -300,12 +326,14 @@ function Workspace({
             canvas={canvas}
             canEdit={canEdit && !busy}
             onChange={edit}
+            issues={issues}
             renderStart={(startId) =>
               !project.archived && (
                 <StartTriggers
                   key={startId + '-' + graph.publishedVersion}
                   startId={startId}
                   path={path}
+                  project={project}
                   published={
                     latest.data?.version === graph.publishedVersion ? latest.data : undefined
                   }
@@ -361,15 +389,19 @@ function PublishedRun({
   project,
   path,
   canRun,
+  startId,
   onRun,
 }: {
   published: PublishedGraph;
   project: ProjectDetail;
   path: string;
   canRun: boolean;
+  startId?: string;
   onRun: (id: string) => void;
 }) {
-  const [flow, setFlow] = useState<GraphFlow>();
+  const [flow, setFlow] = useState<GraphFlow | undefined>(() =>
+    published.definition.flows.find(({ id }) => id === startId),
+  );
   const heading = useRef<HTMLHeadingElement>(null);
   function chooseFlow(next: GraphFlow | undefined) {
     setFlow(next);
@@ -380,6 +412,7 @@ function PublishedRun({
       {canRun && <p>点击带有「手动运行」标识的开始节点，填写运行参数。</p>}
       <PublishedNodes
         definition={published.definition}
+        initialNodeId={startId}
         onChooseFlow={canRun ? chooseFlow : undefined}
       />
       {canRun && flow && (
@@ -393,7 +426,6 @@ function PublishedRun({
             project={project}
             path={path}
             flow={flow}
-            flows={published.definition.flows}
             version={published.version}
             onRun={onRun}
           />
@@ -406,6 +438,7 @@ function PublishedRun({
 function StartTriggers({
   startId,
   path,
+  project,
   published,
   publishedVersion,
   loading,
@@ -416,6 +449,7 @@ function StartTriggers({
 }: {
   startId: string;
   path: string;
+  project: ProjectDetail;
   published?: PublishedGraph;
   publishedVersion: number | null;
   loading: boolean;
@@ -454,6 +488,7 @@ function StartTriggers({
       {open && (
         <ExecutionGraphTriggers
           path={path}
+          project={project}
           startId={startId}
           latestVersion={flow ? publishedVersion : null}
           canManage={canManage}
@@ -542,11 +577,13 @@ function edgeKey({ from, to, when }: GraphEdge) {
 function PublishedNodes({
   definition,
   onChooseFlow,
+  initialNodeId,
 }: {
   definition: GraphDocument['draft'];
   onChooseFlow?: (flow: GraphFlow | undefined) => void;
+  initialNodeId?: string;
 }) {
-  const [selected, setSelected] = useState('');
+  const [selected, setSelected] = useState(initialNodeId ?? '');
   const [hovered, setHovered] = useState<string>();
   const [legacyId, setLegacyId] = useState('');
   const flow: GraphFlow | undefined = definition.canvas
@@ -609,7 +646,9 @@ function PublishedNodes({
             <p>
               {node.checkout.mode === 'COMMIT'
                 ? '提交 · ' + node.checkout.commitSha
-                : '分支 · ' + node.checkout.branch}
+                : node.checkout.mode === 'TAG'
+                  ? '标签 · ' + node.checkout.tag
+                  : '分支 · ' + node.checkout.branch}
               {' · '}
               {node.checkout.fullClone ? '全量历史' : '浅拉取'}
             </p>
@@ -636,7 +675,12 @@ function PublishedNodes({
               {definition.flows.find((item) => item.id === node.flowId)?.name ?? node.flowId}
             </p>
           )}
-          {node.delivery && <p>执行流预设 · {flowPresetLabels[node.delivery.kind]}</p>}
+          {node.inputs?.length ? (
+            <p>声明输入 · {node.inputs.map(({ name }) => name).join('、')}</p>
+          ) : null}
+          {node.outputs?.length ? (
+            <p>声明输出 · {node.outputs.map(({ name }) => name).join('、')}</p>
+          ) : null}
         </div>
       )}
     </>

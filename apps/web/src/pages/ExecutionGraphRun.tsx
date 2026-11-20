@@ -1,34 +1,15 @@
 import { useRef, useState } from 'react';
 import { Play } from 'lucide-react';
 import { formatTime, message, post, useResource } from '../api';
-import {
-  Confirm,
-  ErrorBanner,
-  Field,
-  Loading,
-  RefreshButton,
-  Section,
-  Status,
-} from '../components';
+import { Confirm, ErrorBanner, Loading, RefreshButton, Section, Status } from '../components';
 import type { DeploymentSelection, ProjectDetail } from '../models';
-import type { Artifact } from './Delivery';
-import { isDeployableArtifact } from './Delivery';
-import {
-  DeploymentSelectionPicker,
-  hasDeploymentSelection,
-  selectedDeploymentServers,
-  useDeploymentInventory,
-} from './DeploymentSelection';
-import { graphKey, isDeliveryNode, orderedNodes } from './execution-graph-definition';
-import type { FlowDelivery, GraphNode, GraphFlow, GraphRun } from './execution-graph-definition';
+import { GraphFieldValue } from './ExecutionGraphFields';
+import type { FieldScope } from './ExecutionGraphFields';
+import { graphKey } from './execution-graph-definition';
+import type { GraphNode, GraphFlow, GraphRun } from './execution-graph-definition';
 import { deliveryPath } from './delivery-route';
 
-type Inputs = DeploymentSelection & {
-  value?: string;
-  environmentId?: string;
-  commitSha?: string;
-  artifactIds?: string[];
-};
+type Inputs = { parameters: Record<string, unknown> };
 interface DeliveryPreview {
   nodeId?: string;
   artifactFromNodeId?: string;
@@ -37,13 +18,27 @@ interface DeliveryPreview {
   serverIds?: string[];
   artifactIds?: string[];
   requireApproval?: boolean;
+  requireCodeReview?: boolean;
+  possibleArtifacts?: {
+    nodeId?: string;
+    fieldId?: string;
+    commitSha: string;
+    artifactIds: string[];
+  }[];
   serviceId?: string;
-  sourceSnapshot?: { id?: string; repositoryId: string; branch?: string; commitSha: string }[];
+  sourceSnapshot?: {
+    id?: string;
+    repositoryId: string;
+    branch?: string;
+    tag?: string;
+    commitSha: string;
+  }[];
 }
 interface Preview extends DeliveryPreview {
   configurationHash: string;
   version: number;
   flowId: string;
+  parameters?: Record<string, unknown>;
   nodes: { nodeId: string; name: string; type: GraphNode['type']; selected?: boolean }[];
   deliveries?: DeliveryPreview[];
   checkouts?: {
@@ -51,6 +46,7 @@ interface Preview extends DeliveryPreview {
     flowId: string;
     repositoryId: string;
     branch?: string;
+    tag?: string;
     commitSha: string;
     fullClone: boolean;
   }[];
@@ -64,43 +60,41 @@ interface Preview extends DeliveryPreview {
   }[];
 }
 
-function reachableNodes(root: GraphFlow, flows: GraphFlow[], inputs: Inputs) {
-  const visitedFlows = new Set<string>();
-  const result: GraphNode[] = [];
-  const actionPresets = new Map<string, FlowDelivery>();
-  function visit(flow: GraphFlow) {
-    if (visitedFlows.has(flow.id)) return;
-    visitedFlows.add(flow.id);
-    const reachable = new Set(
-      flow.nodes.filter((node) => node.type === 'START').map((node) => node.id),
-    );
-    const preset = flow.nodes.find((node) => node.type === 'START')?.delivery;
-    for (const node of orderedNodes(flow)) {
-      if (!reachable.has(node.id)) continue;
-      result.push(node);
-      if (node.type === 'FLOW_CALL') {
-        const child = flows.find((f) => f.id === node.flowId);
-        if (child) visit(child);
-      }
-      if (preset && isDeliveryNode(node)) actionPresets.set(node.id, preset);
-      const source = node.condition?.key ?? node.switch?.key;
-      const value = source === 'commitSha' ? inputs.commitSha?.toLowerCase() : (inputs.value ?? '');
-      const matches = (expected: string) =>
-        value === (source === 'commitSha' ? expected.toLowerCase() : expected);
-      const caseIndex = node.switch?.cases.findIndex(matches) ?? -1;
-      const branch = node.switch
-        ? caseIndex < 0
-          ? 'DEFAULT'
-          : `CASE:${caseIndex}`
-        : node.condition && (matches(node.condition.value) ? 'TRUE' : 'FALSE');
-      for (const edge of flow.edges) {
-        if (edge.from !== node.id || (edge.when && edge.when !== branch)) continue;
-        reachable.add(edge.to);
-      }
-    }
-  }
-  visit(root);
-  return { nodes: result, actionPresets };
+function Results({
+  values,
+  labels = {},
+  title,
+}: {
+  values?: Record<string, unknown>;
+  labels?: Record<string, string>;
+  title: string;
+}) {
+  const rows = Object.entries(values ?? {}).filter(
+    ([name]) =>
+      !['decision', 'wakeAt', 'expiresAt', 'decidedAt', 'secretVariables', 'variables'].includes(
+        name,
+      ),
+  );
+  if (!rows.length) return null;
+  return (
+    <details className="graph-field-card">
+      <summary>{title}</summary>
+      <dl className="graph-field-values">
+        {rows.map(([name, value]) => (
+          <div key={name}>
+            <dt>{labels[name] ?? name}</dt>
+            <dd>
+              {typeof value === 'object' ? (
+                <pre>{JSON.stringify(value, null, 2)}</pre>
+              ) : (
+                String(value)
+              )}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </details>
+  );
 }
 
 export function ExecutionGraphStart({
@@ -108,31 +102,30 @@ export function ExecutionGraphStart({
   path,
   version,
   flow,
-  flows,
   onRun,
 }: {
   project: ProjectDetail;
   path: string;
   version: number;
   flow: GraphFlow;
-  flows: GraphFlow[];
   onRun: (id: string) => void;
 }) {
-  const [inputs, setInputs] = useState<Inputs>(() => ({
-    ...(project.environments.length === 1 && { environmentId: project.environments[0]?.id }),
-  }));
-  const { nodes, actionPresets } = reachableNodes(flow, flows, inputs);
-  const actions = nodes.filter(isDeliveryNode);
-  const hasShell = nodes.some((node) => node.type === 'SHELL');
-  const needsValue = nodes.some((n) => (n.condition?.key ?? n.switch?.key) === 'input');
-  const needsCommit = nodes.some((n) => (n.condition?.key ?? n.switch?.key) === 'commitSha');
-  const build = actions.find((node) => node.type === 'BUILD');
-  const deploy = actions.find(
-    (node) => node.type === 'DEPLOY_ARTIFACT' && actionPresets.get(node.id)?.kind === 'DEPLOY',
+  const fields = flow.nodes.find(({ type }) => type === 'START')?.inputs ?? [];
+  const [parameters, setParameters] = useState<Record<string, unknown>>(() =>
+    Object.fromEntries(
+      fields
+        .filter((field) => field.defaultValue !== undefined)
+        .map((field) => [field.id, field.defaultValue]),
+    ),
   );
-  const buildPreset = build && actionPresets.get(build.id);
-  const deployPreset = deploy && actionPresets.get(deploy.id);
-  const [manualTargets, setManualTargets] = useState(false);
+  const scopedValue = (type: NonNullable<(typeof fields)[number]>['type']) =>
+    parameters[fields.find((field) => field.type === type && !field.multiple)?.id ?? ''];
+  const scope: FieldScope = {
+    repositoryId: scopedValue('REPOSITORY') as string | undefined,
+    environmentId: scopedValue('ENVIRONMENT') as string | undefined,
+    serviceId: (scopedValue('SERVICE') as string | undefined) ?? flow.serviceId,
+    targets: scopedValue('TARGETS') as DeploymentSelection | undefined,
+  };
   const [preview, setPreview] = useState<Preview>();
   const key = useRef('');
   const active = useRef(false);
@@ -141,10 +134,6 @@ export function ExecutionGraphStart({
   const base = path + '/flows/' + encodeURIComponent(flow.id);
   async function submit() {
     if (active.current) return;
-    if (!preview && actions.length && manualTargets && !hasDeploymentSelection(inputs)) {
-      setError('请至少选择一台服务器或一个分组。');
-      return;
-    }
     active.current = true;
     setBusy(true);
     setError('');
@@ -173,17 +162,10 @@ export function ExecutionGraphStart({
     }
   }
   function runtimeInputs(): Inputs {
-    const { value, commitSha, artifactIds, ...deployment } = inputs;
     return {
-      ...(needsValue && { value: value ?? '' }),
-      ...((build || needsCommit) && commitSha && { commitSha }),
-      ...(deploy && artifactIds?.length && { artifactIds }),
-      ...(actions.length && deployment),
-      ...(!actions.length &&
-        hasShell &&
-        deployment.environmentId && {
-          environmentId: deployment.environmentId,
-        }),
+      parameters: Object.fromEntries(
+        Object.entries(parameters).filter(([, value]) => value !== undefined),
+      ),
     };
   }
   return (
@@ -196,54 +178,31 @@ export function ExecutionGraphStart({
     >
       <h3>{preview ? '确认执行预览' : '运行参数'}</h3>
       <fieldset disabled={busy || Boolean(preview)} hidden={Boolean(preview)}>
-        {needsValue && (
-          <Field label="运行参数">
-            <input
-              maxLength={500}
-              value={inputs.value ?? ''}
-              onChange={(e) =>
-                setInputs({ ...inputs, value: e.target.value, artifactIds: undefined })
+        {fields.length ? (
+          fields.map((field) => (
+            <GraphFieldValue
+              key={field.id}
+              field={field}
+              project={project}
+              scope={scope}
+              checkRequired
+              canRegisterRepository
+              value={parameters[field.id]}
+              change={(value) =>
+                setParameters((current) => {
+                  const next = { ...current, [field.id]: value };
+                  if (['ENVIRONMENT', 'SERVICE', 'TARGETS'].includes(field.type)) {
+                    for (const candidate of fields)
+                      if (candidate.type === 'ARTIFACT') delete next[candidate.id];
+                  }
+                  return next;
+                })
               }
-              placeholder="用于判断路径，可留空"
             />
-          </Field>
+          ))
+        ) : (
+          <p className="field-note">此执行流没有运行输入。</p>
         )}
-        {!actions.length && needsCommit && (
-          <CommitInput inputs={inputs} change={setInputs} required />
-        )}
-        {!actions.length && hasShell && project.environments.length > 0 && (
-          <Field label="执行环境">
-            <select
-              value={inputs.environmentId ?? ''}
-              onChange={(e) => setInputs({ ...inputs, environmentId: e.target.value || undefined })}
-            >
-              <option value="">仅使用项目公共变量</option>
-              {project.environments.map((environment) => (
-                <option value={environment.id} key={environment.id}>
-                  {environment.name}
-                </option>
-              ))}
-            </select>
-          </Field>
-        )}
-        {actions.some((node) => actionPresets.get(node.id)?.kind === 'BUILD_DEPLOY') && (
-          <p className="field-note">部署使用本次构建生成的产物。</p>
-        )}
-        {actions.length ? (
-          <DeliveryInputs
-            key={actions.map((n) => n.id).join(',')}
-            build={buildPreset}
-            deploy={deployPreset}
-            needsCommit={needsCommit}
-            project={project}
-            inputs={inputs}
-            change={setInputs}
-            override={manualTargets}
-            setOverride={setManualTargets}
-          />
-        ) : !needsValue && !needsCommit && !hasShell ? (
-          <p className="field-note">这条执行流可直接运行，无需选择环境和服务器。</p>
-        ) : null}
       </fieldset>
       {preview && (
         <div className="graph-review" aria-label="执行预览">
@@ -258,12 +217,18 @@ export function ExecutionGraphStart({
               </li>
             ))}
           </ul>
-          {preview.checkouts?.map((checkout) => (
-            <div key={checkout.nodeId} className="graph-delivery-preview">
+          <Results
+            values={preview.parameters}
+            labels={Object.fromEntries(fields.map(({ id, name }) => [id, name]))}
+            title="已固定的运行输入"
+          />
+          {preview.checkouts?.map((checkout, index) => (
+            <div key={`${checkout.nodeId}:${index}`} className="graph-delivery-preview">
               <p>
                 {project.repositories.find(({ id }) => id === checkout.repositoryId)?.name ??
                   checkout.repositoryId}
                 {checkout.branch && ' · ' + checkout.branch}
+                {checkout.tag && ' · 标签 ' + checkout.tag}
                 {' · '}
                 {checkout.fullClone ? '完整历史' : '浅拉取'}
               </p>
@@ -272,9 +237,12 @@ export function ExecutionGraphStart({
               </p>
             </div>
           ))}
-          {preview.scripts?.map((script) => (
-            <p key={`${script.flowId}:${script.nodeId}`} className="graph-delivery-preview">
-              Shell 执行服务器 · {script.serverName || script.serverId}
+          {preview.scripts?.map((script, index) => (
+            <p
+              key={`${script.flowId}:${script.nodeId}:${index}`}
+              className="graph-delivery-preview"
+            >
+              脚本位置 · {script.serverName || script.serverId || '管理端工作区'}
               {' · '}
               {project.environments.find((env) => env.id === script.environmentId)?.name ??
                 '项目公共变量'}
@@ -283,7 +251,7 @@ export function ExecutionGraphStart({
             </p>
           ))}
           {(preview.deliveries ?? (preview.serviceId ? [preview] : [])).map((delivery, i) => (
-            <div key={delivery.nodeId ?? i} className="graph-delivery-preview">
+            <div key={`${delivery.nodeId}:${i}`} className="graph-delivery-preview">
               {delivery.serviceId && (
                 <p>
                   服务 ·{' '}
@@ -309,7 +277,7 @@ export function ExecutionGraphStart({
                     <li key={source.id ?? source.repositoryId}>
                       {project.repositories.find((r) => r.id === source.repositoryId)?.name ??
                         source.repositoryId}{' '}
-                      · {source.branch} <code>{source.commitSha}</code>
+                      · {source.branch ?? source.tag} <code>{source.commitSha}</code>
                     </li>
                   ))}
                 </ul>
@@ -317,9 +285,23 @@ export function ExecutionGraphStart({
               {delivery.artifactIds?.length ? (
                 <p>归档产物 · {delivery.artifactIds.join('、')}</p>
               ) : null}
-              {delivery.artifactFromNodeId && <p>归档产物 · 使用上游构建节点的产物</p>}
+              {delivery.possibleArtifacts?.length ? (
+                <ul aria-label="可能使用的产物来源">
+                  {delivery.possibleArtifacts.map((candidate, index) => (
+                    <li key={index}>
+                      {candidate.nodeId
+                        ? `${preview.nodes.find((node) => node.nodeId === candidate.nodeId)?.name ?? candidate.nodeId} · ${candidate.fieldId ?? '产物'}`
+                        : candidate.artifactIds.join('、')}{' '}
+                      <code>{candidate.commitSha}</code>
+                    </li>
+                  ))}
+                </ul>
+              ) : delivery.artifactFromNodeId ? (
+                <p>归档产物 · 使用本次运行产生的产物</p>
+              ) : null}
               {delivery.serverIds?.length ? <TargetNames ids={delivery.serverIds} /> : null}
               {delivery.requireApproval && <p>本次发布需要管理员审批。</p>}
+              {delivery.requireCodeReview && <p>已核对产物提交的代码审核记录。</p>}
             </div>
           ))}
         </div>
@@ -357,212 +339,6 @@ function TargetNames({ ids }: { ids: string[] }) {
   );
 }
 
-function DeliveryInputs({
-  build,
-  deploy,
-  needsCommit,
-  project,
-  inputs,
-  change,
-  override,
-  setOverride,
-}: {
-  build?: FlowDelivery;
-  deploy?: FlowDelivery;
-  needsCommit: boolean;
-  project: ProjectDetail;
-  inputs: Inputs;
-  change: (v: Inputs) => void;
-  override: boolean;
-  setOverride: (v: boolean) => void;
-}) {
-  const inventory = useDeploymentInventory();
-  const environmentId = inputs.environmentId ?? '';
-  const configured = useResource<DeploymentSelection | null>(
-    deploy?.serviceId && environmentId && !override
-      ? `/services/${deploy.serviceId}/environments/${environmentId}/config`
-      : null,
-  );
-  const selection = override ? inputs : configured.data;
-  const targetIds = selection?.targetId
-    ? project.deploymentTargets?.find(({ id }) => id === selection.targetId)?.serverIds
-    : selection && (!selection.groupIds?.length || inventory.groups.data)
-      ? selectedDeploymentServers(selection, inventory.groups.data ?? [])
-      : undefined;
-  const source = build?.build;
-  const repository = project.repositories.find((item) => item.id === source?.repositoryId);
-  return (
-    <>
-      <Field label="运行环境">
-        <select
-          required
-          value={environmentId}
-          onChange={(e) =>
-            change({ ...inputs, environmentId: e.target.value, artifactIds: undefined })
-          }
-        >
-          <option value="">选择环境</option>
-          {project.environments.map((e) => (
-            <option key={e.id} value={e.id}>
-              {e.name}
-            </option>
-          ))}
-        </select>
-      </Field>
-      {source && (
-        <p className="field-note">
-          构建来源 · {repository?.name ?? '仓库'} ·{' '}
-          {source.commitSha || source.branch || '远程默认分支'}
-        </p>
-      )}
-      {needsCommit && <CommitInput inputs={inputs} change={change} required />}
-      <Field label="目标来源">
-        <select
-          value={override ? 'select' : 'env'}
-          onChange={(e) => {
-            setOverride(e.target.value === 'select');
-            change({
-              value: inputs.value,
-              environmentId,
-              commitSha: inputs.commitSha,
-              artifactIds: undefined,
-            });
-          }}
-        >
-          <option value="env">沿用服务环境目标</option>
-          <option value="select">指定服务器或服务器组</option>
-        </select>
-      </Field>
-      {override && (
-        <DeploymentSelectionPicker
-          projectId={project.id}
-          inventory={inventory}
-          value={inputs}
-          onChange={(v) => change({ ...inputs, ...v, artifactIds: undefined })}
-        />
-      )}
-      {deploy?.serviceId && environmentId && (
-        <HistoryArtifacts
-          key={environmentId + ':' + deploy.serviceId}
-          projectId={project.id}
-          serviceId={deploy.serviceId}
-          environmentId={environmentId}
-          targetIds={targetIds}
-          targetLoading={
-            (!override && configured.loading) ||
-            (Boolean(selection?.groupIds?.length) && inventory.groups.loading)
-          }
-          selected={inputs.artifactIds ?? []}
-          onSelect={(ids) => change({ ...inputs, artifactIds: ids })}
-        />
-      )}
-    </>
-  );
-}
-
-function CommitInput({
-  inputs,
-  change,
-  required,
-}: {
-  inputs: Inputs;
-  change: (v: Inputs) => void;
-  required: boolean;
-}) {
-  return (
-    <Field label="提交 SHA">
-      <input
-        pattern="([a-fA-F0-9]{40}|[a-fA-F0-9]{64})"
-        required={required}
-        value={inputs.commitSha ?? ''}
-        placeholder="输入完整 SHA"
-        onChange={(e) => change({ ...inputs, commitSha: e.target.value.trim() })}
-      />
-    </Field>
-  );
-}
-
-function HistoryArtifacts({
-  projectId,
-  serviceId,
-  environmentId,
-  targetIds,
-  targetLoading,
-  selected,
-  onSelect,
-}: {
-  projectId: string;
-  serviceId: string;
-  environmentId: string;
-  targetIds?: string[];
-  targetLoading: boolean;
-  selected: string[];
-  onSelect: (ids: string[]) => void;
-}) {
-  const query = new URLSearchParams({ projectId, serviceId, environmentId });
-  const resource = useResource<Artifact[]>(`/artifacts?${query}`);
-  const builds = new Map<string, Artifact[]>();
-  for (const artifact of (resource.data ?? []).filter(isDeployableArtifact)) {
-    const id = artifact.pipelineRunId;
-    if (!id) continue;
-    const group = builds.get(id);
-    if (group) group.push(artifact);
-    else builds.set(id, [artifact]);
-  }
-  if (targetIds?.length) {
-    for (const [id, artifacts] of builds) {
-      const managed = artifacts.find((item) => item.serverId === null);
-      const matching: Artifact[] = managed
-        ? [managed]
-        : artifacts.filter(({ serverId }) => serverId && targetIds.includes(serverId));
-      if (
-        managed ||
-        targetIds.every((targetId) => matching.some(({ serverId }) => serverId === targetId))
-      )
-        builds.set(id, matching);
-      else builds.delete(id);
-    }
-  }
-  const selectedBuild = [...builds].find(([, artifacts]) =>
-    artifacts.some((item) => selected.includes(item.id)),
-  )?.[0];
-  return (
-    <fieldset className="graph-artifacts">
-      <legend>构建产物</legend>
-      <ErrorBanner error={resource.error} retry={resource.reload} />
-      {resource.loading || targetLoading ? (
-        <Loading />
-      ) : !builds.size ? (
-        !resource.error && (
-          <p className="field-note">
-            当前服务、环境和目标组合暂无可用构建产物。请先运行构建归档流。
-          </p>
-        )
-      ) : (
-        <Field label="选择构建产物" hint="实际使用的产物及服务器匹配情况将在预览中确认。">
-          <select
-            value={selectedBuild ?? ''}
-            onChange={(e) => onSelect(builds.get(e.target.value)?.map((item) => item.id) ?? [])}
-          >
-            <option value="">最新可用构建产物</option>
-            {[...builds].map(([id, artifacts]) => (
-              <option key={id} value={id}>
-                {formatTime(artifacts[0]?.createdAt ?? 0)}
-                {' · '}
-                {artifacts[0]?.artifactType === 'FILE' ? '文件归档' : 'Docker 镜像'}
-                {' · '}
-                {artifacts[0]?.sourceCommit?.slice(0, 12)}
-                {' · '}
-                {artifacts.length} 份归档
-              </option>
-            ))}
-          </select>
-        </Field>
-      )}
-    </fieldset>
-  );
-}
-
 interface RunNode {
   nodeId: string;
   name: string;
@@ -571,7 +347,7 @@ interface RunNode {
   log: string;
   taskId?: string;
   childRunId?: string | null;
-  output?: {
+  output?: Record<string, unknown> & {
     wakeAt?: number;
     expiresAt?: number;
     decision?: 'APPROVE' | 'REJECT' | 'EXPIRED';
@@ -582,6 +358,8 @@ interface RunDetail extends GraphRun {
   nodes: RunNode[];
   commitSha?: string;
   artifactIds?: string[];
+  definition?: GraphFlow;
+  trigger?: Record<string, unknown>;
 }
 
 export function ExecutionGraphHistory({
@@ -780,6 +558,16 @@ function RunDetails({
                   源码提交 · <code>{item.commitSha}</code>
                 </p>
               )}
+              <Results
+                values={item.outputs}
+                labels={Object.fromEntries(
+                  (item.definition?.nodes.find(({ type }) => type === 'END')?.outputs ?? []).map(
+                    ({ id, name }) => [id, name],
+                  ),
+                )}
+                title="执行流输出"
+              />
+              <Results values={item.trigger} title="触发信息" />
               {item.artifactIds?.length ? (
                 <div className="heading-actions">
                   {item.artifactIds.map((id) => (
@@ -801,6 +589,7 @@ function RunDetails({
                       <Status value={n.status} />
                     </div>
                     {n.log && <pre>{n.log}</pre>}
+                    <Results values={n.output} title="节点输出" />
                     {n.type === 'DELAY' && n.status === 'WAITING' && n.output?.wakeAt && (
                       <p>计划恢复 · {formatTime(n.output.wakeAt)}</p>
                     )}

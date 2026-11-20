@@ -26,6 +26,12 @@ import {
     ReleaseRequestsService,
     RegistriesService,
   ],
-  exports: [PipelinesService, ArtifactsService, DeploymentsService, RegistriesService],
+  exports: [
+    PipelinesService,
+    BuildsService,
+    ArtifactsService,
+    DeploymentsService,
+    RegistriesService,
+  ],
 })
 export class PipelinesModule {}

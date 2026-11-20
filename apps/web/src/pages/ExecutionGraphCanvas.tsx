@@ -42,6 +42,9 @@ const icons = {
   JOIN: GitMerge,
   FLOW_CALL: Workflow,
   CHECKOUT: Download,
+  CHECK: ShieldCheck,
+  LOAD_ENV: ListTree,
+  REGISTER_ARTIFACT: Box,
   SHELL: Code2,
   END: CheckCircle2,
 };

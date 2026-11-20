@@ -1,4 +1,4 @@
-import { ConflictException, Controller, Get, Injectable, Query } from '@nestjs/common';
+import { ConflictException, Controller, Get, Injectable, Optional, Query } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Kysely, Selectable } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
@@ -8,11 +8,15 @@ import { lockTaskLease, TaskLeaseUnavailableError } from '../tasks/task-lease';
 import { assertCurrentTargets, serviceReleasePolicy } from './release-policy';
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
 import { DeliveryRecordFilters } from '../projects/delivery-filters';
+import { SourceReviewService } from './source-review.service';
 
 export type DeploymentHealth = 'NOT_CHECKED' | 'HEALTHY' | 'FAILED' | 'UNKNOWN';
 @Injectable()
 export class DeploymentsService {
-  constructor(private readonly database: DatabaseService) {}
+  constructor(
+    private readonly database: DatabaseService,
+    @Optional() private readonly sourceReviews?: SourceReviewService,
+  ) {}
   async current(db: Kysely<Database>, serviceId: string, environmentId: string, serverId: string) {
     return db
       .selectFrom('deployment_records')
@@ -29,6 +33,16 @@ export class DeploymentsService {
   async assertApproval(taskId: string, snapshot: PipelineSnapshot, targets?: PipelineTarget[]) {
     const db = this.database.db;
     const { policy } = await serviceReleasePolicy(db, snapshot.serviceId, snapshot.environmentId);
+    if (policy.requireCodeReview || snapshot.releasePolicy?.requireCodeReview) {
+      if (!this.sourceReviews) throw new ConflictException('代码审核服务不可用');
+      await this.sourceReviews.requireReviewed(
+        snapshot.projectId,
+        snapshot.serviceId,
+        snapshot.environmentId,
+        snapshot.commitSha,
+        { db, force: true },
+      );
+    }
     const requiresApproval = policy.requireApproval || snapshot.releasePolicy?.requireApproval;
     if (!requiresApproval && snapshot.mode !== 'DEPLOY_ARTIFACT') return;
     const automatic = snapshot.triggerType && snapshot.triggerType !== 'MANUAL';

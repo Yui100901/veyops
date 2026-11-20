@@ -17,7 +17,7 @@ import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import type { Selectable } from 'kysely';
 import type { RepositoriesTable } from '../../core/database/schema';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { parseEnv, promisify } from 'node:util';
@@ -55,6 +55,7 @@ type RepositoryAccess = { clone_url: string; credential_id: string | null };
 export interface GraphCheckoutSnapshot {
   repositoryId: string;
   branch?: string;
+  tag?: string;
   commitSha: string;
   fullClone: boolean;
   access: RepositoryAccess;
@@ -302,8 +303,9 @@ export class RepositoryMetadataService {
     projectId: string,
     input: {
       repositoryId: string;
-      mode: 'BRANCH' | 'COMMIT';
+      mode: 'BRANCH' | 'TAG' | 'COMMIT';
       branch?: string;
+      tag?: string;
       commitSha?: string;
       fullClone?: boolean;
     },
@@ -312,6 +314,7 @@ export class RepositoryMetadataService {
     if (!row) throw new NotFoundException('仓库不存在');
     const access = { clone_url: row.clone_url, credential_id: row.credential_id };
     let branch: string | undefined;
+    let tag: string | undefined;
     let commitSha = input.commitSha?.toLowerCase();
     if (input.mode === 'BRANCH') {
       const remote = await this.withRepository(
@@ -323,18 +326,47 @@ export class RepositoryMetadataService {
       branch = input.branch ?? remote.defaultBranch ?? undefined;
       commitSha = remote.branches.find((item) => item.name === branch)?.sha;
     }
+    if (input.mode === 'TAG') {
+      tag = input.tag;
+      if (!tag || !isBranchName(tag)) throw new BadRequestException('请选择有效的 Git 标签');
+      const ref = 'refs/tags/' + tag;
+      commitSha = await this.withRepository(
+        projectId,
+        input.repositoryId,
+        async (git) => {
+          if (git.redact(tag!) !== tag) throw new BadRequestException('请选择有效的 Git 标签');
+          const data = await git.run(['ls-remote', '--', git.url, ref, ref + '^{}']);
+          const refs = new Map(
+            data
+              .split(/\r?\n/)
+              .map((line) => line.split('\t') as [string, string])
+              .map(([sha, name]) => [name, sha]),
+          );
+          const sha = refs.get(ref + '^{}') ?? refs.get(ref);
+          if (!sha || !shaPattern.test(sha)) throw new BadRequestException('所选 Git 标签不存在');
+          return sha;
+        },
+        access,
+      );
+    }
     if (!commitSha || !shaPattern.test(commitSha))
-      throw new BadRequestException('请选择存在的仓库分支或完整 Git 提交 SHA');
+      throw new BadRequestException('请选择存在的仓库分支、标签或完整 Git 提交 SHA');
     return {
       repositoryId: input.repositoryId,
       branch,
+      tag,
       commitSha,
       fullClone: input.fullClone === true,
       access,
     };
   }
 
-  checkoutGraphSource(projectId: string, snapshot: GraphCheckoutSnapshot, signal?: AbortSignal) {
+  checkoutGraphSource(
+    projectId: string,
+    snapshot: GraphCheckoutSnapshot,
+    signal?: AbortSignal,
+    destination?: string,
+  ) {
     return this.withRepository(
       projectId,
       snapshot.repositoryId,
@@ -352,6 +384,7 @@ export class RepositoryMetadataService {
           ...repo,
           'fetch',
           '--no-tags',
+          '--no-recurse-submodules',
           ...(snapshot.fullClone ? [] : ['--depth=1']),
           '--',
           git.url,
@@ -360,6 +393,13 @@ export class RepositoryMetadataService {
         await git.run([...repo, 'checkout', '--detach', 'FETCH_HEAD']);
         const actual = (await git.run([...repo, 'rev-parse', 'HEAD'])).trim();
         if (actual !== snapshot.commitSha) throw new ConflictException('实际检出提交与预览不一致');
+        if (destination)
+          await cp(worktree, destination, {
+            recursive: true,
+            verbatimSymlinks: true,
+            force: false,
+            errorOnExist: true,
+          });
         return {
           commitSha: actual,
           shallow:

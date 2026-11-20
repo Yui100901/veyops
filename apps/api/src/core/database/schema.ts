@@ -132,6 +132,7 @@ export interface EnvironmentsTable {
   name: string;
   slug: string;
   environment_type: Generated<string>;
+  repository_env_file: Generated<string | null>;
   description: Generated<string>;
   created_at: number;
   updated_at: number;
@@ -358,6 +359,10 @@ export interface RegistriesTable {
 }
 
 export interface ArtifactsTable {
+  artifact_name: Generated<string | null>;
+  artifact_kind: Generated<string | null>;
+  graph_run_id: Generated<string | null>;
+  graph_node_run_id: Generated<string | null>;
   pinned_at: Generated<number | null>;
   pruned_at: Generated<number | null>;
   archive_deleted_at: Generated<number | null>;
@@ -822,6 +827,18 @@ export interface Database {
   deployment_targets: DeploymentTargetsTable;
   deployment_target_servers: DeploymentTargetServersTable;
   service_environment_configs: ServiceEnvironmentConfigsTable;
+  service_source_reviews: {
+    id: string;
+    project_id: string;
+    service_id: string;
+    environment_id: string;
+    commit_sha: string;
+    decision: 'APPROVED' | 'REVOKED';
+    reason: string | null;
+    reviewed_by: string;
+    created_at: number;
+    updated_at: number;
+  };
   project_variables: ProjectVariablesTable;
   environment_variables: EnvironmentVariablesTable;
   service_environment_variables: ServiceEnvironmentVariablesTable;

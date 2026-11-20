@@ -85,6 +85,9 @@ export class GraphTriggerHooksController {
       signature: req.get('x-veyops-signature'),
       raw: req.is('application/json') ? req.rawBody : undefined,
       inputValue: body.inputValue,
+      repositoryId: body.repositoryId,
+      ref: body.ref,
+      commitSha: body.commitSha,
     });
   }
 }

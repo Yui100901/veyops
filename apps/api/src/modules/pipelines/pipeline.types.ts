@@ -1,11 +1,22 @@
 import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import type { DeploymentSelection } from '../deployment-targets/deployment-selection';
+import type { GraphExecutionScope } from '../execution-graphs/graph-workspace';
+
+export interface NamedArtifactDefinition {
+  name: string;
+  type: 'FILE' | 'DIRECTORY' | 'DOCKER_IMAGE';
+  path?: string;
+  imageReference?: string;
+  required?: boolean;
+  composeFilePath?: string;
+}
 
 export type PipelineExecutionMode = 'BUILD_ONLY' | 'DEPLOY';
 export type AutomaticPipelineTrigger = 'WEBHOOK' | 'SCHEDULE' | 'POLL';
 
 export interface ReleasePolicy {
   requireApproval: boolean;
+  requireCodeReview?: boolean;
   archivePushedImage?: boolean;
   rollbackMode: 'OFF' | 'PREVIOUS_HEALTHY' | 'PINNED';
   pinnedDeploymentId?: string;
@@ -59,6 +70,7 @@ export interface PipelineNodeSource {
   branch?: string;
 }
 export interface PipelineDefinition {
+  artifacts?: NamedArtifactDefinition[];
   inheritBuildLocation?: boolean;
   defaultMode?: PipelineExecutionMode;
   repositoryId: string;
@@ -81,6 +93,7 @@ export interface PipelineDefinition {
   nodes?: PipelineNode[];
 }
 export interface PipelineSnapshot {
+  graph?: GraphExecutionScope;
   targetWorkspaceRoot?: string;
   releasePolicy?: ReleasePolicy;
   rollbackOfDeploymentId?: string;
@@ -127,8 +140,11 @@ export interface PipelineArtifact {
   imageTag?: string;
   imageId?: string;
   serverId?: string;
+  name?: string;
+  kind?: NamedArtifactDefinition['type'];
 }
 export interface BuildOutput {
+  artifacts?: { declaration: NamedArtifactDefinition; output: BuildOutput }[];
   localArchive?: string;
   archiveKey?: string;
   archiveImageId?: string;
@@ -143,4 +159,14 @@ export interface BuildOutput {
   sizeBytes?: number;
   cleanup: () => Promise<void>;
 }
+
+export function isStandaloneGraphBuild(snapshot: PipelineSnapshot | undefined) {
+  return Boolean(
+    snapshot?.graph &&
+    snapshot.mode === 'BUILD_ONLY' &&
+    !snapshot.deployAfterBuild &&
+    snapshot.definition.buildLocation === 'MANAGER',
+  );
+}
+
 export type PipelineTarget = SshTarget;

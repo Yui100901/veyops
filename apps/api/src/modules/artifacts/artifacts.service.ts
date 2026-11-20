@@ -105,6 +105,10 @@ function deploymentFingerprint(row: Selectable<ArtifactsTable>) {
       row.pipeline_run_id,
       row.server_id,
       row.source_commit,
+      row.artifact_name,
+      row.artifact_kind,
+      row.graph_run_id,
+      row.graph_node_run_id,
       row.artifact_type,
       row.storage_type,
       row.storage_key,
@@ -125,9 +129,14 @@ export class ArtifactsService {
   async create(snapshot: PipelineSnapshot, artifact: Omit<PipelineArtifact, 'id'>) {
     const id = randomUUID();
     const d = snapshot.definition;
+    const artifactType = artifact.kind
+      ? artifact.kind === 'DOCKER_IMAGE'
+        ? 'DOCKER_IMAGE'
+        : 'FILE'
+      : d.artifactType;
     const storageType =
       artifact.storageType ??
-      (d.artifactType === 'DOCKER_IMAGE'
+      (artifactType === 'DOCKER_IMAGE'
         ? 'REGISTRY_IMAGE'
         : artifact.serverId
           ? 'REMOTE_FILE'
@@ -141,7 +150,11 @@ export class ArtifactsService {
         project_id: snapshot.projectId,
         service_id: snapshot.serviceId,
         pipeline_run_id: snapshot.runId,
-        artifact_type: d.artifactType,
+        artifact_type: artifactType,
+        artifact_name: artifact.name ?? null,
+        artifact_kind: artifact.kind ?? null,
+        graph_run_id: snapshot.graph?.runId ?? null,
+        graph_node_run_id: snapshot.graph?.nodeRunId ?? null,
         storage_type: storageType,
         storage_key: artifact.storageKey,
         archive_key: artifact.archiveKey ?? null,
@@ -209,6 +222,10 @@ export class ArtifactsService {
         (r.taskStatus === 'SUCCESS' || r.taskStatus === 'PARTIAL_FAILED') &&
         hasDeployableMetadata(r),
       artifactType: r.artifact_type,
+      name: r.artifact_name,
+      kind: r.artifact_kind ?? r.artifact_type,
+      graphRunId: r.graph_run_id,
+      graphNodeRunId: r.graph_node_run_id,
       storageType: r.storage_type,
       storageKey: r.storage_key,
       downloadAvailable: r.pruned_at === null && Boolean(archiveKey(r)),
@@ -248,6 +265,8 @@ export class ArtifactsService {
       id: row.id,
       serverId: row.server_id,
       fingerprint: deploymentFingerprint(row),
+      name: row.artifact_name,
+      kind: row.artifact_kind ?? row.artifact_type,
     }));
   }
 

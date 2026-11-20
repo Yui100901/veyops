@@ -93,45 +93,39 @@
 
 ## 项目执行图
 
-以下路径均以 `/projects/:projectId/execution-graph` 为前缀。登录用户可读，管理员和操作员可保存、发布和手动运行；归档项目保留历史查询。
+以下路径使用前缀 `/projects/:projectId/execution-graph`。登录用户可查询，管理员和操作员可保存、发布和运行。
 
 | 方法与相对路径 | 请求与结果 |
 | --- | --- |
-| `GET /` | 返回 `id, projectId, revision, publishedVersion, draft`。新项目带一条“开始 → 结束”的示例流，首次发布前版本为 null。 |
-| `PUT /draft` | 提交 `{expectedRevision, definition:{flows:[],canvas:{nodes,edges,endpoints,templates}}}`。每条 `endpoints` 记录 `{startId,endId}`。服务端根据画布派生执行流，ID 与名称取自开始节点。保存后返回新修订号，其他人已保存时返回 409。 |
-| `POST /publish` | 提交 `{expectedRevision}`，将已保存草稿发布为不可变的完整图版本。重复发布同一修订返回原版本。 |
-| `GET /versions`、`GET /versions/:version` | 列出发布历史，或读取指定版本当时的完整定义。 |
-| `POST /versions/:version/restore` | 管理员或操作员提交 `{expectedRevision}`，将指定已发布版本载入新草稿，确认后可发布新版本。 |
-| `POST /flows/:flowId/preview` | 提交 `{version, inputs?}`。返回实际节点、配置摘要，按需返回 `checkouts` 中的固定提交和拉取深度、`scripts` 中的 SSH 目标，以及交付服务、环境、目标和审批要求。 |
-| `POST /flows/:flowId/run` | 使用与预览相同的版本和输入，附预览返回的 `configurationHash`（传为 `expectedConfigurationHash`）和 `idempotencyKey`。同一用户在同一项目重试同一请求可取回原运行；换参数复用同一键返回 409。 |
-| `GET /runs`、`GET /runs/:runId` | 按时间倒序返回运行，每页最多 100 条。传 `?before=<上一页最后一个运行 ID>` 查看更早记录。详情返回当时的图版本、流定义、输入及节点结果。交付节点包含关联任务 ID，可查逐台服务器、步骤、日志和产物。 |
-| `POST /runs/:runId/cancel` | 取消尚未完成的运行，并将取消传给相关任务和子流。等待中和已经开始的外部操作使用各自的任务状态。 |
-| `POST /runs/:runId/nodes/:nodeId/decision` | 管理员对等待中的人工审批提交 `{decision:"APPROVE"}` 或 `{decision:"REJECT"}`。已结束或超时的审批返回冲突。 |
+| `GET /` | 查询项目图、草稿修订号和当前发布版本。 |
+| `GET /catalog` | 返回内置字段、功能模块版本和端口定义。 |
+| `POST /validate` | 提交 `{definition}`。响应的 `issues` 用 `flowId`、`nodeId`、`fieldId` 和 `message` 定位发布问题。 |
+| `PUT /draft` | 提交 `{expectedRevision, definition:{flows:[],canvas:{nodes,edges,endpoints,templates}}}`。 |
+| `POST /publish` | 提交 `{expectedRevision}`，校验并固定已保存的图版本。 |
+| `GET /versions`、`GET /versions/:version` | 查询发布历史和具体发布版本。 |
+| `POST /versions/:version/restore` | 提交 `{expectedRevision}`，将发布版本载入草稿。 |
+| `POST /flows/:flowId/preview` | 提交 `{version,inputs:{parameters}}`，返回实际参数、固定提交、产物来源、目标、审批条件和 `configurationHash`。 |
+| `POST /flows/:flowId/run` | 提交同样的版本和输入，附 `expectedConfigurationHash` 和 `idempotencyKey`。相同确认可取回原运行。 |
+| `GET /runs`、`GET /runs/:runId` | 查询运行、节点结果、任务、触发元数据和结束节点的 `outputs`。 |
+| `POST /runs/:runId/cancel` | 取消运行及尚未完成的节点和子流。 |
+| `POST /runs/:runId/nodes/:nodeId/decision` | 管理员提交 `{decision:"APPROVE"}` 或 `{decision:"REJECT"}`。 |
 
-每条流有一个 `START` 和一个 `END`。日志节点填写 `message`，`CONDITION` 使用 `{key,value}` 比较 `inputs.value`（`key: input`）或 `inputs.commitSha`（`key: commitSha`），发出的两条边分别标记 `when: TRUE` 和 `when: FALSE`。并行分支由 `PARALLEL` 发起，`JOIN` 等待实际命中的分支。使用 `FLOW_CALL.flowId` 启动同一已发布图版本中的子流，子流独立记录日志和状态。
+开始节点 `inputs` 和结束节点 `outputs` 使用同一字段结构 `{id,name,type,required?,multiple?,defaultValue?,options?,artifactType?,selection?,source?}`。Git 版本值为 `{kind:"BRANCH"|"TAG"|"COMMIT",value}`。产物参数接受已登记 ID，预览返回具体产物引用。`LATEST_COMPATIBLE` 在预览中按作用域及目标固定记录，`CURRENT_RUN` 约束结束产物的来源。
 
-`START.delivery` 声明 `kind`，可选 `CUSTOM`（默认）、`BUILD`、`DEPLOY`、`BUILD_DEPLOY`、`VERIFY`、`MAINTENANCE`、`RELEASE_REVIEW`。构建、部署和组合预设必须通过 `serviceId` 关联所属项目的实际服务。其他预设也可选择关联服务。交付流中的 `BUILD` 和 `DEPLOY_ARTIFACT` 节点使用开始节点的交付配置。
+画布的 `endpoints` 保存 `{startId,endId,serviceId?,edgeSelections?,inputBindings?,outputBindings?}`。端口可引用 `INPUT.fieldId`、`OUTPUT.nodeId` 和 `fieldId`、`CONTEXT.fieldId`、`VALUE.value`，或按顺序选择 `FIRST_AVAILABLE.sources`。普通路径的 `edgeSelections` 按源节点 ID 写入允许的下游节点 ID。`FLOW_CALL` 的端口取子流的开始和结束字段 ID。
 
-- 构建配置 `build` 接受 `repositoryId`、可选 `branch` 或完整 `commitSha`、`buildLocation`、`artifactType`、`buildImage`、`repoPath`、`installCommand`、`buildCommand`、`outputPath`、`dockerfilePath`、`composeFilePath`、`registryId`、`imageRepository`。分支或远端默认分支先解析为固定提交。
-- 发布配置 `deploy` 可声明 `deployPath`、`startCommand`、`stopCommand`、`healthCheckCommand` 及 `composeFilePath`，也可通过服务环境提供有效配置。
-- 输入 `environmentId` 选择服务环境，目标沿用环境或显式使用 `serverIds`、`groupIds`。部署流省略 `artifactIds` 时，预览会选择同项目、服务及环境中与发布目标兼容的最新一批产物。也可传入同一次构建的历史产物 ID。组合流默认使用本次构建产物。
-- 预览的 `deliveries` 显示服务、产物来源、固定提交及审批。缺少合格制品会拒绝预览。产物或配置变化需要重新预览和确认。构建完成后从运行详情读取 `artifactIds` 并通过 `GET /artifacts/:id/download` 下载。
-
-多路选择 `SWITCH.switch` 指定 `key` 和按顺序比较的 `cases`。对应出边分别使用 `CASE:0`、`CASE:1` 等以及 `DEFAULT`。延迟节点 `DELAY.delaySeconds` 使用秒数。人工审批 `APPROVAL.approval.timeoutSeconds` 可设等待时限。等待状态、唤醒或过期时间及管理员决定都随运行保存。
-
-多个开始节点可共享可达的结束节点和功能节点。每个开始节点只能配对一个结束节点，发布时会逐条校验路径。源码拉取节点 `CHECKOUT.checkout` 接受 `repositoryId` 及 `mode: BRANCH` 和 `branch`，或 `mode: COMMIT` 和完整 `commitSha`。默认浅拉取，设置 `fullClone: true` 获取该提交的完整历史。预览锁定实际 SHA，Worker 在管理端临时目录检出并记录结果。Shell 节点 `SHELL.shell` 使用 `command` 与 `serverId` 创建 SSH 任务。
+构建、登记和部署配置分别保存在 `BUILD.build`、`REGISTER_ARTIFACT.registerArtifacts` 和 `DEPLOY_ARTIFACT.deploy`。构建和登记支持 `artifacts` 列表，条目包含 `name`、`type`、`path` 或 `imageReference`，以及可选 `required`、`composeFilePath`。每个名称输出一组可匹配执行目标的产物引用。部署节点从 `artifact` 端口取得待部署记录。归档下载使用 `GET /artifacts/:id/download`。
 
 ### 执行图触发器
 
-管理员在开始节点属性配置触发器。使用 `GET /triggers` 查询规则，通过 `POST /triggers` 创建规则，`flowId` 取开始节点 ID，版本固定为已发布版本。删除开始节点并发布时自动停用其规则。自动触发覆盖本地控制节点，源码拉取、SSH 和交付节点通过开始节点手动预览并确认。
+通过 `GET /triggers` 查询附加规则，管理员经 `POST /triggers` 创建，用 `PATCH /triggers/:id` 更新。规则绑定发布版本和开始节点。`parameterMappings` 按开始字段 ID 指定 `{source:"VALUE",value}` 或 `{source:"EVENT",field}`。事件字段包括 `repository`、`commit`、`ref`、`eventId`、`scheduledAt`、`upstreamRunId` 和 `upstreamStatus`，由触发类型决定可用项。
 
 - `CRON` 使用 `cron` 和 IANA `timeZone`。
-- `API` 使用平台身份通过 `POST /triggers/:triggerId/invoke` 提交 `{eventId,inputValue?}`。
-- `UPSTREAM` 使用同一发布版本内的 `upstreamFlowId` 和 `upstreamStatus`，值为 `SUCCESS`、`FAILED` 或 `ANY`。
-- `WEBHOOK` 绑定自定义密钥凭据。外部以 JSON 向 `/api/v1/graph-webhooks/:triggerId` 发出 POST，携带 `X-Veyops-Timestamp`（Unix 秒）、`X-Veyops-Delivery`（事件 ID）、`X-Veyops-Signature`。签名值为 `sha256=` 与对 `timestamp + "." + eventId + "." + 原始请求体` 计算的十六进制 HMAC-SHA256。
+- `API` 经 `POST /triggers/:triggerId/invoke` 提交 `{eventId,inputValue?,repositoryId?,ref?,commitSha?}`。
+- `UPSTREAM` 指定同一发布版本的 `upstreamFlowId` 和 `upstreamStatus`。
+- `WEBHOOK` 使用签名凭据，可设置 `repositoryId` 和 `refPrefix` 过滤。向 `/api/v1/graph-webhooks/:triggerId` 提交 JSON，携带 `X-Veyops-Timestamp`、`X-Veyops-Delivery`、`X-Veyops-Signature`，签名对 `timestamp + "." + eventId + "." + 原始请求体` 计算 HMAC-SHA256，以 `sha256=` 加十六进制值发送。
 
-`GET /triggers/:triggerId/events` 用于查看受理、启动或拒绝记录。相同规则中，同一个事件 ID 重投不会启动第二次运行。
-
+`GET /triggers/:triggerId/events` 返回事件状态与元数据。同一规则的事件 ID 去重。
 ## 项目视图
 
 | 方法   | 路径       | 请求 / 说明                                                                |
@@ -287,6 +281,8 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 新建仓库、修改克隆地址或凭据时，系统探测远端 HEAD、分支和完整提交 SHA。使用 `GET /projects/:projectId/repositories/:repositoryId/branch-cache` 查询快照，使用该路径的 `POST /refresh` 重新探测。状态有 `PENDING`、`CURRENT`、`STALE` 和 `ERROR`。同一仓库探测失败时保留上次成功分支，切换仓库地址或凭据会清除旧快照。
 
 ### 发布保护与回滚
+
+启用服务环境的 `releasePolicy.requireCodeReview` 后，发布会核对产物对应完整提交 SHA 的有效审核。`GET /projects/:projectId/services/:serviceId/environments/:environmentId/source-reviews` 查询审核记录。管理员通过同一路径下的 `PUT /:commitSha` 提交 `{decision:"APPROVED"|"REVOKED",reason?}`，变更和发布任务均可追溯。
 
 管理员通过服务环境配置的 `releasePolicy` 设置 `requireApproval`、`rollbackMode`（`OFF`、`PREVIOUS_HEALTHY`、`PINNED`）、可选的 `pinnedDeploymentId`、`archivePushedImage` 和 `healthCheck`。健康检查包含可选的 `httpUrl`、`compose`，以及 `attempts`、`intervalSeconds`、`timeoutSeconds`。文件服务环境可另配置 `stopCommand`。
 

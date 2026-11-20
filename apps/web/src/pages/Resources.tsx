@@ -30,6 +30,7 @@ import { ProjectExecutionSettingsPanel } from './ProjectExecutionSettings';
 import { EnvironmentVariables } from './EnvironmentVariables';
 import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
 import { deliveryPath } from './delivery-route';
+import type { GraphDocument } from './execution-graph-definition';
 import {
   Confirm,
   Empty,
@@ -1479,6 +1480,14 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
   const [section, setSection] = useState<
     'resources' | 'relations' | 'deployment' | 'ai' | 'settings'
   >('resources');
+  const executionGraph = useResource<GraphDocument>(
+    section === 'resources' ? '/projects/' + id + '/execution-graph' : null,
+  );
+  const publishedGraph = useResource<{ definition: GraphDocument['draft'] }>(
+    section === 'resources' && executionGraph.data?.publishedVersion
+      ? '/projects/' + id + '/execution-graph/versions/' + executionGraph.data.publishedVersion
+      : null,
+  );
   const [editingProject, setEditingProject] = useInlineEditor<true>();
   const [deletingProject, setDeletingProject] = useState(false);
   const [adding, setAdding] = useInlineEditor<'repositories' | 'services' | 'environments'>();
@@ -1515,6 +1524,7 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
         ...payload,
         slug: text(form, 'slug'),
         environmentType: text(form, 'environmentType'),
+        repositoryEnvFile: text(form, 'repositoryEnvFile') || null,
       };
     try {
       if (editingResource)
@@ -1775,21 +1785,36 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
                     </select>
                   </Field>
                 ) : (
-                  <Field label="环境类型">
-                    <select
-                      name="environmentType"
-                      defaultValue={
-                        (editingResource as Environment | undefined)?.environmentType ??
-                        'DEVELOPMENT'
-                      }
+                  <>
+                    <Field label="环境类型">
+                      <select
+                        name="environmentType"
+                        defaultValue={
+                          (editingResource as Environment | undefined)?.environmentType ??
+                          'DEVELOPMENT'
+                        }
+                      >
+                        <option value="DEVELOPMENT">开发环境</option>
+                        <option value="TESTING">测试环境</option>
+                        <option value="STAGING">预发布环境</option>
+                        <option value="PRODUCTION">生产环境</option>
+                        <option value="CUSTOM">自定义</option>
+                      </select>
+                    </Field>
+                    <Field
+                      label="仓库环境文件"
+                      hint="加载环境节点会读取此工作区相对路径，留空按环境标识查找。"
                     >
-                      <option value="DEVELOPMENT">开发环境</option>
-                      <option value="TESTING">测试环境</option>
-                      <option value="STAGING">预发布环境</option>
-                      <option value="PRODUCTION">生产环境</option>
-                      <option value="CUSTOM">自定义</option>
-                    </select>
-                  </Field>
+                      <input
+                        name="repositoryEnvFile"
+                        maxLength={300}
+                        placeholder=".env.test"
+                        defaultValue={
+                          (editingResource as Environment | undefined)?.repositoryEnvFile ?? ''
+                        }
+                      />
+                    </Field>
+                  </>
                 )}
               </>
             )}
@@ -1857,10 +1882,7 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
                             {item.name}
                           </button>
                         ) : key === 'services' ? (
-                          <a
-                            className="text-link"
-                            href={'#' + `/projects/${id}/execution-graph`}
-                          >
+                          <a className="text-link" href={'#' + `/projects/${id}/execution-graph`}>
                             {item.name} · 执行图
                           </a>
                         ) : (
@@ -1871,6 +1893,29 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
                             ? (item as Repository).cloneUrl
                             : (item as Service | Environment).slug}
                         </small>
+                        {key === 'services' && (
+                          <div
+                            className="service-execution-flows"
+                            aria-label={item.name + '关联执行流'}
+                          >
+                            {(publishedGraph.data?.definition.flows ?? [])
+                              .filter(({ serviceId }) => serviceId === item.id)
+                              .map(({ id: flowId, name }) => (
+                                <a
+                                  key={flowId}
+                                  className="button secondary small"
+                                  href={
+                                    '#/projects/' +
+                                    id +
+                                    '/execution-graph?start=' +
+                                    encodeURIComponent(flowId)
+                                  }
+                                >
+                                  {name}
+                                </a>
+                              ))}
+                          </div>
+                        )}
                       </div>
                       <span className="tag">
                         {key === 'repositories'

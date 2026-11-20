@@ -170,3 +170,13 @@
   justify-content: flex-end;
   margin-bottom: 12px;
 }
+.service-execution-flows {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.35rem;
+}
+
+.service-execution-flows:empty {
+  display: none;
+}

@@ -1,117 +1,24 @@
-import { Plus } from 'lucide-react';
+import { Plus, Trash2 } from 'lucide-react';
 import { useResource } from '../api';
 import { ErrorBanner, Field } from '../components';
 import type { ProjectDetail } from '../models';
 import { useRepositoryBranches, BranchSyncControls } from './RepositoryBranches';
-import { flowPresetLabels } from './execution-graph-definition';
+import { artifactTypes } from './ExecutionGraphFields';
 import type {
   FlowBuildDefinition,
-  FlowDelivery,
   FlowDeployDefinition,
-  FlowPreset,
+  GraphArtifactOutput,
   GraphNode,
 } from './execution-graph-definition';
 
-const presetNodes: Record<FlowPreset, GraphNode['type'][]> = {
-  CUSTOM: [],
-  BUILD: ['BUILD'],
-  DEPLOY: ['DEPLOY_ARTIFACT'],
-  BUILD_DEPLOY: ['BUILD', 'DEPLOY_ARTIFACT'],
-  VERIFY: ['SHELL'],
-  MAINTENANCE: ['APPROVAL', 'SHELL'],
-  RELEASE_REVIEW: ['APPROVAL', 'LOG'],
-};
+export const graphTemplates: { name: string; nodes: GraphNode['type'][] }[] = [
+  { name: '构建并部署', nodes: ['BUILD', 'DEPLOY_ARTIFACT'] },
+  { name: '仅构建', nodes: ['BUILD'] },
+  { name: '仅部署', nodes: ['DEPLOY_ARTIFACT'] },
+  { name: '审批后执行脚本', nodes: ['APPROVAL', 'SHELL'] },
+];
 
-export function StartDeliveryFields({
-  project,
-  value,
-  canEdit,
-  change,
-  insert,
-}: {
-  project: ProjectDetail;
-  value?: FlowDelivery;
-  canEdit: boolean;
-  change: (value?: FlowDelivery) => void;
-  insert?: (nodes: GraphNode['type'][]) => void;
-}) {
-  const kind = value?.kind ?? 'CUSTOM';
-  const hasBuild = kind === 'BUILD' || kind === 'BUILD_DEPLOY';
-  const hasDeploy = kind === 'DEPLOY' || kind === 'BUILD_DEPLOY';
-  return (
-    <>
-      <Field label="执行流预设">
-        <select
-          value={kind}
-          disabled={!canEdit}
-          onChange={(event) => {
-            const next = event.target.value as FlowPreset;
-            const builds = next === 'BUILD' || next === 'BUILD_DEPLOY';
-            const deploys = next === 'DEPLOY' || next === 'BUILD_DEPLOY';
-            change({
-              kind: next,
-              serviceId:
-                value?.serviceId ??
-                ((builds || deploys) && project.services.length === 1
-                  ? project.services[0]!.id
-                  : undefined),
-              ...(builds && { build: value?.build }),
-              ...(deploys && { deploy: value?.deploy }),
-            });
-          }}
-        >
-          {Object.entries(flowPresetLabels).map(([id, label]) => (
-            <option key={id} value={id}>
-              {label}
-            </option>
-          ))}
-        </select>
-      </Field>
-      <Field label={hasBuild || hasDeploy ? '关联服务' : '关联服务（可选）'}>
-        <select
-          value={value?.serviceId ?? ''}
-          disabled={!canEdit}
-          onChange={(event) =>
-            change({ ...value, kind, serviceId: event.target.value || undefined })
-          }
-        >
-          <option value="">{hasBuild || hasDeploy ? '选择项目服务' : '无关联服务'}</option>
-          {project.services.map((service) => (
-            <option value={service.id} key={service.id}>
-              {service.name}
-            </option>
-          ))}
-        </select>
-      </Field>
-      {hasBuild && (
-        <BuildFields
-          project={project}
-          value={value?.build ?? {}}
-          canEdit={canEdit}
-          change={(build) => change({ ...value, kind, build })}
-        />
-      )}
-      {hasDeploy && (
-        <DeployFields
-          value={value?.deploy ?? {}}
-          canEdit={canEdit}
-          change={(deploy) => change({ ...value, kind, deploy })}
-        />
-      )}
-      {canEdit && insert && presetNodes[kind].length > 0 && (
-        <button
-          type="button"
-          className="button secondary small"
-          onClick={() => insert(presetNodes[kind])}
-        >
-          <Plus size={15} /> 插入预设节点
-        </button>
-      )}
-    </>
-  );
-}
-
-function BuildFields({
+export function BuildFields({
   project,
   value,
   canEdit,
@@ -128,7 +35,10 @@ function BuildFields({
     repo ? `/projects/${project.id}/repositories/${repo.id}` : null,
   );
   const registries = useResource<{ id: string; name: string }[]>(
-    value.artifactType === 'DOCKER_IMAGE' ? '/registries' : null,
+    value.artifactType === 'DOCKER_IMAGE' ||
+      value.artifacts?.some(({ type }) => type === 'DOCKER_IMAGE')
+      ? '/registries'
+      : null,
   );
   function patch(fields: Partial<FlowBuildDefinition>) {
     change({ ...value, ...fields });
@@ -196,7 +106,7 @@ function BuildFields({
           <option value="MANAGER">管理端隔离构建</option>
         </select>
       </Field>
-      <Field label="产物类型">
+      <Field label="默认产物类型">
         <select
           disabled={!canEdit}
           value={value.artifactType ?? 'FILE'}
@@ -277,11 +187,16 @@ function BuildFields({
           <ErrorBanner error={registries.error} />
         </>
       )}
+      <ArtifactOutputEditor
+        value={value.artifacts ?? []}
+        canEdit={canEdit}
+        onChange={(artifacts) => patch({ artifacts })}
+      />
     </div>
   );
 }
 
-function DeployFields({
+export function DeployFields({
   value,
   canEdit,
   change,
@@ -330,6 +245,113 @@ function DeployFields({
         />
       </div>
     </details>
+  );
+}
+
+export function ArtifactOutputEditor({
+  value,
+  canEdit,
+  onChange,
+}: {
+  value: GraphArtifactOutput[];
+  canEdit: boolean;
+  onChange: (artifacts: GraphArtifactOutput[]) => void;
+}) {
+  function patch(index: number, fields: Partial<GraphArtifactOutput>) {
+    onChange(value.map((output, i) => (i === index ? { ...output, ...fields } : output)));
+  }
+  return (
+    <fieldset className="graph-fields">
+      <legend>具名产物</legend>
+      {value.map((output, index) => (
+        <details className="graph-field-card" key={index}>
+          <summary>{output.name || '未命名产物'}</summary>
+          <div className="graph-fields">
+            <Field label="产物名称">
+              <input
+                value={output.name}
+                disabled={!canEdit}
+                maxLength={100}
+                onChange={(event) => patch(index, { name: event.target.value })}
+              />
+            </Field>
+            <Field label="来源类型">
+              <select
+                value={output.type}
+                disabled={!canEdit}
+                onChange={(event) =>
+                  patch(index, {
+                    type: event.target.value as GraphArtifactOutput['type'],
+                    path: undefined,
+                    imageReference: undefined,
+                  })
+                }
+              >
+                {artifactTypes.map(({ value, label }) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            {output.type === 'DOCKER_IMAGE' ? (
+              <>
+                <Text
+                  label="镜像引用"
+                  value={output.imageReference}
+                  canEdit={canEdit}
+                  onChange={(imageReference) => patch(index, { imageReference })}
+                />
+                <Text
+                  label="Compose 配置路径（可选）"
+                  value={output.composeFilePath}
+                  canEdit={canEdit}
+                  onChange={(composeFilePath) => patch(index, { composeFilePath })}
+                />
+              </>
+            ) : (
+              <Text
+                label="工作区相对路径"
+                value={output.path}
+                canEdit={canEdit}
+                onChange={(path) => patch(index, { path })}
+              />
+            )}
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                disabled={!canEdit}
+                checked={output.required !== false}
+                onChange={(event) => patch(index, { required: event.target.checked })}
+              />{' '}
+              必需产物
+            </label>
+            {canEdit && (
+              <button
+                type="button"
+                className="button secondary small"
+                onClick={() => onChange(value.filter((_, i) => i !== index))}
+              >
+                <Trash2 size={14} /> 移除产物
+              </button>
+            )}
+          </div>
+        </details>
+      ))}
+      {canEdit && (
+        <button
+          type="button"
+          className="button secondary small"
+          onClick={() => {
+            let i = value.length + 1;
+            while (value.some(({ name }) => name === 'artifact-' + i)) i++;
+            onChange([...value, { name: 'artifact-' + i, type: 'DIRECTORY', required: true }]);
+          }}
+        >
+          <Plus size={14} /> 添加产物
+        </button>
+      )}
+    </fieldset>
   );
 }
 

@@ -2,8 +2,9 @@ import { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
 import type { Transaction } from 'kysely';
 import type { Database } from '../../core/database/schema';
-import type { GraphCheckoutSnapshot } from '../projects/repository-metadata.service';
 import type { ExecutionVariables } from '../../infrastructure/execution-variables';
+import type { GraphModulePayload } from '../execution-graphs/graph-node-tasks';
+import type { DeliveryExecutionProfile } from '../pipelines/delivery-execution-profile';
 
 export type TaskStatus =
   | 'PENDING'
@@ -43,7 +44,7 @@ export interface AiRepairOrigin {
   automatic: boolean;
 }
 export interface TaskPayload {
-  sourceCheckout?: { projectId: string; source: GraphCheckoutSnapshot };
+  graphModule?: GraphModulePayload;
   environment?: ExecutionVariables;
   aiRepair?: AiRepairOrigin;
   targets: SshTarget[];
@@ -88,7 +89,10 @@ export interface TaskExecutionContext {
 }
 export interface TaskHandler {
   type: string;
-  execute(task: TaskRecord, context: TaskExecutionContext): Promise<void>;
+  execute(
+    task: TaskRecord,
+    context: TaskExecutionContext,
+  ): Promise<void | { graphOutputs: Record<string, unknown> }>;
   onFinalize?(
     tx: Transaction<Database>,
     task: TaskRecord,
@@ -99,12 +103,13 @@ export interface TaskHandler {
 }
 
 export interface CreateTaskInput {
-  type: 'COMMAND' | 'OPERATION_PLAN' | 'PIPELINE' | 'GRAPH_CHECKOUT';
+  type: 'COMMAND' | 'OPERATION_PLAN' | 'PIPELINE' | 'GRAPH_MODULE';
   name: string;
   payload: TaskPayload;
   operationPlanVersionId?: string;
   idempotencyKey?: string;
   scope?: { projectId?: string; serviceId?: string; environmentId?: string; targetId?: string };
+  registrationProfile?: DeliveryExecutionProfile;
   pipelineRun?: {
     id: string;
     pipelineId: string;

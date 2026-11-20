@@ -1,7 +1,11 @@
 import { Type } from 'class-transformer';
 import { OmitType } from '@nestjs/swagger';
 import { pipelineNodeTypes } from './pipeline.types';
-import type { PipelineExecutionMode, PipelineNode } from './pipeline.types';
+import type {
+  NamedArtifactDefinition,
+  PipelineExecutionMode,
+  PipelineNode,
+} from './pipeline.types';
 import { DeploymentSelectionDto } from '../deployment-targets/deployment-selection';
 import {
   ArrayMaxSize,
@@ -31,6 +35,14 @@ export class PipelineStepDto {
   @IsString() @Length(1, 65536) command!: string;
   @IsOptional() @IsInt() @Min(1) @Max(3600) timeout?: number;
 }
+export class NamedArtifactDefinitionDto implements NamedArtifactDefinition {
+  @IsString() @Matches(/^[A-Za-z0-9_-]{1,64}$/) name!: string;
+  @IsIn(['FILE', 'DIRECTORY', 'DOCKER_IMAGE']) type!: NamedArtifactDefinition['type'];
+  @IsOptional() @IsString() @Length(1, 1024) path?: string;
+  @IsOptional() @IsString() @Length(1, 512) imageReference?: string;
+  @IsOptional() @IsBoolean() required?: boolean;
+  @IsOptional() @IsString() @Length(1, 1024) composeFilePath?: string;
+}
 class PipelineNodeVariableDto {
   @IsString() @Matches(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/) key!: string;
   @IsOptional() @IsString() @Length(0, 65536) value?: string;
@@ -55,6 +67,13 @@ class PipelineNodeDto implements PipelineNode {
   variables?: PipelineNodeVariableDto[];
 }
 export class PipelineDefinitionDto {
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(30)
+  @ValidateNested({ each: true })
+  @Type(() => NamedArtifactDefinitionDto)
+  artifacts?: NamedArtifactDefinitionDto[];
   @IsOptional() @IsBoolean() inheritBuildLocation?: boolean;
   @IsOptional() @IsIn(['BUILD_ONLY', 'DEPLOY']) defaultMode?: PipelineExecutionMode;
   @IsUUID() repositoryId!: string;

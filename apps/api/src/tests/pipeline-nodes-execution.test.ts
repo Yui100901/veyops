@@ -11,7 +11,13 @@ import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import type { ProcessRunnerService } from '../infrastructure/build-runner/process-runner.service';
 import type { SshService, SshTarget } from '../infrastructure/ssh/ssh.service';
-import { BuildsService, checkoutScript, type BuildSession } from '../modules/builds/builds.service';
+import {
+  archiveMetadata,
+  BuildsService,
+  checkoutScript,
+  packScript,
+  type BuildSession,
+} from '../modules/builds/builds.service';
 import type { CredentialsService } from '../modules/credentials/credentials.service';
 import { PipelineDefinitionDto } from '../modules/pipelines/pipeline.dto';
 import type { PipelineNode, PipelineSnapshot } from '../modules/pipelines/pipeline.types';
@@ -40,6 +46,56 @@ async function fixtureRepo(path: string, files: Record<string, string>) {
   await git('commit', '--allow-empty', '-qm', 'remote progressed');
   return { url: pathToFileURL(path).href, credentialId: null, commitSha: old };
 }
+
+test(
+  'named packages distinguish files and directories and detect absent or escaping paths',
+  {
+    skip: !shell && 'requires a POSIX shell with tar',
+  },
+  async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'veyops-named-output-'));
+    try {
+      const work = (
+        await run(shell!, ['-c', 'cd -P "$1"; pwd -P', 'cwd', tmp.replaceAll('\\', '/')])
+      ).stdout.trim();
+      await mkdir(join(tmp, 'repo', 'dist'), { recursive: true });
+      await writeFile(join(tmp, 'repo', 'app.jar'), 'jar');
+      await writeFile(join(tmp, 'repo', 'dist', 'index.html'), '<h1>Release</h1>');
+      for (const [output, name, type, entry] of [
+        ['app.jar', 'jar', 'FILE', 'app.jar'],
+        ['dist', 'site', 'DIRECTORY', './index.html'],
+      ] as const) {
+        const archive = work + '/' + name + '.tar.gz';
+        const packaged = await run(shell!, [
+          '-eu',
+          '-c',
+          packScript(work, '.', output, archive, type),
+        ]);
+        assert.ok(archiveMetadata(packaged.stdout).sizeBytes > 0);
+        assert.ok(
+          (await run(shell!, ['-c', 'tar -tzf "$1"', 'tar', archive])).stdout
+            .split(/\r?\n/)
+            .includes(entry),
+        );
+      }
+      await assert.rejects(
+        run(shell!, [
+          '-eu',
+          '-c',
+          packScript(work, '.', 'missing', work + '/optional.tar.gz', 'FILE'),
+        ]),
+        { code: 44 },
+      );
+      await assert.rejects(
+        run(shell!, ['-eu', '-c', packScript(work, '.', 'dist', work + '/wrong.tar.gz', 'FILE')]),
+        { code: 1 },
+      );
+      assert.throws(() => packScript(work, '.', '../outside', work + '/unsafe.tar.gz', 'FILE'));
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   'ordered target nodes shallow-checkout pinned sources and pass scoped environment without evaluating dotenv',

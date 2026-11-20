@@ -8,6 +8,7 @@ import {
   BuildSession,
   type RunPipelineNode,
   archiveMetadata,
+  namedArtifactSession,
   enterRepositoryDirectory,
   packScript,
   pushedImageDigest,
@@ -19,7 +20,13 @@ import { DeploymentHealth, DeploymentsService } from '../deployments/deployments
 import { deploymentLock } from '../deployments/deployment-lock';
 import type { TaskExecutionContext, TaskRecord, TaskStatus } from '../tasks/tasks.types';
 import { TaskLeaseUnavailableError } from '../tasks/task-lease';
-import type { BuildOutput, PipelineArtifact, PipelineSnapshot } from './pipeline.types';
+import type {
+  BuildOutput,
+  NamedArtifactDefinition,
+  PipelineArtifact,
+  PipelineSnapshot,
+} from './pipeline.types';
+import { isStandaloneGraphBuild } from './pipeline.types';
 import { deploymentGuard, shellQuote as q } from './pipeline.validation';
 import { serializeComposeEnvironment } from './environment.serialization';
 import { createTargetWorkspace, targetWorkspacePath } from './target-workspace';
@@ -169,8 +176,35 @@ export class PipelineExecutor {
       if (!deployArtifact && snapshot.definition.buildLocation === 'MANAGER') {
         // Manager executes exactly once, before any target deploys the same immutable artifact.
         context.log('管理端隔离构建开始（Docker，无宿主机脚本执行）\n');
-        const first = task.payload.targets[0];
-        if (!first || context.signal.aborted) return;
+        const saveManagerArtifact = async (output: BuildOutput) => {
+          for (const entry of output.artifacts ?? [{ output, declaration: undefined }]) {
+            const artifact = await this.artifacts.create(snapshot, {
+              storageKey: entry.output.localArchive ?? entry.output.imageReference!,
+              archiveKey: entry.output.archiveKey,
+              archiveImageId: entry.output.archiveImageId,
+              archiveImagePlatform: entry.output.archiveImagePlatform,
+              composeYaml: entry.output.composeYaml,
+              checksum: entry.output.checksum,
+              sizeBytes: entry.output.sizeBytes,
+              imageDigest: entry.output.imageDigest,
+              imageReference: entry.output.imageReference,
+              imageTag: entry.output.imageTag,
+              imageId: entry.output.imageId,
+              storageType: entry.output.imageId ? 'LOCAL_IMAGE' : undefined,
+              name: entry.declaration?.name,
+              kind: entry.declaration?.type,
+            });
+            managerArtifact ??= artifact;
+          }
+        };
+        const first = task.payload.targets.at(0);
+        if (context.signal.aborted) return;
+        if (!first) {
+          if (!isStandaloneGraphBuild(snapshot)) throw new Error('管理端构建快照缺少目标');
+          manager = await this.builds.manager(session, undefined, saveManagerArtifact);
+          if (!managerArtifact) await saveManagerArtifact(manager);
+          return;
+        }
         managerTarget = { serverId: first.id, targetId: await context.startTarget(first.id) };
         const managerTargetId = managerTarget.targetId;
         const legacyStep = nodes
@@ -191,22 +225,6 @@ export class PipelineExecutor {
             managerStepCount++,
             run,
           );
-        const saveManagerArtifact = async (output: BuildOutput) => {
-          managerArtifact = await this.artifacts.create(snapshot, {
-            storageKey: output.localArchive ?? output.imageReference!,
-            archiveKey: output.archiveKey,
-            archiveImageId: output.archiveImageId,
-            archiveImagePlatform: output.archiveImagePlatform,
-            composeYaml: output.composeYaml,
-            checksum: output.checksum,
-            sizeBytes: output.sizeBytes,
-            imageDigest: output.imageDigest,
-            imageReference: output.imageReference,
-            imageTag: output.imageTag,
-            imageId: output.imageId,
-            storageType: output.imageId ? 'LOCAL_IMAGE' : undefined,
-          });
-        };
         try {
           manager = await this.builds.manager(session, runNode, saveManagerArtifact);
           if (legacyStep) await context.finishStep(legacyStep, 'SUCCESS', 0);
@@ -389,8 +407,12 @@ export class PipelineExecutor {
           };
           try {
             // A manager-only build produces a single artifact without opening target SSH connections.
-            if (buildOnly && managerArtifact) continue;
-            if (snapshot.definition.artifactType === 'DOCKER_IMAGE')
+            if (buildOnly && manager) continue;
+            if (
+              snapshot.definition.artifactType === 'DOCKER_IMAGE' ||
+              (!deployArtifact &&
+                snapshot.definition.artifacts?.some((output) => output.type === 'DOCKER_IMAGE'))
+            )
               await step('PREPARE', '检查目标主机 Docker 环境', () =>
                 this.builds.checkTargetDocker(target, session, !buildOnly),
               );
@@ -430,13 +452,35 @@ export class PipelineExecutor {
               }
             }
             if (buildOnly) {
-              const packageBuild = () =>
-                this.packageTargetBuild(
-                  target,
-                  work,
-                  session,
-                  packageNode ? async (_phase, _name, run) => run() : step,
-                );
+              const packageBuild = async () => {
+                const report = packageNode
+                  ? async <T>(_phase: string, _name: string, run: () => Promise<T>) => run()
+                  : step;
+                if (!snapshot.definition.artifacts)
+                  return this.packageTargetBuild(target, work, session, report);
+                let first: PipelineArtifact | undefined;
+                for (const declaration of snapshot.definition.artifacts) {
+                  try {
+                    const output = await this.packageTargetBuild(
+                      target,
+                      work,
+                      namedArtifactSession(session, declaration),
+                      report,
+                      declaration,
+                    );
+                    first ??= output;
+                  } catch (error) {
+                    if (
+                      declaration.required !== false ||
+                      !(error instanceof BuildCommandError) ||
+                      error.exitCode !== 44
+                    )
+                      throw error;
+                    context.log(`可选产物 ${declaration.name} 不存在，已略过\n`, target.id);
+                  }
+                }
+                return first;
+              };
               artifact = packageNode
                 ? await runNode(packageNode, packageBuild)
                 : await packageBuild();
@@ -693,13 +737,25 @@ export class PipelineExecutor {
     work: string,
     session: BuildSession,
     step: ReportPhase,
+    declaration?: NamedArtifactDefinition,
   ) {
     const { snapshot } = session;
     const { repoPath, outputPath, artifactType, registryId, imageRepository } = snapshot.definition;
     if (artifactType === 'FILE') {
-      const archive = work + '/artifact.tar.gz';
+      const archive =
+        work + (declaration ? `/artifact-${session.taskId}.tar.gz` : '/artifact.tar.gz');
       const output = await step('PACKAGE', '打包与校验文件产物', () =>
-        this.builds.remoteCapture(target, packScript(work, repoPath, outputPath, archive), session),
+        this.builds.remoteCapture(
+          target,
+          packScript(
+            work,
+            repoPath,
+            outputPath,
+            archive,
+            declaration?.type === 'DOCKER_IMAGE' ? undefined : declaration?.type,
+          ),
+          session,
+        ),
       );
       const metadata = archiveMetadata(output);
       const storageKey = await step('ARTIFACT', '保存并校验构建产物', () =>
@@ -715,11 +771,13 @@ export class PipelineExecutor {
         storageType: 'LOCAL_FILE',
         storageKey,
         serverId: target.id,
+        name: declaration?.name,
+        kind: declaration?.type,
         ...metadata,
       });
     }
     const composeYaml = await step('PACKAGE', '归档 Compose 配置', () =>
-      this.builds.remoteComposeSnapshot(target, work, session),
+      this.builds.remoteComposeSnapshot(target, work, session, Boolean(declaration)),
     );
     if (snapshot.deployAfterBuild && registryId && imageRepository) {
       const image = await step('IMAGE', '构建镜像、推送并固定Digest', () =>
@@ -736,7 +794,7 @@ export class PipelineExecutor {
       });
     }
     const image = await step('IMAGE', '构建并记录本地Docker镜像', () =>
-      this.builds.remoteBuildOnlyImage(target, work, session),
+      this.builds.remoteBuildOnlyImage(target, work, session, declaration),
     );
     return this.artifacts.create(snapshot, {
       ...image,
@@ -744,6 +802,8 @@ export class PipelineExecutor {
       storageKey: image.imageReference,
       storageType: 'REMOTE_IMAGE',
       serverId: target.id,
+      name: declaration?.name,
+      kind: declaration?.type,
     });
   }
   private async finishDeployment(

@@ -22,6 +22,7 @@ import { DeploymentSelectionDto } from '../deployment-targets/deployment-selecti
 import { GraphRunnerService } from './graph-runner.service';
 
 export class GraphInputsDto extends DeploymentSelectionDto {
+  @IsOptional() @IsObject() parameters?: Record<string, unknown>;
   @IsOptional() @IsString() @MaxLength(500) value?: string;
   @IsOptional() @IsUUID() environmentId?: string;
   @IsOptional() @Matches(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i) commitSha?: string;
