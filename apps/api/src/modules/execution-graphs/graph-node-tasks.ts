@@ -2,13 +2,23 @@ import { ConflictException, HttpException, Injectable, OnModuleInit } from '@nes
 import type { GraphCheckoutSnapshot } from '../projects/repository-metadata.service';
 import { RepositoryMetadataService } from '../projects/repository-metadata.service';
 import { TargetResolver } from '../command-center/target-resolver.service';
+import { ServiceConfigsService } from '../service-configs/service-configs.service';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import type { CreateTaskInput } from '../tasks/tasks.types';
+import type { ExecutionVariables } from '../../infrastructure/execution-variables';
 import type { GraphNode } from './execution-graph-definition';
 
 export type GraphNodePlan =
   | { type: 'CHECKOUT'; source: GraphCheckoutSnapshot }
-  | { type: 'SHELL'; serverId: string; serverName: string; targetHash: string };
+  | {
+      type: 'SHELL';
+      serverId: string;
+      serverName: string;
+      targetHash: string;
+      serviceId?: string;
+      environmentId?: string;
+      environment?: ExecutionVariables;
+    };
 
 @Injectable()
 export class GraphNodeTasks implements OnModuleInit {
@@ -16,6 +26,7 @@ export class GraphNodeTasks implements OnModuleInit {
     private readonly repositories: RepositoryMetadataService,
     private readonly targets: TargetResolver,
     private readonly registry: TaskHandlerRegistry,
+    private readonly configs: ServiceConfigsService,
   ) {}
 
   onModuleInit() {
@@ -42,7 +53,11 @@ export class GraphNodeTasks implements OnModuleInit {
     });
   }
 
-  async prepare(projectId: string, node: GraphNode): Promise<GraphNodePlan> {
+  async prepare(
+    projectId: string,
+    node: GraphNode,
+    scope: { environmentId?: string; serviceId?: string },
+  ): Promise<GraphNodePlan> {
     if (node.type === 'CHECKOUT') {
       const config = node.checkout!;
       return {
@@ -56,11 +71,16 @@ export class GraphNodeTasks implements OnModuleInit {
     const serverId = node.shell!.serverId!;
     const target = await this.targets.preview({ serverIds: [serverId] });
     if (target.targets.length !== 1) throw new ConflictException('Shell 节点的服务器不可用');
+    const { environmentId, serviceId } = scope;
+    const environment = await this.configs.resolveVariables(projectId, environmentId, serviceId);
     return {
       type: 'SHELL',
       serverId,
       serverName: target.targets[0]!.name,
       targetHash: target.targetHash,
+      environmentId,
+      serviceId,
+      environment,
     };
   }
 
@@ -97,9 +117,11 @@ export class GraphNodeTasks implements OnModuleInit {
     return {
       ...common,
       type: 'COMMAND',
+      scope: { projectId, serviceId: plan.serviceId, environmentId: plan.environmentId },
       payload: {
         ...defaults,
         targets,
+        environment: plan.environment,
         steps: [{ name: action.name, command: action.shell!.command! }],
       },
     };

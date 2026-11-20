@@ -83,6 +83,53 @@ button.graph-node[aria-pressed='true'] {
 .graph-node small {
   color: var(--muted);
 }
+.graph-node-runnable {
+  border-color: var(--accent);
+  color: var(--accent-dark);
+  background: #eff8ff;
+}
+.graph-node-runnable small {
+  color: var(--accent-dark);
+  font-weight: 600;
+}
+.graph-manual-start h3 {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.graph-context-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 120;
+  display: grid;
+  gap: 0.15rem;
+  width: min(10.5rem, calc(100vw - 1rem));
+  padding: 0.3rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: #fff;
+  box-shadow: 0 8px 24px rgb(31 52 75 / 18%);
+}
+.graph-context-menu button {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.45rem 0.55rem;
+  border: 0;
+  border-radius: 0.3rem;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.graph-context-menu button:hover,
+.graph-context-menu button:focus {
+  background: #eff8ff;
+}
+.graph-context-menu .graph-context-danger {
+  color: #af2b31;
+}
 .graph-properties,
 .graph-review,
 .graph-artifacts {

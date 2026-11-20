@@ -15,6 +15,7 @@ import { MultiTargetExecutor } from '../infrastructure/ssh/multi-target.executor
 import type { TaskExecutionContext, TaskStatus } from '../modules/tasks/tasks.types';
 
 const password = 'ssh-test-secret-value';
+const envSecret = "graph-secret' with spaces\nand newline";
 const hostKey = generateKeyPairSync('rsa', {
   modulusLength: 2048,
   privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
@@ -68,6 +69,35 @@ const server = new Server({ hostKeys: [hostKey] }, (connection) => {
           stream.end();
           return;
         }
+        if (info.command.endsWith('\ncheck-graph-environment')) {
+          let input = '';
+          stream.on('data', (chunk: Buffer) => {
+            input += chunk.toString();
+          });
+          stream.on('end', () => {
+            if (
+              info.command !== '. /dev/stdin || exit $?\ncheck-graph-environment' ||
+              !input.includes("export VEYOPS_PROJECT_ID='project-id'\n") ||
+              !input.includes(
+                "export GRAPH_SECRET='graph-secret'\"'\"' with spaces\nand newline'\n",
+              )
+            ) {
+              stream.exit(2);
+              stream.end();
+              return;
+            }
+            stream.write(`stdout ${envSecret.slice(0, 12)}`);
+            stream.stderr.write(
+              `trace $'graph-secret\\' with spaces\\nand newline'\nstderr ${envSecret}\n`,
+            );
+            setTimeout(() => {
+              stream.write(`${envSecret.slice(12)}\n`);
+              stream.exit(0);
+              stream.end();
+            }, 10);
+          });
+          return;
+        }
         stream.write(`first ${password.slice(0, 8)}`);
         setTimeout(() => {
           stream.write(`${password.slice(8)} last\n`);
@@ -99,6 +129,28 @@ after(async () => {
 });
 const service = (secret = password) =>
   new SshService({ decrypt: async () => ({ password: secret }) } as unknown as CredentialsService);
+
+test('SSH injects scoped variables and redacts multiline environment secrets on both streams', async () => {
+  const ssh = new SshService({
+    decrypt: async (id: string) => (id === 'env-credential' ? { value: envSecret } : { password }),
+  } as unknown as CredentialsService);
+  const logs = { stdout: '', stderr: '' };
+  const result = await ssh.execute(target, 'check-graph-environment', {
+    timeout: 5,
+    variables: {
+      variables: { VEYOPS_PROJECT_ID: 'project-id' },
+      secretVariables: { GRAPH_SECRET: 'env-credential' },
+    },
+    onData: (log, stream) => {
+      logs[stream] += log;
+    },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(logs, {
+    stdout: 'stdout [REDACTED]\n',
+    stderr: "trace $'[REDACTED]'\nstderr [REDACTED]\n",
+  });
+});
 
 test('real SSH host-key probe stops before authentication and never loads a credential', async () => {
   const requestsBefore = authenticationRequests;

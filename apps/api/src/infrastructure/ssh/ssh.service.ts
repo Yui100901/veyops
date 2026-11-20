@@ -6,6 +6,8 @@ import { CredentialsService } from '../../modules/credentials/credentials.servic
 import { redactText, SecretRedactor } from './secret-redactor';
 import { serverProbeCommand } from './server-probe';
 import type { SFTPWrapper } from 'ssh2';
+import { shellQuote } from '../../modules/pipelines/pipeline.validation';
+import { resolveExecutionVariables, type ExecutionVariables } from '../execution-variables';
 
 export interface SshTarget {
   id: string;
@@ -22,6 +24,7 @@ export interface SshOptions {
   signal?: AbortSignal;
   onData?: (text: string, stream: 'stdout' | 'stderr') => void;
   secrets?: string[];
+  variables?: ExecutionVariables;
 }
 export class SshExecutionError extends Error {
   constructor(
@@ -114,8 +117,22 @@ export class SshService {
     if (options.signal?.aborted) throw new SshExecutionError('任务已取消', 'CANCELLED');
     if (!target.credentialId) throw new SshExecutionError('服务器尚未关联 SSH 凭据');
     const secret = await this.credentials.decrypt(target.credentialId, target.credentialNonce);
+    const environment = options.variables
+      ? await resolveExecutionVariables(this.credentials, options.variables)
+      : undefined;
     if (options.signal?.aborted) throw new SshExecutionError('任务已取消', 'CANCELLED');
-    const secretValues = [...Object.values(secret), ...(options.secrets || [])];
+    const secretValues = [
+      ...Object.values(secret),
+      ...(options.secrets ?? []),
+      ...(environment?.secrets ?? []),
+    ];
+    const exports = environment
+      ? Object.entries(environment.values)
+          .map(([key, value]) => `export ${key}=${shellQuote(value)}`)
+          .join('\n') + '\n'
+      : undefined;
+    // Send variable values on the SSH channel so remote process arguments stay free of secrets.
+    const script = exports === undefined ? command : `. /dev/stdin || exit $?\n${command}`;
     return new Promise((resolve, reject) => {
       const client = new Client();
       let channel: ClientChannel | undefined;
@@ -213,7 +230,7 @@ export class SshService {
           client.end();
           return;
         }
-        client.exec(command, (error, stream) => {
+        client.exec(script, (error, stream) => {
           if (error) {
             finish(new SshExecutionError(redactText(error.message, secretValues)));
             return;
@@ -239,6 +256,7 @@ export class SshService {
                 ),
               );
           });
+          if (exports !== undefined) stream.end(exports);
         });
       });
       client.on('error', (error: Error) =>

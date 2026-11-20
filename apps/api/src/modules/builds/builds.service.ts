@@ -29,13 +29,12 @@ import { RegistriesService } from '../registries/registries.service';
 import type { PipelineSnapshot, PipelineNode, BuildOutput } from '../pipelines/pipeline.types';
 import { relativePath, shellQuote as q } from '../pipelines/pipeline.validation';
 import type { TaskExecutionContext } from '../tasks/tasks.types';
-
-// Usernames are metadata (also passed as the standard docker --username option), not secret values.
-// Redacting a one-letter username would corrupt trusted digest/checksum output used for verification.
-const credentialSecrets = (secret: Record<string, string>) =>
-  Object.entries(secret)
-    .filter(([key]) => key !== 'username')
-    .map(([, value]) => value);
+import {
+  credentialSecrets,
+  executionVariableName as envName,
+  resolveExecutionVariables,
+  resolveVariableCredential,
+} from '../../infrastructure/execution-variables';
 
 export interface GitSecret {
   response: string;
@@ -60,7 +59,6 @@ export interface BuildSession {
 export type RunPipelineNode = <T>(node: PipelineNode, run: () => Promise<T>) => Promise<T>;
 
 const maxEnvironmentFileBytes = 64 * 1024;
-const envName = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const helperImage = () => process.env.BUILD_HELPER_IMAGE || 'node:22-bookworm';
 
 function exportedVariables(values: Record<string, string>) {
@@ -249,28 +247,12 @@ export class BuildsService {
     };
   }
   async resolveVariables(snapshot: PipelineSnapshot) {
-    const values: Record<string, string> = Object.assign(Object.create(null), snapshot.variables);
-    const secrets: string[] = [];
-    for (const [name, id] of Object.entries(snapshot.secretVariables)) {
-      values[name] = await this.resolveVariableCredential(name, id, secrets);
-    }
+    const { values, secrets } = await resolveExecutionVariables(this.credentials, snapshot);
+    values.VEYOPS_PROJECT_ID = snapshot.projectId;
+    values.VEYOPS_SERVICE_ID = snapshot.serviceId;
     if (snapshot.projectName !== undefined) values.VEYOPS_PROJECT_NAME = snapshot.projectName;
     if (snapshot.serviceName !== undefined) values.VEYOPS_SERVICE_NAME = snapshot.serviceName;
-    if (Object.keys(values).some((key) => !envName.test(key))) throw new Error('无效环境变量名');
     return { values, secrets };
-  }
-  private async resolveVariableCredential(name: string, id: string, secrets: string[]) {
-    const credential = await this.credentials.decrypt(id);
-    const value =
-      credential.value ??
-      credential.secret ??
-      credential.password ??
-      credential.apiKey ??
-      credential.token;
-    if (value === undefined || value.includes('\0'))
-      throw new Error(`敏感变量 ${name} 的凭据不含支持的值`);
-    secrets.push(...credentialSecrets(credential));
-    return value;
   }
 
   private nodeSource(snapshot: PipelineSnapshot, node: PipelineNode) {
@@ -332,7 +314,8 @@ export class BuildsService {
           if (!envName.test(key) || /^VEYOPS_/i.test(key) || credentialKeys.has(key))
             throw new Error(`环境节点不能覆盖保留变量或敏感变量 ${key}`);
           if (credentialId) {
-            scoped.variables[key] = await this.resolveVariableCredential(
+            scoped.variables[key] = await resolveVariableCredential(
+              this.credentials,
               key,
               credentialId,
               scoped.secrets,

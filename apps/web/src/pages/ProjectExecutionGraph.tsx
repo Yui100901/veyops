@@ -9,11 +9,16 @@ import { ExecutionGraphHistory, ExecutionGraphStart } from './ExecutionGraphRun'
 import { ExecutionGraphTriggers } from './ExecutionGraphTriggers';
 import { GraphVersionTools } from './ExecutionGraphVersions';
 import { flowPresetLabels, graphNodeLabels } from './execution-graph-definition';
-import type { GraphCanvas, GraphDocument, GraphFlow } from './execution-graph-definition';
+import type {
+  GraphCanvas,
+  GraphDocument,
+  GraphEdge,
+  GraphFlow,
+} from './execution-graph-definition';
 import './execution-graph.css';
 import './graph-start.css';
 
-type Pane = 'draft' | 'published' | 'history';
+type Pane = 'run' | 'draft' | 'published' | 'history';
 type PublishedGraph = { version: number; definition: GraphDocument['draft'] };
 
 const emptyCanvas: GraphCanvas = { nodes: [], edges: [], endpoints: [], templates: [] };
@@ -76,7 +81,7 @@ function Workspace({
   const [pane, setPane] = useState<Pane>(
     runId || new URLSearchParams(window.location.hash.split('?')[1]).get('pane') === 'history'
       ? 'history'
-      : 'draft',
+      : 'run',
   );
   const [version, setVersion] = useState<number | null>(initial.publishedVersion);
   const [selectedRun, setSelectedRun] = useState(runId);
@@ -180,13 +185,14 @@ function Workspace({
         description={
           project.archived
             ? '本项目已归档，可查阅发布版本与运行记录。'
-            : '连线后为开始节点选择可达的结束节点，即可定义执行流。'
+            : '在发布的执行图上选择开始节点运行执行流。'
         }
       />
       <nav className="resource-section-switcher" aria-label="执行图视图">
         {(
           [
-            ['draft', '草稿画布'],
+            ['run', '运行执行流'],
+            ['draft', canEdit ? '编辑草稿' : '查看草稿'],
             ['published', '版本历史'],
             ['history', '运行记录'],
           ] as const
@@ -206,6 +212,45 @@ function Workspace({
         <p className="graph-notice" role="status">
           {notice}
         </p>
+      )}
+      {pane === 'run' && (
+        <Section
+          title="已发布执行图"
+          subtitle={graph.publishedVersion ? '版本 v' + graph.publishedVersion : undefined}
+        >
+          <div className="graph-fields">
+            <ErrorBanner error={latest.error} retry={() => void latest.reload()} />
+            {graph.publishedVersion && latest.loading ? (
+              <Loading />
+            ) : latest.data && latest.data.version === graph.publishedVersion ? (
+              <PublishedRun
+                key={latest.data.version}
+                published={latest.data}
+                project={project}
+                path={path}
+                canRun={canEdit}
+                onRun={openRun}
+              />
+            ) : (
+              !graph.publishedVersion && (
+                <>
+                  <p>发布执行图后，开始节点会在这里提供运行入口。</p>
+                  {canEdit && (
+                    <div>
+                      <button
+                        type="button"
+                        className="button primary"
+                        onClick={() => setPane('draft')}
+                      >
+                        编辑执行图
+                      </button>
+                    </div>
+                  )}
+                </>
+              )
+            )}
+          </div>
+        </Section>
       )}
       {pane === 'draft' && (
         <Section
@@ -257,10 +302,9 @@ function Workspace({
             onChange={edit}
             renderStart={(startId) =>
               !project.archived && (
-                <StartActions
+                <StartTriggers
                   key={startId + '-' + graph.publishedVersion}
                   startId={startId}
-                  project={project}
                   path={path}
                   published={
                     latest.data?.version === graph.publishedVersion ? latest.data : undefined
@@ -312,9 +356,55 @@ function Workspace({
   );
 }
 
-function StartActions({
-  startId,
+function PublishedRun({
+  published,
   project,
+  path,
+  canRun,
+  onRun,
+}: {
+  published: PublishedGraph;
+  project: ProjectDetail;
+  path: string;
+  canRun: boolean;
+  onRun: (id: string) => void;
+}) {
+  const [flow, setFlow] = useState<GraphFlow>();
+  const heading = useRef<HTMLHeadingElement>(null);
+  function chooseFlow(next: GraphFlow | undefined) {
+    setFlow(next);
+    if (next) window.requestAnimationFrame(() => heading.current?.focus());
+  }
+  return (
+    <>
+      {canRun && <p>点击带有「手动运行」标识的开始节点，填写运行参数。</p>}
+      <PublishedNodes
+        definition={published.definition}
+        onChooseFlow={canRun ? chooseFlow : undefined}
+      />
+      {canRun && flow && (
+        <div className="graph-properties graph-manual-start" key={flow.id}>
+          <div className="heading-actions">
+            <h3 ref={heading} tabIndex={-1}>
+              <Play size={17} aria-hidden="true" /> 运行 {flow.name}
+            </h3>
+          </div>
+          <ExecutionGraphStart
+            project={project}
+            path={path}
+            flow={flow}
+            flows={published.definition.flows}
+            version={published.version}
+            onRun={onRun}
+          />
+        </div>
+      )}
+    </>
+  );
+}
+
+function StartTriggers({
+  startId,
   path,
   published,
   publishedVersion,
@@ -325,7 +415,6 @@ function StartActions({
   onRun,
 }: {
   startId: string;
-  project: ProjectDetail;
   path: string;
   published?: PublishedGraph;
   publishedVersion: number | null;
@@ -336,53 +425,33 @@ function StartActions({
   onRun: (id: string) => void;
 }) {
   const flow = published?.definition.flows.find(({ id }) => id === startId);
-  const [open, setOpen] = useState<'manual' | 'rules'>();
+  const [open, setOpen] = useState(false);
   return (
     <div className="graph-properties graph-start-actions">
-      <h4>开始方式</h4>
+      <h4>触发器</h4>
       <ErrorBanner error={error} />
       {loading ? (
         <Loading />
       ) : (
         <p className="field-note">
           {flow && published
-            ? '手动运行使用已发布的 v' + published.version + '。'
-            : '绑定可达的结束节点并发布后，即可从这里运行和添加触发器。'}
+            ? '触发器运行已发布的 v' + published.version + '。'
+            : '绑定可达的结束节点并发布后，即可添加触发器。'}
         </p>
       )}
       <div className="heading-actions">
-        {canRun && flow && (
-          <button
-            type="button"
-            className="button primary small"
-            aria-expanded={open === 'manual'}
-            onClick={() => setOpen(open === 'manual' ? undefined : 'manual')}
-          >
-            <Play size={15} /> 手动运行
-          </button>
-        )}
         {publishedVersion && (
           <button
             type="button"
             className="button secondary small"
-            aria-expanded={open === 'rules'}
-            onClick={() => setOpen(open === 'rules' ? undefined : 'rules')}
+            aria-expanded={open}
+            onClick={() => setOpen(!open)}
           >
             附加触发器
           </button>
         )}
       </div>
-      {open === 'manual' && canRun && published && flow && (
-        <ExecutionGraphStart
-          project={project}
-          path={path}
-          flow={flow}
-          flows={published.definition.flows}
-          version={published.version}
-          onRun={onRun}
-        />
-      )}
-      {open === 'rules' && (
+      {open && (
         <ExecutionGraphTriggers
           path={path}
           startId={startId}
@@ -466,8 +535,19 @@ function PublishedVersions({
   );
 }
 
-function PublishedNodes({ definition }: { definition: GraphDocument['draft'] }) {
+function edgeKey({ from, to, when }: GraphEdge) {
+  return JSON.stringify([from, to, when]);
+}
+
+function PublishedNodes({
+  definition,
+  onChooseFlow,
+}: {
+  definition: GraphDocument['draft'];
+  onChooseFlow?: (flow: GraphFlow | undefined) => void;
+}) {
   const [selected, setSelected] = useState('');
+  const [hovered, setHovered] = useState<string>();
   const [legacyId, setLegacyId] = useState('');
   const flow: GraphFlow | undefined = definition.canvas
     ? {
@@ -479,11 +559,24 @@ function PublishedNodes({ definition }: { definition: GraphDocument['draft'] }) 
     : (definition.flows.find(({ id }) => id === legacyId) ?? definition.flows[0]);
   if (!flow) return null;
   const node = flow.nodes.find((item) => item.id === selected);
+  const flowsByStart = new Map(
+    definition.flows.map((item) => [item.nodes.find(({ type }) => type === 'START')?.id, item]),
+  );
+  const selectedFlow = onChooseFlow && flowsByStart.get(selected);
+  const highlight = flowsByStart.get(hovered ?? selected);
+  const highlightedEdges = new Set(highlight?.edges.map(edgeKey));
   return (
     <>
       {!definition.canvas && definition.flows.length > 1 && (
         <Field label="已发布执行流">
-          <select value={flow.id} onChange={(e) => setLegacyId(e.target.value)}>
+          <select
+            value={flow.id}
+            onChange={(e) => {
+              setLegacyId(e.target.value);
+              setSelected('');
+              onChooseFlow?.(undefined);
+            }}
+          >
             {definition.flows.map(({ id, name }) => (
               <option key={id} value={id}>
                 {name}
@@ -492,8 +585,21 @@ function PublishedNodes({ definition }: { definition: GraphDocument['draft'] }) 
           </select>
         </Field>
       )}
-      <NodeMap flow={flow} selected={selected ? [selected] : []} onSelect={setSelected} />
-      {node && (
+      <NodeMap
+        flow={flow}
+        selected={selected ? [selected] : []}
+        highlighted={new Set(highlight?.nodes.map(({ id }) => id))}
+        highlightEdges={
+          new Set(flow.edges.flatMap((edge, i) => (highlightedEdges.has(edgeKey(edge)) ? [i] : [])))
+        }
+        onHighlight={setHovered}
+        isRunnableStart={onChooseFlow ? (id) => flowsByStart.has(id) : undefined}
+        onSelect={(id) => {
+          setSelected(id);
+          onChooseFlow?.(flowsByStart.get(id));
+        }}
+      />
+      {node && !selectedFlow && (
         <div className="graph-properties">
           <strong>
             {node.name} · {graphNodeLabels[node.type]}

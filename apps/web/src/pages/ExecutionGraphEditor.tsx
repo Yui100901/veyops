@@ -190,6 +190,19 @@ export function ProjectGraphEditor({
     select(undefined);
     setError('');
   }
+  function deleteNode(id: string) {
+    if (!canEdit) return;
+    onChange({
+      ...canvas,
+      nodes: canvas.nodes.filter((item) => item.id !== id),
+      edges: canvas.edges.filter((edge) => edge.from !== id && edge.to !== id),
+      endpoints: canvas.endpoints.filter((pair) => pair.startId !== id && pair.endId !== id),
+    });
+    select(undefined);
+    setSource(undefined);
+    setConnector(undefined);
+    setError('');
+  }
   function removeSelection() {
     if (!canEdit) return;
     if (selection?.kind === 'edge' && activeEdge) {
@@ -199,13 +212,8 @@ export function ProjectGraphEditor({
     if (template) {
       onChange({ ...canvas, templates: canvas.templates.filter(({ id }) => id !== template.id) });
     } else if (activeNode) {
-      const id = activeNode.id;
-      onChange({
-        ...canvas,
-        nodes: canvas.nodes.filter((item) => item.id !== id),
-        edges: canvas.edges.filter((edge) => edge.from !== id && edge.to !== id),
-        endpoints: canvas.endpoints.filter((pair) => pair.startId !== id && pair.endId !== id),
-      });
+      deleteNode(activeNode.id);
+      return;
     }
     select(undefined);
     setSource(undefined);
@@ -260,21 +268,27 @@ export function ProjectGraphEditor({
     setSource(undefined);
     setError('');
   }
+  function copyNode(id: string, position?: Position) {
+    const node = canvas.nodes.find((item) => item.id === id);
+    if (!node) return;
+    const origin = position ?? node.position;
+    addNode(
+      node,
+      origin && {
+        x: Math.min(30000, origin.x + 30),
+        y: Math.min(30000, origin.y + 30),
+      },
+    );
+  }
   function duplicate() {
-    if (!inspected) return;
+    if (!inspected || !canEdit) return;
     if (template) {
       const copy = { ...structuredClone(template), id: graphKey('template') };
       onChange({ ...canvas, templates: [...canvas.templates, copy] });
       select({ kind: 'template', id: copy.id });
       return;
     }
-    addNode(
-      inspected,
-      inspected.position && {
-        x: Math.min(30000, inspected.position.x + 30),
-        y: Math.min(30000, inspected.position.y + 30),
-      },
-    );
+    copyNode(inspected.id);
   }
 
   return (
@@ -365,7 +379,7 @@ export function ProjectGraphEditor({
       )}
       <div className="graph-canvas-column">
         <div className="graph-canvas-help">
-          {canEdit && <p>拖节点到画布，点击两端连接点连线。选中连线后可点 × 删除。</p>}
+          {canEdit && <p>拖节点到画布，点击两端连接点连线。右键节点或连线打开操作菜单。</p>}
           {source && (
             <p role="status">
               从「{canvas.nodes.find(({ id }) => id === source)?.name}」连线，选择一个下游连接点。{' '}
@@ -400,6 +414,8 @@ export function ProjectGraphEditor({
               : undefined
           }
           onDropNode={canEdit ? drop : undefined}
+          onNodeCopy={canEdit ? copyNode : undefined}
+          onNodeDelete={canEdit ? deleteNode : undefined}
           onEdgeSelect={
             canEdit
               ? (index) => {

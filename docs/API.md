@@ -110,7 +110,7 @@
 
 每条流有一个 `START` 和一个 `END`。日志节点填写 `message`，`CONDITION` 使用 `{key,value}` 比较 `inputs.value`（`key: input`）或 `inputs.commitSha`（`key: commitSha`），发出的两条边分别标记 `when: TRUE` 和 `when: FALSE`。并行分支由 `PARALLEL` 发起，`JOIN` 等待实际命中的分支。使用 `FLOW_CALL.flowId` 启动同一已发布图版本中的子流，子流独立记录日志和状态。
 
-`START.delivery` 声明 `kind`，可选 `CUSTOM`（默认）、`BUILD`、`DEPLOY`、`BUILD_DEPLOY`、`VERIFY`、`MAINTENANCE`、`RELEASE_REVIEW`。构建、部署和组合预设必须通过 `serviceId` 关联所属项目的实际服务。交付流中的 `BUILD` 和 `DEPLOY_ARTIFACT` 节点使用开始节点的交付配置。
+`START.delivery` 声明 `kind`，可选 `CUSTOM`（默认）、`BUILD`、`DEPLOY`、`BUILD_DEPLOY`、`VERIFY`、`MAINTENANCE`、`RELEASE_REVIEW`。构建、部署和组合预设必须通过 `serviceId` 关联所属项目的实际服务。其他预设也可选择关联服务。交付流中的 `BUILD` 和 `DEPLOY_ARTIFACT` 节点使用开始节点的交付配置。
 
 - 构建配置 `build` 接受 `repositoryId`、可选 `branch` 或完整 `commitSha`、`buildLocation`、`artifactType`、`buildImage`、`repoPath`、`installCommand`、`buildCommand`、`outputPath`、`dockerfilePath`、`composeFilePath`、`registryId`、`imageRepository`。分支或远端默认分支先解析为固定提交。
 - 发布配置 `deploy` 可声明 `deployPath`、`startCommand`、`stopCommand`、`healthCheckCommand` 及 `composeFilePath`，也可通过服务环境提供有效配置。
@@ -268,8 +268,11 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 | --- | --- |
 | `GET /services/:serviceId/repositories`、`PUT /services/:serviceId/repositories` | 查询或保存服务与仓库关联，传入 `{repositories:[{repositoryId,repoPath,isPrimary}]}`。 |
 | `GET /services/:serviceId/environments/:envId/config`、`PUT /services/:serviceId/environments/:envId/config` | 读取或保存服务环境配置。 |
-| `GET /environments/:envId/variables`、`PUT /environments/:envId/variables` | 查询或保存环境变量，传入 `{variables:[{key,value?或credentialId?}]}`。 |
+| `GET /projects/:projectId/variables`、`PUT /projects/:projectId/variables` | 查询或保存项目公共变量。 |
+| `GET /environments/:envId/variables`、`PUT /environments/:envId/variables` | 查询或保存环境本地变量。 |
+| `GET /environments/:envId/variables/inherited` | 查询未被该环境覆盖的项目公共变量。 |
 | `GET /services/:serviceId/environments/:envId/variables`、`PUT /services/:serviceId/environments/:envId/variables` | 查询或保存服务级变量，覆盖同名环境变量。 |
+| `POST /projects/:projectId/variables/:key/reveal`、`POST /environments/:envId/variables/:key/reveal`、`POST /services/:serviceId/environments/:envId/variables/:key/reveal` | 管理员临时读取敏感值 `{value}`，读取动作记入审计。 |
 | `GET /artifacts` | 查看构建产物和下载、部署可用性，可按项目、服务、环境和任务筛选。 |
 | `GET /artifacts/:id/download` | 登录后下载文件或镜像归档，响应头 `X-Artifact-SHA256` 提供校验值。 |
 | `GET /deployments` | 查询逐服务器发布记录。 |
@@ -277,7 +280,7 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 | `PATCH /registries/:id`、`POST /registries/:id/test` | 管理员编辑、测试 HTTPS Registry V2 连通和认证，`credentialId:null` 解除凭据绑定。 |
 | `DELETE /registries/:id` | 管理员删除未被有效配置或镜像产物引用的镜像仓库，仍有引用时返回 409。 |
 
-服务环境配置支持构建位置与发布默认值、变量、目标、部署目录和健康检查。敏感变量通过凭据引用设置。管理端与目标端构建按已固定 SHA 检出并向脚本提供 `VEYOPS_PROJECT_NAME` 和 `VEYOPS_SERVICE_NAME`。目录、文件和镜像交付详见 [执行流交付说明](执行流交付.md)。
+变量保存请求为 `{variables:[{key,value?,isSecret?,description?,keepSecret?,credentialId?}]}`。敏感变量以加密凭据引用存储，查询接口隐藏值。`keepSecret: true` 保留当前敏感值，提供新值可替换。运行时项目公共变量先加载，同名环境变量覆盖，服务环境变量再覆盖。Shell 节点可通过 `inputs.environmentId` 指定环境，默认使用项目公共变量。管理端和目标端构建、部署及 SSH 脚本注入 `VEYOPS_PROJECT_ID`、`VEYOPS_PROJECT_SLUG`，关联服务时注入 `VEYOPS_SERVICE_ID`、`VEYOPS_SERVICE_SLUG`。构建和部署还提供 `VEYOPS_PROJECT_NAME` 和 `VEYOPS_SERVICE_NAME`。目录、文件和镜像交付详见 [执行流交付说明](执行流交付.md)。
 
 管理员和操作员可调用 `/projects/:projectId/repositories/:repositoryId/connection`、`/branches` 和 `/commits` 的 GET 接口检查仓库、读取分支和查询最近提交。`/commits` 接受 `branch` 和 `limit`，默认 20 条，最多 50 条。给仓库绑定凭据需要管理员角色。
 

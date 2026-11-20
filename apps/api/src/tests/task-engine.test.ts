@@ -104,6 +104,11 @@ test('stream redaction hides secrets split across arbitrary output chunks', () =
   }
   const redactor = new SecretRedactor(['abca']);
   assert.equal(redactor.write('abca') + redactor.end(), '[REDACTED]');
+  const overlapping = new SecretRedactor(['abca', 'abcamore']);
+  assert.equal(
+    overlapping.write('abca') + overlapping.write('more') + overlapping.end(),
+    '[REDACTED]',
+  );
 });
 test('executor limits target concurrency and preserves per-server failures', async () => {
   let running = 0;

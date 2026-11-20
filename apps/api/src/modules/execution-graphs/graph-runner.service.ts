@@ -406,7 +406,7 @@ export class GraphRunnerService implements OnModuleInit {
       { flowId: string; start: GraphNode; node: GraphNode; upstreamNodeId?: string }
     >();
     const seen = new Set<string>();
-    const nativeNodes = new Map<string, { flowId: string; node: GraphNode }>();
+    const nativeNodes = new Map<string, { flowId: string; node: GraphNode; serviceId?: string }>();
     const gather = (current: GraphFlow) => {
       if (seen.has(current.id)) return;
       seen.add(current.id);
@@ -445,7 +445,11 @@ export class GraphRunnerService implements OnModuleInit {
           });
         }
         if (isNativeTask(node))
-          nativeNodes.set(planKey(current.id, node.id), { flowId: current.id, node });
+          nativeNodes.set(planKey(current.id, node.id), {
+            flowId: current.id,
+            node,
+            serviceId: start.delivery?.serviceId,
+          });
         if (node.type === 'FLOW_CALL') gather(this.flow(definition, node.flowId!));
       }
     };
@@ -453,9 +457,12 @@ export class GraphRunnerService implements OnModuleInit {
     const nativePlans = new Map<string, GraphNodePlan>();
     const checkouts = [];
     const scripts = [];
-    for (const [key, { flowId, node }] of nativeNodes) {
+    for (const [key, { flowId, node, serviceId }] of nativeNodes) {
       if (!this.nodeTasks) throw new BadRequestException('执行节点服务不可用');
-      const plan = await this.nodeTasks.prepare(projectId, node);
+      const plan = await this.nodeTasks.prepare(projectId, node, {
+        serviceId,
+        environmentId: inputs.environmentId,
+      });
       nativePlans.set(key, plan);
       if (plan.type === 'CHECKOUT') {
         const { repositoryId, branch, commitSha, fullClone } = plan.source;
@@ -466,6 +473,8 @@ export class GraphRunnerService implements OnModuleInit {
           flowId,
           serverId: plan.serverId,
           serverName: plan.serverName,
+          serviceId: plan.serviceId,
+          environmentId: plan.environmentId,
         });
       }
     }

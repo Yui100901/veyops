@@ -54,7 +54,14 @@ interface Preview extends DeliveryPreview {
     commitSha: string;
     fullClone: boolean;
   }[];
-  scripts?: { nodeId: string; flowId: string; serverId: string; serverName: string }[];
+  scripts?: {
+    nodeId: string;
+    flowId: string;
+    serverId: string;
+    serverName: string;
+    environmentId?: string;
+    serviceId?: string;
+  }[];
 }
 
 function reachableNodes(root: GraphFlow, flows: GraphFlow[], inputs: Inputs) {
@@ -116,6 +123,7 @@ export function ExecutionGraphStart({
   }));
   const { nodes, actionPresets } = reachableNodes(flow, flows, inputs);
   const actions = nodes.filter(isDeliveryNode);
+  const hasShell = nodes.some((node) => node.type === 'SHELL');
   const needsValue = nodes.some((n) => (n.condition?.key ?? n.switch?.key) === 'input');
   const needsCommit = nodes.some((n) => (n.condition?.key ?? n.switch?.key) === 'commitSha');
   const build = actions.find((node) => node.type === 'BUILD');
@@ -171,6 +179,11 @@ export function ExecutionGraphStart({
       ...((build || needsCommit) && commitSha && { commitSha }),
       ...(deploy && artifactIds?.length && { artifactIds }),
       ...(actions.length && deployment),
+      ...(!actions.length &&
+        hasShell &&
+        deployment.environmentId && {
+          environmentId: deployment.environmentId,
+        }),
     };
   }
   return (
@@ -198,6 +211,21 @@ export function ExecutionGraphStart({
         {!actions.length && needsCommit && (
           <CommitInput inputs={inputs} change={setInputs} required />
         )}
+        {!actions.length && hasShell && project.environments.length > 0 && (
+          <Field label="执行环境">
+            <select
+              value={inputs.environmentId ?? ''}
+              onChange={(e) => setInputs({ ...inputs, environmentId: e.target.value || undefined })}
+            >
+              <option value="">仅使用项目公共变量</option>
+              {project.environments.map((environment) => (
+                <option value={environment.id} key={environment.id}>
+                  {environment.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
         {actions.some((node) => actionPresets.get(node.id)?.kind === 'BUILD_DEPLOY') && (
           <p className="field-note">部署使用本次构建生成的产物。</p>
         )}
@@ -213,7 +241,7 @@ export function ExecutionGraphStart({
             override={manualTargets}
             setOverride={setManualTargets}
           />
-        ) : !needsValue && !needsCommit && !nodes.some((node) => node.type === 'SHELL') ? (
+        ) : !needsValue && !needsCommit && !hasShell ? (
           <p className="field-note">这条执行流可直接运行，无需选择环境和服务器。</p>
         ) : null}
       </fieldset>
@@ -245,8 +273,13 @@ export function ExecutionGraphStart({
             </div>
           ))}
           {preview.scripts?.map((script) => (
-            <p key={script.nodeId} className="graph-delivery-preview">
+            <p key={`${script.flowId}:${script.nodeId}`} className="graph-delivery-preview">
               Shell 执行服务器 · {script.serverName || script.serverId}
+              {' · '}
+              {project.environments.find((env) => env.id === script.environmentId)?.name ??
+                '项目公共变量'}
+              {script.serviceId &&
+                ` · ${project.services.find((service) => service.id === script.serviceId)?.name ?? script.serviceId}`}
             </p>
           ))}
           {(preview.deliveries ?? (preview.serviceId ? [preview] : [])).map((delivery, i) => (

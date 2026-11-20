@@ -1451,6 +1451,59 @@ export const migrationProvider: MigrationProvider = {
       } satisfies Migration,
       '018_project_execution_graphs': executionGraphsMigration,
       '019_execution_graph_triggers': executionGraphTriggersMigration,
+      '020_project_variables': {
+        async up(db) {
+          await createTables(
+            db,
+            [
+              {
+                name: 'project_variables',
+                columns: [
+                  ['id', 'text', { primaryKey: true }],
+                  ['project_id', 'text', { references: 'projects.id', onDelete: 'cascade' }],
+                  ['key', 'text'],
+                  ['value_text', 'text', { nullable: true }],
+                  [
+                    'credential_id',
+                    'text',
+                    { nullable: true, references: 'credentials.id', onDelete: 'restrict' },
+                  ],
+                  ['is_secret', 'integer', { default: 0 }],
+                  ['description', 'text', { default: '' }],
+                  ['created_at', 'bigint', { default: 0 }],
+                  ['updated_at', 'bigint', { default: 0 }],
+                ],
+                unique: [['project_id', 'key']],
+                checks: [
+                  '(is_secret = 0 AND value_text IS NOT NULL AND credential_id IS NULL) OR (is_secret = 1 AND value_text IS NULL AND credential_id IS NOT NULL)',
+                ],
+              },
+            ],
+            [],
+          );
+          const now = Date.now();
+          for (const table of ['environment_variables', 'service_environment_variables']) {
+            await db.schema
+              .alterTable(table)
+              .addColumn('description', 'text', (c) => c.notNull().defaultTo(''))
+              .execute();
+            // SQLite only supports one ADD COLUMN per ALTER TABLE statement.
+            for (const column of ['created_at', 'updated_at']) {
+              await db.schema
+                .alterTable(table)
+                .addColumn(column, 'bigint', (c) => c.notNull().defaultTo(now))
+                .execute();
+            }
+          }
+        },
+        async down(db) {
+          for (const table of ['environment_variables', 'service_environment_variables']) {
+            for (const column of ['description', 'created_at', 'updated_at'])
+              await db.schema.alterTable(table).dropColumn(column).execute();
+          }
+          await db.schema.dropTable('project_variables').execute();
+        },
+      } satisfies Migration,
     };
   },
 };

@@ -182,22 +182,27 @@ export interface ServiceEnvironmentConfigsTable {
   updated_at: number;
 }
 
-export interface EnvironmentVariablesTable {
+interface VariablesTable {
   id: string;
-  environment_id: string;
   key: string;
   value_text: Generated<string | null>;
   credential_id: Generated<string | null>;
   is_secret: Generated<number>;
+  description: Generated<string>;
+  created_at: Generated<number>;
+  updated_at: Generated<number>;
 }
 
-export interface ServiceEnvironmentVariablesTable {
-  id: string;
+export interface ProjectVariablesTable extends VariablesTable {
+  project_id: string;
+}
+
+export interface EnvironmentVariablesTable extends VariablesTable {
+  environment_id: string;
+}
+
+export interface ServiceEnvironmentVariablesTable extends VariablesTable {
   config_id: string;
-  key: string;
-  value_text: Generated<string | null>;
-  credential_id: Generated<string | null>;
-  is_secret: Generated<number>;
 }
 
 export interface ProjectAddressesTable {
@@ -817,6 +822,7 @@ export interface Database {
   deployment_targets: DeploymentTargetsTable;
   deployment_target_servers: DeploymentTargetServersTable;
   service_environment_configs: ServiceEnvironmentConfigsTable;
+  project_variables: ProjectVariablesTable;
   environment_variables: EnvironmentVariablesTable;
   service_environment_variables: ServiceEnvironmentVariablesTable;
   project_addresses: ProjectAddressesTable;

@@ -24,7 +24,10 @@ async function checkResources(databaseUrl?: string) {
     await import('./helpers/legacy-delivery-fixture.module.js');
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
+  const { DatabaseService } = await import('../core/database/database.service.js');
   const { SshService } = await import('../infrastructure/ssh/ssh.service.js');
+  const { ServiceConfigsService } =
+    await import('../modules/service-configs/service-configs.service.js');
   let probeExitCode = 0;
   const module = await Test.createTestingModule({
     imports: [AppModule, LegacyDeliveryFixtureModule],
@@ -211,6 +214,119 @@ async function checkResources(databaseUrl?: string) {
       (await fetch(`/environments/${environment.id}/variables`))[0].key,
       'ENVIRONMENT_MODE',
     );
+    const projectVarsPath = root + '/variables';
+    const envVarsPath = `/environments/${environment.id}/variables`;
+    const putVariables = (path: string, variables: object[]) =>
+      api.put(base + path).send({ variables });
+    const secretKey = 'DATABASE_URL';
+    const secretValue = 'fixture-secret-value-to-encrypt';
+    const common = [
+      { key: 'ENVIRONMENT_MODE', value: 'common' },
+      { key: 'SERVICE_MODE', value: 'common' },
+    ];
+    await putVariables(projectVarsPath, [
+      ...common,
+      { key: secretKey, value: secretValue, isSecret: true, description: 'Test database' },
+    ]).expect(200);
+    const projectSecret = (await fetch(projectVarsPath)).find(
+      (variable: { key: string }) => variable.key === secretKey,
+    );
+    assert.equal(projectSecret.value, null);
+    assert.equal(projectSecret.isSecret, true);
+    assert.equal(projectSecret.description, 'Test database');
+    assert.equal('credentialId' in projectSecret, false);
+    const db = app.get(DatabaseService).db;
+    const stored = await db
+      .selectFrom('project_variables')
+      .innerJoin('credentials', 'credentials.id', 'project_variables.credential_id')
+      .select(['value_text', 'ciphertext', 'credential_id'])
+      .where('project_id', '=', project.id)
+      .where('key', '=', secretKey)
+      .executeTakeFirstOrThrow();
+    assert.equal(stored.value_text, null);
+    assert.ok(stored.ciphertext && !stored.ciphertext.includes(secretValue));
+    assert.equal((await fetch('/credentials')).length, 1);
+    await putVariables(projectVarsPath, [...common, { key: secretKey, keepSecret: true }]).expect(
+      200,
+    );
+    const kept = (await fetch(projectVarsPath)).find(
+      (variable: { key: string }) => variable.key === secretKey,
+    );
+    assert.deepEqual(kept, projectSecret);
+    const revealUrl = base + projectVarsPath + '/' + secretKey + '/reveal';
+    await putVariables(projectVarsPath, [
+      ...common,
+      { key: secretKey, isSecret: true, value: '••••••••••••' },
+    ]).expect(400);
+    const revealed = await api.post(revealUrl).expect(201).expect('Cache-Control', 'no-store');
+    assert.deepEqual(revealed.body.data, { value: secretValue });
+    const staffPassword = 'fixture-operator-bootstrap';
+    const staffChangedPassword = 'fixture-operator-changed';
+    await create('/users', {
+      username: 'fixture-operator',
+      role: 'OPERATOR',
+      password: staffPassword,
+    });
+    const staff = request.agent(app.getHttpServer());
+    const staffLogin = (password: string) =>
+      staff.post(base + '/auth/login').send({ username: 'fixture-operator', password });
+    await staffLogin(staffPassword).expect(201);
+    await staff
+      .post(base + '/auth/change-password')
+      .send({ currentPassword: staffPassword, newPassword: staffChangedPassword })
+      .expect(200);
+    await staffLogin(staffChangedPassword).expect(201);
+    await staff.post(revealUrl).expect(403);
+    const auditEntries = await db
+      .selectFrom('audit_logs')
+      .select('details_json')
+      .where('action', '=', 'project.variables.reveal')
+      .execute();
+    assert.deepEqual(
+      auditEntries.map((row) => JSON.parse(row.details_json)),
+      [{ key: secretKey }],
+    );
+    const configs = app.get(ServiceConfigsService);
+    assert.deepEqual(
+      (await fetch(envVarsPath + '/inherited')).map((variable: { key: string }) => variable.key),
+      [secretKey, 'SERVICE_MODE'],
+    );
+    const identifiers = {
+      VEYOPS_PROJECT_ID: project.id,
+      VEYOPS_PROJECT_SLUG: project.slug,
+      VEYOPS_SERVICE_ID: service.id,
+      VEYOPS_SERVICE_SLUG: service.slug,
+    };
+    assert.deepEqual(await configs.resolveVariables(project.id, environment.id, service.id), {
+      variables: { ENVIRONMENT_MODE: 'fixture', SERVICE_MODE: 'fixture', ...identifiers },
+      secretVariables: { [secretKey]: stored.credential_id },
+    });
+    await putVariables(envVarsPath, [{ key: secretKey, value: 'environment-override' }]).expect(
+      200,
+    );
+    assert.deepEqual(await configs.resolveVariables(project.id, environment.id, service.id), {
+      variables: {
+        ENVIRONMENT_MODE: 'common',
+        SERVICE_MODE: 'fixture',
+        [secretKey]: 'environment-override',
+        ...identifiers,
+      },
+      secretVariables: {},
+    });
+    await putVariables(envVarsPath, [{ key: secretKey, isSecret: true, keepSecret: true }]).expect(
+      400,
+    );
+    await putVariables(envVarsPath, [{ key: 'VEYOPS_PROJECT_ID', value: 'override' }]).expect(400);
+    await putVariables(envVarsPath, [{ key: 'veyops_service_slug', value: 'override' }]).expect(
+      400,
+    );
+    await putVariables(projectVarsPath, [
+      ...common,
+      { key: secretKey, isSecret: true, value: 'rotated-secret-value' },
+    ]).expect(200);
+    assert.deepEqual((await api.post(revealUrl).expect(201)).body.data, {
+      value: 'rotated-secret-value',
+    });
     await api.delete(base + root + '/addresses/' + address.id).expect(200);
     await api.delete(base + root + '/environments/' + environment.id).expect(200);
     const staging = await create(root + '/environments', { name: 'Staging', slug: 'staging' });

@@ -27,6 +27,7 @@ import { metricNames, metricValue } from './monitoring-data';
 import type { MetricKey, MonitorRow } from './monitoring-data';
 import { ProjectRelations } from './ProjectRelations';
 import { ProjectExecutionSettingsPanel } from './ProjectExecutionSettings';
+import { EnvironmentVariables } from './EnvironmentVariables';
 import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
 import { deliveryPath } from './delivery-route';
 import {
@@ -1482,6 +1483,7 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
   const [deletingProject, setDeletingProject] = useState(false);
   const [adding, setAdding] = useInlineEditor<'repositories' | 'services' | 'environments'>();
   const [editingResource, setEditingResource] = useState<Repository | Service | Environment>();
+  const [variableEnvironment, setVariableEnvironment] = useInlineEditor<Environment>();
   const [deletingResource, setDeletingResource] = useState<{
     key: 'repositories' | 'services' | 'environments';
     item: Repository | Service | Environment;
@@ -1653,7 +1655,19 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
           项目设置
         </button>
       </nav>
-      {section === 'settings' && <ProjectExecutionSettingsPanel projectId={id} user={user} />}
+      {section === 'settings' && (
+        <>
+          <ProjectExecutionSettingsPanel projectId={id} user={user} />
+          <Section title="项目公共变量" subtitle="项目各环境自动继承公共变量，并可用同名变量覆盖。">
+            <p className="muted">
+              执行图自带 <code>VEYOPS_PROJECT_SLUG</code> 和 <code>VEYOPS_PROJECT_ID</code>。
+              与服务关联的执行流还可使用 <code>VEYOPS_SERVICE_SLUG</code> 和{' '}
+              <code>VEYOPS_SERVICE_ID</code>。
+            </p>
+            <EnvironmentVariables key={id} projectId={id} user={user} />
+          </Section>
+        </>
+      )}
       {section === 'ai' && <ProjectAISettings user={user} projectId={id} />}
       {section === 'resources' && adding && (
         <InlineEditor
@@ -1790,8 +1804,19 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
           </Form>
         </InlineEditor>
       )}
+      {section === 'resources' && variableEnvironment && (
+        <InlineEditor
+          key={variableEnvironment.id}
+          title={`${variableEnvironment.name} · 环境变量`}
+          description={`环境 ${variableEnvironment.slug} 可覆盖项目公共变量。`}
+          onClose={() => setVariableEnvironment(undefined)}
+          wide
+        >
+          <EnvironmentVariables projectId={id} environmentId={variableEnvironment.id} user={user} />
+        </InlineEditor>
+      )}
       {section === 'resources' && (
-        <div className="project-detail-grid">
+        <div className="project-detail-grid" hidden={Boolean(variableEnvironment)}>
           {(['repositories', 'services', 'environments'] as const).map((key) => (
             <Section
               key={key}
@@ -1854,6 +1879,20 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
                             ? (item as Service).serviceType
                             : (item as Environment).environmentType}
                       </span>
+                      {key === 'environments' && (
+                        <button
+                          type="button"
+                          className="button secondary small"
+                          aria-label={`${item.name} 环境变量`}
+                          onClick={() => {
+                            setAdding(undefined);
+                            setEditingResource(undefined);
+                            setVariableEnvironment(item as Environment);
+                          }}
+                        >
+                          环境变量
+                        </button>
+                      )}
                       {key === 'repositories' && user.role === 'VIEWER' && (
                         <ContextAIButton
                           user={user}

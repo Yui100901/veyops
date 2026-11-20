@@ -112,6 +112,10 @@
   align-items: start;
 }
 
+.project-workspace .project-detail-grid[hidden] {
+  display: none;
+}
+
 .project-workspace .project-detail-grid .panel-header {
   padding-block: 10px;
 }

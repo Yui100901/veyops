@@ -6,6 +6,7 @@ import { sql } from 'kysely';
 import { DatabaseService } from '../core/database/database.service';
 import { SystemSettingsService } from '../modules/system/system-settings.service';
 import { AuditService } from '../modules/audit/audit.service';
+import { CredentialsService } from '../modules/credentials/credentials.service';
 import { DeploymentTargetsService } from '../modules/deployment-targets/deployment-targets.service';
 import type { ServersService } from '../modules/servers/servers.service';
 import { ServiceConfigsService } from '../modules/service-configs/service-configs.service';
@@ -124,7 +125,8 @@ for (const client of ['sqlite', 'postgres'] as const) {
       const audit = new AuditService(database);
       const settings = new SystemSettingsService(database, audit);
       const targets = new DeploymentTargetsService(database, {} as ServersService, audit, settings);
-      const configs = new ServiceConfigsService(database, targets, audit, settings);
+      const credentials = new CredentialsService(database, audit);
+      const configs = new ServiceConfigsService(database, targets, audit, settings, credentials);
       const base = {
         targetId: target,
         buildLocation: 'TARGET' as const,
@@ -154,7 +156,11 @@ for (const client of ['sqlite', 'postgres'] as const) {
           configs.saveVariables(environment, { variables: [rightVariable] }, user, scope),
         ]);
         assertOneReplacement(
-          await configs.listVariables(environment, scope),
+          (await configs.listVariables(environment, scope)).map(({ key, value, isSecret }) => ({
+            key,
+            value,
+            isSecret,
+          })),
           { ...leftVariable, isSecret: false },
           { ...rightVariable, isSecret: false },
         );

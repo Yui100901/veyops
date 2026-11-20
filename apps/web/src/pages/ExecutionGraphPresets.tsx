@@ -48,20 +48,16 @@ export function StartDeliveryFields({
             const next = event.target.value as FlowPreset;
             const builds = next === 'BUILD' || next === 'BUILD_DEPLOY';
             const deploys = next === 'DEPLOY' || next === 'BUILD_DEPLOY';
-            change(
-              next === 'CUSTOM'
-                ? undefined
-                : {
-                    kind: next,
-                    ...((builds || deploys) && {
-                      serviceId:
-                        value?.serviceId ??
-                        (project.services.length === 1 ? project.services[0]!.id : undefined),
-                    }),
-                    ...(builds && { build: value?.build }),
-                    ...(deploys && { deploy: value?.deploy }),
-                  },
-            );
+            change({
+              kind: next,
+              serviceId:
+                value?.serviceId ??
+                ((builds || deploys) && project.services.length === 1
+                  ? project.services[0]!.id
+                  : undefined),
+              ...(builds && { build: value?.build }),
+              ...(deploys && { deploy: value?.deploy }),
+            });
           }}
         >
           {Object.entries(flowPresetLabels).map(([id, label]) => (
@@ -71,24 +67,22 @@ export function StartDeliveryFields({
           ))}
         </select>
       </Field>
-      {(hasBuild || hasDeploy) && (
-        <Field label="关联服务">
-          <select
-            value={value?.serviceId ?? ''}
-            disabled={!canEdit}
-            onChange={(event) =>
-              change({ ...value, kind, serviceId: event.target.value || undefined })
-            }
-          >
-            <option value="">选择项目服务</option>
-            {project.services.map((service) => (
-              <option value={service.id} key={service.id}>
-                {service.name}
-              </option>
-            ))}
-          </select>
-        </Field>
-      )}
+      <Field label={hasBuild || hasDeploy ? '关联服务' : '关联服务（可选）'}>
+        <select
+          value={value?.serviceId ?? ''}
+          disabled={!canEdit}
+          onChange={(event) =>
+            change({ ...value, kind, serviceId: event.target.value || undefined })
+          }
+        >
+          <option value="">{hasBuild || hasDeploy ? '选择项目服务' : '无关联服务'}</option>
+          {project.services.map((service) => (
+            <option value={service.id} key={service.id}>
+              {service.name}
+            </option>
+          ))}
+        </select>
+      </Field>
       {hasBuild && (
         <BuildFields
           project={project}

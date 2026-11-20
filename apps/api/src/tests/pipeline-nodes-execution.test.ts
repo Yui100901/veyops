@@ -142,6 +142,8 @@ test(
         secretVariables: {},
       };
       const resolved = await builds.resolveVariables(snapshot);
+      assert.equal(resolved.values.VEYOPS_PROJECT_ID, snapshot.projectId);
+      assert.equal(resolved.values.VEYOPS_SERVICE_ID, snapshot.serviceId);
       const session: BuildSession = {
         snapshot,
         taskId: randomUUID(),

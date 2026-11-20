@@ -16,13 +16,21 @@ import {
 } from '@nestjs/common';
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
 import { IsIn, IsObject, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import type { Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
+import type { Database } from '../../core/database/schema';
 import { encryptionKey } from '../../core/config';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { AuditService } from '../audit/audit.service';
 import { pipelineNodeSecrets } from '../pipelines/pipeline-node-config';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
+
+export const variableCredentialType = 'ENVIRONMENT_VARIABLE';
+
+export function variableCredentialValue(secret: Record<string, string>) {
+  return secret.value ?? secret.secret ?? secret.password ?? secret.apiKey ?? secret.token;
+}
 
 const credentialTypes = [
   'SSH_PASSWORD',
@@ -90,6 +98,7 @@ export class CredentialsService {
     const rows = await this.database.db
       .selectFrom('credentials')
       .select(['id', 'name', 'type', 'status', 'created_at', 'updated_at'])
+      .where('type', '!=', variableCredentialType)
       .orderBy('created_at', 'desc')
       .execute();
     return rows.map((r) => ({
@@ -130,6 +139,29 @@ export class CredentialsService {
     await this.audit.record(userId, 'credential.create', 'credential', id);
     return (await this.list()).find((c) => c.id === id)!;
   }
+  async storeVariableValue(
+    tx: Transaction<Database>,
+    userId: string,
+    variable: string,
+    value: string,
+  ) {
+    const id = randomUUID();
+    const now = Date.now();
+    await tx
+      .insertInto('credentials')
+      .values({
+        id,
+        name: variable,
+        type: variableCredentialType,
+        ...this.encrypt({ value }),
+        status: 'ACTIVE',
+        created_by: userId,
+        created_at: now,
+        updated_at: now,
+      })
+      .execute();
+    return id;
+  }
   async decrypt(id: string, expectedNonce?: string): Promise<Record<string, string>> {
     let query = this.database.db.selectFrom('credentials').selectAll().where('id', '=', id);
     if (expectedNonce) query = query.where('nonce', '=', expectedNonce);
@@ -158,6 +190,7 @@ export class CredentialsService {
       .selectFrom('credentials')
       .select(['id', 'type'])
       .where('id', '=', id)
+      .where('type', '!=', variableCredentialType)
       .executeTakeFirst();
     if (!row) throw new NotFoundException('凭据不存在');
     if (dto.secret) this.validateSecret(row.type, dto.secret);
@@ -179,6 +212,7 @@ export class CredentialsService {
       .selectFrom('credentials')
       .select('id')
       .where('id', '=', id)
+      .where('type', '!=', variableCredentialType)
       .executeTakeFirst();
     if (!row) throw new NotFoundException('凭据不存在');
     try {

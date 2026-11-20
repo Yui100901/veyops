@@ -1,11 +1,18 @@
-import { useId, useRef, useState } from 'react';
-import type { DragEvent, PointerEvent } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import type {
+  DragEvent,
+  KeyboardEvent,
+  MouseEvent,
+  PointerEvent as ReactPointerEvent,
+} from 'react';
+import { createPortal } from 'react-dom';
 import {
   Box,
   CheckCircle2,
   CirclePlay,
   Clock3,
   Code2,
+  Copy,
   Download,
   FileText,
   GitBranch,
@@ -13,6 +20,8 @@ import {
   GitMerge,
   ListTree,
   ShieldCheck,
+  Trash2,
+  Unlink2,
   Workflow,
   Upload,
   X,
@@ -90,6 +99,10 @@ interface Point {
   x: number;
   y: number;
 }
+
+type MenuTarget = { kind: 'node'; id: string } | { kind: 'edge'; index: number };
+type CanvasMenuState = { target: MenuTarget; point: Point; trigger: HTMLElement | SVGElement };
+
 export const graphDragType = 'application/x-veyops-graph-node';
 
 function bounds(start: Point, end: Point) {
@@ -110,6 +123,8 @@ export function NodeMap({
   onEdgeSelect,
   onMove,
   onDropNode,
+  onNodeCopy,
+  onNodeDelete,
   onEdgeDelete,
   selectedEdge,
   onHighlight,
@@ -118,6 +133,7 @@ export function NodeMap({
   connecting,
   onConnectSource,
   onConnectTarget,
+  isRunnableStart,
 }: {
   flow: GraphFlow;
   selected?: string[];
@@ -127,6 +143,8 @@ export function NodeMap({
   onEdgeSelect?: (index: number) => void;
   onMove?: (id: string, point: Point) => void;
   onDropNode?: (payload: string, point: Point) => void;
+  onNodeCopy?: (id: string, point: Point) => void;
+  onNodeDelete?: (id: string) => void;
   onEdgeDelete?: (index: number) => void;
   selectedEdge?: number;
   onHighlight?: (id?: string) => void;
@@ -135,18 +153,74 @@ export function NodeMap({
   connecting?: string;
   onConnectSource?: (id: string) => void;
   onConnectTarget?: (id: string) => void;
+  isRunnableStart?: (id: string) => boolean;
 }) {
   const marker = useId();
   const [zoom, setZoom] = useState(100);
   const scale = zoom / 100;
   const [drag, setDrag] = useState<{ start: Point; end: Point }>();
   const [manual, setManual] = useState<{ id: string; point: Point }>();
+  const [menu, setMenu] = useState<CanvasMenuState>();
+  const scroll = useRef<HTMLDivElement>(null);
   const moving = useRef<{ id: string; pointer: Point; position: Point } | null>(null);
   const { points, width: layoutWidth, height: layoutHeight } = layout(flow, manual);
   const width = onDropNode ? Math.max(layoutWidth + 170, 640) : layoutWidth;
   const height = onDropNode ? Math.max(layoutHeight + 100, 360) : layoutHeight;
+
+  function openMenu(
+    event: MouseEvent<HTMLElement | SVGElement> | KeyboardEvent<HTMLElement | SVGElement>,
+    target: MenuTarget,
+  ) {
+    if ('key' in event && event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10'))
+      return;
+    event.preventDefault();
+    const trigger = event.currentTarget;
+    const rect = trigger.getBoundingClientRect();
+    const point =
+      'key' in event
+        ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+        : { x: event.clientX, y: event.clientY };
+    setMenu({ target, point, trigger });
+    if (target.kind === 'node') onSelect?.(target.id, false);
+    else onEdgeSelect?.(target.index);
+  }
+
+  function menuItems(target: MenuTarget) {
+    if (target.kind === 'edge') {
+      const remove = onEdgeDelete;
+      if (!remove || !flow.edges[target.index]) return [];
+      return [
+        { label: '断开连线', icon: Unlink2, action: () => remove(target.index), danger: true },
+      ];
+    }
+    const location = points.get(target.id);
+    const copy = onNodeCopy;
+    const remove = onNodeDelete;
+    if (!location || !copy || !remove) return [];
+    return [
+      { label: '复制节点', icon: Copy, action: () => copy(target.id, location) },
+      { label: '删除节点', icon: Trash2, action: () => remove(target.id), danger: true },
+    ];
+  }
+
+  const closeMenu = useCallback(
+    (reason?: 'action' | 'key') => {
+      setMenu(undefined);
+      if (!menu || !reason) return;
+      const { trigger } = menu;
+      if (reason === 'key') trigger.focus({ preventScroll: true });
+      else
+        window.requestAnimationFrame(() => {
+          if (document.activeElement === document.body)
+            (trigger.isConnected ? trigger : scroll.current)?.focus({ preventScroll: true });
+        });
+    },
+    [menu],
+  );
+
+  const items = menu ? menuItems(menu.target) : [];
   function nodePosition(
-    event: PointerEvent<HTMLDivElement>,
+    event: ReactPointerEvent<HTMLDivElement>,
     origin: NonNullable<typeof moving.current>,
   ) {
     return {
@@ -160,7 +234,7 @@ export function NodeMap({
       ),
     };
   }
-  const point = (event: PointerEvent<HTMLDivElement> | DragEvent<HTMLDivElement>) => {
+  const point = (event: ReactPointerEvent<HTMLDivElement> | DragEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     return {
       x: Math.min(width, Math.max(0, (event.clientX - rect.left) / scale)),
@@ -185,7 +259,12 @@ export function NodeMap({
           </select>
         </label>
       </div>
-      <div className="graph-canvas-scroll" tabIndex={0} aria-label="可滚动的执行流画布">
+      <div
+        className="graph-canvas-scroll"
+        ref={scroll}
+        tabIndex={0}
+        aria-label="可滚动的执行流画布"
+      >
         <div
           className="graph-canvas-viewport"
           style={{ width: width * scale, height: height * scale }}
@@ -300,7 +379,7 @@ export function NodeMap({
                 const path = `M ${start} ${y} C ${start + control} ${y}, ${end - control} ${endY}, ${end} ${endY}`;
                 return (
                   <g
-                    key={i}
+                    key={JSON.stringify([edge.from, edge.to, edge.when])}
                     className={[
                       edge.when && 'edge-' + edge.when.split(':')[0].toLowerCase(),
                       highlightEdges?.has(i) && 'graph-edge-highlighted',
@@ -318,8 +397,15 @@ export function NodeMap({
                         tabIndex={0}
                         aria-label={`连线 ${flow.nodes.find((n) => n.id === edge.from)?.name} → ${flow.nodes.find((n) => n.id === edge.to)?.name}`}
                         aria-pressed={selectedEdge === i}
+                        aria-haspopup={onEdgeDelete ? 'menu' : undefined}
+                        onContextMenu={
+                          onEdgeDelete
+                            ? (event) => openMenu(event, { kind: 'edge', index: i })
+                            : undefined
+                        }
                         onClick={() => onEdgeSelect(i)}
                         onKeyDown={(event) => {
+                          if (onEdgeDelete) openMenu(event, { kind: 'edge', index: i });
                           if (event.key !== 'Enter' && event.key !== ' ') return;
                           event.preventDefault();
                           onEdgeSelect(i);
@@ -351,12 +437,17 @@ export function NodeMap({
                       type="button"
                       className="graph-edge-remove"
                       aria-label="删除所选连线"
+                      aria-haspopup="menu"
                       title="删除连线"
                       style={{
                         left: (from.x + cardWidth + to.x) / 2,
                         top: (from.y + to.y + cardHeight) / 2 + 9,
                       }}
                       onClick={() => onEdgeDelete(selectedEdge)}
+                      onContextMenu={(event) =>
+                        openMenu(event, { kind: 'edge', index: selectedEdge })
+                      }
+                      onKeyDown={(event) => openMenu(event, { kind: 'edge', index: selectedEdge })}
                     >
                       <X size={16} />
                     </button>
@@ -365,6 +456,8 @@ export function NodeMap({
               })()}
             {flow.nodes.map((node) => {
               const Icon = icons[node.type];
+              const runnable = node.type === 'START' && isRunnableStart?.(node.id);
+              const hasMenu = onNodeCopy && onNodeDelete;
               const location = points.get(node.id)!;
               const style = {
                 left: location.x,
@@ -372,13 +465,13 @@ export function NodeMap({
                 width: cardWidth,
                 height: cardHeight,
               };
-              const className = `graph-node${highlighted?.has(node.id) ? ' graph-node-highlighted' : ''}`;
+              const className = `graph-node${highlighted?.has(node.id) ? ' graph-node-highlighted' : ''}${runnable ? ' graph-node-runnable' : ''}`;
               const label = (
                 <>
                   <Icon size={18} />
                   <span>
                     <strong>{node.name || '未命名节点'}</strong>
-                    <small>{graphNodeLabels[node.type]}</small>
+                    <small>{runnable ? '开始 · 手动运行' : graphNodeLabels[node.type]}</small>
                   </span>
                 </>
               );
@@ -390,6 +483,18 @@ export function NodeMap({
                     data-node-type={node.type}
                     style={style}
                     aria-pressed={selected.includes(node.id)}
+                    aria-label={runnable ? `运行 ${node.name}` : undefined}
+                    aria-haspopup={hasMenu ? 'menu' : undefined}
+                    onContextMenu={
+                      hasMenu
+                        ? (event) => openMenu(event, { kind: 'node', id: node.id })
+                        : undefined
+                    }
+                    onKeyDown={
+                      hasMenu
+                        ? (event) => openMenu(event, { kind: 'node', id: node.id })
+                        : undefined
+                    }
                     onPointerEnter={() =>
                       onHighlight?.(node.type === 'START' ? node.id : undefined)
                     }
@@ -454,6 +559,91 @@ export function NodeMap({
           </div>
         </div>
       </div>
+      {menu && items.length > 0 && (
+        <CanvasMenu point={menu.point} items={items} onClose={closeMenu} />
+      )}
     </div>
+  );
+}
+
+function CanvasMenu({
+  point,
+  items,
+  onClose,
+}: {
+  point: Point;
+  items: { label: string; icon: typeof Copy; action: () => void; danger?: boolean }[];
+  onClose: (reason?: 'action' | 'key') => void;
+}) {
+  const menu = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const element = menu.current!;
+    const rect = element.getBoundingClientRect();
+    element.style.left = Math.max(8, Math.min(point.x, window.innerWidth - rect.width - 8)) + 'px';
+    element.style.top = Math.max(8, Math.min(point.y, window.innerHeight - rect.height - 8)) + 'px';
+    element.querySelector('button')?.focus({ preventScroll: true });
+  }, [point]);
+  useEffect(() => {
+    function outside(event: PointerEvent) {
+      if (event.target instanceof Node && !menu.current?.contains(event.target)) onClose();
+    }
+    function dismiss() {
+      onClose();
+    }
+    document.addEventListener('pointerdown', outside, true);
+    window.addEventListener('scroll', dismiss, true);
+    window.addEventListener('resize', dismiss);
+    return () => {
+      document.removeEventListener('pointerdown', outside, true);
+      window.removeEventListener('scroll', dismiss, true);
+      window.removeEventListener('resize', dismiss);
+    };
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      className="graph-context-menu"
+      role="menu"
+      aria-label="画布操作"
+      ref={menu}
+      onContextMenu={(event) => event.preventDefault()}
+      onKeyDown={(event) => {
+        event.stopPropagation();
+        if (event.key === 'Escape' || event.key === 'Tab') {
+          if (event.key === 'Escape') event.preventDefault();
+          onClose('key');
+          return;
+        }
+        const buttons = Array.from(event.currentTarget.querySelectorAll('button'));
+        const active = buttons.findIndex((item) => item === document.activeElement);
+        const positions: Partial<Record<string, number>> = {
+          ArrowDown: (active + 1) % buttons.length,
+          ArrowUp: (active - 1 + buttons.length) % buttons.length,
+          Home: 0,
+          End: buttons.length - 1,
+        };
+        const next = positions[event.key];
+        if (next === undefined) return;
+        event.preventDefault();
+        buttons[next]?.focus();
+      }}
+    >
+      {items.map(({ label, icon: Icon, action, danger }) => (
+        <button
+          type="button"
+          role="menuitem"
+          tabIndex={-1}
+          className={danger ? 'graph-context-danger' : undefined}
+          key={label}
+          onClick={() => {
+            action();
+            onClose('action');
+          }}
+        >
+          <Icon size={16} aria-hidden="true" /> {label}
+        </button>
+      ))}
+    </div>,
+    document.body,
   );
 }

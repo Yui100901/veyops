@@ -37,6 +37,7 @@ export class MultiTargetExecutor {
             const result = await this.ssh.execute(target, step.command, {
               timeout: step.timeout ?? timeout,
               signal,
+              variables: task.payload.environment,
               onData: (text) => context.log(text, target.id),
             });
             exitCode = result.exitCode;

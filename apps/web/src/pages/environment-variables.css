@@ -1,0 +1,73 @@
+.environment-variables {
+  display: grid;
+  min-width: 0;
+  gap: 14px;
+  justify-items: start;
+}
+
+.environment-variable-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  width: 100%;
+}
+
+.environment-variables p {
+  margin: 0;
+}
+
+.environment-variables > .table-scroll,
+.environment-variable-text,
+.environment-variable-inheritance {
+  width: 100%;
+}
+
+.environment-variable-table {
+  min-width: 660px;
+}
+
+.environment-variable-table :is(th, td),
+.environment-variable-inheritance :is(th, td) {
+  padding: 8px 10px;
+  vertical-align: top;
+}
+
+.environment-variable-table :is(input, select, textarea) {
+  width: 100%;
+}
+
+.environment-variable-table textarea {
+  display: block;
+  min-height: 36px;
+  resize: vertical;
+}
+
+.environment-variable-table textarea[readonly] {
+  margin-top: 6px;
+}
+
+.environment-variable-table .heading-actions {
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+
+.environment-variable-code {
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+.environment-variable-text {
+  resize: vertical;
+  min-height: 180px;
+  line-height: 1.55;
+}
+
+.environment-variable-inheritance {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+
+.environment-variable-inheritance h3 {
+  margin: 0 0 10px;
+}

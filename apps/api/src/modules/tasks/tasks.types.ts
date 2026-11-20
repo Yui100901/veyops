@@ -3,6 +3,7 @@ import type { PipelineSnapshot } from '../pipelines/pipeline.types';
 import type { Transaction } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import type { GraphCheckoutSnapshot } from '../projects/repository-metadata.service';
+import type { ExecutionVariables } from '../../infrastructure/execution-variables';
 
 export type TaskStatus =
   | 'PENDING'
@@ -43,6 +44,7 @@ export interface AiRepairOrigin {
 }
 export interface TaskPayload {
   sourceCheckout?: { projectId: string; source: GraphCheckoutSnapshot };
+  environment?: ExecutionVariables;
   aiRepair?: AiRepairOrigin;
   targets: SshTarget[];
   steps: ExecutionStep[];

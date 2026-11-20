@@ -1,42 +1,77 @@
+const shellTraceEscapes: Record<string, string> = {
+  '\\': '\\\\',
+  "'": "\\'",
+  '\n': '\\n',
+  '\r': '\\r',
+  '\t': '\\t',
+  '\b': '\\b',
+  '\f': '\\f',
+  '\v': '\\v',
+  '\x1b': '\\E',
+};
+
+function secretPatterns(values: string[]) {
+  return [
+    ...new Set(
+      values
+        .filter(Boolean)
+        .flatMap((value) => [
+          value,
+          value.replace(/'/g, "'\\''"),
+          value.replace(/'/g, `'"'"'`),
+          value.replace(/[\\'\n\r\t\b\f\v\x1b]/g, (character) => shellTraceEscapes[character]!),
+        ]),
+    ),
+  ].sort((a, b) => b.length - a.length);
+}
+
 /** Buffers incomplete secret values so chunk boundaries cannot leak credentials. */
 export class SecretRedactor {
   private pending = '';
-  private readonly secrets: string[];
+  private readonly byInitial = new Map<string, string[]>();
   constructor(values: string[]) {
-    this.secrets = [...new Set(values.filter((value) => value.length > 0))].sort(
-      (a, b) => b.length - a.length,
-    );
+    for (const secret of secretPatterns(values)) {
+      const initial = secret[0]!;
+      const existing = this.byInitial.get(initial);
+      if (existing) existing.push(secret);
+      else this.byInitial.set(initial, [secret]);
+    }
   }
   write(chunk: string): string {
+    if (!this.byInitial.size) return chunk;
     this.pending += chunk;
     let result = '';
     let index = 0;
     while (index < this.pending.length) {
-      const match = this.secrets.find((secret) => this.pending.startsWith(secret, index));
+      const remaining = this.pending.length - index;
+      const match = this.byInitial
+        .get(this.pending[index]!)
+        ?.find((secret) =>
+          secret.length <= remaining
+            ? this.pending.startsWith(secret, index)
+            : secret.startsWith(this.pending.slice(index)),
+        );
+      if (match && match.length > remaining) break;
       if (match) {
         result += '[REDACTED]';
         index += match.length;
         continue;
       }
-      const remaining = this.pending.slice(index);
-      if (this.secrets.some((secret) => secret.startsWith(remaining))) break;
       result += this.pending[index++];
     }
     this.pending = this.pending.slice(index);
     return result;
   }
   end(): string {
-    let result = this.pending;
-    for (const secret of this.secrets) result = result.split(secret).join('[REDACTED]');
-    if (result && this.secrets.some((secret) => secret.startsWith(result))) result = '[REDACTED]';
+    const result = this.pending ? '[REDACTED]' : '';
     this.pending = '';
     return result;
   }
 }
 
 export function redactText(text: string, values: string[]): string {
-  return values
-    .filter(Boolean)
-    .sort((a, b) => b.length - a.length)
-    .reduce((result, value) => result.split(value).join('[REDACTED]'), text);
+  return secretPatterns(values).reduce(
+    (result, value) => result.split(value).join('[REDACTED]'),
+    text,
+  );
 }
