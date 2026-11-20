@@ -30,6 +30,8 @@ async function checkDelivery(databaseUrl?: string) {
   process.env.ADMIN_PASSWORD = initialPassword;
   process.env.AI_PIPELINE_ANALYSIS = 'false';
 
+  const { LegacyDeliveryFixtureModule } =
+    await import('./helpers/legacy-delivery-fixture.module.js');
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { DatabaseService } = await import('../core/database/database.service.js');
@@ -60,7 +62,9 @@ async function checkDelivery(databaseUrl?: string) {
   let failNextHealthCheck = false;
   let archivePlatformMismatch = false;
   let auxiliaryCommit = 'c'.repeat(40);
-  const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+  const moduleRef = await Test.createTestingModule({
+    imports: [AppModule, LegacyDeliveryFixtureModule],
+  })
     .overrideProvider(ProcessRunnerService)
     .useValue({
       run: async (_command: string, args: string[], options: { gzipOutput?: { path: string } }) => {
@@ -1001,8 +1005,6 @@ async function checkDelivery(databaseUrl?: string) {
       assert.deepEqual(await list(path, { recordId: historical.id, projectId: project.id }), []);
       assert.ok((await getTask(historical.taskId)).pipelineRunId);
     }
-    assert.equal((await list(`/projects/${otherProject.id}/runs`, scope)).length, 2);
-    assert.deepEqual(await list(`/projects/${project.id}/runs`, scope), []);
     assert.deepEqual(
       (await list('/pipelines', { projectId: otherProject.id, serviceId: otherService.id })).map(
         (item: { id: string }) => item.id,
@@ -1396,6 +1398,134 @@ async function checkDelivery(databaseUrl?: string) {
     assert.equal(recovered.nodes[1].status, 'NEEDS_ATTENTION');
     assert.equal(recovered.nodes[2].status, 'SKIPPED');
     assert.equal((await create(buildFlow + '/run', buildRequest)).taskId, interrupted.taskId);
+
+    const directService = await create(`/projects/${project.id}/services`, {
+      name: 'Graph-native delivery',
+      slug: 'graph-native-delivery',
+    });
+    const deliveryNodes = (buildCommand: string) => {
+      const starts = [
+        {
+          id: 'native-build',
+          type: 'START',
+          name: 'Build this service',
+          delivery: {
+            kind: 'BUILD',
+            serviceId: directService.id,
+            build: {
+              repositoryId: repo.id,
+              buildLocation: 'MANAGER',
+              buildCommand,
+              commitSha: successfulCommit,
+            },
+          },
+        },
+        {
+          id: 'native-deploy',
+          type: 'START',
+          name: 'Deploy this service',
+          delivery: {
+            kind: 'DEPLOY',
+            serviceId: directService.id,
+            deploy: { deployPath: '/opt/graph-native-test' },
+          },
+        },
+      ];
+      return {
+        flows: [],
+        canvas: {
+          nodes: [
+            ...starts,
+            { id: 'native-package', type: 'BUILD', name: 'Archive' },
+            { id: 'native-release', type: 'DEPLOY_ARTIFACT', name: 'Release' },
+            { id: 'native-end', type: 'END', name: 'End' },
+          ],
+          edges: [
+            { from: 'native-build', to: 'native-package' },
+            { from: 'native-deploy', to: 'native-release' },
+            { from: 'native-package', to: 'native-end' },
+            { from: 'native-release', to: 'native-end' },
+          ],
+          endpoints: starts.map((start) => ({ startId: start.id, endId: 'native-end' })),
+          templates: [],
+        },
+      };
+    };
+    async function publishNative(buildCommand: string) {
+      const current = (await api.get('/api/v1' + graphPath).expect(200)).body.data;
+      const draft = (
+        await api
+          .put('/api/v1' + graphPath + '/draft')
+          .send({ expectedRevision: current.revision, definition: deliveryNodes(buildCommand) })
+          .expect(200)
+      ).body.data;
+      return (await create(graphPath + '/publish', { expectedRevision: draft.revision }))
+        .publishedVersion;
+    }
+    const nativeBuild = graphPath + '/flows/native-build';
+    const nativeDeploy = graphPath + '/flows/native-deploy';
+    const firstVersion = await publishNative('echo first graph build');
+    await post(nativeDeploy + '/preview', { version: firstVersion, inputs: selected }).expect(400);
+    async function buildArchive(version: number) {
+      const request = { version, inputs: selected };
+      const profileRows = () =>
+        db
+          .selectFrom('pipelines')
+          .select('id')
+          .where('service_id', '=', directService.id)
+          .execute();
+      const before = await profileRows();
+      const preview = await create(nativeBuild + '/preview', request);
+      assert.equal(preview.serviceId, directService.id);
+      assert.equal(preview.pipelineId, undefined);
+      assert.deepEqual(
+        await profileRows(),
+        before,
+        'preview must not create delivery backing records',
+      );
+      const queued = await create(nativeBuild + '/run', {
+        ...request,
+        expectedConfigurationHash: preview.configurationHash,
+        idempotencyKey: randomUUID(),
+      });
+      const detail = await waitGraph(queued.id);
+      assert.equal(detail.status, 'SUCCESS');
+      assert.equal(detail.artifactIds.length, 1);
+      return detail.artifactIds[0] as string;
+    }
+    const olderArchive = await buildArchive(firstVersion);
+    const secondVersion = await publishNative('echo second graph build');
+    const latestArchive = await buildArchive(secondVersion);
+    assert.notEqual(latestArchive, olderArchive);
+    const deployRequest = { version: secondVersion, inputs: selected };
+    const suggested = await create(nativeDeploy + '/preview', deployRequest);
+    assert.deepEqual(suggested.artifactIds, [latestArchive]);
+    const manual = { ...deployRequest, inputs: { ...selected, artifactIds: [olderArchive] } };
+    const chosen = await create(nativeDeploy + '/preview', manual);
+    assert.deepEqual(chosen.artifactIds, [olderArchive]);
+    await post(nativeDeploy + '/preview', {
+      ...manual,
+      inputs: { ...selected, artifactIds: [archiveForGraph.id] },
+    }).expect(400);
+    const deployed = await create(nativeDeploy + '/run', {
+      ...manual,
+      expectedConfigurationHash: chosen.configurationHash,
+      idempotencyKey: randomUUID(),
+    });
+    assert.equal((await waitGraph(deployed.id)).status, 'SUCCESS');
+    const latestRow = await db
+      .selectFrom('artifacts')
+      .select('storage_key')
+      .where('id', '=', latestArchive)
+      .executeTakeFirstOrThrow();
+    await rm(latestRow.storage_key);
+    assert.deepEqual((await create(nativeDeploy + '/preview', deployRequest)).artifactIds, [
+      olderArchive,
+    ]);
+    await post(nativeDeploy + '/preview', {
+      ...deployRequest,
+      inputs: { ...selected, artifactIds: [latestArchive] },
+    }).expect(409);
   } finally {
     await app.close();
   }

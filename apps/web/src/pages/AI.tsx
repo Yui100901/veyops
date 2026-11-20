@@ -20,7 +20,7 @@ import {
   Trash2,
   UserRound,
 } from 'lucide-react';
-import { api, formatTime, message, navigate, post, remove, useResource } from '../api';
+import { api, formatTime, message, post, remove, useResource } from '../api';
 import {
   Confirm,
   Empty,
@@ -34,7 +34,6 @@ import {
   Status,
 } from '../components';
 import type { Project, Server, Task, User } from '../models';
-import { deliveryPath } from './delivery-route';
 import { ActionRules, ModelRouting, type ActionRule } from './AIControls';
 
 interface AIProvider {
@@ -55,7 +54,6 @@ interface AIPolicy {
   serverIds?: string[];
   projectIds?: string[];
   repositoryIds?: string[];
-  approvedPipelineHashes?: string[];
   allowedActions?: string[];
   deniedActions?: string[];
   requireConfirmActions?: string[];
@@ -80,7 +78,6 @@ export interface Proposal {
 }
 export type AIContext =
   | { kind: 'REPOSITORY'; repositoryId: string; commitSha?: string; serviceId?: string }
-  | { kind: 'PIPELINE'; pipelineId: string }
   | { kind: 'SERVICE'; serviceId: string }
   | { kind: 'TASK'; taskId: string }
   | { kind: 'OPERATION_PLAN'; operationPlanId: string; version: number };
@@ -139,14 +136,13 @@ const modes: { value: AIMode; name: string; description: string }[] = [
   {
     value: 'FULL_CONTROL',
     name: '完全控制',
-    description: '在明确授权范围内安装预置组件、运行获准的 Pipeline 或打开 PR。PR 由人工合并。',
+    description: '在明确授权范围内安装预置组件、执行获准操作或打开 PR。PR 由人工合并。',
   },
 ];
 const actionLabels: Record<string, string> = {
   execute_command: '执行远程命令',
   inspect_servers: '只读服务器巡检',
   initialize_component: '初始化目标环境',
-  run_pipeline: '构建并部署 Pipeline',
   publish_source_branch: '推送代码审查分支',
   open_pull_request: '创建 Pull Request',
 };
@@ -511,8 +507,6 @@ function PolicyEditor({
   const [restrictProjects, setRestrictProjects] = useState(false);
   const [repositories, setRepositories] = useState('');
   const [restrictRepositories, setRestrictRepositories] = useState(false);
-  const [pipelineHashes, setPipelineHashes] = useState('');
-  const [restrictPipelineHashes, setRestrictPipelineHashes] = useState(false);
   const [denied, setDenied] = useState('');
   const [allowed, setAllowed] = useState('');
   const [restrictActions, setRestrictActions] = useState(false);
@@ -535,8 +529,6 @@ function PolicyEditor({
     setRestrictProjects(p?.projectIds !== undefined);
     setRepositories(p?.repositoryIds?.join('\n') || '');
     setRestrictRepositories(p?.repositoryIds !== undefined);
-    setPipelineHashes(p?.approvedPipelineHashes?.join('\n') || '');
-    setRestrictPipelineHashes(p?.approvedPipelineHashes !== undefined);
     setDenied(p?.deniedActions?.join(', ') || '');
     setAllowed(p?.allowedActions?.join(', ') || '');
     setRestrictActions(p?.allowedActions !== undefined);
@@ -564,12 +556,6 @@ function PolicyEditor({
           projectIds: restrictProjects ? projectIds : undefined,
           repositoryIds: restrictRepositories
             ? repositories
-                .trim()
-                .split(/[\s,]+/)
-                .filter(Boolean)
-            : undefined,
-          approvedPipelineHashes: restrictPipelineHashes
-            ? pipelineHashes
                 .trim()
                 .split(/[\s,]+/)
                 .filter(Boolean)
@@ -736,7 +722,7 @@ function PolicyEditor({
                 <input
                   value={allowed}
                   onChange={(e) => setAllowed(e.target.value)}
-                  placeholder="initialize_component, run_pipeline, publish_source_branch, open_pull_request"
+                  placeholder="initialize_component, publish_source_branch, open_pull_request"
                 />
               </Field>
             )}
@@ -744,7 +730,7 @@ function PolicyEditor({
               <input
                 value={denied}
                 onChange={(e) => setDenied(e.target.value)}
-                placeholder="例如 execute_command, run_pipeline"
+                placeholder="例如 execute_command, open_pull_request"
               />
             </Field>
             <Field label="强制确认的操作类别" hint="系统级规则不会被项目策略覆盖。">
@@ -769,27 +755,6 @@ function PolicyEditor({
                   rows={3}
                   value={repositories}
                   onChange={(e) => setRepositories(e.target.value)}
-                />
-              </Field>
-            )}
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={restrictPipelineHashes}
-                onChange={(e) => setRestrictPipelineHashes(e.target.checked)}
-              />
-              设置 Pipeline 自动执行授权
-            </label>
-            {restrictPipelineHashes && (
-              <Field
-                label="已审核的 Pipeline 执行指纹"
-                hint="从运行预览复制。指纹绑定版本、提交、环境、模式和目标。每行一个或用逗号分隔。"
-              >
-                <textarea
-                  className="mono"
-                  rows={3}
-                  value={pipelineHashes}
-                  onChange={(e) => setPipelineHashes(e.target.value)}
                 />
               </Field>
             )}
@@ -846,15 +811,11 @@ function PolicyEditor({
 const contextActions = {
   REPOSITORY: {
     title: 'AI 源码分析',
-    suggestion: '分析当前仓库，说明如何构建与部署，并根据仓库内容生成流水线草稿。',
-  },
-  PIPELINE: {
-    title: 'AI 流水线辅助',
-    suggestion: '检查当前流水线配置并给出改进意见。',
+    suggestion: '分析当前仓库，说明如何构建与部署，并根据仓库内容生成构建部署建议。',
   },
   SERVICE: {
-    title: 'AI 生成流水线',
-    suggestion: '根据当前服务与关联仓库生成流水线草稿。',
+    title: 'AI 构建部署建议',
+    suggestion: '根据当前服务与关联仓库生成构建部署建议。',
   },
   TASK: {
     title: 'AI 排查任务',
@@ -875,8 +836,6 @@ function contextKey(context?: AIContext | null) {
         context.commitSha?.toLowerCase(),
         context.serviceId,
       ].join(':');
-    case 'PIPELINE':
-      return `${context.kind}:${context.pipelineId}`;
     case 'SERVICE':
       return `${context.kind}:${context.serviceId}`;
     case 'TASK':
@@ -917,7 +876,6 @@ export function ContextAIButton({
                 user={user}
                 context={context}
                 scopedProjectId={projectId}
-                onAdopt={() => setOpen(false)}
               />
             </div>
           </Modal>,
@@ -931,12 +889,10 @@ export function AIPage({
   user,
   context,
   scopedProjectId,
-  onAdopt,
 }: {
   user: User;
   context?: AIContext;
   scopedProjectId?: string;
-  onAdopt?: () => void;
 }) {
   const servers = useResource<Server[]>('/servers');
   const providers = useResource<AIProvider[]>('/ai/providers');
@@ -947,7 +903,6 @@ export function AIPage({
   const [conversationId, setConversationId] = useState('');
   const [providerId, setProviderId] = useState('');
   const [projectId, setProjectId] = useState(scopedProjectId ?? '');
-  const [draftServiceId, setDraftServiceId] = useState<string>();
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -987,7 +942,6 @@ export function AIPage({
     if (busy) return;
     setConversationId(c.id);
     setProjectId(c.projectId || '');
-    setDraftServiceId(undefined);
     setOptimistic([]);
     setDrafts([]);
     setTasks([]);
@@ -999,7 +953,6 @@ export function AIPage({
     if (busy) return;
     setConversationId('');
     if (context) setProjectId(scopedProjectId ?? '');
-    setDraftServiceId(undefined);
     setOptimistic([]);
     setDrafts([]);
     setTasks([]);
@@ -1025,7 +978,6 @@ export function AIPage({
       });
       setConversationId(result.conversationId);
       if (result.projectId !== undefined) setProjectId(result.projectId ?? '');
-      setDraftServiceId(result.serviceId ?? undefined);
       setDrafts(result.drafts || []);
       setTasks(result.tasks || []);
       setSourceChanges(result.sourceChanges || []);
@@ -1217,7 +1169,7 @@ export function AIPage({
                       ? [contextActions[activeContext.kind].suggestion]
                       : [
                           '列出当前服务器并总结最近连接状态',
-                          '帮我生成 Node.js 项目的文件部署 Pipeline 草稿',
+                          '帮我生成 Node.js 项目的文件部署配置建议',
                           '查看最近失败的任务，给出排查建议',
                         ]
                     ).map((s) => (
@@ -1273,15 +1225,6 @@ export function AIPage({
                 <DraftCard
                   key={i}
                   draft={draft}
-                  projectId={projectId || undefined}
-                  serviceId={
-                    draftServiceId ??
-                    (activeContext && 'serviceId' in activeContext
-                      ? activeContext.serviceId
-                      : undefined)
-                  }
-                  onAdopt={onAdopt}
-                  canAdopt={user.role !== 'VIEWER'}
                   onDismiss={() => setDrafts((items) => items.filter((item) => item !== draft))}
                   onError={setError}
                 />
@@ -1444,62 +1387,24 @@ export function AIPage({
 
 function DraftCard({
   draft,
-  projectId,
-  serviceId,
-  canAdopt,
-  onAdopt,
   onDismiss,
   onError,
 }: {
   draft: Draft;
-  projectId?: string;
-  serviceId?: string;
-  canAdopt: boolean;
-  onAdopt?: () => void;
   onDismiss: () => void;
   onError: (error: string) => void;
 }) {
   let title: string;
   let content: unknown;
-  let pipeline: Record<string, unknown> | undefined;
   if ('source' in draft) {
     title = draft.draft.name;
     content = draft.draft;
-    pipeline = draft.draft;
   } else if ('type' in draft) {
-    title = draft.type === 'PIPELINE' ? 'Pipeline 草稿' : '运维方案草稿';
+    title = draft.type === 'PIPELINE' ? '构建部署建议' : '运维方案草稿';
     content = draft.definition;
-    if (draft.type === 'PIPELINE')
-      pipeline =
-        'definition' in draft.definition
-          ? draft.definition
-          : { name: 'AI Pipeline 草稿', projectId, definition: draft.definition };
   } else {
     title = draft.title || '源代码修改建议';
     content = draft;
-  }
-  function adoptPipeline() {
-    if (!pipeline) return;
-    const project =
-      projectId ?? (typeof pipeline.projectId === 'string' ? pipeline.projectId : undefined);
-    const service =
-      serviceId ?? (typeof pipeline.serviceId === 'string' ? pipeline.serviceId : undefined);
-    try {
-      sessionStorage.setItem(
-        'veyops:pipeline-draft',
-        JSON.stringify({ ...pipeline, projectId: project, serviceId: service }),
-      );
-    } catch {
-      onError('无法暂存草稿，请展开预览后手动复制。');
-      return;
-    }
-    onAdopt?.();
-    const path = project
-      ? deliveryPath(project, 'pipelines', { serviceId: service })
-      : '/pipelines';
-    if (window.location.hash.slice(1) === path)
-      window.dispatchEvent(new Event('veyops:pipeline-draft'));
-    else navigate(path);
   }
   return (
     <div className="ai-draft-card">
@@ -1527,26 +1432,20 @@ function DraftCard({
         <pre className="code-preview">{JSON.stringify(content, null, 2)}</pre>
       </details>
       <div className="row-actions">
-        {Boolean(pipeline) && canAdopt ? (
-          <button className="button primary small" onClick={adoptPipeline}>
-            采用草稿
-          </button>
-        ) : (
-          <button
-            className="button secondary small"
-            onClick={() => {
-              if (!navigator.clipboard) {
-                onError('无法复制，请展开预览后手动复制。');
-                return;
-              }
-              void navigator.clipboard
-                .writeText(JSON.stringify(content, null, 2))
-                .catch(() => onError('无法复制，请展开预览后手动复制。'));
-            }}
-          >
-            复制草稿
-          </button>
-        )}
+        <button
+          className="button secondary small"
+          onClick={() => {
+            if (!navigator.clipboard) {
+              onError('无法复制，请展开预览后手动复制。');
+              return;
+            }
+            void navigator.clipboard
+              .writeText(JSON.stringify(content, null, 2))
+              .catch(() => onError('无法复制，请展开预览后手动复制。'));
+          }}
+        >
+          复制草稿
+        </button>
         <button className="button secondary small" onClick={onDismiss}>
           放弃草稿
         </button>
@@ -1571,10 +1470,6 @@ export function ProposalPreview({ proposal, servers }: { proposal: Proposal; ser
           return { id, name: server?.name, host: server?.host };
         })
       : [];
-  const definition =
-    preview.definition && typeof preview.definition === 'object'
-      ? (preview.definition as Record<string, unknown>)
-      : undefined;
   return (
     <>
       {!!targets.length && (
@@ -1593,16 +1488,6 @@ export function ProposalPreview({ proposal, servers }: { proposal: Proposal; ser
           <h3 className="field-title">即将执行的命令</h3>
           <pre className="code-preview">{preview.command}</pre>
         </>
-      )}
-      {proposal.actionType === 'run_pipeline' && (
-        <div className="deployment-review">
-          <span>固定 Commit</span>
-          <code>{String(preview.commitSha || '')}</code>
-          <span>Pipeline 版本</span>
-          <strong>v{String(preview.version || '')}</strong>
-          <span>部署目录</span>
-          <code>{String(definition?.deployPath || '')}</code>
-        </div>
       )}
       {proposal.actionType === 'initialize_component' && typeof preview.component === 'string' && (
         <>

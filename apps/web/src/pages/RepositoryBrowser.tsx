@@ -9,11 +9,10 @@ import {
   RefreshCw,
   Wifi,
 } from 'lucide-react';
-import { api, message, navigate, post, useResource } from '../api';
+import { api, message, post, useResource } from '../api';
 import { Empty, ErrorBanner, Field, Loading, Modal } from '../components';
 import type { Environment, Repository, Service, User } from '../models';
 import { ContextAIButton } from './AI';
-import { deliveryPath } from './delivery-route';
 
 import { BranchSyncControls, useRepositoryBranches } from './RepositoryBranches';
 export interface RepositoryCommit {
@@ -223,7 +222,7 @@ export function RepositoryDetails({
   return (
     <Modal
       title={repository.name}
-      description="检查 Git 连接、浏览提交，或分析仓库以生成 Pipeline 草稿。"
+      description="检查 Git 连接、浏览提交，或分析仓库的构建与部署方式。"
       onClose={onClose}
       wide
     >
@@ -263,9 +262,9 @@ export function RepositoryDetails({
           </button>
           <a
             className="text-link"
-            href={'#' + deliveryPath(projectId, 'pipelines', { repositoryId: repository.id })}
+            href={`#/projects/${projectId}/execution-graph`}
           >
-            查看此仓库的 Pipeline →
+            打开项目执行图 →
           </a>
           <ContextAIButton
             user={user}
@@ -375,7 +374,7 @@ function RepositoryAnalysis({
   return (
     <div className="repository-browser">
       <p className="field-note">
-        可直接分析仓库默认分支，也可以指定提交和构建子目录。审核草稿后可在 Pipeline 编辑器中采用。
+        可直接分析仓库默认分支，也可以指定提交和构建子目录。可参考生成的配置设置执行流。
       </p>
       <div className="repository-detail-actions">
         <button
@@ -484,7 +483,7 @@ function RepositoryAnalysis({
             </span>
           )}
           <button className="button primary" type="submit" disabled={busy}>
-            {busy ? '正在分析…' : '生成 Pipeline 草稿'}
+            {busy ? '正在分析…' : '生成构建与部署建议'}
           </button>
         </div>
       </form>
@@ -537,26 +536,10 @@ function RepositoryAnalysis({
             <p className="field-note">待审核补充 {result.missingFields.join('、')}</p>
           )}
           <details open>
-            <summary>Pipeline 草稿 JSON</summary>
+            <summary>配置建议 JSON</summary>
             <pre className="code-preview">{draftJson}</pre>
           </details>
           <div className="repository-detail-actions">
-            <button
-              className="button primary small"
-              type="button"
-              onClick={() => {
-                sessionStorage.setItem('veyops:pipeline-draft', draftJson);
-                navigate(
-                  deliveryPath(projectId, 'pipelines', {
-                    repositoryId: repository.id,
-                    serviceId: result.draft.serviceId,
-                  }),
-                );
-              }}
-            >
-              <Check size={14} />
-              采用草稿
-            </button>
             <button
               className="button secondary small"
               type="button"

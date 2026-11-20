@@ -200,9 +200,13 @@ async function checkRegistryRemoval(connectionString?: string) {
   process.env.ENCRYPTION_KEY = randomBytes(32).toString('hex');
   process.env.WORKER_ENABLED = 'false';
   process.env.ADMIN_PASSWORD = initialPassword;
+  const { LegacyDeliveryFixtureModule } =
+    await import('./helpers/legacy-delivery-fixture.module.js');
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
-  const module = await Test.createTestingModule({ imports: [AppModule] }).compile();
+  const module = await Test.createTestingModule({
+    imports: [AppModule, LegacyDeliveryFixtureModule],
+  }).compile();
   const app = module.createNestApplication<NestExpressApplication>({ logger: false });
   configureApp(app);
   const base = '/api/v1';

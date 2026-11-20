@@ -27,13 +27,13 @@ import { deliveryPath } from './delivery-route';
 import { ContextAIButton } from './AI';
 import { FailureHandling } from './FailureHandling';
 import { RunArtifacts } from './Delivery';
-import type { PipelineLogSelection, PipelineTaskStep } from './PipelineRunGraph';
+import type { DeliveryLogSelection, DeliveryTaskStep } from './DeliveryTaskStages';
 
-const PipelineRunGraph = lazy(() => import('./PipelineRunGraph'));
+const DeliveryTaskStages = lazy(() => import('./DeliveryTaskStages'));
 
 function renderTaskLog(
   content: string,
-  steps: PipelineTaskStep[] | undefined,
+  steps: DeliveryTaskStep[] | undefined,
   stepId: string | undefined,
   selection: Ref<HTMLElement>,
 ) {
@@ -47,7 +47,7 @@ function renderTaskLog(
     const lineBreak = segment.indexOf('\n');
     const end = lineBreak === -1 ? segment.length : lineBreak;
     return [
-      <mark className="pipeline-run-log-marker" key={stepId} ref={selection}>
+      <mark className="delivery-task-log-marker" key={stepId} ref={selection}>
         {segment.slice(0, end)}
       </mark>,
       segment.slice(end),
@@ -144,10 +144,10 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
   const task = useResource<Task>(`/tasks/${id}`, 2000);
   const targets = useResource<TaskTarget[]>(`/tasks/${id}/targets`, 2000);
   const logs = useTaskLogs(id);
-  const steps = useResource<PipelineTaskStep[]>(`/tasks/${id}/steps`, 2000);
+  const steps = useResource<DeliveryTaskStep[]>(`/tasks/${id}/steps`, 2000);
   const logPanel = useRef<HTMLPreElement>(null);
   const logMarker = useRef<HTMLElement>(null);
-  const [logSelection, setLogSelection] = useState<PipelineLogSelection>();
+  const [logSelection, setLogSelection] = useState<DeliveryLogSelection>();
   const selectedStepId = logSelection?.step.id;
   const selectedLogPresent =
     !!selectedStepId && logs.data.content.includes(`[node:${selectedStepId}] `);
@@ -215,7 +215,7 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
       <a
         href={
           value.type === 'PIPELINE' && value.projectId
-            ? '#' + deliveryPath(value.projectId, 'runs', deliveryScope)
+            ? '#' + `/projects/${value.projectId}/execution-graph?pane=history`
             : '#/tasks'
         }
         className="back-link"
@@ -343,7 +343,7 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
       )}
       {value.pipelineGraph && (
         <Suspense fallback={<Loading />}>
-          <PipelineRunGraph
+          <DeliveryTaskStages
             task={value}
             graph={value.pipelineGraph}
             targets={targets.data ?? []}
@@ -365,7 +365,6 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
           key={value.pipelineRunId}
           runId={value.pipelineRunId}
           polling={activeTask(value.status)}
-          canDeploy={user.role !== 'VIEWER'}
         />
       )}
       {value.type === 'PIPELINE' && value.serviceId && value.environmentId && failed && (
@@ -445,7 +444,7 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
         >
           <ErrorBanner error={logs.error} />
           {logSelection && (
-            <p className="pipeline-run-log-selection" id="pipeline-log-selection" role="status">
+            <p className="delivery-task-log-selection" id="delivery-log-selection" role="status">
               选中节点 · {logSelection.targetName} / {logSelection.step.name}
               {' · '}
               {selectedLogPresent ? '已定位到节点开始处' : '查看当前保留的任务日志'}
@@ -454,7 +453,7 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
           <pre
             className="task-logs"
             aria-label="执行日志"
-            aria-describedby={logSelection ? 'pipeline-log-selection' : undefined}
+            aria-describedby={logSelection ? 'delivery-log-selection' : undefined}
             ref={logPanel}
             tabIndex={-1}
           >
@@ -486,7 +485,7 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
                   <tr
                     key={step.id}
                     className={
-                      selectedStepId === step.id ? 'pipeline-run-selected-step' : undefined
+                      selectedStepId === step.id ? 'delivery-task-selected-step' : undefined
                     }
                   >
                     <td>

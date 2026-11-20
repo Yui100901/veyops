@@ -38,6 +38,8 @@ async function verify(databaseUrl?: string) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
+  const { LegacyDeliveryFixtureModule } =
+    await import('./helpers/legacy-delivery-fixture.module.js');
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { DatabaseService } = await import('../core/database/database.service.js');
@@ -47,7 +49,9 @@ async function verify(databaseUrl?: string) {
     await import('../modules/projects/repository-metadata.service.js');
   const { PipelinesService } = await import('../modules/pipelines/pipelines.service.js');
   const { AuditService } = await import('../modules/audit/audit.service.js');
-  const m = await Test.createTestingModule({ imports: [AppModule] }).compile();
+  const m = await Test.createTestingModule({
+    imports: [AppModule, LegacyDeliveryFixtureModule],
+  }).compile();
   const app = m.createNestApplication<NestExpressApplication>({ logger: false, rawBody: true });
   configureApp(app);
   try {

@@ -91,6 +91,7 @@ export interface PipelineSnapshot {
   allowPartialDeploy?: boolean;
   deploymentArtifacts?: { id: string; serverId: string | null; fingerprint?: string }[];
   sourceBuildTaskId?: string;
+  artifactServiceScope?: boolean;
   triggerType?: 'MANUAL' | AutomaticPipelineTrigger;
   runId: string;
   pipelineId: string;

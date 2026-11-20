@@ -1,4 +1,4 @@
-.pipeline-node-graph {
+.delivery-step-track {
   display: flex;
   align-items: stretch;
   margin: 0;
@@ -7,13 +7,13 @@
   list-style: none;
 }
 
-.pipeline-node-graph-item {
+.delivery-step-track-item {
   display: flex;
   align-items: stretch;
   flex: 0 0 auto;
 }
 
-.pipeline-node-graph-edge {
+.delivery-step-track-edge {
   align-self: center;
   width: 17px;
   height: 17px;
@@ -21,7 +21,7 @@
   color: #6f8790;
 }
 
-.pipeline-node-graph-card {
+.delivery-step-track-card {
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -39,20 +39,20 @@
   overflow-wrap: anywhere;
 }
 
-button.pipeline-node-graph-card:hover,
-a.pipeline-node-graph-card:hover,
-.pipeline-node-graph-card[aria-pressed='true'] {
+button.delivery-step-track-card:hover,
+a.delivery-step-track-card:hover,
+.delivery-step-track-card[aria-pressed='true'] {
   border-color: #5ea399;
   background: #f0f9f7;
 }
 
-.pipeline-node-graph-card:focus-visible {
+.delivery-step-track-card:focus-visible {
   outline: 2px solid #168b79;
   outline-offset: 2px;
 }
 
-.pipeline-node-graph-kind,
-.pipeline-node-graph-status {
+.delivery-step-track-kind,
+.delivery-step-track-status {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -60,46 +60,46 @@ a.pipeline-node-graph-card:hover,
   color: #536c79;
 }
 
-.pipeline-node-graph-name {
+.delivery-step-track-name {
   font-size: 14px;
   line-height: 1.4;
 }
 
-.pipeline-node-graph-detail {
+.delivery-step-track-detail {
   color: #536c79;
   font-size: 12px;
 }
 
-.pipeline-run-graph .pipeline-node-graph {
+.delivery-task-graph .delivery-step-track {
   margin: 0 15px 9px;
 }
 
-.pipeline-run-scope {
+.delivery-task-scope {
   display: flex;
   align-items: center;
   gap: 7px;
   font-size: 13px;
 }
 
-.pipeline-run-scope select {
+.delivery-task-scope select {
   max-width: min(34vw, 240px);
 }
 
-.pipeline-run-graph .error-banner,
-.pipeline-run-log-selection {
+.delivery-task-graph .error-banner,
+.delivery-task-log-selection {
   margin: 9px 18px;
 }
 
-.pipeline-run-log-selection {
+.delivery-task-log-selection {
   color: #435c68;
   font-size: 13px;
 }
 
-.pipeline-run-selected-step {
+.delivery-task-selected-step {
   background: #edf8f5;
 }
 
-.pipeline-run-log-marker {
+.delivery-task-log-marker {
   border-radius: 3px;
   background: #f9df8c;
   color: #172731;

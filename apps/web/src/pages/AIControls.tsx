@@ -78,7 +78,6 @@ export function ModelRouting({ providers, admin }: { providers: Provider[]; admi
 }
 
 const writeActions = {
-  run_pipeline: '运行流水线',
   initialize_component: '初始化组件',
   execute_command: '执行命令',
   publish_source_branch: '提交评审分支',
@@ -201,7 +200,7 @@ export function ActionRules({
         className="button secondary small"
         type="button"
         disabled={rules.length >= 32}
-        onClick={() => onChange([...rules, { action: 'run_pipeline', effect: 'CONFIRM' }])}
+        onClick={() => onChange([...rules, { action: 'initialize_component', effect: 'CONFIRM' }])}
       >
         添加条件规则
       </button>

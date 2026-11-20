@@ -20,11 +20,15 @@ async function checkResources(databaseUrl?: string) {
   process.env.WORKER_ENABLED = 'false';
   process.env.ADMIN_PASSWORD = 'resources-fixture-bootstrap';
   const password = 'resources-fixture-changed';
+  const { LegacyDeliveryFixtureModule } =
+    await import('./helpers/legacy-delivery-fixture.module.js');
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { SshService } = await import('../infrastructure/ssh/ssh.service.js');
   let probeExitCode = 0;
-  const module = await Test.createTestingModule({ imports: [AppModule] })
+  const module = await Test.createTestingModule({
+    imports: [AppModule, LegacyDeliveryFixtureModule],
+  })
     .overrideProvider(SshService)
     .useValue({
       probe: async () => ({
@@ -252,7 +256,8 @@ async function checkResources(databaseUrl?: string) {
       serviceId: service.id,
       definition: { repositoryId: repo.id },
     });
-    assert.equal((await fetch(root)).pipelines[0].id, pipeline.id);
+    assert.equal((await fetch(root)).pipelines, undefined);
+    assert.ok(pipeline.id);
     await api.delete(base + root + '/repositories/' + repo.id).expect(409);
     await api.delete(base + root + '/services/' + service.id).expect(409);
     const unused = await create(root + '/repositories', {

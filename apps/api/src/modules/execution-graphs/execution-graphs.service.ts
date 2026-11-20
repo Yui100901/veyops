@@ -76,7 +76,15 @@ export class ExecutionGraphsService {
     definition: GraphDefinition,
   ) {
     const flowNodes = definition.flows.flatMap((flow) => flow.nodes);
-    const repos = [...new Set(flowNodes.flatMap((node) => node.checkout?.repositoryId ?? []))];
+    const repos = [
+      ...new Set(
+        flowNodes.flatMap((node) =>
+          [node.checkout?.repositoryId, node.delivery?.build?.repositoryId].filter(
+            (id): id is string => Boolean(id),
+          ),
+        ),
+      ),
+    ];
     if (repos.length) {
       const rows = await tx
         .selectFrom('repositories')
@@ -85,7 +93,18 @@ export class ExecutionGraphsService {
         .where('id', 'in', repos)
         .execute();
       if (rows.length !== repos.length)
-        throw new BadRequestException('源码拉取节点引用的仓库不存在或不属于当前项目');
+        throw new BadRequestException('引用的源码仓库不存在或不属于当前项目');
+    }
+    const services = [...new Set(flowNodes.flatMap(({ delivery }) => delivery?.serviceId ?? []))];
+    if (services.length) {
+      const rows = await tx
+        .selectFrom('services')
+        .select('id')
+        .where('project_id', '=', projectId)
+        .where('id', 'in', services)
+        .execute();
+      if (rows.length !== services.length)
+        throw new BadRequestException('构建或部署绑定的服务不存在或不属于当前项目');
     }
     const nodes = flowNodes.filter((node) => node.pipelineId);
     if (!nodes.length) return;

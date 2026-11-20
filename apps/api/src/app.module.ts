@@ -20,7 +20,6 @@ import { BuildRunnerModule } from './infrastructure/build-runner/process-runner.
 import { DeploymentTargetsModule } from './modules/deployment-targets/deployment-targets.service';
 import { ServiceConfigsModule } from './modules/service-configs/service-configs.service';
 import { PipelinesModule } from './modules/pipelines/pipelines.module';
-import { PipelineHooksModule } from './modules/pipeline-hooks/pipeline-hooks.module';
 import { AiModule } from './modules/ai/ai.module';
 import { InitialConfigurationModule } from './core/initial-configuration';
 import { ViewsModule } from './modules/views/views.module';
@@ -47,7 +46,6 @@ import { MonitoringModule } from './modules/monitoring/monitoring.module';
     OperationPlansModule,
     PipelinesModule,
     ExecutionGraphsModule,
-    PipelineHooksModule,
     AiModule,
     InitialConfigurationModule,
     SystemModule,

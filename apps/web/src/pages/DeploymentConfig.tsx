@@ -51,8 +51,8 @@ export function ProjectDeploymentConfig({
       title="服务与部署配置"
       subtitle="绑定代码仓库，并为每个服务和环境设置可独立覆盖的部署配置"
       action={
-        <a className="text-link" href={`#/projects/${project.id}/pipelines`}>
-          打开 Pipeline →
+        <a className="text-link" href={`#/projects/${project.id}/execution-graph`}>
+          打开 执行流 →
         </a>
       }
     >
@@ -199,7 +199,7 @@ function EnvironmentConfigEditor({
     <InlineEditor
       busy={busy}
       title={`${project.services.find((s) => s.id === serviceId)?.name} · ${project.environments.find((e) => e.id === environmentId)?.name}`}
-      description="此处配置覆盖 Pipeline 对应字段；留空的命令或路径由流程配置提供。"
+      description="此处配置覆盖 执行流 对应字段；留空的命令或路径由流程配置提供。"
       onClose={onClose}
       wide
     >
@@ -243,14 +243,14 @@ function EnvironmentConfigEditor({
               <div className="form-grid">
                 <Field label="构建位置">
                   <select name="buildLocation" defaultValue={config.data?.buildLocation || ''}>
-                    <option value="">沿用流水线构建位置</option>
+                    <option value="">沿用执行流构建位置</option>
                     <option value="TARGET">目标服务器</option>
                     <option value="MANAGER">管理端隔离环境</option>
                   </select>
                 </Field>
                 <Field label="运行模式">
                   <select name="executionMode" defaultValue={config.data?.executionMode || ''}>
-                    <option value="">沿用流水线默认模式</option>
+                    <option value="">沿用执行流默认模式</option>
                     <option value="BUILD_ONLY">仅构建</option>
                     <option value="DEPLOY">构建并部署</option>
                   </select>
@@ -281,7 +281,7 @@ function EnvironmentConfigEditor({
                   <input
                     name="workingDirectory"
                     defaultValue={config.data?.workingDirectory}
-                    placeholder="如 apps/web，留空继承 Pipeline"
+                    placeholder="如 apps/web，留空继承 执行流"
                   />
                 </Field>
               </div>
@@ -289,7 +289,7 @@ function EnvironmentConfigEditor({
                 <input
                   name="deployPath"
                   defaultValue={config.data?.deployPath}
-                  placeholder="继承 Pipeline"
+                  placeholder="继承 执行流"
                 />
               </Field>
               <Field label="构建命令">
@@ -297,7 +297,7 @@ function EnvironmentConfigEditor({
                   className="mono"
                   name="buildCommand"
                   defaultValue={config.data?.buildCommand}
-                  placeholder="继承 Pipeline"
+                  placeholder="继承 执行流"
                 />
               </Field>
               <div className="form-grid">
@@ -305,14 +305,14 @@ function EnvironmentConfigEditor({
                   <input
                     name="outputPath"
                     defaultValue={config.data?.outputPath}
-                    placeholder="继承 Pipeline"
+                    placeholder="继承 执行流"
                   />
                 </Field>
                 <Field label="Compose 文件路径">
                   <input
                     name="composeFilePath"
                     defaultValue={config.data?.composeFilePath}
-                    placeholder="继承 Pipeline"
+                    placeholder="继承 执行流"
                   />
                 </Field>
               </div>
@@ -331,7 +331,7 @@ function EnvironmentConfigEditor({
                     name="stopCommand"
                     rows={2}
                     defaultValue={config.data?.stopCommand}
-                    placeholder="继承 Pipeline"
+                    placeholder="继承 执行流"
                   />
                 </Field>
               )}

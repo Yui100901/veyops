@@ -13,7 +13,7 @@ import {
 } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { open, realpath } from 'node:fs/promises';
+import { lstat, open, realpath } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import type { Response } from 'express';
 import { dataDirectory } from '../../core/config';
@@ -229,18 +229,35 @@ export class ArtifactsService {
     }));
   }
 
-  async deployableIn(db: Kysely<Database>, runId: string) {
+  async deployableIn(db: Kysely<Database>, runId: string, checkArchive = false) {
     const rows = await db
       .selectFrom('artifacts')
       .selectAll()
       .where('pipeline_run_id', '=', runId)
       .orderBy('id')
       .execute();
-    return rows.filter(hasDeployableMetadata).map((row) => ({
+    const eligible = rows.filter(hasDeployableMetadata);
+    const available = checkArchive
+      ? (
+          await Promise.all(
+            eligible.map(async (row) => ((await this.archiveAvailable(row)) ? row : null)),
+          )
+        ).filter((row) => row !== null)
+      : eligible;
+    return available.map((row) => ({
       id: row.id,
       serverId: row.server_id,
       fingerprint: deploymentFingerprint(row),
     }));
+  }
+
+  private async archiveAvailable(row: Selectable<ArtifactsTable>) {
+    if (row.storage_type === 'REGISTRY_IMAGE') return true;
+    const key = archiveKey(row);
+    if (!key) return false;
+    const archive = await this.resolveArchive(key).catch(() => null);
+    const stat = archive ? await lstat(archive).catch(() => null) : null;
+    return Boolean(stat?.isFile() && stat.size === row.size_bytes);
   }
 
   async forDeployment(snapshot: PipelineSnapshot, serverId: string): Promise<DeploymentArtifact> {
@@ -250,7 +267,7 @@ export class ArtifactsService {
     if (!snapshot.sourceBuildTaskId || candidates?.length !== 1)
       throw new ConflictException('目标必须对应唯一的已归档构建产物');
     const candidate = candidates[0]!;
-    const row = await this.database.db
+    const lookup = this.database.db
       .selectFrom('artifacts')
       .innerJoin('pipeline_runs', 'pipeline_runs.id', 'artifacts.pipeline_run_id')
       .innerJoin('tasks', 'tasks.id', 'pipeline_runs.task_id')
@@ -258,14 +275,19 @@ export class ArtifactsService {
       .where('artifacts.id', '=', candidate.id)
       .where('pipeline_runs.task_id', '=', snapshot.sourceBuildTaskId)
       .where('tasks.status', 'in', ['SUCCESS', 'PARTIAL_FAILED'])
-      .where('pipeline_runs.pipeline_id', '=', snapshot.pipelineId)
       .where('pipeline_runs.environment_id', '=', snapshot.environmentId)
       .where('pipeline_runs.commit_sha', '=', snapshot.commitSha)
       .where('artifacts.project_id', '=', snapshot.projectId)
       .where('artifacts.service_id', '=', snapshot.serviceId)
       .where('artifacts.artifact_type', '=', snapshot.definition.artifactType)
-      .where('artifacts.source_commit', '=', snapshot.commitSha)
-      .executeTakeFirst();
+      .where('artifacts.source_commit', '=', snapshot.commitSha);
+    const row = await (
+      snapshot.artifactServiceScope
+        ? lookup
+            .where('pipeline_runs.project_id', '=', snapshot.projectId)
+            .where('pipeline_runs.service_id', '=', snapshot.serviceId)
+        : lookup.where('pipeline_runs.pipeline_id', '=', snapshot.pipelineId)
+    ).executeTakeFirst();
     if (!row || row.server_id !== candidate.serverId || !hasDeployableMetadata(row))
       throw new ConflictException('构建产物不可发布或与当前任务范围不一致');
     if (candidate.fingerprint && candidate.fingerprint !== deploymentFingerprint(row))

@@ -29,7 +29,7 @@ import { OperationsCenterPage, operationsTabForPath } from './pages/BatchOperati
 import { AuditPage, SystemPage } from './pages/System';
 import { BackupsPage } from './pages/Backups';
 import { AIPage } from './pages/AI';
-import { DeliveryRecordsPage, PipelinesPage, RegistriesPage } from './pages/Delivery';
+import { DeliveryRecordsPage, RegistriesPage } from './pages/Delivery';
 import { ProjectDelivery, LegacyDeliveryLink } from './pages/ProjectDelivery';
 import { deliveryTabs, type DeliveryTab } from './pages/delivery-route';
 import { ProjectViewsPage } from './pages/ProjectViews';
@@ -75,7 +75,6 @@ const navigation = [
 
 const routeTitles: Record<string, string> = {
   '/artifacts': '构建产物',
-  '/pipelines': '流水线',
   '/deployments': '交付记录',
   '/settings/users': '用户管理',
   '/settings/backups': '数据备份',
@@ -520,16 +519,14 @@ export function App() {
   } else if (routePath === '/views' || routePath.startsWith('/views/'))
     page = <ProjectViewsPage user={user} id={routePath.slice(7) || undefined} />;
   else if (
-    (routeRoot === 'pipelines' || routeRoot === 'artifacts' || routeRoot === 'deployments') &&
+    (routeRoot === 'artifacts' || routeRoot === 'deployments') &&
     !routeSection &&
     (routeId ||
-      ['recordId', 'projectId', 'pipelineId', 'artifactId', 'deploymentId', 'pipelineRunId'].some(
+      ['recordId', 'projectId', 'artifactId', 'deploymentId', 'pipelineRunId'].some(
         (key) => params.has(key),
       ))
   )
     page = <LegacyDeliveryLink key={route} tab={routeRoot} search={routeSearch} id={routeId} />;
-  else if (routePath === '/pipelines')
-    page = <PipelinesPage user={user} repositoryScope={routeSearch} />;
   else if (routePath === '/artifacts')
     page = <DeliveryRecordsPage key={route} type="artifacts" user={user} />;
   else if (routePath === '/deployments')

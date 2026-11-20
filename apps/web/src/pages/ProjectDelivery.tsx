@@ -1,78 +1,11 @@
 import { useEffect } from 'react';
 import type { FormEvent } from 'react';
-import { formatTime, navigate, useResource } from '../api';
-import { Empty, ErrorBanner, Loading, RefreshButton, Section, Status } from '../components';
+import { navigate, useResource } from '../api';
+import { ErrorBanner, Loading } from '../components';
 import type { ProjectDetail, User } from '../models';
-import { DeliveryRecordsPage, PipelinesPage } from './Delivery';
+import { DeliveryRecordsPage } from './Delivery';
 import { ReleaseApprovals } from './ReleaseOperations';
 import { deliveryPath, deliveryTabs, type DeliveryScope, type DeliveryTab } from './delivery-route';
-
-type Run = {
-  id: string;
-  taskId: string;
-  serviceId: string;
-  environmentId: string;
-  name: string;
-  status: string;
-  createdAt: number;
-  commitSha: string;
-};
-
-function RunHistory({ project, query }: { project: ProjectDetail; query: string }) {
-  const runs = useResource<Run[]>(`/projects/${project.id}/runs?${query}`);
-  return (
-    <Section title="执行记录" action={<RefreshButton onClick={runs.reload} />}>
-      <ErrorBanner error={runs.error} retry={runs.reload} />
-      {runs.loading ? (
-        <Loading />
-      ) : runs.data?.length ? (
-        <div className="table-scroll">
-          <table>
-            <thead>
-              <tr>
-                <th>任务日志</th>
-                <th>服务 / 环境</th>
-                <th>固定 Commit</th>
-                <th>状态</th>
-                <th>创建时间</th>
-              </tr>
-            </thead>
-            <tbody>
-              {runs.data.map((run) => (
-                <tr key={run.id}>
-                  <td>
-                    <a className="text-link" href={`#/tasks/${run.taskId}`}>
-                      {run.name || run.taskId}
-                    </a>
-                  </td>
-                  <td>
-                    {project.services.find((s) => s.id === run.serviceId)?.name || run.serviceId}
-                    <small className="cell-detail">
-                      {project.environments.find((e) => e.id === run.environmentId)?.name ||
-                        run.environmentId}
-                    </small>
-                  </td>
-                  <td className="mono" title={run.commitSha}>
-                    {run.commitSha.slice(0, 12)}
-                  </td>
-                  <td>
-                    <Status value={run.status} />
-                  </td>
-                  <td>{formatTime(run.createdAt)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      ) : (
-        <Empty
-          title="暂无匹配的执行记录"
-          description="完成流水线预览并运行后可在这里查看任务日志。"
-        />
-      )}
-    </Section>
-  );
-}
 
 export function ProjectDelivery({
   id,
@@ -111,16 +44,12 @@ export function ProjectDelivery({
   const filters: DeliveryScope = { serviceId, environmentId, commit };
   const query = new URLSearchParams();
   if (serviceId) query.set('serviceId', serviceId);
-  if (tab !== 'pipelines') {
-    if (environmentId) query.set('environmentId', environmentId);
-    if (commit) query.set('commit', commit);
-  }
-  const runQuery = query.toString();
+  if (environmentId) query.set('environmentId', environmentId);
+  if (commit) query.set('commit', commit);
   query.set('projectId', id);
   if (recordId) query.set('recordId', recordId);
   if (pipelineRunId) query.set('pipelineRunId', pipelineRunId);
   if (taskId) query.set('taskId', taskId);
-  if (tab === 'pipelines' && repositoryId) query.set('repositoryId', repositoryId);
   const searchQuery = query.toString();
   const filter = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -151,7 +80,7 @@ export function ProjectDelivery({
               key={key}
               className={key === tab ? 'active' : ''}
               aria-current={key === tab ? 'page' : undefined}
-              href={'#' + deliveryPath(id, key, key === 'pipelines' ? { serviceId } : filters)}
+              href={'#' + deliveryPath(id, key, filters)}
             >
               {deliveryTabs[key]}
             </a>
@@ -169,8 +98,6 @@ export function ProjectDelivery({
             ))}
           </select>
         </label>
-        {tab !== 'pipelines' && (
-          <>
             <label>
               环境
               <select name="environmentId" defaultValue={environmentId || ''}>
@@ -191,8 +118,6 @@ export function ProjectDelivery({
                 placeholder="完整 SHA 或前缀"
               />
             </label>
-          </>
-        )}
         <button className="button secondary small" type="submit">
           应用筛选
         </button>
@@ -210,14 +135,10 @@ export function ProjectDelivery({
       </form>
       {(recordId || pipelineRunId || taskId) && (
         <p className="field-note">
-          已定位{recordId ? '历史记录' : '流水线执行'} ·{' '}
+          已定位{recordId ? '历史记录' : '执行'} ·{' '}
           <code>{recordId || pipelineRunId || taskId}</code>
         </p>
       )}
-      {tab === 'pipelines' && (
-        <PipelinesPage user={user} repositoryScope={searchQuery} project={project} />
-      )}
-      {tab === 'runs' && <RunHistory project={project} query={runQuery} />}
       {(tab === 'artifacts' || tab === 'deployments') && (
         <DeliveryRecordsPage type={tab} user={user} project={project} query={searchQuery} />
       )}
@@ -237,7 +158,7 @@ export function LegacyDeliveryLink({
   search,
   id,
 }: {
-  tab: 'artifacts' | 'deployments' | 'pipelines';
+  tab: 'artifacts' | 'deployments';
   search?: string;
   id?: string;
 }) {
@@ -247,18 +168,13 @@ export function LegacyDeliveryLink({
     id ||
     params.get('recordId') ||
     params.get(
-      { pipelines: 'pipelineId', artifacts: 'artifactId', deployments: 'deploymentId' }[tab],
+      { artifacts: 'artifactId', deployments: 'deploymentId' }[tab],
     );
   const query = new URLSearchParams();
   if (recordId) query.set('recordId', recordId);
   const runId = params.get('pipelineRunId');
   if (runId) query.set('pipelineRunId', runId);
-  const lookup =
-    !projectId && query.size
-      ? tab === 'pipelines'
-        ? `/pipelines/${encodeURIComponent(recordId || '')}`
-        : `/${tab}?${query}`
-      : null;
+  const lookup = !projectId && query.size ? `/${tab}?${query}` : null;
   type Owner = { projectId: string; serviceId: string };
   const owner = useResource<Owner | Owner[]>(lookup);
   const value = Array.isArray(owner.data) ? owner.data[0] : owner.data;

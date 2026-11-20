@@ -18,8 +18,7 @@ const nodeProperties: [keyof GraphNode, string][] = [
   ['switch', '匹配项'],
   ['delaySeconds', '等待时间'],
   ['approval', '审批设置'],
-  ['pipelineId', '流水线'],
-  ['pipelineVersion', '流水线版本'],
+  ['delivery', '执行流预设'],
   ['flowId', '子流'],
   ['position', '位置'],
 ];

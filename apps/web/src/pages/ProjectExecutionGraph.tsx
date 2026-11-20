@@ -8,9 +8,8 @@ import { ProjectGraphEditor } from './ExecutionGraphEditor';
 import { ExecutionGraphHistory, ExecutionGraphStart } from './ExecutionGraphRun';
 import { ExecutionGraphTriggers } from './ExecutionGraphTriggers';
 import { GraphVersionTools } from './ExecutionGraphVersions';
-import { graphNodeLabels } from './execution-graph-definition';
+import { flowPresetLabels, graphNodeLabels } from './execution-graph-definition';
 import type { GraphCanvas, GraphDocument, GraphFlow } from './execution-graph-definition';
-import { deliveryPath } from './delivery-route';
 import './execution-graph.css';
 import './graph-start.css';
 
@@ -74,7 +73,11 @@ function Workspace({
   const [canvas, setCanvas] = useState(initial.draft.canvas ?? emptyCanvas);
   const [undo, setUndo] = useState<GraphCanvas[]>([]);
   const [redo, setRedo] = useState<GraphCanvas[]>([]);
-  const [pane, setPane] = useState<Pane>(runId ? 'history' : 'draft');
+  const [pane, setPane] = useState<Pane>(
+    runId || new URLSearchParams(window.location.hash.split('?')[1]).get('pane') === 'history'
+      ? 'history'
+      : 'draft',
+  );
   const [version, setVersion] = useState<number | null>(initial.publishedVersion);
   const [selectedRun, setSelectedRun] = useState(runId);
   const [error, setError] = useState('');
@@ -277,7 +280,6 @@ function Workspace({
       {pane === 'published' && (
         <PublishedVersions
           key={graph.publishedVersion}
-          projectId={project.id}
           path={path}
           canRestore={canEdit}
           revision={graph.revision}
@@ -395,7 +397,6 @@ function StartActions({
 }
 
 function PublishedVersions({
-  projectId,
   path,
   canRestore,
   revision,
@@ -405,7 +406,6 @@ function PublishedVersions({
   onRestored,
   onConflict,
 }: {
-  projectId: string;
   path: string;
   canRestore: boolean;
   revision: number;
@@ -456,11 +456,7 @@ function PublishedVersions({
                   onRestored={onRestored}
                   onConflict={onConflict}
                 />
-                <PublishedNodes
-                  key={live.version}
-                  definition={live.definition}
-                  projectId={projectId}
-                />
+                <PublishedNodes key={live.version} definition={live.definition} />
               </>
             )}
           </>
@@ -470,13 +466,7 @@ function PublishedVersions({
   );
 }
 
-function PublishedNodes({
-  definition,
-  projectId,
-}: {
-  definition: GraphDocument['draft'];
-  projectId: string;
-}) {
+function PublishedNodes({ definition }: { definition: GraphDocument['draft'] }) {
   const [selected, setSelected] = useState('');
   const [legacyId, setLegacyId] = useState('');
   const flow: GraphFlow | undefined = definition.canvas
@@ -540,14 +530,7 @@ function PublishedNodes({
               {definition.flows.find((item) => item.id === node.flowId)?.name ?? node.flowId}
             </p>
           )}
-          {node.pipelineId && (
-            <a
-              className="text-link"
-              href={'#' + deliveryPath(projectId, 'pipelines', { recordId: node.pipelineId })}
-            >
-              查看服务流水线 · 固定 v{node.pipelineVersion}
-            </a>
-          )}
+          {node.delivery && <p>执行流预设 · {flowPresetLabels[node.delivery.kind]}</p>}
         </div>
       )}
     </>

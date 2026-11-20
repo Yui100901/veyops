@@ -22,6 +22,8 @@ test('Gitea signed push builds the pinned version once and keeps the build resul
   process.env.ADMIN_PASSWORD = initialPassword;
   process.env.WEBHOOK_BUILD_DOCKER_SOCKET = '/run/user/1000/veyops-test.sock';
   process.env.AI_PIPELINE_ANALYSIS = 'true';
+  const { LegacyDeliveryFixtureModule } =
+    await import('./helpers/legacy-delivery-fixture.module.js');
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { DatabaseService } = await import('../core/database/database.service.js');
@@ -36,7 +38,9 @@ test('Gitea signed push builds the pinned version once and keeps the build resul
   const artifactDirectory = join(directory, 'artifacts');
   await mkdir(artifactDirectory);
   let sshCalls = 0;
-  const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+  const moduleRef = await Test.createTestingModule({
+    imports: [AppModule, LegacyDeliveryFixtureModule],
+  })
     .overrideProvider(BuildsService)
     .useValue({
       resolveVariables: async () => ({ values: {}, secrets: [] }),

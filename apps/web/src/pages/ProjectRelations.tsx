@@ -185,30 +185,7 @@ export function ProjectRelations({
           </a>
         }
       >
-        {!!project.pipelines?.length && (
-          <div className="resource-list">
-            {project.pipelines.map((pipeline) => (
-              <div key={pipeline.id}>
-                <span className="resource-avatar">
-                  <Network size={17} />
-                </span>
-                <div>
-                  <a
-                    className="text-link"
-                    href={`#/projects/${project.id}/pipelines?${new URLSearchParams({ serviceId: pipeline.serviceId, recordId: pipeline.id })}`}
-                  >
-                    {pipeline.name}
-                  </a>
-                  <small>
-                    {project.services.find(({ id }) => id === pipeline.serviceId)?.name}
-                  </small>
-                </div>
-                <span className="tag">Pipeline v{pipeline.version}</span>
-                <span className="tag">{pipeline.enabled ? '已启用' : '已停用'}</span>
-              </div>
-            ))}
-          </div>
-        )}
+
         <div className="resource-list">
           {(project.deploymentTargets ?? []).map((target) => (
             <div key={target.id}>

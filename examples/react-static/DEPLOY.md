@@ -4,7 +4,9 @@
 
 在测试仓库中将此示例提交到 `test` 分支，选择该分支的完整 Commit SHA，在 VeyOps 中为 React 服务配置 Testing 环境和隔离的 Linux 部署目标。可另建 `staging` 分支与 Staging 环境，使用独立发布目录和端口。独立建仓时把本目录内容放到仓库根。
 
-| Pipeline 字段        | Testing 配置                                                          |
+在项目执行图为该服务创建构建流与部署流，按配置填写两个开始节点，或采用构建并部署流。
+
+| 交付配置        | Testing 配置                                                          |
 | -------------------- | --------------------------------------------------------------------- |
 | `repoPath`           | 完整仓库使用 `examples/react-static`，独立仓库使用 `.`                |
 | `buildLocation`      | `MANAGER` 或 `TARGET`                                                 |
@@ -20,7 +22,7 @@
 
 管理端需要可访问 Git 仓库和 npm Registry 的隔离 Docker 构建环境。目标端构建时，SSH 用户需要能运行 Git、Node.js 22.12+ 和 npm 并访问两个依赖来源。目标机运行产物需要 Linux、Node.js 22.12+、`nohup`、可访问的 `/proc` 和发布目录的写权限。
 
-Pipeline 发布完成后，在目标机访问 `http://127.0.0.1:38851/`。浏览器应显示示例文本，`/healthz` 应返回 `status=ok`、`framework=react` 和当前发布目录的标识。核对 Pipeline 产物记录的完整提交和 SHA-256。只构建模式可先下载归档并检查 `public/index.html` 和 `public/assets`。
+部署完成后，在目标机访问 `http://127.0.0.1:38851/`。浏览器应显示示例文本，`/healthz` 应返回 `status=ok`、`framework=react` 和当前发布目录的标识。在项目交付记录中核对产物的完整 Git SHA 和 SHA-256。先运行构建流可在部署前下载归档，检查 `public/index.html` 和 `public/assets`。
 
 在目标机使用同一 SSH 用户停止测试实例。
 

@@ -132,6 +132,8 @@ async function checkGraph(url?: string) {
     const path = root + '/projects/' + id + '/execution-graph';
     const otherPath = root + '/projects/' + other + '/execution-graph';
     const initialGraph = (await api.get(path).expect(200)).body.data;
+    await api.get(root + '/pipelines').expect(404);
+    await api.get(root + '/projects/' + id + '/runs').expect(404);
     assert.equal(initialGraph.publishedVersion, null);
     assert.equal(initialGraph.id, (await api.get(path).expect(200)).body.data.id);
     assert.notEqual(initialGraph.id, (await api.get(otherPath).expect(200)).body.data.id);

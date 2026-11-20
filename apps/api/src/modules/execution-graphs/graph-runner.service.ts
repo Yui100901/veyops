@@ -14,6 +14,12 @@ import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
 import { PipelinesService } from '../pipelines/pipelines.service';
+import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
+import type { PipelineDefinition } from '../pipelines/pipeline.types';
+import {
+  deliveryExecutionProfile,
+  type DeliveryExecutionProfile,
+} from '../pipelines/delivery-execution-profile';
 import { pendingReleaseApprovalTime } from '../deployments/release-policy';
 import { requireProject } from '../projects/project-relations';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
@@ -55,8 +61,9 @@ interface Delivery {
   requireApproval: boolean;
   artifactIds: string[];
   artifactFromNodeId?: string;
-  sourceSnapshot: DeliveryPreview['nodeSources'];
+  sourceSnapshot?: { id?: string; repositoryId?: string; commitSha: string; branch?: string }[];
   pipelineHash: string;
+  profile?: DeliveryExecutionProfile;
 }
 interface RunSnapshot {
   inputs: GraphInputsDto;
@@ -65,6 +72,15 @@ interface RunSnapshot {
 }
 
 const planKey = (flowId: string, nodeId: string) => `${flowId}:${nodeId}`;
+function publicDelivery(delivery: Delivery) {
+  const native = Boolean(delivery.profile);
+  return {
+    ...delivery,
+    pipelineHash: undefined,
+    profile: undefined,
+    ...(native && { pipelineId: undefined, pipelineVersion: undefined }),
+  };
+}
 function isNativeTask(node: Pick<GraphNode, 'type'>) {
   return node.type === 'CHECKOUT' || node.type === 'SHELL';
 }
@@ -132,14 +148,13 @@ export class GraphRunnerService implements OnModuleInit {
   private async delivery(
     projectId: string,
     flowId: string,
+    graphVersion: number,
+    start: GraphNode,
     node: GraphNode,
     inputs: GraphInputsDto,
     upstream?: Delivery,
   ): Promise<Delivery> {
     if (!inputs.environmentId) throw new BadRequestException('请选择运行环境');
-    const pipelineId = node.pipelineId!;
-    const pipeline = await this.pipelines.get(pipelineId);
-    if (pipeline.projectId !== projectId) throw new BadRequestException('流水线不属于当前项目');
     const {
       environmentId,
       targetId,
@@ -159,47 +174,159 @@ export class GraphRunnerService implements OnModuleInit {
       strategy,
       maxParallel,
       failurePolicy,
-      version: node.pipelineVersion,
     };
-    if (upstream && !artifactIds?.length) {
-      const plan = await this.pipelines.previewArtifactDeployPlan(pipelineId, {
-        ...base,
-        commitSha: upstream.commitSha,
-      });
-      return {
-        nodeId: node.id,
-        flowId,
-        pipelineId,
-        pipelineVersion: plan.version,
-        serviceId: plan.serviceId,
-        environmentId: plan.environmentId,
-        commitSha: plan.commitSha,
-        serverIds: plan.serverIds,
-        requireApproval: plan.requireApproval,
-        artifactIds: [],
-        artifactFromNodeId: upstream.nodeId,
-        sourceSnapshot: upstream.sourceSnapshot,
-        pipelineHash: plan.configurationHash,
-      };
-    }
+    const preset = start.delivery;
+    let profile: DeliveryExecutionProfile | undefined;
     let preview: DeliveryPreview;
-    if (node.type === 'BUILD') {
-      preview = await this.pipelines.preview(pipelineId, {
-        ...base,
-        commitSha,
-        mode: 'BUILD_ONLY',
-        confirmed: true,
-      });
+    let sourceBranch: string | undefined;
+
+    const makeProfile = (definition: PipelineDefinition, fields: string[] = []) =>
+      deliveryExecutionProfile(
+        projectId,
+        preset!.serviceId!,
+        flowId,
+        graphVersion,
+        start.name,
+        definition,
+        [...fields, ...Object.keys(preset?.deploy ?? {})],
+      );
+    const fromBuild = (definition: PipelineDefinition) =>
+      makeProfile(
+        Object.assign(
+          new PipelineDefinitionDto(),
+          {
+            repositoryId: definition.repositoryId,
+            artifactType: definition.artifactType,
+            registryId: definition.registryId,
+            imageRepository: definition.imageRepository,
+          },
+          preset?.deploy,
+        ),
+      );
+
+    if (preset && !node.pipelineId) {
+      if (!preset.serviceId) throw new BadRequestException('请选择该流程交付的项目服务');
+      if (node.type === 'BUILD') {
+        const { branch, commitSha: pinned, ...build } = preset.build!;
+        const definition = Object.assign(new PipelineDefinitionDto(), build, preset.deploy, {
+          inheritBuildLocation: !build.buildLocation,
+        });
+        profile = makeProfile(definition, Object.keys(build));
+        const references =
+          !pinned && !commitSha
+            ? await this.pipelines.resolveDeliveryBranch(projectId, definition.repositoryId, branch)
+            : undefined;
+        sourceBranch = references?.branch;
+        preview = await this.pipelines.preview(
+          profile.id,
+          {
+            ...base,
+            commitSha: pinned ?? commitSha ?? references?.commitSha,
+            mode: 'BUILD_ONLY',
+            confirmed: true,
+          },
+          undefined,
+          profile,
+        );
+      } else if (preset.kind === 'BUILD_DEPLOY') {
+        if (!upstream?.profile)
+          throw new BadRequestException('当前执行路径中的部署节点缺少上游构建');
+        profile = upstream.profile;
+        const plan = await this.pipelines.previewArtifactDeployPlan(
+          profile.id,
+          {
+            ...base,
+            commitSha: upstream.commitSha,
+          },
+          profile,
+        );
+        return {
+          nodeId: node.id,
+          flowId,
+          pipelineId: profile.id,
+          pipelineVersion: plan.version,
+          profile,
+          serviceId: plan.serviceId,
+          environmentId: plan.environmentId,
+          commitSha: plan.commitSha,
+          serverIds: plan.serverIds,
+          requireApproval: plan.requireApproval,
+          artifactIds: [],
+          artifactFromNodeId: upstream.nodeId,
+          sourceSnapshot: upstream.sourceSnapshot,
+          pipelineHash: plan.configurationHash,
+        };
+      } else if (artifactIds?.length) {
+        const source = await this.pipelines.deliveryArtifactBuild(
+          projectId,
+          preset.serviceId,
+          environmentId,
+          artifactIds,
+        );
+        profile = fromBuild(source.definition);
+        preview = await this.pipelines.previewArtifactDeploy(
+          profile.id,
+          { ...base, artifactIds },
+          profile,
+        );
+      } else {
+        const latest = await this.latestDeliveryArtifact(
+          projectId,
+          preset.serviceId,
+          base,
+          fromBuild,
+        );
+        profile = latest.profile;
+        preview = latest.preview;
+      }
     } else {
-      if (!artifactIds?.length)
-        throw new BadRequestException('请选择历史构建产物，或连接同一流水线的唯一上游构建节点');
-      preview = await this.pipelines.previewArtifactDeploy(pipelineId, { ...base, artifactIds });
+      const pipelineId = node.pipelineId!;
+      const pipeline = await this.pipelines.get(pipelineId);
+      if (pipeline.projectId !== projectId) throw new BadRequestException('交付配置不属于当前项目');
+      const previous = { ...base, version: node.pipelineVersion };
+      if (upstream && !artifactIds?.length) {
+        const plan = await this.pipelines.previewArtifactDeployPlan(pipelineId, {
+          ...previous,
+          commitSha: upstream.commitSha,
+        });
+        return {
+          nodeId: node.id,
+          flowId,
+          pipelineId,
+          pipelineVersion: plan.version,
+          serviceId: plan.serviceId,
+          environmentId: plan.environmentId,
+          commitSha: plan.commitSha,
+          serverIds: plan.serverIds,
+          requireApproval: plan.requireApproval,
+          artifactIds: [],
+          artifactFromNodeId: upstream.nodeId,
+          sourceSnapshot: upstream.sourceSnapshot,
+          pipelineHash: plan.configurationHash,
+        };
+      }
+      if (node.type === 'BUILD') {
+        preview = await this.pipelines.preview(pipelineId, {
+          ...previous,
+          commitSha,
+          mode: 'BUILD_ONLY',
+          confirmed: true,
+        });
+      } else {
+        if (!artifactIds?.length)
+          throw new BadRequestException('请选择历史构建产物，或连接上游构建节点');
+        preview = await this.pipelines.previewArtifactDeploy(pipelineId, {
+          ...previous,
+          artifactIds,
+        });
+      }
     }
     return {
       nodeId: node.id,
       flowId,
-      pipelineId,
+      pipelineId: preview.pipelineId,
       pipelineVersion: preview.version,
+      profile,
       serviceId: preview.serviceId,
       environmentId: preview.environmentId,
       commitSha: preview.commitSha,
@@ -207,10 +334,63 @@ export class GraphRunnerService implements OnModuleInit {
       requireApproval: preview.requireApproval,
       artifactIds: 'artifactIds' in preview ? preview.artifactIds : [],
       sourceSnapshot: preview.nodeSources ?? [
-        { repositoryId: preview.definition.repositoryId, commitSha: preview.commitSha },
+        {
+          repositoryId: preview.definition.repositoryId,
+          commitSha: preview.commitSha,
+          ...(sourceBranch && { branch: sourceBranch }),
+        },
       ],
       pipelineHash: preview.configurationHash,
     };
+  }
+
+  private async latestDeliveryArtifact(
+    projectId: string,
+    serviceId: string,
+    inputs: Pick<
+      GraphInputsDto,
+      'targetId' | 'serverIds' | 'groupIds' | 'strategy' | 'maxParallel' | 'failurePolicy'
+    > & { environmentId: string },
+    makeProfile: (definition: PipelineDefinition) => DeliveryExecutionProfile,
+  ) {
+    const builds = await this.pipelines.deliveryArtifactCandidates(
+      projectId,
+      serviceId,
+      inputs.environmentId,
+    );
+    let configurationError: HttpException | undefined;
+    for (const build of builds) {
+      const snapshot = (JSON.parse(build.payload_json) as TaskPayload).pipeline;
+      if (!snapshot || snapshot.mode === 'DEPLOY_ARTIFACT') continue;
+      const profile = makeProfile(snapshot.definition);
+      try {
+        const targets = await this.pipelines.previewArtifactDeployPlan(
+          profile.id,
+          {
+            ...inputs,
+            commitSha: build.commit_sha,
+          },
+          profile,
+        );
+        const artifactIds = await this.pipelines.deliveryArtifactIds(build.id, targets.serverIds);
+        if (!artifactIds.length) continue;
+        const preview = await this.pipelines.previewArtifactDeploy(
+          profile.id,
+          { ...inputs, artifactIds },
+          profile,
+        );
+        return { profile, preview };
+      } catch (error) {
+        if (!(error instanceof HttpException) || ![400, 404, 409].includes(error.getStatus()))
+          throw error;
+        configurationError ??= error;
+      }
+    }
+    throw new BadRequestException(
+      configurationError
+        ? '当前服务没有可用于部署的产物：' + configurationError.message
+        : '当前服务和环境没有可部署的构建产物，请先运行构建流',
+    );
   }
 
   private async prepare(projectId: string, flowId: string, request: GraphPreviewDto) {
@@ -223,7 +403,7 @@ export class GraphRunnerService implements OnModuleInit {
     const root = flowSelection(flow, inputs);
     const actionNodes = new Map<
       string,
-      { flowId: string; node: GraphNode; upstreamNodeId?: string }
+      { flowId: string; start: GraphNode; node: GraphNode; upstreamNodeId?: string }
     >();
     const seen = new Set<string>();
     const nativeNodes = new Map<string, { flowId: string; node: GraphNode }>();
@@ -231,6 +411,7 @@ export class GraphRunnerService implements OnModuleInit {
       if (seen.has(current.id)) return;
       seen.add(current.id);
       const selection = flowSelection(current, inputs);
+      const start = selection.ordered.find((node) => node.type === 'START')!;
       const predecessors = new Map<string, Set<string>>();
       for (const node of selection.ordered) {
         if (!selection.selected.has(node.id)) continue;
@@ -242,8 +423,11 @@ export class GraphRunnerService implements OnModuleInit {
         );
         predecessors.set(node.id, ancestors);
         if (isDelivery(node)) {
+          const useUpstream = node.pipelineId
+            ? !inputs.artifactIds?.length
+            : start.delivery?.kind === 'BUILD_DEPLOY';
           const builds =
-            node.type === 'DEPLOY_ARTIFACT' && !inputs.artifactIds?.length
+            node.type === 'DEPLOY_ARTIFACT' && useUpstream
               ? current.nodes.filter(
                   (source) =>
                     source.type === 'BUILD' &&
@@ -252,11 +436,10 @@ export class GraphRunnerService implements OnModuleInit {
                 )
               : [];
           if (builds.length > 1)
-            throw new BadRequestException(
-              '部署节点包含多个同一流水线的上游构建，请指定历史产物或调整连线',
-            );
+            throw new BadRequestException('部署节点包含多个上游构建，请调整连线');
           actionNodes.set(planKey(current.id, node.id), {
             flowId: current.id,
+            start,
             node,
             upstreamNodeId: builds[0]?.id,
           });
@@ -287,22 +470,21 @@ export class GraphRunnerService implements OnModuleInit {
       }
     }
     const approved = new Map<string, Delivery>();
-    for (const { flowId: origin, node, upstreamNodeId } of actionNodes.values())
+    for (const { flowId: origin, start, node, upstreamNodeId } of actionNodes.values())
       approved.set(
         planKey(origin, node.id),
         await this.delivery(
           projectId,
           origin,
+          request.version,
+          start,
           node,
           inputs,
           upstreamNodeId ? approved.get(planKey(origin, upstreamNodeId)) : undefined,
         ),
       );
     const deliveries = [...approved.values()];
-    const publicDeliveries = deliveries.map((delivery) => ({
-      ...delivery,
-      pipelineHash: undefined,
-    }));
+    const publicDeliveries = deliveries.map(publicDelivery);
     const plans = Object.fromEntries<Delivery | GraphNodePlan>([...approved, ...nativePlans]);
     const configurationHash = digest([
       graphId,
@@ -898,6 +1080,7 @@ export class GraphRunnerService implements OnModuleInit {
     };
     const options = {
       idempotencyKey: graphTaskKeyPrefix + node.id,
+      profile: delivery.profile,
       afterInsert: (tx: Transaction<Database>, taskId: string) =>
         this.linkTask(tx, run, node, taskId, delivery.pipelineId),
     };
@@ -906,7 +1089,13 @@ export class GraphRunnerService implements OnModuleInit {
         delivery.pipelineId,
         { ...values, mode: 'BUILD_ONLY', commitSha: delivery.commitSha },
         run.created_by,
-        options,
+        {
+          ...options,
+          ...(delivery.profile &&
+            delivery.sourceSnapshot?.[0]?.branch && {
+              gitRef: 'refs/heads/' + delivery.sourceSnapshot[0].branch,
+            }),
+        },
       );
     else {
       if (delivery.artifactFromNodeId) {
@@ -921,10 +1110,14 @@ export class GraphRunnerService implements OnModuleInit {
           await this.taskArtifacts(upstream.task_id ? [upstream.task_id] : [])
         ).map(({ id }) => id);
         if (!artifactIds.length) throw new BadRequestException('上游没有可部署的持久化产物');
-        const prepared = await this.pipelines.previewArtifactDeploy(delivery.pipelineId, {
-          ...values,
-          artifactIds,
-        });
+        const prepared = await this.pipelines.previewArtifactDeploy(
+          delivery.pipelineId,
+          {
+            ...values,
+            artifactIds,
+          },
+          delivery.profile,
+        );
         if (
           prepared.sourceBuildTaskId !== upstream.task_id ||
           prepared.commitSha !== delivery.commitSha
@@ -1235,7 +1428,7 @@ export class GraphRunnerService implements OnModuleInit {
     const deliveries = rows.flatMap(({ dispatch, type }) => {
       if (!dispatch || type === 'CHECKOUT' || type === 'SHELL') return [];
       const delivery = JSON.parse(dispatch) as Delivery;
-      return [{ ...delivery, pipelineHash: undefined }];
+      return [publicDelivery(delivery)];
     });
     const nodes = rows.map((n) => ({
       nodeId: n.nodeId,

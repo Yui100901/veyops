@@ -1,6 +1,4 @@
 export const deliveryTabs = {
-  pipelines: '流水线',
-  runs: '执行记录',
   artifacts: '构建产物',
   deployments: '部署与回滚',
   approvals: '待审批发布',

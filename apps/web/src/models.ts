@@ -173,7 +173,6 @@ export interface ProjectDetail extends Project {
   addresses?: ProjectAddress[];
   dependencies?: ProjectDependency[];
   deploymentTargets?: ServerGroup[];
-  pipelines?: { id: string; name: string; serviceId: string; version: number; enabled: boolean }[];
   recentDeployments?: DeploymentSummary[];
 }
 export interface ProjectAddress {
@@ -194,12 +193,12 @@ export interface ProjectDependency {
   dependencyType: 'RUNTIME' | 'DEPLOYMENT';
   description: string;
 }
-export type PipelineNodeType =
+export type DeliveryStepType =
   'CHECKOUT' | 'ENVIRONMENT' | 'INSTALL' | 'BUILD' | 'TEST' | 'SHELL' | 'PACKAGE' | 'DEPLOY';
-export interface PipelineGraphNode {
+export interface DeliveryStepNode {
   id: string;
   name: string;
-  type: PipelineNodeType;
+  type: DeliveryStepType;
 }
 export interface Task {
   id: string;
@@ -216,7 +215,7 @@ export interface Task {
   deploymentSkippedReason?: string | null;
   deployAfterBuild?: boolean;
   pipelineRunId?: string | null;
-  pipelineGraph?: { buildLocation: 'TARGET' | 'MANAGER'; nodes: PipelineGraphNode[] };
+  pipelineGraph?: { buildLocation: 'TARGET' | 'MANAGER'; nodes: DeliveryStepNode[] };
   result?: {
     aiAnalysis?:
       | { status: 'SUCCESS'; summary: string; failedPhase: string | null; nextActions: string[] }

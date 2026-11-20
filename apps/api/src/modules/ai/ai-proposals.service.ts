@@ -109,6 +109,8 @@ export class AiProposalsService {
     }
     if (row.status !== 'PENDING') throw new ConflictException('操作提案已处理，不能重复确认');
     const stored = JSON.parse(row.payload_json) as PreparedAiAction;
+    if (stored.action === 'run_pipeline')
+      throw new ConflictException('请从项目执行图预览并确认交付流程');
     const repair = stored.failureTaskId
       ? { taskId: stored.failureTaskId, proposalId: id, automatic }
       : undefined;

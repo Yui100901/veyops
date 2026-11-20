@@ -204,8 +204,11 @@ export class AiService {
       const handled = new Map<string, unknown>();
       let toolCount = 0;
       let answer = '';
-      const definitions = aiToolDefinitions.filter(({ function: { name } }) =>
-        context ? aiContextAllows(context.input.kind, name) : name !== 'get_operation_plan',
+      const definitions = aiToolDefinitions.filter(
+        ({ function: { name } }) =>
+          name !== 'query_pipeline' &&
+          name !== 'run_pipeline' &&
+          (context ? aiContextAllows(context.input.kind, name) : name !== 'get_operation_plan'),
       );
       for (let round = 0; round < 6; round++) {
         const response = await this.wire.complete(connection, messages, definitions);
@@ -221,6 +224,8 @@ export class AiService {
           if (++toolCount > 8) result = { error: '已达到本轮最多8次工具调用限制，请汇总已有结果' };
           else {
             try {
+              if (call.function.name === 'query_pipeline' || call.function.name === 'run_pipeline')
+                throw new BadRequestException('请从项目执行图查看和运行交付流程');
               const safeArguments = sanitizeAiText(call.function.arguments, [connection.apiKey]);
               if (isActionTool(call.function.name) && safeArguments !== call.function.arguments)
                 throw new BadRequestException('AI 执行参数包含疑似明文凭据，已拒绝操作');

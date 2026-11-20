@@ -37,7 +37,6 @@ import { Roles } from '../auth/auth.decorators';
 import type { CurrentUser } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { recentDeployments } from '../deployments/deployment-history';
-import { DeliveryFilters } from './delivery-filters';
 import { byProject, projectAddressLinks } from './project-card-data';
 import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
@@ -123,27 +122,6 @@ export class ProjectsService {
     private readonly relations: ProjectRelationsService,
     private readonly metadata: RepositoryMetadataService,
   ) {}
-  async runs(projectId: string, filters: DeliveryFilters) {
-    let query = this.database.db
-      .selectFrom('pipeline_runs as r')
-      .innerJoin('tasks as t', 't.id', 'r.task_id')
-      .select([
-        'r.id',
-        'r.service_id as serviceId',
-        'r.environment_id as environmentId',
-        'r.commit_sha as commitSha',
-        'r.task_id as taskId',
-        't.name',
-        't.status',
-        'r.created_at as createdAt',
-      ])
-      .where('r.project_id', '=', projectId);
-    if (filters.serviceId) query = query.where('r.service_id', '=', filters.serviceId);
-    if (filters.environmentId) query = query.where('r.environment_id', '=', filters.environmentId);
-    if (filters.commit)
-      query = query.where('r.commit_sha', 'like', filters.commit.toLowerCase() + '%');
-    return query.orderBy('r.created_at', 'desc').orderBy('r.id', 'desc').limit(200).execute();
-  }
   async list(includeAddresses = false) {
     const db = this.database.db;
     const activeProjects = db.selectFrom('projects').where('deleted_at', 'is', null);
@@ -218,7 +196,7 @@ export class ProjectsService {
   async detail(id: string) {
     const project = await this.get(id);
     const db = this.database.db;
-    const [addresses, dependencies, deploymentRows, pipelines, deployments] = await Promise.all([
+    const [addresses, dependencies, deploymentRows, deployments] = await Promise.all([
       this.relations.addresses(id),
       this.relations.dependencies(id),
       db
@@ -243,12 +221,6 @@ export class ProjectsService {
         .orderBy('targets.id')
         .orderBy('members.sort_order')
         .execute(),
-      db
-        .selectFrom('pipelines')
-        .select(['id', 'name', 'service_id as serviceId', 'current_version as version', 'enabled'])
-        .where('project_id', '=', id)
-        .orderBy('created_at', 'desc')
-        .execute(),
       recentDeployments(db, { projectId: id }),
     ]);
     const deploymentTargets = new Map<
@@ -265,7 +237,6 @@ export class ProjectsService {
       addresses,
       dependencies,
       deploymentTargets: [...deploymentTargets.values()],
-      pipelines: pipelines.map((pipeline) => ({ ...pipeline, enabled: Boolean(pipeline.enabled) })),
       recentDeployments: deployments,
     };
   }
@@ -629,9 +600,6 @@ class ProjectsController {
   }
   @Get(':id') get(@Param('id') id: string) {
     return this.service.detail(id);
-  }
-  @Get(':id/runs') runs(@Param('id') id: string, @Query() filters: DeliveryFilters) {
-    return this.service.runs(id, filters);
   }
   @Get(':id/delivery-context') deliveryContext(@Param('id') id: string) {
     return this.service.get(id, true);

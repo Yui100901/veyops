@@ -21,11 +21,15 @@ async function checkApi(databaseUrl?: string) {
   const initialPassword = 'fixture-initial-password';
   const newPassword = 'fixture-changed-password';
   process.env.ADMIN_PASSWORD = initialPassword;
+  const { LegacyDeliveryFixtureModule } =
+    await import('./helpers/legacy-delivery-fixture.module.js');
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { DatabaseService } = await import('../core/database/database.service.js');
   const { SshService } = await import('../infrastructure/ssh/ssh.service.js');
-  const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+  const moduleRef = await Test.createTestingModule({
+    imports: [AppModule, LegacyDeliveryFixtureModule],
+  })
     .overrideProvider(SshService)
     .useValue({
       probe: async () => ({ exitCode: 0, output: 'Linux test-host' }),

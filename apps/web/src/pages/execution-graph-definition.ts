@@ -19,6 +19,44 @@ export interface GraphEdge {
   to: string;
   when?: 'TRUE' | 'FALSE' | 'DEFAULT' | `CASE:${number}`;
 }
+export const flowPresetLabels = {
+  CUSTOM: '自定义',
+  BUILD: '构建归档',
+  DEPLOY: '部署构建产物',
+  BUILD_DEPLOY: '构建并部署',
+  VERIFY: '验证',
+  MAINTENANCE: '维护',
+  RELEASE_REVIEW: '发布审核',
+} as const;
+export type FlowPreset = keyof typeof flowPresetLabels;
+export interface FlowBuildDefinition {
+  repositoryId?: string;
+  branch?: string;
+  commitSha?: string;
+  buildLocation?: 'TARGET' | 'MANAGER';
+  artifactType?: 'FILE' | 'DOCKER_IMAGE';
+  buildImage?: string;
+  repoPath?: string;
+  installCommand?: string;
+  buildCommand?: string;
+  outputPath?: string;
+  dockerfilePath?: string;
+  imageRepository?: string;
+  registryId?: string;
+}
+export interface FlowDeployDefinition {
+  deployPath?: string;
+  startCommand?: string;
+  stopCommand?: string;
+  healthCheckCommand?: string;
+  composeFilePath?: string;
+}
+export interface FlowDelivery {
+  kind: FlowPreset;
+  serviceId?: string;
+  build?: FlowBuildDefinition;
+  deploy?: FlowDeployDefinition;
+}
 export interface GraphNode {
   id: string;
   type: keyof typeof graphNodeLabels;
@@ -32,8 +70,7 @@ export interface GraphNode {
     fullClone?: boolean;
   };
   shell?: { command?: string; serverId?: string };
-  pipelineId?: string;
-  pipelineVersion?: number;
+  delivery?: FlowDelivery;
   condition?: { key: 'input' | 'commitSha'; value: string };
   switch?: { key: 'input' | 'commitSha'; cases: string[] };
   delaySeconds?: number;

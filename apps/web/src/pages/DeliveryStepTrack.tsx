@@ -10,12 +10,12 @@ import {
   Terminal,
 } from 'lucide-react';
 import { Status } from '../components';
-import type { PipelineGraphNode, PipelineNodeType } from '../models';
-import './pipeline-node-graph.css';
+import type { DeliveryStepNode, DeliveryStepType } from '../models';
+import './delivery-step-track.css';
 
-export type { PipelineNodeType } from '../models';
+export type { DeliveryStepType } from '../models';
 
-export const pipelineNodeLabels: Record<PipelineNodeType, string> = {
+export const deliveryActionLabels: Record<DeliveryStepType, string> = {
   CHECKOUT: '获取源码',
   ENVIRONMENT: '设置环境',
   INSTALL: '安装依赖',
@@ -37,7 +37,7 @@ const icons = {
   DEPLOY: Rocket,
 };
 
-export interface PipelineNodeGraphItem extends PipelineGraphNode {
+export interface DeliveryStepTrackItem extends DeliveryStepNode {
   status?: string;
   statusLabel?: string;
   logAvailable?: boolean;
@@ -46,27 +46,27 @@ export interface PipelineNodeGraphItem extends PipelineGraphNode {
   selectable?: boolean;
 }
 
-export function PipelineNodeGraph({
+export function DeliveryStepTrack({
   items,
   onSelect,
   selectedId,
 }: {
-  items: PipelineNodeGraphItem[];
+  items: DeliveryStepTrackItem[];
   onSelect?: (id: string) => void;
   selectedId?: string;
 }) {
   return (
-    <ol className="pipeline-node-graph" aria-label="流水线执行顺序">
+    <ol className="delivery-step-track" aria-label="任务步骤">
       {items.map((item, index) => {
         const Icon = icons[item.type];
         const content = (
           <>
-            <span className="pipeline-node-graph-kind">
-              <Icon size={16} aria-hidden="true" /> {pipelineNodeLabels[item.type]}
+            <span className="delivery-step-track-kind">
+              <Icon size={16} aria-hidden="true" /> {deliveryActionLabels[item.type]}
             </span>
-            <strong className="pipeline-node-graph-name">{item.name}</strong>
+            <strong className="delivery-step-track-name">{item.name}</strong>
             {(item.status || item.statusLabel || item.logAvailable) && (
-              <span className="pipeline-node-graph-status">
+              <span className="delivery-step-track-status">
                 {item.statusLabel ? (
                   <span>{item.statusLabel}</span>
                 ) : item.status ? (
@@ -75,27 +75,27 @@ export function PipelineNodeGraph({
                 {item.logAvailable && <Terminal size={15} role="img" aria-label="日志" />}
               </span>
             )}
-            {item.detail && <small className="pipeline-node-graph-detail">{item.detail}</small>}
+            {item.detail && <small className="delivery-step-track-detail">{item.detail}</small>}
           </>
         );
         return (
-          <li className="pipeline-node-graph-item" key={item.id}>
-            {index > 0 && <ArrowRight className="pipeline-node-graph-edge" aria-hidden="true" />}
+          <li className="delivery-step-track-item" key={item.id}>
+            {index > 0 && <ArrowRight className="delivery-step-track-edge" aria-hidden="true" />}
             {item.href ? (
-              <a className="pipeline-node-graph-card" href={item.href}>
+              <a className="delivery-step-track-card" href={item.href}>
                 {content}
               </a>
             ) : onSelect && item.selectable !== false ? (
               <button
                 type="button"
-                className="pipeline-node-graph-card"
+                className="delivery-step-track-card"
                 aria-pressed={selectedId === item.id}
                 onClick={() => onSelect(item.id)}
               >
                 {content}
               </button>
             ) : (
-              <div className="pipeline-node-graph-card">{content}</div>
+              <div className="delivery-step-track-card">{content}</div>
             )}
           </li>
         );

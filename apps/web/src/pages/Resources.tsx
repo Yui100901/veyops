@@ -1618,9 +1618,6 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
         <button type="button" onClick={() => navigate(`/projects/${id}/execution-graph`)}>
           执行图
         </button>
-        <button type="button" onClick={() => navigate(deliveryPath(id, 'pipelines'))}>
-          流水线
-        </button>
         <button type="button" onClick={() => navigate(deliveryPath(id, 'artifacts'))}>
           交付记录
         </button>
@@ -1837,9 +1834,9 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
                         ) : key === 'services' ? (
                           <a
                             className="text-link"
-                            href={'#' + deliveryPath(id, 'pipelines', { serviceId: item.id })}
+                            href={'#' + `/projects/${id}/execution-graph`}
                           >
-                            {item.name} · 流水线
+                            {item.name} · 执行图
                           </a>
                         ) : (
                           <strong>{item.name}</strong>
@@ -1932,7 +1929,7 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
           title={`删除${labels[deletingResource.key]}`}
           description={
             deletingResource.key === 'repositories'
-              ? `删除「${deletingResource.item.name}」。请先解除服务与 Pipeline 的引用。`
+              ? `删除「${deletingResource.item.name}」。请先解除服务与执行流的引用。`
               : `删除「${deletingResource.item.name}」及其部署配置和变量。地址或历史记录引用此资源时，删除会被阻止。`
           }
           onClose={() => !busy && setDeletingResource(undefined)}

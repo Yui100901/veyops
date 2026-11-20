@@ -84,6 +84,10 @@
   min-width: 0;
 }
 
+.graph-inspector .graph-preset-fields {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .graph-end-pairs {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);

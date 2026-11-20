@@ -3181,67 +3181,6 @@ tbody tr:hover {
   margin-left: auto;
   white-space: nowrap;
 }
-.pipeline-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 22px;
-}
-.pipeline-card {
-  padding: 24px;
-  overflow: hidden;
-}
-.pipeline-card-top {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.pipeline-card h2 {
-  margin: 18px 0 8px;
-  font-size: 18px;
-  overflow-wrap: anywhere;
-}
-.pipeline-card > p {
-  margin: 0;
-  font-size: 12px;
-  color: #596871;
-}
-.pipeline-route {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 27px 0;
-  font-size: 11px;
-  color: #60736c;
-}
-.pipeline-route span {
-  background: #f1f6f3;
-  border: 1px solid #e3ebe5;
-  padding: 7px 9px;
-  border-radius: 5px;
-  white-space: nowrap;
-}
-.pipeline-route i {
-  flex: 1;
-  height: 1px;
-  background: #d7e2dc;
-}
-.pipeline-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  font-size: 11px;
-  color: #7e8a91;
-}
-.pipeline-card-actions {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 17px;
-  border-top: 1px solid #edf0f2;
-  padding-top: 19px;
-  margin-top: 20px;
-}
 .webhook-url {
   margin-bottom: 24px;
 }
@@ -3336,9 +3275,6 @@ tbody tr:hover {
   border-color: #77b8a6;
   color: #247d69;
   background: #eaf5ef;
-}
-.pipeline-card-actions .button {
-  margin-left: auto;
 }
 .form-section-heading {
   display: flex;
@@ -4056,9 +3992,6 @@ fieldset {
   margin-top: 6px;
 }
 @media (max-width: 1250px) {
-  .pipeline-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
   .provider-list {
     grid-template-columns: 1fr;
   }
@@ -4086,21 +4019,8 @@ fieldset {
     align-items: flex-start;
     flex-direction: column;
   }
-  .pipeline-route {
-    gap: 5px;
-  }
-  .pipeline-route span {
-    font-size: 9px;
-    padding: 6px;
-  }
 }
 @media (max-width: 640px) {
-  .pipeline-grid {
-    grid-template-columns: 1fr;
-  }
-  .pipeline-card {
-    padding: 20px;
-  }
   .delivery-banner {
     padding: 17px;
     gap: 12px;

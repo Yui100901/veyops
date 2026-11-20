@@ -5,7 +5,7 @@ import { useResource } from '../api';
 import { ErrorBanner, Field } from '../components';
 import type { ProjectDetail, Server } from '../models';
 import { graphDragType, NodeMap } from './ExecutionGraphCanvas';
-import { PipelineReference } from './ExecutionGraphPipelineReference';
+import { StartDeliveryFields } from './ExecutionGraphPresets';
 import { BranchSyncControls, useRepositoryBranches } from './RepositoryBranches';
 import { branchOptions, graphKey, graphNodeLabels } from './execution-graph-definition';
 import type { GraphCanvas, GraphEdge, GraphNode } from './execution-graph-definition';
@@ -161,6 +161,26 @@ export function ProjectGraphEditor({
       endpoints: [
         ...canvas.endpoints.filter((pair) => pair.startId !== startId),
         ...(endId ? [{ startId, endId }] : []),
+      ],
+    });
+  }
+  const presetEnd =
+    activeNode && canvas.endpoints.find(({ startId }) => startId === activeNode.id)?.endId;
+  const canInsertPreset =
+    activeNode?.type === 'START' &&
+    Boolean(presetEnd) &&
+    canvas.edges.filter(({ from }) => from === activeNode.id).length === 1 &&
+    canvas.edges.some(({ from, to }) => from === activeNode.id && to === presetEnd);
+  function insertPreset(types: NodeType[]) {
+    if (!activeNode || !presetEnd || !canInsertPreset || !canEdit) return;
+    const nodes = types.map((type) => makeNode(type, project));
+    const path = [activeNode.id, ...nodes.map(({ id }) => id), presetEnd];
+    onChange({
+      ...canvas,
+      nodes: [...canvas.nodes, ...nodes],
+      edges: [
+        ...canvas.edges.filter(({ from, to }) => from !== activeNode.id || to !== presetEnd),
+        ...path.slice(1).map((to, i) => ({ from: path[i]!, to })),
       ],
     });
   }
@@ -432,6 +452,13 @@ export function ProjectGraphEditor({
                     canvas={canvas}
                     canEdit={canEdit}
                     assign={assignEnd}
+                  />
+                  <StartDeliveryFields
+                    project={project}
+                    value={activeNode.delivery}
+                    canEdit={canEdit}
+                    change={(delivery) => patch({ delivery })}
+                    insert={canInsertPreset ? insertPreset : undefined}
                   />
                   {renderStart?.(activeNode.id)}
                 </>
@@ -708,7 +735,7 @@ function NodeFields({ node, project, canvas, canEdit, patch }: FieldsProps) {
       )}
       {node.type === 'SHELL' && <ShellFields node={node} canEdit={canEdit} patch={patch} />}
       {(node.type === 'BUILD' || node.type === 'DEPLOY_ARTIFACT') && (
-        <PipelineReference project={project} node={node} canEdit={canEdit} onChange={patch} />
+        <p className="field-note">此节点使用开始节点配置的服务和执行流预设。</p>
       )}
       {node.type === 'CONDITION' && (
         <div className="form-grid">

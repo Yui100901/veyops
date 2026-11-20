@@ -14,16 +14,16 @@ import type { Dashboard, DashboardDeployment, Task } from '../models';
 const taskTypeNames: Record<string, string> = {
   COMMAND: '临时命令',
   OPERATION_PLAN: '运维方案',
-  PIPELINE: 'Pipeline',
+  PIPELINE: '构建与部署',
   GRAPH_CHECKOUT: '执行图源码拉取',
 };
 
 export function taskTypeLabel(task: Task) {
-  if (task.executionMode === 'DEPLOY_ARTIFACT') return 'Pipeline · 产物部署';
+  if (task.executionMode === 'DEPLOY_ARTIFACT') return '产物部署';
   if (task.type !== 'PIPELINE') return taskTypeNames[task.type] ?? task.type;
-  if (task.deliveryStage === 'BUILD' && task.deployAfterBuild) return 'Pipeline · 构建阶段';
-  if (task.executionMode === 'BUILD_ONLY') return 'Pipeline · 仅构建';
-  return 'Pipeline · 构建并部署';
+  if (task.deliveryStage === 'BUILD' && task.deployAfterBuild) return '构建阶段';
+  if (task.executionMode === 'BUILD_ONLY') return '构建';
+  return '构建并部署';
 }
 
 export function TaskTable({ tasks, compact = false }: { tasks: Task[]; compact?: boolean }) {

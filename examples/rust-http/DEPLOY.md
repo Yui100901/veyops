@@ -28,7 +28,7 @@ Rust 产物须与目标机架构及 C 运行库兼容。上表的管理端镜像
 
 在 Linux 测试机为每套配置预留发布目录、端口和 临时 systemd 单元名称。首次发布目录应为空或尚未创建。以下命令要求目标机有 `systemd-run` 和 `curl`，并且部署所用的 SSH 用户有权限启动指定测试单元。在发布前用 `ss -ltn` 检查端口，用 `systemctl status` 核对指定单元名可用于此测试。如有占用，修改环境配置里的端口和单元名。
 
-将以下命令填入 `startCommand`。Pipeline 会在新产物目录内执行它，变量由所选环境传入。
+将以下命令填入部署配置的 `startCommand`。平台在新产物目录内执行它，并传入所选环境的变量。
 
 ```sh
 systemd-run --quiet --unit="$VEYOPS_DEMO_UNIT" --property=WorkingDirectory="$PWD" --setenv="PORT=$PORT" "$PWD/veyops-rust"
@@ -48,7 +48,7 @@ done
 exit 1
 ```
 
-1. 在 Pipeline 选择对应环境、目标和版本，核对完整 Commit 及发布目录。使用「仅构建」时可在任务详情下载 `.tar.gz`，用 `sha256sum` 对照产物记录的 SHA-256。
+1. 运行该服务的构建流，选择相应环境和目标，并核对完整 Git SHA。在项目交付记录中下载 `.tar.gz`，用 `sha256sum` 对照记录中的 SHA-256。运行同一服务的部署流时，选择该次构建并核对目标和发布目录。
 2. 用同一 SHA 执行「构建并部署」，在任务详情查看构建、分发及逐目标健康状态。产物是单个文件，发布后可在 `<deployPath>/current/veyops-rust` 找到它。可在目标机对 `<deployPath>/.artifacts/<task-id>.tar.gz` 计算 SHA-256，与部署任务的产物记录核对。
 3. 在目标机访问所选端口的 `/healthz`，核对语言和状态。部署失败时先看任务失败步骤，再查专用单元日志。若 `curl` 返回 404，核对请求路径是否为 `/healthz`。
 

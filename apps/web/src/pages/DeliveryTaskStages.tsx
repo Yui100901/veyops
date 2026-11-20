@@ -2,9 +2,9 @@ import { useState } from 'react';
 import { activeTask, useResource } from '../api';
 import { ErrorBanner, Section } from '../components';
 import type { Task, TaskTarget } from '../models';
-import { PipelineNodeGraph, type PipelineNodeGraphItem } from './PipelineNodeGraph';
+import { DeliveryStepTrack, type DeliveryStepTrackItem } from './DeliveryStepTrack';
 
-export interface PipelineTaskStep {
+export interface DeliveryTaskStep {
   id: string;
   serverId: string;
   key: string;
@@ -14,12 +14,12 @@ export interface PipelineTaskStep {
   exitCode: number | null;
 }
 
-export interface PipelineLogSelection {
-  step: PipelineTaskStep;
+export interface DeliveryLogSelection {
+  step: DeliveryTaskStep;
   targetName: string;
 }
 
-export default function PipelineRunGraph({
+export default function DeliveryTaskStages({
   task,
   graph,
   targets,
@@ -32,11 +32,11 @@ export default function PipelineRunGraph({
   task: Task;
   graph: NonNullable<Task['pipelineGraph']>;
   targets: TaskTarget[];
-  steps?: PipelineTaskStep[];
+  steps?: DeliveryTaskStep[];
   stepsError: string;
   retrySteps: () => void;
   selectedStepId?: string;
-  onLog: (selection: PipelineLogSelection) => void;
+  onLog: (selection: DeliveryLogSelection) => void;
 }) {
   const [serverId, setServerId] = useState('');
   const deployStage = task.deliveryStage === 'DEPLOY';
@@ -59,7 +59,7 @@ export default function PipelineRunGraph({
   const targetName = manager ? '管理端' : (selectedTarget?.serverName ?? '目标服务器');
   const selectedNode = Array.from(scopedSteps).find(([, step]) => step.id === selectedStepId)?.[0];
 
-  const items = graph.nodes.map<PipelineNodeGraphItem>((node) => {
+  const items = graph.nodes.map<DeliveryStepTrackItem>((node) => {
     const step = scopedSteps.get(node.id);
     if (step) {
       return {
@@ -111,12 +111,12 @@ export default function PipelineRunGraph({
 
   return (
     <Section
-      title="流水线执行图"
+      title="构建与部署步骤"
       subtitle={deployStage ? '独立部署阶段' : '构建与归档阶段'}
-      className="pipeline-run-graph"
+      className="delivery-task-graph"
       action={
         !manager && targets.length > 1 ? (
-          <label className="pipeline-run-scope">
+          <label className="delivery-task-scope">
             <span>执行位置</span>
             <select
               value={selectedTarget?.serverId}
@@ -135,7 +135,7 @@ export default function PipelineRunGraph({
       }
     >
       <ErrorBanner error={stepsError} retry={retrySteps} />
-      <PipelineNodeGraph
+      <DeliveryStepTrack
         items={items}
         selectedId={selectedNode}
         onSelect={(id) => {

@@ -1,8 +1,8 @@
-# Pipeline 验证示例
+# 执行流交付示例
 
-四个 HTTP 示例均使用语言标准库。构建不下载应用依赖，生成一个可用于 `FILE` Pipeline 的独立产物。示例监听 `127.0.0.1`，默认端口为 `8080`，可通过 `PORT` 更改。`GET /healthz` 返回包含 `status` 和 `language` 的 JSON。
+Go、Java、Rust、Python 示例使用各自语言的标准库，可在无需下载应用依赖的情况下生成可独立部署的文件产物。示例监听 `127.0.0.1`，默认端口为 `8080`，可通过 `PORT` 更改。`GET /healthz` 返回包含 `status` 和 `language` 的 JSON。
 
-将相应示例目录设为 Pipeline 的 `repoPath`。构建命令适用于 Linux；`outputPath` 相对于示例目录。发布后在产物解包目录内运行启动命令。
+在项目执行图中为示例服务创建构建流，将示例目录设为构建配置的 `repoPath`，并选择分支或固定提交。下表的构建命令适用于 Linux，`outputPath` 相对于示例目录。然后为同一服务创建部署流，使用当前环境下最新可用产物或选择某次构建。平台在产物解包后的发布目录内执行启动命令。[执行流交付指南](../docs/执行流交付.md)
 
 | 目录 | 构建环境 | `buildCommand` | `outputPath` | 启动命令 |
 | --- | --- | --- | --- | --- |
@@ -15,7 +15,7 @@ Go 和 Rust 产物需要匹配目标主机的操作系统与架构。Rust 还需
 
 各语言的分支、环境、构建、启动与健康检查见 [Go](go-http/DEPLOY.md)、[Java](java-http/DEPLOY.md)、[Rust](rust-http/DEPLOY.md) 和 [Python](python-http/DEPLOY.md) 部署指南。
 
-启动命令会以前台进程运行。手工验证时，在另一个终端执行 `curl -fsS http://127.0.0.1:8080/healthz`，完成后停止示例进程。配置 Pipeline 时，可把启动交给已有的进程管理器，再将该 `curl` 命令用作健康检查。静态文件与 Docker Compose 示例见 [`static-site`](static-site)。
+启动命令会以前台进程运行。手工验证时，在另一个终端执行 `curl -fsS http://127.0.0.1:8080/healthz`，完成后停止示例进程。配置部署流时，可把启动交给已有的进程管理器，再将该 `curl` 命令用作健康检查。静态文件与 Docker Compose 示例见 [`static-site`](static-site)。
 
 [`typescript-http`](typescript-http) 使用 npm 与 pnpm 的锁文件验证 Node.js 应用构建。`test` 分支部署到 Testing 环境的回环端口 `38781`，`staging` 分支部署到 Staging 环境的回环端口 `38782`。两个环境分别保存发布目录和进程状态。管理端构建、SFTP 分发、健康检查与清理命令见 [TypeScript 部署指南](typescript-http/DEPLOY.md)。
 

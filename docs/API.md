@@ -1,4 +1,4 @@
-# veyops v0.2 API
+# VeyOps API
 
 前缀 `/api/v1`。成功：`{"data": ...}`；错误：`{"error":{"code":"HTTP_400","message":"..."}}`。SSE 使用标准事件格式。时间为 UTC 毫秒；ID 为 UUID。所有资源默认需要登录，同团队可读；写接口限定 ADMIN/OPERATOR，凭据管理仅 ADMIN。Cookie `veyops_session` 为 HttpOnly、SameSite=Strict，会话 12 小时；浏览器请求必须同源。生产无匿名 Swagger。
 
@@ -66,9 +66,8 @@
 
 | 请求 | 项目内筛选与追溯 |
 | --- | --- |
-| `GET /pipelines?projectId=…&serviceId=…` | 列出指定项目、服务所属的流水线。 |
-| `GET /projects/:id/runs` | 支持可选的 `serviceId`、`environmentId` 和十六进制提交前缀 `commit`。每次执行返回 `taskId` 以查看原任务及日志。 |
-| `GET /artifacts`、`GET /deployments` | 支持 `projectId`、上述三个条件及 `pipelineRunId`、`taskId`、`recordId`。返回产物或逐服务器发布与原始任务之间的关联。 |
+| `GET /projects/:id/execution-graph/runs` | 读取执行流运行记录，通过运行详情获取关联任务和日志。 |
+| `GET /artifacts`、`GET /deployments` | 支持 `projectId`、上述三个条件及 `taskId`、`recordId`。返回产物或逐服务器发布与原始任务之间的关联。 |
 | `GET /deployments/approvals` | 管理员可按相同条件查看待审批发布，其中 `recordId` 是待审批任务 ID。审批、重新部署及回滚继续调用原有操作接口。 |
 
 ### 首页汇总
@@ -76,7 +75,7 @@
 `GET /dashboard` 返回 `servers`、`projects`、`services`、`totalTasks`、`activeTasks`、`recentDeployments`、`recentTasks` 和 `recentFailedTasks`。
 
 - `services` 包含 `total`、`running` 和 `abnormal`。统计未删除项目，每个服务只计一次。按服务、环境和启用服务器分别取最新部署记录。任一记录显示部署失败、部分失败、超时、需要检查或健康失败、未知时，服务计为异常。没有异常且至少一个目标的部署成功并通过健康检查时，服务计为运行中。未部署和未验证的服务只计入总数。
-- `recentDeployments` 最多六条逐服务器发布记录，含项目、服务、环境、服务器、对应任务、发布版本、执行和健康状态。按开始时间降序，未记录开始时间时使用 Pipeline 运行创建时间。已停用服务器的历史发布仍可查看。
+- `recentDeployments` 最多六条逐服务器发布记录，含项目、服务、环境、服务器、对应任务、发布版本、执行和健康状态。按开始时间降序，未记录开始时间时使用交付任务的创建时间。已停用服务器的历史发布仍可查看。
 - `recentTasks` 和 `recentFailedTasks` 分别最多六条。后者独立查询 `FAILED`、`PARTIAL_FAILED`、`TIMED_OUT` 和 `NEEDS_ATTENTION`，较旧的失败任务不会被新的成功任务挤出。
 
 ### 备份
@@ -104,14 +103,19 @@
 | `GET /versions`、`GET /versions/:version` | 列出发布历史，或读取指定版本当时的完整定义。 |
 | `POST /versions/:version/restore` | 管理员或操作员提交 `{expectedRevision}`，将指定已发布版本载入新草稿，确认后可发布新版本。 |
 | `POST /flows/:flowId/preview` | 提交 `{version, inputs?}`。返回实际节点、配置摘要，按需返回 `checkouts` 中的固定提交和拉取深度、`scripts` 中的 SSH 目标，以及交付服务、环境、目标和审批要求。 |
-| `POST /flows/:flowId/run` | 使用与预览相同的版本和输入，附 `expectedConfigurationHash`、`idempotencyKey`。同一用户在同一项目重试同一请求可取回原运行；换参数复用同一键返回 409。 |
+| `POST /flows/:flowId/run` | 使用与预览相同的版本和输入，附预览返回的 `configurationHash`（传为 `expectedConfigurationHash`）和 `idempotencyKey`。同一用户在同一项目重试同一请求可取回原运行；换参数复用同一键返回 409。 |
 | `GET /runs`、`GET /runs/:runId` | 按时间倒序返回运行，每页最多 100 条。传 `?before=<上一页最后一个运行 ID>` 查看更早记录。详情返回当时的图版本、流定义、输入及节点结果。交付节点包含关联任务 ID，可查逐台服务器、步骤、日志和产物。 |
 | `POST /runs/:runId/cancel` | 取消尚未完成的运行，并将取消传给相关任务和子流。等待中和已经开始的外部操作使用各自的任务状态。 |
 | `POST /runs/:runId/nodes/:nodeId/decision` | 管理员对等待中的人工审批提交 `{decision:"APPROVE"}` 或 `{decision:"REJECT"}`。已结束或超时的审批返回冲突。 |
 
 每条流有一个 `START` 和一个 `END`。日志节点填写 `message`，`CONDITION` 使用 `{key,value}` 比较 `inputs.value`（`key: input`）或 `inputs.commitSha`（`key: commitSha`），发出的两条边分别标记 `when: TRUE` 和 `when: FALSE`。并行分支由 `PARALLEL` 发起，`JOIN` 等待实际命中的分支。使用 `FLOW_CALL.flowId` 启动同一已发布图版本中的子流，子流独立记录日志和状态。
 
-交付节点使用同项目的 `pipelineId` 和固定 `pipelineVersion`。构建时输入 `environmentId` 和提交 SHA（或由源码节点的分支解析），独立部署时选择历史 `artifactIds`。同一执行流的部署节点可省略历史产物，预览会查找同一流水线唯一的可达上游构建节点，并在 `deliveries` 中标出来源。发布仍校验实际产物及已确认的部署配置。目标可沿用环境或显式提供 `serverIds`、`groupIds`。构建成功后从运行详情的 `artifactIds` 获取产物，可通过 `GET /artifacts/:id/download` 下载可用归档。
+`START.delivery` 声明 `kind`，可选 `CUSTOM`（默认）、`BUILD`、`DEPLOY`、`BUILD_DEPLOY`、`VERIFY`、`MAINTENANCE`、`RELEASE_REVIEW`。构建、部署和组合预设必须通过 `serviceId` 关联所属项目的实际服务。交付流中的 `BUILD` 和 `DEPLOY_ARTIFACT` 节点使用开始节点的交付配置。
+
+- 构建配置 `build` 接受 `repositoryId`、可选 `branch` 或完整 `commitSha`、`buildLocation`、`artifactType`、`buildImage`、`repoPath`、`installCommand`、`buildCommand`、`outputPath`、`dockerfilePath`、`composeFilePath`、`registryId`、`imageRepository`。分支或远端默认分支先解析为固定提交。
+- 发布配置 `deploy` 可声明 `deployPath`、`startCommand`、`stopCommand`、`healthCheckCommand` 及 `composeFilePath`，也可通过服务环境提供有效配置。
+- 输入 `environmentId` 选择服务环境，目标沿用环境或显式使用 `serverIds`、`groupIds`。部署流省略 `artifactIds` 时，预览会选择同项目、服务及环境中与发布目标兼容的最新一批产物。也可传入同一次构建的历史产物 ID。组合流默认使用本次构建产物。
+- 预览的 `deliveries` 显示服务、产物来源、固定提交及审批。缺少合格制品会拒绝预览。产物或配置变化需要重新预览和确认。构建完成后从运行详情读取 `artifactIds` 并通过 `GET /artifacts/:id/download` 下载。
 
 多路选择 `SWITCH.switch` 指定 `key` 和按顺序比较的 `cases`。对应出边分别使用 `CASE:0`、`CASE:1` 等以及 `DEFAULT`。延迟节点 `DELAY.delaySeconds` 使用秒数。人工审批 `APPROVAL.approval.timeoutSeconds` 可设等待时限。等待状态、唤醒或过期时间及管理员决定都随运行保存。
 
@@ -146,7 +150,7 @@
 
 `GET /system` 返回系统执行默认值。`PATCH /system` 接受 `{defaultBuildLocation?,targetWorkspaceRoot?,defaultMaxParallelTargets?,logRetentionDays?}`。仅管理员可修改，省略字段保留原值。构建位置为 `TARGET` 或 `MANAGER`，默认 `TARGET`。目标端工作目录默认 `~/.veyops/workspace`，可设为绝对路径或以 `~/` 开头的子目录。目标并发为 1–10，默认 3。
 
-`GET /projects/:id/execution-settings` 返回 `{system,overrides,effective}`，分别为系统默认值、项目显式覆盖值和项目生效值。管理员可用 `PATCH` 修改同一路径，字段与系统设置一致。单项传 `null` 恢复继承，省略则保留原值。流水线定义设置 `inheritBuildLocation: true` 时，预览会解析项目当前的默认构建位置。目标端构建预览会返回 `targetWorkspaceRoot`，该值随运行快照保存。
+`GET /projects/:id/execution-settings` 返回 `{system,overrides,effective}`，分别为系统默认值、项目显式覆盖值和项目生效值。管理员可用 `PATCH` 修改同一路径，字段与系统设置一致。单项传 `null` 恢复继承，省略则保留原值。构建配置继承位置时，预览会解析项目当前的默认构建位置。目标端构建预览会返回 `targetWorkspaceRoot`，该值随运行快照保存。
 
 日志保留期为 0–3650 天，默认 0 表示长期保留。Worker 周期性清理已结束且超过所属项目保留期的任务日志，保留任务记录、子步骤、审计和产物。未关联项目的任务使用系统保留期。
 
@@ -256,61 +260,28 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 
 方案新增版本后，显式选择的旧版本仍可执行。目标成员或 SSH 连接信息与预览不一致时，接口拒绝入队。重新预览并核对目标后可再次提交。管理员和运维人员可执行，只读账号可查看版本。成功入队后从返回的任务 ID 查询 `GET /tasks/:id`、`/tasks/:id/targets` 和 `/tasks/:id/logs?offset=0`。
 
-## v0.2 交付接口
+## 交付记录与保护
 
-服务环境、流水线运行、产物部署和 Webhook 可直接提交 `serverIds` 或 `groupIds`，可同时选用两者，并配置 `strategy`、`maxParallel` 和 `failurePolicy`。运行与产物部署可继承服务环境的选择。预览返回已去重的 `serverIds` 与保存的 `targetSelection`。提交时携带 `expectedConfigurationHash`，成员变化后重新预览。旧 `targetId` 及相关接口保留兼容。
+服务环境和执行流运行可提交 `serverIds` 或 `groupIds`，可同时使用两者，并配置 `strategy`、`maxParallel` 和 `failurePolicy`。执行预览返回去重后的目标和配置摘要，成员变化后需重新预览。
 
-节点式流水线在 `definition.nodes` 保存有序节点。`id` 在同一版本中唯一，步骤记录用 `node:<id>` 关联节点。生效分支由主源码节点明确指定时，运行请求可以省略 `commitSha`。预览返回 `nodeSources` 数组，其中每项包含节点 ID、仓库 ID、固定的 `commitSha` 和可选 `branch`。详情 `GET /tasks/:id` 的 `pipelineGraph` 返回节点 ID、名称、类型及构建位置。查看某次提交中的环境文件可调用 `GET /projects/:projectId/repositories/:repositoryId/environment-files?commitSha=<SHA>`，响应提供文件路径和变量名。
+| 方法与路径 | 说明 |
+| --- | --- |
+| `GET /services/:serviceId/repositories`、`PUT /services/:serviceId/repositories` | 查询或保存服务与仓库关联，传入 `{repositories:[{repositoryId,repoPath,isPrimary}]}`。 |
+| `GET /services/:serviceId/environments/:envId/config`、`PUT /services/:serviceId/environments/:envId/config` | 读取或保存服务环境配置。 |
+| `GET /environments/:envId/variables`、`PUT /environments/:envId/variables` | 查询或保存环境变量，传入 `{variables:[{key,value?或credentialId?}]}`。 |
+| `GET /services/:serviceId/environments/:envId/variables`、`PUT /services/:serviceId/environments/:envId/variables` | 查询或保存服务级变量，覆盖同名环境变量。 |
+| `GET /artifacts` | 查看构建产物和下载、部署可用性，可按项目、服务、环境和任务筛选。 |
+| `GET /artifacts/:id/download` | 登录后下载文件或镜像归档，响应头 `X-Artifact-SHA256` 提供校验值。 |
+| `GET /deployments` | 查询逐服务器发布记录。 |
+| `GET /registries`、`POST /registries` | 查询、登记镜像仓库，创建限管理员。 |
+| `PATCH /registries/:id`、`POST /registries/:id/test` | 管理员编辑、测试 HTTPS Registry V2 连通和认证，`credentialId:null` 解除凭据绑定。 |
+| `DELETE /registries/:id` | 管理员删除未被有效配置或镜像产物引用的镜像仓库，仍有引用时返回 409。 |
 
-| 方法             | 路径                                               | 说明                                                                                                     |
-| ---------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| GET/POST         | /deployment-targets                                | 目标列表/创建：`{name,serverIds,strategy,maxParallel,failurePolicy,description?}`                        |
-| GET/PATCH/DELETE | /deployment-targets/:id                            | 查询/替换配置/无引用时删除                                                                               |
-| GET/PUT          | /services/:serviceId/repositories                  | 查询/替换关联，`{repositories:[{repositoryId,repoPath,isPrimary}]}`                                      |
-| GET/PUT          | /services/:serviceId/environments/:envId/config    | 读取/保存服务环境配置                                                                                    |
-| GET/PUT          | /environments/:envId/variables                     | 环境变量列表/替换：`{variables:[{key,value?或credentialId?}]}`                                           |
-| GET/PUT          | /services/:serviceId/environments/:envId/variables | 服务级变量覆盖同名环境变量                                                                               |
-| GET/POST         | /pipelines                                         | 列表或创建服务级流水线。创建可附带 UUID v4 `creationId`，首次响应丢失后可用相同请求重试以取得已创建的版本 |
-| GET/PATCH/DELETE | /pipelines/:id                                     | 查询/新增版本/禁用并保留历史                                                                             |
-| GET              | /pipelines/:id/versions                            | 不可变历史版本                                                                                           |
-| POST             | /pipelines/:id/preview                             | 固定版本、环境配置与目标的执行预览                                                                       |
-| POST             | /pipelines/:id/run                                 | 接收环境、目标选择、`commitSha`、`confirmed: true` 和预览的 `expectedConfigurationHash`，返回构建任务 |
-| POST             | /pipelines/:id/artifact-deploy/preview             | 接收 `artifactIds`、`environmentId`、目标选择和可选 `version`，返回来源提交、选定版本、目标及 `configurationHash` |
-| POST             | /pipelines/:id/artifact-deploy                     | 与产物预览参数相同，另需 `confirmed: true`、`expectedConfigurationHash`，可带 `expectedServerIds`。返回部署任务 |
-| GET/PUT          | /pipelines/:id/webhook                             | 管理员查询或保存 Gitea 触发配置，提交环境、目标选择、`branch`、`secretCredentialId` 和 `enabled`             |
-| POST             | /pipelines/:id/webhook/preview                     | 管理员预览固定版本、生效模式、发布审批及目标，返回 `bindingHash` |
-| POST             | /webhooks/gitea/:pipelineId                        | 验证签名、仓库及分支，按绑定配置执行 Push 的固定提交 |
-| GET              | /artifacts                                         | 产物列表，支持 `projectId` 和 `pipelineRunId` 筛选，返回 `downloadAvailable`、`deployable`、`pipelineId`、`pipelineVersion`、`environmentId` 和归档时的 `targetSelection` |
-| GET              | /artifacts/:id/download                            | 登录后下载平台归档，响应头 `X-Artifact-SHA256` 提供校验和                                                |
-| GET              | /deployments                                       | 逐服务器交付记录，支持projectId筛选                                                                      |
-| GET/POST         | /registries                                        | Registry列表/创建（创建仅ADMIN）                                                                         |
-| PATCH            | /registries/:id                                    | 管理员编辑 Registry，`credentialId:null` 可解除凭据关联                                                  |
-| POST             | /registries/:id/test                               | 管理员从管理端测试 HTTPS Registry V2 连通与认证，返回 `{success,authenticated,message}`                  |
-| DELETE           | /registries/:id                                    | 管理员删除未被 Pipeline 版本或镜像产物引用的 Registry。仍有引用时返回 409                                |
+服务环境配置支持构建位置与发布默认值、变量、目标、部署目录和健康检查。敏感变量通过凭据引用设置。管理端与目标端构建按已固定 SHA 检出并向脚本提供 `VEYOPS_PROJECT_NAME` 和 `VEYOPS_SERVICE_NAME`。目录、文件和镜像交付详见 [执行流交付说明](执行流交付.md)。
 
 管理员和操作员可调用 `/projects/:projectId/repositories/:repositoryId/connection`、`/branches` 和 `/commits` 的 GET 接口检查仓库、读取分支和查询最近提交。`/commits` 接受 `branch` 和 `limit`，默认 20 条，最多 50 条。给仓库绑定凭据需要管理员角色。
 
-新建仓库、修改克隆地址或凭据时，系统会读取远端 HEAD、分支及完整提交 SHA。使用 `GET /projects/:projectId/repositories/:repositoryId/branch-cache` 读取快照，在缓存地址后加上 `/refresh` 并发送 POST 请求即可重新探测。响应包含 `defaultBranch`、`branches`、`syncedAt`、`checkedAt`、`status` 和 `error`。状态包括待同步 `PENDING`、最新 `CURRENT`、上次成功同步已超过 15 分钟的 `STALE` 和探测失败的 `ERROR`。同一仓库探测失败时保留上次成功的分支列表，切换地址或凭据会清除旧快照。空仓库返回空分支列表和空默认分支。
-
-管理端和目标端的源码步骤都按固定 SHA 执行深度为 1 的检出。旧式流水线也会向构建脚本提供运行快照中的 `VEYOPS_PROJECT_NAME` 和 `VEYOPS_SERVICE_NAME`。
-
-Pipeline 定义、四种组合、目录保护和环境覆盖规则见 [构建部署说明](PIPELINES.md)。环境配置字段包括 `serverIds`、`groupIds`、`buildLocation`、`artifactType`、`deployMethod`、`deployPath`、`buildCommand`、`workingDirectory`、`outputPath`、`composeFilePath`、`startCommand` 和 `healthCheckCommand`。敏感变量以凭据引用传入。
-
-手动运行可显式选择 `DEPLOY` 或 `BUILD_ONLY`。省略 `mode` 时，服务环境的 `executionMode` 优先于该流水线版本的 `definition.defaultMode`。将环境字段设为 `null` 可恢复继承。缺少已保存模式的历史版本沿用原行为，有发布能力的版本默认构建并部署。构建成功、产物归档后才创建独立部署任务。默认要求整批成功，`allowPartialDeploy: true` 允许目标端构建只发布成功目标。构建任务详情返回 `deploymentTaskId` 和 `deploymentSkippedReason`，部署任务详情返回 `sourceBuildTaskId`。
-
-配置 Webhook 时先调用预览，将返回的 `bindingHash` 作为 `expectedBindingHash` 随 PUT 提交。启用自动发布必须确认预览。旧绑定继续仅构建，管理员可设置 `followMode: true` 并重新预览保存。启用后若环境、服务器成员或其他有效配置变化，系统拒绝按过期绑定入队。
-
-已有产物部署要求同一 Pipeline、环境和构建任务，默认使用来源构建版本。管理端产物可供多个目标使用，目标端产物按来源服务器匹配。提交需携带预览返回的 `configurationHash` 作为 `expectedConfigurationHash`。产物、目标或有效配置变化时返回 `409`，重新预览确认后再提交。
-
-`GET /deployments` 返回 `previousDeploymentId`，指向同一目标上一成功的部署记录。发布结果不确定时状态为 `NEEDS_ATTENTION`。启用 AI 分析后，`GET /tasks/:id` 的 `result.aiAnalysis` 异步附加 `{status:"SUCCESS",summary,failedPhase,nextActions}` 或 `{status:"UNAVAILABLE"}`。
-
-### 流水线定时与分支轮询
-
-已登录用户可以通过 `GET /pipelines/:id/triggers` 查看规则，通过 `GET /pipelines/:id/triggers/history` 查询最近 100 次触发。记录包括规则、触发来源、计划时间、分支、提交、有效模式、受理结果、原因及关联任务。构建任务详情可继续追溯产物和发布任务。
-
-管理员使用 `POST /pipelines/:id/triggers/preview` 预览 `kind`、`version`、`environmentId`、`branch` 和 `timing`。省略发布目标时继承服务环境的配置，也可显式提供 `serverIds` 或 `groupIds`。预览返回有效模式、构建位置、目标服务器、审批要求、后续触发时间及 `configurationHash`。将这个哈希填入 `expectedConfigurationHash`，连同预览参数提交到 `POST /pipelines/:id/triggers` 新建并启用规则。使用 `POST /pipelines/:id/triggers/:ruleId` 更新并启用已有规则，使用 `POST /pipelines/:id/triggers/:ruleId/disable` 停用。
-
-定时构建使用 `SCHEDULE`，支持单次、固定间隔和五字段 Cron。Worker 将超过 5 秒宽限期的计划时刻记为漏跑，并继续计算下次触发时间。分支轮询使用 `POLL` 和固定间隔，默认在首次检查时保存基线。设置 `buildCurrent: true` 可在首次检查时构建。读取分支失败会保留基线并延长重试间隔。相同版本、分支、提交、环境和目标配置下，轮询与 Gitea 推送复用同一任务。
+新建仓库、修改克隆地址或凭据时，系统探测远端 HEAD、分支和完整提交 SHA。使用 `GET /projects/:projectId/repositories/:repositoryId/branch-cache` 查询快照，使用该路径的 `POST /refresh` 重新探测。状态有 `PENDING`、`CURRENT`、`STALE` 和 `ERROR`。同一仓库探测失败时保留上次成功分支，切换仓库地址或凭据会清除旧快照。
 
 ### 发布保护与回滚
 
@@ -323,7 +294,7 @@ Pipeline 定义、四种组合、目录保护和环境覆盖规则见 [构建部
 | `POST` | `/deployments/:id/rollback/preview` | 预览使用历史发布快照回滚的范围，返回 `confirmationHash`。 |
 | `POST` | `/deployments/:id/rollback` | 提交预览的 `confirmationHash` 开始回滚，返回可能仍待审批的任务。 |
 
-Pipeline 和产物部署预览的 `requireApproval` 表示部署是否需要管理员批准。部署任务的 `approvalStatus` 为 `PENDING`、`APPROVED` 或 `null`。`GET /deployments` 提供 `isCurrent`、`rollbackAvailable`、`rollbackOfDeploymentId` 和关联任务 ID。
+执行流发布预览的 `requireApproval` 表示部署是否需要管理员批准。部署任务的 `approvalStatus` 为 `PENDING`、`APPROVED` 或 `null`。`GET /deployments` 提供 `isCurrent`、`rollbackAvailable`、`rollbackOfDeploymentId` 和关联任务 ID。
 
 ### 产物保留
 
@@ -352,7 +323,7 @@ Pipeline 和产物部署预览的 `requireApproval` 表示部署是否需要管�
 | POST         | /ai/chat                       | `{message,conversationId?,projectId?,providerId?,context?}`。响应包含生效的项目、服务、页面上下文、消息、提案、任务和草稿 |
 | GET          | /ai/services/:serviceId/environments/:environmentId/failure-handling | 返回该服务环境的配置及最近的故障记录。可用 `taskId` 限定到一次失败 |
 | PATCH        | /ai/services/:serviceId/environments/:environmentId/failure-handling | 管理员设置 `{enabled,component?}`。组件可选 `docker`、`compose`、`node`、`nginx`，省略或传 null 表示仅诊断 |
-| POST         | /ai/repository-analysis        | 管理员或操作员按 `{projectId,repositoryId,serviceId?,environmentId?,branch?,commitSha?,docPath?,repoPath?,pipeline?}` 读取仓库证据并生成草稿。`pipeline` 可指定 `{buildLocation,artifactType,defaultMode}`。响应包含固定提交、证据路径、待补字段和节点草稿 |
+| POST         | /ai/repository-analysis        | 管理员或操作员按 `{projectId,repositoryId,serviceId?,environmentId?,branch?,commitSha?,docPath?,repoPath?}` 读取仓库证据，响应包含固定提交、证据路径和配置建议 |
 | GET          | /ai/conversations              | 仅当前用户的会话                                                                                                           |
 | GET          | /ai/conversations/:id/messages | 仅会话发起者可读                                                                                                           |
 | GET          | /ai/proposals                  | 当前用户的执行提案                                                                                                         |
@@ -365,11 +336,10 @@ Pipeline 和产物部署预览的 `requireApproval` 表示部署是否需要管�
 
 API Key 不回显，更新时省略 Key 表示保留。AI 为空或禁用不会影响手工运维。策略与工具限制见 [AI 说明](AI工具与权限.md)。
 
-`context.kind` 支持 `SERVICE`、`REPOSITORY`、`PIPELINE`、`TASK`、`OPERATION_PLAN`。分别使用 `serviceId`、`repositoryId`、`pipelineId`、`taskId`、`operationPlanId` 绑定页面对象。仓库可附完整 `commitSha` 和同项目的 `serviceId`。运维方案可附正整数 `version`。后续轮次只需传 `conversationId`，更换已绑定对象会返回 400。提案超出当前资源范围或执行权限时，列表中的 `scopeRevoked` 为 true，执行参数和预览均为空，发起人仍可放弃提案。
+`context.kind` 支持 `SERVICE`、`REPOSITORY`、`TASK`、`OPERATION_PLAN`。分别使用 `serviceId`、`repositoryId`、`taskId`、`operationPlanId` 绑定页面对象。仓库可附完整 `commitSha` 和同项目的 `serviceId`。运维方案可附正整数 `version`。后续轮次只需传 `conversationId`，更换已绑定对象会返回 400。提案超出当前资源范围或执行权限时，列表中的 `scopeRevoked` 为 true，执行参数和预览均为空，发起人仍可放弃提案。
 
 仓库分析省略 `commitSha` 时固定远端默认分支的完整提交，返回证据路径、技术栈、服务线索、草稿和缺失字段。巡检通过固定 SSH 查询采集目标环境，诊断只返回结构化故障分类与失败步骤。
 
-完全控制策略可用 `approvedPipelineHashes` 授权 Pipeline 预览返回的 `aiApprovalHash`，它绑定版本、提交、执行模式、环境、目标和有效配置。源码写入使用 `repositoryIds` 授权仓库。评审分支和 PR 是两个写步骤。确认使用提案接口，源码步骤返回 `sourceChange`，任务步骤返回 `task`。
 
 备份恢复由[维护命令](BACKUP.md)提供。
 

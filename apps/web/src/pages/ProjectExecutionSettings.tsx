@@ -33,7 +33,7 @@ export function ExecutionSettingsFields({
     system ? '继承系统 · ' + settingValue(key, system[key]) : undefined;
   return (
     <div className="form-grid">
-      <Field label={labels.defaultBuildLocation} hint="流水线未指定构建位置时使用。">
+      <Field label={labels.defaultBuildLocation} hint="执行流未指定构建位置时使用。">
         <select
           name="defaultBuildLocation"
           defaultValue={values.defaultBuildLocation ?? ''}

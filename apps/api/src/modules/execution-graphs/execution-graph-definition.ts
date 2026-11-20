@@ -1,6 +1,6 @@
 import { BadRequestException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
-import { Type } from 'class-transformer';
+import { plainToInstance, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayMinSize,
@@ -22,6 +22,8 @@ import {
 } from 'class-validator';
 import { isGitBranchName } from '../projects/git-ref';
 import { redactTaskLog } from '../tasks/task-log.service';
+import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
+import { safeDeployPath, validateDefinition } from '../pipelines/pipeline.validation';
 
 const idFormat = /^[A-Za-z0-9_-]{1,64}$/;
 const maxFlows = 50;
@@ -93,10 +95,97 @@ class GraphShell {
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(10_000) command?: string;
 }
 
+export const graphFlowPresets = [
+  'CUSTOM',
+  'BUILD',
+  'DEPLOY',
+  'BUILD_DEPLOY',
+  'VERIFY',
+  'MAINTENANCE',
+  'RELEASE_REVIEW',
+] as const;
+
+export class GraphBuildSettings {
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() repositoryId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @Length(1, 255) branch?: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(commitFormat) commitSha?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsIn(['TARGET', 'MANAGER']) buildLocation?:
+    'TARGET' | 'MANAGER';
+  @ValidateIf((_o, v) => v !== undefined) @IsIn(['FILE', 'DOCKER_IMAGE']) artifactType?:
+    'FILE' | 'DOCKER_IMAGE';
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(200) buildImage?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(300) repoPath?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(65536) installCommand?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(65536) buildCommand?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(300) outputPath?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(300) dockerfilePath?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(250) imageRepository?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() registryId?: string;
+}
+
+export class GraphDeploySettings {
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) deployPath?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(300) composeFilePath?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(65536) startCommand?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(65536) stopCommand?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(65536) healthCheckCommand?: string;
+}
+
+export class GraphFlowPreset {
+  @IsIn(graphFlowPresets) kind!: (typeof graphFlowPresets)[number];
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() serviceId?: string;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphBuildSettings)
+  build?: GraphBuildSettings;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphDeploySettings)
+  deploy?: GraphDeploySettings;
+}
+
+function validatePreset(flow: GraphFlow, ordered: GraphNode[], canvas: boolean) {
+  const preset = ordered[0]?.delivery;
+  if (!preset && !canvas) return;
+  const builds = preset?.kind === 'BUILD' || preset?.kind === 'BUILD_DEPLOY';
+  const deploys = preset?.kind === 'DEPLOY' || preset?.kind === 'BUILD_DEPLOY';
+  const build = ordered.filter(({ type }) => type === 'BUILD');
+  const deploy = ordered.filter(({ type }) => type === 'DEPLOY_ARTIFACT');
+  if (build.length !== Number(builds) || deploy.length !== Number(deploys))
+    throw new BadRequestException(`「${flow.name}」的构建和部署节点须与开始节点选择的流程预设一致`);
+  if ((builds || deploys) && !preset?.serviceId)
+    throw new BadRequestException(`「${flow.name}」须在开始节点选择项目服务`);
+  if ((preset?.build && !builds) || (preset?.deploy && !deploys))
+    throw new BadRequestException('交付配置须与开始节点所选预设一致');
+  const config = preset?.build;
+  if (builds) {
+    if (!config?.repositoryId) throw new BadRequestException('构建流须选择项目仓库');
+    if (config.branch && (!isGitBranchName(config.branch) || config.commitSha))
+      throw new BadRequestException('请选择有效分支或固定提交 SHA');
+    validateDefinition(plainToInstance(PipelineDefinitionDto, config), false);
+  }
+  if (preset?.deploy?.deployPath) safeDeployPath(preset.deploy.deployPath);
+  if (builds && deploys) {
+    const reachable = new Set([build[0]!.id]);
+    for (const { id } of ordered)
+      if (reachable.has(id))
+        for (const edge of flow.edges) if (edge.from === id) reachable.add(edge.to);
+    if (!reachable.has(deploy[0]!.id))
+      throw new BadRequestException('构建并部署预设须将构建连到下游部署节点');
+  }
+}
+
 export class GraphNode {
   @Matches(idFormat) id!: string;
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
   @IsIn(nodeTypes) type!: (typeof nodeTypes)[number];
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphFlowPreset)
+  delivery?: GraphFlowPreset;
   @ValidateIf((_o, v) => v !== undefined)
   @IsString()
   @Length(1, 2000)
@@ -388,15 +477,22 @@ export function validateGraphDefinition(definition: GraphDefinition) {
       );
     const references = { nodeCount: flow.nodes.length, children: [] as string[] };
     calls.set(flow.id, references);
-    for (const node of orderedFlowNodes(flow)) {
+    const ordered = orderedFlowNodes(flow);
+    const preset = ordered[0]?.delivery;
+    validatePreset(flow, ordered, Boolean(definition.canvas));
+    for (const node of ordered) {
       if (!definition.canvas && nodeIds.has(node.id))
         throw new BadRequestException('同一图版本中的节点 ID 必须唯一');
       nodeIds.add(node.id);
       validateAdvancedNode(node);
+      if (node.delivery && node.type !== 'START')
+        throw new BadRequestException('流程预设只能声明在开始节点');
       const action = node.type === 'BUILD' || node.type === 'DEPLOY_ARTIFACT';
       if (action) {
-        if (!node.pipelineId || !node.pipelineVersion)
-          throw new BadRequestException('交付节点须选择流水线和固定版本');
+        if ((preset || definition.canvas) && (node.pipelineId || node.pipelineVersion))
+          throw new BadRequestException('交付节点从开始节点获取构建与部署配置');
+        if (!preset && !definition.canvas && (!node.pipelineId || !node.pipelineVersion))
+          throw new BadRequestException('交付节点须配置服务和固定交付定义');
       } else if (node.pipelineId !== undefined || node.pipelineVersion !== undefined) {
         throw new BadRequestException('流水线引用仅适用于构建或部署节点');
       }

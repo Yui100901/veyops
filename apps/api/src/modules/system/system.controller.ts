@@ -32,7 +32,7 @@ class SystemController {
       workerEnabled: process.env.WORKER_ENABLED !== 'false',
       ...(await this.settings.get()),
       defaultAiPermission: 'CONFIRM',
-      stage: 'Pipeline、构建部署与可选 AI',
+      stage: '项目执行图、构建部署与可选 AI',
       features: {
         authentication: true,
         credentials: true,
