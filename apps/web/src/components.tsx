@@ -230,7 +230,7 @@ export function Form({
   busy?: boolean;
   submit?: string;
   submitDisabled?: boolean;
-  onCancel: () => void;
+  onCancel?: () => void;
   error?: string;
 }) {
   return (
@@ -240,9 +240,11 @@ export function Form({
         <ErrorBanner error={error} />
       </div>
       <div className="modal-footer">
-        <button className="button secondary" type="button" onClick={onCancel} disabled={busy}>
-          取消
-        </button>
+        {onCancel && (
+          <button className="button secondary" type="button" onClick={onCancel} disabled={busy}>
+            取消
+          </button>
+        )}
         <button className="button primary" type="submit" disabled={busy || submitDisabled}>
           {busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
           {busy ? '正在处理…' : submit}

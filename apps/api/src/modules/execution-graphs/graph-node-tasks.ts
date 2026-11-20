@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
 import { lstat } from 'node:fs/promises';
 import { posix } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import type { Database } from '../../core/database/schema';
 import { DatabaseService } from '../../core/database/database.service';
 import {
@@ -28,6 +29,14 @@ import { ServiceConfigsService } from '../service-configs/service-configs.servic
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import type { CreateTaskInput, TaskExecutionContext, TaskRecord } from '../tasks/tasks.types';
 import type { GraphNode } from './execution-graph-definition';
+import {
+  environmentFilePath,
+  graphVariableSources,
+  type GraphEnvironmentFileSource,
+  type GraphEnvironmentPlan,
+  type GraphEnvironmentSource,
+  type GraphVariableSource,
+} from './graph-environment';
 import {
   createGraphWorkspace,
   graphTriggerVariables,
@@ -68,8 +77,15 @@ export type GraphNodePlan =
       serviceId?: string;
       environmentId?: string;
       environment?: ExecutionVariables;
+      variableSources?: GraphVariableSource[];
+      environmentFile?: GraphEnvironmentPlan;
     }
-  | { type: 'LOAD_ENV' }
+  | {
+      type: 'LOAD_ENV';
+      environmentId?: string;
+      environmentFile?: GraphEnvironmentPlan;
+      variables?: GraphVariableSource[];
+    }
   | { type: 'REGISTER_ARTIFACT'; declarations: NamedArtifactDefinition[] };
 
 export interface GraphModulePayload {
@@ -82,6 +98,7 @@ export interface GraphModulePayload {
   variables?: GraphEnvironmentRef;
   targetDirectory?: string;
   envFile?: string;
+  environmentFile?: GraphEnvironmentPlan;
   shell?: {
     command: string;
     timeout: number;
@@ -104,6 +121,10 @@ const workspaceOf = (value: unknown) =>
   typeof value.nodeRunId === 'string'
     ? (value as GraphWorkspaceRef)
     : undefined;
+const sourceOf = (value: unknown) =>
+  value && typeof value === 'object' ? (value as GraphEnvironmentSource) : undefined;
+const variablesOf = (value: unknown) =>
+  value && typeof value === 'object' ? (value as GraphEnvironmentRef) : undefined;
 
 @Injectable()
 export class GraphNodeTasks implements OnModuleInit {
@@ -133,6 +154,73 @@ export class GraphNodeTasks implements OnModuleInit {
     });
   }
 
+  async prepareEnvironment(
+    projectId: string,
+    options: {
+      environmentId?: string;
+      source?: GraphEnvironmentSource;
+      directory?: string;
+      envFile?: string;
+    },
+  ): Promise<GraphEnvironmentPlan | undefined> {
+    const environment = options.environmentId
+      ? await this.database.db
+          .selectFrom('environments')
+          .select(['slug', 'repository_env_file'])
+          .where('id', '=', options.environmentId)
+          .where('project_id', '=', projectId)
+          .where('archived_at', 'is', null)
+          .executeTakeFirst()
+      : undefined;
+    if (options.environmentId && !environment)
+      throw new BadRequestException('环境必须属于当前项目');
+    const directory = options.directory ? relativePath(options.directory) : '.';
+    const explicit = options.envFile
+      ? environmentFilePath(posix.join(directory, relativePath(options.envFile)))
+      : undefined;
+    const configured = environment?.repository_env_file;
+    const source: GraphEnvironmentFileSource = explicit
+      ? 'NODE'
+      : configured
+        ? 'ENVIRONMENT'
+        : 'CONVENTION';
+    const required = source !== 'CONVENTION';
+    const { repositoryId, commitSha, branch, tag } = options.source ?? {};
+    const origin = { repositoryId, commitSha, branch, tag };
+    if (!repositoryId || !commitSha) {
+      if (required) throw new BadRequestException('加载仓库环境文件需要绑定固定提交的 Git 源码');
+      return undefined;
+    }
+    const candidates = explicit
+      ? [explicit]
+      : configured
+        ? [environmentFilePath(configured)]
+        : [
+            ...(environment ? [posix.join(directory, '.env.' + environment.slug)] : []),
+            posix.join(directory, '.env'),
+          ];
+    const entry = await this.repositories.inspectGraphEnvironmentFile(
+      projectId,
+      { repositoryId, commitSha },
+      candidates,
+    );
+    if (!entry) {
+      if (required)
+        throw new BadRequestException('固定 Git 提交中缺少必需的环境文件 ' + candidates[0]);
+      return { ...origin, status: 'SKIPPED', source, required, variables: [] };
+    }
+    return {
+      ...origin,
+      repositoryId,
+      commitSha,
+      status: 'PINNED',
+      source,
+      path: entry.path,
+      required,
+      variables: entry.keys.map((key) => ({ key, source: 'FILE', isSecret: true })),
+    };
+  }
+
   async prepare(projectId: string, node: GraphNode, scope: GraphNodeScope): Promise<GraphNodePlan> {
     const values = scope.values ?? {};
     if (node.type === 'CHECKOUT') {
@@ -160,15 +248,48 @@ export class GraphNodeTasks implements OnModuleInit {
         }),
       };
     }
-    if (node.type === 'LOAD_ENV') return { type: 'LOAD_ENV' };
+    if (node.type === 'LOAD_ENV') {
+      const workspace = sourceOf(values.workspace);
+      const source = sourceOf(values.source);
+      if (
+        source?.repositoryId &&
+        workspace?.repositoryId &&
+        (source.repositoryId !== workspace.repositoryId || source.commitSha !== workspace.commitSha)
+      )
+        throw new BadRequestException('环境文件所绑定的源码与工作区来自不同 Git 提交');
+      const environmentId = resourceId(values.environment) ?? scope.environmentId;
+      const environmentFile = await this.prepareEnvironment(projectId, {
+        environmentId,
+        source: workspace?.repositoryId ? workspace : source,
+        directory: node.loadEnvironment?.directory,
+        envFile: node.loadEnvironment?.envFile,
+      });
+      const configured = await this.configs.resolveVariables(
+        projectId,
+        environmentId,
+        scope.serviceId,
+      );
+      return {
+        type: 'LOAD_ENV',
+        environmentId,
+        environmentFile,
+        variables: graphVariableSources(environmentFile, configured.variableSources),
+      };
+    }
     if (node.type === 'REGISTER_ARTIFACT')
       return { type: 'REGISTER_ARTIFACT', declarations: node.registerArtifacts?.artifacts ?? [] };
     if (node.type !== 'SHELL' && node.type !== 'CHECK')
       throw new BadRequestException('不支持的功能节点');
 
     const serviceId = resourceId(values.service) ?? scope.serviceId;
-    const environmentId = resourceId(values.environment) ?? scope.environmentId;
-    const environment = await this.configs.resolveVariables(projectId, environmentId, serviceId);
+    const variableRef = variablesOf(values.variables);
+    const environmentId =
+      resourceId(values.environment) ?? variableRef?.environmentId ?? scope.environmentId;
+    const { variableSources: configured, ...environment } = await this.configs.resolveVariables(
+      projectId,
+      environmentId,
+      serviceId,
+    );
     const targetValue = values.targets;
     const serverId = node.shell?.serverId;
     const selection = targetValue
@@ -178,7 +299,26 @@ export class GraphNodeTasks implements OnModuleInit {
       : serverId
         ? { serverIds: [serverId] }
         : undefined;
-    const base = { type: node.type, serviceId, environmentId, environment };
+    const boundParameters = (node.shell?.params ?? []).filter(
+      (field) => values[field.id] !== undefined,
+    );
+    const variableSources = graphVariableSources(
+      variableRef?.environmentFile,
+      configured,
+      boundParameters.map(({ id, type }) => ({
+        key: id,
+        source: 'NODE',
+        isSecret: type === 'CREDENTIAL',
+      })),
+    );
+    const base = {
+      type: node.type,
+      serviceId,
+      environmentId,
+      environment,
+      variableSources,
+      environmentFile: variableRef?.environmentFile,
+    };
     if (node.shell?.location === 'MANAGER' || !selection) return base;
     const target = await this.targets.preview(selection);
     if (target.targets.length !== 1)
@@ -244,6 +384,25 @@ export class GraphNodeTasks implements OnModuleInit {
       };
     }
     if (plan.type === 'LOAD_ENV') {
+      if (plan.variables) {
+        if (plan.environmentId !== environmentId)
+          throw new ConflictException('环境节点实际环境与已确认计划不一致');
+        if (plan.environmentFile?.status === 'PINNED') {
+          const source = workspace?.repositoryId ? workspace : sourceOf(values.source);
+          if (
+            source?.repositoryId !== plan.environmentFile.repositoryId ||
+            source.commitSha !== plan.environmentFile.commitSha
+          )
+            throw new ConflictException('环境节点实际源码与已确认计划不一致');
+        }
+        return {
+          ...base,
+          payload: {
+            ...base.payload,
+            graphModule: { ...settings, environmentFile: plan.environmentFile },
+          },
+        };
+      }
       let envFile = node.loadEnvironment?.envFile;
       const directory = node.loadEnvironment?.directory;
       if (envFile && directory)
@@ -366,7 +525,14 @@ export class GraphNodeTasks implements OnModuleInit {
           confirmed: true,
         })
       : [];
-    const variableRef = environmentRef;
+    const variableRef = variablesOf(environmentRef);
+    if (
+      plan.variableSources &&
+      (plan.environmentId !== environmentId ||
+        plan.serviceId !== serviceId ||
+        !isDeepStrictEqual(plan.environmentFile, variableRef?.environmentFile))
+    )
+      throw new ConflictException('脚本节点实际环境与已确认计划不一致');
     const file =
       variableRef &&
       typeof variableRef === 'object' &&
@@ -374,8 +540,9 @@ export class GraphNodeTasks implements OnModuleInit {
       'envFile' in variableRef
         ? { workspace: workspaceOf(variableRef.workspace), envFile: text(variableRef.envFile) }
         : undefined;
-    const variables =
-      file?.workspace && file.envFile
+    const variables: GraphEnvironmentRef | undefined = plan.environmentFile
+      ? { environmentFile: plan.environmentFile, environmentId }
+      : file?.workspace && file.envFile
         ? {
             workspace: await this.repositoryWorkspace(projectId, file.workspace),
             envFile: relativePath(file.envFile),
@@ -471,6 +638,7 @@ export class GraphNodeTasks implements OnModuleInit {
         variables: {
           workspace: module.workspace,
           envFile: module.envFile,
+          environmentFile: module.environmentFile,
           environmentId: module.environmentId,
         } satisfies GraphEnvironmentRef,
       };
@@ -507,8 +675,15 @@ export class GraphNodeTasks implements OnModuleInit {
 
     const shell = module.shell!;
     const parameters = await resolveExecutionVariables(this.credentials, shell.parameters);
+    const scoped = this.shellSnapshot(task, module);
+    const inherited = (variables: Record<string, string>) =>
+      Object.fromEntries(
+        Object.entries(variables).filter(([key]) => !Object.hasOwn(parameters.values, key)),
+      );
     const snapshot = {
-      ...this.shellSnapshot(task, module),
+      ...scoped,
+      variables: inherited(scoped.variables),
+      secretVariables: inherited(scoped.secretVariables),
       graph: module.variables
         ? { runId: '', nodeRunId: '', variables: module.variables }
         : undefined,

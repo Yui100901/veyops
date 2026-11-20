@@ -3402,6 +3402,7 @@ tbody tr:hover {
   background: #e8eef0;
 }
 .record-tabs a,
+.resource-section-switcher a,
 .resource-section-switcher button {
   display: flex;
   align-items: center;
@@ -3415,11 +3416,13 @@ tbody tr:hover {
   font-size: 14px;
 }
 .record-tabs a:hover,
+.resource-section-switcher a:hover,
 .resource-section-switcher button:hover {
   color: var(--accent-dark);
   background: #f7faf9;
 }
 .record-tabs a.active,
+.resource-section-switcher a[aria-current='page'],
 .resource-section-switcher button[aria-pressed='true'] {
   color: var(--accent-dark);
   background: white;

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { executionGraphsMigration } from './execution-graphs-migration';
 import { executionGraphTriggersMigration } from './execution-graph-triggers-migration';
 import {
@@ -1589,6 +1590,88 @@ export const migrationProvider: MigrationProvider = {
             await db.schema.alterTable(table).dropColumn('archived_at').execute();
         },
       } satisfies Migration,
+      '024_environment_execution_settings': {
+        async up(db) {
+          await db.schema
+            .alterTable('environments')
+            .addColumn('default_target_selection_json', 'text')
+            .execute();
+          await createServiceVariablesTable(db, true);
+          await sql`insert into service_environment_variables_next
+            (id, service_id, environment_id, key, value_text, credential_id, is_secret, description, created_at, updated_at)
+            select v.id, c.service_id, c.environment_id, v.key, v.value_text, v.credential_id,
+              v.is_secret, v.description, v.created_at, v.updated_at
+            from service_environment_variables v join service_environment_configs c on c.id = v.config_id`.execute(
+            db,
+          );
+          await db.schema.dropTable('service_environment_variables').execute();
+          await db.schema
+            .alterTable('service_environment_variables_next')
+            .renameTo('service_environment_variables')
+            .execute();
+        },
+        async down(db) {
+          await createServiceVariablesTable(db, false);
+          const missing = await sql<{ service_id: string; environment_id: string }>`
+            select distinct v.service_id, v.environment_id
+            from service_environment_variables v left join service_environment_configs c
+              on c.service_id = v.service_id and c.environment_id = v.environment_id
+            where c.id is null`.execute(db);
+          const now = Date.now();
+          for (const { service_id, environment_id } of missing.rows) {
+            await sql`insert into service_environment_configs
+              (id, service_id, environment_id, created_at, updated_at)
+              values (${randomUUID()}, ${service_id}, ${environment_id}, ${now}, ${now})`.execute(
+              db,
+            );
+          }
+          await sql`insert into service_environment_variables_previous
+            (id, config_id, key, value_text, credential_id, is_secret, description, created_at, updated_at)
+            select v.id, c.id, v.key, v.value_text, v.credential_id, v.is_secret,
+              v.description, v.created_at, v.updated_at
+            from service_environment_variables v join service_environment_configs c
+              on c.service_id = v.service_id and c.environment_id = v.environment_id`.execute(db);
+          await db.schema.dropTable('service_environment_variables').execute();
+          await db.schema
+            .alterTable('service_environment_variables_previous')
+            .renameTo('service_environment_variables')
+            .execute();
+          await db.schema
+            .alterTable('environments')
+            .dropColumn('default_target_selection_json')
+            .execute();
+        },
+      } satisfies Migration,
     };
   },
 };
+
+async function createServiceVariablesTable(db: Kysely<unknown>, independent: boolean) {
+  const legacy = tables.find((table) => table.name === 'service_environment_variables')!;
+  const now = Date.now();
+  await createTables(
+    db,
+    [
+      {
+        name: independent
+          ? 'service_environment_variables_next'
+          : 'service_environment_variables_previous',
+        columns: [
+          ...legacy.columns.filter(([name]) => !independent || name !== 'config_id'),
+          ...(independent
+            ? ([
+                ['service_id', 'text', { references: 'services.id' }],
+                ['environment_id', 'text', { references: 'environments.id' }],
+              ] as const)
+            : []),
+          ['description', 'text', { default: '' }],
+          ['created_at', 'bigint', { default: now }],
+          ['updated_at', 'bigint', { default: now }],
+        ],
+        unique: independent ? [['service_id', 'environment_id', 'key']] : legacy.unique,
+        checks: legacy.checks,
+      },
+    ],
+    [],
+  );
+}

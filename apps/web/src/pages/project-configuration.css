@@ -1,0 +1,65 @@
+.project-configuration {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.project-configuration > .panel {
+  min-width: 0;
+  margin-block: 0;
+}
+
+.project-policy-summary {
+  min-width: 0;
+  margin-bottom: 18px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f6faf8;
+  overflow-wrap: anywhere;
+}
+
+.project-policy-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.project-policy-heading > svg {
+  color: var(--accent);
+  flex: none;
+}
+
+.project-policy-heading > a {
+  margin-inline-start: auto;
+}
+
+.project-policy-summary dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(185px, 100%), 1fr));
+  gap: 10px 16px;
+  margin: 12px 0 0;
+}
+
+.project-policy-summary dt {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.project-policy-summary dd {
+  margin: 4px 0 0;
+}
+
+.project-policy-summary .advanced-options {
+  margin: 12px 0 0;
+}
+
+.project-policy-summary ul {
+  padding-inline-start: 20px;
+  margin-block: 8px 0;
+}
+
+.policy-resource-option small {
+  overflow-wrap: anywhere;
+}

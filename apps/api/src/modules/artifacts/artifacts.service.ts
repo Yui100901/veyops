@@ -185,6 +185,16 @@ export class ArtifactsService {
       .leftJoin('pipeline_runs', 'pipeline_runs.id', 'artifacts.pipeline_run_id')
       .leftJoin('pipeline_versions', 'pipeline_versions.id', 'pipeline_runs.pipeline_version_id')
       .leftJoin('tasks', 'tasks.id', 'pipeline_runs.task_id')
+      .leftJoin('execution_flow_runs as flow', (join) =>
+        join
+          .onRef('flow.id', '=', 'artifacts.graph_run_id')
+          .onRef('flow.project_id', '=', 'artifacts.project_id'),
+      )
+      .leftJoin('execution_node_runs as node', (join) =>
+        join
+          .onRef('node.id', '=', 'artifacts.graph_node_run_id')
+          .onRef('node.run_id', '=', 'flow.id'),
+      )
       .selectAll('artifacts')
       .select([
         'pipeline_runs.pipeline_id as pipelineId',
@@ -195,6 +205,9 @@ export class ArtifactsService {
         'pipeline_runs.target_selection_json as targetSelectionJson',
         'tasks.payload_json as sourceTaskPayload',
         'tasks.status as taskStatus',
+        'flow.version as graphVersion',
+        'flow.flow_name as graphFlowName',
+        'node.name as graphNodeName',
       ]);
     if (projectId) query = query.where('artifacts.project_id', '=', projectId);
     if (pipelineRunId) query = query.where('artifacts.pipeline_run_id', '=', pipelineRunId);
@@ -226,6 +239,9 @@ export class ArtifactsService {
       kind: r.artifact_kind ?? r.artifact_type,
       graphRunId: r.graph_run_id,
       graphNodeRunId: r.graph_node_run_id,
+      graphVersion: r.graphVersion,
+      graphFlowName: r.graphFlowName,
+      graphNodeName: r.graphNodeName,
       storageType: r.storage_type,
       storageKey: r.storage_key,
       downloadAvailable: r.pruned_at === null && Boolean(archiveKey(r)),

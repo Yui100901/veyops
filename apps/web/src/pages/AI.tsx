@@ -33,8 +33,9 @@ import {
   Section,
   Status,
 } from '../components';
-import type { Project, Server, Task, User } from '../models';
+import type { Project, Repository, Server, Task, User } from '../models';
 import { ActionRules, ModelRouting, type ActionRule } from './AIControls';
+import './project-configuration.css';
 
 interface AIProvider {
   id: string;
@@ -54,6 +55,7 @@ interface AIPolicy {
   serverIds?: string[];
   projectIds?: string[];
   repositoryIds?: string[];
+  approvedPipelineHashes?: string[];
   allowedActions?: string[];
   deniedActions?: string[];
   requireConfirmActions?: string[];
@@ -368,7 +370,15 @@ export function AISettings({ user }: { user: User }) {
   );
 }
 
-export function ProjectAISettings({ user, projectId }: { user: User; projectId: string }) {
+export function ProjectAISettings({
+  user,
+  projectId,
+  repositories,
+}: {
+  user: User;
+  projectId: string;
+  repositories: Repository[];
+}) {
   const policies = useResource<Policies>('/ai/policies');
   const servers = useResource<Server[]>('/servers');
   return (
@@ -378,7 +388,8 @@ export function ProjectAISettings({ user, projectId }: { user: User; projectId: 
       projectId={projectId}
       policies={policies.data}
       error={policies.error || servers.error}
-      servers={servers.data ?? []}
+      servers={servers.data}
+      repositories={repositories}
       onSaved={policies.reload}
     />
   );
@@ -483,6 +494,203 @@ function ProviderEditor({
     </InlineEditor>
   );
 }
+function policyIds(value: string) {
+  return [
+    ...new Set(
+      value
+        .trim()
+        .split(/[\s,]+/)
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function ProjectPolicySummary({
+  projectId,
+  system,
+  project,
+  mode,
+  servers,
+  repositories,
+}: {
+  projectId: string;
+  system: AIPolicy;
+  project?: AIPolicy;
+  mode: AIMode;
+  servers?: Server[];
+  repositories?: Repository[];
+}) {
+  const scopes = project ? [system, project] : [system];
+  const projectAllowed = scopes.every(
+    ({ projectIds }) => !projectIds || projectIds.includes(projectId),
+  );
+  const serverAllowed = (id: string) =>
+    scopes.every((scope) => !scope.serverIds || scope.serverIds.includes(id));
+  const repositoryAllowed = (id: string) =>
+    scopes.every((scope) => !scope.repositoryIds || scope.repositoryIds.includes(id));
+  const expired = scopes.flatMap((scope, index) => {
+    const source = index === 0 ? '系统策略' : '项目策略';
+    const scopedServers = new Set([
+      ...(scope.serverIds ?? []),
+      ...(scope.actionRules ?? []).flatMap((rule) => (rule.serverId ? [rule.serverId] : [])),
+    ]);
+    return [
+      ...[...scopedServers]
+        .filter((id) => servers && !servers.some((server) => server.id === id))
+        .map((id) => ({ source, label: '服务器已移除或停用', id })),
+      ...[...new Set(scope.repositoryIds)]
+        .filter((id) => repositories && !repositories.some((repository) => repository.id === id))
+        .map((id) => ({ source, label: '当前项目无此仓库', id })),
+    ];
+  });
+  const showResources = (
+    items: { name: string }[] | undefined,
+    unrestricted: boolean,
+    all: string,
+  ) => {
+    if (!projectAllowed) return '无';
+    if (!items) return '等待资源列表';
+    if (!items.length) return '无';
+    if (unrestricted) return all;
+    return items.map((item) => item.name).join('、');
+  };
+  const denied = [...new Set(scopes.flatMap((scope) => scope.deniedActions ?? []))];
+  const actionLimits = scopes.flatMap(({ allowedActions }) =>
+    allowedActions ? [allowedActions] : [],
+  );
+  const allowed = [...new Set(actionLimits[0])].filter(
+    (action) => !denied.includes(action) && actionLimits.every((limit) => limit.includes(action)),
+  );
+  const approvals = [...new Set(scopes.flatMap((scope) => scope.requireConfirmActions ?? []))];
+  const conditionalRules = scopes.reduce(
+    (count, scope) => count + (scope.actionRules?.length ?? 0),
+    0,
+  );
+
+  return (
+    <div className="project-policy-summary">
+      <div className="project-policy-heading">
+        <ShieldCheck size={19} aria-hidden="true" />
+        <strong>{project ? '项目自定义策略' : '继承系统默认策略'}</strong>
+        <a className="text-link" href="#/settings">
+          查看系统策略
+        </a>
+      </div>
+      <dl>
+        <div>
+          <dt>生效模式</dt>
+          <dd>{modes.find((item) => item.value === mode)?.name}</dd>
+        </div>
+        <div>
+          <dt>项目权限</dt>
+          <dd>{projectAllowed ? '当前项目在授权范围内' : '当前项目超出授权范围'}</dd>
+        </div>
+        <div>
+          <dt>服务器范围</dt>
+          <dd>
+            {showResources(
+              servers?.filter(({ id }) => serverAllowed(id)),
+              scopes.every((scope) => !scope.serverIds),
+              '全部可用服务器',
+            )}
+          </dd>
+        </div>
+        <div>
+          <dt>仓库范围</dt>
+          <dd>
+            {showResources(
+              repositories?.filter(({ id }) => repositoryAllowed(id)),
+              scopes.every((scope) => !scope.repositoryIds),
+              '当前项目的全部仓库',
+            )}
+          </dd>
+        </div>
+        {denied.length > 0 && (
+          <div>
+            <dt>禁止的操作</dt>
+            <dd>{denied.map((action) => actionLabels[action] ?? action).join('、')}</dd>
+          </div>
+        )}
+        {actionLimits.length > 0 && (
+          <div>
+            <dt>策略允许的执行类别</dt>
+            <dd>{allowed.map((action) => actionLabels[action] ?? action).join('、') || '无'}</dd>
+          </div>
+        )}
+        {approvals.length > 0 && (
+          <div>
+            <dt>必须审批</dt>
+            <dd>{approvals.map((action) => actionLabels[action] ?? action).join('、')}</dd>
+          </div>
+        )}
+        {conditionalRules > 0 && (
+          <div>
+            <dt>条件规则</dt>
+            <dd>{conditionalRules} 条规则按执行时的角色和目标生效</dd>
+          </div>
+        )}
+      </dl>
+      {expired.length > 0 && (
+        <details
+          className="advanced-options"
+          open={expired.some(({ source }) => source === '项目策略') || undefined}
+        >
+          <summary>不可用于本项目的引用（{expired.length} 项）</summary>
+          <ul>
+            {expired.map(({ source, label, id }) => (
+              <li key={`${source}:${label}:${id}`}>
+                {source} · {label} <code>{id}</code>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function PolicyResourceOptions({
+  resources,
+  selected,
+  enabled,
+  resourceLabel,
+  onChange,
+}: {
+  resources: { id: string; name: string; host?: string }[];
+  selected: string[];
+  enabled: boolean;
+  resourceLabel: string;
+  onChange: (next: string[]) => void;
+}) {
+  const unavailable = [...new Set(selected)]
+    .filter((id) => !resources.some((resource) => resource.id === id))
+    .map((id) => ({ id, name: `不可用${resourceLabel}`, host: id }));
+  return (
+    <div className="scope-options">
+      {resources.length || unavailable.length ? (
+        [...resources, ...unavailable].map(({ id, name, host }) => (
+          <label className="checkbox-row policy-resource-option" key={id}>
+            <input
+              type="checkbox"
+              disabled={!enabled}
+              checked={selected.includes(id)}
+              onChange={(event) =>
+                onChange(
+                  event.target.checked ? [...selected, id] : selected.filter((item) => item !== id),
+                )
+              }
+            />
+            {name}
+            {host && <small>{host}</small>}
+          </label>
+        ))
+      ) : (
+        <p className="muted">暂无可选{resourceLabel}</p>
+      )}
+    </div>
+  );
+}
+
 function PolicyEditor({
   user,
   projectId,
@@ -490,6 +698,7 @@ function PolicyEditor({
   error,
   projects,
   servers,
+  repositories: projectRepositories,
   onSaved,
 }: {
   user: User;
@@ -497,7 +706,8 @@ function PolicyEditor({
   policies?: Policies;
   error?: string;
   projects?: Project[];
-  servers: Server[];
+  servers?: Server[];
+  repositories?: Repository[];
   onSaved: () => void;
 }) {
   const [mode, setMode] = useState<AIMode>('CONFIRM');
@@ -552,14 +762,10 @@ function PolicyEditor({
           mode,
           projectId,
           actionRules,
+          approvedPipelineHashes: policy?.approvedPipelineHashes,
           serverIds: restrictServers || mode === 'FULL_CONTROL' ? ids : undefined,
           projectIds: restrictProjects ? projectIds : undefined,
-          repositoryIds: restrictRepositories
-            ? repositories
-                .trim()
-                .split(/[\s,]+/)
-                .filter(Boolean)
-            : undefined,
+          repositoryIds: restrictRepositories ? policyIds(repositories) : undefined,
           allowedActions: restrictActions
             ? allowed
                 .split(',')
@@ -606,17 +812,15 @@ function PolicyEditor({
     >
       <form className="section-body" onSubmit={save}>
         <ErrorBanner error={error || saveError} />
-        {projectId && policies && (
-          <div className="confirmation-summary">
-            <ShieldCheck size={21} />
-            <div>
-              <strong>{policy ? '当前项目已自定义' : '当前项目继承系统默认'}</strong>
-              <p>生效模式 · {modes.find((item) => item.value === effectiveMode)?.name}</p>
-              <a className="text-link" href="#/settings">
-                查看系统默认与全局限制
-              </a>
-            </div>
-          </div>
+        {projectId && policies && effectiveMode && (
+          <ProjectPolicySummary
+            projectId={projectId}
+            system={policies.system}
+            project={policy}
+            mode={effectiveMode}
+            servers={servers}
+            repositories={projectRepositories}
+          />
         )}
         <fieldset disabled={user.role !== 'ADMIN' || busy || !policies}>
           <div className="ai-mode-options">
@@ -649,29 +853,34 @@ function PolicyEditor({
                 />
                 限定为选中的服务器
               </label>
-              <div className="scope-options">
-                {servers.length ? (
-                  servers.map((s) => (
-                    <label className="checkbox-row" key={s.id}>
-                      <input
-                        type="checkbox"
-                        disabled={!restrictServers && mode !== 'FULL_CONTROL'}
-                        checked={ids.includes(s.id)}
-                        onChange={(e) =>
-                          setIds(
-                            e.target.checked ? [...ids, s.id] : ids.filter((id) => id !== s.id),
-                          )
-                        }
-                      />
-                      {s.name}
-                      <small>{s.host}</small>
-                    </label>
-                  ))
-                ) : (
-                  <p className="muted">先接入服务器，再授予 AI 执行权限。</p>
-                )}
-              </div>
+              <PolicyResourceOptions
+                resources={servers ?? []}
+                selected={ids}
+                enabled={!!servers && (restrictServers || mode === 'FULL_CONTROL')}
+                resourceLabel="服务器"
+                onChange={setIds}
+              />
             </div>
+            {projectId && projectRepositories && (
+              <div>
+                <h3 className="field-title">允许的仓库范围</h3>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={restrictRepositories}
+                    onChange={(event) => setRestrictRepositories(event.target.checked)}
+                  />
+                  限定为选中的项目仓库
+                </label>
+                <PolicyResourceOptions
+                  resources={projectRepositories}
+                  selected={policyIds(repositories)}
+                  enabled={restrictRepositories}
+                  resourceLabel="仓库"
+                  onChange={(next) => setRepositories(next.join('\n'))}
+                />
+              </div>
+            )}
             {!projectId && projects && (
               <div>
                 <h3 className="field-title">允许的项目范围</h3>
@@ -708,7 +917,7 @@ function PolicyEditor({
           </div>
           <details className="advanced-options">
             <summary>操作规则</summary>
-            <ActionRules rules={actionRules} onChange={setActionRules} servers={servers} />
+            <ActionRules rules={actionRules} onChange={setActionRules} servers={servers ?? []} />
             <label className="checkbox-row">
               <input
                 type="checkbox"
@@ -740,23 +949,27 @@ function PolicyEditor({
                 placeholder="例如 execute_command"
               />
             </Field>
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={restrictRepositories}
-                onChange={(e) => setRestrictRepositories(e.target.checked)}
-              />
-              限制 AI 仓库范围
-            </label>
-            {restrictRepositories && (
-              <Field label="授权仓库 ID" hint="支持换行或逗号分隔。">
-                <textarea
-                  className="mono"
-                  rows={3}
-                  value={repositories}
-                  onChange={(e) => setRepositories(e.target.value)}
-                />
-              </Field>
+            {!projectRepositories && (
+              <>
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={restrictRepositories}
+                    onChange={(e) => setRestrictRepositories(e.target.checked)}
+                  />
+                  限制 AI 仓库范围
+                </label>
+                {restrictRepositories && (
+                  <Field label="授权仓库 ID" hint="支持换行或逗号分隔。">
+                    <textarea
+                      className="mono"
+                      rows={3}
+                      value={repositories}
+                      onChange={(e) => setRepositories(e.target.value)}
+                    />
+                  </Field>
+                )}
+              </>
             )}
           </details>
         </fieldset>

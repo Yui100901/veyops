@@ -2,9 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  changes: string[];
+  constructor(message: string, status: number, changes: string[] = []) {
     super(message);
     this.status = status;
+    this.changes = changes;
   }
 }
 
@@ -14,7 +16,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...options.headers },
   });
-  let body: { data?: T; error?: { message?: string }; message?: string };
+  let body: { data?: T; error?: { message?: string; changes?: unknown }; message?: string };
   try {
     body = await response.json();
   } catch {
@@ -26,6 +28,9 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     throw new ApiError(
       body.error?.message ?? body.message ?? `请求失败（${response.status}）`,
       response.status,
+      Array.isArray(body.error?.changes)
+        ? body.error.changes.filter((change): change is string => typeof change === 'string')
+        : [],
     );
   }
   return body.data as T;

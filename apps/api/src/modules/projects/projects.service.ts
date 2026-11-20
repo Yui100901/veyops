@@ -17,18 +17,22 @@ import {
   Req,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { Type } from 'class-transformer';
 import type { Selectable } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import {
   ArrayMaxSize,
   IsArray,
   IsIn,
+  IsObject,
   IsOptional,
   IsString,
   IsUUID,
   Matches,
   MaxLength,
   MinLength,
+  ValidateIf,
+  ValidateNested,
 } from 'class-validator';
 import { DatabaseService } from '../../core/database/database.service';
 import { initialGraphDraft } from '../../core/database/execution-graphs-migration';
@@ -43,6 +47,14 @@ import type { PipelineDefinition } from '../pipelines/pipeline.types';
 import { assertProjectResourceRemovable } from './project-resource-protection';
 import { projectResourceInventory } from './project-resource-references';
 import { relativePath } from '../pipelines/pipeline.validation';
+import {
+  DeploymentSelectionDto,
+  directDeploymentSelection,
+  selectedServerIds,
+  storedDeploymentSelection,
+  type DeploymentSelection,
+} from '../deployment-targets/deployment-selection';
+import { SystemSettingsService } from '../system/system-settings.service';
 import {
   lockProjectGraph,
   ProjectRelationsController,
@@ -80,12 +92,25 @@ class ServiceDto {
   @IsOptional() @IsString() @MaxLength(2000) description?: string;
 }
 class EnvironmentDto {
-  @IsString() @MinLength(1) @MaxLength(100) name!: string;
-  @IsString() @Matches(/^[a-z0-9][a-z0-9-]{0,62}$/) slug!: string;
-  @IsIn(['DEVELOPMENT', 'TESTING', 'STAGING', 'PRODUCTION', 'CUSTOM']) environmentType =
-    'DEVELOPMENT';
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(100)
+  name?: string;
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsString()
+  @Matches(/^[a-z0-9][a-z0-9-]{0,62}$/)
+  slug?: string;
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsIn(['DEVELOPMENT', 'TESTING', 'STAGING', 'PRODUCTION', 'CUSTOM'])
+  environmentType?: 'DEVELOPMENT' | 'TESTING' | 'STAGING' | 'PRODUCTION' | 'CUSTOM';
   @IsOptional() @IsString() @MaxLength(2000) description?: string;
   @IsOptional() @IsString() @MaxLength(300) repositoryEnvFile?: string | null;
+  @IsOptional()
+  @IsObject()
+  @ValidateNested()
+  @Type(() => DeploymentSelectionDto)
+  defaultTargetSelection?: DeploymentSelectionDto | null;
 }
 
 const repositoryDto = (row: Selectable<Database['repositories']>, cache = branchCache(row)) => ({
@@ -112,6 +137,7 @@ const environmentDto = (row: Selectable<Database['environments']>) => ({
   slug: row.slug,
   environmentType: row.environment_type,
   repositoryEnvFile: row.repository_env_file,
+  defaultTargetSelection: storedDeploymentSelection(row.default_target_selection_json) ?? null,
   description: row.description,
 });
 
@@ -126,6 +152,7 @@ export class ProjectsService {
     private readonly audit: AuditService,
     private readonly relations: ProjectRelationsService,
     private readonly metadata: RepositoryMetadataService,
+    private readonly settings: SystemSettingsService,
   ) {}
   async list(includeAddresses = false) {
     const db = this.database.db;
@@ -203,6 +230,38 @@ export class ProjectsService {
       repositories: repositories.map((row) => repositoryDto(row)),
       services: services.map(serviceDto),
       environments: environments.map(environmentDto),
+    };
+  }
+  async deliveryContext(id: string) {
+    const project = await this.get(id, true);
+    const db = this.database.db;
+    const [archivedServices, archivedEnvironments, archivedRepositories] = await Promise.all([
+      db
+        .selectFrom('services')
+        .select(['id', 'name'])
+        .where('project_id', '=', id)
+        .where('archived_at', 'is not', null)
+        .orderBy('name')
+        .execute(),
+      db
+        .selectFrom('environments')
+        .select(['id', 'name'])
+        .where('project_id', '=', id)
+        .where('archived_at', 'is not', null)
+        .orderBy('name')
+        .execute(),
+      db
+        .selectFrom('repositories')
+        .select('id')
+        .where('project_id', '=', id)
+        .where('archived_at', 'is not', null)
+        .execute(),
+    ]);
+    return {
+      ...project,
+      archivedServices,
+      archivedEnvironments,
+      archivedRepositories: archivedRepositories.map(({ id }) => id),
     };
   }
   async detail(id: string) {
@@ -488,6 +547,17 @@ export class ProjectsService {
     await requireProject(db, projectId);
     const now = Date.now();
     const id = environmentId ?? randomUUID();
+    if (!environmentId && (!dto.name || !dto.slug))
+      throw new BadRequestException('新环境必须设置名称和标识');
+    let selection: DeploymentSelection | undefined;
+    if (dto.defaultTargetSelection) {
+      const defaults = await this.settings.get(projectId);
+      selection = directDeploymentSelection(
+        dto.defaultTargetSelection,
+        defaults.defaultMaxParallelTargets,
+      );
+      if (!selection) throw new BadRequestException('请选择环境默认发布的服务器或服务器分组');
+    }
     const values = {
       name: dto.name,
       slug: dto.slug,
@@ -498,23 +568,43 @@ export class ProjectsService {
           : dto.repositoryEnvFile
             ? relativePath(dto.repositoryEnvFile)
             : null,
+      default_target_selection_json:
+        dto.defaultTargetSelection === undefined
+          ? undefined
+          : selection
+            ? JSON.stringify(selection)
+            : null,
       description: dto.description ?? undefined,
       updated_at: now,
     };
-    const row = await (
-      environmentId
-        ? db
-            .updateTable('environments')
-            .set(values)
-            .where('id', '=', id)
-            .where('project_id', '=', projectId)
-            .where('archived_at', 'is', null)
-        : db
-            .insertInto('environments')
-            .values({ id, project_id: projectId, created_at: now, ...values })
-    )
-      .returningAll()
-      .executeTakeFirst()
+    const row = await db
+      .transaction()
+      .execute(async (tx) => {
+        await lockProjectGraph(tx);
+        await requireProject(tx, projectId);
+        if (selection) await selectedServerIds(tx, selection);
+        return (
+          environmentId
+            ? tx
+                .updateTable('environments')
+                .set(values)
+                .where('id', '=', id)
+                .where('project_id', '=', projectId)
+                .where('archived_at', 'is', null)
+            : tx
+                .insertInto('environments')
+                .values({
+                  id,
+                  project_id: projectId,
+                  created_at: now,
+                  ...values,
+                  name: dto.name!,
+                  slug: dto.slug!,
+                })
+        )
+          .returningAll()
+          .executeTakeFirst();
+      })
       .catch((error: unknown) => {
         if (hasConstraint(error, 'SQLITE_CONSTRAINT_UNIQUE', '23505'))
           throw new ConflictException('该项目中环境标识已存在');
@@ -622,7 +712,7 @@ class ProjectsController {
     return this.service.detail(id);
   }
   @Get(':id/delivery-context') deliveryContext(@Param('id') id: string) {
-    return this.service.get(id, true);
+    return this.service.deliveryContext(id);
   }
   @Roles('ADMIN', 'OPERATOR') @Post() create(@Body() dto: ProjectDto, @Req() req: AuthRequest) {
     return this.service.create(dto, req.user.id);

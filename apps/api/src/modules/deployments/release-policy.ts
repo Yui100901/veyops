@@ -3,6 +3,8 @@ import type { Database } from '../../core/database/schema';
 import type { ReleasePolicy } from '../pipelines/pipeline.types';
 import type { PipelineSnapshot, PipelineTarget } from '../pipelines/pipeline.types';
 import { ConflictException } from '@nestjs/common';
+import { isDeepStrictEqual } from 'node:util';
+import { resolveDeliveryTargets } from '../pipelines/delivery-targets';
 import {
   selectedServerIds,
   storedDeploymentSelection,
@@ -60,20 +62,54 @@ export async function assertCurrentTargets(
   )
     throw new ConflictException('发布成员已变化，请重新预览并提交');
   const configured = storedDeploymentSelection(config?.target_selection_json);
-  const legacyId = config?.target_id ?? pipeline.targetId;
-  const currentIds = configured
-    ? await selectedServerIds(db, configured)
+  const canonical = pipeline.graphReleaseTargets;
+  const environment =
+    canonical &&
+    (await db
+      .selectFrom('environments')
+      .select('default_target_selection_json')
+      .where('id', '=', pipeline.environmentId)
+      .where('project_id', '=', pipeline.projectId)
+      .where('archived_at', 'is', null)
+      .executeTakeFirst());
+  if (canonical && !environment) throw new ConflictException('发布环境已变化，请重新预览并提交');
+  const target =
+    canonical &&
+    resolveDeliveryTargets('RELEASE', canonical.requested, {
+      service: configured,
+      environment: storedDeploymentSelection(environment?.default_target_selection_json),
+      legacyTargetId: config?.target_id,
+      parallel: canonical.defaultParallel,
+    });
+  if (
+    target &&
+    (target.source !== canonical.source ||
+      target.legacyId !== pipeline.targetId ||
+      !isDeepStrictEqual(target.selection, pipeline.targetSelection))
+  )
+    throw new ConflictException('发布目标配置已变化，请重新预览并提交');
+  const legacyId = target ? target.legacyId : (config?.target_id ?? pipeline.targetId);
+  const selection = target ? target.selection : configured;
+  const currentIds = selection
+    ? await selectedServerIds(db, selection)
     : legacyId
       ? (
           await db
             .selectFrom('deployment_target_servers')
             .select('server_id')
             .where('target_id', '=', legacyId)
+            .orderBy('sort_order')
             .execute()
         ).map((row) => row.server_id)
       : (snapshotIds ??
         (pipeline.targetSelection ? await selectedServerIds(db, pipeline.targetSelection) : []));
-  if (!currentIds.length) throw new ConflictException('发布成员已变化，请重新预览并提交');
+  if (
+    !currentIds.length ||
+    (canonical &&
+      !pipeline.rollbackOfDeploymentId &&
+      !isDeepStrictEqual(currentIds, pipeline.targetMemberIds ?? targets.map((item) => item.id)))
+  )
+    throw new ConflictException('发布成员已变化，请重新预览并提交');
   const current = await db
     .selectFrom('servers as server')
     .innerJoin('credentials as credential', 'credential.id', 'server.credential_id')

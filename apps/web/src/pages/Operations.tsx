@@ -23,7 +23,7 @@ import {
 } from '../components';
 import type { Task, TaskTarget, User } from '../models';
 import { TaskTable, taskTypeLabel } from './Dashboard';
-import { deliveryPath } from './delivery-route';
+import { deliveryPath, deliveryTaskReturn, readDeliveryScope } from './delivery-route';
 import { ContextAIButton } from './AI';
 import { FailureHandling } from './FailureHandling';
 import { RunArtifacts } from './Delivery';
@@ -140,7 +140,7 @@ export function TasksPage() {
   );
 }
 
-export function TaskPage({ id, user }: { id: string; user: User }) {
+export function TaskPage({ id, user, search }: { id: string; user: User; search?: string }) {
   const task = useResource<Task>(`/tasks/${id}`, 2000);
   const targets = useResource<TaskTarget[]>(`/tasks/${id}/targets`, 2000);
   const logs = useTaskLogs(id);
@@ -191,7 +191,13 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
   if (!task.data)
     return <ErrorBanner error={task.error || '找不到这个任务。'} retry={task.reload} />;
   const value = task.data;
-  const deliveryScope = { serviceId: value.serviceId, environmentId: value.environmentId };
+  const scope = readDeliveryScope(new URLSearchParams(search));
+  const deliveryScope = {
+    serviceId: value.serviceId,
+    environmentId: value.environmentId,
+    view: scope.view,
+  };
+  const returnToDelivery = value.projectId && deliveryTaskReturn(value.projectId, search);
   const analysis = value.result?.aiAnalysis;
   const failed = ['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION'].includes(
     value.status,
@@ -214,14 +220,20 @@ export function TaskPage({ id, user }: { id: string; user: User }) {
     <>
       <a
         href={
-          value.type === 'PIPELINE' && value.projectId
-            ? '#' + `/projects/${value.projectId}/execution-graph?pane=history`
-            : '#/tasks'
+          returnToDelivery
+            ? '#' + returnToDelivery
+            : value.type === 'PIPELINE' && value.projectId
+              ? '#' + `/projects/${value.projectId}/execution-graph?pane=history`
+              : '#/tasks'
         }
         className="back-link"
       >
         <ArrowLeft size={14} />
-        {value.type === 'PIPELINE' && value.projectId ? '返回项目执行记录' : '返回任务中心'}
+        {returnToDelivery
+          ? '返回交付记录'
+          : value.type === 'PIPELINE' && value.projectId
+            ? '返回项目执行记录'
+            : '返回任务中心'}
       </a>
       <PageHeader
         eyebrow="TASK DETAILS"

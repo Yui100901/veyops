@@ -6,7 +6,7 @@ import {
   OnModuleInit,
   Optional,
 } from '@nestjs/common';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { findLegacyWebhookTask } from './legacy-webhook-task';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
@@ -29,6 +29,7 @@ import {
   confirmDeploymentMembers,
   directDeploymentSelection,
   selectedServerIds,
+  storedDeploymentSelection,
 } from '../deployment-targets/deployment-selection';
 import type { CreateTaskInput, TaskPayload, TaskRecord, TaskStatus } from '../tasks/tasks.types';
 import {
@@ -56,6 +57,10 @@ import { safeDeployPath, validateDefinition, validateGitUrl } from './pipeline.v
 import { storeDeliveryProfile, type DeliveryExecutionProfile } from './delivery-execution-profile';
 import { ownedGraphWorkspace, type GraphExecutionScope } from '../execution-graphs/graph-workspace';
 import { SourceReviewService } from '../deployments/source-review.service';
+import { assertCurrentTargets } from '../deployments/release-policy';
+import { resolveDeliveryTargets } from './delivery-targets';
+import { redactTaskLog } from '../tasks/task-log.service';
+import { encryptionKey } from '../../core/config';
 
 @Injectable()
 export class PipelinesService implements OnModuleInit {
@@ -410,9 +415,10 @@ export class PipelinesService implements OnModuleInit {
     const env = await this.configs.readSnapshot(
       pipeline.serviceId,
       input.environmentId,
-      input.targetId,
+      profile ? undefined : input.targetId,
     );
-    const defaults = await this.settings.get(pipeline.projectId);
+    const settings = profile ? await this.settings.project(pipeline.projectId) : undefined;
+    const defaults = settings?.effective ?? (await this.settings.get(pipeline.projectId));
     const definition = plainToInstance(
       PipelineDefinitionDto,
       JSON.parse(version.definition_json),
@@ -443,18 +449,17 @@ export class PipelinesService implements OnModuleInit {
         'healthCheckCommand',
       ] as const) {
         const value = config[name];
-        const authored = profile?.authoredFields.includes(name);
-        if (
-          value &&
-          (!profile ||
-            (name === 'buildLocation'
-              ? profile.definition.inheritBuildLocation
-              : name !== 'artifactType' && !authored))
-        )
+        const releaseField = [
+          'deployPath',
+          'composeFilePath',
+          'startCommand',
+          'stopCommand',
+          'healthCheckCommand',
+        ].includes(name);
+        if (value && (!profile || (fromArtifact && releaseField)))
           (definition as unknown as Record<string, string>)[name] = value;
       }
-      if (config.workingDirectory && !profile?.authoredFields.includes('repoPath'))
-        definition.repoPath = config.workingDirectory;
+      if (config.workingDirectory && !profile) definition.repoPath = config.workingDirectory;
       const buildNode = definition.nodes?.find((node) => node.type === 'BUILD');
       if (buildNode && config.buildCommand && (!profile || !buildNode.command))
         buildNode.command = config.buildCommand;
@@ -462,21 +467,40 @@ export class PipelinesService implements OnModuleInit {
     const errors = await validate(plainToInstance(PipelineDefinitionDto, definition));
     if (errors.length) throw new BadRequestException('当前交付配置无效');
     const configured = env.config?.targetSelection;
+    const graphPurpose =
+      fromArtifact || mode === 'DEPLOY'
+        ? 'RELEASE'
+        : definition.buildLocation === 'MANAGER'
+          ? 'MANAGER_BUILD'
+          : 'TARGET_BUILD';
+    const graphTargets = profile
+      ? resolveDeliveryTargets(graphPurpose, input, {
+          service: configured,
+          legacyTargetId: env.config?.targetId,
+          environment:
+            graphPurpose === 'RELEASE'
+              ? storedDeploymentSelection(environment.default_target_selection_json)
+              : undefined,
+          parallel: defaults.defaultMaxParallelTargets,
+        })
+      : undefined;
     const defaultParallel =
       input.serverIds !== undefined || input.groupIds !== undefined
         ? (input.maxParallel ?? configured?.maxParallel ?? defaults.defaultMaxParallelTargets)
         : 1;
-    const selection =
-      directDeploymentSelection(
-        {
-          ...input,
-          strategy: input.strategy ?? configured?.strategy,
-          failurePolicy: input.failurePolicy ?? configured?.failurePolicy,
-        },
-        defaultParallel,
-      ) ?? (input.targetId ? undefined : (configured ?? undefined));
-    const legacyId =
-      input.targetId ?? (selection ? undefined : (env.config?.targetId ?? undefined));
+    const selection = graphTargets
+      ? graphTargets.selection
+      : (directDeploymentSelection(
+          {
+            ...input,
+            strategy: input.strategy ?? configured?.strategy,
+            failurePolicy: input.failurePolicy ?? configured?.failurePolicy,
+          },
+          defaultParallel,
+        ) ?? (input.targetId ? undefined : (configured ?? undefined)));
+    const legacyId = graphTargets
+      ? graphTargets.legacyId
+      : (input.targetId ?? (selection ? undefined : (env.config?.targetId ?? undefined)));
     const legacy = legacyId
       ? await this.database.db
           .selectFrom('deployment_targets')
@@ -484,14 +508,13 @@ export class PipelinesService implements OnModuleInit {
           .where('id', '=', legacyId)
           .executeTakeFirst()
       : undefined;
-    const targetless =
-      !selection &&
-      !legacyId &&
-      profile &&
-      mode === 'BUILD_ONLY' &&
-      definition.buildLocation === 'MANAGER';
+    const targetless = graphTargets?.source === 'MANAGER';
     if (!selection && !legacy && !targetless)
-      throw new BadRequestException('请选择服务器或服务器分组');
+      throw new BadRequestException(
+        graphTargets
+          ? `${profile!.name}：${graphPurpose === 'TARGET_BUILD' ? '目标端构建缺少构建服务器' : '发布缺少服务器或服务器分组'}`
+          : '请选择服务器或服务器分组',
+      );
     const members = selection
       ? await selectedServerIds(this.database.db, selection)
       : !legacy
@@ -576,6 +599,109 @@ export class PipelinesService implements OnModuleInit {
       env,
       mode,
       allowPartialDeploy: input.allowPartialDeploy === true,
+      graphTargets,
+      graphPurpose,
+      settings,
+      requestedTargets: {
+        targetId: input.targetId,
+        serverIds: input.serverIds,
+        groupIds: input.groupIds,
+        strategy: input.strategy,
+        maxParallel: input.maxParallel,
+        failurePolicy: input.failurePolicy,
+      },
+    };
+  }
+  private executionConfiguration(p: Awaited<ReturnType<PipelinesService['prepare']>>) {
+    if (!p.graphTargets || !p.settings) return undefined;
+    const build = p.graphPurpose !== 'RELEASE';
+    const scope = (key: keyof typeof p.settings.effective) =>
+      p.settings?.overrides[key] === undefined ? 'SYSTEM' : 'PROJECT';
+    const settings = build
+      ? [
+          {
+            field: 'buildLocation',
+            value: p.definition.buildLocation,
+            source: p.definition.inheritBuildLocation ? scope('defaultBuildLocation') : 'NODE',
+          },
+          { field: 'workDirectory', value: p.definition.repoPath, source: 'NODE' },
+          {
+            field: 'buildCommand',
+            value: redactTaskLog(p.definition.buildCommand),
+            source: 'NODE',
+          },
+          {
+            field: 'installCommand',
+            value: redactTaskLog(p.definition.installCommand),
+            source: 'NODE',
+          },
+          {
+            field: 'logRetentionDays',
+            value: p.settings.effective.logRetentionDays,
+            source: scope('logRetentionDays'),
+          },
+          ...(p.targetWorkspaceRoot
+            ? [
+                {
+                  field: 'workspaceRoot',
+                  value: p.targetWorkspaceRoot,
+                  source: scope('targetWorkspaceRoot'),
+                },
+              ]
+            : []),
+        ]
+      : [
+          ...(
+            [
+              'deployPath',
+              'composeFilePath',
+              'startCommand',
+              'stopCommand',
+              'healthCheckCommand',
+            ] as const
+          ).map((field) => ({
+            field,
+            value: redactTaskLog(p.definition[field] ?? ''),
+            source: p.env.config?.[field] ? 'SERVICE_ENVIRONMENT' : 'NODE',
+          })),
+          ...(p.env.config?.releasePolicy
+            ? [
+                {
+                  field: 'rollbackMode',
+                  value: p.env.config.releasePolicy.rollbackMode,
+                  source: 'SERVICE_ENVIRONMENT',
+                },
+              ]
+            : []),
+        ];
+    return {
+      targetSelection: p.target.selection,
+      legacyTargetId: p.target.id,
+      targets: {
+        purpose: build ? ('BUILD' as const) : ('RELEASE' as const),
+        source: p.graphTargets.source,
+        servers: p.servers.map(({ id, name, host, port }) => ({ id, name, host, port })),
+        groupIds: p.target.selection?.groupIds ?? [],
+        strategy: p.target.strategy,
+        maxParallel: p.target.max_parallel,
+        failurePolicy: p.target.failure_policy,
+      },
+      settings,
+      variables:
+        p.env.variableSources?.map(({ key, source, isSecret }) => ({
+          key,
+          source,
+          sensitive: isSecret,
+        })) ?? [],
+      variableFingerprint: createHmac('sha256', encryptionKey())
+        .update('execution-plan:variables\0')
+        .update(
+          JSON.stringify([
+            Object.entries(p.env.variables).sort(),
+            Object.entries(p.env.secretVariables).sort(),
+          ]),
+        )
+        .digest('hex'),
     };
   }
   private configurationHash(
@@ -597,6 +723,11 @@ export class PipelinesService implements OnModuleInit {
         JSON.stringify(
           canonical({
             definition: p.definition,
+            ...(p.graphTargets && {
+              targetSource: p.graphTargets.source,
+              targetId: p.graphTargets.legacyId,
+              logRetentionDays: p.settings?.effective.logRetentionDays,
+            }),
             targetWorkspaceRoot: p.targetWorkspaceRoot,
             // Preserve existing deploy confirmations made before execution modes were introduced.
             ...(p.mode === 'BUILD_ONLY' ? { mode: p.mode } : {}),
@@ -687,6 +818,7 @@ export class PipelinesService implements OnModuleInit {
       ...(webhookBranch && { webhookConfigurationHash: this.configurationHash(p, false) }),
       aiApprovalHash,
       hasSecretVariables: Object.keys(p.env.secretVariables).length > 0,
+      executionConfiguration: this.executionConfiguration(p),
     };
   }
   assertAutomaticBuild(preview: { definition: PipelineDefinition; hasSecretVariables: boolean }) {
@@ -711,6 +843,14 @@ export class PipelinesService implements OnModuleInit {
       serviceId: p.pipeline.serviceId,
       environmentId: p.environment.id,
       targetId: p.target.id,
+      ...(p.graphPurpose === 'RELEASE' &&
+        p.graphTargets && {
+          graphReleaseTargets: {
+            source: p.graphTargets.source,
+            requested: p.requestedTargets,
+            defaultParallel: p.settings!.effective.defaultMaxParallelTargets,
+          },
+        }),
       ...(p.target.selection && {
         targetSelection: p.target.selection,
         targetMemberIds: p.servers.map((server) => server.id),
@@ -1153,6 +1293,7 @@ export class PipelinesService implements OnModuleInit {
       definition: p.definition,
       configurationHash,
       artifactIds,
+      executionConfiguration: this.executionConfiguration(p),
     };
   }
 
@@ -1187,6 +1328,7 @@ export class PipelinesService implements OnModuleInit {
       requireApproval: Boolean(p.env.config?.releasePolicy?.requireApproval),
       requireCodeReview,
       configurationHash: this.configurationHash(p),
+      executionConfiguration: this.executionConfiguration(p),
     };
   }
 
@@ -1228,6 +1370,7 @@ export class PipelinesService implements OnModuleInit {
       userId,
       async (tx) => {
         if (options.profile) await storeDeliveryProfile(tx, options.profile, userId);
+        if (snapshot.graphReleaseTargets) await assertCurrentTargets(tx, snapshot, p.servers);
         if (snapshot.targetSelection)
           await confirmDeploymentMembers(tx, snapshot.targetSelection, targets);
       },

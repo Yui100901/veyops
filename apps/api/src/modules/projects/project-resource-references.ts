@@ -55,6 +55,30 @@ async function configuredReferences(
     !options.resourceType || types.includes(options.resourceType);
   const stateOf = (...owners: unknown[]): ProjectResourceState =>
     archived || owners.some((value) => typeof value === 'number') ? 'HISTORY' : 'CONFIGURED';
+  if (typeWanted('SERVER', 'SERVER_GROUP', 'ENVIRONMENT')) {
+    const defaults = await db
+      .selectFrom('environments')
+      .select(['id', 'name', 'archived_at', 'default_target_selection_json'])
+      .where('project_id', '=', projectId)
+      .where('default_target_selection_json', 'is not', null)
+      .orderBy('id')
+      .execute();
+    for (const row of defaults) {
+      const state = stateOf(row.archived_at);
+      if (!includes(options, state)) continue;
+      const source: ReferenceSource = {
+        sourceKind: 'ENVIRONMENT_DEFAULT',
+        sourceId: row.id,
+        state,
+        environmentId: row.id,
+        label: row.name,
+      };
+      result.push(
+        ...referenceRows(source, 'ENVIRONMENT', row.id),
+        ...selectionReferences(source, JSON.parse(row.default_target_selection_json!)),
+      );
+    }
+  }
   if (typeWanted('SERVER', 'SERVER_GROUP', 'LEGACY_TARGET', 'SERVICE', 'ENVIRONMENT', 'REGISTRY')) {
     const configs = await db
       .selectFrom('service_environment_configs as config')
@@ -180,15 +204,14 @@ async function configuredReferences(
         .execute(),
       db
         .selectFrom('service_environment_variables as variable')
-        .innerJoin('service_environment_configs as config', 'config.id', 'variable.config_id')
-        .innerJoin('services as service', 'service.id', 'config.service_id')
-        .innerJoin('environments as environment', 'environment.id', 'config.environment_id')
+        .innerJoin('services as service', 'service.id', 'variable.service_id')
+        .innerJoin('environments as environment', 'environment.id', 'variable.environment_id')
         .select([
           'variable.id',
           'variable.key',
           'variable.credential_id',
-          'config.service_id as serviceId',
-          'config.environment_id as environmentId',
+          'variable.service_id as serviceId',
+          'variable.environment_id as environmentId',
           'service.archived_at',
           'environment.archived_at as environmentArchived',
         ])

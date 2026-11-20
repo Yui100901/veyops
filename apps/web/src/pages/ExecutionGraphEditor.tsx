@@ -143,6 +143,7 @@ export function ProjectGraphEditor({
   canEdit,
   onChange,
   renderStart,
+  renderResources,
   issues = [],
   initialNodeId,
   initialFlowId,
@@ -152,6 +153,7 @@ export function ProjectGraphEditor({
   canEdit: boolean;
   onChange: (canvas: GraphCanvas) => void;
   renderStart?: (startId: string) => ReactNode;
+  renderResources?: (node: GraphNode, endpoint?: GraphEndpoint) => ReactNode;
   issues?: GraphIssue[];
   initialNodeId?: string;
   initialFlowId?: string;
@@ -746,6 +748,11 @@ export function ProjectGraphEditor({
                 patch={patch}
                 catalog={catalog.data}
               />
+              {activeNode &&
+                renderResources?.(
+                  activeNode,
+                  selectedPath?.nodes.has(activeNode.id) ? selectedPair : undefined,
+                )}
               {activeNode?.type === 'START' && (
                 <>
                   <StartPair

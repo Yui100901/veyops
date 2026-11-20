@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import { ApiError, formatTime, message, navigate, post, useResource } from '../api';
 import { ErrorBanner, Form, Loading, Modal, RefreshButton, Section } from '../components';
 import type { DeploymentRecord, ProjectDetail, Server, Task } from '../models';
+import { deliveryTaskPath, type DeliveryScope } from './delivery-route';
 
 interface RollbackPreview {
   confirmationHash: string;
@@ -21,9 +22,11 @@ interface RollbackPreview {
 export function RollbackRelease({
   record,
   onClose,
+  scope,
 }: {
   record: DeploymentRecord;
   onClose: () => void;
+  scope?: DeliveryScope;
 }) {
   const [preview, setPreview] = useState<RollbackPreview>();
   const [busy, setBusy] = useState(false);
@@ -47,7 +50,7 @@ export function RollbackRelease({
       }
       const task = await post<Task>(path, { confirmationHash: preview.confirmationHash });
       onClose();
-      navigate(`/tasks/${task.id}`);
+      navigate(scope ? deliveryTaskPath(task.id, 'deployments', scope) : `/tasks/${task.id}`);
     } catch (cause) {
       if (cause instanceof ApiError && cause.status === 409) setPreview(undefined);
       setError(message(cause));
@@ -125,7 +128,7 @@ interface ReleaseApproval {
   rollbackOfDeploymentId?: string | null;
 }
 
-export function ReleaseApprovals({ query = '' }: { query?: string }) {
+export function ReleaseApprovals({ query = '', scope }: { query?: string; scope?: DeliveryScope }) {
   const approvals = useResource<ReleaseApproval[]>(`/deployments/approvals?${query}`);
   const [selected, setSelected] = useState<ReleaseApproval>();
 
@@ -151,7 +154,15 @@ export function ReleaseApprovals({ query = '' }: { query?: string }) {
                 {approvals.data.map((entry) => (
                   <tr key={entry.id}>
                     <td>
-                      <a className="text-link" href={`#/tasks/${entry.id}`}>
+                      <a
+                        className="text-link"
+                        href={
+                          '#' +
+                          (scope
+                            ? deliveryTaskPath(entry.id, 'approvals', scope)
+                            : `/tasks/${entry.id}`)
+                        }
+                      >
                         {entry.name}
                       </a>
                     </td>
@@ -181,7 +192,16 @@ export function ReleaseApprovals({ query = '' }: { query?: string }) {
           onApproved={(task) => {
             setSelected(undefined);
             void approvals.reload();
-            navigate(`/tasks/${task.id}`);
+            navigate(
+              scope
+                ? deliveryTaskPath(task.id, 'approvals', {
+                    serviceId: scope.serviceId,
+                    environmentId: scope.environmentId,
+                    commit: scope.commit,
+                    view: scope.view,
+                  })
+                : `/tasks/${task.id}`,
+            );
           }}
         />
       )}

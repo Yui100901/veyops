@@ -23,7 +23,13 @@ import { dirname, join } from 'node:path';
 import { parseEnv, promisify } from 'node:util';
 import { DatabaseService } from '../../core/database/database.service';
 import { Roles } from '../auth/auth.decorators';
-import { gitCredentialHelper } from '../builds/builds.service';
+import { gitCredentialHelper } from './git-credential';
+import {
+  environmentFilePath,
+  graphEnvironmentMaxBytes,
+  repositoryEnvironmentValues,
+  type GraphEnvironmentFilePin,
+} from '../execution-graphs/graph-environment';
 import { CredentialsService } from '../credentials/credentials.service';
 import { isGitBranchName as isBranchName } from './git-ref';
 
@@ -453,6 +459,88 @@ export class RepositoryMetadataService {
     });
   }
 
+  inspectGraphEnvironmentFile(
+    projectId: string,
+    source: Pick<GraphEnvironmentFilePin, 'repositoryId' | 'commitSha'>,
+    paths: readonly string[],
+  ) {
+    return this.findGraphEnvironmentFile(projectId, source, paths).then((entry) =>
+      entry ? { path: entry.path, keys: Object.keys(entry.values) } : undefined,
+    );
+  }
+
+  async readGraphEnvironmentFile(projectId: string, pin: GraphEnvironmentFilePin) {
+    const entry = await this.findGraphEnvironmentFile(projectId, pin, [pin.path]);
+    if (!entry) throw new ConflictException('已确认的仓库环境文件无法取得，请重新预览');
+    return entry.values;
+  }
+
+  private findGraphEnvironmentFile(
+    projectId: string,
+    source: Pick<GraphEnvironmentFilePin, 'repositoryId' | 'commitSha'>,
+    paths: readonly string[],
+  ) {
+    const { repositoryId, commitSha } = source;
+    if (!shaPattern.test(commitSha)) throw new BadRequestException('环境文件需要固定 Git 提交');
+    const candidates = [...new Set(paths.map(environmentFilePath))];
+    return this.withRepository(projectId, repositoryId, async (repository) => {
+      const gitDir = await this.fetchPinnedCommit(repository, commitSha, graphEnvironmentMaxBytes);
+      const readTree = async (tree: string, names: string[]) => {
+        const records = await repository.runBytes(
+          [gitDir, '--literal-pathspecs', 'ls-tree', '-t', '-z', tree, '--', ...names],
+          analysisTreeMaxBytes,
+        );
+        return new Map(
+          records
+            .toString('utf8')
+            .split('\0')
+            .filter(Boolean)
+            .map((line) => {
+              const tab = line.indexOf('\t');
+              const [mode, type, object] = line.slice(0, tab).split(' ');
+              return [line.slice(tab + 1), { mode, type, object }] as const;
+            }),
+        );
+      };
+      const entries = await readTree(commitSha, candidates);
+      for (const path of candidates) {
+        const entry = entries.get(path);
+        if (!entry) {
+          // ls-tree with a descendant pathspec omits a parent whose object is a blob or submodule.
+          // Check that parent at its own tree level so a symlink is rejected even for optional files.
+          const segments = path.split('/');
+          let parent = commitSha;
+          for (const [index, segment] of segments.slice(0, -1).entries()) {
+            const directory = segments.slice(0, index + 1).join('/');
+            const next = entries.get(directory) ?? (await readTree(parent, [segment])).get(segment);
+            if (!next) break;
+            if (next.type !== 'tree' || !next.object || !shaPattern.test(next.object))
+              throw new BadRequestException('环境文件不能通过符号链接或非仓库目录访问');
+            parent = next.object;
+          }
+          continue;
+        }
+        if (
+          (entry.mode !== '100644' && entry.mode !== '100755') ||
+          entry.type !== 'blob' ||
+          !entry.object ||
+          !shaPattern.test(entry.object)
+        )
+          throw new BadRequestException('环境文件必须是指定提交中的普通文件');
+        const size = Number(
+          (await repository.run([gitDir, 'cat-file', '-s', entry.object])).trim(),
+        );
+        if (!Number.isSafeInteger(size) || size < 0 || size > graphEnvironmentMaxBytes)
+          throw new BadRequestException('环境文件超过 64 KiB 大小限制');
+        const bytes = await repository.runBytes(
+          [gitDir, 'cat-file', 'blob', entry.object],
+          graphEnvironmentMaxBytes,
+        );
+        return { path, values: repositoryEnvironmentValues(bytes) };
+      }
+    });
+  }
+
   async commits(projectId: string, repositoryId: string, query: RepositoryCommitsQuery) {
     const limit = query.limit === undefined ? 20 : Number(query.limit);
     if (!Number.isInteger(limit) || limit < 1 || limit > 50)
@@ -646,7 +734,11 @@ export class RepositoryMetadataService {
     });
   }
 
-  private async fetchPinnedCommit(repository: GitRepository, sha: string) {
+  private async fetchPinnedCommit(
+    repository: GitRepository,
+    sha: string,
+    maxBlobBytes = deploymentDocMaxBytes,
+  ) {
     const bare = join(repository.workspace, 'repository.git');
     const gitDir = `--git-dir=${bare}`;
     await repository.run([
@@ -660,7 +752,7 @@ export class RepositoryMetadataService {
       gitDir,
       'fetch',
       '--depth=1',
-      `--filter=blob:limit=${deploymentDocMaxBytes + 1}`,
+      `--filter=blob:limit=${maxBlobBytes + 1}`,
       '--no-tags',
       '--no-recurse-submodules',
       '--',

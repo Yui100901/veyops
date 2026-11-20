@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import {
@@ -26,6 +26,8 @@ import {
 import { CredentialsService } from '../credentials/credentials.service';
 import { maxComposeBytes } from '../artifacts/artifacts.service';
 import { RegistriesService } from '../registries/registries.service';
+import { gitCredentialHelper } from '../projects/git-credential';
+import { RepositoryMetadataService } from '../projects/repository-metadata.service';
 import type {
   PipelineSnapshot,
   PipelineNode,
@@ -150,8 +152,7 @@ export function webhookBuildSocket() {
     return undefined;
   return socket;
 }
-export const gitCredentialHelper = (responsePath: string) =>
-  `!f() { case "$1" in get) cat -- ${q(responsePath)} ;; store|erase) : ;; *) return 1 ;; esac; }; f`;
+export { gitCredentialHelper } from '../projects/git-credential';
 function gitCommand(credentialResponse?: string) {
   const options = [
     '-c core.hooksPath=/dev/null',
@@ -279,6 +280,7 @@ export class BuildsService {
     private readonly runner: ProcessRunnerService,
     private readonly credentials: CredentialsService,
     private readonly registries: RegistriesService,
+    @Optional() private readonly repositories?: RepositoryMetadataService,
   ) {}
   async gitSecret(credentialId: string | null): Promise<GitSecret | undefined> {
     if (!credentialId) return undefined;
@@ -302,16 +304,25 @@ export class BuildsService {
     if (snapshot.serviceName !== undefined) values.VEYOPS_SERVICE_NAME = snapshot.serviceName;
     if (snapshot.graph) {
       const { variables, trigger } = snapshot.graph;
-      if (variables?.workspace && variables.envFile) {
+      let loaded: Record<string, string> | undefined;
+      if (variables?.environmentFile?.status === 'PINNED') {
+        if (!this.repositories) throw new Error('仓库环境文件读取服务不可用');
+        loaded = await this.repositories.readGraphEnvironmentFile(
+          snapshot.projectId,
+          variables.environmentFile,
+        );
+      } else if (!variables?.environmentFile && variables?.workspace && variables.envFile) {
         const file = await graphWorkspaceEntry(
           variables.workspace,
           relativePath(variables.envFile),
         );
-        for (const [name, value] of Object.entries(await readEnvironmentFile(file))) {
-          if (!/^VEYOPS_/i.test(name) && !Object.hasOwn(values, name)) {
-            values[name] = value;
-            secrets.push(value);
-          }
+        loaded = await readEnvironmentFile(file);
+      }
+      if (loaded) {
+        for (const [name, value] of Object.entries(loaded)) {
+          if (/^VEYOPS_/i.test(name)) continue;
+          secrets.push(value);
+          if (!Object.hasOwn(values, name)) values[name] = value;
         }
       }
       Object.assign(values, graphTriggerVariables(trigger), {

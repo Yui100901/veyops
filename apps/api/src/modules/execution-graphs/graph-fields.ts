@@ -359,6 +359,7 @@ const graphModules = {
       field('version', 'GIT_REF'),
       field('source', 'SOURCE'),
       field('workspace', 'WORKSPACE'),
+      field('variables', 'VARIABLES'),
       ...serviceEnvTargets,
     ],
     [allArtifacts],

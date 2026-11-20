@@ -6,9 +6,9 @@ import type { DeploymentSelection, Server, ServerGroup } from '../models';
 import { BatchStrategy, ServerPicker, defaultExecutionOptions } from './BatchTargets';
 import './deployment-selection.css';
 
-export function useDeploymentInventory() {
-  const servers = useResource<Server[]>('/servers');
-  const groups = useResource<ServerGroup[]>('/server-groups');
+export function useDeploymentInventory(enabled = true) {
+  const servers = useResource<Server[]>(enabled ? '/servers' : null);
+  const groups = useResource<ServerGroup[]>(enabled ? '/server-groups' : null);
   return { servers, groups };
 }
 

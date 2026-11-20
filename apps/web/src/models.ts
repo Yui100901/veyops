@@ -165,6 +165,7 @@ export interface Environment {
   slug: string;
   environmentType: string;
   repositoryEnvFile?: string | null;
+  defaultTargetSelection?: DeploymentSelection | null;
   description?: string;
 }
 export interface ProjectDetail extends Project {
@@ -172,6 +173,9 @@ export interface ProjectDetail extends Project {
   repositories: Repository[];
   services: Service[];
   environments: Environment[];
+  archivedServices?: Pick<Service, 'id' | 'name'>[];
+  archivedEnvironments?: Pick<Environment, 'id' | 'name'>[];
+  archivedRepositories?: string[];
   addresses?: ProjectAddress[];
   dependencies?: ProjectDependency[];
   deploymentTargets?: ServerGroup[];

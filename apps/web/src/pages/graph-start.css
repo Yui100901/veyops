@@ -1,3 +1,11 @@
+.graph-scope-links {
+  margin-bottom: 12px;
+}
+
+.graph-scoped-starts {
+  padding: 0;
+}
+
 .graph-start-actions {
   gap: 0.65rem;
   padding: 0.75rem;

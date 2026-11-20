@@ -8,9 +8,10 @@ import {
   OnModuleInit,
   Optional,
 } from '@nestjs/common';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import type { Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
+import { encryptionKey } from '../../core/config';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
 import { PipelinesService } from '../pipelines/pipelines.service';
@@ -24,6 +25,7 @@ import { pendingReleaseApprovalTime } from '../deployments/release-policy';
 import { lockProjectGraph, requireProject } from '../projects/project-relations';
 import { runResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
+import { confirmDeploymentMembers } from '../deployment-targets/deployment-selection';
 import { RepositoryMetadataService } from '../projects/repository-metadata.service';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { TasksService } from '../tasks/tasks.service';
@@ -37,6 +39,11 @@ import {
 } from './execution-graph-definition';
 import type { GraphInputsDto, GraphPreviewDto, GraphRunDto } from './graph-runner.controller';
 import { GraphNodeTasks, type GraphNodePlan } from './graph-node-tasks';
+import {
+  graphVariableSources,
+  publicEnvironmentFile,
+  type GraphEnvironmentPlan,
+} from './graph-environment';
 import {
   unversionedArtifactCommit,
   unversionedArtifactRepository,
@@ -76,6 +83,12 @@ type NodeRun = Selectable<Database['execution_node_runs']>;
 type DeliveryPreview =
   | Awaited<ReturnType<PipelinesService['preview']>>
   | Awaited<ReturnType<PipelinesService['previewArtifactDeploy']>>;
+type ResolvedDeliveryConfiguration = NonNullable<DeliveryPreview['executionConfiguration']>;
+type DeliveryConfiguration = Omit<ResolvedDeliveryConfiguration, 'targets'> & {
+  targets: Omit<ResolvedDeliveryConfiguration['targets'], 'source'> & {
+    source: ResolvedDeliveryConfiguration['targets']['source'] | 'NODE';
+  };
+};
 interface Delivery {
   nodeId: string;
   flowId: string;
@@ -94,6 +107,8 @@ interface Delivery {
   alternatives?: Delivery[];
   artifactRefs?: Values[];
   targetInputs?: GraphInputsDto;
+  configuration?: DeliveryConfiguration;
+  environmentFile?: GraphEnvironmentPlan;
   sourceSnapshot?: {
     id?: string;
     repositoryId?: string;
@@ -142,6 +157,8 @@ function publicDelivery(delivery: Delivery) {
     alternatives: undefined,
     artifactBinding: undefined,
     targetInputs: undefined,
+    configuration: undefined,
+    environmentFile: undefined,
     possibleArtifacts: delivery.alternatives?.map((candidate) => ({
       nodeId: candidate.artifactFromNodeId,
       fieldId: candidate.artifactFromField,
@@ -400,6 +417,22 @@ export class GraphRunnerService implements OnModuleInit {
       failurePolicy: inputs.failurePolicy,
       ...(values.targets as GraphInputsDto | undefined),
     };
+    const targetBinding = flow.inputBindings?.[node.id]?.targets;
+    const describe = (
+      configuration?: ResolvedDeliveryConfiguration,
+    ): DeliveryConfiguration | undefined =>
+      configuration && {
+        ...configuration,
+        targets: {
+          ...configuration.targets,
+          source:
+            configuration.targets.source === 'RUN_INPUT' &&
+            targetBinding &&
+            targetBinding.kind !== 'INPUT'
+              ? ('NODE' as const)
+              : configuration.targets.source,
+        },
+      };
     const makeProfile = (definition: PipelineDefinition, fields: string[] = []) =>
       deliveryExecutionProfile(
         projectId,
@@ -437,6 +470,7 @@ export class GraphRunnerService implements OnModuleInit {
       ],
       pipelineHash: preview.configurationHash,
       targetInputs: base,
+      configuration: describe(preview.executionConfiguration),
     });
     if (node.type === 'BUILD') {
       const build = node.build ?? {};
@@ -446,6 +480,13 @@ export class GraphRunnerService implements OnModuleInit {
       const repositoryId =
         referenceId(values.repository) ?? source?.repositoryId ?? settings.repositoryId;
       if (!repositoryId) throw new BadRequestException(node.name + '：构建缺少源码或仓库');
+      const workspace = values.workspace as typeof source;
+      if (
+        (source?.repositoryId && source.repositoryId !== repositoryId) ||
+        (workspace?.repositoryId &&
+          (workspace.repositoryId !== repositoryId || workspace.commitSha !== source?.commitSha))
+      )
+        throw new BadRequestException(node.name + '：构建仓库、检出提交与工作区绑定不一致');
       const ref = values.version as GitRefValue | undefined;
       const sha = source?.commitSha ?? pinned ?? (ref ? undefined : inputs.commitSha);
       const fixed = sha
@@ -455,6 +496,7 @@ export class GraphRunnerService implements OnModuleInit {
         repositoryId,
         inheritBuildLocation: !settings.buildLocation,
       });
+      const variableBinding = values.variables as GraphEnvironmentRef | undefined;
       const profile = makeProfile(definition, Object.keys(settings));
       const preview = await this.pipelines.preview(
         profile.id,
@@ -467,10 +509,25 @@ export class GraphRunnerService implements OnModuleInit {
         undefined,
         profile,
       );
-      return wrap(preview, profile, {
-        branch: 'branch' in fixed ? fixed.branch : undefined,
-        tag: 'tag' in fixed ? fixed.tag : undefined,
-      });
+      const environmentFile = variableBinding
+        ? variableBinding.environmentFile
+        : await this.nodeTasks?.prepareEnvironment(projectId, {
+            environmentId,
+            directory: preview.definition.repoPath,
+            source: {
+              repositoryId,
+              commitSha: fixed.commitSha,
+              branch: 'branch' in fixed ? fixed.branch : undefined,
+              tag: 'tag' in fixed ? fixed.tag : undefined,
+            },
+          });
+      return {
+        ...wrap(preview, profile, {
+          branch: 'branch' in fixed ? fixed.branch : undefined,
+          tag: 'tag' in fixed ? fixed.tag : undefined,
+        }),
+        environmentFile,
+      };
     }
 
     const fromBuild = (definition: PipelineDefinition, type?: string) =>
@@ -564,6 +621,7 @@ export class GraphRunnerService implements OnModuleInit {
           sourceSnapshot: producer.sourceSnapshot,
           pipelineHash: plan.configurationHash,
           targetInputs: base,
+          configuration: describe(plan.executionConfiguration),
         });
       }
     }
@@ -658,6 +716,24 @@ export class GraphRunnerService implements OnModuleInit {
       environmentId?: string;
     }[] = [];
     const publishedDeliveries: Delivery[] = [];
+    const scriptsPrepared: { flowId: string; nodeId: string; plan: GraphNodePlan }[] = [];
+    const environmentFiles: ({ flowId: string; nodeId: string } & NonNullable<
+      ReturnType<typeof publicEnvironmentFile>
+    >)[] = [];
+    const nativeVariables: {
+      flowId: string;
+      nodeId: string;
+      key: string;
+      source: string;
+      sensitive: boolean;
+    }[] = [];
+    const deferred: {
+      flowId: string;
+      nodeId: string;
+      field: string;
+      producerNodeId?: string;
+      producerField?: string;
+    }[] = [];
     let invocations = 0;
     const prepareFlow = async (
       current: GraphFlow,
@@ -688,6 +764,17 @@ export class GraphRunnerService implements OnModuleInit {
           'image',
           'variables',
         ]);
+        for (const [field, binding] of Object.entries(current.inputBindings?.[node.id] ?? {})) {
+          if (bindingValue(binding, state) !== undefined) continue;
+          for (const source of outputSources(binding))
+            deferred.push({
+              flowId: current.id,
+              nodeId: node.id,
+              field,
+              producerNodeId: source.nodeId,
+              producerField: source.fieldId,
+            });
+        }
         if (isDelivery(node)) {
           const delivery = await this.delivery(
             projectId,
@@ -730,6 +817,36 @@ export class GraphRunnerService implements OnModuleInit {
             trigger,
           });
           plans.set(key, plan);
+          if (plan.type === 'LOAD_ENV') {
+            outputs.set(node.id, {
+              variables: {
+                environmentFile: plan.environmentFile,
+                environmentId: plan.environmentId,
+              },
+            });
+            const file = publicEnvironmentFile(plan.environmentFile);
+            if (file) environmentFiles.push({ flowId: current.id, nodeId: node.id, ...file });
+            nativeVariables.push(
+              ...(plan.variables ?? []).map(({ key, source, isSecret }) => ({
+                flowId: current.id,
+                nodeId: node.id,
+                key,
+                source,
+                sensitive: isSecret,
+              })),
+            );
+          } else if (plan.type === 'SHELL' || plan.type === 'CHECK') {
+            scriptsPrepared.push({ flowId: current.id, nodeId: node.id, plan });
+            nativeVariables.push(
+              ...(plan.variableSources ?? []).map(({ key, source, isSecret }) => ({
+                flowId: current.id,
+                nodeId: node.id,
+                key,
+                source,
+                sensitive: isSecret,
+              })),
+            );
+          }
           if (node.type === 'REGISTER_ARTIFACT') {
             const origin = (values.source ?? values.workspace) as Values | undefined;
             const repositoryId = stringValue(origin?.repositoryId) ?? unversionedArtifactRepository;
@@ -825,6 +942,84 @@ export class GraphRunnerService implements OnModuleInit {
       bindingContext(projectId, flow, inputs, undefined, trigger),
     );
     const publicDeliveries = publishedDeliveries.map(publicDelivery);
+    const executionPlan = {
+      targets: publishedDeliveries.flatMap(({ flowId, nodeId, configuration }) =>
+        configuration ? [{ flowId, nodeId, ...configuration.targets }] : [],
+      ),
+      settings: publishedDeliveries.flatMap(({ flowId, nodeId, configuration }) =>
+        (configuration?.settings ?? []).map((item) => ({ flowId, nodeId, ...item })),
+      ),
+      environmentFiles: [
+        ...environmentFiles,
+        ...publishedDeliveries.flatMap(({ flowId, nodeId, environmentFile }) => {
+          const file = publicEnvironmentFile(environmentFile);
+          return file ? [{ flowId, nodeId, ...file }] : [];
+        }),
+      ],
+      variables: [
+        ...nativeVariables,
+        ...publishedDeliveries.flatMap(({ flowId, nodeId, configuration, environmentFile }) =>
+          graphVariableSources(
+            environmentFile,
+            (configuration?.variables ?? []).map(({ key, source, sensitive }) => ({
+              key,
+              source,
+              isSecret: sensitive,
+            })),
+          ).map(({ key, source, isSecret }) => ({
+            flowId,
+            nodeId,
+            key,
+            source,
+            sensitive: isSecret,
+          })),
+        ),
+      ],
+      deferred,
+    };
+    const planSections: Record<string, string> = Object.create(null);
+    const section = (flowId: string, nodeId: string, label: string, value: unknown) => {
+      const flowName = definition.flows.find(({ id }) => id === flowId)?.name;
+      const nodeName = definition.flows
+        .find(({ id }) => id === flowId)
+        ?.nodes.find(({ id }) => id === nodeId)?.name;
+      planSections[
+        `${flowName ?? flowId} / ${nodeName ?? nodeId}（${flowId}/${nodeId}） · ${label}`
+      ] = digest(value);
+    };
+    for (const row of executionPlan.targets) section(row.flowId, row.nodeId, '执行目标及成员', row);
+    for (const row of executionPlan.settings) section(row.flowId, row.nodeId, row.field, row);
+    for (const row of executionPlan.environmentFiles)
+      section(row.flowId, row.nodeId, '环境文件', row);
+    for (const row of checkouts) section(row.flowId, row.nodeId, '检出仓库与提交', row);
+    for (const { flowId, nodeId, plan } of scriptsPrepared) {
+      if (plan.type !== 'SHELL' && plan.type !== 'CHECK') continue;
+      section(flowId, nodeId, '执行目标及成员', [plan.serverId, plan.serverName, plan.targetHash]);
+      section(flowId, nodeId, '变量及其来源', [
+        plan.variableSources,
+        createHmac('sha256', encryptionKey())
+          .update('execution-plan:native-vars\0')
+          .update(digest(plan.environment ?? null))
+          .digest('hex'),
+      ]);
+    }
+    for (const row of publishedDeliveries) {
+      section(row.flowId, row.nodeId, '变量及其来源', [
+        row.configuration?.variableFingerprint,
+        executionPlan.variables.filter(
+          (item) => item.flowId === row.flowId && item.nodeId === row.nodeId,
+        ),
+      ]);
+      section(row.flowId, row.nodeId, '源码、产物和发布审批', [
+        row.sourceSnapshot,
+        row.artifactRefs,
+        row.artifactIds,
+        row.artifactFromNodeId,
+        row.artifactFromField,
+        row.requireCodeReview,
+        row.requireApproval,
+      ]);
+    }
     const configurationHash = digest([graphId, request.version, flowId, inputs, trigger, prepared]);
     const preview = {
       ...publicDeliveries[0],
@@ -844,6 +1039,8 @@ export class GraphRunnerService implements OnModuleInit {
       deliveries: publicDeliveries,
       checkouts,
       scripts,
+      executionPlan,
+      planSections,
     };
     return { preview, flow, inputs, plans: prepared.plans, children: prepared.children };
   }
@@ -962,13 +1159,47 @@ export class GraphRunnerService implements OnModuleInit {
       flowId,
       request,
       origin?.metadata,
-    );
+    ).catch((error: unknown) => {
+      if (request.expectedPlanSections && error instanceof HttpException && error.getStatus() < 500)
+        throw new ConflictException({
+          message: '配置已失效，请重新预览',
+          changes: [error.message],
+        });
+      throw error;
+    });
     if (request.expectedConfigurationHash !== preview.configurationHash)
-      throw new ConflictException('版本、运行参数或实际执行配置已变化，请重新预览');
+      throw new ConflictException({
+        message: '版本、运行参数或实际执行配置已变化，请重新预览',
+        changes: request.expectedPlanSections
+          ? [
+              ...Object.keys(preview.planSections).filter(
+                (section) =>
+                  request.expectedPlanSections?.[section] !== preview.planSections[section],
+              ),
+              ...(Object.keys(request.expectedPlanSections).some(
+                (section) => !Object.hasOwn(preview.planSections, section),
+              )
+                ? ['旧计划中的节点或配置来源已变化']
+                : []),
+            ].slice(0, 30)
+          : [],
+      });
     const row = await db.transaction().execute(async (tx) => {
       await lockProjectGraph(tx);
       await this.lockProject(tx, projectId);
       const confirmed = await this.published(projectId, request.version, tx, true);
+      const validateTargets = async (plan: Delivery | GraphNodePlan) => {
+        if (!('pipelineId' in plan)) return;
+        if (plan.configuration?.targetSelection)
+          await confirmDeploymentMembers(tx, plan.configuration.targetSelection, plan.serverIds);
+        for (const alternative of plan.alternatives ?? []) await validateTargets(alternative);
+      };
+      const validateChildTargets = async (child: PreparedChild) => {
+        for (const plan of Object.values(child.plans)) await validateTargets(plan);
+        for (const nested of Object.values(child.children)) await validateChildTargets(nested);
+      };
+      for (const plan of Object.values(plans)) await validateTargets(plan);
+      for (const child of Object.values(children)) await validateChildTargets(child);
       const references = runResourceReferences(
         confirmed.definition,
         {
@@ -1586,7 +1817,21 @@ export class GraphRunnerService implements OnModuleInit {
       afterInsert: (tx: Transaction<Database>, taskId: string) =>
         this.linkTask(tx, run, node, taskId, delivery.pipelineId),
     };
-    if (node.node_type === 'BUILD')
+    if (node.node_type === 'BUILD') {
+      const bound = bindings.variables as GraphEnvironmentRef | undefined;
+      if (
+        delivery.configuration &&
+        bound &&
+        digest(bound.environmentFile ?? null) !== digest(delivery.environmentFile ?? null)
+      )
+        throw new ConflictException('实际环境文件与已确认的仓库、提交或路径不一致');
+      const variables = delivery.environmentFile
+        ? {
+            ...bound,
+            environmentId: bound?.environmentId ?? delivery.environmentId,
+            environmentFile: delivery.environmentFile,
+          }
+        : bound;
       await this.pipelines.run(
         delivery.pipelineId,
         { ...values, mode: 'BUILD_ONLY', commitSha: delivery.commitSha },
@@ -1602,12 +1847,12 @@ export class GraphRunnerService implements OnModuleInit {
             runId: run.id,
             nodeRunId: node.id,
             workspace: bindings.workspace as GraphWorkspaceRef | undefined,
-            variables: bindings.variables as GraphEnvironmentRef | undefined,
+            variables,
             trigger: snapshot.trigger ?? { triggeredAt: run.created_at },
           },
         },
       );
-    else {
+    } else {
       if (delivery.artifactFromNodeId) {
         const upstream = await this.database.db
           .selectFrom('execution_node_runs')

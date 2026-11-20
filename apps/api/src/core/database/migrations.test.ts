@@ -216,8 +216,18 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
     .execute();
   const upgrade = await migrator.migrateTo('017_linux_monitoring');
   assert.ifError(upgrade.error);
+  await sql`insert into service_environment_variables (id, config_id, key, value_text)
+    values ('legacy-variable', 'legacy-config', 'LEGACY_VALUE', 'kept')`.execute(db);
   const graphUpgrade = await migrator.migrateToLatest();
   assert.ifError(graphUpgrade.error);
+  assert.deepEqual(
+    await db
+      .selectFrom('service_environment_variables')
+      .select(['service_id', 'environment_id', 'key', 'value_text'])
+      .where('id', '=', 'legacy-variable')
+      .executeTakeFirstOrThrow(),
+    { service_id: 'service', environment_id: 'env', key: 'LEGACY_VALUE', value_text: 'kept' },
+  );
   assert.deepEqual(await db.selectFrom('execution_graphs').select('id').execute(), []);
   const graph = await db
     .insertInto('execution_graphs')
@@ -443,6 +453,43 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
       .insertInto('notification_events')
       .values({ ...event, id: 'duplicate' })
       .execute(),
+  );
+  await db
+    .insertInto('environments')
+    .values({
+      id: 'independent-env',
+      project_id: 'project',
+      slug: 'independent',
+      name: 'Variables only',
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+  await db
+    .insertInto('service_environment_variables')
+    .values({
+      id: 'independent-variable',
+      service_id: 'service',
+      environment_id: 'independent-env',
+      key: 'INDEPENDENT_VALUE',
+      value_text: 'kept',
+      description: 'Preserve during rollback',
+    })
+    .execute();
+  assert.ifError((await migrator.migrateTo('023_project_resource_lifecycle')).error);
+  assert.deepEqual(
+    (
+      await sql`select v.id, c.environment_id, v.description
+    from service_environment_variables v join service_environment_configs c on c.id = v.config_id
+    where v.id = 'independent-variable'`.execute(db)
+    ).rows,
+    [
+      {
+        id: 'independent-variable',
+        environment_id: 'independent-env',
+        description: 'Preserve during rollback',
+      },
+    ],
   );
   const graphRollback = await migrator.migrateTo('017_linux_monitoring');
   assert.ifError(graphRollback.error);

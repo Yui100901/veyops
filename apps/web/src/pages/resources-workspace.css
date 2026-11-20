@@ -105,6 +105,61 @@
   font-weight: 650;
 }
 
+.project-workspace .project-entry-nav {
+  padding: 6px;
+  gap: 6px;
+  margin-bottom: 20px;
+}
+
+.project-entry-nav a {
+  min-height: 42px;
+  font-size: 15px;
+  white-space: nowrap;
+}
+
+.project-resources {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  min-width: 0;
+}
+
+.project-resources > .panel,
+.project-resources > .resource-section-switcher,
+.project-resources > .project-workspace-summary {
+  margin-bottom: 0;
+}
+
+.project-service-detail > nav,
+.project-service-detail > .row-actions {
+  margin: 0 20px 14px;
+}
+
+.project-resource-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 20px 16px;
+}
+
+.project-resource-links .button {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+@media (max-width: 560px) {
+  .project-workspace .project-entry-nav {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+  .project-entry-nav a {
+    justify-content: center;
+  }
+}
+
 .project-workspace .project-detail-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);

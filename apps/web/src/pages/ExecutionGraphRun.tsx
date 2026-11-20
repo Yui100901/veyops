@@ -1,65 +1,22 @@
 import { useRef, useState } from 'react';
 import { Play } from 'lucide-react';
-import { formatTime, message, post, useResource } from '../api';
+import { ApiError, formatTime, message, post, useResource } from '../api';
 import { Confirm, ErrorBanner, Loading, RefreshButton, Section, Status } from '../components';
 import type { DeploymentSelection, ProjectDetail } from '../models';
 import { GraphFieldValue } from './ExecutionGraphFields';
 import type { FieldScope } from './ExecutionGraphFields';
+import { ExecutionPlan, ExecutionPlanChanges } from './ExecutionGraphPreview';
+import type { Preview } from './ExecutionGraphPreview';
 import { graphKey } from './execution-graph-definition';
-import type { GraphNode, GraphFlow, GraphRun } from './execution-graph-definition';
-import { deliveryPath } from './delivery-route';
+import type { GraphFlow, GraphRun } from './execution-graph-definition';
+import { deliveryPath, deliveryTabs } from './delivery-route';
+import {
+  graphRunHref,
+  type GraphDeliveryReturn,
+  type GraphWorkbenchScope,
+} from './graph-workbench-context';
 
 type Inputs = { parameters: Record<string, unknown> };
-interface DeliveryPreview {
-  nodeId?: string;
-  artifactFromNodeId?: string;
-  environmentId?: string;
-  commitSha?: string;
-  serverIds?: string[];
-  artifactIds?: string[];
-  requireApproval?: boolean;
-  requireCodeReview?: boolean;
-  possibleArtifacts?: {
-    nodeId?: string;
-    fieldId?: string;
-    commitSha: string;
-    artifactIds: string[];
-  }[];
-  serviceId?: string;
-  sourceSnapshot?: {
-    id?: string;
-    repositoryId: string;
-    branch?: string;
-    tag?: string;
-    commitSha: string;
-  }[];
-}
-interface Preview extends DeliveryPreview {
-  configurationHash: string;
-  version: number;
-  flowId: string;
-  parameters?: Record<string, unknown>;
-  nodes: { nodeId: string; name: string; type: GraphNode['type']; selected?: boolean }[];
-  deliveries?: DeliveryPreview[];
-  checkouts?: {
-    nodeId: string;
-    flowId: string;
-    repositoryId: string;
-    branch?: string;
-    tag?: string;
-    commitSha: string;
-    fullClone: boolean;
-  }[];
-  scripts?: {
-    nodeId: string;
-    flowId: string;
-    serverId: string;
-    serverName: string;
-    environmentId?: string;
-    serviceId?: string;
-  }[];
-}
-
 function Results({
   values,
   labels = {},
@@ -102,31 +59,40 @@ export function ExecutionGraphStart({
   path,
   version,
   flow,
+  initialInputs,
   onRun,
 }: {
   project: ProjectDetail;
   path: string;
   version: number;
   flow: GraphFlow;
+  initialInputs?: Record<string, string>;
   onRun: (id: string) => void;
 }) {
   const fields = flow.nodes.find(({ type }) => type === 'START')?.inputs ?? [];
-  const [parameters, setParameters] = useState<Record<string, unknown>>(() =>
-    Object.fromEntries(
+  const [parameters, setParameters] = useState<Record<string, unknown>>(() => ({
+    ...Object.fromEntries(
       fields
         .filter((field) => field.defaultValue !== undefined)
         .map((field) => [field.id, field.defaultValue]),
     ),
-  );
-  const scopedValue = (type: NonNullable<(typeof fields)[number]>['type']) =>
-    parameters[fields.find((field) => field.type === type && !field.multiple)?.id ?? ''];
+    ...initialInputs,
+  }));
+  const scopedValue = (type: NonNullable<(typeof fields)[number]>['type']) => {
+    const candidates = fields.filter((field) => field.type === type && !field.multiple);
+    const field =
+      candidates.find(({ id }) => initialInputs && Object.hasOwn(initialInputs, id)) ??
+      (candidates.length === 1 ? candidates[0] : undefined);
+    return field ? parameters[field.id] : undefined;
+  };
   const scope: FieldScope = {
     repositoryId: scopedValue('REPOSITORY') as string | undefined,
     environmentId: scopedValue('ENVIRONMENT') as string | undefined,
-    serviceId: (scopedValue('SERVICE') as string | undefined) ?? flow.serviceId,
+    serviceId: flow.serviceId ?? (scopedValue('SERVICE') as string | undefined),
     targets: scopedValue('TARGETS') as DeploymentSelection | undefined,
   };
   const [preview, setPreview] = useState<Preview>();
+  const [revision, setRevision] = useState<{ previous: Preview; sections: string[] }>();
   const key = useRef('');
   const active = useRef(false);
   const [busy, setBusy] = useState(false);
@@ -150,12 +116,17 @@ export function ExecutionGraphStart({
           version,
           inputs: runtimeInputs(),
           expectedConfigurationHash: preview.configurationHash,
+          expectedPlanSections: preview.planSections,
           idempotencyKey: key.current,
         });
         onRun(run.id);
       }
     } catch (err) {
       setError(message(err));
+      if (preview && err instanceof ApiError && [400, 409].includes(err.status)) {
+        setRevision({ previous: preview, sections: err.changes });
+        setPreview(undefined);
+      }
     } finally {
       active.current = false;
       setBusy(false);
@@ -176,8 +147,14 @@ export function ExecutionGraphStart({
         void submit();
       }}
     >
-      <h3>{preview ? '确认执行预览' : '运行参数'}</h3>
-      <fieldset disabled={busy || Boolean(preview)} hidden={Boolean(preview)}>
+      <h3>{preview ? '确认执行预览' : revision ? '预览已失效' : '运行参数'}</h3>
+      {initialInputs && Object.keys(initialInputs).length > 0 && (
+        <p className="field-note">服务环境已填入此执行流声明的对应参数。</p>
+      )}
+      <fieldset
+        disabled={busy || Boolean(preview || revision)}
+        hidden={Boolean(preview || revision)}
+      >
         {fields.length ? (
           fields.map((field) => (
             <GraphFieldValue
@@ -185,6 +162,7 @@ export function ExecutionGraphStart({
               field={field}
               project={project}
               scope={scope}
+              disabled={Boolean(initialInputs && Object.hasOwn(initialInputs, field.id))}
               checkRequired
               canRegisterRepository
               value={parameters[field.id]}
@@ -204,6 +182,14 @@ export function ExecutionGraphStart({
           <p className="field-note">此执行流没有运行输入。</p>
         )}
       </fieldset>
+      {revision && (
+        <ExecutionPlanChanges
+          previous={revision.previous}
+          current={preview}
+          sections={revision.sections}
+          project={project}
+        />
+      )}
       {preview && (
         <div className="graph-review" aria-label="执行预览">
           <strong>
@@ -213,108 +199,37 @@ export function ExecutionGraphStart({
             {preview.nodes.map((node) => (
               <li key={node.nodeId}>
                 {node.name}
+                {node.type === 'APPROVAL' && node.selected !== false && <small> · 人工审批</small>}
                 {node.selected === false && <small> · 跳过</small>}
               </li>
             ))}
           </ul>
           <Results
-            values={preview.parameters}
+            values={Object.fromEntries(
+              fields
+                .filter(
+                  ({ type, id }) =>
+                    !['VARIABLES', 'CREDENTIAL'].includes(type) &&
+                    preview.parameters?.[id] !== undefined,
+                )
+                .map(({ id }) => [id, preview.parameters?.[id]]),
+            )}
             labels={Object.fromEntries(fields.map(({ id, name }) => [id, name]))}
             title="已固定的运行输入"
           />
-          {preview.checkouts?.map((checkout, index) => (
-            <div key={`${checkout.nodeId}:${index}`} className="graph-delivery-preview">
-              <p>
-                {project.repositories.find(({ id }) => id === checkout.repositoryId)?.name ??
-                  checkout.repositoryId}
-                {checkout.branch && ' · ' + checkout.branch}
-                {checkout.tag && ' · 标签 ' + checkout.tag}
-                {' · '}
-                {checkout.fullClone ? '完整历史' : '浅拉取'}
-              </p>
-              <p>
-                源码固定提交 · <code>{checkout.commitSha}</code>
-              </p>
-            </div>
-          ))}
-          {preview.scripts?.map((script, index) => (
-            <p
-              key={`${script.flowId}:${script.nodeId}:${index}`}
-              className="graph-delivery-preview"
-            >
-              脚本位置 · {script.serverName || script.serverId || '管理端工作区'}
-              {' · '}
-              {project.environments.find((env) => env.id === script.environmentId)?.name ??
-                '项目公共变量'}
-              {script.serviceId &&
-                ` · ${project.services.find((service) => service.id === script.serviceId)?.name ?? script.serviceId}`}
-            </p>
-          ))}
-          {(preview.deliveries ?? (preview.serviceId ? [preview] : [])).map((delivery, i) => (
-            <div key={`${delivery.nodeId}:${i}`} className="graph-delivery-preview">
-              {delivery.serviceId && (
-                <p>
-                  服务 ·{' '}
-                  {project.services.find((s) => s.id === delivery.serviceId)?.name ??
-                    delivery.serviceId}
-                </p>
-              )}
-              {delivery.environmentId && (
-                <p>
-                  环境 ·{' '}
-                  {project.environments.find((e) => e.id === delivery.environmentId)?.name ??
-                    delivery.environmentId}
-                </p>
-              )}
-              {delivery.commitSha && (
-                <p>
-                  固定提交 · <code>{delivery.commitSha}</code>
-                </p>
-              )}
-              {delivery.sourceSnapshot && delivery.sourceSnapshot.length > 1 && (
-                <ul>
-                  {delivery.sourceSnapshot.map((source) => (
-                    <li key={source.id ?? source.repositoryId}>
-                      {project.repositories.find((r) => r.id === source.repositoryId)?.name ??
-                        source.repositoryId}{' '}
-                      · {source.branch ?? source.tag} <code>{source.commitSha}</code>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {delivery.artifactIds?.length ? (
-                <p>归档产物 · {delivery.artifactIds.join('、')}</p>
-              ) : null}
-              {delivery.possibleArtifacts?.length ? (
-                <ul aria-label="可能使用的产物来源">
-                  {delivery.possibleArtifacts.map((candidate, index) => (
-                    <li key={index}>
-                      {candidate.nodeId
-                        ? `${preview.nodes.find((node) => node.nodeId === candidate.nodeId)?.name ?? candidate.nodeId} · ${candidate.fieldId ?? '产物'}`
-                        : candidate.artifactIds.join('、')}{' '}
-                      <code>{candidate.commitSha}</code>
-                    </li>
-                  ))}
-                </ul>
-              ) : delivery.artifactFromNodeId ? (
-                <p>归档产物 · 使用本次运行产生的产物</p>
-              ) : null}
-              {delivery.serverIds?.length ? <TargetNames ids={delivery.serverIds} /> : null}
-              {delivery.requireApproval && <p>本次发布需要管理员审批。</p>}
-              {delivery.requireCodeReview && <p>已核对产物提交的代码审核记录。</p>}
-            </div>
-          ))}
+          <ExecutionPlan preview={preview} project={project} />
         </div>
       )}
       <ErrorBanner error={error} />
       <div className="heading-actions">
-        {preview && (
+        {(preview || revision) && (
           <button
             type="button"
             className="button secondary"
             disabled={busy}
             onClick={() => {
               setPreview(undefined);
+              setRevision(undefined);
               setError('');
             }}
           >
@@ -323,19 +238,10 @@ export function ExecutionGraphStart({
         )}
         <button type="submit" className="button primary" disabled={busy}>
           <Play size={15} />
-          {busy ? '处理中…' : preview ? '确认启动' : '预览运行'}
+          {busy ? '处理中…' : preview ? '确认启动' : revision ? '重新预览' : '预览运行'}
         </button>
       </div>
     </form>
-  );
-}
-
-function TargetNames({ ids }: { ids: string[] }) {
-  const servers = useResource<{ id: string; name: string }[]>('/servers');
-  return (
-    <p>
-      目标服务器 · {ids.map((id) => servers.data?.find((s) => s.id === id)?.name ?? id).join('、')}
-    </p>
   );
 }
 
@@ -369,6 +275,8 @@ export function ExecutionGraphHistory({
   canApprove,
   selected,
   onSelect,
+  scope,
+  delivery,
 }: {
   path: string;
   projectId: string;
@@ -376,6 +284,8 @@ export function ExecutionGraphHistory({
   canApprove: boolean;
   selected?: string;
   onSelect: (id: string) => void;
+  scope: GraphWorkbenchScope;
+  delivery?: GraphDeliveryReturn;
 }) {
   const [cursors, setCursors] = useState<string[]>([]);
   const before = cursors.at(-1);
@@ -466,6 +376,8 @@ export function ExecutionGraphHistory({
           canCancel={canCancel}
           canApprove={canApprove}
           onChange={list.reload}
+          scope={scope}
+          delivery={delivery}
         />
       )}
     </>
@@ -478,18 +390,38 @@ function RunDetails({
   canCancel,
   canApprove,
   onChange,
+  scope,
+  delivery,
 }: {
   path: string;
   projectId: string;
   canCancel: boolean;
   canApprove: boolean;
   onChange: () => void;
+  scope: GraphWorkbenchScope;
+  delivery?: GraphDeliveryReturn;
 }) {
   const run = useResource<RunDetail>(path, 3000);
   const [cancelDialog, setCancelDialog] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState('');
   const item = run.data;
+  const deliveryScope = {
+    serviceId: scope.serviceId,
+    environmentId: scope.environmentId,
+    view: scope.view,
+  };
+  const returnLink =
+    delivery &&
+    '#' +
+      deliveryPath(projectId, delivery.deliveryTab, {
+        ...deliveryScope,
+        recordId: delivery.recordId,
+        commit: delivery.commit,
+        repositoryId: delivery.repositoryId,
+        pipelineRunId: delivery.pipelineRunId,
+        taskId: delivery.taskId,
+      });
   const active = ['PENDING', 'QUEUED', 'WAITING', 'RUNNING'].includes(item?.status ?? '');
   function closeCancel() {
     if (!cancelling) {
@@ -545,10 +477,17 @@ function RunDetails({
               <small>
                 {formatTime(item.createdAt)} · {item.id}
               </small>
+              {returnLink && delivery && (
+                <div className="heading-actions">
+                  <a className="button secondary small" href={returnLink}>
+                    ← 返回{deliveryTabs[delivery.deliveryTab]}
+                  </a>
+                </div>
+              )}
               {item.parentRunId && (
                 <a
                   className="text-link"
-                  href={`#/projects/${projectId}/execution-graph?run=${item.parentRunId}`}
+                  href={graphRunHref(projectId, item.parentRunId, scope, delivery)}
                 >
                   返回父运行
                 </a>
@@ -568,13 +507,26 @@ function RunDetails({
                 title="执行流输出"
               />
               <Results values={item.trigger} title="触发信息" />
+              {item.artifactIds?.length || scope.serviceId || scope.environmentId ? (
+                <div className="heading-actions">
+                  <a
+                    className="button secondary small"
+                    href={'#' + deliveryPath(projectId, 'artifacts', deliveryScope)}
+                  >
+                    查看{scope.serviceId || scope.environmentId ? '此范围的' : '项目'}构建产物
+                  </a>
+                </div>
+              ) : null}
               {item.artifactIds?.length ? (
                 <div className="heading-actions">
                   {item.artifactIds.map((id) => (
                     <a
                       key={id}
                       className="text-link"
-                      href={'#' + deliveryPath(projectId, 'artifacts', { recordId: id })}
+                      href={
+                        '#' +
+                        deliveryPath(projectId, 'artifacts', { ...deliveryScope, recordId: id })
+                      }
                     >
                       查看产物 {id.slice(0, 8)}
                     </a>
@@ -612,7 +564,7 @@ function RunDetails({
                     {n.childRunId && (
                       <a
                         className="text-link"
-                        href={`#/projects/${projectId}/execution-graph?run=${n.childRunId}`}
+                        href={graphRunHref(projectId, n.childRunId, scope, delivery)}
                       >
                         查看子流运行
                       </a>
@@ -620,10 +572,7 @@ function RunDetails({
                   </li>
                 ))}
               </ol>
-              <a
-                className="text-link"
-                href={`#/projects/${projectId}/execution-graph?run=${item.id}`}
-              >
+              <a className="text-link" href={graphRunHref(projectId, item.id, scope, delivery)}>
                 本次运行的固定链接
               </a>
             </>

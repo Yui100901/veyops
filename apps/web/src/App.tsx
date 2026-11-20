@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { version as appVersion } from '../../../package.json';
 import type { FormEvent, ReactNode } from 'react';
 import {
@@ -23,15 +23,16 @@ import {
 import { ApiError, api, message, navigate, post, useRoute } from './api';
 import { ErrorBanner, Loading, PageHeader, Section } from './components';
 import { DashboardPage } from './pages/Dashboard';
-import { CredentialsPage, ProjectPage, ProjectsPage, ServersPage } from './pages/Resources';
+import { CredentialsPage, ProjectsPage, ServersPage } from './pages/Resources';
 import { TaskPage, TasksPage } from './pages/Operations';
 import { OperationsCenterPage, operationsTabForPath } from './pages/BatchOperations';
 import { AuditPage, SystemPage } from './pages/System';
 import { BackupsPage } from './pages/Backups';
 import { AIPage } from './pages/AI';
 import { DeliveryRecordsPage, RegistriesPage } from './pages/Delivery';
-import { ProjectDelivery, LegacyDeliveryLink } from './pages/ProjectDelivery';
-import { deliveryTabs, type DeliveryTab } from './pages/delivery-route';
+import { LegacyDeliveryLink } from './pages/ProjectDelivery';
+import { ProjectWorkspace } from './pages/ProjectWorkspace';
+import { readProjectWorkspace } from './pages/project-workspace-route';
 import { ProjectViewsPage } from './pages/ProjectViews';
 import { UsersPage } from './pages/Users';
 import {
@@ -42,8 +43,6 @@ import {
 } from './pages/Notifications';
 import { userRoleNames } from './models';
 import type { User } from './models';
-
-const ProjectExecutionGraph = lazy(() => import('./pages/ProjectExecutionGraph'));
 
 const navigation = [
   {
@@ -389,8 +388,9 @@ export function App() {
   const [loggingOut, setLoggingOut] = useState(false);
   const route = useRoute();
   const [routePath, routeSearch] = route.split('?', 2);
-  const [, routeRoot, routeId, routeSection, unexpectedSegment] = routePath.split('/');
+  const [, routeRoot, routeId, routeSection] = routePath.split('/');
   const params = new URLSearchParams(routeSearch);
+  const projectRoute = readProjectWorkspace(routePath, routeSearch);
   async function boot() {
     setLoading(true);
     setError('');
@@ -477,68 +477,15 @@ export function App() {
   else if (routePath === '/servers' || routePath === '/targets') page = <ServersPage user={user} />;
   else if (route === '/credentials') page = <CredentialsPage user={user} />;
   else if (route === '/projects') page = <ProjectsPage user={user} />;
-  else if (
-    routeRoot === 'projects' &&
-    routeId &&
-    routeSection === 'execution-graph' &&
-    !unexpectedSegment
-  )
-    page = (
-      <Suspense fallback={<Loading />}>
-        <ProjectExecutionGraph
-          key={routeId}
-          id={routeId}
-          user={user}
-          runId={params.get('run') ?? undefined}
-          search={routeSearch}
-        />
-      </Suspense>
-    );
-  else if (
-    routeRoot === 'projects' &&
-    routeId &&
-    routeSection &&
-    Object.hasOwn(deliveryTabs, routeSection) &&
-    !unexpectedSegment
-  ) {
-    page = (
-      <ProjectDelivery
-        key={route}
-        id={routeId}
-        tab={routeSection as DeliveryTab}
-        search={routeSearch}
-        user={user}
-      />
-    );
-  } else if (routeRoot === 'projects' && routeId && !routeSection) {
-    const fromView = new URLSearchParams(routeSearch).get('view');
-    const viewId =
-      fromView && /^(all|production|testing|abnormal|[a-f0-9-]{36})$/.test(fromView)
-        ? fromView
-        : undefined;
-    page = (
-      <ProjectPage
-        key={route}
-        id={routePath.slice(10)}
-        user={user}
-        viewId={viewId}
-        deployment={
-          params.get('section') === 'deployment'
-            ? {
-                serviceId: params.get('serviceId') ?? '',
-                environmentId: params.get('environmentId') ?? '',
-              }
-            : undefined
-        }
-      />
-    );
-  } else if (routePath === '/views' || routePath.startsWith('/views/'))
+  else if (projectRoute)
+    page = <ProjectWorkspace key={projectRoute.id} route={projectRoute} user={user} />;
+  else if (routePath === '/views' || routePath.startsWith('/views/'))
     page = <ProjectViewsPage user={user} id={routePath.slice(7) || undefined} />;
   else if (
     (routeRoot === 'artifacts' || routeRoot === 'deployments') &&
     !routeSection &&
     (routeId ||
-      ['recordId', 'projectId', 'artifactId', 'deploymentId', 'pipelineRunId'].some((key) =>
+      ['recordId', 'projectId', 'artifactId', 'deploymentId', 'pipelineRunId', 'taskId'].some((key) =>
         params.has(key),
       ))
   )
@@ -551,7 +498,7 @@ export function App() {
   else if (operationsTab) page = <OperationsCenterPage tab={operationsTab} user={user} />;
   else if (route === '/tasks') page = <TasksPage />;
   else if (route.startsWith('/tasks/'))
-    page = <TaskPage key={route} id={route.slice(7)} user={user} />;
+    page = <TaskPage key={route} id={routePath.slice(7)} user={user} search={routeSearch} />;
   else if (route === '/audit') page = <AuditPage />;
   else if (route === '/settings') page = <SystemPage user={user} />;
   else if (routePath === '/settings/backups') page = <BackupsPage user={user} />;

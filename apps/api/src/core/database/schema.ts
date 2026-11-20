@@ -130,6 +130,7 @@ export interface ServiceRepositoriesTable {
 
 export interface EnvironmentsTable {
   archived_at: Generated<number | null>;
+  default_target_selection_json: Generated<string | null>;
   id: string;
   project_id: string;
   name: string;
@@ -206,7 +207,8 @@ export interface EnvironmentVariablesTable extends VariablesTable {
 }
 
 export interface ServiceEnvironmentVariablesTable extends VariablesTable {
-  config_id: string;
+  service_id: string;
+  environment_id: string;
 }
 
 export interface ProjectAddressesTable {

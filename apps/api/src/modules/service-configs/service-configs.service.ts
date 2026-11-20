@@ -115,12 +115,22 @@ class VariablesDto {
 const variableScopes = {
   project: ['project_variables', 'project_id'],
   environment: ['environment_variables', 'environment_id'],
-  serviceEnvironment: ['service_environment_variables', 'config_id'],
+} as const;
+const variableSources = {
+  project: 'PROJECT',
+  environment: 'ENVIRONMENT',
+  serviceEnvironment: 'SERVICE_ENVIRONMENT',
 } as const;
 type VariableScope =
-  | { kind: 'project' | 'environment'; id: string }
-  | { kind: 'serviceEnvironment'; id: string; serviceId: string; environmentId: string };
+  | { kind: 'project'; id: string }
+  | { kind: 'environment'; id: string }
+  | { kind: 'serviceEnvironment'; serviceId: string; environmentId: string };
 type VariableRow = Omit<Selectable<Database['project_variables']>, 'project_id'>;
+export type VariableSource = {
+  key: string;
+  source: (typeof variableSources)[keyof typeof variableSources] | 'SYSTEM';
+  isSecret: boolean;
+};
 const variableFields = [
   'id',
   'key',
@@ -176,8 +186,8 @@ export class ServiceConfigsService {
     private readonly settings: SystemSettingsService,
     private readonly credentials: CredentialsService,
   ) {}
-  private async project(id: string) {
-    const row = await this.database.db
+  private async project(id: string, db = this.database.db) {
+    const row = await db
       .selectFrom('projects')
       .select(['id', 'slug'])
       .where('id', '=', id)
@@ -257,7 +267,6 @@ export class ServiceConfigsService {
     const projectId = await this.assertScope(serviceId, environmentId);
     const defaults = await this.settings.get(projectId);
     const selection = directDeploymentSelection(input, defaults.defaultMaxParallelTargets);
-    if (!selection && !input.targetId) throw new BadRequestException('请选择服务器或服务器分组');
     if (input.targetId) await this.targets.get(input.targetId);
     if ((input.artifactType === 'FILE') !== (input.deployMethod === 'FILE'))
       throw new BadRequestException('产物类型与部署方式不匹配');
@@ -361,42 +370,55 @@ export class ServiceConfigsService {
     projectId: string,
     environmentId?: string | null,
     serviceId?: string | null,
+    db = this.database.db,
   ) {
     const [project, service] = await Promise.all([
-      this.project(projectId),
-      serviceId ? this.service(serviceId) : undefined,
+      this.project(projectId, db),
+      serviceId ? this.service(serviceId, db) : undefined,
     ]);
     if (service && service.project_id !== project.id)
       throw new BadRequestException('服务必须属于当前项目');
     const scopes: VariableScope[] = [{ kind: 'project', id: projectId }];
     if (environmentId) {
-      const environment = await this.environment(environmentId);
+      const environment = await this.environment(environmentId, db);
       if (environment.project_id !== projectId)
         throw new BadRequestException('环境必须属于当前项目');
       scopes.push({ kind: 'environment', id: environmentId });
     }
-    if (environmentId && serviceId) {
-      const scope = await this.environmentVariableScope(environmentId, serviceId);
-      if (scope) scopes.push(scope);
-    }
+    if (environmentId && serviceId)
+      scopes.push({ kind: 'serviceEnvironment', serviceId, environmentId });
     const layers = await Promise.all(
-      scopes.map((scope) => this.variableQuery(this.database.db, scope).execute()),
+      scopes.map(async (scope) => ({
+        source: variableSources[scope.kind],
+        rows: await this.variableQuery(db, scope).execute(),
+      })),
     );
     const all = new Map(
-      layers
-        .flat()
-        .filter((row) => !systemVariableName.test(row.key))
-        .map((row) => [row.key, row]),
+      layers.flatMap(({ source, rows }) =>
+        rows
+          .filter(({ key }) => !systemVariableName.test(key))
+          .map((row) => [row.key, { ...row, source }] as const),
+      ),
     );
-    const variables = Object.fromEntries(
-      [...all].flatMap(([key, row]) => (row.is_secret ? [] : [[key, row.value_text ?? '']])),
-    ) as Record<string, string>;
-    variables.VEYOPS_PROJECT_ID = project.id;
-    variables.VEYOPS_PROJECT_SLUG = project.slug;
-    if (service) {
-      variables.VEYOPS_SERVICE_ID = service.id;
-      variables.VEYOPS_SERVICE_SLUG = service.slug;
-    }
+    const system = {
+      VEYOPS_PROJECT_ID: project.id,
+      VEYOPS_PROJECT_SLUG: project.slug,
+      ...(service && { VEYOPS_SERVICE_ID: service.id, VEYOPS_SERVICE_SLUG: service.slug }),
+    };
+    const variables: Record<string, string> = {
+      ...Object.fromEntries(
+        [...all].flatMap(([key, row]) => (row.is_secret ? [] : [[key, row.value_text ?? '']])),
+      ),
+      ...system,
+    };
+    const sources: VariableSource[] = [
+      ...[...all].map(([key, row]) => ({
+        key,
+        source: row.source,
+        isSecret: Boolean(row.is_secret),
+      })),
+      ...Object.keys(system).map((key) => ({ key, source: 'SYSTEM' as const, isSecret: false })),
+    ];
     return {
       variables,
       secretVariables: Object.fromEntries(
@@ -404,21 +426,30 @@ export class ServiceConfigsService {
           row.is_secret && row.credential_id ? [[key, row.credential_id]] : [],
         ),
       ) as Record<string, string>,
+      variableSources: sources.sort((a, b) => a.key.localeCompare(b.key)),
     };
   }
   private variableQuery(db: Kysely<Database>, scope: VariableScope) {
-    const [table, parent] = variableScopes[scope.kind];
-    return db.selectFrom(table).select(variableFields).where(parent, '=', scope.id);
+    const variables =
+      scope.kind === 'serviceEnvironment'
+        ? db
+            .selectFrom('service_environment_variables')
+            .select(variableFields)
+            .where('service_id', '=', scope.serviceId)
+            .where('environment_id', '=', scope.environmentId)
+        : db
+            .selectFrom(variableScopes[scope.kind][0])
+            .select(variableFields)
+            .where(variableScopes[scope.kind][1], '=', scope.id);
+    return db.selectFrom(variables.as('scope_variables')).selectAll();
   }
   private async environmentVariableScope(environmentId: string, serviceId?: string) {
     if (!serviceId) {
       await this.environment(environmentId);
       return { kind: 'environment', id: environmentId } as const;
     }
-    const config = await this.get(serviceId, environmentId);
-    return config
-      ? ({ kind: 'serviceEnvironment', id: config.id, serviceId, environmentId } as const)
-      : null;
+    await this.assertScope(serviceId, environmentId);
+    return { kind: 'serviceEnvironment', serviceId, environmentId } as const;
   }
   private async presentVariables(db: Kysely<Database>, rows: VariableRow[]) {
     const refs = [
@@ -455,8 +486,7 @@ export class ServiceConfigsService {
     return this.listVariableScope({ kind: 'project', id: projectId });
   }
   async listVariables(environmentId: string, serviceId?: string) {
-    const scope = await this.environmentVariableScope(environmentId, serviceId);
-    return scope ? this.listVariableScope(scope) : [];
+    return this.listVariableScope(await this.environmentVariableScope(environmentId, serviceId));
   }
   async listInheritedVariables(environmentId: string) {
     const { project_id } = await this.environment(environmentId);
@@ -481,16 +511,14 @@ export class ServiceConfigsService {
     serviceId?: string,
   ) {
     const scope = await this.environmentVariableScope(environmentId, serviceId);
-    if (!scope) throw new BadRequestException('请先保存服务环境配置');
     return this.saveVariableScope(scope, input, userId);
   }
   private async lockVariableScope(tx: Transaction<Database>, scope: VariableScope) {
-    const table =
-      scope.kind === 'project'
-        ? 'projects'
-        : scope.kind === 'environment'
-          ? 'environments'
-          : 'service_environment_configs';
+    if (scope.kind === 'serviceEnvironment') {
+      await this.assertScope(scope.serviceId, scope.environmentId, tx);
+      return;
+    }
+    const table = scope.kind === 'project' ? 'projects' : 'environments';
     // The parent lock serializes even concurrent writes to an initially empty scope.
     let lock = tx.updateTable(table).set((eb) => ({ updated_at: eb.ref('updated_at') }));
     if (table === 'projects') lock = lock.where('deleted_at', 'is', null);
@@ -505,10 +533,7 @@ export class ServiceConfigsService {
     if (reserved) throw new BadRequestException(`${reserved.key} 由系统提供`);
     return this.database.db.transaction().execute(async (tx) => {
       await lockProjectGraph(tx);
-      if (scope.kind === 'serviceEnvironment')
-        await this.assertScope(scope.serviceId, scope.environmentId, tx);
       await this.lockVariableScope(tx, scope);
-      const [table, parent] = variableScopes[scope.kind];
       const old = new Map(
         (await this.variableQuery(tx, scope).execute()).map((row) => [row.key, row]),
       );
@@ -516,7 +541,16 @@ export class ServiceConfigsService {
       for (const variable of input.variables) {
         rows.push(await this.prepareVariable(tx, variable, userId, old.get(variable.key)));
       }
-      await tx.deleteFrom(table).where(parent, '=', scope.id).execute();
+      if (scope.kind === 'serviceEnvironment')
+        await tx
+          .deleteFrom('service_environment_variables')
+          .where('service_id', '=', scope.serviceId)
+          .where('environment_id', '=', scope.environmentId)
+          .execute();
+      else {
+        const [table, parent] = variableScopes[scope.kind];
+        await tx.deleteFrom(table).where(parent, '=', scope.id).execute();
+      }
       if (rows.length) {
         if (scope.kind === 'project')
           await tx
@@ -531,7 +565,13 @@ export class ServiceConfigsService {
         else
           await tx
             .insertInto('service_environment_variables')
-            .values(rows.map((row) => ({ ...row, config_id: scope.id })))
+            .values(
+              rows.map((row) => ({
+                ...row,
+                service_id: scope.serviceId,
+                environment_id: scope.environmentId,
+              })),
+            )
             .execute();
       }
       await this.auditVariableScope(scope, userId, 'update', { count: rows.length }, tx);
@@ -600,7 +640,6 @@ export class ServiceConfigsService {
   }
   async revealVariable(environmentId: string, key: string, userId: string, serviceId?: string) {
     const scope = await this.environmentVariableScope(environmentId, serviceId);
-    if (!scope) throw new NotFoundException('服务环境配置不存在');
     return this.revealVariableScope(scope, key, userId);
   }
   private async revealVariableScope(scope: VariableScope, key: string, userId: string) {

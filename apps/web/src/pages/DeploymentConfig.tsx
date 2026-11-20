@@ -1,9 +1,9 @@
-import { InlineEditor, useInlineEditor } from '../InlineEditor';
+import { InlineEditor } from '../InlineEditor';
 import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Check } from 'lucide-react';
 import { api, formatTime, message, useResource } from '../api';
-import { Empty, ErrorBanner, Field, Form, Loading, Section } from '../components';
+import { ErrorBanner, Field, Form, Loading } from '../components';
 import type {
   DeploymentRecord,
   DeploymentSelection,
@@ -12,14 +12,16 @@ import type {
   User,
 } from '../models';
 import { ArtifactRetentionPolicy } from './ArtifactRetention';
+import { EnvironmentVariables } from './EnvironmentVariables';
 import { FailureHandling } from './FailureHandling';
-import { ProjectServerInventory, type ServiceEnvironmentContext } from './ProjectServerInventory';
+import { ProjectServerInventory } from './ProjectServerInventory';
 import {
   DeploymentSelectionPicker,
   deploymentSelection,
   hasDeploymentSelection,
   useDeploymentInventory,
 } from './DeploymentSelection';
+import { projectResourcePath, type GraphResourceReturn } from './project-workspace-route';
 
 type EnvironmentConfig = DeploymentSelection & {
   executionMode?: 'DEPLOY' | 'BUILD_ONLY' | null;
@@ -36,95 +38,16 @@ type EnvironmentConfig = DeploymentSelection & {
   healthCheckCommand?: string;
   releasePolicy?: ReleasePolicy;
 };
-export function ProjectDeploymentConfig({
-  project,
-  user,
-  reloadProject,
-  initialEnvironment,
-}: {
-  project: ProjectDetail;
-  user: User;
-  reloadProject: () => Promise<void>;
-  initialEnvironment?: ServiceEnvironmentContext;
-}) {
-  const [selected, setSelected] = useInlineEditor<ServiceEnvironmentContext>(initialEnvironment);
-  const [binding, setBinding] = useInlineEditor<string>();
-  return (
-    <Section
-      title="服务与部署配置"
-      subtitle="绑定代码仓库，并为每个服务和环境设置可独立覆盖的部署配置"
-      action={
-        <a className="text-link" href={`#/projects/${project.id}/execution-graph`}>
-          打开 执行流 →
-        </a>
-      }
-    >
-      <div hidden={Boolean(selected || binding)}>
-        {!project.services.length ? (
-          <Empty
-            title="先创建服务"
-            description="创建服务与环境后，可在这里设置仓库关联和部署配置。"
-          />
-        ) : (
-          <div className="resource-list">
-            {project.services.map((s) => (
-              <div className="deployment-service-row" key={s.id}>
-                <div>
-                  <strong>{s.name}</strong>
-                  <span className="tag">{s.serviceType}</span>
-                </div>
-                <div className="deployment-service-actions">
-                  {project.environments.map((e) => (
-                    <button
-                      className="button secondary small"
-                      key={e.id}
-                      onClick={() => setSelected({ serviceId: s.id, environmentId: e.id })}
-                    >
-                      {e.name} 配置
-                    </button>
-                  ))}
-                  {user.role !== 'VIEWER' && (
-                    <button className="text-button" onClick={() => setBinding(s.id)}>
-                      关联仓库
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-      {selected && (
-        <EnvironmentConfigEditor
-          key={`${selected.serviceId}:${selected.environmentId}`}
-          project={project}
-          serviceId={selected.serviceId}
-          environmentId={selected.environmentId}
-          user={user}
-          onClose={() => setSelected(undefined)}
-          onSaved={() => {
-            setSelected(undefined);
-            void reloadProject();
-          }}
-        />
-      )}
-      {binding && (
-        <RepositoryBinding
-          project={project}
-          serviceId={binding}
-          onClose={() => setBinding(undefined)}
-        />
-      )}
-    </Section>
-  );
-}
-function EnvironmentConfigEditor({
+export function EnvironmentConfigEditor({
   project,
   serviceId,
   environmentId,
   user,
   onClose,
   onSaved,
+  panel,
+  view,
+  graphBack,
 }: {
   project: ProjectDetail;
   serviceId: string;
@@ -132,6 +55,9 @@ function EnvironmentConfigEditor({
   user: User;
   onClose: () => void;
   onSaved: () => void;
+  panel?: string;
+  view?: string;
+  graphBack?: GraphResourceReturn;
 }) {
   const config = useResource<EnvironmentConfig | null>(
     `/services/${serviceId}/environments/${environmentId}/config`,
@@ -141,16 +67,26 @@ function EnvironmentConfigEditor({
   const [error, setError] = useState('');
   const [artifactType, setArtifactType] = useState('FILE');
   const [selection, setSelection] = useState<DeploymentSelection>(() => deploymentSelection());
+  const [overrideTargets, setOverrideTargets] = useState(false);
   const [editRetention, setEditRetention] = useState(false);
-  const [tab, setTab] = useState<'settings' | 'servers' | 'reviews' | 'failure'>('settings');
+  const panels = {
+    settings: '部署设置',
+    variables: '服务环境变量',
+    servers: '服务器及来源',
+    reviews: '代码审核',
+    failure: '故障处理',
+  };
+  const tab = panel && Object.hasOwn(panels, panel) ? panel : 'settings';
+  const environment = project.environments.find((row) => row.id === environmentId);
   useEffect(() => {
     setArtifactType(config.data?.artifactType || 'FILE');
     setSelection(deploymentSelection(config.data));
+    setOverrideTargets(Boolean(config.data?.targetId || hasDeploymentSelection(config.data ?? {})));
   }, [config.data]);
   async function save(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (busy || user.role === 'VIEWER') return;
-    if (!hasDeploymentSelection(selection)) {
+    if (overrideTargets && !hasDeploymentSelection(selection) && !config.data?.targetId) {
       setError('请选择服务器或服务器分组。');
       return;
     }
@@ -161,7 +97,8 @@ function EnvironmentConfigEditor({
       await api(`/services/${serviceId}/environments/${environmentId}/config`, {
         method: 'PUT',
         body: JSON.stringify({
-          ...selection,
+          ...(overrideTargets &&
+            (hasDeploymentSelection(selection) ? selection : { targetId: config.data?.targetId })),
           buildLocation: f.get('buildLocation') || null,
           executionMode: f.get('executionMode') || null,
           artifactType: f.get('artifactType'),
@@ -192,6 +129,7 @@ function EnvironmentConfigEditor({
           }),
         }),
       });
+      void config.reload();
       onSaved();
     } catch (err) {
       setError(message(err));
@@ -202,27 +140,46 @@ function EnvironmentConfigEditor({
   return (
     <InlineEditor
       busy={busy}
-      title={`${project.services.find((s) => s.id === serviceId)?.name} · ${project.environments.find((e) => e.id === environmentId)?.name}`}
-      description="此处配置覆盖 执行流 对应字段；留空的命令或路径由流程配置提供。"
+      title={`${project.services.find((s) => s.id === serviceId)?.name} · ${environment?.name}`}
+      description="为当前服务设置发布策略、目标覆盖和独立变量。"
       onClose={onClose}
       wide
     >
       <nav className="resource-section-switcher" aria-label="服务环境配置">
-        <button type="button" aria-pressed={tab === 'settings'} onClick={() => setTab('settings')}>
-          部署设置
-        </button>
-        <button type="button" aria-pressed={tab === 'servers'} onClick={() => setTab('servers')}>
-          服务器及来源
-        </button>
-        <button type="button" aria-pressed={tab === 'reviews'} onClick={() => setTab('reviews')}>
-          代码审核
-        </button>
-        <button type="button" aria-pressed={tab === 'failure'} onClick={() => setTab('failure')}>
-          故障处理
-        </button>
+        {Object.entries(panels).map(([key, label]) => (
+          <a
+            key={key}
+            aria-current={tab === key ? 'page' : undefined}
+            href={
+              '#' +
+              projectResourcePath(project.id, {
+                ...graphBack,
+                view,
+                resource: 'services',
+                serviceId,
+                environmentId,
+                panel: key,
+              })
+            }
+          >
+            {label}
+          </a>
+        ))}
       </nav>
+      {tab === 'variables' && (
+        <EnvironmentVariables
+          projectId={project.id}
+          serviceId={serviceId}
+          environmentId={environmentId}
+          user={user}
+        />
+      )}
       {tab === 'servers' && (
-        <ProjectServerInventory project={project} scope={{ serviceId, environmentId }} />
+        <ProjectServerInventory
+          project={project}
+          scope={{ serviceId, environmentId }}
+          view={view}
+        />
       )}
       {tab === 'failure' && (
         <FailureHandling user={user} serviceId={serviceId} environmentId={environmentId} />
@@ -252,16 +209,49 @@ function EnvironmentConfigEditor({
             submit={user.role === 'VIEWER' ? '只读用户' : '保存环境配置'}
           >
             <fieldset disabled={user.role === 'VIEWER'}>
-              {config.data?.targetId && !hasDeploymentSelection(selection) && (
-                <p className="field-note">请重新选择此环境的服务器或服务器分组。</p>
+              <label className="option-check">
+                <input
+                  type="checkbox"
+                  checked={overrideTargets}
+                  disabled={busy}
+                  onChange={(event) => setOverrideTargets(event.target.checked)}
+                />
+                为此服务覆盖环境默认发布目标
+              </label>
+              {overrideTargets ? (
+                <>
+                  {config.data?.targetId && !hasDeploymentSelection(selection) && (
+                    <p className="field-note">当前保留已有目标。选择服务器或分组后将改用新选择。</p>
+                  )}
+                  <DeploymentSelectionPicker
+                    projectId={project.id}
+                    inventory={inventory}
+                    value={selection}
+                    onChange={setSelection}
+                    disabled={busy || user.role === 'VIEWER'}
+                  />
+                </>
+              ) : (
+                <p className="field-note">
+                  {environment?.defaultTargetSelection
+                    ? '发布继承项目环境的默认目标。'
+                    : '当前环境尚未设置默认发布目标。'}{' '}
+                  <a
+                    className="text-link"
+                    href={
+                      '#' +
+                      projectResourcePath(project.id, {
+                        view,
+                        resource: 'environments',
+                        environmentId,
+                        panel: 'targets',
+                      })
+                    }
+                  >
+                    查看环境默认发布目标
+                  </a>
+                </p>
               )}
-              <DeploymentSelectionPicker
-                projectId={project.id}
-                inventory={inventory}
-                value={selection}
-                onChange={setSelection}
-                disabled={busy || user.role === 'VIEWER'}
-              />
               <div className="form-grid">
                 <Field label="构建位置">
                   <select name="buildLocation" defaultValue={config.data?.buildLocation || ''}>
@@ -659,7 +649,7 @@ function SourceReviews({
   );
 }
 
-function RepositoryBinding({
+export function RepositoryBinding({
   project,
   serviceId,
   onClose,
@@ -684,10 +674,6 @@ function RepositoryBinding({
   }, [existing.data]);
   async function save(e: FormEvent) {
     e.preventDefault();
-    if (!selected.length) {
-      setError('请至少选择一个仓库');
-      return;
-    }
     setBusy(true);
     setError('');
     try {

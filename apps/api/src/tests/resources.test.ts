@@ -132,6 +132,7 @@ async function checkResources(databaseUrl?: string) {
         name: 'Test v2',
         slug: 'test',
         environmentType: 'TESTING',
+        defaultTargetSelection: { groupIds: [group.id], maxParallel: 2 },
       }),
       patch(root + '/repositories/' + repo.id, {
         name: 'Git v2',
@@ -141,6 +142,28 @@ async function checkResources(databaseUrl?: string) {
     ]);
     assert.equal(editedService.serviceType, 'API');
     assert.equal(editedEnvironment.environmentType, 'TESTING');
+    assert.deepEqual(editedEnvironment.defaultTargetSelection, {
+      serverIds: [],
+      groupIds: [group.id],
+      strategy: 'PARALLEL',
+      maxParallel: 2,
+      failurePolicy: 'CONTINUE',
+    });
+    const blockedDefault = await api.delete(base + '/server-groups/' + group.id).expect(409);
+    assert.ok(
+      blockedDefault.body.error.references.some(
+        (ref: { sourceKind: string; environmentId: string }) =>
+          ref.sourceKind === 'ENVIRONMENT_DEFAULT' && ref.environmentId === environment.id,
+      ),
+    );
+    const environmentInventory = await fetch(root + '/resource-references');
+    assert.ok(
+      environmentInventory.servers
+        .find((row: { id: string }) => row.id === server.id)
+        ?.references.some(
+          (ref: { sourceKind: string }) => ref.sourceKind === 'ENVIRONMENT_DEFAULT',
+        ),
+    );
     assert.equal(editedRepo.defaultBranch, null);
     assert.equal(editedRepo.branchSyncStatus, 'ERROR');
     const fixtureTarget = await create('/deployment-targets', {
@@ -150,12 +173,13 @@ async function checkResources(databaseUrl?: string) {
     const configure = async (serviceId: string, environmentId: string) => {
       const scope = `/services/${serviceId}/environments/${environmentId}`;
       await api
-        .put(base + scope + '/config')
-        .send({ targetId: fixtureTarget.id, deployPath: '/tmp/veyops-resource-fixture' })
-        .expect(200);
-      await api
         .put(base + scope + '/variables')
         .send({ variables: [{ key: 'SERVICE_MODE', value: 'fixture' }] })
+        .expect(200);
+      assert.equal(await fetch(scope + '/config'), null);
+      await api
+        .put(base + scope + '/config')
+        .send({ targetId: fixtureTarget.id, deployPath: '/tmp/veyops-resource-fixture' })
         .expect(200);
       return scope;
     };
@@ -297,9 +321,20 @@ async function checkResources(databaseUrl?: string) {
       VEYOPS_SERVICE_ID: service.id,
       VEYOPS_SERVICE_SLUG: service.slug,
     };
+    const platformSources = Object.keys(identifiers).map((key) => ({
+      key,
+      isSecret: false,
+      source: 'SYSTEM',
+    }));
     assert.deepEqual(await configs.resolveVariables(project.id, environment.id, service.id), {
       variables: { ENVIRONMENT_MODE: 'fixture', SERVICE_MODE: 'fixture', ...identifiers },
       secretVariables: { [secretKey]: stored.credential_id },
+      variableSources: [
+        { key: secretKey, isSecret: true, source: 'PROJECT' },
+        { key: 'ENVIRONMENT_MODE', isSecret: false, source: 'ENVIRONMENT' },
+        { key: 'SERVICE_MODE', isSecret: false, source: 'SERVICE_ENVIRONMENT' },
+        ...platformSources,
+      ],
     });
     await putVariables(envVarsPath, [{ key: secretKey, value: 'environment-override' }]).expect(
       200,
@@ -312,6 +347,12 @@ async function checkResources(databaseUrl?: string) {
         ...identifiers,
       },
       secretVariables: {},
+      variableSources: [
+        { key: secretKey, isSecret: false, source: 'ENVIRONMENT' },
+        { key: 'ENVIRONMENT_MODE', isSecret: false, source: 'PROJECT' },
+        { key: 'SERVICE_MODE', isSecret: false, source: 'SERVICE_ENVIRONMENT' },
+        ...platformSources,
+      ],
     });
     await putVariables(envVarsPath, [{ key: secretKey, isSecret: true, keepSecret: true }]).expect(
       400,
@@ -327,6 +368,12 @@ async function checkResources(databaseUrl?: string) {
     assert.deepEqual((await api.post(revealUrl).expect(201)).body.data, {
       value: 'rotated-secret-value',
     });
+    const cleared = await patch(root + '/environments/' + environment.id, {
+      defaultTargetSelection: null,
+    });
+    assert.equal(cleared.name, editedEnvironment.name);
+    assert.equal(cleared.environmentType, 'TESTING');
+    assert.equal(cleared.defaultTargetSelection, null);
     await api.delete(base + root + '/addresses/' + address.id).expect(200);
     await api.delete(base + root + '/environments/' + environment.id).expect(200);
     const staging = await create(root + '/environments', { name: 'Staging', slug: 'staging' });

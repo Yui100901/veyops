@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useState, type FormEvent, type ReactNode } from 'react';
 import {
   Check,
   CircleCheck,
@@ -10,9 +10,15 @@ import {
   Wifi,
 } from 'lucide-react';
 import { api, message, post, useResource } from '../api';
-import { Empty, ErrorBanner, Field, Loading, Modal } from '../components';
+import { Empty, ErrorBanner, Field, Loading } from '../components';
+import { InlineEditor } from '../InlineEditor';
 import type { Environment, Repository, Service, User } from '../models';
 import { ContextAIButton } from './AI';
+import {
+  projectGraphPath,
+  projectResourcePath,
+  type GraphResourceReturn,
+} from './project-workspace-route';
 
 import { BranchSyncControls, useRepositoryBranches } from './RepositoryBranches';
 export interface RepositoryCommit {
@@ -191,6 +197,10 @@ export function RepositoryDetails({
   environments,
   onClose,
   onSynced,
+  view,
+  panel,
+  actions,
+  graphBack,
 }: {
   projectId: string;
   repository: Repository;
@@ -199,11 +209,24 @@ export function RepositoryDetails({
   user: User;
   onClose: () => void;
   onSynced?: () => void;
+  view?: string;
+  panel?: string;
+  actions?: ReactNode;
+  graphBack?: GraphResourceReturn;
 }) {
   const [checking, setChecking] = useState(false);
   const [connection, setConnection] = useState<{ ok: true; defaultBranch: string | null }>();
   const [error, setError] = useState('');
-  const [section, setSection] = useState<'commits' | 'analysis'>();
+  const canInspect = user.role !== 'VIEWER';
+  const pane = (next: string) =>
+    '#' +
+    projectResourcePath(projectId, {
+      ...graphBack,
+      resource: 'repositories',
+      repositoryId: repository.id,
+      view,
+      panel: next === panel ? undefined : next,
+    });
   async function checkConnection() {
     setChecking(true);
     setError('');
@@ -220,12 +243,7 @@ export function RepositoryDetails({
     }
   }
   return (
-    <Modal
-      title={repository.name}
-      description="检查 Git 连接、浏览提交，或分析仓库的构建与部署方式。"
-      onClose={onClose}
-      wide
-    >
+    <InlineEditor title={repository.name} onClose={onClose} wide>
       <div className="form-body">
         <p className="repository-url mono">{repository.cloneUrl}</p>
         <details className="advanced-options">
@@ -233,37 +251,37 @@ export function RepositoryDetails({
           <code>{repository.id}</code>
         </details>
         <div className="repository-detail-actions">
-          <button
-            className="button secondary"
-            type="button"
-            onClick={() => void checkConnection()}
-            disabled={checking}
-          >
-            <Wifi size={16} />
-            {checking ? '正在测试…' : '测试连接'}
-          </button>
-          <button
-            className="button primary"
-            type="button"
-            onClick={() => setSection(section === 'commits' ? undefined : 'commits')}
-            aria-expanded={section === 'commits'}
-          >
-            <GitBranch size={16} />
-            浏览分支与提交
-          </button>
-          <button
-            className="button secondary"
-            type="button"
-            onClick={() => setSection(section === 'analysis' ? undefined : 'analysis')}
-            aria-expanded={section === 'analysis'}
-          >
-            <FileCode2 size={16} />
-            AI 分析仓库
-          </button>
-          <a
-            className="text-link"
-            href={`#/projects/${projectId}/execution-graph`}
-          >
+          {actions}
+          {canInspect && (
+            <>
+              <button
+                className="button secondary"
+                type="button"
+                onClick={() => void checkConnection()}
+                disabled={checking}
+              >
+                <Wifi size={16} />
+                {checking ? '正在测试…' : '测试连接'}
+              </button>
+              <a
+                className="button primary"
+                href={pane('commits')}
+                aria-current={panel === 'commits' ? 'page' : undefined}
+              >
+                <GitBranch size={16} />
+                浏览分支与提交
+              </a>
+              <a
+                className="button secondary"
+                href={pane('analysis')}
+                aria-current={panel === 'analysis' ? 'page' : undefined}
+              >
+                <FileCode2 size={16} />
+                AI 分析仓库
+              </a>
+            </>
+          )}
+          <a className="text-link" href={'#' + projectGraphPath(projectId, { view })}>
             打开项目执行图 →
           </a>
           <ContextAIButton
@@ -282,10 +300,10 @@ export function RepositoryDetails({
             {connection.defaultBranch ? `，远程默认分支为 ${connection.defaultBranch}。` : '。'}
           </p>
         )}
-        {section === 'commits' && (
+        {canInspect && panel === 'commits' && (
           <RepositoryBrowser projectId={projectId} repository={repository} onSynced={onSynced} />
         )}
-        {section === 'analysis' && (
+        {canInspect && panel === 'analysis' && (
           <RepositoryAnalysis
             user={user}
             projectId={projectId}
@@ -295,7 +313,7 @@ export function RepositoryDetails({
           />
         )}
       </div>
-    </Modal>
+    </InlineEditor>
   );
 }
 

@@ -40,6 +40,7 @@ export class GraphPreviewDto {
 }
 export class GraphRunDto extends GraphPreviewDto {
   @Matches(/^[a-f0-9]{64}$/) expectedConfigurationHash!: string;
+  @IsOptional() @IsObject() expectedPlanSections?: Record<string, string>;
   @Matches(/^[a-zA-Z0-9_-]{1,120}$/) idempotencyKey!: string;
 }
 

@@ -38,7 +38,7 @@
 
 ### 执行配置归属
 
-统一预览按下列归属解释配置来源。此批资源查询以已保存配置和执行快照为准。运行配置的统一解析安排在 P0-B。
+执行预览按下列规则解析配置并返回生效来源，资源查询以已保存配置和执行快照为准。
 
 | 字段 | 所属配置与顺序 |
 | --- | --- |
@@ -77,12 +77,12 @@
 
 ### 项目内交付
 
-项目交付页使用 `GET /projects/:id/delivery-context` 加载项目、服务、仓库和环境。已删除项目仍可查看历史，返回 `archived: true`。以下列表在数据库内先应用筛选，再返回最近的记录。
+项目交付页使用 `GET /projects/:id/delivery-context` 加载项目、服务、仓库和环境。已删除项目仍可查看历史，返回 `archived: true`。`archivedServices`、`archivedEnvironments` 和 `archivedRepositories` 供历史筛选核对归属。以下列表在数据库内先应用筛选，再返回最近的记录。
 
 | 请求 | 项目内筛选与追溯 |
 | --- | --- |
 | `GET /projects/:id/execution-graph/runs` | 读取执行流运行记录，通过运行详情获取关联任务和日志。 |
-| `GET /artifacts`、`GET /deployments` | 支持 `projectId`、上述三个条件及 `taskId`、`recordId`。返回产物或逐服务器发布与原始任务之间的关联。 |
+| `GET /artifacts`、`GET /deployments` | 支持 `projectId`、上述三个条件及 `taskId`、`recordId`。有执行图来源时返回 `graphRunId`、`graphVersion`、`graphFlowName` 和 `graphNodeName`。逐服务器发布还返回当次的 `serverName`、`serverHost`、`serverPort` 快照和实际使用的 `artifactId`。 |
 | `GET /deployments/approvals` | 管理员可按相同条件查看待审批发布，其中 `recordId` 是待审批任务 ID。审批、重新部署及回滚继续调用原有操作接口。 |
 
 ### 首页汇总
@@ -106,6 +106,17 @@
 
 备份目录固定为 `DATA_DIR/backups`。在线备份先生成数据库快照，再复制托管文件。需要数据库和文件位于同一维护窗口时，使用停机备份。恢复步骤见 [数据备份与恢复](BACKUP.md)。
 
+## 项目工作台地址
+
+| 入口 | 页面地址 |
+| --- | --- |
+| 项目资源 | `#/projects/:id`。用 `resource`、资源 ID 和 `panel` 定位服务环境、仓库、环境或服务器分组。 |
+| 执行图 | `#/projects/:id/execution-graph`。保留 `start`、`run`、`pane`、`version`、`node` 和 `flow` 深链接。服务环境入口可附带 `serviceId`、`environmentId` 和 `resourcePanel`。 |
+| 交付记录 | `#/projects/:id/delivery?tab=artifacts`。`tab` 可取 `artifacts`、`deployments`、`approvals`。服务、环境、提交和记录定位通过查询参数保留。 |
+| 项目配置 | `#/projects/:id/configuration`。同页维护基本信息、执行默认值、项目公共变量和 AI 策略。 |
+
+`view` 保留返回的项目视图。旧的项目交付地址 `/artifacts`、`/deployments`、`/approvals` 及 `?section=deployment` 服务环境地址继续可用。由已发布开始节点链接传入的服务或环境按该节点声明的输入预填，图中固定绑定继续随版本生效。
+
 ## 项目执行图
 
 以下路径使用前缀 `/projects/:projectId/execution-graph`。登录用户可查询，管理员和操作员可保存、发布和运行。
@@ -120,8 +131,8 @@
 | `GET /versions`、`GET /versions/:version` | 查询发布历史和具体发布版本。 |
 | `POST /versions/:version/retire` | 管理员或操作员停用旧发布版。先发布替代版本，再停用绑定该旧版的启用触发器。返回 `{version,retiredAt}`。停用版保留定义和运行历史，在途计划继续保护其资源。 |
 | `POST /versions/:version/restore` | 提交 `{expectedRevision}`，将发布版本载入草稿。 |
-| `POST /flows/:flowId/preview` | 提交 `{version,inputs:{parameters}}`，返回实际参数、固定提交、产物来源、目标、审批条件和 `configurationHash`。 |
-| `POST /flows/:flowId/run` | 提交同样的版本和输入，附 `expectedConfigurationHash` 和 `idempotencyKey`。相同确认可取回原运行。 |
+| `POST /flows/:flowId/preview` | 提交 `{version,inputs:{parameters}}`。返回 `configurationHash`、`planSections`、实际参数和 `executionPlan`，包括分开的构建与发布目标、配置来源、环境文件、变量元数据及运行期绑定。 |
+| `POST /flows/:flowId/run` | 提交同样的版本和输入，附 `expectedConfigurationHash` 和 `idempotencyKey`。可原样传回 `planSections` 为 `expectedPlanSections`。配置变更返回 409，`error.changes` 给出失效字段或计划段落，重新预览后方可确认。相同确认可取回原运行。 |
 | `GET /runs`、`GET /runs/:runId` | 查询运行、节点结果、任务、触发元数据和结束节点的 `outputs`。 |
 | `POST /runs/:runId/cancel` | 取消运行及尚未完成的节点和子流。 |
 | `POST /runs/:runId/nodes/:nodeId/decision` | 管理员提交 `{decision:"APPROVE"}` 或 `{decision:"REJECT"}`。 |
@@ -277,11 +288,12 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /services/:serviceId/repositories`、`PUT /services/:serviceId/repositories` | 查询或保存服务与仓库关联，传入 `{repositories:[{repositoryId,repoPath,isPrimary}]}`。 |
+| `POST /projects/:projectId/environments`、`PATCH /projects/:projectId/environments/:envId` | 创建或更新环境。`repositoryEnvFile` 指定仓库相对路径。`defaultTargetSelection` 指定默认发布服务器、分组和批次策略，传 `null` 清除默认目标。 |
 | `GET /services/:serviceId/environments/:envId/config`、`PUT /services/:serviceId/environments/:envId/config` | 读取或保存服务环境配置。 |
 | `GET /projects/:projectId/variables`、`PUT /projects/:projectId/variables` | 查询或保存项目公共变量。 |
 | `GET /environments/:envId/variables`、`PUT /environments/:envId/variables` | 查询或保存环境本地变量。 |
 | `GET /environments/:envId/variables/inherited` | 查询未被该环境覆盖的项目公共变量。 |
-| `GET /services/:serviceId/environments/:envId/variables`、`PUT /services/:serviceId/environments/:envId/variables` | 查询或保存服务级变量，覆盖同名环境变量。 |
+| `GET /services/:serviceId/environments/:envId/variables`、`PUT /services/:serviceId/environments/:envId/variables` | 独立查询或保存服务环境变量，覆盖同名环境变量。 |
 | `POST /projects/:projectId/variables/:key/reveal`、`POST /environments/:envId/variables/:key/reveal`、`POST /services/:serviceId/environments/:envId/variables/:key/reveal` | 管理员临时读取敏感值 `{value}`，读取动作记入审计。 |
 | `GET /artifacts` | 查看构建产物和下载、部署可用性，可按项目、服务、环境和任务筛选。 |
 | `GET /artifacts/:id/download` | 登录后下载文件或镜像归档，响应头 `X-Artifact-SHA256` 提供校验值。 |

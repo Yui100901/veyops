@@ -34,18 +34,30 @@ function toDraft(rows: StoredVariable[]): VariableDraft[] {
 export function EnvironmentVariables({
   projectId,
   environmentId,
+  serviceId,
   user,
 }: {
   projectId: string;
   environmentId?: string;
+  serviceId?: string;
   user: User;
 }) {
   const projectPath = `/projects/${encodeURIComponent(projectId)}/variables`;
   const path = environmentId
-    ? `/environments/${encodeURIComponent(environmentId)}/variables`
+    ? `${serviceId ? `/services/${encodeURIComponent(serviceId)}` : ''}/environments/${encodeURIComponent(environmentId)}/variables`
     : projectPath;
   const local = useResource<StoredVariable[]>(path);
-  const inherited = useResource<StoredVariable[]>(environmentId ? projectPath : null);
+  const projectVariables = useResource<StoredVariable[]>(environmentId ? projectPath : null);
+  const environmentVariables = useResource<StoredVariable[]>(
+    serviceId && environmentId
+      ? `/environments/${encodeURIComponent(environmentId)}/variables`
+      : null,
+  );
+  const inherited = new Map(
+    (projectVariables.data ?? []).map((row) => [row.key, { ...row, source: '项目公共变量' }]),
+  );
+  for (const row of environmentVariables.data ?? [])
+    inherited.set(row.key, { ...row, source: '环境变量' });
   return (
     <>
       <ErrorBanner error={local.error} retry={local.reload} />
@@ -55,11 +67,14 @@ export function EnvironmentVariables({
           key={path}
           path={path}
           initial={local.data}
-          inherited={inherited.data}
+          inherited={[...inherited.values()].sort((left, right) =>
+            left.key.localeCompare(right.key),
+          )}
           user={user}
         />
       )}
-      <ErrorBanner error={inherited.error} retry={inherited.reload} />
+      <ErrorBanner error={projectVariables.error} retry={projectVariables.reload} />
+      <ErrorBanner error={environmentVariables.error} retry={environmentVariables.reload} />
     </>
   );
 }
@@ -72,7 +87,7 @@ function VariableEditor({
 }: {
   path: string;
   initial: StoredVariable[];
-  inherited?: StoredVariable[];
+  inherited?: (StoredVariable & { source: string })[];
   user: User;
 }) {
   const [baseline, setBaseline] = useState(() => toDraft(initial));
@@ -514,7 +529,7 @@ function VariableEditor({
       )}
       {!!inherited?.length && (
         <div className="environment-variable-inheritance">
-          <h3>项目公共变量</h3>
+          <h3>继承的变量</h3>
           <div className="table-scroll">
             <table>
               <thead>
@@ -535,7 +550,7 @@ function VariableEditor({
                     </td>
                     <td>
                       <span className="tag">
-                        {localKeys.has(row.key) ? '环境覆盖' : '继承项目'}
+                        {localKeys.has(row.key) ? `已覆盖 · ${row.source}` : row.source}
                       </span>
                     </td>
                   </tr>

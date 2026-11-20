@@ -21,12 +21,18 @@ import type {
   DeploymentRecord,
   DeploymentSelection,
   ProjectDetail,
-  Server,
   User,
 } from '../models';
 import { ReleaseApprovals, RollbackRelease } from './ReleaseOperations';
 import { ArtifactCleanup, ArtifactRetentionPolicy } from './ArtifactRetention';
-import { deliveryPath } from './delivery-route';
+import {
+  deliveryGraphRunPath,
+  deliveryPath,
+  deliveryTaskPath,
+  type DeliveryScope,
+  type DeliveryTab,
+} from './delivery-route';
+import { projectGraphPath } from './project-workspace-route';
 
 interface Registry {
   id: string;
@@ -53,6 +59,9 @@ export type Artifact = {
   kind?: string;
   graphRunId?: string | null;
   graphNodeRunId?: string | null;
+  graphVersion?: number | null;
+  graphFlowName?: string | null;
+  graphNodeName?: string | null;
   storageType: string;
   storageKey: string;
   downloadAvailable: boolean;
@@ -160,19 +169,65 @@ function ArtifactDownload({ artifact }: { artifact: Artifact }) {
   return <span className="muted">—</span>;
 }
 
+function GraphOrigin({
+  record,
+  tab,
+  scope,
+  archived,
+}: {
+  record: Pick<
+    Artifact,
+    'projectId' | 'graphRunId' | 'graphVersion' | 'graphFlowName' | 'graphNodeName'
+  >;
+  tab: DeliveryTab;
+  scope: DeliveryScope;
+  archived?: boolean;
+}) {
+  if (!record.graphRunId || !record.projectId) return null;
+  const name = record.graphFlowName || '执行流运行';
+  const version = record.graphVersion != null ? ` · v${record.graphVersion}` : '';
+  return (
+    <small className="cell-detail">
+      {archived ? (
+        <span>
+          {name}
+          {version}
+        </span>
+      ) : (
+        <a
+          className="text-link"
+          href={'#' + deliveryGraphRunPath(record.projectId, record.graphRunId, tab, scope)}
+        >
+          {name}
+          {version}
+        </a>
+      )}
+      {record.graphNodeName && <span> · {record.graphNodeName}</span>}
+    </small>
+  );
+}
+
 export function DeliveryRecordsPage({
   type,
   user,
   project,
   query = '',
+  scope = {},
 }: {
   type: 'artifacts' | 'deployments';
   user: User;
   project?: ProjectDetail;
   query?: string;
+  scope?: DeliveryScope;
 }) {
-  const records = useResource<(Artifact & DeploymentRecord)[]>(`/${type}?${query}`);
-  const servers = useResource<Server[]>(type === 'deployments' ? '/servers' : null);
+  const records = useResource<
+    (Artifact &
+      DeploymentRecord & {
+        serverName?: string | null;
+        serverHost?: string | null;
+        serverPort?: number | null;
+      })[]
+  >(`/${type}?${query}`);
   const [rollback, setRollback] = useState<DeploymentRecord>();
   const [retention, setRetention] = useState<'policy' | 'cleanup'>();
   const [pinning, setPinning] = useState<string>();
@@ -182,7 +237,12 @@ export function DeliveryRecordsPage({
   const serviceId = scopeParams.get('serviceId');
   const environmentId = scopeParams.get('environmentId');
   const retentionScope =
-    project && serviceId && environmentId ? { serviceId, environmentId } : undefined;
+    serviceId &&
+    environmentId &&
+    project?.services.some(({ id }) => id === serviceId) &&
+    project.environments.some(({ id }) => id === environmentId)
+      ? { serviceId, environmentId }
+      : undefined;
 
   async function togglePin(artifact: Artifact) {
     setPinning(artifact.id);
@@ -255,15 +315,30 @@ export function DeliveryRecordsPage({
         ) : !records.data?.length ? (
           <Empty
             icon={<Boxes size={26} />}
-            title="暂无交付记录"
-            description="运行项目的构建或部署执行流后，结果会出现在这里。"
+            title={scope.recordId ? '找不到这条交付记录' : '暂无交付记录'}
+            description={
+              scope.recordId
+                ? '请核对记录所属项目和当前筛选条件。'
+                : '运行项目的构建或部署执行流后，结果会出现在这里。'
+            }
             action={
-              <a
-                className="button secondary"
-                href={project ? `#/projects/${project.id}/execution-graph` : '#/projects'}
-              >
-                {project ? '打开执行图' : '打开项目列表'}
-              </a>
+              project?.archived ? undefined : (
+                <a
+                  className="button secondary"
+                  href={
+                    project
+                      ? '#' +
+                        projectGraphPath(project.id, {
+                          serviceId: scope.serviceId || undefined,
+                          environmentId: scope.environmentId || undefined,
+                          view: scope.view || undefined,
+                        })
+                      : '#/projects'
+                  }
+                >
+                  {project ? '打开执行图' : '打开项目列表'}
+                </a>
+              )
             }
           />
         ) : (
@@ -296,157 +371,216 @@ export function DeliveryRecordsPage({
                 </tr>
               </thead>
               <tbody>
-                {records.data.map((r) => (
-                  <tr key={r.id}>
-                    <td>
-                      {r.projectId && (
-                        <a
-                          className="text-link"
-                          href={
-                            '#' +
-                            deliveryPath(r.projectId, type, {
-                              serviceId: r.serviceId,
-                              recordId: r.id,
-                            })
-                          }
-                        >
-                          {project?.services.find((s) => s.id === r.serviceId)?.name ||
-                            (project ? r.serviceId : '查看所属项目')}
-                        </a>
-                      )}
-                      <small className="cell-detail">
-                        {project?.environments.find((e) => e.id === r.environmentId)?.name ||
-                          r.environmentId ||
-                          '—'}
-                      </small>
-                    </td>
-                    {type === 'artifacts' ? (
-                      <>
-                        <td>
-                          <strong className="table-name">
-                            {r.artifactType === 'FILE' ? '文件产物' : 'Docker 镜像'}
-                          </strong>
-                          <small className="cell-detail mono" title={r.storageKey}>
-                            {r.storageKey}
-                          </small>
-                          {r.taskId && (
-                            <a className="text-link" href={`#/tasks/${r.taskId}`}>
-                              构建日志
-                            </a>
-                          )}
-                        </td>
-                        <td>
-                          <span className="tag">
-                            {storageLabels[r.storageType] || r.storageType}
-                          </span>
-                          {r.sizeBytes != null && (
-                            <small className="cell-detail">
-                              {(r.sizeBytes / 1024).toFixed(1)} KiB
-                            </small>
-                          )}
-                          {r.pinnedAt != null && <small className="cell-detail">已固定</small>}
-                        </td>
-                        <td className="mono" title={r.sourceCommit}>
-                          {r.sourceCommit?.slice(0, 12) || '—'}
-                        </td>
-                        <td
-                          className="mono truncate"
-                          title={r.checksum || r.imageDigest || r.imageId}
-                        >
-                          {r.checksum || r.imageDigest || r.imageId || '—'}
-                        </td>
-                        <td className="nowrap muted">{formatTime(r.createdAt)}</td>
-                        <td>
-                          <ArtifactDownload artifact={r} />
-                          {user.role === 'ADMIN' &&
-                            canWrite &&
-                            r.prunedAt == null &&
-                            (r.downloadAvailable || r.deployable || r.pinnedAt != null) && (
-                              <button
-                                className="button secondary small"
-                                type="button"
-                                disabled={pinning != null}
-                                onClick={() => void togglePin(r)}
-                              >
-                                {pinning === r.id
-                                  ? '正在更新…'
-                                  : r.pinnedAt != null
-                                    ? '取消固定'
-                                    : '固定产物'}
-                              </button>
-                            )}
-                        </td>
-                      </>
-                    ) : (
-                      <>
-                        <td className="mono">
-                          {r.taskId ? (
-                            <a href={`#/tasks/${r.taskId}`} className="text-link">
-                              {r.releaseVersion || r.id.slice(0, 8)}
-                            </a>
-                          ) : (
-                            r.releaseVersion || r.id.slice(0, 8)
-                          )}
-                          {r.previousDeploymentId && (
-                            <small className="cell-detail" title={r.previousDeploymentId}>
-                              上一成功部署 {r.previousDeploymentId.slice(0, 8)}
-                            </small>
-                          )}
-                          {r.isCurrent && <small className="cell-detail">当前发布</small>}
-                          {r.rollbackOfDeploymentId && (
-                            <small className="cell-detail" title={r.rollbackOfDeploymentId}>
-                              回滚基线 {r.rollbackOfDeploymentId.slice(0, 8)}
-                            </small>
-                          )}
-                        </td>
-                        <td className="truncate" title={r.serverId}>
-                          {servers.data?.find((server) => server.id === r.serverId)?.name ||
-                            r.serverId ||
-                            '—'}
-                        </td>
-                        <td className="mono" title={r.sourceCommit}>
-                          {r.sourceCommit?.slice(0, 12) || '—'}
-                        </td>
-                        <td className="mono truncate" title={r.deployPath}>
-                          {r.deployPath || '—'}
-                        </td>
-                        <td>
-                          <Status value={r.status} />
-                          {r.rollbackStatus && (
-                            <small className="cell-detail">
-                              回滚 <Status value={r.rollbackStatus} />
-                            </small>
-                          )}
-                        </td>
-                        <td>{healthStatusLabels[r.healthStatus] || r.healthStatus || '未配置'}</td>
-                        <td className="nowrap muted">{formatTime(r.finishedAt)}</td>
-                        {canWrite && (
-                          <td>
-                            {r.isCurrent ? null : r.rollbackAvailable ? (
-                              <button
-                                className="button secondary small"
-                                onClick={() => setRollback(r)}
-                              >
-                                回滚到此版本
-                              </button>
-                            ) : r.status === 'SUCCESS' ? (
-                              <span className="muted">
-                                {r.rollbackUnavailableReason || '缺少可用的回滚快照'}
-                              </span>
-                            ) : null}
-                          </td>
+                {records.data.map((r) => {
+                  const rowScope = project
+                    ? scope
+                    : { serviceId: r.serviceId, environmentId: r.environmentId };
+                  const taskHref =
+                    r.taskId &&
+                    '#' +
+                      (r.projectId
+                        ? deliveryTaskPath(r.taskId, type, rowScope)
+                        : `/tasks/${r.taskId}`);
+                  const label =
+                    project?.services.find(({ id }) => id === r.serviceId)?.name ||
+                    project?.archivedServices?.find(({ id }) => id === r.serviceId)?.name ||
+                    (project ? r.serviceId : '查看所属项目');
+                  const archivedScope =
+                    project?.archivedServices?.some(({ id }) => id === r.serviceId) ||
+                    project?.archivedEnvironments?.some(({ id }) => id === r.environmentId);
+                  return (
+                    <tr key={r.id}>
+                      <td>
+                        {r.projectId && scope.recordId !== r.id ? (
+                          <a
+                            className="text-link"
+                            aria-label={`${label} · 查看交付详情`}
+                            href={
+                              '#' +
+                              deliveryPath(r.projectId, type, {
+                                ...rowScope,
+                                recordId: r.id,
+                              })
+                            }
+                          >
+                            {label}
+                          </a>
+                        ) : (
+                          label
                         )}
-                      </>
-                    )}
-                  </tr>
-                ))}
+                        <small className="cell-detail">
+                          {project?.environments.find((e) => e.id === r.environmentId)?.name ||
+                            project?.archivedEnvironments?.find((e) => e.id === r.environmentId)
+                              ?.name ||
+                            r.environmentId ||
+                            '—'}
+                        </small>
+                      </td>
+                      {type === 'artifacts' ? (
+                        <>
+                          <td>
+                            <strong className="table-name">
+                              {r.name || (r.artifactType === 'FILE' ? '文件产物' : 'Docker 镜像')}
+                            </strong>
+                            <small className="cell-detail mono" title={r.storageKey}>
+                              {r.storageKey}
+                            </small>
+                            <GraphOrigin
+                              record={r}
+                              tab={type}
+                              scope={rowScope}
+                              archived={project?.archived}
+                            />
+                            {taskHref && (
+                              <a className="text-link" href={taskHref}>
+                                构建日志
+                              </a>
+                            )}
+                          </td>
+                          <td>
+                            <span className="tag">
+                              {storageLabels[r.storageType] || r.storageType}
+                            </span>
+                            {r.sizeBytes != null && (
+                              <small className="cell-detail">
+                                {(r.sizeBytes / 1024).toFixed(1)} KiB
+                              </small>
+                            )}
+                            {r.pinnedAt != null && <small className="cell-detail">已固定</small>}
+                          </td>
+                          <td className="mono" title={r.sourceCommit}>
+                            {r.sourceCommit?.slice(0, 12) || '—'}
+                          </td>
+                          <td
+                            className="mono truncate"
+                            title={r.checksum || r.imageDigest || r.imageId}
+                          >
+                            {r.checksum || r.imageDigest || r.imageId || '—'}
+                          </td>
+                          <td className="nowrap muted">{formatTime(r.createdAt)}</td>
+                          <td>
+                            <ArtifactDownload artifact={r} />
+                            {user.role === 'ADMIN' &&
+                              canWrite &&
+                              r.prunedAt == null &&
+                              (r.downloadAvailable || r.deployable || r.pinnedAt != null) && (
+                                <button
+                                  className="button secondary small"
+                                  type="button"
+                                  disabled={pinning != null}
+                                  onClick={() => void togglePin(r)}
+                                >
+                                  {pinning === r.id
+                                    ? '正在更新…'
+                                    : r.pinnedAt != null
+                                      ? '取消固定'
+                                      : '固定产物'}
+                                </button>
+                              )}
+                          </td>
+                        </>
+                      ) : (
+                        <>
+                          <td className="mono">
+                            {taskHref ? (
+                              <a href={taskHref} className="text-link">
+                                {r.releaseVersion || r.id.slice(0, 8)}
+                              </a>
+                            ) : (
+                              r.releaseVersion || r.id.slice(0, 8)
+                            )}
+                            <GraphOrigin
+                              record={r}
+                              tab={type}
+                              scope={rowScope}
+                              archived={project?.archived}
+                            />
+                            {r.projectId && r.artifactId && (
+                              <small className="cell-detail">
+                                <a
+                                  className="text-link"
+                                  href={
+                                    '#' +
+                                    deliveryPath(r.projectId, 'artifacts', {
+                                      serviceId: scope.serviceId,
+                                      environmentId: scope.environmentId,
+                                      commit: scope.commit,
+                                      view: scope.view,
+                                      recordId: r.artifactId,
+                                    })
+                                  }
+                                >
+                                  使用的产物 {r.artifactId.slice(0, 8)}
+                                </a>
+                              </small>
+                            )}
+                            {r.previousDeploymentId && (
+                              <small className="cell-detail" title={r.previousDeploymentId}>
+                                上一成功部署 {r.previousDeploymentId.slice(0, 8)}
+                              </small>
+                            )}
+                            {r.isCurrent && <small className="cell-detail">当前发布</small>}
+                            {r.rollbackOfDeploymentId && (
+                              <small className="cell-detail" title={r.rollbackOfDeploymentId}>
+                                回滚基线 {r.rollbackOfDeploymentId.slice(0, 8)}
+                              </small>
+                            )}
+                          </td>
+                          <td className="truncate" title={r.serverId}>
+                            {r.serverName || r.serverId || '—'}
+                            {r.serverHost && (
+                              <small className="cell-detail mono">
+                                {r.serverHost}
+                                {r.serverPort ? ` · ${r.serverPort}` : ''}
+                              </small>
+                            )}
+                          </td>
+                          <td className="mono" title={r.sourceCommit}>
+                            {r.sourceCommit?.slice(0, 12) || '—'}
+                          </td>
+                          <td className="mono truncate" title={r.deployPath}>
+                            {r.deployPath || '—'}
+                          </td>
+                          <td>
+                            <Status value={r.status} />
+                            {r.rollbackStatus && (
+                              <small className="cell-detail">
+                                回滚 <Status value={r.rollbackStatus} />
+                              </small>
+                            )}
+                          </td>
+                          <td>
+                            {healthStatusLabels[r.healthStatus] || r.healthStatus || '未配置'}
+                          </td>
+                          <td className="nowrap muted">{formatTime(r.finishedAt)}</td>
+                          {canWrite && (
+                            <td>
+                              {r.isCurrent || archivedScope ? null : r.rollbackAvailable ? (
+                                <button
+                                  className="button secondary small"
+                                  onClick={() => setRollback(r)}
+                                >
+                                  回滚到此版本
+                                </button>
+                              ) : r.status === 'SUCCESS' ? (
+                                <span className="muted">
+                                  {r.rollbackUnavailableReason || '缺少可用的回滚快照'}
+                                </span>
+                              ) : null}
+                            </td>
+                          )}
+                        </>
+                      )}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         )}
       </Section>
       {type === 'deployments' && rollback && (
-        <RollbackRelease record={rollback} onClose={() => setRollback(undefined)} />
+        <RollbackRelease record={rollback} onClose={() => setRollback(undefined)} scope={scope} />
       )}
       {type === 'artifacts' && retention === 'policy' && (
         <ArtifactRetentionPolicy scope={retentionScope} onClose={() => setRetention(undefined)} />

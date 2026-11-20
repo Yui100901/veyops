@@ -248,6 +248,13 @@ export class DeploymentsService {
       .selectFrom('deployment_records')
       .innerJoin('pipeline_runs', 'pipeline_runs.id', 'deployment_records.pipeline_run_id')
       .leftJoin('artifacts', 'artifacts.id', 'deployment_records.artifact_id')
+      .leftJoin('task_targets', 'task_targets.id', 'deployment_records.task_target_id')
+      .leftJoin('execution_node_runs as node', 'node.task_id', 'pipeline_runs.task_id')
+      .leftJoin('execution_flow_runs as flow', (join) =>
+        join
+          .onRef('flow.id', '=', 'node.run_id')
+          .onRef('flow.project_id', '=', 'pipeline_runs.project_id'),
+      )
       .selectAll('deployment_records')
       .select([
         'pipeline_runs.project_id',
@@ -255,6 +262,13 @@ export class DeploymentsService {
         'pipeline_runs.task_id',
         'artifacts.pruned_at',
         'artifacts.storage_type',
+        'task_targets.server_name_snapshot',
+        'task_targets.host_snapshot',
+        'task_targets.port_snapshot',
+        'flow.id as graph_run_id',
+        'flow.version as graph_version',
+        'flow.flow_name as graph_flow_name',
+        'node.name as graph_node_name',
       ])
       .select((eb) =>
         eb
@@ -300,9 +314,16 @@ export class DeploymentsService {
         sourceCommit: r.commit_sha,
         pipelineRunId: r.pipeline_run_id,
         artifactId: r.artifact_id,
+        graphRunId: r.graph_run_id,
+        graphVersion: r.graph_version,
+        graphFlowName: r.graph_flow_name,
+        graphNodeName: r.graph_run_id ? r.graph_node_name : null,
         serviceId: r.service_id,
         environmentId: r.environment_id,
         serverId: r.server_id,
+        serverName: r.server_name_snapshot,
+        serverHost: r.host_snapshot,
+        serverPort: r.port_snapshot,
         status: r.status,
         releaseVersion: r.release_version,
         deployPath: r.deploy_path,

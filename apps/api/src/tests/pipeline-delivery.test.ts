@@ -174,6 +174,7 @@ async function checkDelivery(databaseUrl?: string) {
     })
     .overrideProvider(RepositoryMetadataService)
     .useValue({
+      inspectGraphEnvironmentFile: async () => undefined,
       planGraphCheckout: async (
         _projectId: string,
         source: { repositoryId: string; commitSha?: string; branch?: string },
@@ -1041,6 +1042,38 @@ async function checkDelivery(databaseUrl?: string) {
       [],
     );
     await api.get('/api/v1/artifacts').query({ commit: '%' }).expect(400);
+    const archivedService = await create(`/projects/${otherProject.id}/services`, {
+      name: 'Archived service',
+      slug: 'archived-service',
+    });
+    const archivedEnvironment = await create(`/projects/${otherProject.id}/environments`, {
+      name: 'Archived environment',
+      slug: 'archived-environment',
+      environmentType: 'TESTING',
+    });
+    await api
+      .delete(`/api/v1/projects/${otherProject.id}/services/${archivedService.id}`)
+      .expect(200);
+    await api
+      .delete(`/api/v1/projects/${otherProject.id}/environments/${archivedEnvironment.id}`)
+      .expect(200);
+    const activeContext = (
+      await api.get(`/api/v1/projects/${otherProject.id}/delivery-context`).expect(200)
+    ).body.data;
+    assert.deepEqual(activeContext.archivedServices, [
+      { id: archivedService.id, name: archivedService.name },
+    ]);
+    assert.deepEqual(activeContext.archivedEnvironments, [
+      { id: archivedEnvironment.id, name: archivedEnvironment.name },
+    ]);
+    assert.deepEqual(
+      activeContext.services.map((row: { id: string }) => row.id),
+      [otherService.id],
+    );
+    assert.deepEqual(
+      activeContext.environments.map((row: { id: string }) => row.id),
+      [otherEnv.id],
+    );
     await api.delete('/api/v1/projects/' + otherProject.id).expect(200);
     await api.get('/api/v1/projects/' + otherProject.id).expect(404);
     const historicalContext = (
@@ -1448,6 +1481,16 @@ async function checkDelivery(databaseUrl?: string) {
     );
     assert(artifactRows.every((row) => row.graph_node_run_id && row.checksum === checksum));
     const savedImage = artifactRows[0]!.id;
+    const [produced] = await list('/artifacts', {
+      projectId: project.id,
+      serviceId: service.id,
+      environmentId: graphEnv.id,
+      recordId: savedImage,
+    });
+    assert.equal(produced.name, 'image');
+    assert.equal(produced.graphRunId, onlyBuild.detail.id);
+    assert.equal(produced.graphNodeName, '构建归档');
+    assert.equal(produced.graphVersion, published.publishedVersion);
     const buildEnd = onlyBuild.detail.nodes.find(
       (node: { nodeId: string }) => node.nodeId === 'build-end',
     );
@@ -1473,6 +1516,18 @@ async function checkDelivery(databaseUrl?: string) {
     );
     assert.equal(releaseNode.output.release.status, 'SUCCESS');
     assert.notEqual(releaseNode.output.release.deployments[0].artifactId, savedImage);
+    const deploymentTask = combined.detail.nodes.find(
+      (node: { nodeId: string }) => node.nodeId === 'deploy-node',
+    ).taskId;
+    const [released] = await list('/deployments', {
+      projectId: project.id,
+      taskId: deploymentTask,
+    });
+    assert.equal(released.artifactId, releaseNode.output.release.deployments[0].artifactId);
+    assert.equal(released.graphRunId, combined.detail.id);
+    assert.equal(released.graphNodeName, '部署共享节点');
+    assert.equal(released.graphVersion, published.publishedVersion);
+    assert.equal(released.serverHost, 'host-first.test');
     const implicitLatest = await submit('latest');
     assert.equal(
       implicitLatest.detail.status,

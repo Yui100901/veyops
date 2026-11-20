@@ -356,6 +356,7 @@ function preparedNodeReferences(
 ): ProjectResourceReference[] {
   const plan = objectValue(value);
   const target = objectValue(plan.targetInputs);
+  const resolution = objectValue(plan.configuration);
   const checkout = objectValue(plan.source);
   const definition = objectValue(objectValue(plan.profile).definition);
   const readsRepository =
@@ -374,6 +375,10 @@ function preparedNodeReferences(
   return [
     ...selectionReferences(context, plan),
     ...selectionReferences(context, { groupIds: target.groupIds, targetId: target.targetId }),
+    ...selectionReferences(context, {
+      ...objectValue(resolution.targetSelection),
+      targetId: resolution.legacyTargetId,
+    }),
     ...referenceRows(
       { ...context, serverNameSnapshot: idValue(plan.serverName) },
       'SERVER',
@@ -381,6 +386,7 @@ function preparedNodeReferences(
     ),
     ...referenceRows(context, 'SERVICE', plan.serviceId),
     ...referenceRows(context, 'ENVIRONMENT', plan.environmentId),
+    ...referenceRows(context, 'REPOSITORY', objectValue(plan.environmentFile).repositoryId),
     ...referenceRows(context, 'ARTIFACT', plan.artifactIds),
     ...referenceRows(context, 'REGISTRY', definition.registryId),
     ...(readsRepository
@@ -484,6 +490,9 @@ export function taskPayloadResourceReferences(source: ReferenceSource, payload: 
             pipeline?.definition?.repositoryId,
             module?.source?.repositoryId,
             module?.workspace?.repositoryId,
+            module?.environmentFile?.repositoryId,
+            module?.variables?.environmentFile?.repositoryId,
+            pipeline?.graph?.variables?.environmentFile?.repositoryId,
             ...(pipeline?.definition?.nodes ?? []).map(({ repositoryId }) => repositoryId),
           ]),
           ...referenceRows(source, 'CREDENTIAL', [

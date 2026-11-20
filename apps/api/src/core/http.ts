@@ -50,6 +50,11 @@ export class ApiExceptionFilter implements ExceptionFilter {
           typeof body === 'object' &&
           'references' in body &&
           Array.isArray(body.references) && { references: body.references }),
+        ...(status === 409 &&
+          body &&
+          typeof body === 'object' &&
+          'changes' in body &&
+          Array.isArray(body.changes) && { changes: body.changes }),
       },
     });
   }

@@ -1,7 +1,9 @@
 import { RefreshCw, Server } from 'lucide-react';
 import { useResource } from '../api';
 import { ErrorBanner, Loading, Section, Status } from '../components';
-import type { ProjectDetail } from '../models';
+import type { ProjectDetail, ServerGroup } from '../models';
+import { graphWorkbenchPath } from './graph-workbench-context';
+import { projectResourcePath } from './project-workspace-route';
 import './project-server-inventory.css';
 
 export interface ServiceEnvironmentContext {
@@ -100,26 +102,53 @@ function referenceLink(
   projectId: string,
   ref: ResourceReference,
   scope?: ServiceEnvironmentContext,
+  view?: string,
 ) {
-  const project = `#/projects/${encodeURIComponent(projectId)}`;
-  const graph = `${project}/execution-graph`;
+  const context = { ...scope, view };
   if (ref.runId)
-    return { href: `${graph}?run=${encodeURIComponent(ref.runId)}`, title: '查看运行' };
+    return {
+      href: '#' + graphWorkbenchPath(projectId, { ...context, run: ref.runId }),
+      title: '查看运行',
+    };
   if (ref.taskId) return { href: `#/tasks/${encodeURIComponent(ref.taskId)}`, title: '查看任务' };
   if (ref.sourceKind === 'GRAPH' || ref.sourceKind === 'TRIGGER') {
-    const params = new URLSearchParams({ pane: ref.state === 'DRAFT' ? 'draft' : 'published' });
-    if (ref.version) params.set('version', String(ref.version));
-    if (ref.nodeId || ref.flowId) params.set('node', ref.nodeId || ref.flowId!);
-    if (ref.flowId) params.set('flow', ref.flowId);
-    return { href: `${graph}?${params}`, title: ref.state === 'DRAFT' ? '查看草稿' : '查看版本' };
+    return {
+      href:
+        '#' +
+        graphWorkbenchPath(projectId, {
+          ...context,
+          pane: ref.state === 'DRAFT' ? 'draft' : 'published',
+          version: ref.version,
+          node: ref.nodeId || ref.flowId,
+          flow: ref.flowId,
+        }),
+      title: ref.state === 'DRAFT' ? '查看草稿' : '查看版本',
+    };
   }
+  if (ref.sourceKind === 'ENVIRONMENT_DEFAULT' && ref.environmentId)
+    return {
+      href:
+        '#' +
+        projectResourcePath(projectId, {
+          view,
+          resource: 'environments',
+          environmentId: ref.environmentId,
+        }),
+      title: '环境默认发布目标',
+    };
   if (ref.serviceId && ref.environmentId && !scope) {
-    const params = new URLSearchParams({
-      section: 'deployment',
-      serviceId: ref.serviceId,
-      environmentId: ref.environmentId,
-    });
-    return { href: `${project}?${params}`, title: '服务环境配置' };
+    return {
+      href:
+        '#' +
+        projectResourcePath(projectId, {
+          view,
+          resource: 'services',
+          serviceId: ref.serviceId,
+          environmentId: ref.environmentId,
+          panel: 'servers',
+        }),
+      title: '服务环境配置',
+    };
   }
 }
 
@@ -127,10 +156,12 @@ function ReferenceList({
   project,
   references,
   scope,
+  view,
 }: {
   project: ProjectDetail;
   references: ResourceReference[];
   scope?: ServiceEnvironmentContext;
+  view?: string;
 }) {
   return (
     <ul className="project-server-references">
@@ -153,7 +184,7 @@ function ReferenceList({
             ? '直接选择服务器'
             : undefined,
         ].filter(Boolean);
-        const destination = referenceLink(project.id, ref, scope);
+        const destination = referenceLink(project.id, ref, scope, view);
         const snapshot = [
           ref.serverNameSnapshot,
           ref.hostSnapshot ? endpoint(ref.hostSnapshot, ref.portSnapshot) : undefined,
@@ -182,17 +213,31 @@ function ReferenceList({
 export function ProjectServerInventory({
   project,
   scope,
+  view,
+  serverId,
+  groupId,
 }: {
   project: ProjectDetail;
   scope?: ServiceEnvironmentContext;
+  view?: string;
+  serverId?: string;
+  groupId?: string;
 }) {
   const data = useResource<ResourceInventory>(
     `/projects/${encodeURIComponent(project.id)}/resource-references`,
   );
+  const groups = useResource<ServerGroup[]>(scope ? null : '/server-groups');
+  const referencedGroups = new Set(
+    data.data?.references
+      .filter(({ resourceType, state }) => resourceType === 'SERVER_GROUP' && state !== 'HISTORY')
+      .map(({ resourceId }) => resourceId),
+  );
   const inScope = (ref: ResourceReference) =>
-    !scope ||
-    (ref.environmentId === scope.environmentId &&
-      (ref.serviceId === scope.serviceId || ref.sourceKind === 'ENVIRONMENT_DEFAULT'));
+    (!serverId || ref.resourceId === serverId) &&
+    (!groupId || ref.viaGroupId === groupId) &&
+    (!scope ||
+      (ref.environmentId === scope.environmentId &&
+        (ref.serviceId === scope.serviceId || ref.sourceKind === 'ENVIRONMENT_DEFAULT')));
   const servers = (data.data?.servers ?? []).flatMap((server) => {
     const matching = server.references.filter(inScope);
     const current = matching.filter(({ state }) => state !== 'HISTORY');
@@ -228,6 +273,36 @@ export function ProjectServerInventory({
       ) : (
         data.data && (
           <>
+            {!scope && !serverId && (
+              <div className="project-resource-links">
+                {groups.data
+                  ?.filter(({ id }) => referencedGroups.has(id) && (!groupId || id === groupId))
+                  .map((group) => (
+                    <a
+                      className="button secondary small"
+                      key={group.id}
+                      href={
+                        '#' +
+                        projectResourcePath(project.id, {
+                          view,
+                          resource: 'servers',
+                          groupId: group.id,
+                        })
+                      }
+                    >
+                      {group.name} <span className="tag">{group.serverIds.length} 台</span>
+                    </a>
+                  ))}
+              </div>
+            )}
+            {(serverId || groupId) && (
+              <a
+                className="text-link"
+                href={'#' + projectResourcePath(project.id, { view, resource: 'servers' })}
+              >
+                查看全部项目服务器
+              </a>
+            )}
             {!servers.length && (
               <p className="mini-empty">
                 {scope ? '这个服务环境暂无当前服务器引用。' : '这个项目暂无当前服务器引用。'}
@@ -246,11 +321,16 @@ export function ProjectServerInventory({
                   <Status value={active === false ? 'DISABLED' : status} />
                   <span className="tag">{current.length} 项来源</span>
                 </summary>
-                <ReferenceList project={project} references={current} scope={scope} />
+                <ReferenceList project={project} references={current} scope={scope} view={view} />
                 {!!history.length && (
                   <details className="project-server-history">
                     <summary>{history.length} 项历史引用</summary>
-                    <ReferenceList project={project} references={history} scope={scope} />
+                    <ReferenceList
+                      project={project}
+                      references={history}
+                      scope={scope}
+                      view={view}
+                    />
                   </details>
                 )}
               </details>
@@ -258,13 +338,18 @@ export function ProjectServerInventory({
             {historicalOnly.length > 0 && (
               <details className="project-server-entry">
                 <summary>仅历史运行引用的服务器</summary>
-                <ReferenceList project={project} references={historicalOnly} scope={scope} />
+                <ReferenceList
+                  project={project}
+                  references={historicalOnly}
+                  scope={scope}
+                  view={view}
+                />
               </details>
             )}
             {historical.length > 0 && (
               <a
                 className="text-link"
-                href={`#/projects/${encodeURIComponent(project.id)}/execution-graph?pane=history`}
+                href={'#' + graphWorkbenchPath(project.id, { view, ...scope, pane: 'history' })}
               >
                 在运行记录查看历史目标
               </a>

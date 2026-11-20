@@ -4,6 +4,7 @@ import { dataDirectory } from '../../core/config';
 import type { GraphCheckoutSnapshot } from '../projects/repository-metadata.service';
 import type { Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
+import type { GraphEnvironmentPlan } from './graph-environment';
 
 const workspaceId = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const root = () => resolve(dataDirectory, 'graph-workspaces');
@@ -22,6 +23,7 @@ export interface GraphWorkspaceRef {
 export interface GraphEnvironmentRef {
   workspace?: GraphWorkspaceRef;
   envFile?: string;
+  environmentFile?: GraphEnvironmentPlan;
   environmentId?: string;
 }
 

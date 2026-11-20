@@ -168,7 +168,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     join(web, 'compose.yaml'),
     'services:\n  web:\n    environment:\n      DB_PASSWORD: "sample-quoted-secret"\n',
   );
-  await writeFile(join(web, '.env'), 'SHOULD_NOT_SEND=env-file-private');
+  await writeFile(join(web, '.env'), 'SHOULD_NOT_SEND=env-file-private\n');
   await writeFile(join(web, 'secrets', 'README.md'), 'secrets-file-private');
   await writeFile(
     join(source, 'services', 'api', 'package.json'),
@@ -187,6 +187,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     '--cacheinfo',
     `120000,${pointer},link/DEPLOY.md`,
   );
+  await git('-C', source, 'update-index', '--add', '--cacheinfo', `120000,${pointer},linked`);
   const commit = async (subject: string) => {
     await git('-C', source, 'commit', '--allow-empty', '-m', subject);
     return (await git('-C', source, 'rev-parse', 'HEAD')).stdout.trim();
@@ -194,7 +195,9 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   const first = await commit('First change');
   await writeFile(join(docs, 'DEPLOY.md'), '# Second release\n');
   await writeFile(join(web, 'src', 'index.ts'), 'export const version = "current-source-entry";\n');
-  await git('-C', source, 'add', 'docs/DEPLOY.md', 'services/web/src/index.ts');
+  await writeFile(join(web, '.env'), 'SHOULD_NOT_SEND=new-private-value\n');
+  await writeFile(join(web, '.env.test'), 'TEST_KEY=test-value\nVEYOPS_PROJECT_ID=spoof\n');
+  await git('-C', source, 'add', 'docs/DEPLOY.md', 'services/web');
   const second = await commit('Second change');
   const main = await commit('Third change');
   await git('-C', source, 'tag', '-a', 'release/v1', '-m', 'annotated release', second);
@@ -225,6 +228,9 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   const { DatabaseService } = await import('../core/database/database.service.js');
   const { RepositoryMetadataService } =
     await import('../modules/projects/repository-metadata.service.js');
+  const { GraphNodeTasks } = await import('../modules/execution-graphs/graph-node-tasks.js');
+  const { BuildsService } = await import('../modules/builds/builds.service.js');
+  const { PipelineDefinitionDto } = await import('../modules/pipelines/pipeline.dto.js');
   const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
   const app = moduleRef.createNestApplication<NestExpressApplication>({ logger: false });
   resources.app = app;
@@ -414,6 +420,82 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     files: [{ path: 'services/web/.env', keys: ['SHOULD_NOT_SEND'] }],
   });
   assert.equal(environmentFiles.text.includes('env-file-private'), false);
+  const graphNodes = app.get(GraphNodeTasks);
+  const selectedEnvironment = (
+    await operator
+      .post(`/api/v1/projects/${project}/environments`)
+      .send({ name: 'Test', slug: 'test', repositoryEnvFile: 'services/web/.env' })
+      .expect(201)
+  ).body.data.id;
+  const currentSource = { repositoryId: id, commitSha: main, branch: 'main' };
+  const configured = await graphNodes.prepareEnvironment(project, {
+    environmentId: selectedEnvironment,
+    source: { ...currentSource, commitSha: first },
+    directory: 'services/web',
+  });
+  assert.equal(configured?.status, 'PINNED');
+  assert.equal(configured.source, 'ENVIRONMENT');
+  assert.equal(configured.path, 'services/web/.env');
+  assert.deepEqual(configured.variables, [
+    { key: 'SHOULD_NOT_SEND', source: 'FILE', isSecret: true },
+  ]);
+  assert.equal(JSON.stringify(configured).includes('env-file-private'), false);
+  const resolved = await app.get(BuildsService).resolveVariables({
+    runId: 'fixture-run',
+    pipelineId: 'fixture-pipeline',
+    pipelineVersionId: 'fixture-version',
+    projectId: project,
+    serviceId: 'fixture-service',
+    environmentId: selectedEnvironment,
+    commitSha: main,
+    repository: { url: create.cloneUrl, credentialId: credential },
+    definition: new PipelineDefinitionDto(),
+    variables: { SHOULD_NOT_SEND: 'higher-layer-value' },
+    secretVariables: {},
+    graph: {
+      runId: 'fixture-run',
+      nodeRunId: 'fixture-node',
+      variables: { environmentFile: configured },
+    },
+  });
+  assert.equal(resolved.values.SHOULD_NOT_SEND, 'higher-layer-value');
+  assert.equal(resolved.secrets.includes('env-file-private'), true);
+  assert.equal(resolved.secrets.includes('new-private-value'), false);
+  const explicit = await graphNodes.prepareEnvironment(project, {
+    environmentId: selectedEnvironment,
+    source: currentSource,
+    directory: 'services//web',
+    envFile: './.env.test',
+  });
+  assert.equal(explicit?.status, 'PINNED');
+  assert.equal(explicit.source, 'NODE');
+  assert.equal(explicit.path, 'services/web/.env.test');
+  assert.deepEqual(
+    explicit.variables.map(({ key }) => key),
+    ['TEST_KEY'],
+  );
+  await assert.rejects(
+    graphNodes.prepareEnvironment(project, {
+      environmentId: selectedEnvironment,
+      source: { ...currentSource, commitSha: first },
+      envFile: 'services/web/.env.test',
+    }),
+    /缺少必需的环境文件/,
+  );
+  await assert.rejects(
+    metadata.inspectGraphEnvironmentFile(project, currentSource, ['linked/.env']),
+    /符号链接/,
+  );
+  await assert.rejects(
+    metadata.inspectGraphEnvironmentFile(project, currentSource, ['link/DEPLOY.md']),
+    /普通文件/,
+  );
+  const skipped = await graphNodes.prepareEnvironment(project, { source: currentSource });
+  assert.equal(skipped?.status, 'SKIPPED');
+  await assert.rejects(
+    graphNodes.prepareEnvironment(project, { source: currentSource, envFile: '../.env' }),
+    /相对路径/,
+  );
   const requestsBeforeInvalidQueries = fixture.authenticatedRequests();
   await assert.rejects(
     metadata.readDeploymentDoc(other, id, first, 'docs/DEPLOY.md'),

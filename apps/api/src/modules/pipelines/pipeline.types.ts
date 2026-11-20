@@ -93,6 +93,11 @@ export interface PipelineDefinition {
   nodes?: PipelineNode[];
 }
 export interface PipelineSnapshot {
+  graphReleaseTargets?: {
+    source: import('./delivery-targets').DeliveryTargetSource;
+    requested: import('../deployment-targets/deployment-selection').DeploymentSelectionDto;
+    defaultParallel: number;
+  };
   graph?: GraphExecutionScope;
   targetWorkspaceRoot?: string;
   releasePolicy?: ReleasePolicy;
