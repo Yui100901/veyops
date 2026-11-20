@@ -3,13 +3,22 @@ import { Box, FolderGit2, Layers, Pencil, Plus, Trash2 } from 'lucide-react';
 import { InlineEditor } from '../InlineEditor';
 import { api, formatTime, message, navigate, post, remove, useResource } from '../api';
 import { Confirm, ErrorBanner, Field, Form, Loading, Section, Status } from '../components';
-import type { Credential, Environment, ProjectDetail, Repository, Service, User } from '../models';
+import type {
+  Credential,
+  DeploymentSummary,
+  Environment,
+  ProjectDetail,
+  Repository,
+  Service,
+  User,
+} from '../models';
 import { EnvironmentConfigEditor, RepositoryBinding } from './DeploymentConfig';
 import { ProjectEnvironment } from './ProjectEnvironment';
 import { ProjectRelations } from './ProjectRelations';
 import { ProjectServerInventory } from './ProjectServerInventory';
 import { RepositoryDetails } from './RepositoryBrowser';
 import { repositoryBranchLabel } from './RepositoryBranches';
+import { DeploymentHistory } from './ServerResources';
 import { deliveryPath } from './delivery-route';
 import type { GraphDocument } from './execution-graph-definition';
 import {
@@ -391,6 +400,10 @@ function ServiceDetails({
   const repos = useResource<{ repositoryId: string; repoPath: string; isPrimary: boolean }[]>(
     `/services/${serviceId}/repositories`,
   );
+  const deployments = useResource<DeploymentSummary[]>(
+    `/projects/${id}/services/${serviceId}/recent-deployments` +
+      (environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : ''),
+  );
   const flows = (published.data?.definition.flows ?? []).filter((flow) =>
     flowMatchesScope(flow, scope),
   );
@@ -460,7 +473,9 @@ function ServiceDetails({
             ))}
           </div>
         ) : (
-          <p className="mini-empty">当前服务环境没有匹配的已发布执行流。</p>
+          <p className="mini-empty">
+            {version ? '当前范围没有匹配的已发布执行流。' : '项目尚未发布执行图。'}
+          </p>
         )}
       </Section>
       {environment ? (
@@ -517,6 +532,28 @@ function ServiceDetails({
           )}
         </Section>
       )}
+      <Section
+        title="最近发布"
+        action={
+          <a className="text-link" href={'#' + deliveryPath(id, 'deployments', scope)}>
+            查看全部部署与回滚 →
+          </a>
+        }
+      >
+        <ErrorBanner error={deployments.error} retry={deployments.reload} />
+        {deployments.loading ? (
+          <Loading />
+        ) : (
+          !deployments.error && (
+            <DeploymentHistory
+              rows={deployments.data ?? []}
+              resolveName={(row) =>
+                project.environments.find(({ id }) => id === row.environmentId)?.name || '查看任务'
+              }
+            />
+          )
+        )}
+      </Section>
     </>
   );
 }

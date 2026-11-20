@@ -64,6 +64,7 @@ export function ProjectDelivery({
   if (serviceId) query.set('serviceId', serviceId);
   if (environmentId) query.set('environmentId', environmentId);
   if (commit) query.set('commit', commit);
+  if (repositoryId && tab !== 'approvals') query.set('repositoryId', repositoryId);
   if (recordId) query.set('recordId', recordId);
   if (pipelineRunId) query.set('pipelineRunId', pipelineRunId);
   if (taskId) query.set('taskId', taskId);
@@ -77,6 +78,7 @@ export function ProjectDelivery({
         serviceId: String(values.get('serviceId') || ''),
         environmentId: String(values.get('environmentId') || ''),
         commit: String(values.get('commit') || '').trim(),
+        repositoryId: String(values.get('repositoryId') || ''),
       }),
     );
   };
@@ -131,7 +133,7 @@ export function ProjectDelivery({
       <form
         className="delivery-filters"
         onSubmit={filter}
-        key={[serviceId, environmentId, commit].join('|')}
+        key={[serviceId, environmentId, commit, repositoryId].join('|')}
       >
         <label>
           服务
@@ -165,6 +167,24 @@ export function ProjectDelivery({
             ))}
           </select>
         </label>
+        {tab !== 'approvals' && (
+          <label>
+            源码仓库
+            <select name="repositoryId" defaultValue={repositoryId || ''}>
+              <option value="">全部仓库</option>
+              {project.repositories.map((repository) => (
+                <option key={repository.id} value={repository.id}>
+                  {repository.name}
+                </option>
+              ))}
+              {project.archivedRepositories?.map((repository) => (
+                <option key={repository} value={repository}>
+                  {repository}（已归档）
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         <label>
           固定 Commit
           <input

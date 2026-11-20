@@ -151,6 +151,12 @@ class GraphLoadEnvironment {
 }
 
 export class GraphBuildSettings {
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(8)
+  @ArrayUnique()
+  @Matches(/^[a-z][a-z0-9-]{0,31}$/, { each: true })
+  dependencies?: string[];
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() repositoryId?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @Length(1, 255) branch?: string;
   @ValidateIf((_o, v) => v !== undefined) @Matches(commitFormat) commitSha?: string;

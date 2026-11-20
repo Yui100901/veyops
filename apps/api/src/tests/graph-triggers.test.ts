@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,7 @@ import { test } from 'node:test';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import type { GraphFlow } from '../modules/execution-graphs/execution-graph-definition';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
 
 async function verify(databaseUrl?: string) {
@@ -32,6 +33,8 @@ async function verify(databaseUrl?: string) {
     await import('../modules/execution-graphs/graph-triggers.service.js');
   const { GraphRunnerService } =
     await import('../modules/execution-graphs/graph-runner.service.js');
+  const { assertAutomaticGraphFlow, assertGraphAutomation } =
+    await import('../modules/execution-graphs/graph-automatic-delivery.js');
   const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
   const { TaskHandlerRegistry } = await import('../modules/tasks/task-handler.registry.js');
   const app = (
@@ -123,6 +126,52 @@ async function verify(databaseUrl?: string) {
           .expect(201)
       ).body.data;
     const manual = await makeRule({ kind: 'API', inputValue: 'preset' });
+    const apiRule = await database.db
+      .selectFrom('execution_graph_triggers')
+      .select(['created_by', 'config_json'])
+      .where('id', '=', manual.id)
+      .executeTakeFirstOrThrow();
+    const apiOrigin = {
+      kind: 'API' as const,
+      ruleId: manual.id,
+      revision: JSON.parse(apiRule.config_json).revision as string,
+    };
+    const apiAutomation = (invokedBy?: string, externalWrite = true) =>
+      assertGraphAutomation(
+        database.db,
+        project.id,
+        apiRule.created_by,
+        { ...apiOrigin, invokedBy },
+        externalWrite,
+      );
+    const previousRollout = process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
+    const writingFlow = {
+      flows: [
+        {
+          id: 'release',
+          name: '发布',
+          nodes: [{ id: 'deploy', name: '部署', type: 'DEPLOY_ARTIFACT' as const }],
+          edges: [],
+        },
+      ],
+    };
+    try {
+      delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
+      assert.throws(() => assertAutomaticGraphFlow(writingFlow, 'release', 'API'), /API 尚未放行/);
+      await apiAutomation(undefined, false);
+      process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = ' API , WEBHOOK ';
+      assert.equal(assertAutomaticGraphFlow(writingFlow, 'release', 'API'), true);
+      assert.throws(
+        () => assertAutomaticGraphFlow(writingFlow, 'release', 'CRON'),
+        /CRON 尚未放行/,
+      );
+      await assert.rejects(apiAutomation(), /缺少已认证的 API 调用者/);
+      await assert.rejects(apiAutomation(randomUUID()), /触发 API 的调用者权限已失效/);
+      await apiAutomation(apiRule.created_by);
+    } finally {
+      if (previousRollout === undefined) delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
+      else process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = previousRollout;
+    }
     const signed = await makeRule({ kind: 'WEBHOOK', credentialId: credential.id });
     const scheduled = await makeRule({
       kind: 'CRON',
@@ -169,6 +218,21 @@ async function verify(databaseUrl?: string) {
         .expect(202)
     ).body.data;
     assert.equal(entered.id, replay.id);
+    const legacyValue = JSON.stringify({ value: 'event override' });
+    const legacyHash = createHash('sha256')
+      .update(JSON.stringify([apiRule.config_json, 'api-once', legacyValue]))
+      .digest('hex');
+    await database.db
+      .updateTable('execution_graph_trigger_events')
+      .set({ input_value: legacyValue, request_hash: legacyHash })
+      .where('id', '=', entered.id)
+      .execute();
+    const legacyReplay = await admin
+      .post(triggers + '/' + manual.id + '/invoke')
+      .send({ eventId: 'api-once', inputValue: 'event override' })
+      .expect(202);
+    assert.equal(legacyReplay.body.data.id, entered.id);
+    assert.equal(legacyReplay.body.data.metadata.invokedBy, undefined);
     await admin
       .post(triggers + '/' + manual.id + '/invoke')
       .send({ eventId: 'api-once', inputValue: 'other event' })
@@ -342,3 +406,18 @@ test(
   { skip: !process.env.VEYOPS_TEST_POSTGRES_URL },
   () => withIsolatedPostgres(process.env.VEYOPS_TEST_POSTGRES_URL!, verify),
 );
+
+test('graph trigger commit supplies a condition when the run has no explicit commit input', async () => {
+  const { branchMatch } = await import('../modules/execution-graphs/graph-run-lifecycle.js');
+  const sha = 'a'.repeat(40);
+  const condition = {
+    id: 'check',
+    type: 'CONDITION' as const,
+    name: 'Commit check',
+    condition: { key: 'commitSha' as const, value: sha },
+  };
+  const flow: GraphFlow = { id: 'flow', name: 'Flow', nodes: [condition], edges: [] };
+  const bindings = { context: { triggerCommitSha: sha } };
+  assert.equal(branchMatch(flow, condition, {}, bindings), 'TRUE');
+  assert.equal(branchMatch(flow, condition, { commitSha: 'b'.repeat(40) }, bindings), 'FALSE');
+});

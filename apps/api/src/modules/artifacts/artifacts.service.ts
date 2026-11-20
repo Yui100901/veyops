@@ -14,7 +14,7 @@ import {
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, posix } from 'node:path';
 import type { Response } from 'express';
 import { dataDirectory } from '../../core/config';
 import { DatabaseService } from '../../core/database/database.service';
@@ -25,9 +25,30 @@ import type { TaskPayload } from '../tasks/tasks.types';
 import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
 import { archiveKey, isLocalImage } from './artifact-availability';
 import { DeliveryRecordFilters } from '../projects/delivery-filters';
+import { readArtifactSources } from './artifact-sources';
+import {
+  maxComposeBytes,
+  readManagedCompose,
+  type ComposeTemplateReference,
+} from '../service-configs/compose-template-reference';
+
+export { maxComposeBytes } from '../service-configs/compose-template-reference';
 
 const uuid = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
 const sha256 = /^[a-f0-9]{64}$/;
+
+function sourceEvent(value: string | null) {
+  if (!value) return undefined;
+  const trigger = (JSON.parse(value) as { trigger?: Record<string, unknown> }).trigger;
+  if (!trigger?.eventId) return undefined;
+  return Object.fromEntries(
+    ['eventId', 'repositoryId', 'commitSha', 'ref', 'triggeredAt'].flatMap((key) =>
+      typeof trigger[key] === 'string' || typeof trigger[key] === 'number'
+        ? [[key, trigger[key]]]
+        : [],
+    ),
+  );
+}
 
 function historicalServerSelection(value: string | null) {
   if (!value) return null;
@@ -42,6 +63,29 @@ function historicalServerSelection(value: string | null) {
       }
     : null;
 }
+
+export function archivedComposeTemplate(
+  value: string | null,
+  name: string | null,
+  checksum: string | null,
+): Extract<ComposeTemplateReference, { source: 'ARCHIVE' }> | undefined {
+  if (!checksum) return undefined;
+  const definition = value ? (JSON.parse(value) as TaskPayload).pipeline?.definition : undefined;
+  const path =
+    definition?.artifacts?.find((declaration) => declaration.name === name)?.composeFilePath ??
+    definition?.composeFilePath;
+  return {
+    source: 'ARCHIVE',
+    path: path ? posix.join(definition?.repoPath ?? '.', path) : undefined,
+    checksum,
+  };
+}
+
+function declaredImageReference(value: string | null, name: string | null) {
+  if (!value || !name) return undefined;
+  const definition = (JSON.parse(value) as TaskPayload).pipeline?.definition;
+  return definition?.artifacts?.find((artifact) => artifact.name === name)?.imageReference;
+}
 const digest = /^sha256:[a-f0-9]{64}$/;
 const registryReference = /^[a-zA-Z0-9._:/-]+@sha256:[a-f0-9]{64}$/;
 const registryTag = /^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$/;
@@ -49,8 +93,6 @@ const imagePlatform = /^[a-z0-9]+\/[a-z0-9]+$/;
 const localImageReference = new RegExp(
   `^veyops-build/${uuid}(?:/${uuid})?:[a-f0-9]{40,64}-${uuid}$`,
 );
-export const maxComposeBytes = 256 * 1024;
-
 export interface DeploymentArtifact {
   id: string;
   localArchive?: string;
@@ -58,6 +100,7 @@ export interface DeploymentArtifact {
   imageReference?: string;
   imageId?: string;
   composeYaml?: string;
+  composeTemplate?: ComposeTemplateReference;
   offlineImage?: {
     reference: string;
     imageId: string;
@@ -66,7 +109,7 @@ export interface DeploymentArtifact {
   };
 }
 
-function hasDeployableMetadata(row: Selectable<ArtifactsTable>) {
+function hasDeployableMetadata(row: Selectable<ArtifactsTable>, managedCompose: boolean) {
   if (row.pruned_at !== null && row.storage_type !== 'REGISTRY_IMAGE') return false;
   const hasArchive = Boolean(
     archiveKey(row) &&
@@ -79,10 +122,11 @@ function hasDeployableMetadata(row: Selectable<ArtifactsTable>) {
   if (row.artifact_type === 'FILE') return hasArchive && row.storage_type === 'LOCAL_FILE';
   if (
     row.artifact_type !== 'DOCKER_IMAGE' ||
-    !row.compose_yaml ||
-    Buffer.byteLength(row.compose_yaml) > maxComposeBytes ||
-    !row.compose_checksum ||
-    !sha256.test(row.compose_checksum) ||
+    (!managedCompose &&
+      (!row.compose_yaml ||
+        Buffer.byteLength(row.compose_yaml) > maxComposeBytes ||
+        !row.compose_checksum ||
+        !sha256.test(row.compose_checksum))) ||
     !row.image_digest ||
     !digest.test(row.image_digest)
   )
@@ -143,40 +187,65 @@ export class ArtifactsService {
           : 'LOCAL_FILE');
     const localImage = isLocalImage(storageType);
     const imageTagPosition = artifact.imageReference?.lastIndexOf(':') ?? -1;
-    await this.database.db
-      .insertInto('artifacts')
-      .values({
-        id,
-        project_id: snapshot.projectId,
-        service_id: snapshot.serviceId,
-        pipeline_run_id: snapshot.runId,
-        artifact_type: artifactType,
-        artifact_name: artifact.name ?? null,
-        artifact_kind: artifact.kind ?? null,
-        graph_run_id: snapshot.graph?.runId ?? null,
-        graph_node_run_id: snapshot.graph?.nodeRunId ?? null,
-        storage_type: storageType,
-        storage_key: artifact.storageKey,
-        archive_key: artifact.archiveKey ?? null,
-        archive_image_id: artifact.archiveImageId ?? null,
-        archive_image_platform: artifact.archiveImagePlatform ?? null,
-        server_id: artifact.serverId ?? null,
-        registry_id: storageType === 'REGISTRY_IMAGE' ? (d.registryId ?? null) : null,
-        image_repository: localImage
-          ? artifact.imageReference!.slice(0, imageTagPosition)
-          : (d.imageRepository ?? null),
-        image_tag: localImage
-          ? artifact.imageReference!.slice(imageTagPosition + 1)
-          : (artifact.imageTag ?? null),
-        image_digest: artifact.imageId ?? artifact.imageDigest ?? null,
-        compose_yaml: artifact.composeYaml ?? null,
-        compose_checksum: artifact.composeYaml ? checksumOf(artifact.composeYaml) : null,
-        checksum: artifact.checksum ?? null,
-        size_bytes: artifact.sizeBytes ?? null,
-        source_commit: snapshot.commitSha,
-        created_at: Date.now(),
-      })
-      .execute();
+    const declared = d.artifacts?.find((entry) => entry.name === artifact.name);
+    const sources =
+      artifactType === 'DOCKER_IMAGE' && declared?.imageReference
+        ? []
+        : (artifact.sources ?? snapshot.artifactSources);
+    await this.database.db.transaction().execute(async (tx) => {
+      await tx
+        .insertInto('artifacts')
+        .values({
+          id,
+          project_id: snapshot.projectId,
+          service_id: snapshot.serviceId,
+          pipeline_run_id: snapshot.runId,
+          artifact_type: artifactType,
+          artifact_name: artifact.name ?? null,
+          artifact_kind: artifact.kind ?? null,
+          graph_run_id: snapshot.graph?.runId ?? null,
+          graph_node_run_id: snapshot.graph?.nodeRunId ?? null,
+          storage_type: storageType,
+          storage_key: artifact.storageKey,
+          archive_key: artifact.archiveKey ?? null,
+          archive_image_id: artifact.archiveImageId ?? null,
+          archive_image_platform: artifact.archiveImagePlatform ?? null,
+          server_id: artifact.serverId ?? null,
+          registry_id: storageType === 'REGISTRY_IMAGE' ? (d.registryId ?? null) : null,
+          image_repository: localImage
+            ? artifact.imageReference!.slice(0, imageTagPosition)
+            : (d.imageRepository ?? null),
+          image_tag: localImage
+            ? artifact.imageReference!.slice(imageTagPosition + 1)
+            : (artifact.imageTag ?? null),
+          image_digest: artifact.imageId ?? artifact.imageDigest ?? null,
+          compose_yaml: artifact.composeYaml ?? null,
+          compose_checksum: artifact.composeYaml ? checksumOf(artifact.composeYaml) : null,
+          checksum: artifact.checksum ?? null,
+          size_bytes: artifact.sizeBytes ?? null,
+          source_commit: snapshot.commitSha,
+          source_manifest: sources ? 1 : null,
+          created_at: Date.now(),
+        })
+        .execute();
+      if (sources?.length)
+        await tx
+          .insertInto('artifact_sources')
+          .values(
+            sources.map((source, position) => ({
+              artifact_id: id,
+              position,
+              repository_id: source.repositoryId,
+              commit_sha: source.commitSha,
+              git_ref: source.ref ?? null,
+              commit_subject: source.subject ?? null,
+              workspace_run_id: source.workspace?.runId ?? null,
+              workspace_node_run_id: source.workspace?.nodeRunId ?? null,
+              path: source.path ?? null,
+            })),
+          )
+          .execute();
+    });
     return { ...artifact, id };
   }
   async list(projectId?: string, pipelineRunId?: string, filters: DeliveryRecordFilters = {}) {
@@ -207,8 +276,20 @@ export class ArtifactsService {
         'tasks.status as taskStatus',
         'flow.version as graphVersion',
         'flow.flow_name as graphFlowName',
+        'flow.inputs_json as graphInputs',
         'node.name as graphNodeName',
-      ]);
+        'node.node_type as graphNodeType',
+      ])
+      .select((eb) =>
+        eb
+          .selectFrom('service_compose_templates as template')
+          .select('template.checksum')
+          .whereRef('template.service_id', '=', 'artifacts.service_id')
+          .whereRef('template.environment_id', '=', 'pipeline_runs.environment_id')
+          .orderBy('template.version', 'desc')
+          .limit(1)
+          .as('managedComposeChecksum'),
+      );
     if (projectId) query = query.where('artifacts.project_id', '=', projectId);
     if (pipelineRunId) query = query.where('artifacts.pipeline_run_id', '=', pipelineRunId);
     if (filters.taskId) query = query.where('pipeline_runs.task_id', '=', filters.taskId);
@@ -216,9 +297,36 @@ export class ArtifactsService {
     if (filters.serviceId) query = query.where('artifacts.service_id', '=', filters.serviceId);
     if (filters.environmentId)
       query = query.where('pipeline_runs.environment_id', '=', filters.environmentId);
-    if (filters.commit)
-      query = query.where('artifacts.source_commit', 'like', filters.commit.toLowerCase() + '%');
-    return (await query.orderBy('artifacts.created_at', 'desc').limit(200).execute()).map((r) => ({
+    if (filters.commit || filters.repositoryId) {
+      const sha = filters.commit?.toLowerCase();
+      query = query.where((eb) => {
+        const matched = eb.exists(
+          eb
+            .selectFrom('artifact_sources as source')
+            .select('source.artifact_id')
+            .whereRef('source.artifact_id', '=', 'artifacts.id')
+            .$if(Boolean(filters.repositoryId), (q) =>
+              q.where('source.repository_id', '=', filters.repositoryId!),
+            )
+            .$if(Boolean(sha), (q) => q.where('source.commit_sha', 'like', sha + '%')),
+        );
+        return !filters.repositoryId && sha
+          ? eb.or([
+              matched,
+              eb.and([
+                eb('artifacts.source_manifest', 'is', null),
+                eb('artifacts.source_commit', 'like', sha + '%'),
+              ]),
+            ])
+          : matched;
+      });
+    }
+    const rows = await query.orderBy('artifacts.created_at', 'desc').limit(200).execute();
+    const sources = await readArtifactSources(
+      this.database.db,
+      rows.map(({ id }) => id),
+    );
+    return rows.map((r) => ({
       id: r.id,
       projectId: r.project_id,
       serviceId: r.service_id,
@@ -233,7 +341,7 @@ export class ArtifactsService {
         storedDeploymentSelection(r.targetSelectionJson),
       deployable:
         (r.taskStatus === 'SUCCESS' || r.taskStatus === 'PARTIAL_FAILED') &&
-        hasDeployableMetadata(r),
+        hasDeployableMetadata(r, Boolean(r.managedComposeChecksum)),
       artifactType: r.artifact_type,
       name: r.artifact_name,
       kind: r.artifact_kind ?? r.artifact_type,
@@ -258,18 +366,38 @@ export class ArtifactsService {
       checksum: r.checksum,
       sizeBytes: r.size_bytes,
       sourceCommit: r.source_commit,
+      sources: sources.get(r.id),
+      sourceEvent: sourceEvent(r.graphInputs),
+      composeTemplate: archivedComposeTemplate(
+        r.sourceTaskPayload,
+        r.artifact_name,
+        r.compose_checksum,
+      ),
+      imageOrigin:
+        r.artifact_type === 'DOCKER_IMAGE'
+          ? r.graphNodeType === 'REGISTER_ARTIFACT' ||
+            declaredImageReference(r.sourceTaskPayload, r.artifact_name)
+            ? 'REGISTERED_IMAGE'
+            : sources.get(r.id)?.length
+              ? 'BUILD'
+              : undefined
+          : undefined,
+      sourceImageReference:
+        r.artifact_type === 'DOCKER_IMAGE'
+          ? declaredImageReference(r.sourceTaskPayload, r.artifact_name)
+          : undefined,
       createdAt: r.created_at,
     }));
   }
 
-  async deployableIn(db: Kysely<Database>, runId: string, checkArchive = false) {
+  async deployableIn(db: Kysely<Database>, runId: string, checkArchive = false, managedCompose = false) {
     const rows = await db
       .selectFrom('artifacts')
       .selectAll()
       .where('pipeline_run_id', '=', runId)
       .orderBy('id')
       .execute();
-    const eligible = rows.filter(hasDeployableMetadata);
+    const eligible = rows.filter((row) => hasDeployableMetadata(row, managedCompose));
     const available = checkArchive
       ? (
           await Promise.all(
@@ -295,6 +423,16 @@ export class ArtifactsService {
     return Boolean(stat?.isFile() && stat.size === row.size_bytes);
   }
 
+  async managedCompose(snapshot: PipelineSnapshot) {
+    if (!snapshot.managedCompose) return undefined;
+    return readManagedCompose(
+      this.database.db,
+      snapshot.serviceId,
+      snapshot.environmentId,
+      snapshot.managedCompose,
+    );
+  }
+
   async forDeployment(snapshot: PipelineSnapshot, serverId: string): Promise<DeploymentArtifact> {
     const candidates = snapshot.deploymentArtifacts?.filter(
       (artifact) => artifact.serverId === null || artifact.serverId === serverId,
@@ -307,6 +445,7 @@ export class ArtifactsService {
       .innerJoin('pipeline_runs', 'pipeline_runs.id', 'artifacts.pipeline_run_id')
       .innerJoin('tasks', 'tasks.id', 'pipeline_runs.task_id')
       .selectAll('artifacts')
+      .select('tasks.payload_json as build_payload')
       .where('artifacts.id', '=', candidate.id)
       .where('pipeline_runs.task_id', '=', snapshot.sourceBuildTaskId)
       .where('tasks.status', 'in', ['SUCCESS', 'PARTIAL_FAILED'])
@@ -323,7 +462,11 @@ export class ArtifactsService {
             .where('pipeline_runs.service_id', '=', snapshot.serviceId)
         : lookup.where('pipeline_runs.pipeline_id', '=', snapshot.pipelineId)
     ).executeTakeFirst();
-    if (!row || row.server_id !== candidate.serverId || !hasDeployableMetadata(row))
+    if (
+      !row ||
+      row.server_id !== candidate.serverId ||
+      !hasDeployableMetadata(row, Boolean(snapshot.managedCompose))
+    )
       throw new ConflictException('构建产物不可发布或与当前任务范围不一致');
     if (candidate.fingerprint && candidate.fingerprint !== deploymentFingerprint(row))
       throw new ConflictException('已确认的构建产物校验信息发生变化');
@@ -337,7 +480,7 @@ export class ArtifactsService {
         .executeTakeFirst();
       if (!successful) throw new ConflictException('产物来源目标构建未成功');
     }
-    if (row.compose_yaml && checksumOf(row.compose_yaml) !== row.compose_checksum)
+    if (!snapshot.managedCompose && row.compose_yaml && checksumOf(row.compose_yaml) !== row.compose_checksum)
       throw new ConflictException('Compose 配置未通过完整性校验');
     const key = row.pruned_at === null ? archiveKey(row) : null;
     const registry = row.storage_type === 'REGISTRY_IMAGE';
@@ -363,6 +506,7 @@ export class ArtifactsService {
       ...archive,
       offlineImage,
       composeYaml: row.compose_yaml ?? undefined,
+      composeTemplate: archivedComposeTemplate(row.build_payload, row.artifact_name, row.compose_checksum),
       imageReference: row.artifact_type === 'DOCKER_IMAGE' ? row.storage_key : undefined,
       imageId: isLocalImage(row.storage_type) ? (row.image_digest ?? undefined) : undefined,
     };

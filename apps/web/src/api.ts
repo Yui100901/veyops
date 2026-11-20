@@ -90,10 +90,72 @@ export function useResource<T>(path: string | null, interval = 0) {
 export function navigate(path: string) {
   window.location.hash = path;
 }
-export function useRoute() {
-  const [route, setRoute] = useState(() => window.location.hash.slice(1) || '/');
+
+export type RouteTransition = {
+  proceed: () => void;
+  cancel: () => void;
+};
+
+let routeBlocker: ((transition: RouteTransition | null) => void) | undefined;
+
+export function useRouteBlocker(active: boolean, onTransition: typeof routeBlocker) {
   useEffect(() => {
-    const update = () => setRoute(window.location.hash.slice(1) || '/');
+    if (!active || !onTransition) return;
+    routeBlocker = onTransition;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => {
+      if (routeBlocker === onTransition) routeBlocker = undefined;
+      window.removeEventListener('beforeunload', warn);
+    };
+  }, [active, onTransition]);
+}
+
+function currentRoute() {
+  return window.location.hash.slice(1) || '/';
+}
+
+function routePosition(fallback: number): number {
+  const state = window.history.state;
+  if (Number.isSafeInteger(state?.veyopsRoutePosition)) return state.veyopsRoutePosition;
+  window.history.replaceState({ ...state, veyopsRoutePosition: fallback }, '');
+  return fallback;
+}
+
+export function useRoute() {
+  const [route, setRoute] = useState(currentRoute);
+  useEffect(() => {
+    let current = currentRoute();
+    let position = routePosition(0);
+    let browserPosition = position;
+    const update = () => {
+      const next = currentRoute();
+      // A blocked traversal leaves the original entry in place so cancelling can restore it.
+      const destination = (browserPosition = routePosition(browserPosition + 1));
+      const commit = () => {
+        current = next;
+        position = destination;
+        setRoute(next);
+      };
+      if (!routeBlocker || current === next) {
+        routeBlocker?.(null);
+        commit();
+        return;
+      }
+      const stillPending = () =>
+        currentRoute() === next && window.history.state?.veyopsRoutePosition === destination;
+      routeBlocker({
+        proceed: () => {
+          if (stillPending()) commit();
+        },
+        cancel: () => {
+          if (stillPending()) window.history.go(position - destination);
+        },
+      });
+    };
     window.addEventListener('hashchange', update);
     return () => window.removeEventListener('hashchange', update);
   }, []);

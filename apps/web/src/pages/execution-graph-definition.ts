@@ -87,6 +87,7 @@ export interface GraphArtifactOutput {
   required?: boolean;
 }
 export interface FlowBuildDefinition {
+  dependencies?: string[];
   repositoryId?: string;
   branch?: string;
   commitSha?: string;

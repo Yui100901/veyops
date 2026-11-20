@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   ForbiddenException,
   Get,
@@ -32,8 +33,9 @@ import {
   ValidateIf,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import type { Kysely, Selectable, Transaction } from 'kysely';
+import { encryptionKey } from '../../core/config';
 import type { Database } from '../../core/database/schema';
 import { DatabaseService } from '../../core/database/database.service';
 import { AuditService } from '../audit/audit.service';
@@ -106,6 +108,10 @@ class VariableDto {
   @IsOptional() @IsString() @MaxLength(1000) description?: string;
 }
 class VariablesDto {
+  @IsString()
+  @Matches(/^[a-f0-9]{64}$/)
+  expectedRevision!: string;
+
   @IsArray()
   @ArrayMaxSize(100)
   @ValidateNested({ each: true })
@@ -143,6 +149,17 @@ const variableFields = [
 ] as const;
 const systemVariableName = /^VEYOPS_(PROJECT|SERVICE)_(ID|SLUG)$/i;
 const secretMask = '••••••••••••';
+
+function variableRevision(scope: VariableScope, rows: VariableRow[]) {
+  const entries = [...rows]
+    .sort((left, right) => left.key.localeCompare(right.key, 'en'))
+    .map((row) => variableFields.map((field) => row[field]));
+  return createHmac('sha256', encryptionKey())
+    .update('variable-scope\0')
+    .update(JSON.stringify([scope, entries]))
+    .digest('hex');
+}
+
 class RepoLinkDto {
   @IsUUID() repositoryId!: string;
   @IsOptional() @IsString() @MaxLength(1024) repoPath = '.';
@@ -479,7 +496,14 @@ export class ServiceConfigsService {
   }
   private async listVariableScope(scope: VariableScope) {
     const db = this.database.db;
-    return this.presentVariables(db, await this.variableQuery(db, scope).orderBy('key').execute());
+    const rows = await this.variableQuery(db, scope).orderBy('key').execute();
+    return this.presentVariableScope(db, scope, rows);
+  }
+  private async presentVariableScope(db: Kysely<Database>, scope: VariableScope, rows: VariableRow[]) {
+    return {
+      revision: variableRevision(scope, rows),
+      variables: await this.presentVariables(db, rows),
+    };
   }
   async listProjectVariables(projectId: string) {
     await this.project(projectId);
@@ -534,9 +558,10 @@ export class ServiceConfigsService {
     return this.database.db.transaction().execute(async (tx) => {
       await lockProjectGraph(tx);
       await this.lockVariableScope(tx, scope);
-      const old = new Map(
-        (await this.variableQuery(tx, scope).execute()).map((row) => [row.key, row]),
-      );
+      const current = await this.variableQuery(tx, scope).execute();
+      if (variableRevision(scope, current) !== input.expectedRevision)
+        throw new ConflictException('此处变量已被其他操作更新，请重新加载最新变量后再修改。');
+      const old = new Map(current.map((row) => [row.key, row]));
       const rows: VariableRow[] = [];
       for (const variable of input.variables) {
         rows.push(await this.prepareVariable(tx, variable, userId, old.get(variable.key)));
@@ -575,7 +600,7 @@ export class ServiceConfigsService {
             .execute();
       }
       await this.auditVariableScope(scope, userId, 'update', { count: rows.length }, tx);
-      return this.presentVariables(tx, rows);
+      return this.presentVariableScope(tx, scope, rows);
     });
   }
   private async prepareVariable(

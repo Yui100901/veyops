@@ -9,6 +9,7 @@ import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
+import { replaceVariables } from './helpers/variable-scope';
 
 async function checkPlan(t: TestContext, url?: string) {
   const data = await mkdtemp(join(tmpdir(), 'veyops-execution-plan-'));
@@ -25,6 +26,8 @@ async function checkPlan(t: TestContext, url?: string) {
   });
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
+  const { GraphRunnerService } =
+    await import('../modules/execution-graphs/graph-runner.service.js');
   const { RepositoryMetadataService } =
     await import('../modules/projects/repository-metadata.service.js');
   const { ServersService } = await import('../modules/servers/servers.service.js');
@@ -83,15 +86,10 @@ async function checkPlan(t: TestContext, url?: string) {
     const vars = `/services/${service.id}/environments/${env.id}/variables`;
     const plain = 'value-must-not-be-in-preview';
     const secret = 'secret-must-not-be-in-preview';
-    await api
-      .put(base + vars)
-      .send({
-        variables: [
-          { key: 'OVERLAP', value: plain },
-          { key: 'PASSWORD', value: secret, isSecret: true },
-        ],
-      })
-      .expect(200);
+    await replaceVariables(api, base + vars, [
+      { key: 'OVERLAP', value: plain },
+      { key: 'PASSWORD', value: secret, isSecret: true },
+    ]);
     const pin = 'd'.repeat(40);
     const files = t.mock.method(
       app.get(RepositoryMetadataService),
@@ -102,6 +100,8 @@ async function checkPlan(t: TestContext, url?: string) {
         paths: string[],
       ) => {
         assert.deepEqual(source, { repositoryId: repo.id, commitSha: pin });
+        assert.equal(paths.length, 1);
+        if (paths[0] === '.env') return { path: '.env', keys: ['UNEXPECTED_FALLBACK'] };
         return paths.includes('.env.test')
           ? { path: '.env.test', keys: ['FROM_FILE', 'OVERLAP'] }
           : undefined;
@@ -198,6 +198,19 @@ async function checkPlan(t: TestContext, url?: string) {
     const previewWithDefaults = await create(flow('build-only') + '/preview', args(env.id));
     assert.equal(snapshots.mock.callCount(), 0);
     assert.deepEqual(previewOnly.executionPlan.targets[0].servers, []);
+    assert.deepEqual(previewOnly.executionPlan.environmentFiles[0], {
+      flowId: 'build-only',
+      nodeId: 'manager',
+      status: 'SKIPPED',
+      source: 'CONVENTION',
+      required: false,
+      repositoryId: repo.id,
+      commitSha: pin,
+      path: '.env.empty',
+    });
+    assert.ok(
+      !previewOnly.executionPlan.variables.some((v: { key: string }) => v.key === 'UNEXPECTED_FALLBACK'),
+    );
     assert.equal(previewWithDefaults.executionPlan.targets[0].source, 'MANAGER');
     assert.equal(previewWithDefaults.executionPlan.environmentFiles[0].path, '.env.test');
     assert.equal(previewWithDefaults.executionPlan.environmentFiles[0].commitSha, pin);
@@ -219,6 +232,16 @@ async function checkPlan(t: TestContext, url?: string) {
     assert.match(missing.body.error.message, /target.*缺少构建服务器/);
     const combined = flow('combined');
     const defaultPlan = await create(combined + '/preview', args(env.id));
+    assert.equal(defaultPlan.deliveries[1].requireApproval, false);
+    const automaticPlan = await app.get(GraphRunnerService).preview(
+      project.id,
+      'combined',
+      args(env.id),
+      { automation: { kind: 'API', ruleId: 'fixture', revision: '1' } },
+    );
+    assert.equal(automaticPlan.deliveries[0]?.requireApproval, false);
+    assert.equal(automaticPlan.deliveries[1]?.requireApproval, true);
+    assert.notEqual(automaticPlan.configurationHash, defaultPlan.configurationHash);
     assert.deepEqual(
       defaultPlan.executionPlan.targets.map((item: { purpose: string; source: string }) => [
         item.purpose,

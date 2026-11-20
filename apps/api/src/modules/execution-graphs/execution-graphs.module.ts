@@ -8,6 +8,8 @@ import { GraphTriggerHooksController, GraphTriggersController } from './graph-tr
 import { GraphTriggersService } from './graph-triggers.service';
 import { CommandCenterModule } from '../command-center/command-center.module';
 import { GraphNodeTasks } from './graph-node-tasks';
+import { GraphMigrationController } from './graph-migration.controller';
+import { GraphMigrationService } from './graph-migration.service';
 
 @Module({
   imports: [PipelinesModule, CommandCenterModule],
@@ -16,7 +18,14 @@ import { GraphNodeTasks } from './graph-node-tasks';
     GraphRunnerController,
     GraphTriggersController,
     GraphTriggerHooksController,
+    GraphMigrationController,
   ],
-  providers: [ExecutionGraphsService, GraphRunnerService, GraphTriggersService, GraphNodeTasks],
+  providers: [
+    ExecutionGraphsService,
+    GraphRunnerService,
+    GraphTriggersService,
+    GraphNodeTasks,
+    GraphMigrationService,
+  ],
 })
 export class ExecutionGraphsModule {}

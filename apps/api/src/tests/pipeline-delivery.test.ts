@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import type { PipelineSnapshot } from '../modules/pipelines/pipeline.types';
 
 let testDirectory: Promise<string> | undefined;
 const deliveryDirectory = () =>
@@ -43,12 +44,18 @@ async function checkDelivery(databaseUrl?: string) {
   const { PipelineTriggersService } =
     await import('../modules/pipeline-triggers/pipeline-triggers.service.js');
   const { BuildsService } = await import('../modules/builds/builds.service.js');
+  const { ArtifactsService } = await import('../modules/artifacts/artifacts.service.js');
+  const { GraphTriggersService } =
+    await import('../modules/execution-graphs/graph-triggers.service.js');
   const { RepositoryMetadataService } =
     await import('../modules/projects/repository-metadata.service.js');
 
   const archive = Buffer.from('fixture file artifact\n');
   const checksum = createHash('sha256').update(archive).digest('hex');
   const compose = 'services:\n  web:\n    image: ${VEYOPS_IMAGE}\n';
+  const managedV1 = compose + '# Service environment revision 1\n';
+  const managedV2 = compose + '# Service environment revision 2\n';
+  const composeUploads: string[] = [];
   const imageDigest = `sha256:${'1'.repeat(64)}`;
   const imageId = `sha256:${'2'.repeat(64)}`;
   const successfulCommit = 'a'.repeat(40);
@@ -80,6 +87,18 @@ async function checkDelivery(databaseUrl?: string) {
             stdout: 'VEYOPS_OUTPUT={"result":"generated"}\nVEYOPS_EXIT_CODE=0\n',
             stderr: '',
           };
+        }
+        if (script.includes('GRAPH_DEPENDENCY_FIXTURE')) {
+          const mount = args.find((argument) => argument.endsWith(',dst=/workspace'))!;
+          const workspace = mount.slice('type=bind,src='.length, -',dst=/workspace'.length);
+          assert.equal(
+            await readFile(join(workspace, 'repo', 'origin.txt'), 'utf8'),
+            successfulCommit,
+          );
+          assert.equal(
+            await readFile(join(workspace, 'dependencies', 'schema', 'origin.txt'), 'utf8'),
+            auxiliaryCommit,
+          );
         }
         const checkout = script.includes('fetch --no-recurse-submodules --no-tags --depth=1');
         if (checkout || script.includes("printf 'VEYOPS_ARTIFACT")) {
@@ -155,6 +174,8 @@ async function checkDelivery(databaseUrl?: string) {
           const platform = command.includes('{{.Architecture}}') ? ' linux/amd64' : '';
           options?.onData?.(`${imageId}${platform}\n`);
         }
+        if (command.includes("printf 'VEYOPS_COMPOSE_IMAGE_ID="))
+          options?.onData?.(`VEYOPS_COMPOSE_IMAGE_ID=${imageId}\n`);
         if (registryPullFails && command.includes(' pull') && command.includes(imageDigest))
           return { exitCode: 1 };
         if (archivePlatformMismatch && command.includes('{{.Server.Os}}/{{.Server.Arch}}'))
@@ -166,7 +187,7 @@ async function checkDelivery(databaseUrl?: string) {
         transferredArchives.push(target.id);
       },
       uploadContent: async (_target: unknown, contents: string, destination: string) => {
-        if (destination.endsWith('/compose.yaml')) assert.equal(contents, compose);
+        if (destination.endsWith('/compose.yaml')) composeUploads.push(contents);
       },
       download: async (_target: unknown, source: string, destination: string) => {
         await writeFile(destination, source.endsWith('/compose.snapshot.yaml') ? compose : archive);
@@ -182,6 +203,23 @@ async function checkDelivery(databaseUrl?: string) {
         ...source,
         commitSha: source.commitSha ?? successfulCommit,
       }),
+      checkoutGraphSource: async (
+        _projectId: string,
+        source: { commitSha: string },
+        _signal: AbortSignal,
+        destination: string,
+      ) => {
+        if (source.commitSha === failingCommit) throw new Error('Fixture checkout error');
+        await mkdir(destination, { recursive: true });
+        await writeFile(join(destination, 'Dockerfile'), 'FROM scratch\n');
+        await writeFile(join(destination, 'compose.yaml'), compose);
+        await writeFile(join(destination, 'origin.txt'), source.commitSha);
+        return {
+          commitSha: source.commitSha,
+          subject: 'Fixture ' + source.commitSha.slice(0, 8),
+          shallow: true,
+        };
+      },
       refreshBranches: async () => ({
         defaultBranch: 'main',
         branches: [{ name: 'main', sha: successfulCommit }],
@@ -1242,6 +1280,16 @@ async function checkDelivery(databaseUrl?: string) {
     }
 
     const graphPath = '/projects/' + project.id + '/execution-graph';
+    const dependencyRepo = await create('/projects/' + project.id + '/repositories', {
+      name: 'Graph schema',
+      cloneUrl: 'https://repo.example.test/team/schema.git',
+    });
+    await api
+      .put('/api/v1/services/' + service.id + '/repositories')
+      .send({
+        repositories: [{ repositoryId: repo.id, repoPath: '.', isPrimary: true }],
+      })
+      .expect(200);
     const graph = (await api.get('/api/v1' + graphPath).expect(200)).body.data;
     const graphEnv = await create('/projects/' + project.id + '/environments', {
       name: 'Graph release',
@@ -1348,13 +1396,31 @@ async function checkDelivery(databaseUrl?: string) {
         inputs: [...scoped, targets, { ...historical, selection: 'LATEST_COMPATIBLE' }],
       },
       {
+        id: 'git-actual',
+        type: 'CHECKOUT',
+        name: '实际服务源码',
+        checkout: { repositoryId: sharedRepo.id, mode: 'COMMIT', commitSha: successfulCommit },
+      },
+      {
+        id: 'git-schema',
+        type: 'CHECKOUT',
+        name: '实际构建依赖',
+        checkout: { repositoryId: dependencyRepo.id, mode: 'COMMIT', commitSha: auxiliaryCommit },
+      },
+      {
+        id: 'git-unused',
+        type: 'CHECKOUT',
+        name: '未绑定的源码',
+        checkout: { repositoryId: repo.id, mode: 'COMMIT', commitSha: successfulCommit },
+      },
+      {
         id: 'build-node',
         type: 'BUILD',
         name: '构建归档',
         build: {
-          repositoryId: repo.id,
           buildLocation: 'MANAGER',
-          buildCommand: 'echo BUILD_FIXTURE',
+          dependencies: ['schema'],
+          buildCommand: 'echo GRAPH_DEPENDENCY_FIXTURE',
           artifacts: [
             { name: 'jar', type: 'FILE', path: 'app.jar' },
             { name: 'image', type: 'DOCKER_IMAGE', path: 'Dockerfile' },
@@ -1379,20 +1445,30 @@ async function checkDelivery(databaseUrl?: string) {
       ['custom', 'script'],
       ['script', 'register'],
       ['register', 'custom-end'],
-      ['build', 'build-node'],
-      ['composed', 'build-node'],
+      ['build', 'git-actual'],
+      ['composed', 'git-actual'],
+      ['git-actual', 'git-schema'],
+      ['git-schema', 'git-unused'],
+      ['git-unused', 'build-node'],
       ['build-node', 'build-end'],
       ['build-node', 'deploy-node'],
       ['release', 'deploy-node'],
       ['latest', 'deploy-node'],
       ['deploy-node', 'release-end'],
     ].map(([from, to]) => ({ from, to }));
+    const buildBindings = {
+      'git-actual': { version: input('version') },
+      'build-node': {
+        workspace: from('git-actual', 'workspace'),
+        dependency_schema: from('git-schema', 'workspace'),
+      },
+    };
     const releaseEndpoint = (startId: string, artifact: object) => ({
       startId,
       endId: 'release-end',
       serviceId: service.id,
       inputBindings: {
-        ...(startId === 'composed' && { 'build-node': { version: input('version') } }),
+        ...(startId === 'composed' && buildBindings),
         'deploy-node': { artifact },
       },
       outputBindings: { release: from('deploy-node', 'release') },
@@ -1416,7 +1492,7 @@ async function checkDelivery(databaseUrl?: string) {
           {
             startId: 'build',
             endId: 'build-end',
-            inputBindings: { 'build-node': { version: input('version') } },
+            inputBindings: buildBindings,
             outputBindings: { jar: from('build-node', 'jar'), image: from('build-node', 'image') },
           },
           releaseEndpoint('composed', from('build-node', 'image')),
@@ -1465,6 +1541,12 @@ async function checkDelivery(databaseUrl?: string) {
     const onlyBuild = await submit('build');
     assert.deepEqual(onlyBuild.reviewed.deliveries[0].serverIds, []);
     assert.equal(onlyBuild.detail.status, 'SUCCESS', JSON.stringify(onlyBuild.detail.nodes));
+    assert.deepEqual(
+      onlyBuild.reviewed.deliveries[0].sourceSnapshot.map(
+        (source: { repositoryId: string }) => source.repositoryId,
+      ),
+      [sharedRepo.id, dependencyRepo.id],
+    );
     assert.equal(remoteCommands.length, beforePublish, 'Standalone manager build never opens SSH');
     const artifactRows = await db
       .selectFrom('artifacts')
@@ -1491,6 +1573,64 @@ async function checkDelivery(databaseUrl?: string) {
     assert.equal(produced.graphRunId, onlyBuild.detail.id);
     assert.equal(produced.graphNodeName, '构建归档');
     assert.equal(produced.graphVersion, published.publishedVersion);
+    assert.equal(produced.imageOrigin, 'BUILD');
+    assert.deepEqual(produced.composeTemplate, {
+      source: 'ARCHIVE',
+      path: 'compose.yaml',
+      checksum: createHash('sha256').update(compose).digest('hex'),
+    });
+    assert.deepEqual(
+      produced.sources.map(
+        (source: { repositoryId: string; commitSha: string; subject: string }) => [
+          source.repositoryId,
+          source.commitSha,
+          source.subject,
+        ],
+      ),
+      [
+        [sharedRepo.id, successfulCommit, 'Fixture ' + successfulCommit.slice(0, 8)],
+        [dependencyRepo.id, auxiliaryCommit, 'Fixture ' + auxiliaryCommit.slice(0, 8)],
+      ],
+    );
+    assert.ok(
+      produced.sources.every(
+        (source: { workspace?: { runId: string } }) =>
+          source.workspace?.runId === onlyBuild.detail.id,
+      ),
+    );
+    assert.equal(
+      (
+        await list('/artifacts', {
+          projectId: project.id,
+          recordId: savedImage,
+          repositoryId: dependencyRepo.id,
+          commit: auxiliaryCommit.slice(0, 12),
+        })
+      ).length,
+      1,
+    );
+    assert.equal(
+      (
+        await list('/artifacts', {
+          projectId: project.id,
+          recordId: savedImage,
+          repositoryId: dependencyRepo.id,
+          commit: successfulCommit,
+        })
+      ).length,
+      0,
+    );
+    assert.equal(
+      (
+        await list('/artifacts', {
+          projectId: project.id,
+          recordId: savedImage,
+          repositoryId: repo.id,
+          commit: successfulCommit,
+        })
+      ).length,
+      0,
+    );
     const buildEnd = onlyBuild.detail.nodes.find(
       (node: { nodeId: string }) => node.nodeId === 'build-end',
     );
@@ -1509,6 +1649,10 @@ async function checkDelivery(databaseUrl?: string) {
       JSON.stringify(historicalRelease.detail.nodes),
     );
     assert.deepEqual(historicalRelease.reviewed.deliveries[0].artifactIds, [savedImage]);
+    assert.deepEqual(
+      historicalRelease.reviewed.deliveries[0].artifactRefs[0].composeTemplate,
+      produced.composeTemplate,
+    );
     const combined = await submit('composed');
     assert.equal(combined.detail.status, 'SUCCESS', JSON.stringify(combined.detail.nodes));
     const releaseNode = combined.detail.nodes.find(
@@ -1528,6 +1672,11 @@ async function checkDelivery(databaseUrl?: string) {
     assert.equal(released.graphNodeName, '部署共享节点');
     assert.equal(released.graphVersion, published.publishedVersion);
     assert.equal(released.serverHost, 'host-first.test');
+    assert.deepEqual(released.composeRelease, {
+      template: produced.composeTemplate,
+      imageReference: (await list('/artifacts', { recordId: released.artifactId }))[0].storageKey,
+      imageId,
+    });
     const implicitLatest = await submit('latest');
     assert.equal(
       implicitLatest.detail.status,
@@ -1537,8 +1686,9 @@ async function checkDelivery(databaseUrl?: string) {
     assert.deepEqual(implicitLatest.reviewed.deliveries[0].artifactIds, [
       releaseNode.output.release.deployments[0].artifactId,
     ]);
+    const graphConfigPath = `/api/v1/services/${service.id}/environments/${graphEnv.id}/config`;
     await api
-      .put('/api/v1/services/' + service.id + '/environments/' + graphEnv.id + '/config')
+      .put(graphConfigPath)
       .send({ ...directConfig, releasePolicy: { requireCodeReview: true } })
       .expect(200);
     const historicalInput = args({ image: [savedImage] });
@@ -1555,12 +1705,279 @@ async function checkDelivery(databaseUrl?: string) {
           '/source-reviews/' +
           successfulCommit,
       )
-      .send({ decision: 'APPROVED' })
+      .send({ decision: 'APPROVED', repositoryId: sharedRepo.id })
+      .expect(200);
+    await post(reviewPreview, historicalInput).expect(409);
+    await api
+      .put(
+        '/api/v1/projects/' +
+          project.id +
+          '/services/' +
+          service.id +
+          '/environments/' +
+          graphEnv.id +
+          '/source-reviews/' +
+          auxiliaryCommit,
+      )
+      .send({ decision: 'APPROVED', repositoryId: dependencyRepo.id })
       .expect(200);
     assert.equal(
       (await create(reviewPreview, historicalInput)).deliveries[0].requireCodeReview,
       true,
     );
+
+    const previousAutomaticKinds = process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
+    const previousBuildSocket = process.env.WEBHOOK_BUILD_DOCKER_SOCKET;
+    process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = 'API,WEBHOOK,CRON,UPSTREAM';
+    process.env.WEBHOOK_BUILD_DOCKER_SOCKET = '/run/user/1000/fixture-docker.sock';
+    try {
+      await api
+        .put(graphConfigPath)
+        .send({
+          ...directConfig,
+          releasePolicy: { requireCodeReview: true, requireApproval: true },
+        })
+        .expect(200);
+      const triggerPath = graphPath + '/triggers';
+      const triggers = app.get(GraphTriggersService);
+      const releaseRule = {
+        name: 'Automatic archive release',
+        enabled: true,
+        version: published.publishedVersion,
+        flowId: 'release',
+        parameterMappings: { image: { source: 'VALUE', value: [savedImage] } },
+      };
+      const events = (ruleId: string) => list(triggerPath + '/' + ruleId + '/events', {});
+      const invoke = (ruleId: string, eventId: string) =>
+        post(triggerPath + '/' + ruleId + '/invoke', {
+          eventId,
+          repositoryId: repo.id,
+          commitSha: failingCommit,
+        }).expect(202);
+      const releaseTaskFor = async (
+        ruleId: string,
+        kind: string,
+        approval: 'PENDING' | null = 'PENDING',
+      ) => {
+        const rows = await events(ruleId);
+        assert.equal(rows.length, 1, JSON.stringify(rows));
+        const [event] = rows;
+        assert.equal(event.status, 'QUEUED', JSON.stringify(event));
+        const run = (await api.get('/api/v1' + graphPath + '/runs/' + event.runId).expect(200)).body
+          .data;
+        assert.equal(run.triggerType, kind);
+        if (kind === 'API' || kind === 'WEBHOOK')
+          assert.equal(run.trigger.commitSha, failingCommit);
+        const node = run.nodes.find((item: { nodeId: string }) => item.nodeId === 'deploy-node');
+        assert.ok(node.taskId, JSON.stringify(node));
+        const task = await getTask(node.taskId);
+        assert.equal(task.triggerType, kind);
+        assert.equal(task.approvalStatus, approval);
+        const row = await db
+          .selectFrom('tasks')
+          .select('payload_json')
+          .where('id', '=', task.id)
+          .executeTakeFirstOrThrow();
+        const payload = JSON.parse(row.payload_json) as {
+          pipeline: PipelineSnapshot;
+          targets: { id: string }[];
+        };
+        assert.equal(payload.pipeline.graphAutomation?.ruleId, ruleId);
+        assert.equal(payload.pipeline.commitSha, successfulCommit);
+        assert.deepEqual(
+          payload.pipeline.deploymentArtifacts?.map(({ id }) => id),
+          [savedImage],
+        );
+        assert.deepEqual(
+          payload.targets.map(({ id }) => id),
+          [serverIds[0]],
+        );
+        return task.id as string;
+      };
+      const previousRemoteCommands = remoteCommands.length;
+      const autoBuild = await create(triggerPath, {
+        ...releaseRule,
+        kind: 'API',
+        flowId: 'build',
+        parameterMappings: {},
+      });
+      const builder = mock.method(
+        app.get(BuildsService) as unknown as { configureWebhookDocker: () => Promise<void> },
+        'configureWebhookDocker',
+        async () => {},
+      );
+      try {
+        await invoke(autoBuild.id, 'native-api-build');
+        await triggers.tick();
+        const [buildEvent] = await events(autoBuild.id);
+        assert.equal(buildEvent.status, 'QUEUED', JSON.stringify(buildEvent));
+        const run = await waitGraph(buildEvent.runId);
+        assert.equal(run.status, 'SUCCESS', JSON.stringify(run.nodes));
+        assert.equal(run.trigger.commitSha, failingCommit);
+        const node = run.nodes.find((item: { nodeId: string }) => item.nodeId === 'build-node');
+        const task = await getTask(node.taskId);
+        assert.equal(task.triggerType, 'API');
+        assert.equal(task.deploymentTaskId, null);
+        assert.equal(builder.mock.callCount(), 1);
+        assert.ok(
+          run.deliveries[0].sourceSnapshot.some(
+            (source: { repositoryId: string; commitSha: string }) =>
+              source.repositoryId === sharedRepo.id && source.commitSha === successfulCommit,
+          ),
+        );
+      } finally {
+        builder.mock.restore();
+      }
+      assert.equal(remoteCommands.length, previousRemoteCommands);
+
+      const hookKey = randomBytes(32).toString('hex');
+      const hookCredential = await create('/credentials', {
+        name: 'Native archive release signature',
+        type: 'CUSTOM_SECRET',
+        secret: { value: hookKey },
+      });
+      const nativeApi = await create(triggerPath, { ...releaseRule, kind: 'API' });
+      const nativeHook = await create(triggerPath, {
+        ...releaseRule,
+        kind: 'WEBHOOK',
+        credentialId: hookCredential.id,
+        repositoryId: repo.id,
+        refPrefix: 'refs/heads/release/',
+      });
+      const nativeCron = await create(triggerPath, {
+        ...releaseRule,
+        kind: 'CRON',
+        cron: '15 9 * * *',
+        timeZone: 'Asia/Shanghai',
+      });
+      const nativeUpstream = await create(triggerPath, {
+        ...releaseRule,
+        kind: 'UPSTREAM',
+        upstreamFlowId: 'build',
+        upstreamStatus: 'SUCCESS',
+      });
+      const firstApiEvent = await invoke(nativeApi.id, 'native-api-archive');
+      assert.equal(
+        (await invoke(nativeApi.id, 'native-api-archive')).body.data.id,
+        firstApiEvent.body.data.id,
+      );
+      const body = JSON.stringify({
+        repositoryId: repo.id,
+        ref: 'refs/heads/release/fixture',
+        commitSha: failingCommit,
+      });
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const deliveryId = 'native-hook-archive';
+      const signature =
+        'sha256=' +
+        createHmac('sha256', hookKey)
+          .update(timestamp + '.' + deliveryId + '.' + body)
+          .digest('hex');
+      const sendHook = () =>
+        request(app.getHttpServer())
+          .post('/api/v1/graph-webhooks/' + nativeHook.id)
+          .set('X-Veyops-Timestamp', timestamp)
+          .set('X-Veyops-Delivery', deliveryId)
+          .set('X-Veyops-Signature', signature)
+          .type('json')
+          .send(body)
+          .expect(202);
+      assert.equal((await sendHook()).body.data.id, (await sendHook()).body.data.id);
+      assert.equal((await submit('build')).detail.status, 'SUCCESS');
+      await triggers.tick(nativeCron.nextAt);
+      await triggers.tick(nativeCron.nextAt);
+      assert.equal(remoteCommands.length, previousRemoteCommands);
+
+      for (const [rule, kind] of [
+        [nativeApi, 'API'],
+        [nativeHook, 'WEBHOOK'],
+        [nativeCron, 'CRON'],
+        [nativeUpstream, 'UPSTREAM'],
+      ] as const) {
+        const taskId = await releaseTaskFor(rule.id, kind);
+        const activated = activations().length;
+        await create('/deployments/approvals/' + taskId + '/approve', {});
+        const release = await runTask(taskId);
+        assert.equal(release.status, 'SUCCESS', release.errorSummary);
+        assert.equal(activations().length, activated + 1);
+        assert.equal(activations().at(-1)?.serverId, serverIds[0]);
+      }
+
+      const revokedRule = await create(triggerPath, { ...releaseRule, kind: 'API' });
+      await invoke(revokedRule.id, 'native-api-revoked-rule');
+      await triggers.tick();
+      const revokedTaskId = await releaseTaskFor(revokedRule.id, 'API');
+      await create('/deployments/approvals/' + revokedTaskId + '/approve', {});
+      await api
+        .patch('/api/v1' + triggerPath + '/' + revokedRule.id)
+        .send({ ...releaseRule, kind: 'API', enabled: false })
+        .expect(200);
+      const afterRuleDisabled = remoteCommands.length;
+      const revoked = await runTask(revokedTaskId);
+      assert.equal(remoteCommands.length, afterRuleDisabled);
+      assert.equal(revoked.status, 'FAILED', revoked.errorSummary);
+      assert.match(revoked.errorSummary, /触发器已停用/);
+
+      const ruleOwner = await create('/users', {
+        username: 'graph-release-admin',
+        role: 'ADMIN',
+        password: initialPassword,
+      });
+      const ownerApi = request.agent(app.getHttpServer());
+      await ownerApi
+        .post('/api/v1/auth/login')
+        .send({ username: ruleOwner.username, password: initialPassword })
+        .expect(201);
+      await ownerApi
+        .post('/api/v1/auth/change-password')
+        .send({ currentPassword: initialPassword, newPassword: password })
+        .expect(200);
+      await ownerApi
+        .post('/api/v1/auth/login')
+        .send({ username: ruleOwner.username, password })
+        .expect(201);
+      const ownerRule = (
+        await ownerApi
+          .post('/api/v1' + triggerPath)
+          .send({ ...releaseRule, kind: 'API' })
+          .expect(201)
+      ).body.data;
+      await invoke(ownerRule.id, 'native-api-revoked-owner');
+      await triggers.tick();
+      const ownerTaskId = await releaseTaskFor(ownerRule.id, 'API');
+      await create('/deployments/approvals/' + ownerTaskId + '/approve', {});
+      await api
+        .patch('/api/v1/users/' + ruleOwner.id)
+        .send({ role: 'VIEWER' })
+        .expect(200);
+      const afterRoleChanged = remoteCommands.length;
+      const ownerRevoked = await runTask(ownerTaskId);
+      assert.equal(remoteCommands.length, afterRoleChanged);
+      assert.equal(ownerRevoked.status, 'FAILED', ownerRevoked.errorSummary);
+      assert.match(ownerRevoked.errorSummary, /配置管理员已失效/);
+
+      await api
+        .put(graphConfigPath)
+        .send({
+          ...directConfig,
+          releasePolicy: { requireCodeReview: true, requireApproval: false },
+        })
+        .expect(200);
+      const direct = await create(triggerPath, { ...releaseRule, kind: 'API' });
+      await invoke(direct.id, 'native-api-direct-release');
+      await triggers.tick();
+      const directTaskId = await releaseTaskFor(direct.id, 'API', null);
+      const activated = activations().length;
+      const directRelease = await runTask(directTaskId);
+      assert.equal(directRelease.status, 'SUCCESS', directRelease.errorSummary);
+      assert.equal(activations().length, activated + 1);
+    } finally {
+      if (previousAutomaticKinds === undefined) delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
+      else process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = previousAutomaticKinds;
+      if (previousBuildSocket === undefined) delete process.env.WEBHOOK_BUILD_DOCKER_SOCKET;
+      else process.env.WEBHOOK_BUILD_DOCKER_SOCKET = previousBuildSocket;
+    }
+
     const graphFailure = await submit('build', {
       version: { kind: 'COMMIT', value: failingCommit },
     });
@@ -1573,6 +1990,121 @@ async function checkDelivery(databaseUrl?: string) {
       (node: { nodeId: string }) => node.nodeId === 'script',
     );
     assert.equal(scriptResult.output.result, 'generated');
+    const buildTask = onlyBuild.detail.nodes.find(
+      (node: { nodeId: string }) => node.nodeId === 'build-node',
+    );
+    const { payload_json: payload } = await db
+      .selectFrom('tasks')
+      .select('payload_json')
+      .where('id', '=', buildTask.taskId)
+      .executeTakeFirstOrThrow();
+    const snapshot = (JSON.parse(payload) as { pipeline: PipelineSnapshot }).pipeline;
+    const imported = await app.get(ArtifactsService).create(
+      {
+        ...snapshot,
+        definition: {
+          ...snapshot.definition,
+          artifacts: [
+            {
+              name: 'imported',
+              type: 'DOCKER_IMAGE',
+              imageReference: 'fixture/test@' + imageDigest,
+            },
+          ],
+        },
+      },
+      {
+        name: 'imported',
+        kind: 'DOCKER_IMAGE',
+        storageType: 'LOCAL_IMAGE',
+        imageReference: 'fixture/test:local',
+        imageId,
+        storageKey: produced.storageKey,
+      },
+    );
+    const [importedRecord] = await list('/artifacts', {
+      projectId: project.id,
+      recordId: imported.id,
+    });
+    assert.deepEqual(
+      importedRecord.sources,
+      [],
+      'an imported image cannot inherit the build checkout provenance',
+    );
+    assert.ok(composeUploads.length > 0 && composeUploads.every((value) => value === compose));
+    const managedPath = `/services/${service.id}/environments/${graphEnv.id}/compose-templates`;
+    const managed = (content: string, expectedVersion = 0) => ({
+      source: 'SERVICE_ENVIRONMENT',
+      expectedVersion,
+      content,
+    });
+    await post(managedPath, managed('services: { app: { image: mutable:latest } }')).expect(400);
+    await post(managedPath, managed(managedV1 + '---\nservices: {}\n')).expect(400);
+    const revision = await create(managedPath, managed(managedV1));
+    assert.equal(revision.version, 1);
+    assert.equal(revision.checksum, createHash('sha256').update(managedV1).digest('hex'));
+    await post(managedPath, managed(managedV2)).expect(409);
+    const managedHistory = await api.get('/api/v1' + managedPath).expect(200);
+    assert.equal(managedHistory.body.data.versions[0].content, undefined);
+    const savedTemplate = await api.get(`/api/v1${managedPath}/${revision.id}`).expect(200);
+    assert.equal(savedTemplate.body.data.content, managedV1);
+    assert.equal(savedTemplate.headers['cache-control'], 'no-store');
+
+    // The image remains deployable without a Compose file when a template is managed by the service environment.
+    await db
+      .updateTable('artifacts')
+      .set({ compose_yaml: null, compose_checksum: null })
+      .where('id', '=', savedImage)
+      .execute();
+    const firstManaged = await submit('release', { image: [savedImage] });
+    assert.equal(firstManaged.detail.status, 'SUCCESS', JSON.stringify(firstManaged.detail.nodes));
+    assert.equal(composeUploads.at(-1), managedV1);
+    const managedDeployTask = firstManaged.detail.nodes.find(
+      (node: { nodeId: string }) => node.nodeId === 'deploy-node',
+    ).taskId;
+    const [managedRecord] = await list('/deployments', { taskId: managedDeployTask });
+    assert.deepEqual(managedRecord.composeRelease, {
+      template: {
+        id: revision.id,
+        source: 'SERVICE_ENVIRONMENT',
+        path: 'compose.yaml',
+        version: 1,
+        checksum: revision.checksum,
+      },
+      imageReference: produced.storageKey,
+      imageId,
+    });
+
+    const oldPlan = await create(reviewPreview, historicalInput);
+    const revision2 = await create(managedPath, managed(managedV2, 1));
+    assert.equal(revision2.version, 2);
+    await post(graphPath + '/flows/release/run', {
+      ...historicalInput,
+      idempotencyKey: randomUUID(),
+      expectedConfigurationHash: oldPlan.configurationHash,
+    }).expect(409);
+    const secondManaged = await submit('release', { image: [savedImage] });
+    assert.equal(
+      secondManaged.detail.status,
+      'SUCCESS',
+      JSON.stringify(secondManaged.detail.nodes),
+    );
+    assert.equal(composeUploads.at(-1), managedV2);
+
+    const archiveRevision = await create(managedPath, { source: 'ARCHIVE', expectedVersion: 2 });
+    assert.equal(archiveRevision.version, 3);
+    await post(reviewPreview, historicalInput).expect(409);
+    const managedRollbackPath = `/deployments/${managedRecord.id}/rollback`;
+    const managedRollbackPlan = await create(managedRollbackPath + '/preview', {});
+    assert.deepEqual(managedRollbackPlan.composeTemplate, managedRecord.composeRelease.template);
+    assert.deepEqual(managedRollbackPlan.previousCompose, managedRecord.composeRelease);
+    const managedRollback = await create(managedRollbackPath, {
+      confirmationHash: managedRollbackPlan.confirmationHash,
+    });
+    assert.equal((await runTask(managedRollback.id)).status, 'SUCCESS');
+    assert.equal(composeUploads.at(-1), managedV1);
+    const [managedRolledBack] = await list('/deployments', { taskId: managedRollback.id });
+    assert.deepEqual(managedRolledBack.composeRelease, managedRecord.composeRelease);
   } finally {
     await app.close();
   }

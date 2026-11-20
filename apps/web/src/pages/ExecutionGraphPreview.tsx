@@ -55,6 +55,9 @@ interface ArtifactPreview {
   type?: string;
   kind?: string;
   digest?: string;
+  imageRepository?: string;
+  imageReference?: string;
+  composeTemplate?: { source: 'ARCHIVE'; path?: string; checksum: string };
   checksum?: string;
   commitSha?: string;
 }
@@ -69,6 +72,8 @@ interface DeliveryPreview extends NodeScope {
   artifactRefs?: ArtifactPreview[];
   requireApproval?: boolean;
   requireCodeReview?: boolean;
+  sourceReviews?: { repositoryId: string; commitSha: string; reviewId: string }[] | null;
+  sourceReviewPendingMaterialization?: boolean;
   possibleArtifacts?: {
     nodeId?: string;
     fieldId?: string;
@@ -81,6 +86,8 @@ interface DeliveryPreview extends NodeScope {
     repositoryId: string;
     branch?: string;
     tag?: string;
+    ref?: string;
+    path?: string;
     commitSha: string;
   }[];
 }
@@ -135,6 +142,7 @@ const sourceNames: Record<string, string> = {
   FILE: '仓库环境文件',
   WORKSPACE: '上游工作区',
   OUTPUT: '上游输出',
+  ARTIFACT: '构建产物',
   CONTEXT: '平台变量',
   PLATFORM: '平台变量',
 };
@@ -158,6 +166,9 @@ const fieldNames: Record<string, string> = {
   deployPath: '发布目录',
   composeFile: 'Compose 文件',
   composeFilePath: 'Compose 文件',
+  composeSource: 'Compose 来源',
+  composeVersion: 'Compose 模板版本',
+  composeChecksum: 'Compose 模板 SHA-256',
   dockerfilePath: 'Dockerfile 路径',
   startCommand: '启动命令',
   stopCommand: '停止命令',
@@ -437,7 +448,17 @@ export function ExecutionPlan({ preview, project }: { preview: Preview; project:
                     ` · ${settingValue((artifact.type ?? artifact.kind)!)}`}
                   {(artifact.digest || artifact.checksum) && (
                     <small>
-                      <code>{artifact.digest ?? artifact.checksum}</code>
+                      <code>
+                        {artifact.imageReference ??
+                          ((artifact.imageRepository ? artifact.imageRepository + ' · ' : '') +
+                            (artifact.digest ?? artifact.checksum))}
+                      </code>
+                    </small>
+                  )}
+                  {artifact.composeTemplate && (
+                    <small>
+                      Compose 归档 {artifact.composeTemplate.path} ·{' '}
+                      <code>{artifact.composeTemplate.checksum}</code>
                     </small>
                   )}
                 </div>
@@ -478,6 +499,8 @@ export function ExecutionPlan({ preview, project }: { preview: Preview; project:
                       {name.repository(source.repositoryId)}
                       {source.branch && ` · ${source.branch}`}
                       {source.tag && ` · 标签 ${source.tag}`} <code>{source.commitSha}</code>
+                      {source.ref && source.ref !== source.commitSha && ` · ${source.ref}`}
+                      {source.path && ` · ${source.path}`}
                     </li>
                   ))}
                 </ul>
@@ -488,7 +511,25 @@ export function ExecutionPlan({ preview, project }: { preview: Preview; project:
                 )}
               {delivery.requireApproval && <span className="field-note">发布需要管理员审批</span>}
               {delivery.requireCodeReview && (
-                <span className="field-note">发布需要有效的源码审核记录</span>
+                <>
+                  <span className="field-note">
+                    {delivery.sourceReviewPendingMaterialization
+                      ? '源码审核 · 登记本次产物后按其实际来源复核'
+                      : delivery.sourceReviews?.length
+                        ? '源码审核 · 已核对产物来源，发布前再次复核'
+                        : '源码审核 · 发布前按产物实际来源复核'}
+                  </span>
+                  {!!delivery.sourceReviews?.length && (
+                    <ul className="execution-plan-list">
+                      {delivery.sourceReviews.map((review) => (
+                        <li key={review.reviewId}>
+                          {name.repository(review.repositoryId)} · <code>{review.commitSha}</code> ·
+                          审核通过
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
               )}
             </div>
           ))}
@@ -614,7 +655,11 @@ function reviewRows(preview: Preview, project: ProjectDetail) {
         delivery,
         'review',
         '源码审核',
-        delivery.requireCodeReview ? '需要审核' : '无需审核',
+        delivery.sourceReviewPendingMaterialization
+          ? '等待产物登记'
+          : delivery.requireCodeReview
+            ? '需要审核'
+            : '无需审核',
       );
   }
   return rows;

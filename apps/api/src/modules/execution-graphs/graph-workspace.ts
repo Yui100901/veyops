@@ -5,6 +5,7 @@ import type { GraphCheckoutSnapshot } from '../projects/repository-metadata.serv
 import type { Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import type { GraphEnvironmentPlan } from './graph-environment';
+import { artifactSourceRef, type ArtifactSource } from '../artifacts/artifact-sources';
 
 const workspaceId = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const root = () => resolve(dataDirectory, 'graph-workspaces');
@@ -18,6 +19,7 @@ export interface GraphWorkspaceRef {
   commitSha?: string;
   branch?: string;
   tag?: string;
+  subject?: string;
 }
 
 export interface GraphEnvironmentRef {
@@ -31,8 +33,37 @@ export interface GraphExecutionScope {
   runId: string;
   nodeRunId: string;
   workspace?: GraphWorkspaceRef;
+  dependencies?: Record<string, GraphWorkspaceRef>;
   variables?: GraphEnvironmentRef;
   trigger?: Record<string, unknown>;
+}
+
+export function workspaceArtifactSource(
+  reference?: GraphWorkspaceRef,
+  path?: string,
+): ArtifactSource[] {
+  if (!reference?.repositoryId || !reference.commitSha) return [];
+  return [
+    {
+      repositoryId: reference.repositoryId,
+      commitSha: reference.commitSha,
+      ref: artifactSourceRef({ ...reference, commitSha: reference.commitSha }),
+      subject: reference.subject,
+      workspace: { runId: reference.runId, nodeRunId: reference.nodeRunId },
+      path,
+    },
+  ];
+}
+
+export async function copyGraphDependencies(
+  dependencies: NonNullable<GraphExecutionScope['dependencies']>,
+  destination: string,
+) {
+  await mkdir(destination, { mode: 0o700 });
+  for (const [alias, reference] of Object.entries(dependencies)) {
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(alias)) throw new Error('构建依赖工作区名称无效');
+    await copyGraphRepository(reference, join(destination, alias));
+  }
 }
 
 export function workspaceReference(

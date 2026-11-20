@@ -29,6 +29,7 @@ import { ServiceConfigsService } from '../service-configs/service-configs.servic
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import type { CreateTaskInput, TaskExecutionContext, TaskRecord } from '../tasks/tasks.types';
 import type { GraphNode } from './execution-graph-definition';
+import { graphNodeRequiresIsolation, isGraphTriggerKind } from './graph-automatic-delivery';
 import {
   environmentFilePath,
   graphVariableSources,
@@ -46,6 +47,7 @@ import {
   unversionedArtifactCommit,
   unversionedArtifactRepository,
   workspaceReference,
+  workspaceArtifactSource,
   type GraphEnvironmentRef,
   type GraphWorkspaceRef,
 } from './graph-workspace';
@@ -191,23 +193,20 @@ export class GraphNodeTasks implements OnModuleInit {
       if (required) throw new BadRequestException('加载仓库环境文件需要绑定固定提交的 Git 源码');
       return undefined;
     }
-    const candidates = explicit
-      ? [explicit]
-      : configured
-        ? [environmentFilePath(configured)]
-        : [
-            ...(environment ? [posix.join(directory, '.env.' + environment.slug)] : []),
-            posix.join(directory, '.env'),
-          ];
+    const path =
+      explicit ??
+      (configured
+        ? environmentFilePath(configured)
+        : environment && environmentFilePath(posix.join(directory, '.env.' + environment.slug)));
+    if (!path) return undefined;
     const entry = await this.repositories.inspectGraphEnvironmentFile(
       projectId,
       { repositoryId, commitSha },
-      candidates,
+      [path],
     );
     if (!entry) {
-      if (required)
-        throw new BadRequestException('固定 Git 提交中缺少必需的环境文件 ' + candidates[0]);
-      return { ...origin, status: 'SKIPPED', source, required, variables: [] };
+      if (required) throw new BadRequestException('固定 Git 提交中缺少必需的环境文件 ' + path);
+      return { ...origin, status: 'SKIPPED', source, path, required, variables: [] };
     }
     return {
       ...origin,
@@ -478,6 +477,7 @@ export class GraphNodeTasks implements OnModuleInit {
       );
       const pipeline: PipelineSnapshot = {
         graph: { runId: scope.runId!, nodeRunId: scope.nodeRunId!, workspace },
+        artifactSources: workspaceArtifactSource(workspace),
         runId: randomUUID(),
         pipelineId: profile.id,
         pipelineVersionId: profile.versionId,
@@ -606,16 +606,20 @@ export class GraphNodeTasks implements OnModuleInit {
     context: TaskExecutionContext,
   ): Promise<Record<string, unknown>> {
     const module = task.payload.graphModule!;
+    if (isGraphTriggerKind(module.trigger?.kind) && graphNodeRequiresIsolation(module.type))
+      throw new ConflictException('该执行图节点尚未启用隔离自动执行');
     if (module.type === 'CHECKOUT') {
       const { repositoryId, commitSha, branch, tag, fullClone } = module.source!;
-      await createGraphWorkspace(module.workspace!, (destination) =>
-        this.repositories.checkoutGraphSource(
+      let subject: string | undefined;
+      await createGraphWorkspace(module.workspace!, async (destination) => {
+        const checkout = await this.repositories.checkoutGraphSource(
           module.projectId,
           module.source!,
           context.signal,
           destination,
-        ),
-      );
+        );
+        subject = checkout?.subject;
+      });
       context.log(
         '\u6e90\u7801\u68c0\u51fa\u5b8c\u6210 · ' +
           (tag ?? branch ?? '固定提交') +
@@ -624,8 +628,8 @@ export class GraphNodeTasks implements OnModuleInit {
           '\n',
       );
       return {
-        source: { repositoryId, commitSha, branch, tag, fullClone },
-        workspace: module.workspace,
+        source: { repositoryId, commitSha, branch, tag, fullClone, subject },
+        workspace: { ...module.workspace!, subject },
       };
     }
     if (module.type === 'LOAD_ENV') {
@@ -654,6 +658,7 @@ export class GraphNodeTasks implements OnModuleInit {
           await this.artifacts.create(session.snapshot, {
             name: declaration.name,
             kind: declaration.type,
+            ...(declaration.type === 'DOCKER_IMAGE' && { sources: [] }),
             storageKey: output.localArchive ?? output.imageReference!,
             imageReference: output.imageReference,
             imageId: output.imageId,

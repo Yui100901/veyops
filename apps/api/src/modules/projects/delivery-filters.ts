@@ -7,6 +7,7 @@ export class DeliveryFilters {
 }
 
 export class DeliveryRecordFilters extends DeliveryFilters {
+  @IsOptional() @IsUUID() repositoryId?: string;
   @IsOptional() @IsUUID() projectId?: string;
   @IsOptional() @IsUUID() recordId?: string;
   @IsOptional() @IsUUID() pipelineRunId?: string;

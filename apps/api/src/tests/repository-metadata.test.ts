@@ -197,6 +197,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   await writeFile(join(web, 'src', 'index.ts'), 'export const version = "current-source-entry";\n');
   await writeFile(join(web, '.env'), 'SHOULD_NOT_SEND=new-private-value\n');
   await writeFile(join(web, '.env.test'), 'TEST_KEY=test-value\nVEYOPS_PROJECT_ID=spoof\n');
+  await writeFile(join(web, '.env.prod'), 'PROD_KEY=prod-value\n');
   await git('-C', source, 'add', 'docs/DEPLOY.md', 'services/web');
   const second = await commit('Second change');
   const main = await commit('Third change');
@@ -359,6 +360,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   assert.equal(shallow.commitSha, feature);
   assert.deepEqual(await metadata.checkoutGraphSource(project, shallow), {
     commitSha: feature,
+    subject: 'Branch change with [REDACTED]',
     shallow: true,
   });
   const tag = await metadata.planGraphCheckout(project, {
@@ -396,6 +398,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   });
   assert.deepEqual(await metadata.checkoutGraphSource(project, history), {
     commitSha: second,
+    subject: 'Second change',
     shallow: false,
   });
   await assert.rejects(metadata.checkoutGraphSource(other, shallow), /仓库不存在/);
@@ -424,7 +427,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   const selectedEnvironment = (
     await operator
       .post(`/api/v1/projects/${project}/environments`)
-      .send({ name: 'Test', slug: 'test', repositoryEnvFile: 'services/web/.env' })
+      .send({ name: 'Configured', slug: 'configured', repositoryEnvFile: 'services/web/.env' })
       .expect(201)
   ).body.data.id;
   const currentSource = { repositoryId: id, commitSha: main, branch: 'main' };
@@ -490,8 +493,35 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     metadata.inspectGraphEnvironmentFile(project, currentSource, ['link/DEPLOY.md']),
     /普通文件/,
   );
-  const skipped = await graphNodes.prepareEnvironment(project, { source: currentSource });
-  assert.equal(skipped?.status, 'SKIPPED');
+  for (const [slug, key] of [
+    ['test', 'TEST_KEY'],
+    ['prod', 'PROD_KEY'],
+    ['staging', undefined],
+  ] as const) {
+    const environmentId = (
+      await operator
+        .post(`/api/v1/projects/${project}/environments`)
+        .send({ name: slug, slug })
+        .expect(201)
+    ).body.data.id;
+    const plan = await graphNodes.prepareEnvironment(project, {
+      environmentId,
+      source: currentSource,
+      directory: 'services/web',
+    });
+    assert.equal(plan?.commitSha, main);
+    assert.equal(plan.source, 'CONVENTION');
+    assert.equal(plan.path, `services/web/.env.${slug}`);
+    assert.equal(plan.status, key ? 'PINNED' : 'SKIPPED');
+    assert.deepEqual(plan.variables.map(({ key }) => key), key ? [key] : []);
+  }
+  assert.equal(
+    await graphNodes.prepareEnvironment(project, {
+      source: currentSource,
+      directory: 'services/web',
+    }),
+    undefined,
+  );
   await assert.rejects(
     graphNodes.prepareEnvironment(project, { source: currentSource, envFile: '../.env' }),
     /相对路径/,

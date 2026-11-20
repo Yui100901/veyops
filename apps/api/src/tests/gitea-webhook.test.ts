@@ -9,6 +9,7 @@ import { createServer } from 'node:http';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import { replaceVariables } from './helpers/variable-scope';
 
 test('Gitea signed push builds the pinned version once and keeps the build result independent of AI', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'veyops-webhook-'));
@@ -301,10 +302,9 @@ test('Gitea signed push builds the pinned version once and keeps the build resul
     assert.equal(payload.pipeline.definition.buildCommand, 'printf fixture');
     assert.equal(task.payload_json.includes(secret), false);
 
-    await api
-      .put(`/api/v1/environments/${settings.environmentId}/variables`)
-      .send({ variables: [{ key: 'EXAMPLE', value: 'config changed' }] })
-      .expect(200);
+    await replaceVariables(api, `/api/v1/environments/${settings.environmentId}/variables`, [
+      { key: 'EXAMPLE', value: 'config changed' },
+    ]);
     await deliver(raw({ ...push, after: 'b'.repeat(40) })).expect(409);
     assert.equal((await api.put(settingsPath).send(settings).expect(200)).body.data.version, 4);
     await db

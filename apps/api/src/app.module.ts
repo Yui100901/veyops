@@ -19,6 +19,7 @@ import { ArtifactRetentionModule } from './modules/artifacts/artifact-retention.
 import { BuildRunnerModule } from './infrastructure/build-runner/process-runner.service';
 import { DeploymentTargetsModule } from './modules/deployment-targets/deployment-targets.service';
 import { ServiceConfigsModule } from './modules/service-configs/service-configs.service';
+import { ComposeTemplatesModule } from './modules/service-configs/compose-templates.service';
 import { PipelinesModule } from './modules/pipelines/pipelines.module';
 import { AiModule } from './modules/ai/ai.module';
 import { InitialConfigurationModule } from './core/initial-configuration';
@@ -41,6 +42,7 @@ import { SourceReviewModule } from './modules/deployments/source-review.service'
     ViewsModule,
     DeploymentTargetsModule,
     ServiceConfigsModule,
+    ComposeTemplatesModule,
     BuildRunnerModule,
     TasksModule,
     CommandCenterModule,

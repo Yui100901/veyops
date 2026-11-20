@@ -11,6 +11,7 @@ import {
   Module,
   NotFoundException,
   Param,
+  ParseUUIDPipe,
   Patch,
   Post,
   Query,
@@ -267,9 +268,10 @@ export class ProjectsService {
   async detail(id: string) {
     const project = await this.get(id);
     const db = this.database.db;
-    const [addresses, dependencies, deploymentRows, deployments] = await Promise.all([
+    const [addresses, dependencies, dependents, deploymentRows, deployments] = await Promise.all([
       this.relations.addresses(id),
       this.relations.dependencies(id),
+      this.relations.dependents(id),
       db
         .selectFrom('deployment_targets as targets')
         .leftJoin('deployment_target_servers as members', 'members.target_id', 'targets.id')
@@ -310,9 +312,34 @@ export class ProjectsService {
       ...project,
       addresses,
       dependencies,
+      dependents,
       deploymentTargets: [...deploymentTargets.values()],
       recentDeployments: deployments,
     };
+  }
+
+  async serviceRecentDeployments(projectId: string, serviceId: string, environmentId?: string) {
+    const db = this.database.db;
+    await requireProject(db, projectId);
+    const service = await db
+      .selectFrom('services')
+      .select('id')
+      .where('id', '=', serviceId)
+      .where('project_id', '=', projectId)
+      .where('archived_at', 'is', null)
+      .executeTakeFirst();
+    if (!service) throw new NotFoundException('服务不在当前项目中');
+    if (environmentId) {
+      const environment = await db
+        .selectFrom('environments')
+        .select('id')
+        .where('id', '=', environmentId)
+        .where('project_id', '=', projectId)
+        .where('archived_at', 'is', null)
+        .executeTakeFirst();
+      if (!environment) throw new NotFoundException('环境不在当前项目中');
+    }
+    return recentDeployments(db, { projectId, serviceId, environmentId }, 5);
   }
 
   async resourceReferences(projectId: string) {
@@ -591,16 +618,14 @@ export class ProjectsService {
                 .where('id', '=', id)
                 .where('project_id', '=', projectId)
                 .where('archived_at', 'is', null)
-            : tx
-                .insertInto('environments')
-                .values({
-                  id,
-                  project_id: projectId,
-                  created_at: now,
-                  ...values,
-                  name: dto.name!,
-                  slug: dto.slug!,
-                })
+            : tx.insertInto('environments').values({
+                id,
+                project_id: projectId,
+                created_at: now,
+                ...values,
+                name: dto.name!,
+                slug: dto.slug!,
+              })
         )
           .returningAll()
           .executeTakeFirst();
@@ -713,6 +738,13 @@ class ProjectsController {
   }
   @Get(':id/delivery-context') deliveryContext(@Param('id') id: string) {
     return this.service.deliveryContext(id);
+  }
+  @Get(':id/services/:serviceId/recent-deployments') serviceRecentDeployments(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('serviceId', ParseUUIDPipe) serviceId: string,
+    @Query('environmentId', new ParseUUIDPipe({ optional: true })) environmentId?: string,
+  ) {
+    return this.service.serviceRecentDeployments(id, serviceId, environmentId);
   }
   @Roles('ADMIN', 'OPERATOR') @Post() create(@Body() dto: ProjectDto, @Req() req: AuthRequest) {
     return this.service.create(dto, req.user.id);

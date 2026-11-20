@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import { Download, Eye, EyeOff, Plus, Trash2 } from 'lucide-react';
-import { api, message, post, useResource } from '../api';
+import { ApiError, api, message, post, useResource } from '../api';
 import { ErrorBanner, Loading } from '../components';
 import type { User } from '../models';
 import {
@@ -19,6 +19,8 @@ type StoredVariable = {
   isSecret: boolean;
   description?: string;
 };
+
+type VariableSnapshot = { revision: string; variables: StoredVariable[] };
 
 function toDraft(rows: StoredVariable[]): VariableDraft[] {
   return rows.map((row) => ({
@@ -46,17 +48,20 @@ export function EnvironmentVariables({
   const path = environmentId
     ? `${serviceId ? `/services/${encodeURIComponent(serviceId)}` : ''}/environments/${encodeURIComponent(environmentId)}/variables`
     : projectPath;
-  const local = useResource<StoredVariable[]>(path);
-  const projectVariables = useResource<StoredVariable[]>(environmentId ? projectPath : null);
-  const environmentVariables = useResource<StoredVariable[]>(
+  const local = useResource<VariableSnapshot>(path);
+  const projectVariables = useResource<VariableSnapshot>(environmentId ? projectPath : null);
+  const environmentVariables = useResource<VariableSnapshot>(
     serviceId && environmentId
       ? `/environments/${encodeURIComponent(environmentId)}/variables`
       : null,
   );
   const inherited = new Map(
-    (projectVariables.data ?? []).map((row) => [row.key, { ...row, source: '项目公共变量' }]),
+    (projectVariables.data?.variables ?? []).map((row) => [
+      row.key,
+      { ...row, source: '项目公共变量' },
+    ]),
   );
-  for (const row of environmentVariables.data ?? [])
+  for (const row of environmentVariables.data?.variables ?? [])
     inherited.set(row.key, { ...row, source: '环境变量' });
   return (
     <>
@@ -86,11 +91,12 @@ function VariableEditor({
   user,
 }: {
   path: string;
-  initial: StoredVariable[];
+  initial: VariableSnapshot;
   inherited?: (StoredVariable & { source: string })[];
   user: User;
 }) {
-  const [baseline, setBaseline] = useState(() => toDraft(initial));
+  const [revision, setRevision] = useState(initial.revision);
+  const [baseline, setBaseline] = useState(() => toDraft(initial.variables));
   const [rows, setRows] = useState(baseline);
   const [mode, setMode] = useState<'table' | 'text'>('table');
   const [text, setText] = useState('');
@@ -98,6 +104,7 @@ function VariableEditor({
   const [textSecrets, setTextSecrets] = useState<Map<string, string> | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [conflict, setConflict] = useState(false);
   const [saved, setSaved] = useState(false);
   const rowNumber = useRef(0);
   const canEdit = user.role !== 'VIEWER';
@@ -144,6 +151,25 @@ function VariableEditor({
     setError('');
   }
 
+  function applySnapshot(snapshot: VariableSnapshot) {
+    const next = toDraft(snapshot.variables);
+    setRevision(snapshot.revision);
+    setBaseline(next);
+    clearDraft(next);
+    setConflict(false);
+  }
+
+  async function reloadVariables() {
+    setBusy(true);
+    try {
+      applySnapshot(await api<VariableSnapshot>(path));
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function save() {
     setError('');
     setSaved(false);
@@ -155,17 +181,16 @@ function VariableEditor({
         ...(value === undefined ? { keepSecret: true } : { value }),
       }));
       setBusy(true);
-      const next = toDraft(
-        await api<StoredVariable[]>(path, {
+      applySnapshot(
+        await api<VariableSnapshot>(path, {
           method: 'PUT',
-          body: JSON.stringify({ variables }),
+          body: JSON.stringify({ expectedRevision: revision, variables }),
         }),
       );
-      setBaseline(next);
-      clearDraft(next);
       setSaved(true);
     } catch (err) {
-      setError(message(err));
+      if (err instanceof ApiError && err.status === 409) setConflict(true);
+      else setError(message(err));
     } finally {
       setBusy(false);
     }
@@ -503,12 +528,13 @@ function VariableEditor({
         </>
       )}
       <ErrorBanner error={error} />
+      {conflict && <ErrorBanner error="变量已在其他页面更新，当前草稿已保留。" />}
       {canEdit && (
         <div className="heading-actions environment-variable-actions">
           <button
             type="button"
             className="button primary"
-            disabled={busy}
+            disabled={busy || conflict}
             onClick={() => void save()}
           >
             保存变量
@@ -518,11 +544,12 @@ function VariableEditor({
             className="button secondary"
             disabled={busy}
             onClick={() => {
-              clearDraft(baseline);
               setSaved(false);
+              if (conflict) void reloadVariables();
+              else clearDraft(baseline);
             }}
           >
-            放弃修改
+            {conflict ? '放弃草稿并加载最新变量' : '放弃修改'}
           </button>
           {saved && <span role="status">变量已保存</span>}
         </div>

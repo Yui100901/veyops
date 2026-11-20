@@ -9,6 +9,7 @@ import request from 'supertest';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
+import { replaceVariables } from './helpers/variable-scope';
 
 async function checkResources(databaseUrl?: string) {
   const directory = await mkdtemp(join(tmpdir(), 'veyops-resources-'));
@@ -172,10 +173,9 @@ async function checkResources(databaseUrl?: string) {
     });
     const configure = async (serviceId: string, environmentId: string) => {
       const scope = `/services/${serviceId}/environments/${environmentId}`;
-      await api
-        .put(base + scope + '/variables')
-        .send({ variables: [{ key: 'SERVICE_MODE', value: 'fixture' }] })
-        .expect(200);
+      await replaceVariables(api, base + scope + '/variables', [
+        { key: 'SERVICE_MODE', value: 'fixture' },
+      ]);
       assert.equal(await fetch(scope + '/config'), null);
       await api
         .put(base + scope + '/config')
@@ -184,10 +184,9 @@ async function checkResources(databaseUrl?: string) {
       return scope;
     };
     const configuredScope = await configure(service.id, environment.id);
-    await api
-      .put(base + `/environments/${environment.id}/variables`)
-      .send({ variables: [{ key: 'ENVIRONMENT_MODE', value: 'fixture' }] })
-      .expect(200);
+    await replaceVariables(api, base + `/environments/${environment.id}/variables`, [
+      { key: 'ENVIRONMENT_MODE', value: 'fixture' },
+    ]);
     const address = await create(root + '/addresses', {
       name: 'API',
       url: 'https://example.invalid/api',
@@ -233,15 +232,15 @@ async function checkResources(databaseUrl?: string) {
     await api.delete(base + root + '/services/' + service.id).expect(409);
     await api.delete(base + root + '/environments/' + environment.id).expect(409);
     assert.equal((await fetch(configuredScope + '/config')).targetId, fixtureTarget.id);
-    assert.equal((await fetch(configuredScope + '/variables'))[0].key, 'SERVICE_MODE');
+    assert.equal((await fetch(configuredScope + '/variables')).variables[0].key, 'SERVICE_MODE');
     assert.equal(
-      (await fetch(`/environments/${environment.id}/variables`))[0].key,
+      (await fetch(`/environments/${environment.id}/variables`)).variables[0].key,
       'ENVIRONMENT_MODE',
     );
     const projectVarsPath = root + '/variables';
     const envVarsPath = `/environments/${environment.id}/variables`;
-    const putVariables = (path: string, variables: object[]) =>
-      api.put(base + path).send({ variables });
+    const putVariables = (path: string, variables: object[], status?: number) =>
+      replaceVariables(api, base + path, variables, status);
     const secretKey = 'DATABASE_URL';
     const secretValue = 'fixture-secret-value-to-encrypt';
     const common = [
@@ -251,8 +250,9 @@ async function checkResources(databaseUrl?: string) {
     await putVariables(projectVarsPath, [
       ...common,
       { key: secretKey, value: secretValue, isSecret: true, description: 'Test database' },
-    ]).expect(200);
-    const projectSecret = (await fetch(projectVarsPath)).find(
+    ]);
+    const projectVariables = await fetch(projectVarsPath);
+    const projectSecret = projectVariables.variables.find(
       (variable: { key: string }) => variable.key === secretKey,
     );
     assert.equal(projectSecret.value, null);
@@ -270,18 +270,19 @@ async function checkResources(databaseUrl?: string) {
     assert.equal(stored.value_text, null);
     assert.ok(stored.ciphertext && !stored.ciphertext.includes(secretValue));
     assert.equal((await fetch('/credentials')).length, 1);
-    await putVariables(projectVarsPath, [...common, { key: secretKey, keepSecret: true }]).expect(
-      200,
-    );
-    const kept = (await fetch(projectVarsPath)).find(
+    await putVariables(projectVarsPath, [...common, { key: secretKey, keepSecret: true }]);
+    const keptSnapshot = await fetch(projectVarsPath);
+    assert.equal(keptSnapshot.revision, projectVariables.revision);
+    const kept = keptSnapshot.variables.find(
       (variable: { key: string }) => variable.key === secretKey,
     );
     assert.deepEqual(kept, projectSecret);
     const revealUrl = base + projectVarsPath + '/' + secretKey + '/reveal';
-    await putVariables(projectVarsPath, [
-      ...common,
-      { key: secretKey, isSecret: true, value: '••••••••••••' },
-    ]).expect(400);
+    await putVariables(
+      projectVarsPath,
+      [...common, { key: secretKey, isSecret: true, value: '••••••••••••' }],
+      400,
+    );
     const revealed = await api.post(revealUrl).expect(201).expect('Cache-Control', 'no-store');
     assert.deepEqual(revealed.body.data, { value: secretValue });
     const staffPassword = 'fixture-operator-bootstrap';
@@ -336,9 +337,7 @@ async function checkResources(databaseUrl?: string) {
         ...platformSources,
       ],
     });
-    await putVariables(envVarsPath, [{ key: secretKey, value: 'environment-override' }]).expect(
-      200,
-    );
+    await putVariables(envVarsPath, [{ key: secretKey, value: 'environment-override' }]);
     assert.deepEqual(await configs.resolveVariables(project.id, environment.id, service.id), {
       variables: {
         ENVIRONMENT_MODE: 'common',
@@ -354,17 +353,22 @@ async function checkResources(databaseUrl?: string) {
         ...platformSources,
       ],
     });
-    await putVariables(envVarsPath, [{ key: secretKey, isSecret: true, keepSecret: true }]).expect(
-      400,
-    );
-    await putVariables(envVarsPath, [{ key: 'VEYOPS_PROJECT_ID', value: 'override' }]).expect(400);
-    await putVariables(envVarsPath, [{ key: 'veyops_service_slug', value: 'override' }]).expect(
-      400,
-    );
+    await putVariables(envVarsPath, [{ key: secretKey, isSecret: true, keepSecret: true }], 400);
+    await putVariables(envVarsPath, [{ key: 'VEYOPS_PROJECT_ID', value: 'override' }], 400);
+    await putVariables(envVarsPath, [{ key: 'veyops_service_slug', value: 'override' }], 400);
     await putVariables(projectVarsPath, [
       ...common,
       { key: secretKey, isSecret: true, value: 'rotated-secret-value' },
-    ]).expect(200);
+    ]);
+    await api
+      .put(base + projectVarsPath)
+      .send({
+        expectedRevision: keptSnapshot.revision,
+        variables: [{ key: secretKey, isSecret: true, keepSecret: true }],
+      })
+      .expect(409);
+    await api.put(base + projectVarsPath).send({ variables: [] }).expect(400);
+    assert.equal((await fetch(projectVarsPath)).variables.length, 3);
     assert.deepEqual((await api.post(revealUrl).expect(201)).body.data, {
       value: 'rotated-secret-value',
     });
@@ -394,6 +398,15 @@ async function checkResources(databaseUrl?: string) {
     ]);
 
     const dependency = await create(root + '/dependencies', { dependsOnProjectId: peer.id });
+    assert.deepEqual((await fetch('/projects/' + peer.id)).dependents, [
+      {
+        id: dependency.id,
+        projectId: project.id,
+        projectName: 'Fixture A',
+        dependencyType: 'RUNTIME',
+        description: '',
+      },
+    ]);
     await create('/projects/' + peer.id + '/dependencies', {
       dependsOnProjectId: third.id,
       dependencyType: 'DEPLOYMENT',

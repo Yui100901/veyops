@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -97,8 +97,27 @@ async function checkReviews(databaseUrl?: string) {
       hostKeyFingerprint: 'a'.repeat(64),
     });
     const reviews = app.get(SourceReviewService);
+    const db = app.get(DatabaseService).db;
     const sha = 'b'.repeat(40);
     const otherSha = 'c'.repeat(40);
+    const repository = async (projectId: string, name: string) => {
+      const id = randomUUID();
+      await db
+        .insertInto('repositories')
+        .values({
+          id,
+          project_id: projectId,
+          name,
+          clone_url: 'https://example.test/' + id,
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        })
+        .execute();
+      return id;
+    };
+    const repoA = await repository(project.id, 'Primary repository');
+    const foreign = await repository(foreignProject.id, 'Foreign repository');
+    const source = [{ repositoryId: repoA, commitSha: sha }];
     const reviewUrl =
       base +
       '/projects/' +
@@ -110,7 +129,10 @@ async function checkReviews(databaseUrl?: string) {
       '/source-reviews';
     const approval = { decision: 'APPROVED', reason: 'Reviewed exact revision' };
 
-    assert.equal(await reviews.requireReviewed(project.id, service.id, environment.id, sha), null);
+    assert.equal(
+      await reviews.requireReviewed(project.id, service.id, environment.id, source),
+      null,
+    );
     const configUrl =
       base + '/services/' + service.id + '/environments/' + environment.id + '/config';
     const config = (
@@ -124,9 +146,30 @@ async function checkReviews(databaseUrl?: string) {
     ).body.data;
     assert.equal(config.releasePolicy.requireCodeReview, true);
     assert.equal(config.releasePolicy.requireApproval, false);
+    const legacyId = randomUUID();
+    const root = await db
+      .selectFrom('users')
+      .select('id')
+      .where('username', '=', 'root')
+      .executeTakeFirstOrThrow();
+    await db
+      .insertInto('service_source_reviews')
+      .values({
+        id: legacyId,
+        project_id: project.id,
+        service_id: service.id,
+        environment_id: environment.id,
+        commit_sha: sha,
+        decision: 'APPROVED',
+        reason: 'Legacy approval retained for history',
+        reviewed_by: root.id,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      })
+      .execute();
     await assert.rejects(
-      reviews.requireReviewed(project.id, service.id, environment.id, sha),
-      /尚未通过/,
+      reviews.requireReviewed(project.id, service.id, environment.id, source),
+      /Primary repository.*缺少当前服务环境的有效代码审核/,
     );
     await operator
       .put(reviewUrl + '/' + sha)
@@ -139,6 +182,10 @@ async function checkReviews(databaseUrl?: string) {
     await admin
       .put(reviewUrl.replace(project.id, foreignProject.id) + '/' + sha)
       .send(approval)
+      .expect(404);
+    await admin
+      .put(reviewUrl + '/' + sha)
+      .send({ ...approval, repositoryId: foreign })
       .expect(404);
     await admin
       .put(reviewUrl + '/abc')
@@ -162,39 +209,89 @@ async function checkReviews(databaseUrl?: string) {
     assert.equal(approved.commitSha, sha);
     assert.equal(approved.decision, 'APPROVED');
     assert.equal(approved.reviewer, 'root');
+    assert.equal(approved.repositoryId, repoA);
+    assert.equal(approved.repositoryName, 'Primary repository');
     assert.equal(
-      (await reviews.requireReviewed(project.id, service.id, environment.id, sha))?.id,
+      (await reviews.requireReviewed(project.id, service.id, environment.id, source))?.[0]
+        ?.reviewId,
       approved.id,
     );
     await assert.rejects(
-      reviews.requireReviewed(project.id, service.id, environment.id, otherSha),
-      /尚未通过/,
+      reviews.requireReviewed(project.id, service.id, environment.id, [
+        { repositoryId: repoA, commitSha: otherSha },
+      ]),
+      /有效代码审核/,
     );
     await assert.rejects(
-      reviews.requireReviewed(project.id, service.id, staging.id, sha, { force: true }),
-      /尚未通过/,
+      reviews.requireReviewed(project.id, service.id, staging.id, source, { force: true }),
+      /有效代码审核/,
     );
     await assert.rejects(
-      reviews.requireReviewed(project.id, service.id, environment.id, '0'.repeat(40)),
-      /必须关联实际 Git 提交/,
+      reviews.requireReviewed(project.id, service.id, environment.id, [
+        { repositoryId: repoA, commitSha: '0'.repeat(40) },
+      ]),
+      /缺少完整 Git 提交/,
     );
-    const rows = (await operator.get(reviewUrl + '?commitSha=' + sha).expect(200)).body.data;
+    await assert.rejects(
+      reviews.requireReviewed(project.id, service.id, environment.id, [
+        { repositoryId: foreign, commitSha: sha },
+      ]),
+      /仓库不属于当前项目/,
+    );
+    await assert.rejects(
+      reviews.requireReviewed(project.id, service.id, environment.id, []),
+      /缺少可核验的仓库/,
+    );
+    const legacyRows = (await operator.get(reviewUrl + '?commitSha=' + sha).expect(200)).body.data;
+    assert.equal(legacyRows.find((row: typeof approved) => row.id === legacyId).repositoryId, null);
+    const rows = (
+      await operator.get(reviewUrl + '?commitSha=' + sha + '&repositoryId=' + repoA).expect(200)
+    ).body.data;
     assert.deepEqual(
       rows.map((row: typeof approved) => row.id),
       [approved.id],
     );
+    const repoB = await repository(project.id, 'Actual dependency');
+    const combined = [...source, { repositoryId: repoB, commitSha: sha }];
+    await admin
+      .put(reviewUrl + '/' + sha)
+      .send(approval)
+      .expect(400);
+    await assert.rejects(
+      reviews.requireReviewed(project.id, service.id, environment.id, combined),
+      /Actual dependency.*缺少当前服务环境的有效代码审核/,
+    );
+    const dependency = (
+      await admin
+        .put(reviewUrl + '/' + sha)
+        .send({ ...approval, repositoryId: repoB })
+        .expect(200)
+    ).body.data;
+    assert.notEqual(dependency.id, approved.id);
+    const both = await reviews.requireReviewed(project.id, service.id, environment.id, combined);
+    assert.deepEqual(
+      new Set(both?.map(({ repositoryId }) => repositoryId)),
+      new Set([repoA, repoB]),
+    );
+
+    await db.updateTable('users').set({ role: 'OPERATOR' }).where('id', '=', root.id).execute();
+    await assert.rejects(
+      reviews.requireReviewed(project.id, service.id, environment.id, combined),
+      /有效代码审核/,
+    );
+    await db.updateTable('users').set({ role: 'ADMIN' }).where('id', '=', root.id).execute();
 
     const revoked = (
       await admin
         .put(reviewUrl + '/' + sha)
-        .send({ decision: 'REVOKED', reason: 'Review invalidated' })
+        .send({ repositoryId: repoA, decision: 'REVOKED', reason: 'Review invalidated' })
         .expect(200)
     ).body.data;
     assert.equal(revoked.id, approved.id);
     assert.equal(revoked.decision, 'REVOKED');
     await assert.rejects(
-      reviews.requireReviewed(project.id, service.id, environment.id, sha),
-      /尚未通过/,
+      reviews.requireReviewed(project.id, service.id, environment.id, combined),
+      /Primary repository.*缺少当前服务环境的有效代码审核/,
     );
     const audited = await app
       .get(DatabaseService)
@@ -210,8 +307,14 @@ async function checkReviews(databaseUrl?: string) {
       assert.equal(row.user_id, approved.reviewedBy);
       const detail = JSON.parse(row.details_json);
       assert.deepEqual(
-        [detail.projectId, detail.serviceId, detail.environmentId, detail.commitSha],
-        [project.id, service.id, environment.id, sha],
+        [
+          detail.projectId,
+          detail.serviceId,
+          detail.environmentId,
+          detail.repositoryId,
+          detail.commitSha,
+        ],
+        [project.id, service.id, environment.id, repoA, sha],
       );
     }
   } finally {
@@ -220,7 +323,7 @@ async function checkReviews(databaseUrl?: string) {
   }
 }
 
-test('SQLite source reviews bind decisions and auditing to the exact commit and service environment', () =>
+test('SQLite source reviews verify every repository and commit in the service environment', () =>
   checkReviews());
 test(
   'PostgreSQL source reviews preserve scope checks, revocation and admin auditing',

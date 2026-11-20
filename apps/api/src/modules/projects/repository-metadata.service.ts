@@ -31,6 +31,7 @@ import {
   type GraphEnvironmentFilePin,
 } from '../execution-graphs/graph-environment';
 import { CredentialsService } from '../credentials/credentials.service';
+import { redactTaskLog } from '../tasks/task-log.service';
 import { isGitBranchName as isBranchName } from './git-ref';
 
 const exec = promisify(execFile);
@@ -400,6 +401,9 @@ export class RepositoryMetadataService {
         await git.run([...repo, 'checkout', '--detach', 'FETCH_HEAD']);
         const actual = (await git.run([...repo, 'rev-parse', 'HEAD'])).trim();
         if (actual !== snapshot.commitSha) throw new ConflictException('实际检出提交与预览不一致');
+        const subject = redactTaskLog(
+          git.redact((await git.run([...repo, 'show', '-s', '--format=%s', 'HEAD', '--'])).trim()),
+        ).slice(0, 500);
         if (destination)
           await cp(worktree, destination, {
             recursive: true,
@@ -409,6 +413,7 @@ export class RepositoryMetadataService {
           });
         return {
           commitSha: actual,
+          subject,
           shallow:
             (await git.run([...repo, 'rev-parse', '--is-shallow-repository'])).trim() === 'true',
         };

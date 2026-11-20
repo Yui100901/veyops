@@ -364,7 +364,7 @@ async function checkPresets(api: Api, db: Kysely<Database>, userId: string) {
           finished_at: finishedAt,
         })
         .execute();
-      return { taskId, recordId };
+      return { taskId, recordId, serviceId };
     };
   }
 
@@ -419,6 +419,19 @@ async function checkPresets(api: Api, db: Kysely<Database>, userId: string) {
   );
   assert.equal(testProject.recentDeployments[0]?.taskId, tested.taskId);
   assert.equal(testProject.recentDeployments[0]?.id, tested.recordId);
+
+  const recent = `/projects/${mixed.id}/services/${tested.serviceId}/recent-deployments`;
+  const rows = await get<{ id: string; serviceId: string }[]>(api, recent);
+  assert.equal(rows.length, 5);
+  assert.equal(rows[0]?.id, tested.recordId);
+  assert.ok(rows.every(({ serviceId }) => serviceId === tested.serviceId));
+  const testRows = await get<{ id: string }[]>(api, `${recent}?environmentId=${testing.id}`);
+  assert.deepEqual(
+    testRows.map(({ id }) => id),
+    [tested.recordId],
+  );
+  await api.get(`${apiBase}${recent}?environmentId=${uncheckedEnv.id}`).expect(404);
+  await api.get(apiBase + recent.replace(mixed.id, unchecked.id)).expect(404);
 
   const fix = await mixedDeploy(production.id, serverIds[0]!, now + 70, 'SUCCESS', 'HEALTHY');
   assert.deepEqual((await get<ViewDetail>(api, '/views/abnormal')).projectIds, []);

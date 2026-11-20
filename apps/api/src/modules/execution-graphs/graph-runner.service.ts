@@ -14,6 +14,8 @@ import { DatabaseService } from '../../core/database/database.service';
 import { encryptionKey } from '../../core/config';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
+import { artifactSourceRef } from '../artifacts/artifact-sources';
+import { archivedComposeTemplate } from '../artifacts/artifacts.service';
 import { PipelinesService } from '../pipelines/pipelines.service';
 import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
@@ -22,6 +24,8 @@ import {
   type DeliveryExecutionProfile,
 } from '../pipelines/delivery-execution-profile';
 import { pendingReleaseApprovalTime } from '../deployments/release-policy';
+import { SourceReviewConflict } from '../deployments/release-source-policy';
+import type { SourceReviewProof } from '../deployments/source-review.service';
 import { lockProjectGraph, requireProject } from '../projects/project-relations';
 import { runResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
@@ -39,6 +43,13 @@ import {
 } from './execution-graph-definition';
 import type { GraphInputsDto, GraphPreviewDto, GraphRunDto } from './graph-runner.controller';
 import { GraphNodeTasks, type GraphNodePlan } from './graph-node-tasks';
+import {
+  assertAutomaticGraphFlow,
+  assertGraphAutomation,
+  graphNodeRequiresIsolation,
+  isGraphTriggerKind,
+  type GraphAutomation,
+} from './graph-automatic-delivery';
 import {
   graphVariableSources,
   publicEnvironmentFile,
@@ -100,6 +111,8 @@ interface Delivery {
   serverIds: string[];
   requireApproval: boolean;
   requireCodeReview?: boolean;
+  sourceReviews?: SourceReviewProof[] | null;
+  sourceReviewPendingMaterialization?: boolean;
   artifactIds: string[];
   artifactFromNodeId?: string;
   artifactFromField?: string;
@@ -109,12 +122,15 @@ interface Delivery {
   targetInputs?: GraphInputsDto;
   configuration?: DeliveryConfiguration;
   environmentFile?: GraphEnvironmentPlan;
+  dependencySources?: Record<string, { repositoryId: string; commitSha: string }>;
   sourceSnapshot?: {
     id?: string;
     repositoryId?: string;
     commitSha: string;
     branch?: string;
     tag?: string;
+    ref?: string;
+    path?: string;
   }[];
   pipelineHash: string;
   profile?: DeliveryExecutionProfile;
@@ -124,6 +140,7 @@ interface RunSnapshot {
   deliveries?: Record<string, Delivery | GraphNodePlan>;
   rootId?: string;
   trigger?: Values;
+  automation?: GraphAutomation;
   children?: Record<string, PreparedChild>;
 }
 
@@ -175,8 +192,15 @@ function isNativeTask(node: Pick<GraphNode, 'type'>) {
 interface AutomaticRunOrigin {
   triggerType: 'CRON' | 'WEBHOOK' | 'API' | 'UPSTREAM';
   metadata?: Values;
+  authorization: GraphAutomation;
   beforeInsert?: (tx: Transaction<Database>) => Promise<void>;
   afterInsert?: (tx: Transaction<Database>, runId: string) => Promise<void>;
+}
+
+interface PlanContext {
+  trigger?: Values;
+  automation?: GraphAutomation;
+  allowRetired?: boolean;
 }
 
 function digest(value: unknown) {
@@ -263,6 +287,7 @@ export class GraphRunnerService implements OnModuleInit {
     const rows = await this.database.db
       .selectFrom('artifacts')
       .leftJoin('pipeline_runs as build', 'build.id', 'artifacts.pipeline_run_id')
+      .leftJoin('tasks as build_task', 'build_task.id', 'build.task_id')
       .select([
         'artifacts.id',
         'artifacts.artifact_type',
@@ -270,6 +295,10 @@ export class GraphRunnerService implements OnModuleInit {
         'artifacts.artifact_name',
         'artifacts.checksum',
         'artifacts.image_digest',
+        'artifacts.compose_checksum',
+        'artifacts.image_repository',
+        'artifacts.storage_key',
+        'build_task.payload_json as build_payload',
         'artifacts.server_id',
         'artifacts.service_id',
         'artifacts.source_commit',
@@ -292,6 +321,13 @@ export class GraphRunnerService implements OnModuleInit {
         type: kind,
         checksum: row.checksum,
         digest: row.image_digest,
+        imageRepository: row.image_repository,
+        imageReference: row.artifact_type === 'DOCKER_IMAGE' ? row.storage_key : undefined,
+        composeTemplate: archivedComposeTemplate(
+          row.build_payload,
+          row.artifact_name,
+          row.compose_checksum,
+        ),
         serverId: row.server_id,
         serviceId: row.service_id,
         environmentId: row.environment_id,
@@ -397,6 +433,7 @@ export class GraphRunnerService implements OnModuleInit {
     inputs: GraphInputsDto,
     values: Values,
     production: ReadonlyMap<string, PreparedProduction[]>,
+    automation?: GraphAutomation,
   ): Promise<Delivery> {
     const scope = declaredScope(flow, inputs);
     const serviceId = referenceId(values.service) ?? scope.serviceId;
@@ -457,8 +494,10 @@ export class GraphRunnerService implements OnModuleInit {
       environmentId: preview.environmentId,
       commitSha: preview.commitSha,
       serverIds: preview.serverIds,
-      requireApproval: preview.requireApproval,
+      requireApproval:
+        preview.requireApproval || (node.type === 'DEPLOY_ARTIFACT' && Boolean(automation)),
       requireCodeReview: 'requireCodeReview' in preview && preview.requireCodeReview === true,
+      ...('sourceReviews' in preview && { sourceReviews: preview.sourceReviews }),
       artifactIds: 'artifactIds' in preview ? preview.artifactIds : [],
       sourceSnapshot: preview.nodeSources ?? [
         {
@@ -474,7 +513,7 @@ export class GraphRunnerService implements OnModuleInit {
     });
     if (node.type === 'BUILD') {
       const build = node.build ?? {};
-      const { branch, commitSha: pinned, ...settings } = build;
+      const { branch, commitSha: pinned, dependencies = [], ...settings } = build;
       const source = (values.source ?? values.workspace) as
         { repositoryId?: string; commitSha?: string; branch?: string; tag?: string } | undefined;
       const repositoryId =
@@ -487,6 +526,26 @@ export class GraphRunnerService implements OnModuleInit {
           (workspace.repositoryId !== repositoryId || workspace.commitSha !== source?.commitSha))
       )
         throw new BadRequestException(node.name + '：构建仓库、检出提交与工作区绑定不一致');
+      if (dependencies.length && (!workspace?.repositoryId || !workspace.commitSha))
+        throw new BadRequestException(node.name + '：多仓构建需要绑定主源码工作区');
+      const dependencySources = Object.fromEntries(
+        dependencies.map((alias) => {
+          const dependency = values['dependency_' + alias] as typeof source;
+          if (!dependency?.repositoryId || !dependency.commitSha)
+            throw new BadRequestException(
+              node.name + '：源码依赖缺少已固定的检出工作区 · ' + alias,
+            );
+          return [
+            alias,
+            {
+              repositoryId: dependency.repositoryId,
+              commitSha: dependency.commitSha,
+              ref: artifactSourceRef({ ...dependency, commitSha: dependency.commitSha }),
+              path: 'dependencies/' + alias,
+            },
+          ];
+        }),
+      );
       const ref = values.version as GitRefValue | undefined;
       const sha = source?.commitSha ?? pinned ?? (ref ? undefined : inputs.commitSha);
       const fixed = sha
@@ -521,11 +580,29 @@ export class GraphRunnerService implements OnModuleInit {
               tag: 'tag' in fixed ? fixed.tag : undefined,
             },
           });
+      const reviewed = wrap(preview, profile, {
+        branch: 'branch' in fixed ? fixed.branch : undefined,
+        tag: 'tag' in fixed ? fixed.tag : undefined,
+      });
       return {
-        ...wrap(preview, profile, {
-          branch: 'branch' in fixed ? fixed.branch : undefined,
-          tag: 'tag' in fixed ? fixed.tag : undefined,
-        }),
+        ...reviewed,
+        dependencySources,
+        sourceSnapshot: [
+          ...(reviewed.sourceSnapshot ?? []),
+          ...Object.values(dependencySources),
+          ...(environmentFile?.status === 'PINNED' &&
+          (environmentFile.repositoryId !== repositoryId ||
+            environmentFile.commitSha !== fixed.commitSha)
+            ? [
+                {
+                  repositoryId: environmentFile.repositoryId,
+                  commitSha: environmentFile.commitSha,
+                  ref: artifactSourceRef(environmentFile),
+                  path: environmentFile.path,
+                },
+              ]
+            : []),
+        ],
         environmentFile,
       };
     }
@@ -613,8 +690,9 @@ export class GraphRunnerService implements OnModuleInit {
           environmentId: plan.environmentId,
           commitSha: plan.commitSha,
           serverIds: plan.serverIds,
-          requireApproval: plan.requireApproval,
+          requireApproval: plan.requireApproval || Boolean(automation),
           requireCodeReview: plan.requireCodeReview,
+          sourceReviewPendingMaterialization: plan.sourceReviewPendingMaterialization,
           artifactIds: [],
           artifactFromNodeId: source.nodeId,
           artifactFromField: source.fieldId,
@@ -663,6 +741,8 @@ export class GraphRunnerService implements OnModuleInit {
           build.id,
           targets.serverIds,
           field.artifactType,
+          undefined,
+          Boolean(targets.executionConfiguration?.managedCompose),
         );
         if (!ids.length || (!field.multiple && ids.length !== 1)) continue;
         await this.artifactReferences(projectId, ids, field);
@@ -673,6 +753,7 @@ export class GraphRunnerService implements OnModuleInit {
         );
         return { profile, preview };
       } catch (error) {
+        if (error instanceof SourceReviewConflict) throw error;
         if (!(error instanceof HttpException) || ![400, 404, 409].includes(error.getStatus()))
           throw error;
       }
@@ -684,8 +765,7 @@ export class GraphRunnerService implements OnModuleInit {
     projectId: string,
     flowId: string,
     request: GraphPreviewDto,
-    trigger?: Values,
-    allowRetired = false,
+    { trigger, automation, allowRetired = false }: PlanContext = {},
   ) {
     await requireProject(this.database.db, projectId);
     const { graphId, definition } = await this.published(
@@ -784,6 +864,7 @@ export class GraphRunnerService implements OnModuleInit {
             args,
             values,
             production,
+            automation,
           );
           plans.set(key, delivery);
           publishedDeliveries.push(delivery);
@@ -902,6 +983,12 @@ export class GraphRunnerService implements OnModuleInit {
               (outputSources(binding).length > 0 ||
                 (binding.kind === 'CONTEXT' && binding.fieldId === 'triggeredAt')),
           );
+          if (
+            hasDeferred &&
+            automation &&
+            assertAutomaticGraphFlow(definition, child.id, automation.kind)
+          )
+            throw new BadRequestException(node.name + '：自动交付子流的参数必须在派发前确定');
           if (!hasDeferred) {
             const childArgs = await this.resolveParameters(projectId, child, {
               ...args,
@@ -1017,6 +1104,8 @@ export class GraphRunnerService implements OnModuleInit {
         row.artifactFromNodeId,
         row.artifactFromField,
         row.requireCodeReview,
+        row.sourceReviews,
+        row.sourceReviewPendingMaterialization,
         row.requireApproval,
       ]);
     }
@@ -1045,8 +1134,13 @@ export class GraphRunnerService implements OnModuleInit {
     return { preview, flow, inputs, plans: prepared.plans, children: prepared.children };
   }
 
-  async preview(projectId: string, flowId: string, request: GraphPreviewDto, trigger?: Values) {
-    return (await this.prepare(projectId, flowId, request, trigger)).preview;
+  async preview(
+    projectId: string,
+    flowId: string,
+    request: GraphPreviewDto,
+    context?: PlanContext,
+  ) {
+    return (await this.prepare(projectId, flowId, request, context)).preview;
   }
   private async lockProject(tx: Transaction<Database>, projectId: string) {
     const active = await tx
@@ -1158,7 +1252,7 @@ export class GraphRunnerService implements OnModuleInit {
       projectId,
       flowId,
       request,
-      origin?.metadata,
+      { trigger: origin?.metadata, automation: origin?.authorization },
     ).catch((error: unknown) => {
       if (request.expectedPlanSections && error instanceof HttpException && error.getStatus() < 500)
         throw new ConflictException({
@@ -1233,6 +1327,7 @@ export class GraphRunnerService implements OnModuleInit {
             deliveries: plans,
             children,
             trigger: origin?.metadata,
+            automation: origin?.authorization,
           }),
         },
         flow,
@@ -1610,8 +1705,7 @@ export class GraphRunnerService implements OnModuleInit {
         run.project_id,
         flow.id,
         { version: run.version, inputs: { ...snapshot.inputs, parameters } },
-        snapshot.trigger,
-        true,
+        { trigger: snapshot.trigger, automation: snapshot.automation, allowRetired: true },
       ));
     const confirmedHash =
       'preview' in prepared
@@ -1632,6 +1726,7 @@ export class GraphRunnerService implements OnModuleInit {
         inputs: prepared.inputs,
         rootId,
         trigger: snapshot.trigger,
+        automation: snapshot.automation,
         deliveries: prepared.plans,
         children: prepared.children,
       };
@@ -1658,6 +1753,7 @@ export class GraphRunnerService implements OnModuleInit {
           request_hash: run.request_hash,
           configuration_hash: confirmedHash,
           inputs_json: JSON.stringify(childSnapshot),
+          trigger_type: snapshot.automation?.kind ?? null,
         },
         flow,
         prepared.inputs,
@@ -1814,10 +1910,23 @@ export class GraphRunnerService implements OnModuleInit {
     const options = {
       idempotencyKey: graphTaskKeyPrefix + node.id,
       profile: delivery.profile,
+      graphAutomation: snapshot.automation,
       afterInsert: (tx: Transaction<Database>, taskId: string) =>
         this.linkTask(tx, run, node, taskId, delivery.pipelineId),
     };
     if (node.node_type === 'BUILD') {
+      const dependencies = Object.fromEntries(
+        Object.entries(delivery.dependencySources ?? {}).map(([alias, source]) => {
+          const workspace = bindings['dependency_' + alias] as GraphWorkspaceRef | undefined;
+          if (
+            !workspace ||
+            workspace.repositoryId !== source.repositoryId ||
+            workspace.commitSha !== source.commitSha
+          )
+            throw new ConflictException('构建依赖工作区与已确认计划不一致 · ' + alias);
+          return [alias, workspace];
+        }),
+      );
       const bound = bindings.variables as GraphEnvironmentRef | undefined;
       if (
         delivery.configuration &&
@@ -1847,6 +1956,7 @@ export class GraphRunnerService implements OnModuleInit {
             runId: run.id,
             nodeRunId: node.id,
             workspace: bindings.workspace as GraphWorkspaceRef | undefined,
+            ...(Object.keys(dependencies).length ? { dependencies } : {}),
             variables,
             trigger: snapshot.trigger ?? { triggeredAt: run.created_at },
           },
@@ -1905,6 +2015,19 @@ export class GraphRunnerService implements OnModuleInit {
         await this.tasks.cancel(taskId, false).catch(() => undefined);
     for (const { node, action, values } of state.ready) {
       try {
+        const automatic =
+          isGraphTriggerKind(state.run.trigger_type) ||
+          isGraphTriggerKind(state.snapshot.trigger?.kind);
+        if (automatic && (isDelivery(action) || graphNodeRequiresIsolation(action.type))) {
+          if (!state.snapshot.automation || !isDelivery(action))
+            throw new ConflictException('当前节点缺少有效的自动交付授权或隔离策略');
+          await assertGraphAutomation(
+            this.database.db,
+            state.run.project_id,
+            state.run.created_by,
+            state.snapshot.automation,
+          );
+        }
         if (node.node_type === 'FLOW_CALL') {
           const childId = await this.callChild(
             state.run,

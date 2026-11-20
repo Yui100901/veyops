@@ -1642,6 +1642,112 @@ export const migrationProvider: MigrationProvider = {
             .execute();
         },
       } satisfies Migration,
+      '025_artifact_source_manifest': {
+        async up(db) {
+          await db.schema.alterTable('artifacts').addColumn('source_manifest', 'integer').execute();
+          await db.schema
+            .createTable('artifact_sources')
+            .addColumn('artifact_id', 'text', (column) =>
+              column.notNull().references('artifacts.id').onDelete('cascade'),
+            )
+            .addColumn('position', 'integer', (column) => column.notNull())
+            .addColumn('repository_id', 'text', (column) => column.notNull())
+            .addColumn('commit_sha', 'text', (column) => column.notNull())
+            .addColumn('git_ref', 'text')
+            .addColumn('commit_subject', 'text')
+            .addColumn('workspace_run_id', 'text')
+            .addColumn('workspace_node_run_id', 'text')
+            .addColumn('path', 'text')
+            .addPrimaryKeyConstraint('artifact_sources_pk', ['artifact_id', 'position'])
+            .execute();
+          await db.schema
+            .createIndex('artifact_sources_repository_commit')
+            .on('artifact_sources')
+            .columns(['repository_id', 'commit_sha'])
+            .execute();
+        },
+        async down(db) {
+          await db.schema.dropTable('artifact_sources').execute();
+          await db.schema.alterTable('artifacts').dropColumn('source_manifest').execute();
+        },
+      } satisfies Migration,
+      '026_repository_source_reviews': {
+        async up(db) {
+          await createTables(
+            db,
+            [
+              {
+                name: 'repository_source_reviews',
+                columns: [
+                  ['id', 'text', { primaryKey: true }],
+                  ['project_id', 'text', { references: 'projects.id', onDelete: 'cascade' }],
+                  ['service_id', 'text', { references: 'services.id', onDelete: 'cascade' }],
+                  [
+                    'environment_id',
+                    'text',
+                    { references: 'environments.id', onDelete: 'cascade' },
+                  ],
+                  [
+                    'repository_id',
+                    'text',
+                    { references: 'repositories.id', onDelete: 'restrict' },
+                  ],
+                  ['commit_sha', 'text'],
+                  ['decision', 'text'],
+                  ['reason', 'text', { nullable: true }],
+                  ['reviewed_by', 'text', { references: 'users.id', onDelete: 'restrict' }],
+                  ['created_at', 'bigint'],
+                  ['updated_at', 'bigint'],
+                ],
+                unique: [
+                  ['project_id', 'service_id', 'environment_id', 'repository_id', 'commit_sha'],
+                ],
+                checks: ["decision in ('APPROVED', 'REVOKED')", 'length(commit_sha) in (40, 64)'],
+              },
+            ],
+            [],
+          );
+        },
+        async down(db) {
+          await db.schema.dropTable('repository_source_reviews').execute();
+        },
+      } satisfies Migration,
+      '027_service_compose_templates': {
+        async up(db) {
+          await createTables(
+            db,
+            [
+              {
+                name: 'service_compose_templates',
+                columns: [
+                  ['id', 'text', { primaryKey: true }],
+                  ['service_id', 'text', { references: 'services.id', onDelete: 'cascade' }],
+                  ['environment_id', 'text', { references: 'environments.id', onDelete: 'cascade' }],
+                  ['version', 'integer'],
+                  ['content', 'text', { nullable: true }],
+                  ['checksum', 'text', { nullable: true }],
+                  ['created_by', 'text', { references: 'users.id', onDelete: 'restrict' }],
+                  ['created_at', 'bigint'],
+                ],
+                unique: [['service_id', 'environment_id', 'version']],
+                checks: [
+                  'version > 0',
+                  '(content is null and checksum is null) or (content is not null and length(checksum) = 64 and checksum is not null)',
+                ],
+              },
+            ],
+            [],
+          );
+          await db.schema
+            .alterTable('deployment_records')
+            .addColumn('compose_release_json', 'text')
+            .execute();
+        },
+        async down(db) {
+          await db.schema.alterTable('deployment_records').dropColumn('compose_release_json').execute();
+          await db.schema.dropTable('service_compose_templates').execute();
+        },
+      } satisfies Migration,
     };
   },
 };

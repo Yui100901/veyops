@@ -1,0 +1,52 @@
+.execution-migration {
+  display: grid;
+  gap: 16px;
+}
+
+.execution-migration > .panel {
+  margin-bottom: 0;
+}
+
+.migration-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  padding: 0 20px 12px;
+}
+
+.migration-compare {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-block: 12px;
+}
+
+.migration-compare > div {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+
+.migration-compare dl > div,
+.migration-issue {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-block: 8px;
+}
+
+.migration-compare dt {
+  min-width: 5em;
+}
+
+.migration-compare dd {
+  margin: 0;
+}
+
+@media (max-width: 600px) {
+  .migration-compare {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

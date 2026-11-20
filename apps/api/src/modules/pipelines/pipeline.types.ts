@@ -1,6 +1,7 @@
 import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import type { DeploymentSelection } from '../deployment-targets/deployment-selection';
 import type { GraphExecutionScope } from '../execution-graphs/graph-workspace';
+import type { GraphAutomation } from '../execution-graphs/graph-automatic-delivery';
 
 export interface NamedArtifactDefinition {
   name: string;
@@ -93,6 +94,8 @@ export interface PipelineDefinition {
   nodes?: PipelineNode[];
 }
 export interface PipelineSnapshot {
+  managedCompose?: import('../service-configs/compose-template-reference').ManagedComposeReference;
+  artifactSources?: import('../artifacts/artifact-sources').ArtifactSource[];
   graphReleaseTargets?: {
     source: import('./delivery-targets').DeliveryTargetSource;
     requested: import('../deployment-targets/deployment-selection').DeploymentSelectionDto;
@@ -110,7 +113,8 @@ export interface PipelineSnapshot {
   deploymentArtifacts?: { id: string; serverId: string | null; fingerprint?: string }[];
   sourceBuildTaskId?: string;
   artifactServiceScope?: boolean;
-  triggerType?: 'MANUAL' | AutomaticPipelineTrigger;
+  triggerType?: 'MANUAL' | AutomaticPipelineTrigger | GraphAutomation['kind'];
+  graphAutomation?: GraphAutomation;
   runId: string;
   pipelineId: string;
   pipelineVersionId: string;
@@ -131,6 +135,7 @@ export interface PipelineSnapshot {
   secretVariables: Record<string, string>;
 }
 export interface PipelineArtifact {
+  sources?: import('../artifacts/artifact-sources').ArtifactSource[];
   id: string;
   storageKey: string;
   archiveKey?: string;

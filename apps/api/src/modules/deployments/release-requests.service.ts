@@ -19,11 +19,14 @@ import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
+import { assertGraphAutomation } from '../execution-graphs/graph-automatic-delivery';
 import { ServersService } from '../servers/servers.service';
 import { TasksService } from '../tasks/tasks.service';
 import type { TaskPayload } from '../tasks/tasks.types';
 import { DeploymentsService } from './deployments.service';
 import { DeliveryRecordFilters } from '../projects/delivery-filters';
+import { lockProjectGraph } from '../projects/project-relations';
+import type { ComposeReleaseEvidence } from '../service-configs/compose-template-reference';
 import {
   assertCurrentTargets,
   pendingReleaseApprovalTime,
@@ -83,6 +86,7 @@ export class ReleaseRequestsService {
         commitSha: payload.pipeline?.commitSha ?? null,
         serverIds: payload.targets.map((server) => server.id),
         artifactIds: payload.pipeline?.deploymentArtifacts?.map((artifact) => artifact.id) ?? [],
+        requireCodeReview: payload.pipeline?.releasePolicy?.requireCodeReview === true,
         rollbackOfDeploymentId: payload.pipeline?.rollbackOfDeploymentId ?? null,
       };
     });
@@ -90,22 +94,42 @@ export class ReleaseRequestsService {
 
   async approve(id: string, userId: string) {
     await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
       const row = await tx
         .selectFrom('tasks')
         .innerJoin('users', 'users.id', 'tasks.created_by')
-        .select('tasks.payload_json')
+        .select(['tasks.payload_json', 'tasks.created_by'])
         .where('tasks.id', '=', id)
         .where('tasks.status', '=', 'PENDING')
         .where('tasks.available_at', '=', pendingReleaseApprovalTime)
         .where('users.role', 'in', ['ADMIN', 'OPERATOR'])
         .where('users.status', '=', 'ACTIVE')
+        .where('users.must_change_password', '=', 0)
         .executeTakeFirst();
       if (!row) throw new ConflictException('发布已处理或提交人权限已失效');
       const payload = JSON.parse(row.payload_json) as TaskPayload;
       const snapshot = payload.pipeline;
       if (!snapshot || snapshot.mode === 'BUILD_ONLY')
         throw new ConflictException('任务不需要发布审批');
+      if (snapshot.graphAutomation)
+        await assertGraphAutomation(
+          tx,
+          snapshot.projectId,
+          row.created_by,
+          snapshot.graphAutomation,
+        );
       await assertCurrentTargets(tx, snapshot, payload.targets);
+      const sourceReviews = await this.deployments.assertSourceReview(snapshot, { db: tx });
+      const approver = await tx
+        .updateTable('users')
+        .set((eb) => ({ updated_at: eb.ref('updated_at') }))
+        .where('id', '=', userId)
+        .where('role', '=', 'ADMIN')
+        .where('status', '=', 'ACTIVE')
+        .where('must_change_password', '=', 0)
+        .returning('id')
+        .executeTakeFirst();
+      if (!approver) throw new ConflictException('管理员审批权限已失效');
       const now = Date.now();
       const changed = await tx
         .updateTable('tasks')
@@ -116,7 +140,16 @@ export class ReleaseRequestsService {
         .returning('id')
         .executeTakeFirst();
       if (!changed) throw new ConflictException('发布已由其他管理员处理');
-      await this.audit.record(userId, 'deployment.approve', 'task', id, {}, tx);
+      await this.audit.record(
+        userId,
+        'deployment.approve',
+        'task',
+        id,
+        {
+          ...(sourceReviews && { sourceReviews }),
+        },
+        tx,
+      );
     });
     return this.tasks.get(id);
   }
@@ -178,16 +211,25 @@ export class ReleaseRequestsService {
       deployAfterBuild: false,
       deploymentArtifacts: [{ id: source.artifactId, serverId: artifact.server_id }],
       triggerType: 'MANUAL',
+      graphAutomation: undefined,
       rollbackOfDeploymentId: id,
       expectedCurrentDeploymentId: current.id,
       releaseKey: undefined,
       releasePolicy: {
         ...(source.snapshot.releasePolicy ?? policy),
         requireApproval: policy.requireApproval,
+        requireCodeReview: Boolean(
+          source.snapshot.releasePolicy?.requireCodeReview || policy.requireCodeReview,
+        ),
         rollbackMode: 'OFF',
       },
     };
-    await this.artifacts.forDeployment(snapshot, row.server_id);
+    const deploymentArtifact = await this.artifacts.forDeployment(snapshot, row.server_id);
+    await this.artifacts.managedCompose(snapshot);
+    const previousCompose = row.compose_release_json
+      ? (JSON.parse(row.compose_release_json) as ComposeReleaseEvidence)
+      : undefined;
+    const sourceReviews = await this.deployments.assertSourceReview(snapshot, { db });
     const connection = [
       server.id,
       server.host,
@@ -197,11 +239,12 @@ export class ReleaseRequestsService {
       server.hostKeyFingerprint,
     ];
     const confirmationHash = createHash('sha256')
-      .update(JSON.stringify([id, snapshot, connection]))
+      .update(JSON.stringify([id, snapshot, connection, sourceReviews]))
       .digest('hex');
     return {
       snapshot,
       server,
+      sourceReviews,
       preview: {
         confirmationHash,
         deploymentId: id,
@@ -209,11 +252,16 @@ export class ReleaseRequestsService {
         sourceCommit: snapshot.commitSha,
         checksum: artifact.checksum,
         imageDigest: artifact.image_digest,
+        imageReference: deploymentArtifact.imageReference,
+        composeTemplate: snapshot.managedCompose ?? deploymentArtifact.composeTemplate,
+        previousCompose,
         serviceId: row.service_id,
         environmentId: row.environment_id,
         serverId: row.server_id,
         deployPath: row.deploy_path,
         requireApproval: policy.requireApproval,
+        requireCodeReview: sourceReviews !== null,
+        sourceReviews,
       },
     };
   }
@@ -223,12 +271,16 @@ export class ReleaseRequestsService {
   }
 
   async rollback(id: string, confirmationHash: string, userId: string) {
-    const { snapshot, server, preview } = await this.rollbackPlan(id);
+    const { snapshot, server, preview, sourceReviews } = await this.rollbackPlan(id);
     if (preview.confirmationHash !== confirmationHash)
       throw new ConflictException('发布或目标状态已变化，请重新预览回滚');
     snapshot.runId = randomUUID();
     const taskId = await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
       await assertCurrentTargets(tx, snapshot, [server]);
+      const currentReviews = await this.deployments.assertSourceReview(snapshot, { db: tx });
+      if (JSON.stringify(sourceReviews) !== JSON.stringify(currentReviews))
+        throw new ConflictException('代码审核结果已变化，请重新预览回滚');
       const current = await this.deployments.current(
         tx,
         snapshot.serviceId,
@@ -275,7 +327,7 @@ export class ReleaseRequestsService {
         'deployment.rollback',
         'task',
         taskId,
-        { sourceDeploymentId: id },
+        { sourceDeploymentId: id, ...(sourceReviews && { sourceReviews }) },
         tx,
       );
       return taskId;

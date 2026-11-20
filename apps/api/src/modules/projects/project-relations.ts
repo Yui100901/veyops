@@ -101,6 +101,24 @@ export class ProjectRelationsService {
       .execute();
   }
 
+  dependents(projectId: string) {
+    return this.database.db
+      .selectFrom('project_dependencies as dependencies')
+      .innerJoin('projects as dependent', 'dependent.id', 'dependencies.project_id')
+      .select([
+        'dependencies.id as id',
+        'dependent.id as projectId',
+        'dependent.name as projectName',
+        'dependencies.dependency_type as dependencyType',
+        'dependencies.description as description',
+      ])
+      .where('dependencies.depends_on_project_id', '=', projectId)
+      .where('dependent.deleted_at', 'is', null)
+      .orderBy('dependent.name')
+      .orderBy('dependencies.id')
+      .execute();
+  }
+
   async saveAddress(projectId: string, dto: AddressDto, userId: string, addressId?: string) {
     const parsed = URL.parse(dto.url);
     if (

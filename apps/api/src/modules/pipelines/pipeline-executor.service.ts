@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, HttpException, Injectable, NotFoundException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { posix } from 'node:path';
 import { SshExecutionError, SshService, SshTarget } from '../../infrastructure/ssh/ssh.service';
@@ -20,6 +20,7 @@ import { DeploymentHealth, DeploymentsService } from '../deployments/deployments
 import { deploymentLock } from '../deployments/deployment-lock';
 import type { TaskExecutionContext, TaskRecord, TaskStatus } from '../tasks/tasks.types';
 import { TaskLeaseUnavailableError } from '../tasks/task-lease';
+import { redactTaskLog } from '../tasks/task-log.service';
 import type {
   BuildOutput,
   NamedArtifactDefinition,
@@ -31,6 +32,10 @@ import { deploymentGuard, shellQuote as q } from './pipeline.validation';
 import { serializeComposeEnvironment } from './environment.serialization';
 import { createTargetWorkspace, targetWorkspacePath } from './target-workspace';
 import { composeHealthCheck, httpHealthCheck, waitForReleaseHealth } from './release-health';
+import type {
+  ComposeReleaseEvidence,
+  ComposeTemplateReference,
+} from '../service-configs/compose-template-reference';
 
 type PipelinePhase =
   | 'PREPARE'
@@ -48,7 +53,13 @@ type PipelinePhase =
   | 'CLEANUP';
 type ReportPhase = <T>(phase: PipelinePhase, name: string, action: () => Promise<T>) => Promise<T>;
 
-type ComposeRelease = { compose: string; docker: string; image: string; imageId?: string };
+type ComposeRelease = {
+  compose: string;
+  docker: string;
+  image: string;
+  imageId?: string;
+  template?: ComposeTemplateReference;
+};
 type RollbackCandidate = {
   artifactId: string;
   snapshot: PipelineSnapshot;
@@ -106,7 +117,10 @@ export class PipelineExecutor {
     const packageNode = nodes?.find((node) => node.type === 'PACKAGE');
     const deployNode = nodes?.find((node) => node.type === 'DEPLOY');
     if (snapshot.triggerType && snapshot.triggerType !== 'MANUAL') {
-      if (snapshot.definition.buildLocation !== 'MANAGER')
+      if (
+        (!deployArtifact || !snapshot.graphAutomation) &&
+        snapshot.definition.buildLocation !== 'MANAGER'
+      )
         throw new Error('自动任务必须使用隔离管理端构建环境');
       if (
         Object.keys(snapshot.secretVariables).length ||
@@ -119,12 +133,25 @@ export class PipelineExecutor {
       )
         throw new Error('自动发布必须引用已归档产物和来源构建任务');
     }
+    if (buildOnly && (snapshot.graphAutomation || snapshot.graph?.trigger?.kind))
+      await this.deployments.assertAutomaticDelivery(task.id, snapshot);
     const siblingCancellation = new AbortController();
     context = { ...context, signal: AbortSignal.any([context.signal, siblingCancellation.signal]) };
     const lease = context.leaseOwner ? { taskId: task.id, owner: context.leaseOwner } : undefined;
     if (buildOnly) context.log('构建并保留产物\n');
     else {
-      await this.deployments.assertApproval(task.id, snapshot, task.payload.targets);
+      try {
+        await this.deployments.assertApproval(task.id, snapshot, task.payload.targets);
+      } catch (error) {
+        if (
+          !snapshot.graphAutomation ||
+          !(error instanceof HttpException) ||
+          error.getStatus() >= 500
+        )
+          throw error;
+        await this.failReleasePreflight(task, context, `自动发布复核失败：${error.message}`);
+        return;
+      }
       if (
         snapshot.releasePolicy &&
         snapshot.releasePolicy.rollbackMode !== 'OFF' &&
@@ -150,13 +177,11 @@ export class PipelineExecutor {
       } catch (error) {
         if (!(error instanceof ConflictException || error instanceof NotFoundException))
           throw error;
-        const summary = `产物校验失败，未开始部署：${error.message}`;
-        context.log(`${summary}\n`);
-        for (const target of task.payload.targets) {
-          if (context.signal.aborted) return;
-          const id = await context.startTarget(target.id);
-          await context.finishTarget(id, 'FAILED', null, summary);
-        }
+        await this.failReleasePreflight(
+          task,
+          context,
+          `产物校验失败，未开始部署：${error.message}`,
+        );
         return;
       }
     }
@@ -386,11 +411,15 @@ export class PipelineExecutor {
               artifact?.id,
             );
           };
-          const activate = async (name: string, action: () => Promise<void>) => {
+          const activate = async (
+            name: string,
+            action: () => Promise<void | ComposeReleaseEvidence>,
+          ) => {
             await step('DEPLOY', name, async () => {
               await this.deployments.assertApproval(task.id, snapshot, task.payload.targets);
+              let evidence: void | ComposeReleaseEvidence;
               try {
-                await action();
+                evidence = await action();
                 activated = true;
               } catch (error) {
                 if (error instanceof SshExecutionError && error.kind === 'FAILED') throw error;
@@ -402,7 +431,7 @@ export class PipelineExecutor {
                   commandExitCode(error),
                 );
               }
-              await this.deployments.markActivated(deploymentId!, lease);
+              await this.deployments.markActivated(deploymentId!, lease, evidence ?? undefined);
             });
           };
           try {
@@ -704,6 +733,20 @@ export class PipelineExecutor {
       }
     }
   }
+
+  private async failReleasePreflight(
+    task: TaskRecord,
+    context: TaskExecutionContext,
+    reason: string,
+  ) {
+    const summary = redactTaskLog(reason);
+    context.log(`${summary}\n`);
+    for (const target of task.payload.targets) {
+      if (context.signal.aborted) return;
+      const id = await context.startTarget(target.id);
+      await context.finishTarget(id, 'FAILED', null, summary);
+    }
+  }
   private async trackStep<T>(
     context: TaskExecutionContext,
     targetId: string,
@@ -883,16 +926,22 @@ export class PipelineExecutor {
       throw new ConflictException('历史发布使用不同的部署路径，需要人工恢复');
     if (!this.hasHealthCheck(previous))
       throw new ConflictException('历史发布缺少可验证的健康检查，需要人工恢复');
+    const originalArtifact = previous.deploymentArtifacts?.find(
+      ({ id }) => id === candidate.artifactId,
+    );
+    if (!originalArtifact) throw new ConflictException('历史发布缺少所选产物的固定引用');
     const releaseKey = randomUUID();
     const snapshot: PipelineSnapshot = {
       ...previous,
       runId: forward.snapshot.runId,
       mode: 'DEPLOY_ARTIFACT',
+      deploymentArtifacts: [originalArtifact],
       releaseKey,
       rollbackOfDeploymentId: failedDeploymentId,
       expectedCurrentDeploymentId: undefined,
       releasePolicy: previous.releasePolicy && { ...previous.releasePolicy, rollbackMode: 'OFF' },
     };
+    await this.deployments.assertSourceReview(snapshot);
     const id = await this.deployments.start(
       snapshot,
       target.id,
@@ -919,6 +968,7 @@ export class PipelineExecutor {
         30,
       );
       let compose: ComposeRelease | undefined;
+      let composeEvidence: ComposeReleaseEvidence | undefined;
       if (snapshot.definition.artifactType === 'FILE') {
         if (!artifact.localArchive || !artifact.checksum)
           throw new ConflictException('缺少已校验的回滚文件归档');
@@ -928,6 +978,7 @@ export class PipelineExecutor {
           signal: session.context.signal,
         });
         await this.prepareFileRelease(target, archive, artifact.checksum, session);
+        await this.deployments.assertSourceReview(snapshot);
         await this.activateFileRelease(
           target,
           rollbackWork,
@@ -944,9 +995,10 @@ export class PipelineExecutor {
           undefined,
           artifact,
         );
-        await this.activateComposeRelease(target, session, compose);
+        await this.deployments.assertSourceReview(snapshot);
+        composeEvidence = await this.activateComposeRelease(target, session, compose);
       }
-      await this.deployments.markActivated(id, lease);
+      await this.deployments.markActivated(id, lease, composeEvidence);
       if (snapshot.definition.startCommand)
         await this.inRelease(
           target,
@@ -1029,15 +1081,24 @@ fi
   private async activateComposeRelease(
     target: SshTarget,
     session: BuildSession,
-    { compose, docker, image, imageId }: ComposeRelease,
+    { compose, docker, image, imageId, template }: ComposeRelease,
   ) {
-    await this.builds.remote(
+    const action = `set -eu\n${compose} up -d --no-build${imageId ? ' --pull never' : ''}\n${verifyComposeImage(compose, docker, image, imageId)}\n${this.switchRelease(session)}`;
+    const failure = 'Compose 发布激活失败。请检查宿主机端口占用、Compose 容器状态和当前版本链接';
+    if (!template) {
+      await this.builds.remote(target, action, session, 600, failure);
+      return;
+    }
+    const output = await this.builds.remoteCapture(
       target,
-      `set -eu\n${compose} up -d --no-build${imageId ? ' --pull never' : ''}\n${verifyComposeImage(compose, docker, image, imageId)}\n${this.switchRelease(session)}`,
+      `${action}\nprintf 'VEYOPS_COMPOSE_IMAGE_ID=%s\\n' "$expected_image"`,
       session,
       600,
-      'Compose 发布激活失败。请检查宿主机端口占用、Compose 容器状态和当前版本链接',
+      failure,
     );
+    const verified = /^VEYOPS_COMPOSE_IMAGE_ID=(sha256:[a-f0-9]{64})\s*$/m.exec(output)?.[1];
+    if (!verified) throw new Error('Compose 激活未返回已验证的镜像 ID');
+    return { template, imageReference: image, imageId: verified };
   }
   private async targetImage(target: SshTarget, work: string, session: BuildSession) {
     const d = session.snapshot.definition;
@@ -1079,14 +1140,17 @@ fi
       d = s.definition,
       p = d.deployPath,
       release = p + '/releases/' + session.taskId;
+    const managed = s.managedCompose ? await this.artifacts.managedCompose(s) : undefined;
+    const template = s.managedCompose ?? artifact?.composeTemplate;
     await this.builds.remote(
       target,
       `set -eu; ${deploymentGuard(p, `${s.projectId}:${s.serviceId}:${s.environmentId}`)}; test ! -e ${q(release)} && test ! -L ${q(release)}; mkdir ${q(release)}`,
       session,
       30,
     );
-    if (artifact?.composeYaml)
-      await this.ssh.uploadContent(target, artifact.composeYaml, release + '/compose.yaml', {
+    const composeYaml = managed ?? artifact?.composeYaml;
+    if (composeYaml)
+      await this.ssh.uploadContent(target, composeYaml, release + '/compose.yaml', {
         timeout: 60,
         signal: session.context.signal,
         mode: 0o600,
@@ -1166,7 +1230,7 @@ fi
         '离线 Compose 还需要目标预先缓存其余镜像',
       );
       session.context.log(`离线归档镜像已校验，使用 ${reference} (${imageId}) 激活\n`);
-      return { compose, docker, image: reference, imageId };
+      return { compose, docker, image: reference, imageId, template };
     };
 
     if (d.registryId || !artifact?.imageId) {
@@ -1189,7 +1253,7 @@ fi
     } catch (error) {
       return offline(error);
     }
-    return { compose, docker, image, imageId: artifact?.imageId };
+    return { compose, docker, image, imageId: artifact?.imageId, template };
   }
   private async loadArchivedImage(
     target: SshTarget,

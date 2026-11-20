@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import request from 'supertest';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
+import { replaceVariables } from './helpers/variable-scope';
 
 async function checkApi(databaseUrl?: string) {
   const directory = await mkdtemp(join(tmpdir(), 'veyops-api-'));
@@ -230,23 +231,22 @@ async function checkApi(databaseUrl?: string) {
         deployPath: '/tmp/veyops-test-service',
       })
       .expect(200);
-    await api
-      .put(`/api/v1/environments/${environmentId}/variables`)
-      .send({
-        variables: [
-          { key: 'APP_MODE', value: 'production' },
-          { key: 'SECRET_REF', credentialId },
-        ],
-      })
-      .expect(200);
-    await api
-      .put(`/api/v1/environments/${environmentId}/variables`)
-      .send({ variables: [{ key: 'INVALID', value: 'plaintext', credentialId }] })
-      .expect(400);
-    await api
-      .put(`/api/v1/services/${serviceId}/environments/${environmentId}/variables`)
-      .send({ variables: [{ key: 'APP_MODE', value: 'service-override' }] })
-      .expect(200);
+    const environmentVariables = `/api/v1/environments/${environmentId}/variables`;
+    await replaceVariables(api, environmentVariables, [
+      { key: 'APP_MODE', value: 'production' },
+      { key: 'SECRET_REF', credentialId },
+    ]);
+    await replaceVariables(
+      api,
+      environmentVariables,
+      [{ key: 'INVALID', value: 'plaintext', credentialId }],
+      400,
+    );
+    await replaceVariables(
+      api,
+      `/api/v1/services/${serviceId}/environments/${environmentId}/variables`,
+      [{ key: 'APP_MODE', value: 'service-override' }],
+    );
     const { ServiceConfigsService } =
       await import('../modules/service-configs/service-configs.service.js');
     const snapshot = await app

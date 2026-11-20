@@ -493,6 +493,7 @@ export function taskPayloadResourceReferences(source: ReferenceSource, payload: 
             module?.environmentFile?.repositoryId,
             module?.variables?.environmentFile?.repositoryId,
             pipeline?.graph?.variables?.environmentFile?.repositoryId,
+            ...(pipeline?.artifactSources ?? []).map(({ repositoryId }) => repositoryId),
             ...(pipeline?.definition?.nodes ?? []).map(({ repositoryId }) => repositoryId),
           ]),
           ...referenceRows(source, 'CREDENTIAL', [

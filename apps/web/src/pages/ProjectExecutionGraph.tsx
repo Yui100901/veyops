@@ -1,10 +1,21 @@
 import { useEffect, useRef, useState } from 'react';
 import { Play, Redo2, Save, Undo2, Upload } from 'lucide-react';
-import { api, ApiError, formatTime, message, navigate, post, useResource } from '../api';
-import { Confirm, ErrorBanner, Field, Loading, PageHeader, Section } from '../components';
+import {
+  api,
+  ApiError,
+  formatTime,
+  message,
+  navigate,
+  post,
+  useResource,
+  useRouteBlocker,
+  type RouteTransition,
+} from '../api';
+import { Confirm, ErrorBanner, Field, Loading, Modal, PageHeader, Section } from '../components';
 import type { ProjectDetail, User } from '../models';
 import { NodeMap } from './ExecutionGraphCanvas';
 import { ProjectGraphEditor } from './ExecutionGraphEditor';
+import { ExecutionGraphMigration } from './ExecutionGraphMigration';
 import { ExecutionGraphResourceLinks } from './ExecutionGraphResourceLinks';
 import { ExecutionGraphHistory, ExecutionGraphStart } from './ExecutionGraphRun';
 import { ExecutionGraphTriggers } from './ExecutionGraphTriggers';
@@ -56,17 +67,34 @@ export default function ProjectExecutionGraph({
     providedProject ? null : base + '/delivery-context',
   );
   const project = providedProject ?? projectResource.data;
-  const graph = useResource<GraphDocument>(base + '/execution-graph');
-  if ((!providedProject && projectResource.loading) || graph.loading) return <Loading />;
+  const params = new URLSearchParams(search);
+  const view = params.get('view') || undefined;
+  const canMigrate = user.role !== 'VIEWER' && !!project && !project.archived;
+  const showMigration = canMigrate && params.get('pane') === 'migration';
+  const graph = useResource<GraphDocument>(showMigration ? null : base + '/execution-graph');
+  if (!providedProject && projectResource.loading) return <Loading />;
+  if (showMigration && project)
+    return <ExecutionGraphMigration project={project} user={user} view={view} />;
+  if (graph.loading) return <Loading />;
   if (!project || !graph.data)
     return (
-      <ErrorBanner
-        error={projectResource.error || graph.error || '项目执行图不可用'}
-        retry={() => {
-          if (!providedProject) void projectResource.reload();
-          void graph.reload();
-        }}
-      />
+      <>
+        <ErrorBanner
+          error={projectResource.error || graph.error || '项目执行图不可用'}
+          retry={() => {
+            if (!providedProject) void projectResource.reload();
+            void graph.reload();
+          }}
+        />
+        {canMigrate && (
+          <a
+            className="button secondary"
+            href={'#' + graphWorkbenchPath(id, { view, pane: 'migration' })}
+          >
+            执行图迁移
+          </a>
+        )}
+      </>
     );
   return (
     <Workspace
@@ -137,8 +165,10 @@ function Workspace({
   const [issues, setIssues] = useState<GraphIssue[]>([]);
   const [conflict, setConflict] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [leaving, setLeaving] = useState<RouteTransition | null>(null);
   const saving = useRef(false);
   const dirty = canvas !== (graph.draft.canvas ?? emptyCanvas);
+  useRouteBlocker(canEdit && dirty, setLeaving);
   const latest = useResource<PublishedGraph>(
     graph.publishedVersion ? path + '/versions/' + graph.publishedVersion : null,
   );
@@ -203,6 +233,7 @@ function Workspace({
             ? '草稿已保存'
             : '已载入服务器草稿',
       );
+      return true;
     } catch (err) {
       setError(message(err));
       setConflict(err instanceof ApiError && err.status === 409);
@@ -210,6 +241,28 @@ function Workspace({
       saving.current = false;
       setBusy(false);
     }
+  }
+
+  function stayInDraft() {
+    if (saving.current || !leaving) return;
+    leaving.cancel();
+    setLeaving(null);
+  }
+
+  async function leaveDraft(save: boolean) {
+    if (saving.current || !leaving) return;
+    if (save) {
+      if (!(await persist('save'))) return;
+    } else {
+      setCanvas(graph.draft.canvas ?? emptyCanvas);
+      setUndo([]);
+      setRedo([]);
+      setIssues([]);
+      setError('');
+      setNotice('');
+    }
+    leaving.proceed();
+    setLeaving(null);
   }
 
   function edit(next: GraphCanvas) {
@@ -243,6 +296,45 @@ function Workspace({
 
   return (
     <div className="project-workspace execution-graph">
+      {leaving && (
+        <Modal
+          title="草稿有未保存的更改"
+          description="可以保存当前草稿后离开，放弃本次更改，或返回画布继续编辑。"
+          onClose={stayInDraft}
+        >
+          {error && (
+            <div className="form-body">
+              <ErrorBanner error={error} />
+            </div>
+          )}
+          <div className="modal-footer">
+            <button
+              type="button"
+              className="button secondary"
+              onClick={stayInDraft}
+              disabled={busy}
+            >
+              继续编辑
+            </button>
+            <button
+              type="button"
+              className="button danger"
+              onClick={() => void leaveDraft(false)}
+              disabled={busy}
+            >
+              放弃更改
+            </button>
+            <button
+              type="button"
+              className="button primary"
+              onClick={() => void leaveDraft(true)}
+              disabled={busy || conflict}
+            >
+              {busy ? '正在保存…' : '保存并离开'}
+            </button>
+          </div>
+        </Modal>
+      )}
       {!embedded && (
         <>
           <a
@@ -290,6 +382,11 @@ function Workspace({
             {label}
           </a>
         ))}
+        {canEdit && (
+          <a href={'#' + graphWorkbenchPath(project.id, { view: scope.view, pane: 'migration' })}>
+            执行图迁移
+          </a>
+        )}
       </nav>
       <ErrorBanner error={error} />
       {conflict && (

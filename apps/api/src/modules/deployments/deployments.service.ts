@@ -6,9 +6,14 @@ import type { Database, DeploymentRecordsTable } from '../../core/database/schem
 import type { PipelineSnapshot, PipelineTarget } from '../pipelines/pipeline.types';
 import { lockTaskLease, TaskLeaseUnavailableError } from '../tasks/task-lease';
 import { assertCurrentTargets, serviceReleasePolicy } from './release-policy';
+import {
+  assertGraphAutomation,
+  isGraphTriggerKind,
+} from '../execution-graphs/graph-automatic-delivery';
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
 import { DeliveryRecordFilters } from '../projects/delivery-filters';
 import { SourceReviewService } from './source-review.service';
+import type { ComposeReleaseEvidence } from '../service-configs/compose-template-reference';
 
 export type DeploymentHealth = 'NOT_CHECKED' | 'HEALTHY' | 'FAILED' | 'UNKNOWN';
 @Injectable()
@@ -30,19 +35,37 @@ export class DeploymentsService {
       .executeTakeFirst();
   }
 
+  async assertAutomaticDelivery(taskId: string, snapshot: PipelineSnapshot) {
+    const db = this.database.db;
+    if (!snapshot.graphAutomation) {
+      const linked = await db
+        .selectFrom('execution_node_runs as node')
+        .innerJoin('execution_flow_runs as run', 'run.id', 'node.run_id')
+        .select(['run.trigger_type', 'run.inputs_json'])
+        .where('node.task_id', '=', taskId)
+        .executeTakeFirst();
+      if (
+        isGraphTriggerKind(snapshot.graph?.trigger?.kind) ||
+        (linked &&
+          (isGraphTriggerKind(linked.trigger_type) ||
+            isGraphTriggerKind(JSON.parse(linked.inputs_json).trigger?.kind)))
+      )
+        throw new ConflictException('旧版自动交付任务缺少授权记录，请从触发入口重新提交');
+      return;
+    }
+    const task = await db
+      .selectFrom('tasks')
+      .select('created_by')
+      .where('id', '=', taskId)
+      .executeTakeFirstOrThrow();
+    await assertGraphAutomation(db, snapshot.projectId, task.created_by, snapshot.graphAutomation);
+  }
+
   async assertApproval(taskId: string, snapshot: PipelineSnapshot, targets?: PipelineTarget[]) {
+    await this.assertAutomaticDelivery(taskId, snapshot);
     const db = this.database.db;
     const { policy } = await serviceReleasePolicy(db, snapshot.serviceId, snapshot.environmentId);
-    if (policy.requireCodeReview || snapshot.releasePolicy?.requireCodeReview) {
-      if (!this.sourceReviews) throw new ConflictException('代码审核服务不可用');
-      await this.sourceReviews.requireReviewed(
-        snapshot.projectId,
-        snapshot.serviceId,
-        snapshot.environmentId,
-        snapshot.commitSha,
-        { db, force: true },
-      );
-    }
+    await this.assertSourceReview(snapshot, { db, required: policy.requireCodeReview });
     const requiresApproval = policy.requireApproval || snapshot.releasePolicy?.requireApproval;
     if (!requiresApproval && snapshot.mode !== 'DEPLOY_ARTIFACT') return;
     const automatic = snapshot.triggerType && snapshot.triggerType !== 'MANUAL';
@@ -67,6 +90,23 @@ export class DeploymentsService {
       throw new ConflictException(
         requiresApproval ? '发布需要有效的管理员审批，请预览并重新提交' : '发布提交人的权限已失效',
       );
+  }
+
+  async assertSourceReview(
+    snapshot: PipelineSnapshot,
+    { db = this.database.db, required }: { db?: Kysely<Database>; required?: boolean } = {},
+  ) {
+    if (
+      !snapshot.releasePolicy?.requireCodeReview &&
+      !(
+        required ??
+        (await serviceReleasePolicy(db, snapshot.serviceId, snapshot.environmentId)).policy
+          .requireCodeReview
+      )
+    )
+      return null;
+    if (!this.sourceReviews) throw new ConflictException('代码审核服务不可用');
+    return this.sourceReviews.requireReleaseReviewed(snapshot, db, true);
   }
 
   async activeSnapshot(
@@ -200,13 +240,20 @@ export class DeploymentsService {
     return id;
   }
 
-  async markActivated(id: string, lease?: { taskId: string; owner: string }) {
+  async markActivated(
+    id: string,
+    lease?: { taskId: string; owner: string },
+    composeRelease?: ComposeReleaseEvidence,
+  ) {
     await this.database.db.transaction().execute(async (tx) => {
       if (lease && !(await lockTaskLease(tx, lease.taskId, lease.owner)))
         throw new TaskLeaseUnavailableError();
       const active = await tx
         .updateTable('deployment_records')
-        .set({ activated_at: Date.now() })
+        .set({
+          activated_at: Date.now(),
+          ...(composeRelease && { compose_release_json: JSON.stringify(composeRelease) }),
+        })
         .where('id', '=', id)
         .where('status', '=', 'RUNNING')
         .returning('id')
@@ -304,8 +351,30 @@ export class DeploymentsService {
     if (filters.serviceId) q = q.where('deployment_records.service_id', '=', filters.serviceId);
     if (filters.environmentId)
       q = q.where('deployment_records.environment_id', '=', filters.environmentId);
-    if (filters.commit)
-      q = q.where('pipeline_runs.commit_sha', 'like', filters.commit.toLowerCase() + '%');
+    if (filters.commit || filters.repositoryId) {
+      const sha = filters.commit?.toLowerCase();
+      q = q.where((eb) => {
+        const matched = eb.exists(
+          eb
+            .selectFrom('artifact_sources as source')
+            .select('source.artifact_id')
+            .whereRef('source.artifact_id', '=', 'deployment_records.artifact_id')
+            .$if(Boolean(filters.repositoryId), (query) =>
+              query.where('source.repository_id', '=', filters.repositoryId!),
+            )
+            .$if(Boolean(sha), (query) => query.where('source.commit_sha', 'like', sha + '%')),
+        );
+        return !filters.repositoryId && sha
+          ? eb.or([
+              matched,
+              eb.and([
+                eb('artifacts.source_manifest', 'is', null),
+                eb('pipeline_runs.commit_sha', 'like', sha + '%'),
+              ]),
+            ])
+          : matched;
+      });
+    }
     return (await q.orderBy('deployment_records.started_at', 'desc').limit(200).execute()).map(
       (r) => ({
         id: r.id,
@@ -327,6 +396,9 @@ export class DeploymentsService {
         status: r.status,
         releaseVersion: r.release_version,
         deployPath: r.deploy_path,
+        composeRelease: r.compose_release_json
+          ? (JSON.parse(r.compose_release_json) as ComposeReleaseEvidence)
+          : undefined,
         healthStatus: r.health_status,
         previousDeploymentId: r.previous_deployment_id,
         rollbackAvailable:

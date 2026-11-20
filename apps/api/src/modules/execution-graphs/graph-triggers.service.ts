@@ -38,6 +38,7 @@ import {
   type UpstreamResult,
 } from './graph-trigger.dto';
 import { GraphRunnerService } from './graph-runner.service';
+import { assertAutomaticGraphFlow, assertGraphAutomation } from './graph-automatic-delivery';
 
 type Rule = Selectable<Database['execution_graph_triggers']>;
 type Event = Selectable<Database['execution_graph_trigger_events']>;
@@ -58,6 +59,7 @@ interface TriggerConfig {
 }
 
 interface TriggerEventInput {
+  invokedBy?: string;
   value?: string | null;
   repositoryId?: string;
   ref?: string;
@@ -351,6 +353,7 @@ export class GraphTriggersService implements OnModuleInit {
       input.enabled,
     );
     this.validateMappings(this.startFields(definition, input.flowId), input);
+    if (input.enabled) assertAutomaticGraphFlow(definition, input.flowId, input.kind);
     const now = Date.now();
     const settings: TriggerConfig = {
       revision: randomUUID(),
@@ -543,10 +546,56 @@ export class GraphTriggersService implements OnModuleInit {
       .set((eb) => ({ updated_at: eb.ref('updated_at') }))
       .where('id', '=', rule.id)
       .where('enabled', '=', 1)
+      .where('version', '=', rule.version)
+      .where('flow_id', '=', rule.flow_id)
       .where('config_json', '=', rule.config_json)
       .returning('id')
       .executeTakeFirst();
     if (!row) throw new ConflictException('触发器已停用或配置已变更');
+  }
+
+  async validateMigrationBinding(
+    tx: Transaction<Database>,
+    rule: Rule,
+    version: number,
+    definition: GraphDefinition,
+  ) {
+    const settings = config(rule);
+    const active = rule.enabled === 1;
+    const flow = definition.flows.find(({ id }) => id === rule.flow_id);
+    if (!flow) throw new ConflictException('切换版本中没有触发器关联的执行流');
+    const fields = flowStart(flow).inputs ?? [];
+    this.validateMappings(fields, {
+      name: rule.name,
+      kind: rule.kind as GraphTriggerKind,
+      version,
+      flowId: rule.flow_id,
+      enabled: active,
+      parameterMappings: settings.parameterMappings,
+    });
+    if (!active) return;
+    assertAutomaticGraphFlow(definition, rule.flow_id, rule.kind as GraphTriggerKind);
+    if (settings.upstreamFlowId) {
+      if (!definition.flows.some(({ id }) => id === settings.upstreamFlowId))
+        throw new ConflictException('切换版本缺少触发器所需的上游执行流');
+      await this.ensureNoUpstreamLoop(
+        tx,
+        rule.project_id,
+        version,
+        rule.flow_id,
+        settings.upstreamFlowId,
+        rule.id,
+      );
+    }
+    await this.requireAdmin(tx, rule.created_by);
+    await this.lockCredential(tx, settings);
+    const references = graphTriggerReferences(
+      definition,
+      { sourceId: rule.id, version, flowId: rule.flow_id, label: rule.name },
+      settings,
+    );
+    if (await unavailableReference(tx, rule.project_id, references))
+      throw new ConflictException('触发器引用的资源不可用，请检查参数映射');
   }
 
   private async recordEvent(
@@ -578,9 +627,14 @@ export class GraphTriggersService implements OnModuleInit {
       .where('trigger_id', '=', rule.id)
       .where('event_key', '=', eventId)
       .executeTakeFirstOrThrow();
-    if (previous.request_hash !== hash)
-      throw new ConflictException('该事件标识已用于另一组触发参数');
-    return previous;
+    if (previous.request_hash === hash) return previous;
+    if (rule.kind === 'API' && !eventFields(previous).invokedBy) {
+      const legacyInput = { ...fields };
+      delete legacyInput.invokedBy;
+      if (previous.request_hash === requestHash(rule, eventId, JSON.stringify(legacyInput)))
+        return previous;
+    }
+    throw new ConflictException('该事件标识已用于另一组触发参数');
   }
 
   async invoke(projectId: string, triggerId: string, input: InvokeGraphTriggerDto, userId: string) {
@@ -591,6 +645,7 @@ export class GraphTriggersService implements OnModuleInit {
     return this.database.db.transaction().execute(async (tx) => {
       await this.lockRule(tx, rule);
       const event = await this.recordEvent(tx, rule, input.eventId, {
+        invokedBy: userId,
         value: plainValue(input.inputValue ?? config(rule).inputValue),
         repositoryId: input.repositoryId,
         ref: input.ref,
@@ -705,6 +760,8 @@ export class GraphTriggersService implements OnModuleInit {
           .set({ next_at: nextAt })
           .where('id', '=', rule.id)
           .where('enabled', '=', 1)
+          .where('version', '=', rule.version)
+          .where('flow_id', '=', rule.flow_id)
           .where('config_json', '=', rule.config_json)
           .where('next_at', '=', rule.next_at)
           .returning('id')
@@ -788,9 +845,13 @@ export class GraphTriggersService implements OnModuleInit {
       )
         throw new ConflictException('触发器已停用或配置已变更');
       const definition = await this.published(rule.project_id, rule.version);
+      const kind = rule.kind as GraphTriggerKind;
+      const hasDelivery = assertAutomaticGraphFlow(definition, rule.flow_id, kind);
       const fields = this.startFields(definition, rule.flow_id);
-      const eventInput = eventFields(event);
-      const mappings = config(rule).parameterMappings ?? {};
+      const { invokedBy, ...eventInput } = eventFields(event);
+      const settings = config(rule);
+      const authorization = { kind, ruleId: rule.id, revision: settings.revision, invokedBy };
+      const mappings = settings.parameterMappings ?? {};
       const parameters = Object.fromEntries(
         fields.flatMap((field) => {
           const mapping = Object.hasOwn(mappings, field.id) ? mappings[field.id] : undefined;
@@ -801,7 +862,6 @@ export class GraphTriggersService implements OnModuleInit {
       );
       const inputs = {
         value: eventInput.value ?? undefined,
-        commitSha: eventInput.commitSha,
         parameters,
       };
       const metadata: Values = {
@@ -818,7 +878,7 @@ export class GraphTriggersService implements OnModuleInit {
           version: rule.version,
           inputs,
         },
-        metadata,
+        { trigger: metadata, automation: authorization },
       );
       await this.runner.run(
         rule.project_id,
@@ -831,12 +891,20 @@ export class GraphTriggersService implements OnModuleInit {
         },
         rule.created_by,
         {
-          triggerType: rule.kind as GraphTriggerKind,
+          triggerType: kind,
+          authorization,
           metadata,
           beforeInsert: async (tx) => {
             await this.lockRule(tx, rule);
             await this.requireAdmin(tx, rule.created_by);
             await this.lockCredential(tx, config(rule));
+            await assertGraphAutomation(
+              tx,
+              rule.project_id,
+              rule.created_by,
+              authorization,
+              hasDelivery,
+            );
             const pending = await tx
               .updateTable('execution_graph_trigger_events')
               .set({ status: 'PENDING' })

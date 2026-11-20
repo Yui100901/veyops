@@ -187,6 +187,17 @@ export interface ServiceEnvironmentConfigsTable {
   updated_at: number;
 }
 
+export interface ServiceComposeTemplatesTable {
+  id: string;
+  service_id: string;
+  environment_id: string;
+  version: number;
+  content: string | null;
+  checksum: string | null;
+  created_by: string;
+  created_at: number;
+}
+
 interface VariablesTable {
   id: string;
   key: string;
@@ -364,6 +375,7 @@ export interface RegistriesTable {
 }
 
 export interface ArtifactsTable {
+  source_manifest: Generated<number | null>;
   artifact_name: Generated<string | null>;
   artifact_kind: Generated<string | null>;
   graph_run_id: Generated<string | null>;
@@ -394,6 +406,18 @@ export interface ArtifactsTable {
   created_at: number;
 }
 
+export interface ArtifactSourcesTable {
+  artifact_id: string;
+  position: number;
+  repository_id: string;
+  commit_sha: string;
+  git_ref: string | null;
+  commit_subject: string | null;
+  workspace_run_id: string | null;
+  workspace_node_run_id: string | null;
+  path: string | null;
+}
+
 export interface DeploymentRecordsTable {
   id: string;
   pipeline_run_id: string;
@@ -409,6 +433,7 @@ export interface DeploymentRecordsTable {
   previous_deployment_id: Generated<string | null>;
   rollback_of_deployment_id: Generated<string | null>;
   release_snapshot_json: Generated<string | null>;
+  compose_release_json: Generated<string | null>;
   activated_at: Generated<number | null>;
   started_at: Generated<number | null>;
   finished_at: Generated<number | null>;
@@ -833,11 +858,25 @@ export interface Database {
   deployment_targets: DeploymentTargetsTable;
   deployment_target_servers: DeploymentTargetServersTable;
   service_environment_configs: ServiceEnvironmentConfigsTable;
+  service_compose_templates: ServiceComposeTemplatesTable;
   service_source_reviews: {
     id: string;
     project_id: string;
     service_id: string;
     environment_id: string;
+    commit_sha: string;
+    decision: 'APPROVED' | 'REVOKED';
+    reason: string | null;
+    reviewed_by: string;
+    created_at: number;
+    updated_at: number;
+  };
+  repository_source_reviews: {
+    id: string;
+    project_id: string;
+    service_id: string;
+    environment_id: string;
+    repository_id: string;
     commit_sha: string;
     decision: 'APPROVED' | 'REVOKED';
     reason: string | null;
@@ -859,6 +898,7 @@ export interface Database {
   pipeline_runs: PipelineRunsTable;
   registries: RegistriesTable;
   artifacts: ArtifactsTable;
+  artifact_sources: ArtifactSourcesTable;
   deployment_records: DeploymentRecordsTable;
   command_templates: CommandTemplatesTable;
   command_template_versions: CommandTemplateVersionsTable;

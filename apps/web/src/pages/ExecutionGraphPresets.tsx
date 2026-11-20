@@ -125,6 +125,23 @@ export function BuildFields({
         canEdit={canEdit}
         onChange={(repoPath) => patch({ repoPath })}
       />
+      <Field
+        label="额外源码工作区"
+        hint="用逗号分隔小写别名，保存后在所属执行流绑定输入。构建命令可访问 VEYOPS_GRAPH_DEPENDENCY_ROOT 下对应的目录。"
+      >
+        <input
+          key={value.dependencies?.join(',') || ''}
+          defaultValue={value.dependencies?.join(', ') || ''}
+          placeholder="例如 frontend, schemas"
+          maxLength={280}
+          disabled={!canEdit}
+          onBlur={(event) => {
+            const dependencies = event.target.value.split(/[,，\s]+/).filter(Boolean);
+            if (dependencies.join(',') !== (value.dependencies ?? []).join(','))
+              patch({ dependencies: dependencies.length ? dependencies : undefined });
+          }}
+        />
+      </Field>
       {value.buildLocation !== 'TARGET' && (
         <Text
           label="构建环境镜像"

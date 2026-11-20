@@ -440,9 +440,19 @@ export function graphModulePorts(node: GraphNode, calledFlow?: GraphFlow): Modul
       : node.type === 'REGISTER_ARTIFACT'
         ? node.registerArtifacts?.artifacts
         : undefined;
+  const inputs =
+    node.type === 'BUILD' && node.build?.dependencies?.length
+      ? [
+          ...definition.inputs,
+          ...node.build.dependencies.map((alias) =>
+            field('dependency_' + alias, 'WORKSPACE', true, '源码依赖 · ' + alias),
+          ),
+        ]
+      : definition.inputs;
   if (artifacts?.length)
     return {
       ...definition,
+      inputs,
       outputs: [
         { ...allArtifacts, required: artifacts.some((artifact) => artifact.required !== false) },
         ...artifacts.map(({ name, type, required }) => ({
@@ -452,7 +462,7 @@ export function graphModulePorts(node: GraphNode, calledFlow?: GraphFlow): Modul
         })),
       ],
     };
-  return definition;
+  return { ...definition, inputs };
 }
 
 export function graphDefaultBinding(

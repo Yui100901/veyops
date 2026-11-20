@@ -2,7 +2,14 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { ApiError, formatTime, message, navigate, post, useResource } from '../api';
 import { ErrorBanner, Form, Loading, Modal, RefreshButton, Section } from '../components';
-import type { DeploymentRecord, ProjectDetail, Server, Task } from '../models';
+import type {
+  ComposeReleaseEvidence,
+  ComposeTemplateReference,
+  DeploymentRecord,
+  ProjectDetail,
+  Server,
+  Task,
+} from '../models';
 import { deliveryTaskPath, type DeliveryScope } from './delivery-route';
 
 interface RollbackPreview {
@@ -12,11 +19,15 @@ interface RollbackPreview {
   sourceCommit: string;
   checksum?: string | null;
   imageDigest?: string | null;
+  imageReference?: string;
+  composeTemplate?: ComposeTemplateReference;
+  previousCompose?: ComposeReleaseEvidence;
   serviceId: string;
   environmentId: string;
   serverId: string;
   deployPath?: string;
   requireApproval?: boolean;
+  requireCodeReview?: boolean;
 }
 
 export function RollbackRelease({
@@ -107,10 +118,39 @@ export function RollbackRelease({
                   <code>{digest}</code>
                 </>
               )}
+              {preview.composeTemplate && (
+                <>
+                  <span>Compose 模板</span>
+                  <strong>
+                    {preview.composeTemplate.path || '产物归档'}{' '}
+                    {preview.composeTemplate.source === 'SERVICE_ENVIRONMENT' &&
+                      `v${preview.composeTemplate.version}`}
+                  </strong>
+                  <span>Compose 模板 SHA-256</span>
+                  <code>{preview.composeTemplate.checksum}</code>
+                </>
+              )}
+              {preview.imageReference && (
+                <>
+                  <span>待拉取或导入镜像</span>
+                  <code>{preview.imageReference}</code>
+                </>
+              )}
+              {preview.previousCompose && (
+                <>
+                  <span>历史实际镜像</span>
+                  <code title={preview.previousCompose.imageId}>
+                    {preview.previousCompose.imageReference}
+                  </code>
+                </>
+              )}
             </>
           )}
         </div>
         {preview?.requireApproval && <p className="field-note">管理员批准后开始回滚。</p>}
+        {preview?.requireCodeReview && (
+          <p className="field-note">已核对历史产物的源码审核，激活前将再次复核。</p>
+        )}
       </Form>
     </Modal>
   );
@@ -125,6 +165,7 @@ interface ReleaseApproval {
   commitSha: string | null;
   serverIds: string[];
   artifactIds: string[];
+  requireCodeReview?: boolean;
   rollbackOfDeploymentId?: string | null;
 }
 
@@ -274,6 +315,9 @@ function ReviewRelease({
             </>
           )}
         </div>
+        {approval.requireCodeReview && (
+          <p className="field-note">批准发布时会另外核对产物各来源的源码审核记录。</p>
+        )}
       </Form>
     </Modal>
   );

@@ -14,6 +14,7 @@ import type {
 import { ArtifactRetentionPolicy } from './ArtifactRetention';
 import { EnvironmentVariables } from './EnvironmentVariables';
 import { FailureHandling } from './FailureHandling';
+import { ComposeTemplates } from './ComposeTemplates';
 import { ProjectServerInventory } from './ProjectServerInventory';
 import {
   DeploymentSelectionPicker,
@@ -71,6 +72,7 @@ export function EnvironmentConfigEditor({
   const [editRetention, setEditRetention] = useState(false);
   const panels = {
     settings: '部署设置',
+    compose: 'Compose 模板',
     variables: '服务环境变量',
     servers: '服务器及来源',
     reviews: '代码审核',
@@ -184,11 +186,20 @@ export function EnvironmentConfigEditor({
       {tab === 'failure' && (
         <FailureHandling user={user} serviceId={serviceId} environmentId={environmentId} />
       )}
+      {tab === 'compose' && (
+        <ComposeTemplates
+          key={serviceId + ':' + environmentId}
+          user={user}
+          serviceId={serviceId}
+          environmentId={environmentId}
+        />
+      )}
       {tab === 'reviews' && (
         <SourceReviews
           projectId={project.id}
           serviceId={serviceId}
           environmentId={environmentId}
+          repositories={project.repositories}
           canReview={user.role === 'ADMIN'}
           required={config.data?.releasePolicy?.requireCodeReview === true}
         />
@@ -428,7 +439,7 @@ function ReleasePolicyFields({
           type="checkbox"
           defaultChecked={policy?.requireCodeReview}
         />
-        <span>要求产物的 Git 提交通过代码审核</span>
+        <span>要求产物实际依赖的仓库及 Git 提交全部通过源码审核</span>
       </label>
       {composeDeployment && (
         <label className="checkbox-row">
@@ -526,6 +537,8 @@ function ReleasePolicyFields({
 }
 interface SourceReview {
   id: string;
+  repositoryId: string | null;
+  repositoryName?: string;
   commitSha: string;
   decision: 'APPROVED' | 'REVOKED';
   reason?: string | null;
@@ -537,12 +550,14 @@ function SourceReviews({
   projectId,
   serviceId,
   environmentId,
+  repositories,
   canReview,
   required,
 }: {
   projectId: string;
   serviceId: string;
   environmentId: string;
+  repositories: ProjectDetail['repositories'];
   canReview: boolean;
   required: boolean;
 }) {
@@ -560,13 +575,18 @@ function SourceReviews({
       .trim()
       .toLowerCase();
     const decision = values.get('decision');
+    const repositoryId = values.get('repositoryId');
     setBusy(true);
     setError('');
     setNotice('');
     try {
       const saved = await api<SourceReview>(path + '/' + encodeURIComponent(sha), {
         method: 'PUT',
-        body: JSON.stringify({ decision, reason: String(values.get('reason') || '').trim() }),
+        body: JSON.stringify({
+          repositoryId,
+          decision,
+          reason: String(values.get('reason') || '').trim(),
+        }),
       });
       form.reset();
       setNotice(saved.decision === 'APPROVED' ? '已记录代码审核通过。' : '已撤销代码审核。');
@@ -581,12 +601,26 @@ function SourceReviews({
     <div className="form-body">
       <p className="field-note">
         {required
-          ? '本服务环境只允许发布已通过代码审核的 Git 提交。'
-          : '可预先记录审核结论。在部署设置启用代码审核后，系统会按产物的 Git 提交检查。'}
+          ? '发布前会按产物实际依赖的每个仓库和完整提交检查源码审核。'
+          : '可预先记录仓库及提交的审核决定。启用源码审核后，系统按产物的实际来源检查。'}
       </p>
       {canReview && (
         <form onSubmit={(event) => void save(event)} className="resource-form">
-          <fieldset disabled={busy}>
+          <fieldset disabled={busy || !repositories.length}>
+            <Field label="源码仓库" required>
+              <select
+                name="repositoryId"
+                defaultValue={repositories.length === 1 ? repositories[0]?.id : ''}
+                required
+              >
+                <option value="">选择实际检出的仓库</option>
+                {repositories.map((repository) => (
+                  <option key={repository.id} value={repository.id}>
+                    {repository.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
             <Field label="已审核的完整 Git 提交 SHA" required>
               <input
                 name="commitSha"
@@ -622,6 +656,7 @@ function SourceReviews({
           <table>
             <thead>
               <tr>
+                <th>仓库</th>
                 <th>Git 提交</th>
                 <th>结论</th>
                 <th>审核人</th>
@@ -632,6 +667,7 @@ function SourceReviews({
             <tbody>
               {reviews.data.map((row) => (
                 <tr key={row.id}>
+                  <td>{row.repositoryName || row.repositoryId || '旧记录 · 仓库未标明'}</td>
                   <td>
                     <code>{row.commitSha}</code>
                   </td>

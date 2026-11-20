@@ -33,7 +33,7 @@ export type GraphEnvironmentPlan = {
   variables: GraphVariableSource[];
 } & (
   | ({ status: 'PINNED' } & GraphEnvironmentFilePin)
-  | ({ status: 'SKIPPED' } & GraphEnvironmentSource)
+  | ({ status: 'SKIPPED'; path?: string } & GraphEnvironmentSource)
 );
 
 export function environmentFilePath(value: string) {
@@ -74,7 +74,7 @@ export function publicEnvironmentFile(plan?: GraphEnvironmentPlan) {
     commitSha: plan.commitSha,
     branch: plan.branch,
     tag: plan.tag,
-    ...(plan.status === 'PINNED' && { path: plan.path }),
+    path: plan.path,
   };
 }
 

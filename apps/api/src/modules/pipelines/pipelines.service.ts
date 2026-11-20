@@ -17,7 +17,8 @@ import { ServersService } from '../servers/servers.service';
 import { TasksService } from '../tasks/tasks.service';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { AuditService } from '../audit/audit.service';
-import { ArtifactsService } from '../artifacts/artifacts.service';
+import { archivedComposeTemplate, ArtifactsService } from '../artifacts/artifacts.service';
+import { artifactSourceRef, type ArtifactSource } from '../artifacts/artifact-sources';
 import { ServiceConfigsService } from '../service-configs/service-configs.service';
 import { lockRegistry, RegistriesService } from '../registries/registries.service';
 import { PipelineExecutor } from './pipeline-executor.service';
@@ -55,12 +56,27 @@ import {
 } from './pipeline-node-config';
 import { safeDeployPath, validateDefinition, validateGitUrl } from './pipeline.validation';
 import { storeDeliveryProfile, type DeliveryExecutionProfile } from './delivery-execution-profile';
-import { ownedGraphWorkspace, type GraphExecutionScope } from '../execution-graphs/graph-workspace';
+import {
+  ownedGraphWorkspace,
+  workspaceArtifactSource,
+  type GraphExecutionScope,
+} from '../execution-graphs/graph-workspace';
 import { SourceReviewService } from '../deployments/source-review.service';
-import { assertCurrentTargets } from '../deployments/release-policy';
+import { releaseArtifactSources, SourceReviewConflict } from '../deployments/release-source-policy';
+import { assertCurrentTargets, serviceReleasePolicy } from '../deployments/release-policy';
+import {
+  assertGraphAutomation,
+  type GraphAutomation,
+} from '../execution-graphs/graph-automatic-delivery';
 import { resolveDeliveryTargets } from './delivery-targets';
 import { redactTaskLog } from '../tasks/task-log.service';
 import { encryptionKey } from '../../core/config';
+import {
+  activeComposeRevision,
+  managedComposeReference,
+  readManagedCompose,
+} from '../service-configs/compose-template-reference';
+import { lockProjectGraph } from '../projects/project-relations';
 
 @Injectable()
 export class PipelinesService implements OnModuleInit {
@@ -473,6 +489,12 @@ export class PipelinesService implements OnModuleInit {
         : definition.buildLocation === 'MANAGER'
           ? 'MANAGER_BUILD'
           : 'TARGET_BUILD';
+    const managedCompose =
+      graphPurpose === 'RELEASE' && definition.artifactType === 'DOCKER_IMAGE'
+        ? managedComposeReference(
+            await activeComposeRevision(this.database.db, pipeline.serviceId, environment.id),
+          )
+        : undefined;
     const graphTargets = profile
       ? resolveDeliveryTargets(graphPurpose, input, {
           service: configured,
@@ -601,6 +623,7 @@ export class PipelinesService implements OnModuleInit {
       allowPartialDeploy: input.allowPartialDeploy === true,
       graphTargets,
       graphPurpose,
+      managedCompose,
       settings,
       requestedTargets: {
         targetId: input.targetId,
@@ -651,19 +674,40 @@ export class PipelinesService implements OnModuleInit {
             : []),
         ]
       : [
-          ...(
-            [
-              'deployPath',
-              'composeFilePath',
-              'startCommand',
-              'stopCommand',
-              'healthCheckCommand',
-            ] as const
-          ).map((field) => ({
-            field,
-            value: redactTaskLog(p.definition[field] ?? ''),
-            source: p.env.config?.[field] ? 'SERVICE_ENVIRONMENT' : 'NODE',
-          })),
+          ...(['deployPath', 'startCommand', 'stopCommand', 'healthCheckCommand'] as const).map(
+            (field) => ({
+              field,
+              value: redactTaskLog(p.definition[field] ?? ''),
+              source: p.env.config?.[field] ? 'SERVICE_ENVIRONMENT' : 'NODE',
+            }),
+          ),
+          ...(p.definition.artifactType === 'DOCKER_IMAGE'
+            ? p.managedCompose
+              ? [
+                  {
+                    field: 'composeFile',
+                    value: p.managedCompose.path,
+                    source: 'SERVICE_ENVIRONMENT',
+                  },
+                  {
+                    field: 'composeVersion',
+                    value: p.managedCompose.version,
+                    source: 'SERVICE_ENVIRONMENT',
+                  },
+                  {
+                    field: 'composeChecksum',
+                    value: p.managedCompose.checksum,
+                    source: 'SERVICE_ENVIRONMENT',
+                  },
+                ]
+              : [
+                  {
+                    field: 'composeSource',
+                    value: '产物归档',
+                    source: 'ARTIFACT',
+                  },
+                ]
+            : []),
           ...(p.env.config?.releasePolicy
             ? [
                 {
@@ -687,6 +731,7 @@ export class PipelinesService implements OnModuleInit {
         failurePolicy: p.target.failure_policy,
       },
       settings,
+      ...(p.managedCompose && { managedCompose: p.managedCompose }),
       variables:
         p.env.variableSources?.map(({ key, source, isSecret }) => ({
           key,
@@ -723,6 +768,7 @@ export class PipelinesService implements OnModuleInit {
         JSON.stringify(
           canonical({
             definition: p.definition,
+            ...(p.managedCompose && { managedCompose: p.managedCompose }),
             ...(p.graphTargets && {
               targetSource: p.graphTargets.source,
               targetId: p.graphTargets.legacyId,
@@ -864,6 +910,7 @@ export class PipelinesService implements OnModuleInit {
         registry: { registryUrl: p.registry.registryUrl, credentialId: p.registry.credentialId },
       }),
       definition: p.definition,
+      ...(p.managedCompose && { managedCompose: p.managedCompose }),
       variables: p.env.variables,
       secretVariables: p.env.secretVariables,
       releasePolicy: p.env.config?.releasePolicy,
@@ -956,7 +1003,12 @@ export class PipelinesService implements OnModuleInit {
       ).map((row) => row.server_id),
     );
     const targets = task.payload.targets.filter((target) => completed.has(target.id));
-    const candidates = await this.artifacts.deployableIn(tx, build.runId);
+    const candidates = await this.artifacts.deployableIn(
+      tx,
+      build.runId,
+      false,
+      Boolean(build.managedCompose),
+    );
     const selected =
       build.definition.buildLocation === 'MANAGER'
         ? candidates.filter((item) => item.serverId === null)
@@ -979,6 +1031,20 @@ export class PipelinesService implements OnModuleInit {
       deploymentArtifacts: selected,
       sourceBuildTaskId: task.id,
     };
+    let sourceReviews;
+    try {
+      if (
+        !this.sourceReviews &&
+        (deployment.releasePolicy?.requireCodeReview ||
+          (await serviceReleasePolicy(tx, deployment.serviceId, deployment.environmentId)).policy
+            .requireCodeReview)
+      )
+        throw new SourceReviewConflict('代码审核服务不可用');
+      sourceReviews = await this.sourceReviews?.requireReleaseReviewed(deployment, tx);
+    } catch (error) {
+      if (!(error instanceof SourceReviewConflict)) throw error;
+      return { deploymentSkippedReason: error.message };
+    }
     const deploymentTaskId = await this.tasks.createInTransaction(
       tx,
       this.taskInput(
@@ -998,6 +1064,7 @@ export class PipelinesService implements OnModuleInit {
         sourceBuildTaskId: task.id,
         artifactIds: selected.map((item) => item.id),
         targetCount: targets.length,
+        ...(sourceReviews && { sourceReviews }),
       },
       tx,
     );
@@ -1089,8 +1156,14 @@ export class PipelinesService implements OnModuleInit {
     targetIds: string[],
     artifactKind?: string,
     name?: string,
+    managedCompose = false,
   ) {
-    const artifacts = await this.artifacts.deployableIn(this.database.db, runId);
+    const artifacts = await this.artifacts.deployableIn(
+      this.database.db,
+      runId,
+      false,
+      managedCompose,
+    );
     const groups = new Map<string, typeof artifacts>();
     for (const artifact of artifacts) {
       if ((artifactKind && artifact.kind !== artifactKind) || (name && artifact.name !== name))
@@ -1138,6 +1211,7 @@ export class PipelinesService implements OnModuleInit {
         'artifacts.checksum',
         'artifacts.compose_checksum',
         'artifacts.image_digest',
+        'artifacts.image_repository',
         'artifacts.storage_key',
         'artifacts.server_id',
         'artifacts.storage_type',
@@ -1174,10 +1248,6 @@ export class PipelinesService implements OnModuleInit {
       throw new BadRequestException('产物必须来自相同服务和环境的一次构建');
     if (source.status !== 'SUCCESS' && source.status !== 'PARTIAL_FAILED')
       throw new ConflictException('来源任务没有可发布的成功构建');
-    const candidates = await this.artifacts.deployableIn(db, source.run_id, !!profile);
-    const references = candidates.filter((candidate) => artifactIds.includes(candidate.id));
-    if (references.length !== rows.length)
-      throw new ConflictException('产物缺少可校验的发布所需数据');
     const serverIds = rows.flatMap((row) => (row.server_id ? [row.server_id] : []));
     if (serverIds.length) {
       const successful = await db
@@ -1205,6 +1275,21 @@ export class PipelinesService implements OnModuleInit {
       undefined,
       profile,
     );
+    const candidates = await this.artifacts.deployableIn(
+      db,
+      source.run_id,
+      Boolean(profile),
+      Boolean(p.managedCompose),
+    );
+    const references = candidates.filter((candidate) => artifactIds.includes(candidate.id));
+    if (references.length !== rows.length)
+      throw new ConflictException(
+        p.definition.artifactType === 'DOCKER_IMAGE' && !p.managedCompose
+          ? '产物缺少可校验的镜像或 Compose 归档，也可以为服务环境配置独立模板'
+          : '产物缺少可校验的发布所需数据',
+      );
+    if (p.managedCompose)
+      await readManagedCompose(db, p.pipeline.serviceId, p.environment.id, p.managedCompose);
     if (
       rows.some(
         (row) =>
@@ -1217,13 +1302,22 @@ export class PipelinesService implements OnModuleInit {
     if (!this.artifactsMatchTargets(references, targets))
       throw new BadRequestException('目标端构建产物须与所选部署目标逐一匹配');
     const reviewRequired = p.env.config?.releasePolicy?.requireCodeReview;
-    if (reviewRequired && !this.sourceReviews) throw new ConflictException('代码审核服务不可用');
-    const sourceReview = reviewRequired
+    const scope = {
+      projectId: p.pipeline.projectId,
+      serviceId: p.pipeline.serviceId,
+      environmentId: p.environment.id,
+    };
+    const sources = await releaseArtifactSources(db, scope, artifactIds).catch((error) => {
+      if (reviewRequired || !(error instanceof SourceReviewConflict)) throw error;
+      return [];
+    });
+    if (reviewRequired && !this.sourceReviews) throw new SourceReviewConflict('代码审核服务不可用');
+    const sourceReviews = reviewRequired
       ? await this.sourceReviews?.requireReviewed(
-          p.pipeline.projectId,
-          p.pipeline.serviceId,
-          p.environment.id,
-          source.commit_sha,
+          scope.projectId,
+          scope.serviceId,
+          scope.environmentId,
+          sources,
           { force: true },
         )
       : undefined;
@@ -1237,11 +1331,40 @@ export class PipelinesService implements OnModuleInit {
           this.configurationHash(p),
           rows,
           references,
-          sourceReview,
+          sources,
+          sourceReviews,
         ]),
       )
       .digest('hex');
-    return { p, references, source, configurationHash, artifactIds, targets };
+    const build = rows.some((row) => row.compose_checksum)
+      ? await db
+          .selectFrom('tasks')
+          .select('payload_json')
+          .where('id', '=', source.task_id)
+          .executeTakeFirst()
+      : undefined;
+    const artifactDetails = rows.map((row) => ({
+      id: row.id,
+      checksum: row.checksum,
+      imageRepository: row.image_repository,
+      imageDigest: row.image_digest,
+      composeTemplate: archivedComposeTemplate(
+        build?.payload_json ?? null,
+        row.artifact_name,
+        row.compose_checksum,
+      ),
+    }));
+    return {
+      p,
+      references,
+      source,
+      sources,
+      sourceReviews,
+      configurationHash,
+      artifactIds,
+      artifactDetails,
+      targets,
+    };
   }
 
   async previewArtifactDeploy(
@@ -1249,29 +1372,16 @@ export class PipelinesService implements OnModuleInit {
     input: ArtifactDeployPreviewDto,
     profile?: DeliveryExecutionProfile,
   ) {
-    const { p, source, configurationHash, artifactIds, targets } = await this.prepareArtifactDeploy(
-      id,
-      input,
-      profile,
-    );
-    const buildTask = await this.database.db
-      .selectFrom('tasks')
-      .select('payload_json')
-      .where('id', '=', source.task_id)
-      .executeTakeFirstOrThrow();
-    const built = (JSON.parse(buildTask.payload_json) as TaskPayload).pipeline;
-    const sources = (built?.definition.nodes ?? []).flatMap((node) => {
-      const snapshot = built?.nodeSources?.[node.id];
-      if (node.type !== 'CHECKOUT' || !snapshot || !built) return [];
-      return [
-        {
-          id: node.id,
-          repositoryId: node.repositoryId ?? built.definition.repositoryId,
-          commitSha: snapshot.commitSha,
-          branch: snapshot.branch,
-        },
-      ];
-    });
+    const {
+      p,
+      source,
+      sources,
+      sourceReviews,
+      configurationHash,
+      artifactIds,
+      artifactDetails,
+      targets,
+    } = await this.prepareArtifactDeploy(id, input, profile);
     return {
       pipelineId: id,
       projectId: p.pipeline.projectId,
@@ -1287,12 +1397,13 @@ export class PipelinesService implements OnModuleInit {
       version: p.version.version,
       commitSha: source.commit_sha,
       sourceBuildTaskId: source.task_id,
-      nodeSources: sources.length
-        ? sources
-        : [{ repositoryId: built?.definition.repositoryId, commitSha: source.commit_sha }],
+      nodeSources: sources,
+      sourceReviews,
       definition: p.definition,
       configurationHash,
       artifactIds,
+      artifactDetails,
+      managedCompose: p.managedCompose,
       executionConfiguration: this.executionConfiguration(p),
     };
   }
@@ -1310,15 +1421,8 @@ export class PipelinesService implements OnModuleInit {
       profile,
     );
     const requireCodeReview = Boolean(p.env.config?.releasePolicy?.requireCodeReview);
-    if (requireCodeReview && !this.sourceReviews) throw new ConflictException('代码审核服务不可用');
-    if (requireCodeReview)
-      await this.sourceReviews?.requireReviewed(
-        p.pipeline.projectId,
-        p.pipeline.serviceId,
-        p.environment.id,
-        p.commitSha,
-        { force: true },
-      );
+    if (requireCodeReview && !this.sourceReviews)
+      throw new SourceReviewConflict('代码审核服务不可用');
     return {
       version: p.version.version,
       serviceId: p.pipeline.serviceId,
@@ -1327,6 +1431,7 @@ export class PipelinesService implements OnModuleInit {
       serverIds: p.servers.map(({ id }) => id),
       requireApproval: Boolean(p.env.config?.releasePolicy?.requireApproval),
       requireCodeReview,
+      sourceReviewPendingMaterialization: requireCodeReview,
       configurationHash: this.configurationHash(p),
       executionConfiguration: this.executionConfiguration(p),
     };
@@ -1340,11 +1445,12 @@ export class PipelinesService implements OnModuleInit {
       idempotencyKey?: string;
       expectedPlanHash?: string;
       profile?: DeliveryExecutionProfile;
+      graphAutomation?: GraphAutomation;
       afterInsert?: (tx: Transaction<Database>, taskId: string) => Promise<void>;
     } = {},
   ) {
     if (input.confirmed !== true) throw new BadRequestException('必须确认产物和部署目标');
-    const { p, references, source, configurationHash, artifactIds, targets } =
+    const { p, references, source, sourceReviews, configurationHash, artifactIds, targets } =
       await this.prepareArtifactDeploy(id, input, options.profile);
     if (
       input.expectedConfigurationHash !== configurationHash ||
@@ -1353,12 +1459,19 @@ export class PipelinesService implements OnModuleInit {
         JSON.stringify([...input.expectedServerIds].sort()) !== JSON.stringify([...targets].sort()))
     )
       throw new ConflictException('产物、执行目标或配置已变化，请重新确认');
+    const automation = options.graphAutomation;
+    if (automation && Object.keys(p.env.secretVariables).length)
+      throw new BadRequestException('自动发布不能使用敏感环境变量');
     const snapshot: PipelineSnapshot = {
       ...this.snapshot(p, source.commit_sha),
       mode: 'DEPLOY_ARTIFACT',
       deploymentArtifacts: references,
       sourceBuildTaskId: source.task_id,
       ...(options.profile && { artifactServiceScope: true }),
+      ...(automation && {
+        graphAutomation: automation,
+        triggerType: automation.kind,
+      }),
     };
     const task = await this.tasks.create(
       this.taskInput(
@@ -1369,10 +1482,24 @@ export class PipelinesService implements OnModuleInit {
       ),
       userId,
       async (tx) => {
+        if (snapshot.definition.artifactType === 'DOCKER_IMAGE') {
+          await lockProjectGraph(tx);
+          const active = managedComposeReference(
+            await activeComposeRevision(tx, snapshot.serviceId, snapshot.environmentId),
+          );
+          if (active?.id !== snapshot.managedCompose?.id)
+            throw new ConflictException('Compose 模板版本已变化，请重新预览发布产物');
+        }
+        if (automation) await assertGraphAutomation(tx, snapshot.projectId, userId, automation);
         if (options.profile) await storeDeliveryProfile(tx, options.profile, userId);
         if (snapshot.graphReleaseTargets) await assertCurrentTargets(tx, snapshot, p.servers);
         if (snapshot.targetSelection)
           await confirmDeploymentMembers(tx, snapshot.targetSelection, targets);
+        if (this.sourceReviews) {
+          const current = await this.sourceReviews.requireReleaseReviewed(snapshot, tx);
+          if (JSON.stringify(current ?? undefined) !== JSON.stringify(sourceReviews))
+            throw new SourceReviewConflict('代码审核结果已变化，请重新预览发布产物');
+        }
       },
       options.afterInsert,
     );
@@ -1381,6 +1508,7 @@ export class PipelinesService implements OnModuleInit {
         sourceBuildTaskId: source.task_id,
         artifactIds,
         targetCount: targets.length,
+        ...(sourceReviews && { sourceReviews }),
       });
     return task;
   }
@@ -1396,6 +1524,7 @@ export class PipelinesService implements OnModuleInit {
       beforeInsert?: (tx: Transaction<Database>) => Promise<void>;
       profile?: DeliveryExecutionProfile;
       graph?: GraphExecutionScope;
+      graphAutomation?: GraphAutomation;
       afterInsert?: (tx: Transaction<Database>, taskId: string, created: boolean) => Promise<void>;
     } = {},
   ) {
@@ -1416,11 +1545,14 @@ export class PipelinesService implements OnModuleInit {
     );
     if ((p.target.selection || p.definition.nodes) && !input.expectedConfigurationHash)
       throw new ConflictException('请先预览并确认服务器、分组和执行配置');
-    if (options.triggerType)
+    const automation = options.graphAutomation;
+    if (options.triggerType || automation)
       this.assertAutomaticBuild({
         definition: p.definition,
         hasSecretVariables: Object.keys(p.env.secretVariables).length > 0,
       });
+    if (automation && p.registry)
+      throw new BadRequestException('执行图自动构建只归档镜像，暂未放行构建时推送 Registry');
     if (
       input.expectedServerIds &&
       JSON.stringify([...input.expectedServerIds].sort()) !==
@@ -1433,21 +1565,73 @@ export class PipelinesService implements OnModuleInit {
     )
       throw new ConflictException('执行配置已变化，请重新确认');
     const commit = p.commitSha;
-    if (options.graph?.workspace) {
+    let graph = options.graph;
+    if (graph?.workspace) {
       const workspace = await ownedGraphWorkspace(
         this.database.db,
         p.pipeline.projectId,
-        options.graph.workspace,
+        graph.workspace,
       );
       if (workspace.repositoryId !== p.definition.repositoryId || workspace.commitSha !== commit)
         throw new ConflictException('构建工作区与已确认的源码版本不一致');
+      graph = { ...graph, workspace };
     }
-    if (options.graph?.variables?.workspace)
-      await ownedGraphWorkspace(
-        this.database.db,
-        p.pipeline.projectId,
-        options.graph.variables.workspace,
+    if (graph?.variables?.workspace)
+      await ownedGraphWorkspace(this.database.db, p.pipeline.projectId, graph.variables.workspace);
+    const mainSource = workspaceArtifactSource(graph?.workspace, p.definition.repoPath);
+    const artifactSources: ArtifactSource[] = mainSource.length
+      ? mainSource
+      : p.sources?.preview.length
+        ? p.sources.preview.map((source) => ({
+            repositoryId: source.repositoryId,
+            commitSha: source.commitSha,
+            ref: artifactSourceRef(source),
+            path: p.definition.nodes?.find(({ id }) => id === source.id)?.directory,
+          }))
+        : [
+            {
+              repositoryId: p.definition.repositoryId,
+              commitSha: commit,
+              ref: options.gitRef ?? commit,
+              path: p.definition.repoPath,
+            },
+          ];
+    if (graph?.dependencies) {
+      const dependencies = await Promise.all(
+        Object.entries(graph.dependencies).map(
+          async ([alias, reference]) =>
+            [
+              alias,
+              await ownedGraphWorkspace(this.database.db, p.pipeline.projectId, reference),
+            ] as const,
+        ),
       );
+      graph = { ...graph, dependencies: Object.fromEntries(dependencies) };
+      for (const [alias, workspace] of dependencies)
+        artifactSources.push(...workspaceArtifactSource(workspace, 'dependencies/' + alias));
+    }
+    const environmentFile = graph?.variables?.environmentFile;
+    if (
+      automation &&
+      environmentFile?.status === 'PINNED' &&
+      (environmentFile.repositoryId !== p.definition.repositoryId ||
+        environmentFile.commitSha !== commit)
+    )
+      throw new BadRequestException('自动构建的环境文件必须来自构建仓库的已固定提交');
+    if (
+      environmentFile?.status === 'PINNED' &&
+      !artifactSources.some(
+        (source) =>
+          source.repositoryId === environmentFile.repositoryId &&
+          source.commitSha === environmentFile.commitSha,
+      )
+    )
+      artifactSources.push({
+        repositoryId: environmentFile.repositoryId,
+        commitSha: environmentFile.commitSha,
+        ref: artifactSourceRef(environmentFile),
+        path: environmentFile.path,
+      });
     const snapshot: PipelineSnapshot = {
       ...this.snapshot(p, commit),
       mode: 'BUILD_ONLY',
@@ -1455,8 +1639,10 @@ export class PipelinesService implements OnModuleInit {
         deployAfterBuild: true,
         allowPartialDeploy: p.allowPartialDeploy,
       }),
-      triggerType: options.triggerType ?? 'MANUAL',
-      graph: options.graph,
+      triggerType: automation?.kind ?? options.triggerType ?? 'MANUAL',
+      graphAutomation: automation,
+      graph,
+      artifactSources,
     };
     const task = await this.tasks.create(
       this.taskInput(
@@ -1469,6 +1655,7 @@ export class PipelinesService implements OnModuleInit {
       userId,
       async (tx) => {
         if (options.profile) await storeDeliveryProfile(tx, options.profile, userId);
+        if (automation) await assertGraphAutomation(tx, snapshot.projectId, userId, automation);
         await options.beforeInsert?.(tx);
         if (snapshot.targetSelection)
           await confirmDeploymentMembers(tx, snapshot.targetSelection, snapshot.targetMemberIds!);

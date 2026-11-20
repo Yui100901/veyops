@@ -66,6 +66,18 @@ export type Artifact = {
   storageKey: string;
   downloadAvailable: boolean;
   sourceCommit?: string;
+  sources?: {
+    repositoryId: string;
+    commitSha: string;
+    ref?: string;
+    subject?: string;
+    workspace?: { runId: string; nodeRunId: string };
+    path?: string;
+  }[];
+  sourceEvent?: { eventId?: string; repositoryId?: string; commitSha?: string; ref?: string };
+  composeTemplate?: { source: 'ARCHIVE'; path?: string; checksum: string };
+  imageOrigin?: 'REGISTERED_IMAGE' | 'BUILD';
+  sourceImageReference?: string;
   checksum?: string;
   imageDigest?: string;
   imageId?: string;
@@ -204,6 +216,92 @@ function GraphOrigin({
       )}
       {record.graphNodeName && <span> · {record.graphNodeName}</span>}
     </small>
+  );
+}
+
+function ArtifactOrigins({
+  artifact,
+  project,
+  scope,
+}: {
+  artifact: Artifact;
+  project?: ProjectDetail;
+  scope: DeliveryScope;
+}) {
+  const { sources, sourceEvent, sourceCommit, projectId } = artifact;
+  return (
+    <div className="cell-detail">
+      {sources?.length ? (
+        <details>
+          <summary>{sources.length} 项源码来源</summary>
+          <ul>
+            {sources.map((source, index) => {
+              const label =
+                project?.repositories.find(({ id }) => id === source.repositoryId)?.name ||
+                source.repositoryId;
+              return (
+                <li key={index}>
+                  {projectId ? (
+                    <a
+                      className="text-link"
+                      href={
+                        '#' +
+                        deliveryPath(projectId, 'artifacts', {
+                          serviceId: scope.serviceId,
+                          environmentId: scope.environmentId,
+                          view: scope.view,
+                          repositoryId: source.repositoryId,
+                          commit: source.commitSha,
+                        })
+                      }
+                    >
+                      {label}
+                    </a>
+                  ) : (
+                    label
+                  )}
+                  <small className="cell-detail mono">{source.ref || source.commitSha}</small>
+                  {source.ref !== source.commitSha && (
+                    <small className="cell-detail mono">{source.commitSha}</small>
+                  )}
+                  {source.subject && <small className="cell-detail">{source.subject}</small>}
+                  {source.path && <small className="cell-detail mono">{source.path}</small>}
+                  {source.workspace && projectId && (
+                    <a
+                      className="text-link"
+                      href={
+                        '#' +
+                        deliveryGraphRunPath(projectId, source.workspace.runId, 'artifacts', scope)
+                      }
+                      title={source.workspace.nodeRunId}
+                    >
+                      工作区来源
+                    </a>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </details>
+      ) : (
+        <>
+          {sourceCommit && sources === undefined && (
+            <code title={sourceCommit}>{sourceCommit.slice(0, 12)}</code>
+          )}
+          <small className="cell-detail muted">
+            {sources === undefined ? '历史记录缺少仓库溯源' : '缺少可验证的源码来源'}
+          </small>
+        </>
+      )}
+      {sourceEvent && (
+        <small className="cell-detail" title={sourceEvent.eventId}>
+          触发提交 ·{' '}
+          <code title={sourceEvent.commitSha}>
+            {sourceEvent.commitSha?.slice(0, 12) || sourceEvent.ref || '—'}
+          </code>
+        </small>
+      )}
+    </div>
   );
 }
 
@@ -447,9 +545,23 @@ export function DeliveryRecordsPage({
                               </small>
                             )}
                             {r.pinnedAt != null && <small className="cell-detail">已固定</small>}
+                            {r.imageOrigin === 'REGISTERED_IMAGE' && (
+                              <small className="cell-detail">
+                                登记的现有镜像{' '}
+                                {r.sourceImageReference && <code>{r.sourceImageReference}</code>}
+                              </small>
+                            )}
+                            {r.composeTemplate && (
+                              <small className="cell-detail">
+                                Compose 归档 {r.composeTemplate.path} ·{' '}
+                                <code title={r.composeTemplate.checksum}>
+                                  {r.composeTemplate.checksum.slice(0, 12)}
+                                </code>
+                              </small>
+                            )}
                           </td>
-                          <td className="mono" title={r.sourceCommit}>
-                            {r.sourceCommit?.slice(0, 12) || '—'}
+                          <td>
+                            <ArtifactOrigins artifact={r} project={project} scope={rowScope} />
                           </td>
                           <td
                             className="mono truncate"
@@ -540,6 +652,22 @@ export function DeliveryRecordsPage({
                           </td>
                           <td className="mono truncate" title={r.deployPath}>
                             {r.deployPath || '—'}
+                            {r.composeRelease && (
+                              <>
+                                <small className="cell-detail" title={r.composeRelease.template.checksum}>
+                                  Compose {r.composeRelease.template.path ?? '产物归档'}{' '}
+                                  {r.composeRelease.template.source === 'SERVICE_ENVIRONMENT' &&
+                                    `v${r.composeRelease.template.version} · `}
+                                  {r.composeRelease.template.checksum.slice(0, 12)}
+                                </small>
+                                <small
+                                  className="cell-detail"
+                                  title={r.composeRelease.imageReference + ' · ' + r.composeRelease.imageId}
+                                >
+                                  镜像 {r.composeRelease.imageId.slice(0, 19)}
+                                </small>
+                              </>
+                            )}
                           </td>
                           <td>
                             <Status value={r.status} />

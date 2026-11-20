@@ -1,7 +1,8 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import { ConflictException } from '@nestjs/common';
 import { sql } from 'kysely';
 import { DatabaseService } from '../core/database/database.service';
 import { SystemSettingsService } from '../modules/system/system-settings.service';
@@ -28,6 +29,12 @@ for (const client of ['sqlite', 'postgres'] as const) {
       skip: client === 'postgres' && !postgresTestUrl ? 'VEYOPS_TEST_POSTGRES_URL is unset' : false,
     },
     async (t) => {
+      const previousKey = process.env.ENCRYPTION_KEY;
+      process.env.ENCRYPTION_KEY = randomBytes(32).toString('hex');
+      t.after(() => {
+        if (previousKey === undefined) delete process.env.ENCRYPTION_KEY;
+        else process.env.ENCRYPTION_KEY = previousKey;
+      });
       let database: DatabaseService;
       if (client === 'postgres') {
         database = await createPostgresTestDatabase(t);
@@ -150,13 +157,31 @@ for (const client of ['sqlite', 'postgres'] as const) {
 
       const leftVariable = { key: 'LEFT', value: 'one' };
       const rightVariable = { key: 'RIGHT', value: 'two' };
-      for (const scope of [undefined, service]) {
-        await Promise.all([
-          configs.saveVariables(environment, { variables: [leftVariable] }, user, scope),
-          configs.saveVariables(environment, { variables: [rightVariable] }, user, scope),
+      const scopes = [
+        {
+          read: () => configs.listProjectVariables(project),
+          save: (expectedRevision: string, variables: typeof leftVariable[]) =>
+            configs.saveProjectVariables(project, { expectedRevision, variables }, user),
+        },
+        ...[undefined, service].map((serviceId) => ({
+          read: () => configs.listVariables(environment, serviceId),
+          save: (expectedRevision: string, variables: typeof leftVariable[]) =>
+            configs.saveVariables(environment, { expectedRevision, variables }, user, serviceId),
+        })),
+      ];
+      for (const scope of scopes) {
+        const { revision } = await scope.read();
+        const results = await Promise.allSettled([
+          scope.save(revision, [leftVariable]),
+          scope.save(revision, [rightVariable]),
         ]);
+        const conflicts = results.filter((result) => result.status === 'rejected');
+        assert.equal(conflicts.length, 1);
+        assert.ok(conflicts[0]!.reason instanceof ConflictException);
+        const current = await scope.read();
+        assert.notEqual(current.revision, revision);
         assertOneReplacement(
-          (await configs.listVariables(environment, scope)).map(({ key, value, isSecret }) => ({
+          current.variables.map(({ key, value, isSecret }) => ({
             key,
             value,
             isSecret,

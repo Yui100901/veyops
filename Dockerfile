@@ -10,7 +10,7 @@ COPY apps/api/package.json ./apps/api/package.json
 COPY apps/web/package.json ./apps/web/package.json
 RUN npm ci
 COPY . .
-RUN npm run build && npm prune --omit=dev
+RUN npm run build && npm prune --omit=dev && mkdir -p apps/api/node_modules
 
 FROM ${NODE_IMAGE} AS runtime
 ARG POSTGRES_CLIENT_MAJOR=17
@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && chown -R node:node /app
 COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/apps/api/node_modules ./apps/api/node_modules
 COPY --from=build --chown=node:node /app/apps/api/package.json ./apps/api/package.json
 COPY --from=build --chown=node:node /app/apps/api/dist ./apps/api/dist
 COPY --from=build --chown=node:node /app/apps/web/package.json ./apps/web/package.json

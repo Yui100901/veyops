@@ -8,7 +8,7 @@ import {
   type GraphNode,
 } from './execution-graph-definition';
 import type { GraphInputsDto } from './graph-runner.controller';
-import { nodeBindings, type GraphBindingContext } from './graph-run-bindings';
+import { nodeBindings, stringValue, type GraphBindingContext } from './graph-run-bindings';
 
 export const graphTaskKeyPrefix = 'execution-flow:';
 export const activeFlowStatuses = ['QUEUED', 'RUNNING', 'WAITING', 'CANCEL_REQUESTED'];
@@ -59,7 +59,7 @@ export function branchMatch(
   if (typeof settled === 'string') return settled as GraphEdge['when'];
   const value = explicit
     ? state && nodeBindings(flow, node, state, ['value']).value
-    : branchInput(inputs, configuration.key);
+    : branchInput(inputs, configuration.key, stringValue(state?.context?.triggerCommitSha));
   if (explicit && value === undefined) return undefined;
   const commit = !explicit && configuration.key === 'commitSha';
   const matches = (candidate: string) =>
@@ -70,11 +70,12 @@ export function branchMatch(
   return index === -1 ? 'DEFAULT' : `CASE:${index}`;
 }
 
-function branchInput(inputs: GraphInputsDto, key?: 'input' | 'commitSha') {
+function branchInput(inputs: GraphInputsDto, key?: 'input' | 'commitSha', triggerCommitSha?: string) {
   if (!key) return inputs.value;
   if (key === 'input') return inputs.value;
-  if (!inputs.commitSha) throw new BadRequestException('按提交判断的流程必须提供完整提交 SHA');
-  return inputs.commitSha.toLowerCase();
+  const sha = inputs.commitSha ?? triggerCommitSha;
+  if (!sha) throw new BadRequestException('按提交判断的流程必须提供完整提交 SHA');
+  return sha.toLowerCase();
 }
 
 export function graphNodeOutput(node: GraphNode, match?: GraphEdge['when']) {

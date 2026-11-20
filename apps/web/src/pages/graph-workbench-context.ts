@@ -9,7 +9,7 @@ export type GraphWorkbenchScope = {
   view?: string;
   resourcePanel?: (typeof resourcePanels)[number];
 };
-export type GraphPane = 'run' | 'draft' | 'published' | 'history';
+export type GraphPane = 'run' | 'draft' | 'published' | 'history' | 'migration';
 export type GraphDeliveryReturn = Pick<
   DeliveryScope,
   'recordId' | 'commit' | 'repositoryId' | 'pipelineRunId' | 'taskId'

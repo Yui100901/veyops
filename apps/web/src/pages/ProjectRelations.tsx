@@ -177,6 +177,30 @@ export function ProjectRelations({
           <p className="mini-empty">暂无项目依赖</p>
         )}
       </Section>
+      <Section title="依赖此项目的项目">
+        {project.dependents?.length ? (
+          <div className="resource-list">
+            {project.dependents.map((item) => (
+              <div key={item.id}>
+                <span className="resource-avatar">
+                  <Network size={17} />
+                </span>
+                <div>
+                  <a className="text-link" href={`#/projects/${item.projectId}`}>
+                    {item.projectName}
+                  </a>
+                  {item.description && <small>{item.description}</small>}
+                </div>
+                <span className="tag">
+                  {item.dependencyType === 'DEPLOYMENT' ? '部署依赖' : '运行依赖'}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="mini-empty">暂无其他项目依赖此项目。</p>
+        )}
+      </Section>
       <Section title="最近部署">
         <DeploymentHistory
           rows={project.recentDeployments ?? []}

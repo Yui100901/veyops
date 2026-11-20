@@ -37,6 +37,7 @@ import type {
 import { relativePath, shellQuote as q } from '../pipelines/pipeline.validation';
 import type { TaskExecutionContext } from '../tasks/tasks.types';
 import {
+  copyGraphDependencies,
   copyGraphRepository,
   graphTriggerVariables,
   graphWorkspaceEntry,
@@ -455,14 +456,30 @@ export class BuildsService {
     node?: PipelineNode,
   ) {
     if (session.snapshot.graph?.workspace) {
-      const directory = await openGraphWorkspace(session.snapshot.graph.workspace);
+      const { workspace, dependencies } = session.snapshot.graph;
+      const directory = await openGraphWorkspace(workspace);
       const temporary = await mkdtemp(join(tmpdir(), 'veyops-workspace-'));
       try {
         const archive = join(temporary, 'checkout.tar.gz');
-        const packaged = await this.runner.run('tar', ['-czf', archive, '-C', directory, 'repo'], {
-          timeout: 300,
-          signal: session.context.signal,
-        });
+        if (dependencies) {
+          await copyGraphRepository(workspace, join(temporary, 'repo'));
+          await copyGraphDependencies(dependencies, join(temporary, 'dependencies'));
+        }
+        const packaged = await this.runner.run(
+          'tar',
+          [
+            '-czf',
+            archive,
+            '-C',
+            dependencies ? temporary : directory,
+            'repo',
+            ...(dependencies ? ['dependencies'] : []),
+          ],
+          {
+            timeout: 300,
+            signal: session.context.signal,
+          },
+        );
         const details = await lstat(archive).catch(() => undefined);
         if (packaged.exitCode !== 0 || !details?.isFile() || details.size > maxArchiveBytes)
           throw new Error('工作区打包失败或超过 1GiB');
@@ -580,7 +597,12 @@ export class BuildsService {
   }
   async remoteBuild(target: SshTarget, work: string, session: BuildSession) {
     const d = session.snapshot.definition;
-    const env = Object.entries(session.variables)
+    const env = Object.entries({
+      ...session.variables,
+      ...(session.snapshot.graph?.dependencies && {
+        VEYOPS_GRAPH_DEPENDENCY_ROOT: work + '/dependencies',
+      }),
+    })
       .map(([k, v]) => `export ${k}=${q(v)}`)
       .join('\n');
     // Variables are transferred by SFTP, not embedded in command arguments or stored in task payload.
@@ -744,7 +766,7 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
       if (
         error instanceof BuildCommandError &&
         error.exitCode === 44 &&
-        !session.snapshot.deployAfterBuild
+        (!session.snapshot.deployAfterBuild || session.snapshot.managedCompose)
       )
         return;
       throw error;
@@ -884,6 +906,8 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
           '管理端 Docker 守护进程不可用。请检查 Docker 服务和平台进程的访问权限',
         );
       if (boundWorkspace) await copyGraphRepository(boundWorkspace, join(workspace, 'repo'));
+      const dependencies = session.snapshot.graph?.dependencies;
+      if (dependencies) await copyGraphDependencies(dependencies, join(workspace, 'dependencies'));
       if (d.nodes) await this.managerNodes(session, workspace, secretDir, runNode);
       else {
         if (!boundWorkspace) {
@@ -914,7 +938,10 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
         await writeFile(
           envPath,
           graphEnvironment
-            ? exportedVariables(session.variables)
+            ? exportedVariables({
+                ...session.variables,
+                ...(dependencies && { VEYOPS_GRAPH_DEPENDENCY_ROOT: '/workspace/dependencies' }),
+              })
             : Object.entries(session.variables)
                 .map(([key, value]) => `${key}=${value}`)
                 .join('\n'),
@@ -1091,7 +1118,8 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     if (buildOnly) {
       const composePath = await realpath(resolve(buildContext, d.composeFilePath)).catch(
         (error: NodeJS.ErrnoException) => {
-          if (error.code === 'ENOENT' && !session.snapshot.deployAfterBuild) return undefined;
+          if (error.code === 'ENOENT' && (!session.snapshot.deployAfterBuild || session.snapshot.managedCompose))
+            return undefined;
           throw new Error('无法读取 Compose 配置，请确认配置文件位于仓库内');
         },
       );
@@ -1182,6 +1210,8 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
       };
     }
     const localCompose = join(workspace, 'compose.yaml');
+    if (session.snapshot.managedCompose)
+      return { ...offline, imageReference: `${repository}@${imageDigest}`, imageTag, imageDigest, cleanup };
     await this.container(
       session,
       workspace,

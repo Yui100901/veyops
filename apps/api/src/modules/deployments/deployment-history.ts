@@ -154,10 +154,15 @@ export function workspaceRecentDeployments(
 
 export async function recentDeployments(
   database: Kysely<Database>,
-  scope: { projectId: string } | { serverId: string },
+  scope: { projectId: string; serviceId?: string; environmentId?: string } | { serverId: string },
+  limit = 20,
 ) {
   let query = deploymentRuns(database).select(summaryColumns);
-  if ('projectId' in scope) query = query.where('run.project_id', '=', scope.projectId);
-  else query = query.where('deployment.server_id', '=', scope.serverId);
-  return query.orderBy('run.created_at', 'desc').orderBy('deployment.id').limit(20).execute();
+  if ('projectId' in scope) {
+    query = query.where('run.project_id', '=', scope.projectId);
+    if (scope.serviceId) query = query.where('deployment.service_id', '=', scope.serviceId);
+    if (scope.environmentId)
+      query = query.where('deployment.environment_id', '=', scope.environmentId);
+  } else query = query.where('deployment.server_id', '=', scope.serverId);
+  return query.orderBy('run.created_at', 'desc').orderBy('deployment.id').limit(limit).execute();
 }

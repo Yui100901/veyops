@@ -26,6 +26,16 @@ function moduleFields(
     );
   }
   const standard = catalog?.modules[node.type]?.[kind] ?? [];
+  if (node.type === 'BUILD' && kind === 'inputs')
+    return [
+      ...standard,
+      ...(node.build?.dependencies ?? []).map((alias): GraphField => ({
+        id: 'dependency_' + alias,
+        name: '源码依赖 · ' + alias,
+        type: 'WORKSPACE',
+        required: true,
+      })),
+    ];
   if (node.type === 'SHELL' || node.type === 'CHECK')
     return [
       ...standard,

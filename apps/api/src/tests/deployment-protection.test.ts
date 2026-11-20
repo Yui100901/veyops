@@ -7,6 +7,7 @@ import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ConflictException } from '@nestjs/common';
 import {
   SshExecutionError,
   SshService,
@@ -95,6 +96,7 @@ function fixture(
     releaseKey: string;
   },
   activeSnapshot?: PipelineSnapshot,
+  sourceReview?: (snapshot: PipelineSnapshot) => void,
 ) {
   const commands: string[] = [];
   const logs: string[] = [];
@@ -143,6 +145,7 @@ function fixture(
   const deploymentService = {
     activeSnapshot: async () => activeSnapshot,
     assertApproval: async () => undefined,
+    assertSourceReview: async (release: PipelineSnapshot) => sourceReview?.(release),
     markActivated: async () => undefined,
     start: async (release: PipelineSnapshot) => {
       deploymentsStarted++;
@@ -421,6 +424,32 @@ test('automatic rollback restores the archived release under the same lock', asy
     environment.commands.map((command) => command.includes('rmdir --')).lastIndexOf(true) >
       environment.commands.findIndex((command) => command.includes('restored-health-marker')),
   );
+
+  let sourceChecks = 0;
+  const revokedDuringRestore = fixture(
+    async (command) => {
+      if (command.includes('candidate-health-marker'))
+        throw new BuildCommandError(1, 'check failed');
+    },
+    false,
+    previous,
+    undefined,
+    (restore) => {
+      assert.deepEqual(
+        restore.deploymentArtifacts?.map(({ id }) => id),
+        [artifactId],
+      );
+      if (++sourceChecks === 2) throw new ConflictException('源码审核已撤销');
+    },
+  );
+  await revokedDuringRestore.run(task(release));
+  assert.equal(sourceChecks, 2);
+  assert.equal(
+    revokedDuringRestore.commands.filter((command) => command.includes('mv -Tf')).length,
+    1,
+  );
+  assert.equal(revokedDuringRestore.statuses[0], 'NEEDS_ATTENTION');
+  assert.match(revokedDuringRestore.targetResults[0]?.error ?? '', /源码审核已撤销/);
 });
 
 test('an unconfirmed activation keeps ownership and temporary files for investigation', async () => {

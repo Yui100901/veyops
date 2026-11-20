@@ -86,7 +86,16 @@ export interface DeploymentRecord extends DeploymentSummary {
   isCurrent?: boolean;
   rollbackOfDeploymentId?: string | null;
   rollbackStatus?: string | null;
+  composeRelease?: ComposeReleaseEvidence;
 }
+export type ComposeTemplateReference =
+  | { source: 'ARCHIVE'; path?: string; checksum: string }
+  | { source: 'SERVICE_ENVIRONMENT'; path: string; version: number; checksum: string };
+export type ComposeReleaseEvidence = {
+  template: ComposeTemplateReference;
+  imageReference: string;
+  imageId: string;
+};
 export interface ReleasePolicy {
   requireApproval: boolean;
   requireCodeReview?: boolean;
@@ -178,6 +187,7 @@ export interface ProjectDetail extends Project {
   archivedRepositories?: string[];
   addresses?: ProjectAddress[];
   dependencies?: ProjectDependency[];
+  dependents?: ProjectDependent[];
   deploymentTargets?: ServerGroup[];
   recentDeployments?: DeploymentSummary[];
 }
@@ -199,6 +209,9 @@ export interface ProjectDependency {
   dependencyType: 'RUNTIME' | 'DEPLOYMENT';
   description: string;
 }
+export type ProjectDependent = Omit<ProjectDependency, 'dependsOnProjectId' | 'projectSlug'> & {
+  projectId: string;
+};
 export type DeliveryStepType =
   'CHECKOUT' | 'ENVIRONMENT' | 'INSTALL' | 'BUILD' | 'TEST' | 'SHELL' | 'PACKAGE' | 'DEPLOY';
 export interface DeliveryStepNode {
