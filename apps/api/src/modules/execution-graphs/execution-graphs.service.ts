@@ -4,22 +4,16 @@ import type { Kysely, Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
-import { requireProject } from '../projects/project-relations';
+import { lockProjectGraph, requireProject } from '../projects/project-relations';
+import { graphResourceReferences } from '../projects/project-resource-references';
+import { unavailableReference } from '../projects/project-resource-protection';
 import { canvasIssues, compileCanvas, withDraftCanvas } from './execution-graph-canvas';
 import {
   type GraphDefinition,
-  type GraphFlow,
-  type GraphNode,
   type SaveGraphDraftDto,
   validateGraphDefinition,
 } from './execution-graph-definition';
-import {
-  GraphCompileError,
-  graphModulePorts,
-  type GraphBinding,
-  type GraphDiagnostic,
-  type GraphField,
-} from './graph-fields';
+import { GraphCompileError, type GraphDiagnostic } from './graph-fields';
 
 function graphResponse(row: Selectable<Database['execution_graphs']>) {
   return {
@@ -77,92 +71,24 @@ export class ExecutionGraphsService {
     projectId: string,
     definition: GraphDefinition,
   ) {
-    const tables = {
-      REPOSITORY: 'repositories',
-      ENVIRONMENT: 'environments',
-      SERVICE: 'services',
-      ARTIFACT: 'artifacts',
-    } as const;
-    type ResourceType = keyof typeof tables;
-    type Reference = { flow: GraphFlow; node: GraphNode; field: GraphField };
-    const refs = new Map<ResourceType, Map<string, Reference>>();
-    function addReference(flow: GraphFlow, node: GraphNode, field: GraphField, value: unknown) {
-      if (!Object.hasOwn(tables, field.type)) return;
-      const type = field.type as ResourceType;
-      const layer = refs.get(type) ?? new Map<string, Reference>();
-      for (const item of Array.isArray(value) ? value : [value]) {
-        const id =
-          typeof item === 'string'
-            ? item
-            : item && typeof item === 'object' && 'id' in item && typeof item.id === 'string'
-              ? item.id
-              : undefined;
-        if (id) layer.set(id, { flow, node, field });
-      }
-      if (layer.size) refs.set(type, layer);
-    }
-    function fromBinding(
-      flow: GraphFlow,
-      node: GraphNode,
-      field: GraphField,
-      binding: GraphBinding,
-    ) {
-      if (binding.kind === 'VALUE') addReference(flow, node, field, binding.value);
-      if (binding.kind === 'FIRST_AVAILABLE')
-        for (const item of binding.sources) fromBinding(flow, node, field, item);
-    }
-    const flows = new Map(definition.flows.map((flow) => [flow.id, flow]));
-    for (const flow of definition.flows) {
-      const start = flow.nodes.find((node) => node.type === 'START')!;
-      const end = flow.nodes.find((node) => node.type === 'END')!;
-      if (flow.serviceId)
-        addReference(
-          flow,
-          start,
-          { id: 'service', name: '项目服务', type: 'SERVICE' },
-          flow.serviceId,
-        );
-      for (const input of start.inputs ?? []) addReference(flow, start, input, input.defaultValue);
-      for (const node of flow.nodes) {
-        const repository = node.checkout?.repositoryId ?? node.build?.repositoryId;
-        if (repository)
-          addReference(
-            flow,
-            node,
-            { id: 'repository', name: '项目仓库', type: 'REPOSITORY' },
-            repository,
-          );
-        const ports = graphModulePorts(node, flows.get(node.flowId ?? ''))?.inputs ?? [];
-        for (const field of ports) {
-          const binding = flow.inputBindings?.[node.id]?.[field.id];
-          if (binding) fromBinding(flow, node, field, binding);
-        }
-      }
-      for (const field of end.outputs ?? []) {
-        const binding = flow.outputBindings?.[field.id];
-        if (binding) fromBinding(flow, end, field, binding);
-      }
-    }
-    for (const [type, bindings] of refs) {
-      const ids = [...bindings.keys()];
-      const rows = await tx
-        .selectFrom(tables[type])
-        .select('id')
-        .where('project_id', '=', projectId)
-        .where('id', 'in', ids)
-        .execute();
-      const available = new Set(rows.map((row) => row.id));
-      const missing = ids.find((id) => !available.has(id));
-      if (missing) {
-        const { flow, node, field } = bindings.get(missing)!;
-        throw new GraphCompileError({
-          flowId: flow.id,
-          nodeId: node.id,
-          fieldId: field.id,
-          message: `「${flow.name}」 → 「${node.name}」 → 「${field.name}」 · 引用的资源不存在或不属于当前项目`,
-        });
-      }
-    }
+    const reference = await unavailableReference(
+      tx,
+      projectId,
+      graphResourceReferences(definition, {
+        sourceId: projectId,
+        state: 'RUNNABLE',
+      }),
+    );
+    if (!reference) return;
+    const flow = definition.flows.find(({ id }) => id === reference.flowId);
+    const node = flow?.nodes.find(({ id }) => id === reference.nodeId);
+    const path = [flow?.name, node?.name, reference.fieldId].filter(Boolean).join(' → ');
+    throw new GraphCompileError({
+      flowId: reference.flowId,
+      nodeId: reference.nodeId,
+      fieldId: reference.fieldId,
+      message: (path ? path + ' · ' : '') + '引用的资源不存在、已停用或不属于当前项目',
+    });
   }
 
   async validate(
@@ -228,6 +154,7 @@ export class ExecutionGraphsService {
 
   async publish(projectId: string, expectedRevision: number, userId: string) {
     return this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
       const graph = await this.lockDraft(tx, projectId, expectedRevision);
       const existing = await tx
         .selectFrom('execution_graph_versions')
@@ -294,6 +221,7 @@ export class ExecutionGraphsService {
         'source_revision as sourceRevision',
         'created_at as createdAt',
         'created_by as createdBy',
+        'retired_at as retiredAt',
       ])
       .where('graph_id', '=', graph.id)
       .orderBy('version', 'desc')
@@ -308,6 +236,7 @@ export class ExecutionGraphsService {
       sourceRevision: row.source_revision,
       createdAt: row.created_at,
       createdBy: row.created_by,
+      retiredAt: row.retired_at,
       definition: JSON.parse(row.definition_json) as GraphDefinition,
     };
   }
@@ -329,6 +258,41 @@ export class ExecutionGraphsService {
         tx,
       );
       return graphResponse(row);
+    });
+  }
+
+  async retire(projectId: string, version: number, userId: string) {
+    return this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      await requireProject(tx, projectId);
+      const graph = await this.graph(projectId, tx);
+      const published = await this.publishedVersion(tx, graph.id, version);
+      if (published.retired_at !== null) return { version, retiredAt: published.retired_at };
+      if (graph.published_version === version)
+        throw new ConflictException('请先发布替代版本，再停用当前发布版本');
+      const trigger = await tx
+        .selectFrom('execution_graph_triggers')
+        .select('name')
+        .where('project_id', '=', projectId)
+        .where('version', '=', version)
+        .where('enabled', '=', 1)
+        .executeTakeFirst();
+      if (trigger) throw new ConflictException(`请先停用该版本的触发器「${trigger.name}」`);
+      const retiredAt = Date.now();
+      await tx
+        .updateTable('execution_graph_versions')
+        .set({ retired_at: retiredAt })
+        .where('id', '=', published.id)
+        .execute();
+      await this.audit.record(
+        userId,
+        'execution_graph.retire',
+        'execution_graph',
+        graph.id,
+        { projectId, version },
+        tx,
+      );
+      return { version, retiredAt };
     });
   }
 

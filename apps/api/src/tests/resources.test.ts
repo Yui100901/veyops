@@ -381,6 +381,14 @@ async function checkResources(databaseUrl?: string) {
       cloneUrl: 'https://example.invalid/unused.git',
     });
     await api.delete(base + root + '/repositories/' + unused.id).expect(200);
+    const inUse = await api.delete(base + '/servers/' + server.id).expect(409);
+    assert.ok(
+      inUse.body.error.references.some(
+        (ref: { environmentId?: string; state: string }) =>
+          ref.environmentId === staging.id && ref.state === 'CONFIGURED',
+      ),
+    );
+    await api.delete(base + root + '/environments/' + staging.id).expect(200);
     await api.delete(base + '/servers/' + server.id).expect(200);
     assert.deepEqual((await fetch('/server-groups'))[0].serverIds, []);
     await api.delete(base + '/server-groups/' + group.id).expect(200);

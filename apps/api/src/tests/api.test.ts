@@ -535,8 +535,11 @@ async function checkApi(databaseUrl?: string) {
       audit.body.data.some((r: { action: string }) => r.action === 'system.settings.update'),
     );
     assert.equal(JSON.stringify(audit.body).includes('server-secret-123'), false);
-    await api.delete(`/api/v1/servers/${serverId}`).expect(200);
-    await api.get(`/api/v1/servers/${serverId}`).expect(404);
+    const usedServer = await api.delete(`/api/v1/servers/${serverId}`).expect(409);
+    assert.ok(
+      usedServer.body.error.references.some((ref: { state: string }) => ref.state === 'CONFIGURED'),
+    );
+    await api.get(`/api/v1/servers/${serverId}`).expect(200);
     const history = await api.get(`/api/v1/tasks/${command.body.data.id}/targets`).expect(200);
     assert.equal(history.body.data.length, 1);
     await api.post('/api/v1/auth/logout').expect(201);

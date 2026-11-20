@@ -4,8 +4,8 @@ import { ArrowLeft } from 'lucide-react';
 import './inline-editor.css';
 
 /** Keep the opening control mounted when switching the list to its editor. */
-export function useInlineEditor<T>() {
-  const [value, setValue] = useState<T>();
+export function useInlineEditor<T>(initial?: T) {
+  const [value, setValue] = useState<T | undefined>(initial);
   const opener = useRef<HTMLElement | null>(null);
   const change = useCallback((next: T | undefined) => {
     if (next !== undefined) {

@@ -162,6 +162,66 @@ async function checkTypedRuns(url?: string) {
       automated.nodes.find((node: { nodeId: string }) => node.nodeId === 'no').status,
       'SKIPPED',
     );
+
+    const clock = { id: 'clock', name: 'Started at', type: 'NUMBER', required: true };
+    const deferredDefinition = {
+      flows: [],
+      canvas: {
+        nodes: [
+          { id: 'entry', type: 'START', name: 'Start' },
+          { id: 'approve', type: 'APPROVAL', name: 'Approve' },
+          { id: 'call-child', type: 'FLOW_CALL', name: 'Call child', flowId: 'clock-child' },
+          { id: 'exit', type: 'END', name: 'End', outputs: [clock] },
+          { id: 'clock-child', type: 'START', name: 'Child', inputs: [clock] },
+          { id: 'clock-end', type: 'END', name: 'Child end', outputs: [clock] },
+        ],
+        edges: [
+          { from: 'entry', to: 'approve' },
+          { from: 'approve', to: 'call-child' },
+          { from: 'call-child', to: 'exit' },
+          { from: 'clock-child', to: 'clock-end' },
+        ],
+        endpoints: [
+          {
+            startId: 'entry',
+            endId: 'exit',
+            inputBindings: { 'call-child': { clock: { kind: 'CONTEXT', fieldId: 'triggeredAt' } } },
+            outputBindings: { clock: { kind: 'OUTPUT', nodeId: 'call-child', fieldId: 'clock' } },
+          },
+          {
+            startId: 'clock-child',
+            endId: 'clock-end',
+            outputBindings: { clock: { kind: 'INPUT', fieldId: 'clock' } },
+          },
+        ],
+        templates: [],
+      },
+    };
+    const publish = async (nextDefinition: object) => {
+      const { revision } = await get(graph);
+      const draft = await api
+        .put(prefix + graph + '/draft')
+        .send({ expectedRevision: revision, definition: nextDefinition })
+        .expect(200);
+      return post(graph + '/publish', { expectedRevision: draft.body.data.revision });
+    };
+    const deferred = await publish(deferredDefinition);
+    const deferredFlow = graph + '/flows/entry';
+    const deferredArgs = { version: deferred.publishedVersion };
+    const preview = await post(deferredFlow + '/preview', deferredArgs);
+    const pending = await post(deferredFlow + '/run', {
+      ...deferredArgs,
+      idempotencyKey: randomUUID(),
+      expectedConfigurationHash: preview.configurationHash,
+    });
+    assert.equal(pending.status, 'WAITING');
+    await publish(definition);
+    await post(`${graph}/versions/${deferred.publishedVersion}/retire`, {});
+    const resumed = await post(`${graph}/runs/${pending.id}/nodes/approve/decision`, {
+      decision: 'APPROVE',
+    });
+    assert.equal(resumed.status, 'SUCCESS');
+    assert.ok(resumed.outputs.clock > 0);
   } finally {
     await app.close();
     await rm(data, { recursive: true, force: true });

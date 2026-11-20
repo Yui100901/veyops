@@ -51,6 +51,8 @@ import { SystemSettingsService } from '../system/system-settings.service';
 import { readReleasePolicy } from '../deployments/release-policy';
 import type { ReleasePolicy } from '../pipelines/pipeline.types';
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
+import { lockProjectGraph } from '../projects/project-relations';
+import { unavailableReference } from '../projects/project-resource-protection';
 import {
   CredentialsService,
   variableCredentialType,
@@ -184,31 +186,33 @@ export class ServiceConfigsService {
     if (!row) throw new NotFoundException('项目不存在');
     return row;
   }
-  private async service(id: string) {
-    const r = await this.database.db
+  private async service(id: string, db = this.database.db) {
+    const r = await db
       .selectFrom('services')
       .innerJoin('projects', 'projects.id', 'services.project_id')
       .select(['services.id', 'services.slug', 'services.project_id'])
       .where('services.id', '=', id)
+      .where('services.archived_at', 'is', null)
       .where('projects.deleted_at', 'is', null)
       .executeTakeFirst();
     if (!r) throw new NotFoundException('服务不存在');
     return r;
   }
-  private async environment(id: string) {
-    const r = await this.database.db
+  private async environment(id: string, db = this.database.db) {
+    const r = await db
       .selectFrom('environments')
       .innerJoin('projects', 'projects.id', 'environments.project_id')
       .select(['environments.id', 'environments.project_id'])
       .where('environments.id', '=', id)
+      .where('environments.archived_at', 'is', null)
       .where('projects.deleted_at', 'is', null)
       .executeTakeFirst();
     if (!r) throw new NotFoundException('环境不存在');
     return r;
   }
-  private async assertScope(serviceId: string, environmentId: string) {
-    const s = await this.service(serviceId),
-      e = await this.environment(environmentId);
+  private async assertScope(serviceId: string, environmentId: string, db = this.database.db) {
+    const s = await this.service(serviceId, db),
+      e = await this.environment(environmentId, db);
     if (s.project_id !== e.project_id) throw new BadRequestException('服务和环境必须属于同一项目');
     return s.project_id;
   }
@@ -286,6 +290,15 @@ export class ServiceConfigsService {
         updated_at: now,
       };
     const config = await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      await this.assertScope(serviceId, environmentId, tx);
+      if (
+        input.targetId &&
+        (await unavailableReference(tx, projectId, [
+          { resourceType: 'LEGACY_TARGET', resourceId: input.targetId },
+        ]))
+      )
+        throw new NotFoundException('部署目标不存在');
       if (selection) await selectedServerIds(tx, selection);
       if (policy?.rollbackMode === 'PINNED') {
         const baseline = await tx
@@ -481,6 +494,7 @@ export class ServiceConfigsService {
     // The parent lock serializes even concurrent writes to an initially empty scope.
     let lock = tx.updateTable(table).set((eb) => ({ updated_at: eb.ref('updated_at') }));
     if (table === 'projects') lock = lock.where('deleted_at', 'is', null);
+    if (table === 'environments') lock = lock.where('archived_at', 'is', null);
     const parent = await lock.where('id', '=', scope.id).returning('id').executeTakeFirst();
     if (!parent) throw new NotFoundException('变量所属资源不存在');
   }
@@ -490,6 +504,9 @@ export class ServiceConfigsService {
     const reserved = input.variables.find((v) => systemVariableName.test(v.key));
     if (reserved) throw new BadRequestException(`${reserved.key} 由系统提供`);
     return this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      if (scope.kind === 'serviceEnvironment')
+        await this.assertScope(scope.serviceId, scope.environmentId, tx);
       await this.lockVariableScope(tx, scope);
       const [table, parent] = variableScopes[scope.kind];
       const old = new Map(
@@ -632,7 +649,6 @@ export class ServiceConfigsService {
     }));
   }
   async saveLinks(serviceId: string, input: RepoLinksDto, userId: string) {
-    const s = await this.service(serviceId);
     if (
       new Set(input.repositories.map((r) => r.repositoryId)).size !== input.repositories.length ||
       input.repositories.filter((r) => r.isPrimary).length > 1
@@ -641,17 +657,21 @@ export class ServiceConfigsService {
     for (const r of input.repositories) {
       if (r.repoPath.startsWith('/') || r.repoPath.split(/[\\/]/).includes('..'))
         throw new BadRequestException('仓库子目录必须位于仓库中');
-      if (
-        !(await this.database.db
-          .selectFrom('repositories')
-          .select('id')
-          .where('id', '=', r.repositoryId)
-          .where('project_id', '=', s.project_id)
-          .executeTakeFirst())
-      )
-        throw new BadRequestException('仓库必须属于同一项目');
     }
     await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      const service = await this.service(serviceId, tx);
+      if (
+        await unavailableReference(
+          tx,
+          service.project_id,
+          input.repositories.map(({ repositoryId }) => ({
+            resourceType: 'REPOSITORY',
+            resourceId: repositoryId,
+          })),
+        )
+      )
+        throw new BadRequestException('仓库必须可用且属于同一项目');
       const parent = await tx
         .updateTable('services')
         .set((eb) => ({ updated_at: eb.ref('updated_at') }))

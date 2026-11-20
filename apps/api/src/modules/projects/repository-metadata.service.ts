@@ -213,6 +213,7 @@ export class RepositoryMetadataService {
       .selectAll('repositories')
       .where('repositories.id', '=', repositoryId)
       .where('repositories.project_id', '=', projectId)
+      .where('repositories.archived_at', 'is', null)
       .where('projects.deleted_at', 'is', null)
       .executeTakeFirst();
   }
@@ -736,6 +737,7 @@ export class RepositoryMetadataService {
       .select(['repositories.clone_url', 'repositories.credential_id'])
       .where('repositories.id', '=', repositoryId)
       .where('repositories.project_id', '=', projectId)
+      .where('repositories.archived_at', 'is', null)
       .where('projects.deleted_at', 'is', null)
       .executeTakeFirst();
     if (!repository) throw new NotFoundException('仓库不存在');

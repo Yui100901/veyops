@@ -25,6 +25,11 @@ import type { AuthRequest } from '../auth/auth.guard';
 import { AuditService } from '../audit/audit.service';
 import { pipelineNodeSecrets } from '../pipelines/pipeline-node-config';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
+import { lockProjectGraph } from '../projects/project-relations';
+import {
+  assertProjectResourceRemovable,
+  ResourceReferenceConflict,
+} from '../projects/project-resource-protection';
 
 export const variableCredentialType = 'ENVIRONMENT_VARIABLE';
 
@@ -217,6 +222,8 @@ export class CredentialsService {
     if (!row) throw new NotFoundException('凭据不存在');
     try {
       await this.database.db.transaction().execute(async (tx) => {
+        await lockProjectGraph(tx);
+        await assertProjectResourceRemovable(tx, { resourceType: 'CREDENTIAL', resourceId: id });
         await tx
           .updateTable('credentials')
           .set((eb) => ({ updated_at: eb.ref('updated_at') }))
@@ -235,7 +242,8 @@ export class CredentialsService {
           throw new ConflictException('凭据被流水线环境节点引用');
         await tx.deleteFrom('credentials').where('id', '=', id).execute();
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof ResourceReferenceConflict) throw error;
       throw new ConflictException('凭据正在被资源或历史任务引用，不能删除；可以禁用');
     }
     await this.audit.record(userId, 'credential.delete', 'credential', id);

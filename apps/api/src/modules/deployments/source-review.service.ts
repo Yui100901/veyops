@@ -90,7 +90,9 @@ export class SourceReviewService {
       .where('projects.id', '=', projectId)
       .where('projects.deleted_at', 'is', null)
       .where('services.id', '=', serviceId)
+      .where('services.archived_at', 'is', null)
       .where('environments.id', '=', environmentId)
+      .where('environments.archived_at', 'is', null)
       .executeTakeFirst();
     if (!exists) throw new NotFoundException('当前项目没有该服务和环境组合');
   }

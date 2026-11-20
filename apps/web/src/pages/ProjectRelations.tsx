@@ -177,29 +177,7 @@ export function ProjectRelations({
           <p className="mini-empty">暂无项目依赖</p>
         )}
       </Section>
-      <Section
-        title="项目部署概览"
-        action={
-          <a href="#/servers" className="text-link">
-            管理服务器与分组
-          </a>
-        }
-      >
-
-        <div className="resource-list">
-          {(project.deploymentTargets ?? []).map((target) => (
-            <div key={target.id}>
-              <span className="resource-avatar">
-                <Network size={17} />
-              </span>
-              <div>
-                <strong>{target.name}</strong>
-                <small>{target.description}</small>
-              </div>
-              <span className="tag">{target.serverIds.length} 台</span>
-            </div>
-          ))}
-        </div>
+      <Section title="最近部署">
         <DeploymentHistory
           rows={project.recentDeployments ?? []}
           resolveName={(row) =>

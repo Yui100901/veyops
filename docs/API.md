@@ -32,6 +32,21 @@
 
 ## 资源
 
+`GET /projects/:projectId/resource-references` 返回 `{servers, references}`。服务器按 ID 合并，列表保留直接选择、分组成员、旧部署目标及执行图等来源。每条引用包含 `resourceType`、`resourceId`、`sourceKind`、`sourceId`、`state`，并按来源附带服务、环境、图版本、节点、触发器、运行、任务或分组 ID。`CONFIGURED` 表示配置中使用，`DRAFT` 表示草稿引用，`RUNNABLE` 表示可运行版本或已启用规则，`PENDING` 表示尚未完成的运行或任务，`HISTORY` 表示冻结的历史来源。`RUN` 来源包含该次确认的计划和候选目标，逐目标结果以任务或部署记录为准。仅在某次运行选中的主机通过运行或任务来源追溯。两项目共享同一主机时，各自返回本项目的来源。
+
+项目仓库、服务和环境移除后归档并退出新选择，历史数据继续使用原 ID。仍有可运行、已配置或待执行引用时返回 409，`error.references` 提供需先调整的来源。草稿保持可编辑，发布时重新校验归属和可用状态。
+
+### 执行配置归属
+
+统一预览按下列归属解释配置来源。此批资源查询以已保存配置和执行快照为准。运行配置的统一解析安排在 P0-B。
+
+| 字段 | 所属配置与顺序 |
+| --- | --- |
+| 构建位置、并发、工作区根目录、日志保留 | 系统默认，项目可覆盖。构建节点可选择执行位置，已声明且允许调整的运行参数可指定并发。 |
+| 代码与构建产物 | Git 节点固定仓库、ref 和实际 SHA。构建节点声明工作目录、命令及具名产物，部署节点绑定已登记产物。 |
+| 环境文件和变量 | 节点显式文件、环境配置路径、约定探测依次尝试。变量由低到高为文件、项目、环境、服务环境、节点绑定。平台保留键由系统赋值。 |
+| 发布目标和策略 | 允许运行选择、服务环境覆盖、项目环境默认目标依次生效。发布方式、目录、健康检查、审核、审批和回滚由服务环境管理。 |
+
 | 方法                 | 路径                       | 请求 / 说明                                                                                                  |
 | -------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | GET / POST           | /credentials               | 列表 / `{name,type,secret,metadata?}`                                                                        |
@@ -103,6 +118,7 @@
 | `PUT /draft` | 提交 `{expectedRevision, definition:{flows:[],canvas:{nodes,edges,endpoints,templates}}}`。 |
 | `POST /publish` | 提交 `{expectedRevision}`，校验并固定已保存的图版本。 |
 | `GET /versions`、`GET /versions/:version` | 查询发布历史和具体发布版本。 |
+| `POST /versions/:version/retire` | 管理员或操作员停用旧发布版。先发布替代版本，再停用绑定该旧版的启用触发器。返回 `{version,retiredAt}`。停用版保留定义和运行历史，在途计划继续保护其资源。 |
 | `POST /versions/:version/restore` | 提交 `{expectedRevision}`，将发布版本载入草稿。 |
 | `POST /flows/:flowId/preview` | 提交 `{version,inputs:{parameters}}`，返回实际参数、固定提交、产物来源、目标、审批条件和 `configurationHash`。 |
 | `POST /flows/:flowId/run` | 提交同样的版本和输入，附 `expectedConfigurationHash` 和 `idempotencyKey`。相同确认可取回原运行。 |

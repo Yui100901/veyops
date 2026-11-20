@@ -21,7 +21,9 @@ import {
   type DeliveryExecutionProfile,
 } from '../pipelines/delivery-execution-profile';
 import { pendingReleaseApprovalTime } from '../deployments/release-policy';
-import { requireProject } from '../projects/project-relations';
+import { lockProjectGraph, requireProject } from '../projects/project-relations';
+import { runResourceReferences } from '../projects/project-resource-references';
+import { unavailableReference } from '../projects/project-resource-protection';
 import { RepositoryMetadataService } from '../projects/repository-metadata.service';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { TasksService } from '../tasks/tasks.service';
@@ -197,15 +199,21 @@ export class GraphRunnerService implements OnModuleInit {
     this.registry?.registerGraphPump((taskId) => (taskId ? this.taskChanged(taskId) : this.tick()));
   }
 
-  private async published(projectId: string, version: number, db = this.database.db) {
+  private async published(
+    projectId: string,
+    version: number,
+    db = this.database.db,
+    runnable = false,
+  ) {
     const row = await db
       .selectFrom('execution_graph_versions as version')
       .innerJoin('execution_graphs as graph', 'graph.id', 'version.graph_id')
-      .select(['graph.id as graphId', 'version.definition_json'])
+      .select(['graph.id as graphId', 'version.definition_json', 'version.retired_at'])
       .where('graph.project_id', '=', projectId)
       .where('version.version', '=', version)
       .executeTakeFirst();
     if (!row) throw new NotFoundException('项目执行图发布版本不存在');
+    if (runnable && row.retired_at !== null) throw new ConflictException('该执行图版本已停用');
     return { graphId: row.graphId, definition: JSON.parse(row.definition_json) as GraphDefinition };
   }
 
@@ -301,6 +309,7 @@ export class GraphRunnerService implements OnModuleInit {
           .selectFrom(table)
           .select('id')
           .where('project_id', '=', projectId)
+          .where('archived_at', 'is', null)
           .where('id', 'in', [...new Set(ids)] as string[])
           .execute();
         if (rows.length !== new Set(ids).size)
@@ -618,9 +627,15 @@ export class GraphRunnerService implements OnModuleInit {
     flowId: string,
     request: GraphPreviewDto,
     trigger?: Values,
+    allowRetired = false,
   ) {
     await requireProject(this.database.db, projectId);
-    const { graphId, definition } = await this.published(projectId, request.version);
+    const { graphId, definition } = await this.published(
+      projectId,
+      request.version,
+      this.database.db,
+      !allowRetired,
+    );
     const flow = this.flow(definition, flowId);
     const inputs = await this.resolveParameters(projectId, flow, request.inputs ?? {});
     if (inputs.value && redactTaskLog(inputs.value) !== inputs.value)
@@ -951,7 +966,21 @@ export class GraphRunnerService implements OnModuleInit {
     if (request.expectedConfigurationHash !== preview.configurationHash)
       throw new ConflictException('版本、运行参数或实际执行配置已变化，请重新预览');
     const row = await db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
       await this.lockProject(tx, projectId);
+      const confirmed = await this.published(projectId, request.version, tx, true);
+      const references = runResourceReferences(
+        confirmed.definition,
+        {
+          sourceId: preview.graphId,
+          version: request.version,
+          flowId,
+          state: 'PENDING',
+        },
+        { inputs, deliveries: plans, children },
+      );
+      if (await unavailableReference(tx, projectId, references))
+        throw new ConflictException('计划引用的资源已变化，请重新预览');
       await origin?.beforeInsert?.(tx);
       const inserted = await this.insertRun(
         tx,
@@ -1351,12 +1380,14 @@ export class GraphRunnerService implements OnModuleInit {
         flow.id,
         { version: run.version, inputs: { ...snapshot.inputs, parameters } },
         snapshot.trigger,
+        true,
       ));
     const confirmedHash =
       'preview' in prepared
         ? prepared.preview.configurationHash
         : digest([run.configuration_hash, node.node_id, prepared]);
     return this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
       const parent = await this.lockRun(tx, run.id);
       if (!parent || parent.status === 'CANCEL_REQUESTED') return undefined;
       const existing = await tx
@@ -1366,6 +1397,21 @@ export class GraphRunnerService implements OnModuleInit {
         .executeTakeFirstOrThrow();
       if (existing.child_run_id) return existing.child_run_id;
       const rootId = snapshot.rootId ?? run.id;
+      const childSnapshot = {
+        inputs: prepared.inputs,
+        rootId,
+        trigger: snapshot.trigger,
+        deliveries: prepared.plans,
+        children: prepared.children,
+      };
+      const { definition } = await this.published(run.project_id, run.version, tx);
+      const references = runResourceReferences(
+        definition,
+        { sourceId: run.id, version: run.version, flowId: flow.id, state: 'PENDING' },
+        childSnapshot,
+      );
+      if (await unavailableReference(tx, run.project_id, references))
+        throw new ConflictException('子执行流所需的资源已变化');
       const child = await this.insertRun(
         tx,
         {
@@ -1380,13 +1426,7 @@ export class GraphRunnerService implements OnModuleInit {
           idempotency_key: `child:${run.id}:${node.id}`,
           request_hash: run.request_hash,
           configuration_hash: confirmedHash,
-          inputs_json: JSON.stringify({
-            inputs: prepared.inputs,
-            rootId,
-            trigger: snapshot.trigger,
-            deliveries: prepared.plans,
-            children: prepared.children,
-          }),
+          inputs_json: JSON.stringify(childSnapshot),
         },
         flow,
         prepared.inputs,

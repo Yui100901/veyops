@@ -1,0 +1,66 @@
+.project-server-inventory,
+.project-server-references {
+  display: grid;
+  gap: 8px;
+}
+
+.project-server-inventory {
+  padding: 12px var(--surface-inset);
+}
+
+.form-body > .project-server-inventory {
+  padding-inline: 0;
+}
+
+.project-server-entry {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.project-server-entry > summary {
+  padding: 10px 12px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.project-server-entry > summary > * {
+  margin-inline-end: 8px;
+}
+
+.project-server-entry > summary > svg {
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.project-server-references {
+  list-style: none;
+  margin: 0;
+  padding: 0 12px 12px;
+}
+
+.project-server-references li {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+.project-server-source {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+
+.project-server-references small {
+  display: block;
+  margin-top: 4px;
+}
+
+.project-server-history {
+  margin: 0 12px 12px;
+}
+
+.project-server-history > summary {
+  cursor: pointer;
+}

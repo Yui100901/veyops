@@ -1,5 +1,6 @@
 import {
   Body,
+  BadRequestException,
   Controller,
   Delete,
   Get,
@@ -25,6 +26,11 @@ import { ServersService } from './servers.service';
 import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
+import { lockProjectGraph } from '../projects/project-relations';
+import {
+  assertProjectResourceRemovable,
+  unavailableReference,
+} from '../projects/project-resource-protection';
 class GroupDto {
   @IsString() @MinLength(1) @MaxLength(100) name!: string;
   @IsOptional() @IsString() @MaxLength(2000) description?: string;
@@ -72,6 +78,15 @@ class ServerGroupsController {
     const values = { name: dto.name, description: dto.description ?? '' };
     const serverIds = [...new Set(dto.serverIds)];
     await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      if (
+        await unavailableReference(
+          tx,
+          '',
+          serverIds.map((resourceId) => ({ resourceType: 'SERVER', resourceId })),
+        )
+      )
+        throw new BadRequestException('部分服务器已停用或不存在');
       if (groupId) {
         const updated = await tx
           .updateTable('server_groups')
@@ -112,13 +127,25 @@ class ServerGroupsController {
     @Param('id') id: string,
     @Req() req: AuthRequest,
   ) {
-    const removed = await this.database.db
-      .deleteFrom('server_groups')
-      .where('id', '=', id)
-      .returning('id')
-      .executeTakeFirst();
-    if (!removed) throw new NotFoundException('分组不存在');
-    await this.audit.record(req.user.id, 'server-group.delete', 'server-group', id);
+    await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      const group = await tx
+        .selectFrom('server_groups')
+        .select('id')
+        .where('id', '=', id)
+        .executeTakeFirst();
+      if (!group) throw new NotFoundException('分组不存在');
+      await assertProjectResourceRemovable(tx, { resourceType: 'SERVER_GROUP', resourceId: id });
+      await tx.deleteFrom('server_groups').where('id', '=', id).execute();
+      await this.audit.record(
+        req.user.id,
+        'server-group.delete',
+        'server-group',
+        id,
+        undefined,
+        tx,
+      );
+    });
     return { success: true };
   }
 }

@@ -144,6 +144,8 @@ export function ProjectGraphEditor({
   onChange,
   renderStart,
   issues = [],
+  initialNodeId,
+  initialFlowId,
 }: {
   canvas: GraphCanvas;
   project: ProjectDetail;
@@ -151,12 +153,16 @@ export function ProjectGraphEditor({
   onChange: (canvas: GraphCanvas) => void;
   renderStart?: (startId: string) => ReactNode;
   issues?: GraphIssue[];
+  initialNodeId?: string;
+  initialFlowId?: string;
 }) {
-  const [selection, select] = useState<Selection>();
+  const [selection, select] = useState<Selection | undefined>(
+    initialNodeId ? { kind: 'node', id: initialNodeId } : undefined,
+  );
   const [hovered, hover] = useState<string>();
   const [source, setSource] = useState<string>();
   const [connector, setConnector] = useState<Connector>();
-  const [startId, setStartId] = useState<string>();
+  const [startId, setStartId] = useState<string | undefined>(initialFlowId);
   const [templateType, setTemplateType] = useState<NodeType>('CHECKOUT');
   const [error, setError] = useState('');
   const catalog = useResource<GraphCatalog>('/projects/' + project.id + '/execution-graph/catalog');

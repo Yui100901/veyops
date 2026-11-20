@@ -45,6 +45,11 @@ export class ApiExceptionFilter implements ExceptionFilter {
       error: {
         code: `HTTP_${status}`,
         message: Array.isArray(message) ? message.join('；') : message,
+        ...(status === 409 &&
+          body &&
+          typeof body === 'object' &&
+          'references' in body &&
+          Array.isArray(body.references) && { references: body.references }),
       },
     });
   }

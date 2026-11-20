@@ -25,6 +25,9 @@ import { pendingReleaseApprovalTime, serviceReleasePolicy } from '../deployments
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
 import { storeDeliveryProfile } from '../pipelines/delivery-execution-profile';
 import { isStandaloneGraphBuild } from '../pipelines/pipeline.types';
+import { lockProjectGraph } from '../projects/project-relations';
+import { taskPayloadResourceReferences } from '../projects/project-resource-references';
+import { unavailableReference } from '../projects/project-resource-protection';
 
 const terminal = new Set<string>(terminalTaskStatuses);
 export const isTerminalStatus = (status: string) => terminal.has(status);
@@ -105,7 +108,34 @@ export class TasksService {
     afterInsert?: (tx: Transaction<Database>, taskId: string) => Promise<void>,
   ) {
     const taskId = await this.database.db.transaction().execute(async (tx) => {
+      if (input.scope?.projectId) await lockProjectGraph(tx);
       const existing = await beforeInsert?.(tx);
+      if (!existing && input.scope?.projectId) {
+        const references = taskPayloadResourceReferences(
+          {
+            sourceKind: 'TASK',
+            sourceId: input.scope.projectId,
+            state: 'PENDING',
+            serviceId: input.scope.serviceId,
+            environmentId: input.scope.environmentId,
+          },
+          input.payload,
+        );
+        const scoped = [
+          ...references,
+          ...(input.scope.serviceId
+            ? [{ resourceType: 'SERVICE' as const, resourceId: input.scope.serviceId }]
+            : []),
+          ...(input.scope.environmentId
+            ? [{ resourceType: 'ENVIRONMENT' as const, resourceId: input.scope.environmentId }]
+            : []),
+          ...(input.scope.targetId
+            ? [{ resourceType: 'LEGACY_TARGET' as const, resourceId: input.scope.targetId }]
+            : []),
+        ];
+        if (await unavailableReference(tx, input.scope.projectId, scoped))
+          throw new ConflictException('任务引用的资源已变化，请重新预览');
+      }
       const id = existing || (await this.createInTransaction(tx, input, userId));
       await afterInsert?.(tx, id);
       return id;

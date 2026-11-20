@@ -36,6 +36,12 @@ import { AuditService } from '../audit/audit.service';
 import { SystemSettingsService } from '../system/system-settings.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
+import { lockProjectGraph } from '../projects/project-relations';
+import {
+  assertProjectResourceRemovable,
+  ResourceReferenceConflict,
+  unavailableReference,
+} from '../projects/project-resource-protection';
 
 export class DeploymentTargetDto {
   @IsString() @MinLength(1) @MaxLength(100) name!: string;
@@ -102,6 +108,15 @@ export class DeploymentTargetsService {
     const targetId = id || randomUUID(),
       now = Date.now();
     await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      if (
+        await unavailableReference(
+          tx,
+          '',
+          serverIds.map((resourceId) => ({ resourceType: 'SERVER', resourceId })),
+        )
+      )
+        throw new BadRequestException('部分服务器已停用或不存在');
       const values = {
         name: input.name,
         description: input.description,
@@ -111,7 +126,13 @@ export class DeploymentTargetsService {
         updated_at: now,
       };
       if (id) {
-        await tx.updateTable('deployment_targets').set(values).where('id', '=', id).execute();
+        const updated = await tx
+          .updateTable('deployment_targets')
+          .set(values)
+          .where('id', '=', id)
+          .returning('id')
+          .executeTakeFirst();
+        if (!updated) throw new NotFoundException('部署目标不存在');
         await tx.deleteFrom('deployment_target_servers').where('target_id', '=', id).execute();
       } else
         await tx
@@ -141,8 +162,19 @@ export class DeploymentTargetsService {
   async remove(id: string, userId: string) {
     await this.get(id);
     try {
-      await this.database.db.deleteFrom('deployment_targets').where('id', '=', id).execute();
-    } catch {
+      await this.database.db.transaction().execute(async (tx) => {
+        await lockProjectGraph(tx);
+        await assertProjectResourceRemovable(tx, { resourceType: 'LEGACY_TARGET', resourceId: id });
+        const removed = await tx
+          .deleteFrom('deployment_targets')
+          .where('id', '=', id)
+          .returning('id')
+          .executeTakeFirst();
+        if (!removed) throw new NotFoundException('部署目标不存在');
+      });
+    } catch (error) {
+      if (error instanceof ResourceReferenceConflict || error instanceof NotFoundException)
+        throw error;
       throw new ConflictException('部署目标被环境配置或历史记录引用，不能删除');
     }
     await this.audit.record(userId, 'deployment-target.delete', 'deployment-target', id);

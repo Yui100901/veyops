@@ -1574,6 +1574,21 @@ export const migrationProvider: MigrationProvider = {
           await db.schema.dropTable('service_source_reviews').execute();
         },
       } satisfies Migration,
+      '023_project_resource_lifecycle': {
+        async up(db) {
+          for (const table of ['repositories', 'services', 'environments'])
+            await db.schema.alterTable(table).addColumn('archived_at', 'bigint').execute();
+          await db.schema
+            .alterTable('execution_graph_versions')
+            .addColumn('retired_at', 'bigint')
+            .execute();
+        },
+        async down(db) {
+          await db.schema.alterTable('execution_graph_versions').dropColumn('retired_at').execute();
+          for (const table of ['environments', 'services', 'repositories'])
+            await db.schema.alterTable(table).dropColumn('archived_at').execute();
+        },
+      } satisfies Migration,
     };
   },
 };

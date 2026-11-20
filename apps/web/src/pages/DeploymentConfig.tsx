@@ -13,6 +13,7 @@ import type {
 } from '../models';
 import { ArtifactRetentionPolicy } from './ArtifactRetention';
 import { FailureHandling } from './FailureHandling';
+import { ProjectServerInventory, type ServiceEnvironmentContext } from './ProjectServerInventory';
 import {
   DeploymentSelectionPicker,
   deploymentSelection,
@@ -39,12 +40,14 @@ export function ProjectDeploymentConfig({
   project,
   user,
   reloadProject,
+  initialEnvironment,
 }: {
   project: ProjectDetail;
   user: User;
   reloadProject: () => Promise<void>;
+  initialEnvironment?: ServiceEnvironmentContext;
 }) {
-  const [selected, setSelected] = useInlineEditor<{ serviceId: string; environmentId: string }>();
+  const [selected, setSelected] = useInlineEditor<ServiceEnvironmentContext>(initialEnvironment);
   const [binding, setBinding] = useInlineEditor<string>();
   return (
     <Section
@@ -139,7 +142,7 @@ function EnvironmentConfigEditor({
   const [artifactType, setArtifactType] = useState('FILE');
   const [selection, setSelection] = useState<DeploymentSelection>(() => deploymentSelection());
   const [editRetention, setEditRetention] = useState(false);
-  const [tab, setTab] = useState<'settings' | 'reviews' | 'failure'>('settings');
+  const [tab, setTab] = useState<'settings' | 'servers' | 'reviews' | 'failure'>('settings');
   useEffect(() => {
     setArtifactType(config.data?.artifactType || 'FILE');
     setSelection(deploymentSelection(config.data));
@@ -208,6 +211,9 @@ function EnvironmentConfigEditor({
         <button type="button" aria-pressed={tab === 'settings'} onClick={() => setTab('settings')}>
           部署设置
         </button>
+        <button type="button" aria-pressed={tab === 'servers'} onClick={() => setTab('servers')}>
+          服务器及来源
+        </button>
         <button type="button" aria-pressed={tab === 'reviews'} onClick={() => setTab('reviews')}>
           代码审核
         </button>
@@ -215,6 +221,9 @@ function EnvironmentConfigEditor({
           故障处理
         </button>
       </nav>
+      {tab === 'servers' && (
+        <ProjectServerInventory project={project} scope={{ serviceId, environmentId }} />
+      )}
       {tab === 'failure' && (
         <FailureHandling user={user} serviceId={serviceId} environmentId={environmentId} />
       )}

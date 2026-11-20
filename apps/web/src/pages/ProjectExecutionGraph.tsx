@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Play, Redo2, Save, Undo2, Upload } from 'lucide-react';
 import { api, ApiError, formatTime, message, post, useResource } from '../api';
-import { ErrorBanner, Field, Loading, PageHeader, Section } from '../components';
+import { Confirm, ErrorBanner, Field, Loading, PageHeader, Section } from '../components';
 import type { ProjectDetail, User } from '../models';
 import { NodeMap } from './ExecutionGraphCanvas';
 import { ProjectGraphEditor } from './ExecutionGraphEditor';
@@ -28,10 +28,12 @@ export default function ProjectExecutionGraph({
   id,
   user,
   runId,
+  search,
 }: {
   id: string;
   user: User;
   runId?: string;
+  search?: string;
 }) {
   const base = `/projects/${encodeURIComponent(id)}`;
   const project = useResource<ProjectDetail>(base + '/delivery-context');
@@ -56,6 +58,7 @@ export default function ProjectExecutionGraph({
       canEdit={user.role !== 'VIEWER' && !project.data.archived}
       isAdmin={user.role === 'ADMIN'}
       runId={runId}
+      search={search}
     />
   );
 }
@@ -67,6 +70,7 @@ function Workspace({
   canEdit,
   isAdmin,
   runId,
+  search,
 }: {
   project: ProjectDetail;
   initial: GraphDocument;
@@ -74,17 +78,26 @@ function Workspace({
   canEdit: boolean;
   isAdmin: boolean;
   runId?: string;
+  search?: string;
 }) {
+  const params = new URLSearchParams(search);
+  const paneParam = params.get('pane');
+  const linkedPane = runId
+    ? 'history'
+    : paneParam === 'draft' || paneParam === 'published' || paneParam === 'history'
+      ? paneParam
+      : undefined;
+  const rawVersion = Number(params.get('version'));
+  const linkedVersion = Number.isSafeInteger(rawVersion) && rawVersion > 0 ? rawVersion : undefined;
+  const linkedNode = params.get('node') ?? undefined;
+  const linkedFlow = params.get('flow') ?? undefined;
+  const linkedStart = params.get('start') ?? undefined;
   const [graph, setGraph] = useState(initial);
   const [canvas, setCanvas] = useState(initial.draft.canvas ?? emptyCanvas);
   const [undo, setUndo] = useState<GraphCanvas[]>([]);
   const [redo, setRedo] = useState<GraphCanvas[]>([]);
-  const [pane, setPane] = useState<Pane>(
-    runId || new URLSearchParams(window.location.hash.split('?')[1]).get('pane') === 'history'
-      ? 'history'
-      : 'run',
-  );
-  const [version, setVersion] = useState<number | null>(initial.publishedVersion);
+  const [pane, setPane] = useState<Pane>(linkedPane ?? 'run');
+  const [version, setVersion] = useState<number | null>(linkedVersion ?? initial.publishedVersion);
   const [selectedRun, setSelectedRun] = useState(runId);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -98,11 +111,11 @@ function Workspace({
   );
 
   useEffect(() => {
-    if (runId) {
-      setSelectedRun(runId);
-      setPane('history');
-    }
-  }, [runId]);
+    if (runId) setSelectedRun(runId);
+    if (linkedPane) setPane(linkedPane);
+    else if (linkedStart) setPane('run');
+    if (linkedVersion) setVersion(linkedVersion);
+  }, [runId, linkedPane, linkedStart, linkedVersion]);
 
   async function persist(action: 'save' | 'publish' | 'reload' | 'validate') {
     if (saving.current) return;
@@ -239,14 +252,12 @@ function Workspace({
               <Loading />
             ) : latest.data && latest.data.version === graph.publishedVersion ? (
               <PublishedRun
-                key={latest.data.version}
+                key={`${latest.data.version}:${linkedStart ?? ''}`}
                 published={latest.data}
                 project={project}
                 path={path}
                 canRun={canEdit}
-                startId={
-                  new URLSearchParams(window.location.hash.split('?')[1]).get('start') ?? undefined
-                }
+                startId={linkedStart}
                 onRun={openRun}
               />
             ) : (
@@ -322,11 +333,14 @@ function Workspace({
           }
         >
           <ProjectGraphEditor
+            key={`${linkedNode ?? ''}:${linkedFlow ?? ''}`}
             project={project}
             canvas={canvas}
             canEdit={canEdit && !busy}
             onChange={edit}
             issues={issues}
+            initialNodeId={linkedNode}
+            initialFlowId={linkedFlow}
             renderStart={(startId) =>
               !project.archived && (
                 <StartTriggers
@@ -354,6 +368,9 @@ function Workspace({
           key={graph.publishedVersion}
           path={path}
           canRestore={canEdit}
+          latestVersion={graph.publishedVersion}
+          linkedNode={linkedNode}
+          linkedFlow={linkedFlow}
           revision={graph.revision}
           dirty={dirty || conflict}
           version={version ?? graph.publishedVersion}
@@ -503,6 +520,9 @@ function StartTriggers({
 function PublishedVersions({
   path,
   canRestore,
+  latestVersion,
+  linkedNode,
+  linkedFlow,
   revision,
   dirty,
   version,
@@ -512,6 +532,9 @@ function PublishedVersions({
 }: {
   path: string;
   canRestore: boolean;
+  latestVersion: number | null;
+  linkedNode?: string;
+  linkedFlow?: string;
   revision: number;
   dirty: boolean;
   version: number | null;
@@ -519,12 +542,33 @@ function PublishedVersions({
   onRestored: (graph: GraphDocument, version: number) => void;
   onConflict: () => void;
 }) {
-  const list = useResource<{ version: number; createdAt: number }[]>(path + '/versions');
+  const list = useResource<{ version: number; createdAt: number; retiredAt?: number | null }[]>(
+    path + '/versions',
+  );
+  const [retiring, setRetiring] = useState<number>();
+  const [retireError, setRetireError] = useState('');
+  const [retireBusy, setRetireBusy] = useState(false);
   const activeVersion = version ?? list.data?.[0]?.version;
   const item = useResource<PublishedGraph>(
     activeVersion ? path + '/versions/' + activeVersion : null,
   );
   const live = item.data?.version === activeVersion ? item.data : undefined;
+  const retiredAt = list.data?.find((entry) => entry.version === activeVersion)?.retiredAt;
+
+  async function retireVersion() {
+    if (retiring === undefined || retireBusy) return;
+    setRetireBusy(true);
+    setRetireError('');
+    try {
+      await post(`${path}/versions/${retiring}/retire`);
+      await list.reload();
+      setRetiring(undefined);
+    } catch (error) {
+      setRetireError(message(error));
+    } finally {
+      setRetireBusy(false);
+    }
+  }
   return (
     <Section title="发布版本">
       <div className="graph-fields">
@@ -540,9 +584,10 @@ function PublishedVersions({
                 value={activeVersion ?? ''}
                 onChange={(event) => setVersion(Number(event.target.value))}
               >
-                {list.data.map(({ version, createdAt }) => (
+                {list.data.map(({ version, createdAt, retiredAt }) => (
                   <option key={version} value={version}>
                     v{version} · {formatTime(createdAt)}
+                    {retiredAt ? ' · 已停用' : ''}
                   </option>
                 ))}
               </select>
@@ -560,10 +605,45 @@ function PublishedVersions({
                   onRestored={onRestored}
                   onConflict={onConflict}
                 />
-                <PublishedNodes key={live.version} definition={live.definition} />
+                {retiredAt ? (
+                  <p className="field-note">运行入口已于 {formatTime(retiredAt)} 停用。</p>
+                ) : (
+                  canRestore &&
+                  live.version !== latestVersion && (
+                    <div>
+                      <button
+                        className="button secondary small"
+                        type="button"
+                        onClick={() => {
+                          setRetireError('');
+                          setRetiring(live.version);
+                        }}
+                      >
+                        停用此版本
+                      </button>
+                    </div>
+                  )
+                )}
+                <PublishedNodes
+                  key={`${live.version}:${linkedNode ?? ''}:${linkedFlow ?? ''}`}
+                  definition={live.definition}
+                  initialNodeId={linkedNode}
+                  initialFlowId={linkedFlow}
+                />
               </>
             )}
           </>
+        )}
+        {retiring !== undefined && (
+          <Confirm
+            title={`停用 v${retiring}`}
+            description="停止从此版本发起新运行。请先关闭绑定此版本的已启用触发器。"
+            label="停用版本"
+            onClose={() => !retireBusy && setRetiring(undefined)}
+            onConfirm={retireVersion}
+            busy={retireBusy}
+            error={retireError}
+          />
         )}
       </div>
     </Section>
@@ -578,14 +658,16 @@ function PublishedNodes({
   definition,
   onChooseFlow,
   initialNodeId,
+  initialFlowId,
 }: {
   definition: GraphDocument['draft'];
   onChooseFlow?: (flow: GraphFlow | undefined) => void;
   initialNodeId?: string;
+  initialFlowId?: string;
 }) {
   const [selected, setSelected] = useState(initialNodeId ?? '');
   const [hovered, setHovered] = useState<string>();
-  const [legacyId, setLegacyId] = useState('');
+  const [legacyId, setLegacyId] = useState(initialFlowId ?? '');
   const flow: GraphFlow | undefined = definition.canvas
     ? {
         id: 'canvas',

@@ -38,6 +38,8 @@ import { summarizeProbe } from '../../infrastructure/ssh/server-probe';
 import { compareServerConfigurations } from './configuration-comparison';
 import { recentDeployments } from '../deployments/deployment-history';
 import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
+import { lockProjectGraph } from '../projects/project-relations';
+import { assertProjectResourceRemovable } from '../projects/project-resource-protection';
 import type { Selectable } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import {
@@ -456,13 +458,23 @@ export class ServersService {
     return { success: true, server: await this.get(id), result };
   }
   async remove(id: string, userId: string) {
-    await this.get(id);
-    await this.database.db
-      .updateTable('servers')
-      .set({ is_active: 0, updated_at: Date.now() })
-      .where('id', '=', id)
-      .execute();
-    await this.audit.record(userId, 'server.delete', 'server', id);
+    await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      const server = await tx
+        .selectFrom('servers')
+        .select('id')
+        .where('id', '=', id)
+        .where('is_active', '=', 1)
+        .executeTakeFirst();
+      if (!server) throw new NotFoundException('服务器不存在');
+      await assertProjectResourceRemovable(tx, { resourceType: 'SERVER', resourceId: id });
+      await tx
+        .updateTable('servers')
+        .set({ is_active: 0, updated_at: Date.now() })
+        .where('id', '=', id)
+        .execute();
+      await this.audit.record(userId, 'server.delete', 'server', id, undefined, tx);
+    });
     return { success: true };
   }
 }

@@ -89,6 +89,7 @@ export interface ProjectsTable {
 }
 
 export interface RepositoriesTable {
+  archived_at: Generated<number | null>;
   id: string;
   project_id: string;
   name: string;
@@ -106,6 +107,7 @@ export interface RepositoriesTable {
 }
 
 export interface ServicesTable {
+  archived_at: Generated<number | null>;
   id: string;
   project_id: string;
   name: string;
@@ -127,6 +129,7 @@ export interface ServiceRepositoriesTable {
 }
 
 export interface EnvironmentsTable {
+  archived_at: Generated<number | null>;
   id: string;
   project_id: string;
   name: string;
@@ -712,6 +715,7 @@ export interface Database {
     updated_at: number;
   };
   execution_graph_versions: {
+    retired_at: Generated<number | null>;
     id: string;
     graph_id: string;
     version: number;

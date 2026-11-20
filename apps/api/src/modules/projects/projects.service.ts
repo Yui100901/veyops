@@ -40,6 +40,8 @@ import { recentDeployments } from '../deployments/deployment-history';
 import { byProject, projectAddressLinks } from './project-card-data';
 import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
+import { assertProjectResourceRemovable } from './project-resource-protection';
+import { projectResourceInventory } from './project-resource-references';
 import { relativePath } from '../pipelines/pipeline.validation';
 import {
   lockProjectGraph,
@@ -130,8 +132,12 @@ export class ProjectsService {
     const activeProjects = db.selectFrom('projects').where('deleted_at', 'is', null);
     const [rows, services, envs, addresses] = await Promise.all([
       activeProjects.selectAll().orderBy('created_at', 'desc').execute(),
-      db.selectFrom('services').select(['project_id']).execute(),
-      db.selectFrom('environments').select(['project_id']).execute(),
+      db.selectFrom('services').select(['project_id']).where('archived_at', 'is', null).execute(),
+      db
+        .selectFrom('environments')
+        .select(['project_id'])
+        .where('archived_at', 'is', null)
+        .execute(),
       includeAddresses
         ? projectAddressLinks(db)
             .where('address.project_id', 'in', activeProjects.select('id'))
@@ -165,18 +171,21 @@ export class ProjectsService {
         .selectFrom('repositories')
         .selectAll()
         .where('project_id', '=', id)
+        .where('archived_at', 'is', null)
         .orderBy('created_at')
         .execute(),
       db
         .selectFrom('services')
         .selectAll()
         .where('project_id', '=', id)
+        .where('archived_at', 'is', null)
         .orderBy('created_at')
         .execute(),
       db
         .selectFrom('environments')
         .selectAll()
         .where('project_id', '=', id)
+        .where('archived_at', 'is', null)
         .orderBy('created_at')
         .execute(),
     ]);
@@ -217,8 +226,11 @@ export class ProjectsService {
           db
             .selectFrom('service_environment_configs as configs')
             .innerJoin('services', 'services.id', 'configs.service_id')
+            .innerJoin('environments', 'environments.id', 'configs.environment_id')
             .select('configs.target_id')
-            .where('services.project_id', '=', id),
+            .where('services.project_id', '=', id)
+            .where('services.archived_at', 'is', null)
+            .where('environments.archived_at', 'is', null),
         )
         .orderBy('targets.name')
         .orderBy('targets.id')
@@ -242,6 +254,11 @@ export class ProjectsService {
       deploymentTargets: [...deploymentTargets.values()],
       recentDeployments: deployments,
     };
+  }
+
+  async resourceReferences(projectId: string) {
+    await requireProject(this.database.db, projectId);
+    return projectResourceInventory(this.database.db, projectId);
   }
   async create(dto: ProjectDto, userId: string) {
     const id = randomUUID();
@@ -338,6 +355,7 @@ export class ProjectsService {
           .selectAll()
           .where('project_id', '=', projectId)
           .where('id', '=', repositoryId)
+          .where('archived_at', 'is', null)
           .executeTakeFirst()
       : undefined;
     if (repositoryId && !current) throw new NotFoundException('仓库不存在');
@@ -394,6 +412,7 @@ export class ProjectsService {
           .set(values)
           .where('id', '=', id)
           .where('project_id', '=', projectId)
+          .where('archived_at', 'is', null)
           .where('updated_at', '=', current.updated_at)
           .returningAll()
           .executeTakeFirst()
@@ -437,6 +456,7 @@ export class ProjectsService {
             .set(values)
             .where('id', '=', id)
             .where('project_id', '=', projectId)
+            .where('archived_at', 'is', null)
         : db
             .insertInto('services')
             .values({ id, project_id: projectId, created_at: now, ...values })
@@ -488,6 +508,7 @@ export class ProjectsService {
             .set(values)
             .where('id', '=', id)
             .where('project_id', '=', projectId)
+            .where('archived_at', 'is', null)
         : db
             .insertInto('environments')
             .values({ id, project_id: projectId, created_at: now, ...values })
@@ -516,89 +537,76 @@ export class ProjectsService {
     id: string,
     userId: string,
   ) {
-    const db = this.database.db;
     const resourceType = {
-      repositories: 'repository',
-      services: 'service',
-      environments: 'environment',
-    }[table];
-    await db
-      .transaction()
-      .execute(async (tx) => {
-        await lockProjectGraph(tx);
-        await requireProject(tx, projectId);
-        if (table === 'repositories') {
-          // A write lock on the repository also serializes Pipeline version creation.
-          const repository = await tx
-            .updateTable('repositories')
-            .set((eb) => ({ updated_at: eb.ref('updated_at') }))
-            .where('id', '=', id)
-            .where('project_id', '=', projectId)
-            .returning('id')
-            .executeTakeFirst();
-          if (!repository) throw new NotFoundException('仓库不存在');
-          const association = await tx
-            .selectFrom('service_repositories')
-            .select('repository_id')
-            .where('repository_id', '=', id)
-            .executeTakeFirst();
-          const definitions = await tx
-            .selectFrom('pipeline_versions as versions')
-            .innerJoin('pipelines', 'pipelines.id', 'versions.pipeline_id')
-            .select('versions.definition_json')
-            .where('pipelines.project_id', '=', projectId)
-            .execute();
-          if (
-            association ||
-            definitions.some(({ definition_json }) =>
-              pipelineSourceRepositories(
-                JSON.parse(definition_json) as PipelineDefinition,
-              ).includes(id),
-            )
-          )
-            throw new ConflictException('仓库被服务或 Pipeline 版本引用，不能删除');
-        }
-        if (table !== 'repositories') {
-          const resource = tx
-            .selectFrom(table)
-            .select('id')
-            .where('id', '=', id)
-            .where('project_id', '=', projectId);
-          const scope = table === 'services' ? 'service_id' : 'environment_id';
-          const configs = tx
-            .selectFrom('service_environment_configs')
-            .select('id')
-            .where(scope, 'in', resource);
-          await tx
-            .deleteFrom('service_environment_variables')
-            .where('config_id', 'in', configs)
-            .execute();
-          await tx.deleteFrom('service_environment_configs').where(scope, 'in', resource).execute();
-          if (table === 'environments')
-            await tx
-              .deleteFrom('environment_variables')
-              .where('environment_id', 'in', resource)
-              .execute();
-        }
-        const row = await tx
-          .deleteFrom(table)
-          .where('id', '=', id)
-          .where('project_id', '=', projectId)
-          .returning('id')
-          .executeTakeFirst();
-        if (!row) throw new NotFoundException('项目资源不存在');
-      })
-      .catch((error: unknown) => {
+      repositories: 'REPOSITORY',
+      services: 'SERVICE',
+      environments: 'ENVIRONMENT',
+    } as const;
+    await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      await requireProject(tx, projectId);
+      const current = await tx
+        .selectFrom(table)
+        .select('id')
+        .where('id', '=', id)
+        .where('project_id', '=', projectId)
+        .where('archived_at', 'is', null)
+        .executeTakeFirst();
+      if (!current) throw new NotFoundException('项目资源不存在');
+      await assertProjectResourceRemovable(
+        tx,
+        { resourceType: resourceType[table], resourceId: id },
+        projectId,
+      );
+
+      if (table === 'repositories' || table === 'services') {
+        // UUID v8 profiles are generated by the graph engine for historical tasks. Explicit
+        // Pipeline definitions still exposed to old callers use ordinary UUIDs.
+        let definitions = tx
+          .selectFrom('pipeline_versions as version')
+          .innerJoin('pipelines', 'pipelines.id', 'version.pipeline_id')
+          .select('version.definition_json')
+          .where('pipelines.project_id', '=', projectId)
+          .where('pipelines.enabled', '=', 1)
+          .where('pipelines.id', 'not like', '________-____-8___-%');
+        if (table === 'services') definitions = definitions.where('pipelines.service_id', '=', id);
+        const rows = await definitions.execute();
         if (
-          hasConstraint(error, 'SQLITE_CONSTRAINT_FOREIGNKEY', 'SQLITE_CONSTRAINT_TRIGGER', '23503')
+          table === 'services'
+            ? rows.length > 0
+            : rows.some(({ definition_json }) =>
+                pipelineSourceRepositories(
+                  JSON.parse(definition_json) as PipelineDefinition,
+                ).includes(id),
+              )
         )
-          throw new ConflictException('资源被项目配置或历史记录引用，不能删除');
-        throw error;
-      });
-    await this.audit.record(userId, `${resourceType}.delete`, 'project', projectId, {
-      resourceId: id,
+          throw new ConflictException('资源被可运行的旧交付配置引用');
+      }
+      if (table !== 'repositories') {
+        const address = await tx
+          .selectFrom('project_addresses')
+          .select('id')
+          .where('project_id', '=', projectId)
+          .where(table === 'services' ? 'service_id' : 'environment_id', '=', id)
+          .executeTakeFirst();
+        if (address) throw new ConflictException('资源被项目访问地址引用，请先调整访问地址');
+      }
+      const now = Date.now();
+      await tx
+        .updateTable(table)
+        .set({ archived_at: now, updated_at: now })
+        .where('id', '=', id)
+        .execute();
+      await this.audit.record(
+        userId,
+        resourceType[table].toLowerCase() + '.archive',
+        'project',
+        projectId,
+        { resourceId: id },
+        tx,
+      );
     });
-    return { success: true };
+    return { success: true, archived: true };
   }
 }
 @Controller('projects')
@@ -606,6 +614,9 @@ class ProjectsController {
   constructor(private readonly service: ProjectsService) {}
   @Get() list(@Query('include') include?: string) {
     return this.service.list(include === 'addresses');
+  }
+  @Get(':id/resource-references') resourceReferences(@Param('id') id: string) {
+    return this.service.resourceReferences(id);
   }
   @Get(':id') get(@Param('id') id: string) {
     return this.service.detail(id);

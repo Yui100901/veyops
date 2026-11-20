@@ -23,6 +23,16 @@ import { graphCatalog } from './graph-fields';
 export class ExecutionGraphsController {
   constructor(private readonly graphs: ExecutionGraphsService) {}
 
+  @Post('versions/:version/retire')
+  @Roles('ADMIN', 'OPERATOR')
+  retire(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Param('version', ParseIntPipe) version: number,
+    @Req() req: AuthRequest,
+  ) {
+    return this.graphs.retire(projectId, version, req.user.id);
+  }
+
   @Get()
   get(@Param('projectId', ParseUUIDPipe) projectId: string) {
     return this.graphs.get(projectId);

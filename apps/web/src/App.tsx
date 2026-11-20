@@ -490,6 +490,7 @@ export function App() {
           id={routeId}
           user={user}
           runId={params.get('run') ?? undefined}
+          search={routeSearch}
         />
       </Suspense>
     );
@@ -515,15 +516,30 @@ export function App() {
       fromView && /^(all|production|testing|abnormal|[a-f0-9-]{36})$/.test(fromView)
         ? fromView
         : undefined;
-    page = <ProjectPage key={route} id={routePath.slice(10)} user={user} viewId={viewId} />;
+    page = (
+      <ProjectPage
+        key={route}
+        id={routePath.slice(10)}
+        user={user}
+        viewId={viewId}
+        deployment={
+          params.get('section') === 'deployment'
+            ? {
+                serviceId: params.get('serviceId') ?? '',
+                environmentId: params.get('environmentId') ?? '',
+              }
+            : undefined
+        }
+      />
+    );
   } else if (routePath === '/views' || routePath.startsWith('/views/'))
     page = <ProjectViewsPage user={user} id={routePath.slice(7) || undefined} />;
   else if (
     (routeRoot === 'artifacts' || routeRoot === 'deployments') &&
     !routeSection &&
     (routeId ||
-      ['recordId', 'projectId', 'artifactId', 'deploymentId', 'pipelineRunId'].some(
-        (key) => params.has(key),
+      ['recordId', 'projectId', 'artifactId', 'deploymentId', 'pipelineRunId'].some((key) =>
+        params.has(key),
       ))
   )
     page = <LegacyDeliveryLink key={route} tab={routeRoot} search={routeSearch} id={routeId} />;

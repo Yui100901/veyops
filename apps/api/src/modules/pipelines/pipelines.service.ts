@@ -151,6 +151,7 @@ export class PipelinesService implements OnModuleInit {
       .selectFrom('services')
       .select(['project_id', 'name'])
       .where('id', '=', serviceId)
+      .where('archived_at', 'is', null)
       .executeTakeFirst();
     const repositoryIds = fromArtifact
       ? [definition.repositoryId]
@@ -160,6 +161,7 @@ export class PipelinesService implements OnModuleInit {
       .selectAll()
       .where('id', 'in', repositoryIds)
       .where('project_id', '=', projectId)
+      .where('archived_at', 'is', null)
       .execute();
     if (
       !project ||
@@ -401,6 +403,7 @@ export class PipelinesService implements OnModuleInit {
       .selectFrom('environments')
       .selectAll()
       .where('id', '=', input.environmentId)
+      .where('archived_at', 'is', null)
       .executeTakeFirst();
     if (environment?.project_id !== pipeline.projectId)
       throw new BadRequestException('运行环境必须属于当前项目');

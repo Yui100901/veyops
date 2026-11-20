@@ -23,6 +23,8 @@ import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { CredentialsService } from '../credentials/credentials.service';
 import { checkRegistryConnection, registryAddress } from './registry-connection';
+import { lockProjectGraph } from '../projects/project-relations';
+import { assertProjectResourceRemovable } from '../projects/project-resource-protection';
 
 class RegistryDto {
   @IsString() @Length(1, 120) name!: string;
@@ -150,7 +152,9 @@ export class RegistriesService {
       new ConflictException('镜像仓库被 Pipeline 版本或镜像产物引用，不能删除');
     try {
       await this.database.db.transaction().execute(async (tx) => {
+        await lockProjectGraph(tx);
         await lockRegistry(tx, id);
+        await assertProjectResourceRemovable(tx, { resourceType: 'REGISTRY', resourceId: id });
         const artifact = await tx
           .selectFrom('artifacts')
           .select('id')

@@ -26,6 +26,7 @@ import { MonitorSummary } from './ServerMonitoring';
 import { metricNames, metricValue } from './monitoring-data';
 import type { MetricKey, MonitorRow } from './monitoring-data';
 import { ProjectRelations } from './ProjectRelations';
+import { ProjectServerInventory, type ServiceEnvironmentContext } from './ProjectServerInventory';
 import { ProjectExecutionSettingsPanel } from './ProjectExecutionSettings';
 import { EnvironmentVariables } from './EnvironmentVariables';
 import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
@@ -1473,13 +1474,23 @@ export function ProjectsPage({ user }: { user: User }) {
   );
 }
 
-export function ProjectPage({ id, user, viewId }: { id: string; user: User; viewId?: string }) {
+export function ProjectPage({
+  id,
+  user,
+  viewId,
+  deployment,
+}: {
+  id: string;
+  user: User;
+  viewId?: string;
+  deployment?: ServiceEnvironmentContext;
+}) {
   const resource = useResource<ProjectDetail>(`/projects/${id}`);
   const backPath = viewId ? `/views/${viewId}` : '/projects';
   const credentials = useResource<Credential[]>('/credentials');
   const [section, setSection] = useState<
     'resources' | 'relations' | 'deployment' | 'ai' | 'settings'
-  >('resources');
+  >(deployment ? 'deployment' : 'resources');
   const executionGraph = useResource<GraphDocument>(
     section === 'resources' ? '/projects/' + id + '/execution-graph' : null,
   );
@@ -1982,8 +1993,20 @@ export function ProjectPage({ id, user, viewId }: { id: string; user: User; view
       {section === 'relations' && (
         <ProjectRelations project={project} user={user} reload={resource.reload} />
       )}
+      {section === 'resources' && <ProjectServerInventory project={project} />}
       {section === 'deployment' && (
-        <ProjectDeploymentConfig project={project} user={user} reloadProject={resource.reload} />
+        <ProjectDeploymentConfig
+          project={project}
+          user={user}
+          reloadProject={resource.reload}
+          initialEnvironment={
+            deployment &&
+            project.services.some(({ id }) => id === deployment.serviceId) &&
+            project.environments.some(({ id }) => id === deployment.environmentId)
+              ? deployment
+              : undefined
+          }
+        />
       )}
       {deletingProject && (
         <Confirm

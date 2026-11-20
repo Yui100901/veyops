@@ -20,7 +20,9 @@ import {
   upcomingTimes,
 } from '../operation-schedules/operation-schedule-time';
 import type { ScheduleTiming } from '../operation-schedules/operation-schedule-time';
-import { requireProject } from '../projects/project-relations';
+import { lockProjectGraph, requireProject } from '../projects/project-relations';
+import { graphTriggerReferences } from '../projects/project-resource-references';
+import { unavailableReference } from '../projects/project-resource-protection';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { redactTaskLog } from '../tasks/task-log.service';
 import type { GraphDefinition } from './execution-graph-definition';
@@ -233,15 +235,21 @@ export class GraphTriggersService implements OnModuleInit {
     if (!valid) throw new ForbiddenException('Webhook 密钥已变更，请重新保存触发器');
   }
 
-  private async published(projectId: string, version: number) {
-    const row = await this.database.db
+  private async published(
+    projectId: string,
+    version: number,
+    db = this.database.db,
+    runnable = true,
+  ) {
+    const row = await db
       .selectFrom('execution_graph_versions as version')
       .innerJoin('execution_graphs as graph', 'graph.id', 'version.graph_id')
       .where('graph.project_id', '=', projectId)
       .where('version.version', '=', version)
-      .select('version.definition_json')
+      .select(['version.definition_json', 'version.retired_at'])
       .executeTakeFirst();
     if (!row) throw new NotFoundException('已发布的图版本不存在');
+    if (runnable && row.retired_at !== null) throw new ConflictException('该执行图版本已停用');
     return JSON.parse(row.definition_json) as GraphDefinition;
   }
 
@@ -336,7 +344,12 @@ export class GraphTriggersService implements OnModuleInit {
     const name = input.name.trim();
     if (!name) throw new BadRequestException('请填写触发器名称');
     await requireProject(this.database.db, projectId);
-    const definition = await this.published(projectId, input.version);
+    const definition = await this.published(
+      projectId,
+      input.version,
+      this.database.db,
+      input.enabled,
+    );
     this.validateMappings(this.startFields(definition, input.flowId), input);
     const now = Date.now();
     const settings: TriggerConfig = {
@@ -371,6 +384,7 @@ export class GraphTriggersService implements OnModuleInit {
           .select('id')
           .where('id', '=', input.repositoryId)
           .where('project_id', '=', projectId)
+          .where('archived_at', 'is', null)
           .executeTakeFirst())
       )
         throw new BadRequestException('Webhook 仓库过滤必须引用当前项目中的仓库');
@@ -388,6 +402,7 @@ export class GraphTriggersService implements OnModuleInit {
       settings.upstreamStatus = input.upstreamStatus;
     }
     return this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
       const project = await tx
         .updateTable('projects')
         .set((eb) => ({ updated_at: eb.ref('updated_at') }))
@@ -397,6 +412,19 @@ export class GraphTriggersService implements OnModuleInit {
         .executeTakeFirst();
       if (!project) throw new NotFoundException('项目不存在或已归档');
       if (input.enabled) {
+        const bound = await this.published(projectId, input.version, tx);
+        const references = graphTriggerReferences(
+          bound,
+          {
+            sourceId: triggerId ?? projectId,
+            version: input.version,
+            flowId: input.flowId,
+            label: name,
+          },
+          settings,
+        );
+        if (await unavailableReference(tx, projectId, references))
+          throw new ConflictException('触发器引用的资源不可用，请检查参数映射');
         const latest = await tx
           .selectFrom('execution_graphs as graph')
           .innerJoin('execution_graph_versions as version', (join) =>
