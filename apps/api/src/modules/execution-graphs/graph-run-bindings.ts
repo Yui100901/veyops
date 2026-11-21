@@ -1,5 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
+import { ExecutionPlanIssueError } from '../../core/execution-plan-issue';
 import type { GraphFlow, GraphNode } from './execution-graph-definition';
+import { graphInputIssue } from './graph-execution-plan-issues';
 import {
   graphDefaultBinding,
   validateGraphValue,
@@ -78,19 +80,23 @@ export function outputSources(binding?: GraphBinding): { nodeId: string; fieldId
 export function checkedParameters(flow: GraphFlow, supplied?: Values, allowArtifactRule = false) {
   const fields = flowStart(flow).inputs ?? [];
   if (supplied && (Object.keys(supplied).length > 64 || JSON.stringify(supplied).length > 65_536))
-    throw new BadRequestException('运行参数过大');
+    throw graphInputIssue(flow, '运行参数过大');
   for (const id of Object.keys(supplied ?? {}))
     if (!fields.some((field) => field.id === id))
-      throw new BadRequestException(`未声明运行参数 ${id}`);
+      throw graphInputIssue(flow, `未声明运行参数 ${id}`);
   return Object.fromEntries(
     fields.flatMap((field) => {
       const value = entry(supplied, field.id) ?? field.defaultValue;
       if (value === undefined && allowArtifactRule && field.selection === 'LATEST_COMPATIBLE')
         return [];
       if (!validateGraphValue(field, value))
-        throw new BadRequestException(`运行参数「${field.name}」缺失或不符合 ${field.type} 约束`);
+        throw graphInputIssue(
+          flow,
+          `运行参数「${field.name}」缺失或不符合 ${field.type} 约束`,
+          field,
+        );
       if (value !== undefined && redactTaskLog(JSON.stringify(value)) !== JSON.stringify(value))
-        throw new BadRequestException(`运行参数「${field.name}」含明文凭据，请使用凭据引用`);
+        throw graphInputIssue(flow, `运行参数「${field.name}」含明文凭据，请使用凭据引用`, field);
       return value === undefined ? [] : [[field.id, value]];
     }),
   );
@@ -149,7 +155,11 @@ export function artifactIds(value: unknown) {
   const items = Array.isArray(value) ? value : value === undefined ? [] : [value];
   const ids = items.map(referenceId);
   if (ids.some((id) => !id) || new Set(ids).size !== ids.length)
-    throw new BadRequestException('产物输入必须包含不同的产物引用');
+    throw new ExecutionPlanIssueError({
+      code: 'ARTIFACT',
+      fieldId: 'artifact',
+      message: '产物输入必须包含不同的产物引用',
+    });
   return ids as string[];
 }
 

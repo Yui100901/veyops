@@ -1,22 +1,106 @@
-import { useRef, useState } from 'react';
-import { Play } from 'lucide-react';
-import { ApiError, formatTime, message, post, useResource } from '../api';
+import { useEffect, useRef, useState } from 'react';
+import { AlertCircle, Play } from 'lucide-react';
+import { ApiError, formatTime, message, post, useResource, type ExecutionPlanIssue } from '../api';
 import { Confirm, ErrorBanner, Loading, RefreshButton, Section, Status } from '../components';
 import type { DeploymentSelection, ProjectDetail } from '../models';
 import { GraphFieldValue } from './ExecutionGraphFields';
 import type { FieldScope } from './ExecutionGraphFields';
 import { ExecutionPlan, ExecutionPlanChanges } from './ExecutionGraphPreview';
 import type { Preview } from './ExecutionGraphPreview';
+import {
+  ExecutionGraphParameterLink,
+  ExecutionGraphRepairLinks,
+  type GraphSetupIssue,
+} from './ExecutionGraphRepairLinks';
+import { ExecutionGraphStartStatus } from './ExecutionGraphStartStatus';
 import { graphKey } from './execution-graph-definition';
-import type { GraphFlow, GraphRun } from './execution-graph-definition';
+import type { GraphField, GraphFlow, GraphRun } from './execution-graph-definition';
 import { deliveryPath, deliveryTabs } from './delivery-route';
 import {
   graphRunHref,
+  graphStartReadiness,
   type GraphDeliveryReturn,
   type GraphWorkbenchScope,
 } from './graph-workbench-context';
 
 type Inputs = { parameters: Record<string, unknown> };
+type ParameterEdits = Record<string, { schema: string; value: unknown }>;
+export type GraphRunDrafts = Map<string, ParameterEdits>;
+
+function parameterSchema(field: GraphField) {
+  return JSON.stringify([
+    field.type,
+    field.multiple,
+    field.artifactType,
+    field.source,
+    field.options,
+  ]);
+}
+
+function focusRunField(field: HTMLElement | undefined) {
+  if (!field) return;
+  const input = field.querySelector<HTMLElement>(
+    'select:enabled, input:enabled:not([type="hidden"]), textarea:enabled, button:enabled',
+  );
+  field.scrollIntoView({ block: 'center' });
+  (input ?? field).focus({ preventScroll: true });
+}
+
+function repairKind(code: ExecutionPlanIssue['code']): GraphSetupIssue['kind'] | undefined {
+  if (code === 'RELEASE_TARGET') return 'DEPLOY_TARGET';
+  if (code === 'REPOSITORY' || code === 'BUILD_TARGET' || code === 'ARTIFACT') return code;
+}
+
+const planIssueLabels: Record<ExecutionPlanIssue['code'], string> = {
+  INPUT: '运行参数有待处理',
+  REPOSITORY: '仓库有待处理',
+  BUILD_TARGET: '构建目标有待处理',
+  RELEASE_TARGET: '发布目标有待处理',
+  ARTIFACT: '产物有待处理',
+  SOURCE_REVIEW: '源码审核有待处理',
+  CONFIGURATION: '执行配置有待处理',
+};
+
+function PlanIssueBanner({
+  issue,
+  flow,
+  project,
+}: {
+  issue: ExecutionPlanIssue;
+  flow: GraphFlow;
+  project: ProjectDetail;
+}) {
+  const currentFlow = !issue.flowId || issue.flowId === flow.id;
+  const node = currentFlow ? flow.nodes.find(({ id }) => id === issue.nodeId) : undefined;
+  const field = node?.inputs?.find(({ id }) => id === issue.fieldId)?.name;
+  const location = [
+    issue.flowName ?? (issue.flowId ? (currentFlow ? flow.name : issue.flowId) : undefined),
+    issue.nodeName ?? node?.name ?? issue.nodeId,
+    issue.fieldName ?? field ?? issue.fieldId,
+  ]
+    .filter(Boolean)
+    .join(' / ');
+  const repository =
+    project.repositories.find(({ id }) => id === issue.repositoryId)?.name ?? issue.repositoryId;
+  return (
+    <div className="error-banner graph-plan-issue" role="alert">
+      <AlertCircle size={17} aria-hidden="true" />
+      <div>
+        <strong>{planIssueLabels[issue.code]}</strong>
+        {location && <p>{location}</p>}
+        <p>{issue.message}</p>
+        {(repository || issue.commitSha) && (
+          <p>
+            {repository}
+            {repository && issue.commitSha && ' · '}
+            {issue.commitSha && <code>{issue.commitSha}</code>}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Results({
   values,
   labels = {},
@@ -60,6 +144,9 @@ export function ExecutionGraphStart({
   version,
   flow,
   initialInputs,
+  workbenchScope,
+  drafts,
+  focusFieldId,
   onRun,
 }: {
   project: ProjectDetail;
@@ -67,17 +154,33 @@ export function ExecutionGraphStart({
   version: number;
   flow: GraphFlow;
   initialInputs?: Record<string, string>;
+  workbenchScope: GraphWorkbenchScope;
+  drafts?: GraphRunDrafts;
+  focusFieldId?: string;
   onRun: (id: string) => void;
 }) {
-  const fields = flow.nodes.find(({ type }) => type === 'START')?.inputs ?? [];
-  const [parameters, setParameters] = useState<Record<string, unknown>>(() => ({
+  const startNode = flow.nodes.find(({ type }) => type === 'START');
+  const fields = startNode?.inputs ?? [];
+  const draftKey = JSON.stringify([
+    flow.id,
+    workbenchScope.serviceId,
+    workbenchScope.environmentId,
+  ]);
+  const [edits, setEdits] = useState<ParameterEdits>(() => drafts?.get(draftKey) ?? {});
+  const parameters: Record<string, unknown> = {
     ...Object.fromEntries(
-      fields
-        .filter((field) => field.defaultValue !== undefined)
-        .map((field) => [field.id, field.defaultValue]),
+      fields.map((field) => {
+        const edit = Object.hasOwn(edits, field.id) ? edits[field.id] : undefined;
+        return [
+          field.id,
+          edit?.schema === parameterSchema(field) ? edit.value : field.defaultValue,
+        ];
+      }),
     ),
     ...initialInputs,
-  }));
+  };
+  const readiness = graphStartReadiness(flow, workbenchScope, project, parameters);
+  const fieldRefs = useRef(new Map<string, HTMLElement>());
   const scopedValue = (type: NonNullable<(typeof fields)[number]>['type']) => {
     const candidates = fields.filter((field) => field.type === type && !field.multiple);
     const field =
@@ -97,12 +200,30 @@ export function ExecutionGraphStart({
   const active = useRef(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [planIssue, setPlanIssue] = useState<ExecutionPlanIssue>();
+  const issueParameter =
+    planIssue && (!planIssue.flowId || planIssue.flowId === flow.id)
+      ? (planIssue.parameterId ??
+        (planIssue.nodeId === startNode?.id ? planIssue.fieldId : undefined))
+      : undefined;
+  const issueKind = planIssue && repairKind(planIssue.code);
+  const runLocation = { ...workbenchScope, start: flow.id, version, field: focusFieldId };
+  useEffect(() => {
+    if (!focusFieldId) return;
+    setPreview(undefined);
+    setRevision(undefined);
+    const frame = window.requestAnimationFrame(() =>
+      focusRunField(fieldRefs.current.get(focusFieldId)),
+    );
+    return () => window.cancelAnimationFrame(frame);
+  }, [focusFieldId]);
   const base = path + '/flows/' + encodeURIComponent(flow.id);
   async function submit() {
     if (active.current) return;
     active.current = true;
     setBusy(true);
     setError('');
+    setPlanIssue(undefined);
     try {
       if (!preview) {
         const checked = await post<Preview>(base + '/preview', {
@@ -119,13 +240,21 @@ export function ExecutionGraphStart({
           expectedPlanSections: preview.planSections,
           idempotencyKey: key.current,
         });
+        drafts?.delete(draftKey);
         onRun(run.id);
       }
     } catch (err) {
-      setError(message(err));
-      if (preview && err instanceof ApiError && [400, 409].includes(err.status)) {
-        setRevision({ previous: preview, sections: err.changes });
+      const apiError = err instanceof ApiError ? err : undefined;
+      if (apiError?.planIssue) {
+        setPlanIssue(apiError.planIssue);
         setPreview(undefined);
+        setRevision(undefined);
+      } else {
+        setError(message(err));
+        if (preview && apiError && [400, 409].includes(apiError.status)) {
+          setRevision({ previous: preview, sections: apiError.changes });
+          setPreview(undefined);
+        }
       }
     } finally {
       active.current = false;
@@ -139,6 +268,30 @@ export function ExecutionGraphStart({
       ),
     };
   }
+  function updateParameter(field: GraphField, value: unknown) {
+    const next = {
+      ...(drafts?.get(draftKey) ?? edits),
+      [field.id]: { schema: parameterSchema(field), value },
+    };
+    if (['ENVIRONMENT', 'SERVICE', 'TARGETS'].includes(field.type)) {
+      for (const candidate of fields) {
+        if (candidate.type === 'ARTIFACT') {
+          next[candidate.id] = { schema: parameterSchema(candidate), value: undefined };
+        }
+      }
+    }
+    drafts?.set(draftKey, next);
+    setEdits(next);
+    if (planIssue) {
+      setPlanIssue(undefined);
+      setError('');
+    }
+  }
+  function openParameter(fieldId: string) {
+    setPreview(undefined);
+    setRevision(undefined);
+    window.requestAnimationFrame(() => focusRunField(fieldRefs.current.get(fieldId)));
+  }
   return (
     <form
       className="graph-run-form"
@@ -148,6 +301,15 @@ export function ExecutionGraphStart({
       }}
     >
       <h3>{preview ? '确认执行预览' : revision ? '预览已失效' : '运行参数'}</h3>
+      {!preview && !revision && (
+        <ExecutionGraphStartStatus
+          readiness={readiness}
+          flow={flow}
+          project={project}
+          repairStart={runLocation}
+          onFocusParameter={openParameter}
+        />
+      )}
       {initialInputs && Object.keys(initialInputs).length > 0 && (
         <p className="field-note">服务环境已填入此执行流声明的对应参数。</p>
       )}
@@ -157,26 +319,26 @@ export function ExecutionGraphStart({
       >
         {fields.length ? (
           fields.map((field) => (
-            <GraphFieldValue
+            <div
               key={field.id}
-              field={field}
-              project={project}
-              scope={scope}
-              disabled={Boolean(initialInputs && Object.hasOwn(initialInputs, field.id))}
-              checkRequired
-              canRegisterRepository
-              value={parameters[field.id]}
-              change={(value) =>
-                setParameters((current) => {
-                  const next = { ...current, [field.id]: value };
-                  if (['ENVIRONMENT', 'SERVICE', 'TARGETS'].includes(field.type)) {
-                    for (const candidate of fields)
-                      if (candidate.type === 'ARTIFACT') delete next[candidate.id];
-                  }
-                  return next;
-                })
-              }
-            />
+              className="graph-run-field"
+              tabIndex={-1}
+              ref={(element) => {
+                if (element) fieldRefs.current.set(field.id, element);
+                else fieldRefs.current.delete(field.id);
+              }}
+            >
+              <GraphFieldValue
+                field={field}
+                project={project}
+                scope={scope}
+                disabled={Boolean(initialInputs && Object.hasOwn(initialInputs, field.id))}
+                checkRequired
+                canRegisterRepository
+                value={parameters[field.id]}
+                change={(value) => updateParameter(field, value)}
+              />
+            </div>
           ))
         ) : (
           <p className="field-note">此执行流没有运行输入。</p>
@@ -220,7 +382,37 @@ export function ExecutionGraphStart({
           <ExecutionPlan preview={preview} project={project} />
         </div>
       )}
-      <ErrorBanner error={error} />
+      {planIssue ? (
+        <PlanIssueBanner issue={planIssue} flow={flow} project={project} />
+      ) : (
+        <ErrorBanner error={error} />
+      )}
+      {planIssue && issueKind && (
+        <ExecutionGraphRepairLinks
+          project={project}
+          flow={flow}
+          start={runLocation}
+          issue={{
+            ...planIssue,
+            kind: issueKind,
+            parameterId: issueParameter,
+            serviceId: planIssue.serviceId ?? scope.serviceId,
+            environmentId: planIssue.environmentId ?? scope.environmentId,
+          }}
+          onFocusParameter={openParameter}
+        />
+      )}
+      {planIssue?.code === 'INPUT' &&
+        issueParameter &&
+        fields.some(({ id }) => id === issueParameter) && (
+          <ExecutionGraphParameterLink
+            projectId={project.id}
+            start={runLocation}
+            fieldId={issueParameter}
+            label="查看运行参数"
+            onFocus={openParameter}
+          />
+        )}
       <div className="heading-actions">
         {(preview || revision) && (
           <button
@@ -231,6 +423,7 @@ export function ExecutionGraphStart({
               setPreview(undefined);
               setRevision(undefined);
               setError('');
+              setPlanIssue(undefined);
             }}
           >
             返回修改参数

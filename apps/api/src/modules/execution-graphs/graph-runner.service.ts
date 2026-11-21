@@ -13,6 +13,7 @@ import type { Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import { encryptionKey } from '../../core/config';
 import type { Database } from '../../core/database/schema';
+import { ExecutionPlanIssueError } from '../../core/execution-plan-issue';
 import { AuditService } from '../audit/audit.service';
 import { artifactSourceRef } from '../artifacts/artifact-sources';
 import { archivedComposeTemplate } from '../artifacts/artifacts.service';
@@ -42,6 +43,7 @@ import {
   type GraphNode,
 } from './execution-graph-definition';
 import type { GraphInputsDto, GraphPreviewDto, GraphRunDto } from './graph-runner.controller';
+import { graphInputIssue, withNodePlanIssue, withPlanIssue } from './graph-execution-plan-issues';
 import { GraphNodeTasks, type GraphNodePlan } from './graph-node-tasks';
 import {
   assertAutomaticGraphFlow,
@@ -165,10 +167,15 @@ interface PreparedProduction {
 const outputKey = (nodeId: string, fieldId: string) => `${nodeId}:${fieldId}`;
 
 const planKey = (flowId: string, nodeId: string) => `${flowId}:${nodeId}`;
-function publicDelivery(delivery: Delivery) {
+function publicDelivery(delivery: Delivery, definition: GraphDefinition) {
   const native = Boolean(delivery.profile);
+  const flow = definition.flows.find(({ id }) => id === delivery.flowId);
+  const nodeName = (nodeId?: string) => flow?.nodes.find(({ id }) => id === nodeId)?.name;
   return {
     ...delivery,
+    flowName: flow?.name,
+    nodeName: nodeName(delivery.nodeId),
+    artifactFromNodeName: nodeName(delivery.artifactFromNodeId),
     pipelineHash: undefined,
     profile: undefined,
     alternatives: undefined,
@@ -178,9 +185,14 @@ function publicDelivery(delivery: Delivery) {
     environmentFile: undefined,
     possibleArtifacts: delivery.alternatives?.map((candidate) => ({
       nodeId: candidate.artifactFromNodeId,
+      nodeName: nodeName(candidate.artifactFromNodeId),
       fieldId: candidate.artifactFromField,
       commitSha: candidate.commitSha,
       artifactIds: candidate.artifactIds,
+      artifactRefs: candidate.artifactRefs,
+      sourceSnapshot: candidate.sourceSnapshot,
+      sourceReviews: candidate.sourceReviews,
+      sourceReviewPendingMaterialization: candidate.sourceReviewPendingMaterialization,
     })),
     ...(native && { pipelineId: undefined, pipelineVersion: undefined }),
   };
@@ -314,7 +326,11 @@ export class GraphRunnerService implements OnModuleInit {
       const row = byId.get(id);
       const kind = row?.artifact_kind ?? row?.artifact_type;
       if (!row || (field?.artifactType && kind !== field.artifactType))
-        throw new BadRequestException('选中的产物不可用、类型不匹配或不属于当前项目');
+        throw new ExecutionPlanIssueError({
+          code: 'ARTIFACT',
+          fieldId: 'artifact',
+          message: '选中的产物不可用、类型不匹配或不属于当前项目',
+        });
       return {
         id,
         name: row.artifact_name,
@@ -336,6 +352,22 @@ export class GraphRunnerService implements OnModuleInit {
     });
   }
 
+  private async artifactParameter(
+    projectId: string,
+    flow: GraphFlow,
+    field: GraphField,
+    value: unknown,
+  ) {
+    try {
+      const refs = await this.artifactReferences(projectId, boundArtifactIds(value), field);
+      return field.multiple ? refs : refs[0];
+    } catch (error) {
+      if (error instanceof ExecutionPlanIssueError)
+        throw graphInputIssue(flow, error.issue.message, field);
+      throw error;
+    }
+  }
+
   private async resolveParameters(projectId: string, flow: GraphFlow, input: GraphInputsDto) {
     const parameters = checkedParameters(flow, input.parameters, true);
     const inputs = { ...input, parameters };
@@ -343,10 +375,8 @@ export class GraphRunnerService implements OnModuleInit {
     for (const field of flowStart(flow).inputs ?? []) {
       const value = parameters[field.id];
       if (value === undefined) continue;
-      if (field.type === 'ARTIFACT') {
-        const refs = await this.artifactReferences(projectId, boundArtifactIds(value), field);
-        parameters[field.id] = field.multiple ? refs : refs[0];
-      }
+      if (field.type === 'ARTIFACT')
+        parameters[field.id] = await this.artifactParameter(projectId, flow, field, value);
       const table =
         field.type === 'REPOSITORY'
           ? 'repositories'
@@ -357,7 +387,7 @@ export class GraphRunnerService implements OnModuleInit {
               : undefined;
       if (table) {
         const ids = (Array.isArray(value) ? value : [value]).map(referenceId);
-        if (ids.some((id) => !id)) throw new BadRequestException('项目资源引用无效');
+        if (ids.some((id) => !id)) throw graphInputIssue(flow, '项目资源引用无效', field);
         const rows = await this.database.db
           .selectFrom(table)
           .select('id')
@@ -366,7 +396,7 @@ export class GraphRunnerService implements OnModuleInit {
           .where('id', 'in', [...new Set(ids)] as string[])
           .execute();
         if (rows.length !== new Set(ids).size)
-          throw new BadRequestException(field.name + ' 不属于当前项目');
+          throw graphInputIssue(flow, field.name + ' 不属于当前项目', field);
       }
     }
     if (scope.environmentId) inputs.environmentId = scope.environmentId;
@@ -386,7 +416,7 @@ export class GraphRunnerService implements OnModuleInit {
     if (!remaining.length) return;
     const { serviceId, environmentId } = declaredScope(flow, inputs);
     if (!serviceId || !environmentId)
-      throw new BadRequestException('获取最新产物需要选择项目服务和环境');
+      throw graphInputIssue(flow, '获取最新产物需要选择项目服务和环境', remaining[0]);
     for (const field of remaining) {
       const results = await this.database.db
         .selectFrom('artifacts')
@@ -410,7 +440,7 @@ export class GraphRunnerService implements OnModuleInit {
         .orderBy('artifacts.id', 'asc')
         .execute();
       const first = results[0];
-      if (!first) throw new BadRequestException(`参数「${field.name}」没有可用产物`);
+      if (!first) throw graphInputIssue(flow, `参数「${field.name}」没有可用产物`, field);
       const ids = field.multiple
         ? results
             .filter(
@@ -420,8 +450,7 @@ export class GraphRunnerService implements OnModuleInit {
             )
             .map((row) => row.id)
         : [first.id];
-      const refs = await this.artifactReferences(projectId, ids, field);
-      inputs.parameters![field.id] = field.multiple ? refs : refs[0];
+      inputs.parameters![field.id] = await this.artifactParameter(projectId, flow, field, ids);
     }
   }
 
@@ -433,17 +462,34 @@ export class GraphRunnerService implements OnModuleInit {
     inputs: GraphInputsDto,
     values: Values,
     production: ReadonlyMap<string, PreparedProduction[]>,
-    automation?: GraphAutomation,
   ): Promise<Delivery> {
     const scope = declaredScope(flow, inputs);
     const serviceId = referenceId(values.service) ?? scope.serviceId;
     const environmentId = referenceId(values.environment) ?? scope.environmentId;
-    if (!serviceId) throw new BadRequestException(node.name + '：请选择项目服务');
-    if (!environmentId) throw new BadRequestException(node.name + '：请选择运行环境');
+    if (!serviceId)
+      throw new ExecutionPlanIssueError({
+        code: 'CONFIGURATION',
+        fieldId: 'service',
+        message: '请选择项目服务',
+      });
+    if (!environmentId)
+      throw new ExecutionPlanIssueError({
+        code: 'CONFIGURATION',
+        fieldId: 'environment',
+        message: '请选择运行环境',
+      });
     if (flow.serviceId && serviceId !== flow.serviceId)
-      throw new BadRequestException(node.name + '：节点服务必须与执行流关联服务一致');
+      throw new ExecutionPlanIssueError({
+        code: 'CONFIGURATION',
+        fieldId: 'service',
+        message: '节点服务必须与执行流关联服务一致',
+      });
     if (flow.serviceId && scope.environmentId && environmentId !== scope.environmentId)
-      throw new BadRequestException(node.name + '：节点环境必须与执行流所选环境一致');
+      throw new ExecutionPlanIssueError({
+        code: 'CONFIGURATION',
+        fieldId: 'environment',
+        message: '节点环境必须与执行流所选环境一致',
+      });
     const base = {
       environmentId,
       targetId: inputs.targetId,
@@ -494,8 +540,7 @@ export class GraphRunnerService implements OnModuleInit {
       environmentId: preview.environmentId,
       commitSha: preview.commitSha,
       serverIds: preview.serverIds,
-      requireApproval:
-        preview.requireApproval || (node.type === 'DEPLOY_ARTIFACT' && Boolean(automation)),
+      requireApproval: preview.requireApproval,
       requireCodeReview: 'requireCodeReview' in preview && preview.requireCodeReview === true,
       ...('sourceReviews' in preview && { sourceReviews: preview.sourceReviews }),
       artifactIds: 'artifactIds' in preview ? preview.artifactIds : [],
@@ -518,23 +563,40 @@ export class GraphRunnerService implements OnModuleInit {
         { repositoryId?: string; commitSha?: string; branch?: string; tag?: string } | undefined;
       const repositoryId =
         referenceId(values.repository) ?? source?.repositoryId ?? settings.repositoryId;
-      if (!repositoryId) throw new BadRequestException(node.name + '：构建缺少源码或仓库');
+      if (!repositoryId)
+        throw new ExecutionPlanIssueError({
+          code: 'REPOSITORY',
+          fieldId: 'repository',
+          message: '构建缺少源码或仓库',
+        });
       const workspace = values.workspace as typeof source;
       if (
         (source?.repositoryId && source.repositoryId !== repositoryId) ||
         (workspace?.repositoryId &&
           (workspace.repositoryId !== repositoryId || workspace.commitSha !== source?.commitSha))
       )
-        throw new BadRequestException(node.name + '：构建仓库、检出提交与工作区绑定不一致');
+        throw new ExecutionPlanIssueError({
+          code: 'REPOSITORY',
+          fieldId: 'workspace',
+          repositoryId,
+          message: '构建仓库、检出提交与工作区绑定不一致',
+        });
       if (dependencies.length && (!workspace?.repositoryId || !workspace.commitSha))
-        throw new BadRequestException(node.name + '：多仓构建需要绑定主源码工作区');
+        throw new ExecutionPlanIssueError({
+          code: 'REPOSITORY',
+          fieldId: 'workspace',
+          repositoryId,
+          message: '多仓构建需要绑定主源码工作区',
+        });
       const dependencySources = Object.fromEntries(
         dependencies.map((alias) => {
           const dependency = values['dependency_' + alias] as typeof source;
           if (!dependency?.repositoryId || !dependency.commitSha)
-            throw new BadRequestException(
-              node.name + '：源码依赖缺少已固定的检出工作区 · ' + alias,
-            );
+            throw new ExecutionPlanIssueError({
+              code: 'REPOSITORY',
+              fieldId: 'dependency_' + alias,
+              message: '源码依赖缺少已固定的检出工作区 · ' + alias,
+            });
           return [
             alias,
             {
@@ -550,7 +612,13 @@ export class GraphRunnerService implements OnModuleInit {
       const sha = source?.commitSha ?? pinned ?? (ref ? undefined : inputs.commitSha);
       const fixed = sha
         ? { commitSha: sha, branch: source?.branch, tag: source?.tag }
-        : await this.pinnedSource(projectId, repositoryId, ref, branch);
+        : await this.pinnedSource(projectId, repositoryId, ref, branch).catch((error: unknown) =>
+            withPlanIssue(error, {
+              code: 'REPOSITORY',
+              fieldId: error instanceof NotFoundException ? 'repository' : 'version',
+              repositoryId,
+            }),
+          );
       const definition = Object.assign(new PipelineDefinitionDto(), settings, {
         repositoryId,
         inheritBuildLocation: !settings.buildLocation,
@@ -633,7 +701,11 @@ export class GraphRunnerService implements OnModuleInit {
     if (ids.length) {
       const refs = await this.artifactReferences(projectId, ids, inputField);
       if (refs.some((ref) => ref.serviceId !== serviceId || ref.environmentId !== environmentId))
-        throw new BadRequestException(node.name + '：产物不属于当前服务及运行环境');
+        throw new ExecutionPlanIssueError({
+          code: 'ARTIFACT',
+          fieldId: 'artifact',
+          message: '产物不属于当前服务及运行环境',
+        });
       const source = await this.pipelines.deliveryArtifactBuild(
         projectId,
         serviceId,
@@ -670,7 +742,11 @@ export class GraphRunnerService implements OnModuleInit {
           (producer.serviceId && producer.serviceId !== serviceId) ||
           (producer.environmentId && producer.environmentId !== environmentId)
         )
-          throw new BadRequestException(node.name + '：上游生产者和部署的服务或环境不一致');
+          throw new ExecutionPlanIssueError({
+            code: 'ARTIFACT',
+            fieldId: 'artifact',
+            message: '上游生产者和部署的服务或环境不一致',
+          });
         const profile = fromBuild(producer.definition, producer.kind);
         const plan = await this.pipelines.previewArtifactDeployPlan(
           profile.id,
@@ -690,7 +766,7 @@ export class GraphRunnerService implements OnModuleInit {
           environmentId: plan.environmentId,
           commitSha: plan.commitSha,
           serverIds: plan.serverIds,
-          requireApproval: plan.requireApproval || Boolean(automation),
+          requireApproval: plan.requireApproval,
           requireCodeReview: plan.requireCodeReview,
           sourceReviewPendingMaterialization: plan.sourceReviewPendingMaterialization,
           artifactIds: [],
@@ -704,7 +780,11 @@ export class GraphRunnerService implements OnModuleInit {
       }
     }
     if (!plans.length)
-      throw new BadRequestException(node.name + '：请绑定可部署的已登记产物或上游具名产物');
+      throw new ExecutionPlanIssueError({
+        code: 'ARTIFACT',
+        fieldId: 'artifact',
+        message: '请绑定可部署的已登记产物或上游具名产物',
+      });
     return {
       ...plans[0]!,
       artifactBinding: binding,
@@ -753,12 +833,20 @@ export class GraphRunnerService implements OnModuleInit {
         );
         return { profile, preview };
       } catch (error) {
-        if (error instanceof SourceReviewConflict) throw error;
+        if (
+          error instanceof SourceReviewConflict ||
+          (error instanceof ExecutionPlanIssueError && error.issue.code === 'RELEASE_TARGET')
+        )
+          throw error;
         if (!(error instanceof HttpException) || ![400, 404, 409].includes(error.getStatus()))
           throw error;
       }
     }
-    throw new BadRequestException('当前服务和环境没有与所选目标兼容的最新产物');
+    throw new ExecutionPlanIssueError({
+      code: 'ARTIFACT',
+      fieldId: 'artifact',
+      message: '当前服务和环境没有与所选目标兼容的最新产物',
+    });
   }
 
   private async prepare(
@@ -777,7 +865,7 @@ export class GraphRunnerService implements OnModuleInit {
     const flow = this.flow(definition, flowId);
     const inputs = await this.resolveParameters(projectId, flow, request.inputs ?? {});
     if (inputs.value && redactTaskLog(inputs.value) !== inputs.value)
-      throw new BadRequestException('条件值只接受普通文本，请移除凭据');
+      throw graphInputIssue(flow, '条件值只接受普通文本，请移除凭据');
     const checkouts: {
       nodeId: string;
       flowId: string;
@@ -844,6 +932,10 @@ export class GraphRunnerService implements OnModuleInit {
           'image',
           'variables',
         ]);
+        const nodeScope = {
+          serviceId: referenceId(values.service) ?? scope.serviceId,
+          environmentId: referenceId(values.environment) ?? scope.environmentId,
+        };
         for (const [field, binding] of Object.entries(current.inputBindings?.[node.id] ?? {})) {
           if (bindingValue(binding, state) !== undefined) continue;
           for (const source of outputSources(binding))
@@ -864,8 +956,7 @@ export class GraphRunnerService implements OnModuleInit {
             args,
             values,
             production,
-            automation,
-          );
+          ).catch((error: unknown) => withNodePlanIssue(error, current, node, nodeScope));
           plans.set(key, delivery);
           publishedDeliveries.push(delivery);
           if (node.type === 'BUILD' && delivery.profile) {
@@ -890,13 +981,15 @@ export class GraphRunnerService implements OnModuleInit {
               ]);
           }
         } else if (isNativeTask(node)) {
-          if (!this.nodeTasks) throw new BadRequestException('执行节点服务不可用');
-          const plan = await this.nodeTasks.prepare(projectId, node, {
-            serviceId: referenceId(values.service) ?? scope.serviceId,
-            environmentId: referenceId(values.environment) ?? scope.environmentId,
-            values,
-            trigger,
-          });
+          if (!this.nodeTasks)
+            withNodePlanIssue(new BadRequestException('执行节点服务不可用'), current, node);
+          const plan = await this.nodeTasks
+            .prepare(projectId, node, {
+              ...nodeScope,
+              values,
+              trigger,
+            })
+            .catch((error: unknown) => withNodePlanIssue(error, current, node, nodeScope));
           plans.set(key, plan);
           if (plan.type === 'LOAD_ENV') {
             outputs.set(node.id, {
@@ -1028,7 +1121,9 @@ export class GraphRunnerService implements OnModuleInit {
       inputs,
       bindingContext(projectId, flow, inputs, undefined, trigger),
     );
-    const publicDeliveries = publishedDeliveries.map(publicDelivery);
+    const publicDeliveries = publishedDeliveries.map((delivery) =>
+      publicDelivery(delivery, definition),
+    );
     const executionPlan = {
       targets: publishedDeliveries.flatMap(({ flowId, nodeId, configuration }) =>
         configuration ? [{ flowId, nodeId, ...configuration.targets }] : [],
@@ -2305,7 +2400,7 @@ export class GraphRunnerService implements OnModuleInit {
     const deliveries = rows.flatMap(({ dispatch, type }) => {
       if (!dispatch || (type !== 'BUILD' && type !== 'DEPLOY_ARTIFACT')) return [];
       const delivery = JSON.parse(dispatch) as Delivery;
-      return [publicDelivery(delivery)];
+      return [publicDelivery(delivery, definition)];
     });
     const nodes = rows.map((n) => ({
       nodeId: n.nodeId,

@@ -1,8 +1,9 @@
-import { lazy, Suspense } from 'react';
+import { lazy, Suspense, useRef } from 'react';
 import { Boxes, FolderGit2, GitFork, Settings2 } from 'lucide-react';
 import { useResource } from '../api';
 import { ErrorBanner, Loading, PageHeader } from '../components';
 import type { ProjectDetail, User } from '../models';
+import type { GraphRunDrafts } from './ExecutionGraphRun';
 import { ProjectConfiguration } from './ProjectConfiguration';
 import { ProjectDelivery } from './ProjectDelivery';
 import { ProjectResources } from './ProjectResources';
@@ -19,6 +20,7 @@ export function ProjectWorkspace({
   user: User;
 }) {
   const { id, entry, location, search, tab } = route;
+  const graphRunDrafts = useRef<GraphRunDrafts>(new Map());
   const projectResource = useResource<ProjectDetail>(
     `/projects/${id}${entry === 'delivery' || entry === 'graph' ? '/delivery-context' : ''}`,
   );
@@ -66,6 +68,7 @@ export function ProjectWorkspace({
             user={user}
             embedded
             project={project}
+            runDrafts={graphRunDrafts.current}
             runId={new URLSearchParams(search).get('run') ?? undefined}
             search={search}
           />

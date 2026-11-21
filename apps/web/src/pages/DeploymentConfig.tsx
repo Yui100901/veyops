@@ -80,6 +80,7 @@ export function EnvironmentConfigEditor({
   };
   const tab = panel && Object.hasOwn(panels, panel) ? panel : 'settings';
   const environment = project.environments.find((row) => row.id === environmentId);
+  const hasEnvironmentTargets = hasDeploymentSelection(environment?.defaultTargetSelection ?? {});
   useEffect(() => {
     setArtifactType(config.data?.artifactType || 'FILE');
     setSelection(deploymentSelection(config.data));
@@ -231,6 +232,7 @@ export function EnvironmentConfigEditor({
               </label>
               {overrideTargets ? (
                 <>
+                  <p className="field-note">发布目标来源为服务环境覆盖。</p>
                   {config.data?.targetId && !hasDeploymentSelection(selection) && (
                     <p className="field-note">当前保留已有目标。选择服务器或分组后将改用新选择。</p>
                   )}
@@ -244,7 +246,7 @@ export function EnvironmentConfigEditor({
                 </>
               ) : (
                 <p className="field-note">
-                  {environment?.defaultTargetSelection
+                  {hasEnvironmentTargets
                     ? '发布继承项目环境的默认目标。'
                     : '当前环境尚未设置默认发布目标。'}{' '}
                   <a
@@ -252,6 +254,7 @@ export function EnvironmentConfigEditor({
                     href={
                       '#' +
                       projectResourcePath(project.id, {
+                        ...graphBack,
                         view,
                         resource: 'environments',
                         environmentId,

@@ -268,7 +268,8 @@ export class SourceReviewService {
       } catch {
         throw new SourceReviewConflict('产物源码来源缺少完整 Git 提交 SHA');
       }
-      if (!source.repositoryId) throw new SourceReviewConflict(`提交 ${commitSha} 缺少仓库来源`);
+      if (!source.repositoryId)
+        throw new SourceReviewConflict(`提交 ${commitSha} 缺少仓库来源`, { commitSha });
       revisions.set(source.repositoryId + ':' + commitSha, {
         repositoryId: source.repositoryId,
         commitSha,
@@ -289,7 +290,10 @@ export class SourceReviewService {
         a.repositoryId.localeCompare(b.repositoryId) || a.commitSha.localeCompare(b.commitSha),
     )) {
       const name = names.get(repositoryId);
-      if (!name) throw new SourceReviewConflict(`提交 ${commitSha} 的仓库不属于当前项目或已归档`);
+      if (!name)
+        throw new SourceReviewConflict(`提交 ${commitSha} 的仓库不属于当前项目或已归档`, {
+          commitSha,
+        });
       const review = await this.scope(db, projectId, serviceId, environmentId)
         .innerJoin('users as reviewer', 'reviewer.id', 'review.reviewed_by')
         .select(['review.id', 'review.reviewed_by', 'review.updated_at'])
@@ -303,6 +307,7 @@ export class SourceReviewService {
       if (!review)
         throw new SourceReviewConflict(
           `仓库「${name}」提交 ${commitSha} 缺少当前服务环境的有效代码审核`,
+          { repositoryId, commitSha },
         );
       approved.push({
         repositoryId,

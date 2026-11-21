@@ -1,6 +1,6 @@
-import { ConflictException } from '@nestjs/common';
 import type { Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
+import { ExecutionPlanIssueError } from '../../core/execution-plan-issue';
 import { readArtifactSources, type ArtifactSource } from '../artifacts/artifact-sources';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
 import type { TaskPayload } from '../tasks/tasks.types';
@@ -8,7 +8,11 @@ import type { ReviewSource } from './source-review.service';
 
 type ReleaseScope = Pick<PipelineSnapshot, 'projectId' | 'serviceId' | 'environmentId'>;
 
-export class SourceReviewConflict extends ConflictException {}
+export class SourceReviewConflict extends ExecutionPlanIssueError {
+  constructor(message: string, source?: Partial<ReviewSource>) {
+    super({ code: 'SOURCE_REVIEW', message, ...source }, 409);
+  }
+}
 
 export function buildReviewSources(snapshot: PipelineSnapshot): ReviewSource[] {
   if (snapshot.graph) {

@@ -17,7 +17,12 @@ import { NodeMap } from './ExecutionGraphCanvas';
 import { ProjectGraphEditor } from './ExecutionGraphEditor';
 import { ExecutionGraphMigration } from './ExecutionGraphMigration';
 import { ExecutionGraphResourceLinks } from './ExecutionGraphResourceLinks';
-import { ExecutionGraphHistory, ExecutionGraphStart } from './ExecutionGraphRun';
+import {
+  ExecutionGraphHistory,
+  ExecutionGraphStart,
+  type GraphRunDrafts,
+} from './ExecutionGraphRun';
+import { ExecutionGraphStartList, ExecutionGraphStartStatus } from './ExecutionGraphStartStatus';
 import { ExecutionGraphTriggers } from './ExecutionGraphTriggers';
 import { GraphVersionTools } from './ExecutionGraphVersions';
 import { graphNodeLabels } from './execution-graph-definition';
@@ -30,12 +35,11 @@ import type {
   GraphNode,
 } from './execution-graph-definition';
 import {
-  flowMatchesScope,
-  graphFlowScope,
   graphResourcePanel,
   graphReturnDelivery,
   graphScopeBackHref,
   graphStartHref,
+  graphStartReadiness,
   graphWorkbenchPath,
   type GraphPane,
   type GraphWorkbenchScope,
@@ -53,6 +57,7 @@ export default function ProjectExecutionGraph({
   runId,
   search,
   embedded,
+  runDrafts,
   project: providedProject,
 }: {
   id: string;
@@ -60,6 +65,7 @@ export default function ProjectExecutionGraph({
   runId?: string;
   search?: string;
   embedded?: boolean;
+  runDrafts?: GraphRunDrafts;
   project?: ProjectDetail;
 }) {
   const base = `/projects/${encodeURIComponent(id)}`;
@@ -107,6 +113,7 @@ export default function ProjectExecutionGraph({
       runId={runId}
       search={search}
       embedded={embedded}
+      runDrafts={runDrafts}
     />
   );
 }
@@ -120,6 +127,7 @@ function Workspace({
   runId,
   search,
   embedded,
+  runDrafts,
 }: {
   project: ProjectDetail;
   initial: GraphDocument;
@@ -129,6 +137,7 @@ function Workspace({
   runId?: string;
   search?: string;
   embedded?: boolean;
+  runDrafts?: GraphRunDrafts;
 }) {
   const params = new URLSearchParams(search);
   const paneParam = params.get('pane');
@@ -143,6 +152,9 @@ function Workspace({
   const linkedNode = params.get('node') ?? undefined;
   const linkedFlow = params.get('flow') ?? undefined;
   const linkedStart = params.get('start') ?? undefined;
+  const linkedField = params.get('field') ?? undefined;
+  const returnStart = pane === 'draft' ? params.get('returnStart') || undefined : undefined;
+  const returnField = returnStart ? params.get('returnField') || undefined : undefined;
   const scope: GraphWorkbenchScope = {
     serviceId: params.get('serviceId') || undefined,
     environmentId: params.get('environmentId') || undefined,
@@ -174,6 +186,14 @@ function Workspace({
   );
 
   function panePath(next: GraphPane) {
+    if (next === 'run' && returnStart) {
+      return graphWorkbenchPath(project.id, {
+        ...scope,
+        start: returnStart,
+        field: returnField,
+        version: linkedVersion,
+      });
+    }
     return graphWorkbenchPath(project.id, {
       ...scope,
       ...(next === 'history' && delivery),
@@ -184,6 +204,9 @@ function Workspace({
         version: linkedVersion,
         node: linkedNode,
         flow: linkedFlow,
+        field: linkedField,
+        returnStart,
+        returnField,
       }),
     });
   }
@@ -418,9 +441,11 @@ function Workspace({
                 path={path}
                 canRun={canEdit}
                 startId={linkedStart}
+                focusFieldId={linkedField}
                 inspectNodeId={linkedNode}
                 inspectFlowId={linkedFlow}
                 scope={scope}
+                drafts={runDrafts}
                 onRun={openRun}
               />
             ) : (
@@ -491,8 +516,18 @@ function Workspace({
             )
           }
         >
+          {returnStart && (
+            <div className="graph-fields graph-setup-return">
+              <div className="heading-actions">
+                <a className="button secondary small" href={'#' + panePath('run')}>
+                  ← 返回运行参数
+                </a>
+                <p className="field-note">发布修复后的草稿，运行入口会使用新版本。</p>
+              </div>
+            </div>
+          )}
           <ProjectGraphEditor
-            key={`${linkedNode ?? ''}:${linkedFlow ?? ''}`}
+            key={`${linkedNode ?? ''}:${linkedFlow ?? ''}:${linkedField ?? ''}`}
             project={project}
             canvas={canvas}
             canEdit={canEdit && !busy}
@@ -500,6 +535,7 @@ function Workspace({
             issues={issues}
             initialNodeId={linkedNode}
             initialFlowId={linkedFlow}
+            initialFieldId={linkedField}
             renderResources={(node, pair) => (
               <ExecutionGraphResourceLinks
                 node={node}
@@ -583,9 +619,11 @@ function PublishedRun({
   path,
   canRun,
   startId,
+  focusFieldId,
   inspectNodeId,
   inspectFlowId,
   scope,
+  drafts,
   onRun,
 }: {
   published: PublishedGraph;
@@ -593,50 +631,50 @@ function PublishedRun({
   path: string;
   canRun: boolean;
   startId?: string;
+  focusFieldId?: string;
   inspectNodeId?: string;
   inspectFlowId?: string;
   scope: GraphWorkbenchScope;
+  drafts?: GraphRunDrafts;
   onRun: (id: string) => void;
 }) {
   const scoped = Boolean(scope.serviceId || scope.environmentId);
-  const available = published.definition.flows.filter((flow) => flowMatchesScope(flow, scope));
-  const flow = available.find(
+  const { flows } = published.definition;
+  const starts = new Map(
+    flows.map((entry) => [entry.id, graphStartReadiness(entry, scope, project)]),
+  );
+  const selected = flows.find(
     (item) =>
       item.id === startId ||
       item.nodes.some((node) => node.type === 'START' && node.id === startId),
   );
-  const initialInputs = flow ? graphFlowScope(flow, scope) : undefined;
-  const start = flow?.nodes.find(({ type }) => type === 'START');
+  const readiness = selected && starts.get(selected.id);
+  const flow = readiness && readiness.status !== 'CONTEXT_MISMATCH' ? selected : undefined;
+  const initialInputs = readiness && 'parameters' in readiness ? readiness.parameters : undefined;
+  const start = selected?.nodes.find(({ type }) => type === 'START');
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
-    if (canRun && flow) heading.current?.focus();
-  }, [canRun, flow]);
+    if (canRun && flow && !focusFieldId) heading.current?.focus();
+  }, [canRun, flow, focusFieldId]);
   return (
     <>
       {scoped && (
         <div className="graph-fields graph-scoped-starts">
           <h3>关联的开始节点</h3>
-          {available.length ? (
-            <div className="heading-actions">
-              {available.map((item) => (
-                <a
-                  className={`button ${flow?.id === item.id ? 'primary' : 'secondary'} small`}
-                  key={item.id}
-                  href={graphStartHref(project.id, item.id, scope)}
-                  aria-current={flow?.id === item.id ? 'true' : undefined}
-                >
-                  {item.name}
-                </a>
-              ))}
-            </div>
-          ) : (
-            <p className="field-note">这个服务环境暂无可用的已发布开始节点。</p>
-          )}
+          <ExecutionGraphStartList
+            flows={flows}
+            project={project}
+            scope={scope}
+            href={(entry) => graphStartHref(project.id, entry.id, scope)}
+            selectedId={selected?.id}
+            canRepair={canRun}
+            version={published.version}
+          />
         </div>
       )}
-      {startId && !flow && <ErrorBanner error="当前发布版本中没有适用于此范围的开始节点。" />}
+      {startId && !selected && <ErrorBanner error="当前发布版本中找不到此开始节点。" />}
       {canRun && !scoped && <p>点击带有「手动运行」标识的开始节点，填写运行参数。</p>}
-      {canRun && flow && (
+      {canRun && flow && readiness && (
         <div className="graph-properties graph-manual-start" key={flow.id}>
           <div className="heading-actions">
             <h3 ref={heading} tabIndex={-1}>
@@ -660,6 +698,9 @@ function PublishedRun({
             flow={flow}
             version={published.version}
             initialInputs={initialInputs}
+            workbenchScope={scope}
+            drafts={drafts}
+            focusFieldId={focusFieldId}
             onRun={onRun}
           />
         </div>
@@ -667,26 +708,50 @@ function PublishedRun({
       <PublishedNodes
         definition={published.definition}
         initialNodeId={inspectNodeId ?? start?.id}
-        initialFlowId={inspectFlowId ?? flow?.id}
-        runFlowId={flow?.id}
-        runnableFlowIds={new Set(available.map(({ id }) => id))}
+        initialFlowId={inspectFlowId ?? selected?.id}
+        runFlowId={canRun ? flow?.id : undefined}
+        runnableFlowIds={
+          new Set(
+            flows
+              .filter(({ id }) => starts.get(id)?.status !== 'CONTEXT_MISMATCH')
+              .map(({ id }) => id),
+          )
+        }
         onChooseFlow={
           canRun
             ? (item) =>
                 item && navigate(graphWorkbenchPath(project.id, { ...scope, start: item.id }))
             : undefined
         }
-        renderResources={(node, inspectedFlow) => (
-          <ExecutionGraphResourceLinks
-            node={node}
-            start={inspectedFlow?.nodes.find(({ type }) => type === 'START')}
-            flow={inspectedFlow}
-            flowId={inspectedFlow?.id}
-            pane="run"
-            project={project}
-            scope={scope}
-          />
-        )}
+        renderResources={(node, inspectedFlow) => {
+          const startStatus =
+            node.type === 'START' && inspectedFlow && starts.get(inspectedFlow.id);
+          return (
+            <>
+              {startStatus && inspectedFlow && (
+                <ExecutionGraphStartStatus
+                  readiness={startStatus}
+                  flow={inspectedFlow}
+                  project={project}
+                  repairStart={
+                    canRun
+                      ? { ...scope, start: inspectedFlow.id, version: published.version }
+                      : undefined
+                  }
+                />
+              )}
+              <ExecutionGraphResourceLinks
+                node={node}
+                start={inspectedFlow?.nodes.find(({ type }) => type === 'START')}
+                flow={inspectedFlow}
+                flowId={inspectedFlow?.id}
+                pane="run"
+                project={project}
+                scope={scope}
+              />
+            </>
+          );
+        }}
       />
     </>
   );
@@ -988,7 +1053,7 @@ function PublishedNodes({
         isRunnableStart={onChooseFlow ? (id) => Boolean(runnable(id)) : undefined}
         onSelect={(id) => {
           setSelected(id);
-          onChooseFlow?.(runnable(id));
+          onChooseFlow?.(flowsByStart.get(id));
         }}
       />
       {node && !selectedFlow && (

@@ -1,5 +1,10 @@
 import { deliveryPath, deliveryTabs, type DeliveryTab } from './delivery-route';
-import type { GraphPane } from './graph-workbench-context';
+import {
+  graphResourcePanel,
+  graphWorkbenchPath,
+  type GraphPane,
+  type GraphStartLocation,
+} from './graph-workbench-context';
 
 export const projectEntries = {
   resources: '项目资源',
@@ -24,6 +29,8 @@ export type GraphResourceReturn = {
   graphVersion?: string;
   graphNode?: string;
   graphFlow?: string;
+  graphStart?: string;
+  graphField?: string;
   graphServiceId?: string;
   graphEnvironmentId?: string;
   graphResourcePanel?: string;
@@ -41,6 +48,49 @@ export function projectResourcePath(id: string, location: ResourceLocation = {})
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(location)) if (value) params.set(key, value);
   return `/projects/${encodeURIComponent(id)}${params.size ? '?' + params : ''}`;
+}
+
+export function graphSetupResourceHref(
+  id: string,
+  origin: GraphStartLocation,
+  destination: Pick<
+    ResourceLocation,
+    'resource' | 'repositoryId' | 'serviceId' | 'environmentId' | 'panel'
+  >,
+) {
+  return (
+    '#' +
+    projectResourcePath(id, {
+      ...destination,
+      view: origin.view,
+      graphPane: 'run',
+      graphVersion: origin.version?.toString(),
+      graphStart: origin.start,
+      graphField: origin.field,
+      graphServiceId: origin.serviceId,
+      graphEnvironmentId: origin.environmentId,
+      graphResourcePanel: origin.resourcePanel,
+    })
+  );
+}
+
+export function graphResourceReturnHref(id: string, context: GraphResourceReturn, view?: string) {
+  const version = Number(context.graphVersion);
+  return (
+    '#' +
+    graphWorkbenchPath(id, {
+      view,
+      pane: context.graphPane,
+      version: Number.isSafeInteger(version) && version > 0 ? version : undefined,
+      node: context.graphNode,
+      flow: context.graphFlow,
+      start: context.graphPane === 'run' ? (context.graphStart ?? context.graphFlow) : undefined,
+      field: context.graphField,
+      serviceId: context.graphServiceId,
+      environmentId: context.graphEnvironmentId,
+      resourcePanel: graphResourcePanel(context.graphResourcePanel),
+    })
+  );
 }
 
 export function projectGraphPath(
@@ -84,6 +134,8 @@ export function readProjectWorkspace(path: string, search?: string) {
     graphVersion: params.get('graphVersion') || undefined,
     graphNode: params.get('graphNode') || undefined,
     graphFlow: params.get('graphFlow') || undefined,
+    graphStart: params.get('graphStart') || undefined,
+    graphField: params.get('graphField') || undefined,
     graphServiceId: params.get('graphServiceId') || undefined,
     graphEnvironmentId: params.get('graphEnvironmentId') || undefined,
     graphResourcePanel: params.get('graphResourcePanel') || undefined,

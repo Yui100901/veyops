@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { DragEvent, ReactNode } from 'react';
 import { Copy, Plus, Trash2, ArrowRight, ArrowLeft } from 'lucide-react';
 import { useResource } from '../api';
@@ -35,6 +35,28 @@ type NodeType = GraphNode['type'];
 type Position = NonNullable<GraphNode['position']>;
 type Selection = { kind: 'node' | 'template'; id: string } | { kind: 'edge'; index: number };
 type Connector = Pick<GraphEdge, 'from' | 'to'>;
+type FieldFocus = { nodeId: string; fieldId: string };
+
+function focusInspectorField(inspector: HTMLElement, fieldId: string, bound: boolean) {
+  const escaped = CSS.escape(fieldId);
+  const binding = inspector.querySelector<HTMLElement>(
+    `.graph-binding-field[data-graph-field="${escaped}"]`,
+  );
+  const configured = inspector.querySelector<HTMLElement>(`[data-graph-node-field="${escaped}"]`);
+  const declaration = inspector.querySelector<HTMLDetailsElement>(
+    `details[data-graph-field="${escaped}"]`,
+  );
+  const field =
+    (bound ? (binding ?? configured) : (configured ?? binding)) ??
+    declaration ??
+    inspector.querySelector<HTMLElement>('h3');
+  if (!field) return;
+  if (field instanceof HTMLDetailsElement) field.open = true;
+  const controls = 'select:enabled, input:enabled, textarea:enabled';
+  const control = field.matches(controls) ? field : field.querySelector<HTMLElement>(controls);
+  field.scrollIntoView({ block: 'nearest' });
+  (control ?? inspector.querySelector<HTMLElement>('h3'))?.focus({ preventScroll: true });
+}
 
 const palette: { name: string; types: NodeType[] }[] = [
   { name: '开始与结束', types: ['START', 'END'] },
@@ -147,6 +169,7 @@ export function ProjectGraphEditor({
   issues = [],
   initialNodeId,
   initialFlowId,
+  initialFieldId,
 }: {
   canvas: GraphCanvas;
   project: ProjectDetail;
@@ -157,6 +180,7 @@ export function ProjectGraphEditor({
   issues?: GraphIssue[];
   initialNodeId?: string;
   initialFlowId?: string;
+  initialFieldId?: string;
 }) {
   const [selection, select] = useState<Selection | undefined>(
     initialNodeId ? { kind: 'node', id: initialNodeId } : undefined,
@@ -167,9 +191,19 @@ export function ProjectGraphEditor({
   const [startId, setStartId] = useState<string | undefined>(initialFlowId);
   const [templateType, setTemplateType] = useState<NodeType>('CHECKOUT');
   const [error, setError] = useState('');
+  const [focusRequest, setFocusRequest] = useState<FieldFocus | undefined>(() =>
+    initialNodeId && initialFieldId
+      ? { nodeId: initialNodeId, fieldId: initialFieldId }
+      : undefined,
+  );
+  const handledFocus = useRef<FieldFocus>(undefined);
+  const inspector = useRef<HTMLElement>(null);
   const catalog = useResource<GraphCatalog>('/projects/' + project.id + '/execution-graph/catalog');
   const activeNode =
     selection?.kind === 'node' ? canvas.nodes.find(({ id }) => id === selection.id) : undefined;
+  const missingRepairNode = Boolean(
+    initialFieldId && selection?.kind === 'node' && selection.id === initialNodeId && !activeNode,
+  );
   const template =
     selection?.kind === 'template'
       ? canvas.templates.find(({ id }) => id === selection.id)
@@ -180,6 +214,23 @@ export function ProjectGraphEditor({
   const selectedPath = pathHighlight(canvas, selectedPair?.startId);
   const highlight = pathHighlight(canvas, hovered) ?? selectedPath;
   const flow = { id: project.id, name: project.name, nodes: canvas.nodes, edges: canvas.edges };
+  const boundField = Boolean(
+    focusRequest && selectedPair?.inputBindings?.[focusRequest.nodeId]?.[focusRequest.fieldId],
+  );
+  const pendingBindings = Boolean(
+    activeNode && selectedPath?.nodes.has(activeNode.id) && catalog.loading,
+  );
+  useEffect(() => {
+    if (!focusRequest || focusRequest === handledFocus.current || pendingBindings) return;
+    if (inspected?.id !== focusRequest.nodeId) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (!inspector.current) return;
+      focusInspectorField(inspector.current, focusRequest.fieldId, boundField);
+      handledFocus.current = focusRequest;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [focusRequest, inspected?.id, pendingBindings, boundField]);
+
   function patch(fields: Partial<GraphNode>) {
     if (!inspected || !canEdit) return;
     const change = (item: GraphNode) => (item.id === inspected.id ? { ...item, ...fields } : item);
@@ -498,6 +549,7 @@ export function ProjectGraphEditor({
   }
   function selectNode(id: string) {
     select({ kind: 'node', id });
+    setFocusRequest(undefined);
     if (canvas.endpoints.some((pair) => pair.startId === id)) setStartId(id);
     setConnector(undefined);
     setSource(undefined);
@@ -654,19 +706,11 @@ export function ProjectGraphEditor({
                     className="button secondary small"
                     onClick={() => {
                       const nodeId = issue.nodeId ?? issue.flowId;
-                      if (nodeId && canvas.nodes.some(({ id }) => id === nodeId))
+                      if (nodeId && canvas.nodes.some(({ id }) => id === nodeId)) {
                         selectNode(nodeId);
-                      if (issue.flowId) setStartId(issue.flowId);
-                      if (issue.fieldId) {
-                        const fieldId = CSS.escape(issue.fieldId);
-                        window.requestAnimationFrame(() => {
-                          document
-                            .querySelector<HTMLElement>(
-                              '.graph-inspector [data-graph-field="' + fieldId + '"] select',
-                            )
-                            ?.focus();
-                        });
+                        if (issue.fieldId) setFocusRequest({ nodeId, fieldId: issue.fieldId });
                       }
+                      if (issue.flowId) setStartId(issue.flowId);
                     }}
                   >
                     {issue.flowId &&
@@ -679,6 +723,7 @@ export function ProjectGraphEditor({
           </section>
         )}
         <ErrorBanner error={catalog.error} retry={catalog.reload} />
+        {missingRepairNode && <ErrorBanner error="运行问题关联的节点已不在当前草稿中。" />}
         <ErrorBanner error={error} />
         <NodeMap
           flow={flow}
@@ -733,10 +778,10 @@ export function ProjectGraphEditor({
         )}
       </div>
       {(inspected || activeEdge || connector) && (
-        <aside className="graph-inspector graph-properties" aria-label="选中项属性">
+        <aside ref={inspector} className="graph-inspector graph-properties" aria-label="选中项属性">
           {inspected && (
             <>
-              <h3>
+              <h3 tabIndex={-1}>
                 {template ? '模板属性' : '节点属性'} · {graphNodeLabels[inspected.type]}
               </h3>
               <NodeFields
@@ -1337,6 +1382,7 @@ function CheckoutFields({ project, node, canEdit, patch }: Omit<FieldsProps, 'ca
         hint={project.repositories.length ? undefined : '请先在项目中登记仓库。'}
       >
         <select
+          data-graph-node-field="repository"
           disabled={!canEdit}
           value={settings.repositoryId}
           onChange={(event) => {
@@ -1469,6 +1515,7 @@ function ShellFields({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canEd
       {shell.location !== 'MANAGER' && (
         <Field label="执行服务器" hint="可在当前流绑定目标。">
           <select
+            data-graph-node-field="targets"
             disabled={!canEdit}
             value={shell.serverId ?? ''}
             onChange={(event) =>

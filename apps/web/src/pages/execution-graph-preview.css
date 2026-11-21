@@ -1,6 +1,8 @@
 .execution-plan,
 .execution-plan section,
 .execution-plan-row,
+.execution-plan-artifact-source,
+.execution-plan-policy,
 .execution-plan-changes {
   display: grid;
   gap: 0.5rem;
@@ -27,6 +29,24 @@
 .execution-plan-table small {
   display: block;
   color: var(--muted);
+}
+
+.execution-plan-artifact-source,
+.execution-plan-approval {
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: #fff;
+  overflow-wrap: anywhere;
+}
+
+.execution-plan-policy {
+  gap: 0.25rem;
+}
+
+.execution-plan-artifact-source .execution-plan-policy {
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--border);
 }
 
 .execution-plan-heading {

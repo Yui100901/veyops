@@ -13,6 +13,7 @@ import type {
   User,
 } from '../models';
 import { EnvironmentConfigEditor, RepositoryBinding } from './DeploymentConfig';
+import { ExecutionGraphStartList } from './ExecutionGraphStartStatus';
 import { ProjectEnvironment } from './ProjectEnvironment';
 import { ProjectRelations } from './ProjectRelations';
 import { ProjectServerInventory } from './ProjectServerInventory';
@@ -21,13 +22,9 @@ import { repositoryBranchLabel } from './RepositoryBranches';
 import { DeploymentHistory } from './ServerResources';
 import { deliveryPath } from './delivery-route';
 import type { GraphDocument } from './execution-graph-definition';
+import { graphResourcePanel, graphStartHref } from './graph-workbench-context';
 import {
-  flowMatchesScope,
-  graphResourcePanel,
-  graphStartHref,
-  graphWorkbenchPath,
-} from './graph-workbench-context';
-import {
+  graphResourceReturnHref,
   projectGraphPath,
   projectResourcePath,
   projectResources,
@@ -73,6 +70,8 @@ export function ProjectResources({
     graphVersion,
     graphNode,
     graphFlow,
+    graphStart,
+    graphField,
     graphServiceId,
     graphEnvironmentId,
     graphResourcePanel: originalPanel,
@@ -82,12 +81,14 @@ export function ProjectResources({
     graphVersion,
     graphNode,
     graphFlow,
+    graphStart,
+    graphField,
     graphServiceId,
     graphEnvironmentId,
     graphResourcePanel: originalPanel,
   };
-  const canEdit = user.role !== 'VIEWER';
-  const [editor, setEditor] = useState<{ kind: EditableKind; item?: Resource }>();
+  const canEdit = user.role !== 'VIEWER' && !project.archived;
+  const [editing, setEditor] = useState<{ kind: EditableKind; item?: Resource }>();
   const [deleting, setDeleting] = useState<{ kind: EditableKind; item: Resource }>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -103,8 +104,12 @@ export function ProjectResources({
     (resource === 'environments' && environmentId && !environment) ||
     (resource === 'repositories' && repositoryId && !repository);
   const selected = Boolean(service || (resource === 'environments' && environment) || repository);
+  const addingRepository =
+    canEdit && resource === 'repositories' && !repositoryId && panel === 'new';
+  const editor =
+    editing ?? (addingRepository ? { kind: 'repositories' as const, item: undefined } : undefined);
   const resourceHref = (kind?: ResourceKind) =>
-    '#' + projectResourcePath(id, { view, resource: kind });
+    '#' + projectResourcePath(id, { ...graphBack, view, resource: kind });
   async function archive() {
     if (!deleting) return;
     setBusy(true);
@@ -114,7 +119,8 @@ export function ProjectResources({
       const archivedDetail = [service?.id, environment?.id, repository?.id].includes(
         deleting.item.id,
       );
-      if (archivedDetail) navigate(projectResourcePath(id, { view, resource: deleting.kind }));
+      if (archivedDetail)
+        navigate(projectResourcePath(id, { ...graphBack, view, resource: deleting.kind }));
       setDeleting(undefined);
       await reload();
     } catch (err) {
@@ -154,24 +160,8 @@ export function ProjectResources({
     <div className="project-resources">
       {!resource && <ProjectResourceSummary project={project} view={view} />}
       {graphPane && (
-        <a
-          className="back-link"
-          href={
-            '#' +
-            graphWorkbenchPath(id, {
-              view,
-              pane: graphPane,
-              version: Number(graphVersion) || undefined,
-              node: graphNode,
-              flow: graphFlow,
-              start: graphPane === 'run' ? graphFlow : undefined,
-              serviceId: graphServiceId,
-              environmentId: graphEnvironmentId,
-              resourcePanel: graphResourcePanel(originalPanel),
-            })
-          }
-        >
-          ← 返回执行图
+        <a className="back-link" href={graphResourceReturnHref(id, graphBack, view)}>
+          {graphPane === 'run' && graphStart ? '← 返回运行参数' : '← 返回执行图'}
         </a>
       )}
       <nav className="resource-section-switcher" aria-label="项目资源分类">
@@ -190,18 +180,25 @@ export function ProjectResources({
       </nav>
       {missing ? (
         <ErrorBanner error="该资源已归档或不属于当前项目。" />
-      ) : editor ? (
+      ) : canEdit && editor ? (
         <ProjectResourceEditor
           key={editor.item?.id ?? editor.kind}
           project={project}
           user={user}
           adding={editor.kind}
           editingResource={editor.item}
-          onClose={() => setEditor(undefined)}
+          onClose={() => {
+            setEditor(undefined);
+            if (addingRepository)
+              navigate(projectResourcePath(id, { ...graphBack, view, resource }));
+          }}
           onSaved={async (item) => {
             setEditor(undefined);
             await reload();
-            if (!editor.item) navigate(projectResourcePath(id, detail(editor.kind, item.id, view)));
+            if (!editor.item)
+              navigate(
+                projectResourcePath(id, { ...detail(editor.kind, item.id, view), ...graphBack }),
+              );
           }}
         />
       ) : (
@@ -239,7 +236,13 @@ export function ProjectResources({
                               <div>
                                 <a
                                   className="text-link"
-                                  href={'#' + projectResourcePath(id, detail(kind, item.id, view))}
+                                  href={
+                                    '#' +
+                                    projectResourcePath(id, {
+                                      ...detail(kind, item.id, view),
+                                      ...graphBack,
+                                    })
+                                  }
                                 >
                                   {item.name}
                                 </a>
@@ -300,7 +303,9 @@ export function ProjectResources({
               services={project.services}
               environments={project.environments}
               onSynced={reload}
-              onClose={() => navigate(projectResourcePath(id, { view, resource: 'repositories' }))}
+              onClose={() =>
+                navigate(projectResourcePath(id, { ...graphBack, view, resource: 'repositories' }))
+              }
               actions={itemActions('repositories', repository)}
             />
           )}
@@ -383,6 +388,7 @@ function ServiceDetails({
   const serviceId = service.id;
   const environmentId = environment?.id;
   const scope: ProjectScope = { serviceId, environmentId, view };
+  const graphScope = { ...scope, resourcePanel: graphResourcePanel(panel) };
   const path = (env?: string, subpanel?: string) =>
     projectResourcePath(id, {
       ...graphBack,
@@ -394,9 +400,10 @@ function ServiceDetails({
     });
   const graph = useResource<GraphDocument>(`/projects/${id}/execution-graph`);
   const version = graph.data?.publishedVersion;
-  const published = useResource<{ definition: GraphDocument['draft'] }>(
+  const published = useResource<{ version: number; definition: GraphDocument['draft'] }>(
     version ? `/projects/${id}/execution-graph/versions/${version}` : null,
   );
+  const activePublished = published.data?.version === version ? published.data : undefined;
   const repos = useResource<{ repositoryId: string; repoPath: string; isPrimary: boolean }[]>(
     `/services/${serviceId}/repositories`,
   );
@@ -404,9 +411,7 @@ function ServiceDetails({
     `/projects/${id}/services/${serviceId}/recent-deployments` +
       (environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : ''),
   );
-  const flows = (published.data?.definition.flows ?? []).filter((flow) =>
-    flowMatchesScope(flow, scope),
-  );
+  const graphError = graph.error || published.error;
   return (
     <>
       <Section
@@ -436,7 +441,13 @@ function ServiceDetails({
           {environment && (
             <a
               className="button secondary small"
-              href={'#' + projectResourcePath(id, detail('environments', environment.id, view))}
+              href={
+                '#' +
+                projectResourcePath(id, {
+                  ...detail('environments', environment.id, view),
+                  ...graphBack,
+                })
+              }
             >
               环境详情
             </a>
@@ -444,42 +455,34 @@ function ServiceDetails({
         </div>
       </Section>
       <Section
-        title="可运行的已发布执行流"
+        title="已发布执行流"
+        className="project-service-starts"
         action={
           <a className="text-link" href={'#' + projectGraphPath(id, scope)}>
             查看执行图 →
           </a>
         }
       >
-        <ErrorBanner
-          error={graph.error || published.error}
-          retry={graph.error ? graph.reload : published.reload}
-        />
-        {graph.loading || (version && published.loading) ? (
+        {graphError ? (
+          <ErrorBanner error={graphError} retry={graph.error ? graph.reload : published.reload} />
+        ) : graph.loading || (version && !activePublished) ? (
           <Loading />
-        ) : flows.length ? (
-          <div className="project-resource-links">
-            {flows.map((flow) => (
-              <a
-                className="button secondary small"
-                key={flow.id}
-                href={graphStartHref(id, flow.id, {
-                  ...scope,
-                  resourcePanel: graphResourcePanel(panel),
-                })}
-              >
-                {flow.name}
-              </a>
-            ))}
-          </div>
+        ) : activePublished ? (
+          <ExecutionGraphStartList
+            project={project}
+            scope={graphScope}
+            flows={activePublished.definition.flows}
+            version={activePublished.version}
+            canRepair={user.role !== 'VIEWER' && !project.archived}
+            href={(flow) => graphStartHref(id, flow.id, graphScope)}
+          />
         ) : (
-          <p className="mini-empty">
-            {version ? '当前范围没有匹配的已发布执行流。' : '项目尚未发布执行图。'}
-          </p>
+          <p className="mini-empty">项目尚未发布执行图。</p>
         )}
       </Section>
       {environment ? (
         <EnvironmentConfigEditor
+          key={serviceId + ':' + environment.id}
           project={project}
           user={user}
           serviceId={serviceId}

@@ -1,4 +1,10 @@
-import { BadRequestException, ConflictException, Injectable, OnModuleInit } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+  OnModuleInit,
+} from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
 import { lstat } from 'node:fs/promises';
@@ -6,6 +12,7 @@ import { posix } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { Database } from '../../core/database/schema';
 import { DatabaseService } from '../../core/database/database.service';
+import { ExecutionPlanIssueError } from '../../core/execution-plan-issue';
 import {
   executionVariableName,
   resolveExecutionVariables,
@@ -21,6 +28,7 @@ import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
 import { relativePath, shellQuote } from '../pipelines/pipeline.validation';
 import { deliveryExecutionProfile } from '../pipelines/delivery-execution-profile';
 import type { PipelineSnapshot, NamedArtifactDefinition } from '../pipelines/pipeline.types';
+import { withPlanIssue } from './graph-execution-plan-issues';
 import {
   RepositoryMetadataService,
   type GraphCheckoutSnapshot,
@@ -175,7 +183,11 @@ export class GraphNodeTasks implements OnModuleInit {
           .executeTakeFirst()
       : undefined;
     if (options.environmentId && !environment)
-      throw new BadRequestException('环境必须属于当前项目');
+      throw new ExecutionPlanIssueError({
+        code: 'CONFIGURATION',
+        fieldId: 'environment',
+        message: '环境必须属于当前项目',
+      });
     const directory = options.directory ? relativePath(options.directory) : '.';
     const explicit = options.envFile
       ? environmentFilePath(posix.join(directory, relativePath(options.envFile)))
@@ -190,7 +202,12 @@ export class GraphNodeTasks implements OnModuleInit {
     const { repositoryId, commitSha, branch, tag } = options.source ?? {};
     const origin = { repositoryId, commitSha, branch, tag };
     if (!repositoryId || !commitSha) {
-      if (required) throw new BadRequestException('加载仓库环境文件需要绑定固定提交的 Git 源码');
+      if (required)
+        throw new ExecutionPlanIssueError({
+          code: 'REPOSITORY',
+          fieldId: 'source',
+          message: '加载仓库环境文件需要绑定固定提交的 Git 源码',
+        });
       return undefined;
     }
     const path =
@@ -199,13 +216,27 @@ export class GraphNodeTasks implements OnModuleInit {
         ? environmentFilePath(configured)
         : environment && environmentFilePath(posix.join(directory, '.env.' + environment.slug)));
     if (!path) return undefined;
-    const entry = await this.repositories.inspectGraphEnvironmentFile(
-      projectId,
-      { repositoryId, commitSha },
-      [path],
-    );
+    const entry = await this.repositories
+      .inspectGraphEnvironmentFile(projectId, { repositoryId, commitSha }, [path])
+      .catch((error: unknown) =>
+        withPlanIssue(error, {
+          code: 'CONFIGURATION',
+          fieldId: 'envFile',
+          fieldName: '环境文件',
+          repositoryId,
+          commitSha,
+        }),
+      );
     if (!entry) {
-      if (required) throw new BadRequestException('固定 Git 提交中缺少必需的环境文件 ' + path);
+      if (required)
+        throw new ExecutionPlanIssueError({
+          code: 'CONFIGURATION',
+          fieldId: 'envFile',
+          fieldName: '环境文件',
+          repositoryId,
+          commitSha,
+          message: '固定 Git 提交中缺少必需的环境文件 ' + path,
+        });
       return { ...origin, status: 'SKIPPED', source, path, required, variables: [] };
     }
     return {
@@ -225,7 +256,12 @@ export class GraphNodeTasks implements OnModuleInit {
     if (node.type === 'CHECKOUT') {
       const config = node.checkout;
       const repositoryId = resourceId(values.repository) ?? config?.repositoryId;
-      if (!repositoryId) throw new BadRequestException('Git 拉取需要项目仓库');
+      if (!repositoryId)
+        throw new ExecutionPlanIssueError({
+          code: 'REPOSITORY',
+          fieldId: 'repository',
+          message: 'Git 拉取需要项目仓库',
+        });
       const value = values.version;
       const ref =
         value && typeof value === 'object' && 'kind' in value && 'value' in value
@@ -233,18 +269,31 @@ export class GraphNodeTasks implements OnModuleInit {
           : undefined;
       const kind = ref?.kind ?? config?.mode ?? 'BRANCH';
       if (kind !== 'BRANCH' && kind !== 'TAG' && kind !== 'COMMIT')
-        throw new BadRequestException('Git 版本类型无效');
+        throw new ExecutionPlanIssueError({
+          code: 'REPOSITORY',
+          fieldId: 'version',
+          repositoryId,
+          message: 'Git 版本类型无效',
+        });
       const version = text(ref?.value);
       return {
         type: 'CHECKOUT',
-        source: await this.repositories.planGraphCheckout(projectId, {
-          repositoryId,
-          mode: kind,
-          branch: kind === 'BRANCH' ? (version ?? config?.branch) : undefined,
-          tag: kind === 'TAG' ? (version ?? config?.tag) : undefined,
-          commitSha: kind === 'COMMIT' ? (version ?? config?.commitSha) : undefined,
-          fullClone: config?.fullClone,
-        }),
+        source: await this.repositories
+          .planGraphCheckout(projectId, {
+            repositoryId,
+            mode: kind,
+            branch: kind === 'BRANCH' ? (version ?? config?.branch) : undefined,
+            tag: kind === 'TAG' ? (version ?? config?.tag) : undefined,
+            commitSha: kind === 'COMMIT' ? (version ?? config?.commitSha) : undefined,
+            fullClone: config?.fullClone,
+          })
+          .catch((error: unknown) =>
+            withPlanIssue(error, {
+              code: 'REPOSITORY',
+              fieldId: error instanceof NotFoundException ? 'repository' : 'version',
+              repositoryId,
+            }),
+          ),
       };
     }
     if (node.type === 'LOAD_ENV') {
@@ -255,7 +304,11 @@ export class GraphNodeTasks implements OnModuleInit {
         workspace?.repositoryId &&
         (source.repositoryId !== workspace.repositoryId || source.commitSha !== workspace.commitSha)
       )
-        throw new BadRequestException('环境文件所绑定的源码与工作区来自不同 Git 提交');
+        throw new ExecutionPlanIssueError({
+          code: 'REPOSITORY',
+          fieldId: 'source',
+          message: '环境文件所绑定的源码与工作区来自不同 Git 提交',
+        });
       const environmentId = resourceId(values.environment) ?? scope.environmentId;
       const environmentFile = await this.prepareEnvironment(projectId, {
         environmentId,

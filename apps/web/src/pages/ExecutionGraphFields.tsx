@@ -541,7 +541,7 @@ export function GraphFieldEditor({
     <section className="graph-fields">
       <h4>{title ?? (isInput ? '运行输入' : '结束输出')}</h4>
       {fields.map((field) => (
-        <details className="graph-field-card" key={field.id}>
+        <details className="graph-field-card" data-graph-field={field.id} key={field.id}>
           <summary>
             {field.name}{' '}
             <small>

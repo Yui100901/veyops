@@ -64,6 +64,7 @@ export function ProjectEnvironment({
         </Section>
       ) : (
         <EnvironmentSettings
+          key={environment.id}
           projectId={project.id}
           environment={environment}
           user={user}

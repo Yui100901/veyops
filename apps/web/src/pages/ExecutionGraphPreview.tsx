@@ -62,8 +62,35 @@ interface ArtifactPreview {
   commitSha?: string;
 }
 
+interface PreviewSource {
+  id?: string;
+  repositoryId?: string;
+  branch?: string;
+  tag?: string;
+  ref?: string;
+  path?: string;
+  commitSha: string;
+}
+
+interface SourceReviewProof {
+  repositoryId: string;
+  commitSha: string;
+  reviewId: string;
+}
+
+interface ArtifactChoice extends NodeScope {
+  fieldId?: string;
+  commitSha?: string;
+  artifactIds?: string[];
+  artifactRefs?: ArtifactPreview[];
+  sourceSnapshot?: PreviewSource[];
+  sourceReviews?: SourceReviewProof[] | null;
+  sourceReviewPendingMaterialization?: boolean;
+}
+
 interface DeliveryPreview extends NodeScope {
   artifactFromNodeId?: string;
+  artifactFromNodeName?: string;
   artifactFromField?: string;
   environmentId?: string;
   commitSha?: string;
@@ -72,24 +99,11 @@ interface DeliveryPreview extends NodeScope {
   artifactRefs?: ArtifactPreview[];
   requireApproval?: boolean;
   requireCodeReview?: boolean;
-  sourceReviews?: { repositoryId: string; commitSha: string; reviewId: string }[] | null;
+  sourceReviews?: SourceReviewProof[] | null;
   sourceReviewPendingMaterialization?: boolean;
-  possibleArtifacts?: {
-    nodeId?: string;
-    fieldId?: string;
-    commitSha: string;
-    artifactIds: string[];
-  }[];
+  possibleArtifacts?: ArtifactChoice[];
   serviceId?: string;
-  sourceSnapshot?: {
-    id?: string;
-    repositoryId: string;
-    branch?: string;
-    tag?: string;
-    ref?: string;
-    path?: string;
-    commitSha: string;
-  }[];
+  sourceSnapshot?: PreviewSource[];
 }
 
 export interface Preview extends DeliveryPreview {
@@ -277,10 +291,139 @@ function fileStatus(file: PlanEnvironmentFile) {
   return file.required ? '必需 · 已固定' : '可选 · 已固定';
 }
 
-function artifactRows(delivery: DeliveryPreview) {
-  return delivery.artifactRefs?.length
-    ? delivery.artifactRefs
-    : (delivery.artifactIds ?? []).map((id): ArtifactPreview => ({ id }));
+function artifactRows(source: Pick<ArtifactChoice, 'artifactIds' | 'artifactRefs'>) {
+  return source.artifactRefs?.length
+    ? source.artifactRefs
+    : (source.artifactIds ?? []).map((id): ArtifactPreview => ({ id }));
+}
+
+function artifactChoices(delivery: DeliveryPreview): ArtifactChoice[] {
+  if (delivery.possibleArtifacts?.length) {
+    return delivery.possibleArtifacts.map((choice) => ({
+      flowId: delivery.flowId,
+      flowName: delivery.flowName,
+      ...choice,
+    }));
+  }
+  if (!delivery.artifactFromNodeId && !artifactRows(delivery).length) return [];
+  return [
+    {
+      ...delivery,
+      nodeId: delivery.artifactFromNodeId,
+      nodeName: delivery.artifactFromNodeName,
+      fieldId: delivery.artifactFromField,
+    },
+  ];
+}
+
+function sourceReviewStatus(needed: boolean, source: ArtifactChoice) {
+  if (!needed) return '当前策略无需源码审核';
+  if (source.sourceReviewPendingMaterialization) return '本次产物登记后按实际仓库及提交复核';
+  if (source.sourceReviews?.length) return '已核对产物来源，发布前再次复核';
+  return '发布前按产物实际来源复核';
+}
+
+type PreviewNames = ReturnType<typeof names>;
+
+function SourceDetails({ source, name }: { source: ArtifactChoice; name: PreviewNames }) {
+  return (
+    <>
+      {source.commitSha && (
+        <small>
+          关联提交 · <code>{source.commitSha}</code>
+        </small>
+      )}
+      {!!source.sourceSnapshot?.length && (
+        <ul className="execution-plan-list" aria-label="仓库与提交">
+          {source.sourceSnapshot.map((entry, index) => (
+            <li key={`${entry.id ?? entry.repositoryId}:${index}`}>
+              {name.repository(entry.repositoryId)}
+              {entry.branch && ` · ${entry.branch}`}
+              {entry.tag && ` · 标签 ${entry.tag}`} <code>{entry.commitSha}</code>
+              {entry.ref && entry.ref !== entry.commitSha && ` · ${entry.ref}`}
+              {entry.path && ` · ${entry.path}`}
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
+function DeliveryArtifacts({
+  delivery,
+  projectId,
+  name,
+}: {
+  delivery: DeliveryPreview;
+  projectId: string;
+  name: PreviewNames;
+}) {
+  const choices = artifactChoices(delivery);
+  if (!choices.length) return <SourceDetails source={delivery} name={name} />;
+  return (
+    <>
+      {choices.length > 1 && <strong>可能使用的产物来源</strong>}
+      {choices.map((source, index) => (
+        <div className="execution-plan-artifact-source" key={index}>
+          <strong>{source.nodeId ? '本次执行产出' : '已固定的历史产物'}</strong>
+          {source.nodeId && (
+            <span>
+              {name.node(source)} / <code>{source.fieldId ?? '产物'}</code>
+            </span>
+          )}
+          {artifactRows(source).map((artifact) => (
+            <div key={artifact.id}>
+              <a
+                className="text-link"
+                href={'#' + deliveryPath(projectId, 'artifacts', { recordId: artifact.id })}
+              >
+                {artifact.name ?? artifact.id}
+              </a>
+              {(artifact.type || artifact.kind) &&
+                ` · ${settingValue((artifact.type ?? artifact.kind)!)}`}
+              {(artifact.digest || artifact.checksum) && (
+                <small>
+                  <code>
+                    {artifact.imageReference ??
+                      (artifact.imageRepository ? artifact.imageRepository + ' · ' : '') +
+                        (artifact.digest ?? artifact.checksum)}
+                  </code>
+                </small>
+              )}
+              {artifact.composeTemplate && (
+                <small>
+                  Compose 归档 {artifact.composeTemplate.path} ·{' '}
+                  <code>{artifact.composeTemplate.checksum}</code>
+                </small>
+              )}
+            </div>
+          ))}
+          <SourceDetails source={source} name={name} />
+          <div className="execution-plan-policy">
+            <strong>源码审核</strong>
+            <span>{sourceReviewStatus(Boolean(delivery.requireCodeReview), source)}</span>
+            {!!source.sourceReviews?.length && (
+              <ul className="execution-plan-list">
+                {source.sourceReviews.map((review) => (
+                  <li key={review.reviewId}>
+                    {name.repository(review.repositoryId)} · <code>{review.commitSha}</code> ·
+                    审核通过
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      ))}
+      <div className="execution-plan-policy execution-plan-approval">
+        <strong>发布审批</strong>
+        <span>
+          {delivery.requireApproval ? '执行到发布步骤时等待管理员审批' : '当前策略无需发布审批'}
+        </span>
+      </div>
+    </>
+  );
 }
 
 export function ExecutionPlan({ preview, project }: { preview: Preview; project: ProjectDetail }) {
@@ -435,102 +578,11 @@ export function ExecutionPlan({ preview, project }: { preview: Preview; project:
                     .join(' · ')}
                 </small>
               )}
-              {artifactRows(delivery).map((artifact) => (
-                <div key={artifact.id}>
-                  已固定 ·{' '}
-                  <a
-                    className="text-link"
-                    href={'#' + deliveryPath(project.id, 'artifacts', { recordId: artifact.id })}
-                  >
-                    {artifact.name ?? artifact.id}
-                  </a>
-                  {(artifact.type || artifact.kind) &&
-                    ` · ${settingValue((artifact.type ?? artifact.kind)!)}`}
-                  {(artifact.digest || artifact.checksum) && (
-                    <small>
-                      <code>
-                        {artifact.imageReference ??
-                          ((artifact.imageRepository ? artifact.imageRepository + ' · ' : '') +
-                            (artifact.digest ?? artifact.checksum))}
-                      </code>
-                    </small>
-                  )}
-                  {artifact.composeTemplate && (
-                    <small>
-                      Compose 归档 {artifact.composeTemplate.path} ·{' '}
-                      <code>{artifact.composeTemplate.checksum}</code>
-                    </small>
-                  )}
-                </div>
-              ))}
-              {delivery.possibleArtifacts?.length ? (
-                <ul className="execution-plan-list" aria-label="可能使用的产物来源">
-                  {delivery.possibleArtifacts.map((candidate, index) => (
-                    <li key={index}>
-                      {candidate.nodeId
-                        ? `运行中产出 · ${name.node({ ...delivery, nodeName: undefined, nodeId: candidate.nodeId })} / ${candidate.fieldId ?? '产物'}`
-                        : candidate.artifactIds.join('、')}{' '}
-                      <code>{candidate.commitSha}</code>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                delivery.artifactFromNodeId && (
-                  <span>
-                    运行中产出 ·{' '}
-                    {name.node({
-                      ...delivery,
-                      nodeName: undefined,
-                      nodeId: delivery.artifactFromNodeId,
-                    })}{' '}
-                    / {delivery.artifactFromField ?? '产物'}
-                  </span>
-                )
-              )}
-              {delivery.commitSha && (
-                <small>
-                  关联提交 · <code>{delivery.commitSha}</code>
-                </small>
-              )}
-              {!!delivery.sourceSnapshot?.length && (
-                <ul className="execution-plan-list">
-                  {delivery.sourceSnapshot.map((source, index) => (
-                    <li key={`${source.id ?? source.repositoryId}:${index}`}>
-                      {name.repository(source.repositoryId)}
-                      {source.branch && ` · ${source.branch}`}
-                      {source.tag && ` · 标签 ${source.tag}`} <code>{source.commitSha}</code>
-                      {source.ref && source.ref !== source.commitSha && ` · ${source.ref}`}
-                      {source.path && ` · ${source.path}`}
-                    </li>
-                  ))}
-                </ul>
-              )}
+              <DeliveryArtifacts delivery={delivery} projectId={project.id} name={name} />
               {!plan?.targets.some((target) => scopeKey(target) === scopeKey(delivery)) &&
                 !!delivery.serverIds?.length && (
                   <span>目标服务器 · {delivery.serverIds.join('、')}</span>
                 )}
-              {delivery.requireApproval && <span className="field-note">发布需要管理员审批</span>}
-              {delivery.requireCodeReview && (
-                <>
-                  <span className="field-note">
-                    {delivery.sourceReviewPendingMaterialization
-                      ? '源码审核 · 登记本次产物后按其实际来源复核'
-                      : delivery.sourceReviews?.length
-                        ? '源码审核 · 已核对产物来源，发布前再次复核'
-                        : '源码审核 · 发布前按产物实际来源复核'}
-                  </span>
-                  {!!delivery.sourceReviews?.length && (
-                    <ul className="execution-plan-list">
-                      {delivery.sourceReviews.map((review) => (
-                        <li key={review.reviewId}>
-                          {name.repository(review.repositoryId)} · <code>{review.commitSha}</code> ·
-                          审核通过
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </>
-              )}
             </div>
           ))}
         </section>
@@ -621,45 +673,52 @@ function reviewRows(preview: Preview, project: ProjectDetail) {
         .join(' · '),
     );
   for (const delivery of preview.deliveries ?? []) {
-    for (const artifact of artifactRows(delivery))
-      add(
-        'artifacts',
-        delivery,
-        'archive',
-        '固定产物',
-        [artifact.id, artifact.type ?? artifact.kind, artifact.digest ?? artifact.checksum]
-          .filter(Boolean)
-          .join(' · '),
-      );
-    for (const candidate of delivery.possibleArtifacts ?? [])
-      add(
-        'artifacts',
-        delivery,
-        'candidate',
-        '产物来源',
-        [candidate.nodeId, candidate.fieldId, ...candidate.artifactIds, candidate.commitSha]
-          .filter(Boolean)
-          .join(' · '),
-      );
-    if (delivery.requireApproval !== undefined)
+    const choices = artifactChoices(delivery);
+    for (const source of choices) {
+      if (source.nodeId)
+        add(
+          'artifacts',
+          delivery,
+          'producer',
+          '本次执行产出',
+          [name.node(source), source.fieldId, source.commitSha].filter(Boolean).join(' · '),
+        );
+      for (const artifact of artifactRows(source))
+        add(
+          'artifacts',
+          delivery,
+          'archive',
+          '已固定的历史产物',
+          [
+            artifact.name,
+            artifact.id,
+            artifact.type ?? artifact.kind,
+            artifact.digest ?? artifact.checksum,
+          ]
+            .filter(Boolean)
+            .join(' · '),
+        );
+      if (delivery.requireCodeReview !== undefined)
+        add(
+          'policies',
+          delivery,
+          'review',
+          '源码审核',
+          [
+            sourceReviewStatus(delivery.requireCodeReview, source),
+            ...(source.sourceReviews ?? []).map(
+              ({ repositoryId, commitSha }) => `${name.repository(repositoryId)} · ${commitSha}`,
+            ),
+          ].join(' · '),
+        );
+    }
+    if (choices.length && delivery.requireApproval !== undefined)
       add(
         'policies',
         delivery,
         'approval',
         '发布审批',
         delivery.requireApproval ? '需要审批' : '无需审批',
-      );
-    if (delivery.requireCodeReview !== undefined)
-      add(
-        'policies',
-        delivery,
-        'review',
-        '源码审核',
-        delivery.sourceReviewPendingMaterialization
-          ? '等待产物登记'
-          : delivery.requireCodeReview
-            ? '需要审核'
-            : '无需审核',
       );
   }
   return rows;

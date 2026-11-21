@@ -13,6 +13,7 @@ import { validate } from 'class-validator';
 import type { Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
+import { executionIssue, type ExecutionPlanIssue } from '../../core/execution-plan-issue';
 import { ServersService } from '../servers/servers.service';
 import { TasksService } from '../tasks/tasks.service';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
@@ -68,7 +69,7 @@ import {
   assertGraphAutomation,
   type GraphAutomation,
 } from '../execution-graphs/graph-automatic-delivery';
-import { resolveDeliveryTargets } from './delivery-targets';
+import { resolveDeliveryTargets, type DeliveryTargetSource } from './delivery-targets';
 import { redactTaskLog } from '../tasks/task-log.service';
 import { encryptionKey } from '../../core/config';
 import {
@@ -188,9 +189,20 @@ export class PipelinesService implements OnModuleInit {
       !project ||
       service?.project_id !== projectId ||
       (!allowArchivedSource && repositoryRows.length !== repositoryIds.length)
-    )
-      throw new BadRequestException('项目、服务和仓库必须存在且属于同一项目');
-    for (const row of repositoryRows) validateGitUrl(row.clone_url);
+    ) {
+      const error = new BadRequestException('项目、服务和仓库必须存在且属于同一项目');
+      if (project && service?.project_id === projectId && !fromArtifact)
+        throw executionIssue(error, { code: 'REPOSITORY', fieldId: 'repository', serviceId });
+      throw error;
+    }
+    for (const row of repositoryRows) {
+      try {
+        validateGitUrl(row.clone_url);
+      } catch (error) {
+        if (fromArtifact || !(error instanceof BadRequestException)) throw error;
+        throw executionIssue(error, { code: 'REPOSITORY', fieldId: 'repository', serviceId });
+      }
+    }
     const repositories = new Map(repositoryRows.map((row) => [row.id, row]));
     const repository = repositories.get(definition.repositoryId) ?? {
       clone_url: '',
@@ -495,8 +507,21 @@ export class PipelinesService implements OnModuleInit {
             await activeComposeRevision(this.database.db, pipeline.serviceId, environment.id),
           )
         : undefined;
-    const graphTargets = profile
-      ? resolveDeliveryTargets(graphPurpose, input, {
+    const targetIssue = (error: unknown, targetSource?: DeliveryTargetSource) => {
+      if (!profile || !(error instanceof BadRequestException || error instanceof NotFoundException))
+        return error;
+      return executionIssue(error, {
+        code: graphPurpose === 'TARGET_BUILD' ? 'BUILD_TARGET' : 'RELEASE_TARGET',
+        fieldId: 'targets',
+        serviceId: pipeline.serviceId,
+        environmentId: environment.id,
+        targetSource: targetSource === 'MANAGER' ? undefined : targetSource,
+      });
+    };
+    let graphTargets: ReturnType<typeof resolveDeliveryTargets> | undefined;
+    try {
+      if (profile)
+        graphTargets = resolveDeliveryTargets(graphPurpose, input, {
           service: configured,
           legacyTargetId: env.config?.targetId,
           environment:
@@ -504,8 +529,10 @@ export class PipelinesService implements OnModuleInit {
               ? storedDeploymentSelection(environment.default_target_selection_json)
               : undefined,
           parallel: defaults.defaultMaxParallelTargets,
-        })
-      : undefined;
+        });
+    } catch (error) {
+      throw targetIssue(error, 'RUN_INPUT');
+    }
     const defaultParallel =
       input.serverIds !== undefined || input.groupIds !== undefined
         ? (input.maxParallel ?? configured?.maxParallel ?? defaults.defaultMaxParallelTargets)
@@ -532,13 +559,18 @@ export class PipelinesService implements OnModuleInit {
       : undefined;
     const targetless = graphTargets?.source === 'MANAGER';
     if (!selection && !legacy && !targetless)
-      throw new BadRequestException(
-        graphTargets
-          ? `${profile!.name}：${graphPurpose === 'TARGET_BUILD' ? '目标端构建缺少构建服务器' : '发布缺少服务器或服务器分组'}`
-          : '请选择服务器或服务器分组',
+      throw targetIssue(
+        new BadRequestException(
+          graphTargets
+            ? `${profile!.name}：${graphPurpose === 'TARGET_BUILD' ? '目标端构建缺少构建服务器' : '发布缺少服务器或服务器分组'}`
+            : '请选择服务器或服务器分组',
+        ),
+        legacyId ? 'LEGACY_TARGET' : undefined,
       );
     const members = selection
-      ? await selectedServerIds(this.database.db, selection)
+      ? await selectedServerIds(this.database.db, selection).catch((error) => {
+          throw targetIssue(error, graphTargets?.source);
+        })
       : !legacy
         ? []
         : (
@@ -549,7 +581,11 @@ export class PipelinesService implements OnModuleInit {
               .orderBy('sort_order')
               .execute()
           ).map((member) => member.server_id);
-    const servers = targetless ? [] : await this.servers.snapshot(members);
+    const servers = targetless
+      ? []
+      : await this.servers.snapshot(members).catch((error) => {
+          throw targetIssue(error, graphTargets?.source);
+        });
     const target = selection
       ? {
           id: undefined,
@@ -569,7 +605,10 @@ export class PipelinesService implements OnModuleInit {
       (mode === 'DEPLOY' || definition.buildLocation === 'TARGET') &&
       servers.some((s) => !s.credentialId || !s.hostKeyFingerprint)
     )
-      throw new BadRequestException('执行目标必须配置SSH凭据和已确认指纹');
+      throw targetIssue(
+        new BadRequestException('执行目标必须配置SSH凭据和已确认指纹'),
+        graphTargets?.source,
+      );
     const { repository, repositories, registry, projectName, serviceName } = await this.resources(
       pipeline.projectId,
       pipeline.serviceId,
@@ -1087,7 +1126,13 @@ export class PipelinesService implements OnModuleInit {
     environmentId: string,
     artifactIds: string[],
   ) {
-    if (!artifactIds.length) throw new BadRequestException('请选择构建产物');
+    const issue: Omit<ExecutionPlanIssue, 'message'> = {
+      code: 'ARTIFACT',
+      fieldId: 'artifact',
+      serviceId,
+      environmentId,
+    };
+    if (!artifactIds.length) throw executionIssue(new BadRequestException('请选择构建产物'), issue);
     const rows = await this.database.db
       .selectFrom('artifacts')
       .innerJoin('pipeline_runs as build', 'build.id', 'artifacts.pipeline_run_id')
@@ -1119,10 +1164,13 @@ export class PipelinesService implements OnModuleInit {
           candidate.artifact_name !== row.artifact_name,
       )
     )
-      throw new BadRequestException('请选择该服务和环境下同一次成功构建的产物');
+      throw executionIssue(
+        new BadRequestException('请选择该服务和环境下同一次成功构建的产物'),
+        issue,
+      );
     const build = (JSON.parse(row.payload_json) as TaskPayload).pipeline;
     if (!build || build.mode === 'DEPLOY_ARTIFACT')
-      throw new BadRequestException('产物没有可用的构建记录');
+      throw executionIssue(new BadRequestException('产物没有可用的构建记录'), issue);
     return {
       definition: {
         ...build.definition,
@@ -1194,9 +1242,18 @@ export class PipelinesService implements OnModuleInit {
     input: ArtifactDeployPreviewDto,
     profile?: DeliveryExecutionProfile,
   ) {
+    const artifactIssue = (error: BadRequestException | ConflictException) =>
+      profile
+        ? executionIssue(error, {
+            code: 'ARTIFACT',
+            fieldId: 'artifact',
+            serviceId: profile.serviceId,
+            environmentId: input.environmentId,
+          })
+        : error;
     const artifactIds = [...new Set(input.artifactIds)].sort();
     if (!artifactIds.length || artifactIds.length !== input.artifactIds.length)
-      throw new BadRequestException('请选择互不重复的部署产物');
+      throw artifactIssue(new BadRequestException('请选择互不重复的部署产物'));
     const db = this.database.db;
     const query = db
       .selectFrom('artifacts')
@@ -1245,9 +1302,9 @@ export class PipelinesService implements OnModuleInit {
           (row.artifact_commit !== null && row.artifact_commit !== source.commit_sha),
       )
     )
-      throw new BadRequestException('产物必须来自相同服务和环境的一次构建');
+      throw artifactIssue(new BadRequestException('产物必须来自相同服务和环境的一次构建'));
     if (source.status !== 'SUCCESS' && source.status !== 'PARTIAL_FAILED')
-      throw new ConflictException('来源任务没有可发布的成功构建');
+      throw artifactIssue(new ConflictException('来源任务没有可发布的成功构建'));
     const serverIds = rows.flatMap((row) => (row.server_id ? [row.server_id] : []));
     if (serverIds.length) {
       const successful = await db
@@ -1258,9 +1315,9 @@ export class PipelinesService implements OnModuleInit {
         .where('status', '=', 'SUCCESS')
         .execute();
       if (successful.length !== new Set(serverIds).size)
-        throw new ConflictException('所选产物包含未成功构建的目标');
+        throw artifactIssue(new ConflictException('所选产物包含未成功构建的目标'));
     } else if (source.status !== 'SUCCESS') {
-      throw new ConflictException('来源任务未成功完成');
+      throw artifactIssue(new ConflictException('来源任务未成功完成'));
     }
     const p = await this.prepare(
       id,
@@ -1283,10 +1340,12 @@ export class PipelinesService implements OnModuleInit {
     );
     const references = candidates.filter((candidate) => artifactIds.includes(candidate.id));
     if (references.length !== rows.length)
-      throw new ConflictException(
-        p.definition.artifactType === 'DOCKER_IMAGE' && !p.managedCompose
-          ? '产物缺少可校验的镜像或 Compose 归档，也可以为服务环境配置独立模板'
-          : '产物缺少可校验的发布所需数据',
+      throw artifactIssue(
+        new ConflictException(
+          p.definition.artifactType === 'DOCKER_IMAGE' && !p.managedCompose
+            ? '产物缺少可校验的镜像或 Compose 归档，也可以为服务环境配置独立模板'
+            : '产物缺少可校验的发布所需数据',
+        ),
       );
     if (p.managedCompose)
       await readManagedCompose(db, p.pipeline.serviceId, p.environment.id, p.managedCompose);
@@ -1297,10 +1356,10 @@ export class PipelinesService implements OnModuleInit {
           (row.storage_type === 'REGISTRY_IMAGE' && row.registry_id !== p.definition.registryId),
       )
     )
-      throw new BadRequestException('产物类型或 Registry 与有效部署配置不一致');
+      throw artifactIssue(new BadRequestException('产物类型或 Registry 与有效部署配置不一致'));
     const targets = p.servers.map((server) => server.id);
     if (!this.artifactsMatchTargets(references, targets))
-      throw new BadRequestException('目标端构建产物须与所选部署目标逐一匹配');
+      throw artifactIssue(new BadRequestException('目标端构建产物须与所选部署目标逐一匹配'));
     const reviewRequired = p.env.config?.releasePolicy?.requireCodeReview;
     const scope = {
       projectId: p.pipeline.projectId,

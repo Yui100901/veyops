@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { map } from 'rxjs/operators';
+import { ExecutionPlanIssueError } from './execution-plan-issue';
 
 @Injectable()
 export class ApiResponseInterceptor implements NestInterceptor {
@@ -45,6 +46,7 @@ export class ApiExceptionFilter implements ExceptionFilter {
       error: {
         code: `HTTP_${status}`,
         message: Array.isArray(message) ? message.join('；') : message,
+        ...(error instanceof ExecutionPlanIssueError && { planIssue: error.issue }),
         ...(status === 409 &&
           body &&
           typeof body === 'object' &&

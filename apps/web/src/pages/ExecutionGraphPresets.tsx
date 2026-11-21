@@ -47,6 +47,7 @@ export function BuildFields({
     <div className="form-grid graph-preset-fields">
       <Field label="构建仓库">
         <select
+          data-graph-node-field="repository"
           disabled={!canEdit}
           value={repositoryId}
           onChange={(event) =>

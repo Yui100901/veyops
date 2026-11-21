@@ -1,12 +1,82 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+const planIssueCodes = [
+  'INPUT',
+  'REPOSITORY',
+  'BUILD_TARGET',
+  'RELEASE_TARGET',
+  'ARTIFACT',
+  'SOURCE_REVIEW',
+  'CONFIGURATION',
+] as const;
+
+export interface ExecutionPlanIssue {
+  code: (typeof planIssueCodes)[number];
+  message: string;
+  flowId?: string;
+  flowName?: string;
+  nodeId?: string;
+  nodeName?: string;
+  fieldId?: string;
+  fieldName?: string;
+  repositoryId?: string;
+  commitSha?: string;
+  parameterId?: string;
+  serviceId?: string;
+  environmentId?: string;
+  targetSource?:
+    'RUN_INPUT' | 'NODE' | 'SERVICE_ENVIRONMENT' | 'PROJECT_ENVIRONMENT' | 'LEGACY_TARGET';
+}
+
+function readPlanIssue(value: unknown): ExecutionPlanIssue | undefined {
+  if (!value || typeof value !== 'object') return;
+  const row = value as Record<string, unknown>;
+  const code = planIssueCodes.find((candidate) => candidate === row.code);
+  if (!code || typeof row.message !== 'string') return;
+  const issue: ExecutionPlanIssue = { code, message: row.message };
+  for (const key of [
+    'flowId',
+    'flowName',
+    'nodeId',
+    'nodeName',
+    'fieldId',
+    'fieldName',
+    'repositoryId',
+    'commitSha',
+    'parameterId',
+    'serviceId',
+    'environmentId',
+  ] as const) {
+    const value = row[key];
+    if (typeof value === 'string') issue[key] = value;
+  }
+  const { targetSource } = row;
+  if (
+    targetSource === 'RUN_INPUT' ||
+    targetSource === 'NODE' ||
+    targetSource === 'SERVICE_ENVIRONMENT' ||
+    targetSource === 'PROJECT_ENVIRONMENT' ||
+    targetSource === 'LEGACY_TARGET'
+  ) {
+    issue.targetSource = targetSource;
+  }
+  return issue;
+}
+
 export class ApiError extends Error {
   status: number;
   changes: string[];
-  constructor(message: string, status: number, changes: string[] = []) {
+  readonly planIssue?: ExecutionPlanIssue;
+  constructor(
+    message: string,
+    status: number,
+    changes: string[] = [],
+    planIssue?: ExecutionPlanIssue,
+  ) {
     super(message);
     this.status = status;
     this.changes = changes;
+    this.planIssue = planIssue;
   }
 }
 
@@ -16,7 +86,11 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...options.headers },
   });
-  let body: { data?: T; error?: { message?: string; changes?: unknown }; message?: string };
+  let body: {
+    data?: T;
+    error?: { message?: string; changes?: unknown; planIssue?: unknown };
+    message?: string;
+  };
   try {
     body = await response.json();
   } catch {
@@ -31,6 +105,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
       Array.isArray(body.error?.changes)
         ? body.error.changes.filter((change): change is string => typeof change === 'string')
         : [],
+      readPlanIssue(body.error?.planIssue),
     );
   }
   return body.data as T;
