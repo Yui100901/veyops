@@ -83,9 +83,16 @@ async function checkLifecycle(url?: string) {
             definition: {
               flows: [],
               canvas: {
-                nodes,
-                edges,
-                endpoints: [{ startId: 'start', endId: 'end' }],
+                nodes: [
+                  ...nodes,
+                  { id: 'control', type: 'START', name: 'Control flow' },
+                  { id: 'control-end', type: 'END', name: 'Control end' },
+                ],
+                edges: [...edges, { from: 'control', to: 'control-end' }],
+                endpoints: [
+                  { startId: 'start', endId: 'end' },
+                  { startId: 'control', endId: 'control-end' },
+                ],
                 templates: [],
               },
             },
@@ -123,10 +130,11 @@ async function checkLifecycle(url?: string) {
     const rule = {
       name: 'Pins earlier version',
       kind: 'API',
-      flowId: 'start',
+      flowId: 'control',
       version,
       enabled: true,
     };
+    await post(graph + '/triggers', { ...rule, flowId: 'start' }).expect(403);
     const trigger = await make(graph + '/triggers', rule);
     const review = await make(graph + '/flows/start/preview', { version });
     const live = await make(graph + '/flows/start/run', {
