@@ -1,17 +1,9 @@
 import { InlineEditor, useInlineEditor } from '../InlineEditor';
-import { projectAccessUrl } from './ProjectAccessLinks';
-import { useState } from 'react';
-import type { FormEvent } from 'react';
-import { Link2, Network, Pencil, Plus, Trash2 } from 'lucide-react';
+import { useState, type FormEvent } from 'react';
+import { Network, Pencil, Plus, Trash2 } from 'lucide-react';
 import { api, message, post, remove, useResource } from '../api';
 import { Confirm, ErrorBanner, Field, Form, Section } from '../components';
-import type { Project, ProjectAddress, ProjectDependency, ProjectDetail, User } from '../models';
-import { DeploymentHistory } from './ServerResources';
-
-type Relation =
-  { type: 'addresses'; item?: ProjectAddress } | { type: 'dependencies'; item?: ProjectDependency };
-
-const labels = { addresses: '访问地址', dependencies: '项目依赖' };
+import type { Project, ProjectDependency, ProjectDetail, User } from '../models';
 
 export function ProjectRelations({
   project,
@@ -22,133 +14,51 @@ export function ProjectRelations({
   user: User;
   reload: () => Promise<void>;
 }) {
-  const [editing, setEditing] = useInlineEditor<Relation>();
-  const [deleting, setDeleting] = useState<Relation>();
+  const [editing, setEditing] = useInlineEditor<ProjectDependency | 'new'>();
+  const [deleting, setDeleting] = useState<ProjectDependency>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const canEdit = user.role !== 'VIEWER';
+  const canEdit = user.role !== 'VIEWER' && !project.archived;
 
-  async function deleteRelation() {
-    if (!deleting?.item) return;
+  async function deleteDependency() {
+    if (!deleting) return;
     setError('');
     setBusy(true);
     try {
-      await remove(`/projects/${project.id}/${deleting.type}/${deleting.item.id}`);
+      await remove(`/projects/${project.id}/dependencies/${deleting.id}`);
       setDeleting(undefined);
       await reload();
-    } catch (err) {
-      setError(message(err));
+    } catch (cause) {
+      setError(message(cause));
     } finally {
       setBusy(false);
     }
   }
 
-  function actions(relation: Relation) {
-    return (
-      canEdit && (
-        <span className="row-actions">
-          <button
-            className="icon-button bare muted"
-            aria-label={`编辑${labels[relation.type]}`}
-            onClick={() => setEditing(relation)}
-          >
-            <Pencil size={15} />
-          </button>
-          <button
-            className="icon-button bare muted"
-            aria-label={`删除${labels[relation.type]}`}
-            onClick={() => {
-              setError('');
-              setDeleting(relation);
-            }}
-          >
-            <Trash2 size={15} />
-          </button>
-        </span>
-      )
-    );
-  }
-
   return (
     <>
       {editing && (
-        <RelationEditor
-          key={editing.type + (editing.item?.id ?? 'new')}
+        <DependencyEditor
+          key={editing === 'new' ? 'new' : editing.id}
           project={project}
-          relation={editing}
+          dependency={editing === 'new' ? undefined : editing}
           onClose={() => setEditing(undefined)}
-          onSave={() => {
+          onSaved={() => {
             setEditing(undefined);
             void reload();
           }}
         />
       )}
       <Section
-        title="访问地址"
-        action={
-          canEdit && (
-            <button
-              className="button secondary small"
-              onClick={() => setEditing({ type: 'addresses' })}
-            >
-              <Plus size={14} />
-              添加地址
-            </button>
-          )
-        }
-      >
-        {project.addresses?.length ? (
-          <div className="resource-list">
-            {project.addresses.map((item) => {
-              const href = projectAccessUrl(item.url);
-              const scope = [
-                project.services.find(({ id }) => id === item.serviceId)?.name,
-                project.environments.find(({ id }) => id === item.environmentId)?.name,
-              ]
-                .filter(Boolean)
-                .join(' · ');
-              return (
-                <div key={item.id}>
-                  <span className="resource-avatar">
-                    <Link2 size={17} />
-                  </span>
-                  <div>
-                    {href ? (
-                      <a
-                        href={href}
-                        className="text-link"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        {item.name} ↗
-                      </a>
-                    ) : (
-                      <strong>{item.name}</strong>
-                    )}
-                    <small title={item.url}>{item.url}</small>
-                    {item.description && <small>{item.description}</small>}
-                  </div>
-                  <span className="tag">{scope || '项目级'}</span>
-                  <span className="tag">{item.visibility === 'PUBLIC' ? '公开' : '内部'}</span>
-                  {actions({ type: 'addresses', item })}
-                </div>
-              );
-            })}
-          </div>
-        ) : (
-          <p className="mini-empty">暂无访问地址</p>
-        )}
-      </Section>
-      <Section
         title="项目依赖"
         action={
           canEdit && (
             <button
               className="button secondary small"
-              onClick={() => setEditing({ type: 'dependencies' })}
+              type="button"
+              onClick={() => setEditing('new')}
             >
-              <Plus size={14} />
-              添加依赖
+              <Plus size={15} /> 添加依赖
             </button>
           )
         }
@@ -169,7 +79,29 @@ export function ProjectRelations({
                 <span className="tag">
                   {item.dependencyType === 'DEPLOYMENT' ? '部署依赖' : '运行依赖'}
                 </span>
-                {actions({ type: 'dependencies', item })}
+                {canEdit && (
+                  <span className="row-actions">
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      aria-label={`编辑依赖 ${item.projectName}`}
+                      onClick={() => setEditing(item)}
+                    >
+                      <Pencil size={15} /> 编辑
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-button bare muted"
+                      aria-label={`删除依赖 ${item.projectName}`}
+                      onClick={() => {
+                        setError('');
+                        setDeleting(item);
+                      }}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </span>
+                )}
               </div>
             ))}
           </div>
@@ -186,7 +118,7 @@ export function ProjectRelations({
                   <Network size={17} />
                 </span>
                 <div>
-                  <a className="text-link" href={`#/projects/${item.projectId}`}>
+                  <a href={`#/projects/${item.projectId}`} className="text-link">
                     {item.projectName}
                   </a>
                   {item.description && <small>{item.description}</small>}
@@ -201,25 +133,12 @@ export function ProjectRelations({
           <p className="mini-empty">暂无其他项目依赖此项目。</p>
         )}
       </Section>
-      <Section title="最近部署">
-        <DeploymentHistory
-          rows={project.recentDeployments ?? []}
-          resolveName={(row) =>
-            [
-              project.services.find(({ id }) => id === row.serviceId)?.name,
-              project.environments.find(({ id }) => id === row.environmentId)?.name,
-            ]
-              .filter(Boolean)
-              .join(' · ')
-          }
-        />
-      </Section>
-      {deleting?.item && (
+      {deleting && (
         <Confirm
-          title={`删除${labels[deleting.type]}`}
-          description={`删除「${'name' in deleting.item ? deleting.item.name : deleting.item.projectName}」。`}
+          title="删除项目依赖"
+          description={`移除对「${deleting.projectName}」的依赖。`}
           onClose={() => !busy && setDeleting(undefined)}
-          onConfirm={deleteRelation}
+          onConfirm={deleteDependency}
           busy={busy}
           error={error}
           destructive
@@ -230,149 +149,82 @@ export function ProjectRelations({
   );
 }
 
-function RelationEditor({
+function DependencyEditor({
   project,
-  relation,
+  dependency,
   onClose,
-  onSave,
+  onSaved,
 }: {
   project: ProjectDetail;
-  relation: Relation;
+  dependency?: ProjectDependency;
   onClose: () => void;
-  onSave: () => void;
+  onSaved: () => void;
 }) {
-  const address = relation.type === 'addresses' ? relation.item : undefined;
-  const dependency = relation.type === 'dependencies' ? relation.item : undefined;
-  const projects = useResource<Project[]>(relation.type === 'dependencies' ? '/projects' : null);
+  const projects = useResource<Project[]>('/projects');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
-    const description = String(data.get('description')).trim();
-    const body =
-      relation.type === 'addresses'
-        ? {
-            description,
-            name: String(data.get('name')).trim(),
-            url: String(data.get('url')).trim(),
-            serviceId: data.get('serviceId') || null,
-            environmentId: data.get('environmentId') || null,
-            addressType: data.get('addressType'),
-            visibility: data.get('visibility'),
-          }
-        : {
-            description,
-            dependsOnProjectId: data.get('dependsOnProjectId'),
-            dependencyType: data.get('dependencyType'),
-          };
+    const body = {
+      description: String(data.get('description')).trim(),
+      dependsOnProjectId: data.get('dependsOnProjectId'),
+      dependencyType: data.get('dependencyType'),
+    };
     setError('');
     setBusy(true);
     try {
-      const path = `/projects/${project.id}/${relation.type}`;
-      if (relation.item)
-        await api(`${path}/${relation.item.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+      const path = `/projects/${project.id}/dependencies`;
+      if (dependency)
+        await api(`${path}/${dependency.id}`, { method: 'PATCH', body: JSON.stringify(body) });
       else await post(path, body);
-      onSave();
-    } catch (err) {
-      setError(message(err));
+      onSaved();
+    } catch (cause) {
+      setError(message(cause));
     } finally {
       setBusy(false);
     }
   }
+
   return (
     <InlineEditor
       busy={busy}
-      title={`${relation.item ? '编辑' : '添加'}${labels[relation.type]}`}
-      onClose={() => !busy && onClose()}
+      title={dependency ? '编辑项目依赖' : '添加项目依赖'}
+      onClose={onClose}
     >
       <Form onSubmit={save} error={error} busy={busy} onCancel={onClose}>
-        {relation.type === 'addresses' ? (
-          <>
-            <Field label="名称" required>
-              <input name="name" defaultValue={address?.name} required maxLength={100} autoFocus />
-            </Field>
-            <Field label="访问 URL" required>
-              <input
-                name="url"
-                type="url"
-                pattern="https?://.+"
-                defaultValue={address?.url}
-                required
-                maxLength={2048}
-              />
-            </Field>
-            <div className="form-grid">
-              <Field label="关联服务">
-                <select name="serviceId" defaultValue={address?.serviceId ?? ''}>
-                  <option value="">所有服务</option>
-                  {project.services.map((service) => (
-                    <option key={service.id} value={service.id}>
-                      {service.name}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-              <Field label="关联环境">
-                <select name="environmentId" defaultValue={address?.environmentId ?? ''}>
-                  <option value="">所有环境</option>
-                  {project.environments.map((environment) => (
-                    <option key={environment.id} value={environment.id}>
-                      {environment.name}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-              <Field label="类型">
-                <select name="addressType" defaultValue={address?.addressType ?? 'WEB'}>
-                  <option value="WEB">网页</option>
-                  <option value="API">API</option>
-                  <option value="DOCS">文档</option>
-                </select>
-              </Field>
-              <Field label="可见范围">
-                <select name="visibility" defaultValue={address?.visibility ?? 'INTERNAL'}>
-                  <option value="INTERNAL">内部</option>
-                  <option value="PUBLIC">公开</option>
-                </select>
-              </Field>
-            </div>
-          </>
-        ) : (
-          <>
-            <ErrorBanner error={projects.error} retry={projects.reload} />
-            <Field label="依赖项目" required>
-              <select
-                name="dependsOnProjectId"
-                defaultValue={dependency?.dependsOnProjectId ?? ''}
-                required
-              >
-                <option value="">选择项目</option>
-                {projects.data
-                  ?.filter(({ id }) => id !== project.id)
-                  .map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.name}
-                    </option>
-                  ))}
-                {dependency &&
-                  !projects.data?.some(({ id }) => id === dependency.dependsOnProjectId) && (
-                    <option value={dependency.dependsOnProjectId}>{dependency.projectName}</option>
-                  )}
-              </select>
-            </Field>
-            <Field label="依赖类型">
-              <select name="dependencyType" defaultValue={dependency?.dependencyType ?? 'RUNTIME'}>
-                <option value="RUNTIME">运行依赖</option>
-                <option value="DEPLOYMENT">部署依赖</option>
-              </select>
-            </Field>
-          </>
-        )}
+        <ErrorBanner error={projects.error} retry={projects.reload} />
+        <Field label="依赖项目" required>
+          <select
+            name="dependsOnProjectId"
+            defaultValue={dependency?.dependsOnProjectId ?? ''}
+            required
+          >
+            <option value="">选择项目</option>
+            {projects.data
+              ?.filter(({ id }) => id !== project.id)
+              .map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+            {dependency &&
+              !projects.data?.some(({ id }) => id === dependency.dependsOnProjectId) && (
+                <option value={dependency.dependsOnProjectId}>{dependency.projectName}</option>
+              )}
+          </select>
+        </Field>
+        <Field label="依赖类型">
+          <select name="dependencyType" defaultValue={dependency?.dependencyType ?? 'RUNTIME'}>
+            <option value="RUNTIME">运行依赖</option>
+            <option value="DEPLOYMENT">部署依赖</option>
+          </select>
+        </Field>
         <Field label="说明">
           <textarea
             name="description"
-            defaultValue={relation.item?.description}
+            defaultValue={dependency?.description}
             maxLength={2000}
             rows={2}
           />

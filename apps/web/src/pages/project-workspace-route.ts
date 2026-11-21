@@ -9,21 +9,25 @@ import {
 export const projectEntries = {
   resources: '项目资源',
   graph: '执行图',
-  delivery: '交付记录',
+  artifacts: '产物',
   configuration: '项目配置',
 } as const;
 
 export const projectResources = {
   repositories: '仓库',
   services: '服务',
-  environments: '环境',
-  servers: '服务器与分组',
-  relations: '访问地址与项目依赖',
+  'environment-sets': '变量集合',
+  relations: '项目依赖',
 } as const;
 
 type Entry = keyof typeof projectEntries;
-export type ResourceKind = keyof typeof projectResources;
-export type ProjectScope = { serviceId?: string; environmentId?: string; view?: string };
+export type ResourceKind = keyof typeof projectResources | 'environments';
+export type ProjectScope = {
+  serviceId?: string;
+  environmentId?: string;
+  view?: string;
+  viewSearch?: string;
+};
 export type GraphResourceReturn = {
   graphPane?: GraphPane;
   graphVersion?: string;
@@ -39,8 +43,7 @@ export type ResourceLocation = ProjectScope &
   GraphResourceReturn & {
     resource?: ResourceKind;
     repositoryId?: string;
-    serverId?: string;
-    groupId?: string;
+    environmentSetId?: string;
     panel?: string;
   };
 
@@ -55,7 +58,7 @@ export function graphSetupResourceHref(
   origin: GraphStartLocation,
   destination: Pick<
     ResourceLocation,
-    'resource' | 'repositoryId' | 'serviceId' | 'environmentId' | 'panel'
+    'resource' | 'repositoryId' | 'serviceId' | 'environmentId' | 'environmentSetId' | 'panel'
   >,
 ) {
   return (
@@ -63,6 +66,7 @@ export function graphSetupResourceHref(
     projectResourcePath(id, {
       ...destination,
       view: origin.view,
+      viewSearch: origin.viewSearch,
       graphPane: 'run',
       graphVersion: origin.version?.toString(),
       graphStart: origin.start,
@@ -74,12 +78,18 @@ export function graphSetupResourceHref(
   );
 }
 
-export function graphResourceReturnHref(id: string, context: GraphResourceReturn, view?: string) {
+export function graphResourceReturnHref(
+  id: string,
+  context: GraphResourceReturn,
+  view?: string,
+  viewSearch?: string,
+) {
   const version = Number(context.graphVersion);
   return (
     '#' +
     graphWorkbenchPath(id, {
       view,
+      viewSearch,
       pane: context.graphPane,
       version: Number.isSafeInteger(version) && version > 0 ? version : undefined,
       node: context.graphNode,
@@ -108,24 +118,30 @@ export function readProjectWorkspace(path: string, search?: string) {
   const [, id, section] = match;
   const params = new URLSearchParams(search);
   const rawView = params.get('view') ?? '';
+  const viewSearch = new URLSearchParams(params.get('viewSearch') ?? '');
+  for (const [key, value] of [...viewSearch]) {
+    if (!['serviceId', 'serverId', 'groupId'].includes(key) || !/^[\w-]+$/.test(value))
+      viewSearch.delete(key);
+  }
   const scope: ProjectScope = {
     view: /^(all|production|testing|abnormal|[a-f0-9-]{36})$/.test(rawView) ? rawView : undefined,
     serviceId: params.get('serviceId') || undefined,
     environmentId: params.get('environmentId') || undefined,
+    viewSearch: viewSearch.size ? viewSearch.toString() : undefined,
   };
   const rawResource = params.get('resource') ?? '';
   const legacyConfig = params.get('section') === 'deployment';
   const graphPane = params.get('graphPane');
   const location: ResourceLocation = {
     ...scope,
-    resource: Object.hasOwn(projectResources, rawResource)
-      ? (rawResource as ResourceKind)
-      : legacyConfig
-        ? 'services'
-        : undefined,
+    resource:
+      rawResource === 'environments' || Object.hasOwn(projectResources, rawResource)
+        ? (rawResource as ResourceKind)
+        : legacyConfig
+          ? 'services'
+          : undefined,
     repositoryId: params.get('repositoryId') || undefined,
-    serverId: params.get('serverId') || undefined,
-    groupId: params.get('groupId') || undefined,
+    environmentSetId: params.get('environmentSetId') || undefined,
     panel: params.get('panel') || (legacyConfig && scope.environmentId ? 'settings' : undefined),
     graphPane:
       graphPane === 'draft' || graphPane === 'published' || graphPane === 'run'
@@ -145,7 +161,7 @@ export function readProjectWorkspace(path: string, search?: string) {
   if (section === 'execution-graph') entry = 'graph';
   else if (section === 'configuration') entry = 'configuration';
   else if (section === 'delivery' || (section && Object.hasOwn(deliveryTabs, section))) {
-    entry = 'delivery';
+    entry = 'artifacts';
     const selected = section === 'delivery' ? params.get('tab') || '' : section;
     if (Object.hasOwn(deliveryTabs, selected)) tab = selected as DeliveryTab;
   } else if (section && section !== 'resources') return;
@@ -154,11 +170,15 @@ export function readProjectWorkspace(path: string, search?: string) {
 
 export function projectEntryPath(id: string, entry: Entry, scope: ProjectScope) {
   if (entry === 'graph') return projectGraphPath(id, scope);
-  if (entry === 'delivery') return deliveryPath(id, 'artifacts', scope);
-  if (entry === 'configuration')
-    return `/projects/${encodeURIComponent(id)}/configuration${scope.view ? '?view=' + scope.view : ''}`;
+  if (entry === 'artifacts') return deliveryPath(id, 'artifacts', scope);
+  if (entry === 'configuration') {
+    const params = new URLSearchParams();
+    if (scope.view) params.set('view', scope.view);
+    if (scope.viewSearch) params.set('viewSearch', scope.viewSearch);
+    return `/projects/${encodeURIComponent(id)}/configuration${params.size ? '?' + params : ''}`;
+  }
   return projectResourcePath(id, {
     ...scope,
-    resource: scope.serviceId ? 'services' : scope.environmentId ? 'environments' : undefined,
+    resource: scope.serviceId ? 'services' : undefined,
   });
 }

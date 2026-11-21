@@ -10,6 +10,7 @@ import {
   Module,
   NotFoundException,
   Param,
+  ParseUUIDPipe,
   Patch,
   Post,
   Req,
@@ -37,9 +38,9 @@ import { SshHostKeyMismatchError, SshService } from '../../infrastructure/ssh/ss
 import { summarizeProbe } from '../../infrastructure/ssh/server-probe';
 import { compareServerConfigurations } from './configuration-comparison';
 import { recentDeployments } from '../deployments/deployment-history';
-import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
 import { lockProjectGraph } from '../projects/project-relations';
 import { assertProjectResourceRemovable } from '../projects/project-resource-protection';
+import { targetProjectReferences } from '../projects/project-resource-references';
 import type { Selectable } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import {
@@ -94,6 +95,7 @@ function present(row: Selectable<Database['servers']>) {
     hostKeyFingerprint: row.host_key_fingerprint || '',
     osType: row.os_type,
     status: row.status,
+    active: row.is_active === 1,
     lastCheckedAt: row.last_checked_at,
     tags: JSON.parse(row.tags_json) as string[],
     description: row.description,
@@ -120,12 +122,12 @@ export class ServersService {
         .execute()
     ).map(present);
   }
-  async get(id: string) {
+  async get(id: string, includeInactive = false) {
     const row = await this.database.db
       .selectFrom('servers')
       .selectAll()
       .where('id', '=', id)
-      .where('is_active', '=', 1)
+      .$if(!includeInactive, (query) => query.where('is_active', '=', 1))
       .executeTakeFirst();
     if (!row) throw new NotFoundException('服务器不存在');
     return present(row);
@@ -153,7 +155,7 @@ export class ServersService {
     return result;
   }
   async detail(id: string) {
-    const server = await this.get(id);
+    const server = await this.get(id, true);
     const db = this.database.db;
     const [groups, projects, deployments, commands, probes] = await Promise.all([
       db
@@ -163,25 +165,7 @@ export class ServersService {
         .where('members.server_id', '=', id)
         .orderBy('groups.name')
         .execute(),
-      db
-        .selectFrom('projects as projects')
-        .innerJoin('services as services', 'services.project_id', 'projects.id')
-        .innerJoin('service_environment_configs as configs', 'configs.service_id', 'services.id')
-        .leftJoin('deployment_target_servers as members', (join) =>
-          join
-            .onRef('members.target_id', '=', 'configs.target_id')
-            .on('members.server_id', '=', id),
-        )
-        .select([
-          'projects.id as id',
-          'projects.name as name',
-          'projects.slug as slug',
-          'configs.target_selection_json',
-          'members.server_id as legacyServerId',
-        ])
-        .where('projects.deleted_at', 'is', null)
-        .orderBy('projects.name')
-        .execute(),
+      targetProjectReferences(db, 'SERVER', id),
       recentDeployments(db, { serverId: id }),
       db
         .selectFrom('task_targets as targets')
@@ -215,18 +199,7 @@ export class ServersService {
     return {
       ...server,
       groups,
-      projects: [
-        ...new Map(
-          projects.flatMap(({ target_selection_json, legacyServerId, ...project }) => {
-            const selection = storedDeploymentSelection(target_selection_json);
-            const applies = selection
-              ? selection.serverIds.includes(id) ||
-                groups.some((group) => selection.groupIds.includes(group.id))
-              : legacyServerId === id;
-            return applies ? [[project.id, project] as const] : [];
-          }),
-        ).values(),
-      ],
+      projects,
       recentDeployments: deployments,
       recentCommands: commands,
       probeHistory: probes.map((row) => {
@@ -243,6 +216,10 @@ export class ServersService {
         };
       }),
     };
+  }
+  async projectReferences(id: string) {
+    await this.get(id, true);
+    return targetProjectReferences(this.database.db, 'SERVER', id);
   }
   async create(dto: ServerDto, userId: string) {
     if (Boolean(dto.hostKeyFingerprint) === Boolean(dto.hostKeyAcceptanceToken))
@@ -490,26 +467,29 @@ class ServersController {
   @Get() list() {
     return this.service.list();
   }
-  @Get(':id') get(@Param('id') id: string) {
+  @Get(':id') get(@Param('id', ParseUUIDPipe) id: string) {
     return this.service.detail(id);
   }
-  @Roles('ADMIN', 'OPERATOR') @Post() create(@Body() dto: ServerDto, @Req() req: AuthRequest) {
+  @Get(':id/project-references') projectReferences(@Param('id', ParseUUIDPipe) id: string) {
+    return this.service.projectReferences(id);
+  }
+  @Roles('ADMIN') @Post() create(@Body() dto: ServerDto, @Req() req: AuthRequest) {
     return this.service.create(dto, req.user.id);
   }
-  @Roles('ADMIN', 'OPERATOR') @Post('host-key/probe') probeHostKey(
+  @Roles('ADMIN') @Post('host-key/probe') probeHostKey(
     @Body() dto: HostKeyProbeDto,
     @Req() req: AuthRequest,
   ) {
     return this.service.probeHostKey(dto, req.user.id);
   }
-  @Roles('ADMIN', 'OPERATOR') @Post(':id/host-key/accept') confirmHostKey(
+  @Roles('ADMIN') @Post(':id/host-key/accept') confirmHostKey(
     @Param('id') id: string,
     @Body() dto: AcceptHostKeyDto,
     @Req() req: AuthRequest,
   ) {
     return this.service.confirmHostKey(id, dto, req.user.id);
   }
-  @Roles('ADMIN', 'OPERATOR') @Patch(':id') update(
+  @Roles('ADMIN') @Patch(':id') update(
     @Param('id') id: string,
     @Body() dto: ServerDto,
     @Req() req: AuthRequest,
@@ -522,7 +502,7 @@ class ServersController {
   ) {
     return this.service.test(id, req.user.id);
   }
-  @Roles('ADMIN', 'OPERATOR') @Delete(':id') remove(
+  @Roles('ADMIN') @Delete(':id') remove(
     @Param('id') id: string,
     @Req() req: AuthRequest,
   ) {

@@ -33,6 +33,7 @@ import {
   type DeliveryTab,
 } from './delivery-route';
 import { projectGraphPath } from './project-workspace-route';
+import { serverResourceHref } from './server-resource-route';
 
 interface Registry {
   id: string;
@@ -51,14 +52,39 @@ function DeliveryHeading({
   );
 }
 
+export const artifactVerificationLabels = {
+  NOT_CHECKED: '待验证',
+  AVAILABLE: '可用',
+  MISSING: '实物缺失',
+  CHANGED: '实物已变化',
+  UNVERIFIABLE: '无法验证',
+};
+export type ArtifactKind = 'FILE' | 'DIRECTORY' | 'DOCKER_IMAGE';
+export type ArtifactVerification = keyof typeof artifactVerificationLabels;
+export type ArtifactLifecycle = 'STAGING' | 'ACTIVE' | 'CLEANING' | 'DELETED';
+export type ArtifactPhysical = {
+  location: 'SERVER_PATH' | 'BUILDER_PATH' | 'DOCKER_ENGINE' | 'REGISTRY';
+  owner?: 'MANAGED' | 'EXTERNAL';
+  serverId?: string;
+  path?: string;
+  sha256?: string;
+  sizeBytes?: number;
+  imageId?: string;
+  platform?: string;
+  imageReference?: string;
+  digest?: string;
+};
 export type Artifact = {
   id: string;
+  artifactId?: string | null;
+  instanceId?: string;
   projectId?: string;
   artifactType: string;
   name?: string | null;
   kind?: string;
   graphRunId?: string | null;
   graphNodeRunId?: string | null;
+  graphNodeId?: string | null;
   graphVersion?: number | null;
   graphFlowName?: string | null;
   graphNodeName?: string | null;
@@ -84,22 +110,64 @@ export type Artifact = {
   imageRepository?: string;
   sizeBytes?: number;
   createdAt: number;
-  serviceId: string;
+  serviceId?: string | null;
   pipelineRunId?: string;
   serverId?: string | null;
+  serverName?: string | null;
   environmentId?: string;
   targetSelection?: DeploymentSelection | null;
   deployable?: boolean;
   pinnedAt?: number | null;
   prunedAt?: number | null;
+  physical?: ArtifactPhysical | null;
+  verificationStatus?: ArtifactVerification;
+  verificationReason?: string | null;
+  verifiedAt?: number | null;
+  lifecycleState?: ArtifactLifecycle;
+  temporary?: boolean;
+  environmentSet?: { id: string; name: string; revision: number } | null;
 };
+export type ArtifactRef = { artifactId: string; instanceId?: string };
+export const artifactKindLabel = (kind: string) =>
+  kind === 'FILE'
+    ? '文件'
+    : kind === 'DIRECTORY'
+      ? '目录'
+      : kind === 'DOCKER_IMAGE'
+        ? 'Docker 镜像'
+        : kind;
+
+export const artifactLogicalId = (artifact: Artifact) => artifact.artifactId ?? artifact.id;
+export const artifactInstanceId = (artifact: Artifact) => artifact.instanceId ?? artifact.id;
+
 export function isDeployableArtifact(artifact: Artifact) {
   return Boolean(
     artifact.deployable &&
     artifact.projectId &&
     artifact.pipelineRunId &&
-    artifact.environmentId &&
-    artifact.prunedAt == null,
+    artifact.prunedAt == null &&
+    !artifact.temporary &&
+    (!artifact.lifecycleState || artifact.lifecycleState === 'ACTIVE') &&
+    (!artifact.verificationStatus ||
+      ['NOT_CHECKED', 'AVAILABLE'].includes(artifact.verificationStatus)),
+  );
+}
+
+export function ArtifactStatus({ artifact }: { artifact: Artifact }) {
+  const lifecycle = artifact.lifecycleState;
+  const verification = artifact.verificationStatus ?? 'NOT_CHECKED';
+  const label =
+    lifecycle === 'DELETED' || artifact.prunedAt != null
+      ? '已清理'
+      : lifecycle === 'STAGING'
+        ? '登记中'
+        : lifecycle === 'CLEANING'
+          ? '清理中'
+          : artifactVerificationLabels[verification];
+  return (
+    <span className="tag" title={artifact.verificationReason ?? undefined}>
+      {label}
+    </span>
   );
 }
 
@@ -141,9 +209,28 @@ export function RunArtifacts({ runId, polling }: { runId: string; polling: boole
               {artifacts.data.map((artifact) => (
                 <tr key={artifact.id}>
                   <td>
-                    <strong>{artifact.artifactType === 'FILE' ? '文件产物' : 'Docker 镜像'}</strong>
+                    <strong>
+                      {artifact.name ?? artifactKindLabel(artifact.kind ?? artifact.artifactType)}
+                    </strong>
+                    <small className="cell-detail">
+                      <ArtifactStatus artifact={artifact} />
+                      {artifact.temporary && <span className="tag">运行内临时产物</span>}
+                    </small>
                     {artifact.artifactType === 'DOCKER_IMAGE' && (
                       <small className="cell-detail mono">{artifact.storageKey}</small>
+                    )}
+                    {artifact.projectId && (
+                      <a
+                        className="text-link"
+                        href={
+                          '#' +
+                          deliveryPath(artifact.projectId, 'artifacts', {
+                            recordId: artifactLogicalId(artifact),
+                          })
+                        }
+                      >
+                        查看详情
+                      </a>
                     )}
                   </td>
                   <td className="mono">
@@ -164,8 +251,9 @@ export function RunArtifacts({ runId, polling }: { runId: string; polling: boole
   );
 }
 
-function ArtifactDownload({ artifact }: { artifact: Artifact }) {
-  if (artifact.prunedAt != null) return <span className="muted">归档已清理</span>;
+export function ArtifactDownload({ artifact }: { artifact: Artifact }) {
+  if (artifact.lifecycleState === 'DELETED' || artifact.prunedAt != null)
+    return <span className="muted">已清理</span>;
   if (artifact.downloadAvailable)
     return (
       <a
@@ -178,6 +266,8 @@ function ArtifactDownload({ artifact }: { artifact: Artifact }) {
     );
   if (artifact.storageType === 'REGISTRY_IMAGE')
     return <span className="muted">从 Registry 拉取</span>;
+  if (artifact.physical?.location === 'SERVER_PATH')
+    return <span className="muted">保存在构建服务器</span>;
   return <span className="muted">—</span>;
 }
 
@@ -219,7 +309,7 @@ function GraphOrigin({
   );
 }
 
-function ArtifactOrigins({
+export function ArtifactOrigins({
   artifact,
   project,
   scope,
@@ -473,6 +563,15 @@ export function DeliveryRecordsPage({
                   const rowScope = project
                     ? scope
                     : { serviceId: r.serviceId, environmentId: r.environmentId };
+                  const serverHref =
+                    r.serverId &&
+                    serverResourceHref({
+                      serverId: r.serverId,
+                      projectId: r.projectId ?? undefined,
+                      returnPath: r.projectId
+                        ? deliveryPath(r.projectId, type, { ...rowScope, recordId: r.id })
+                        : undefined,
+                    });
                   const taskHref =
                     r.taskId &&
                     '#' +
@@ -520,6 +619,7 @@ export function DeliveryRecordsPage({
                             <strong className="table-name">
                               {r.name || (r.artifactType === 'FILE' ? '文件产物' : 'Docker 镜像')}
                             </strong>
+                            <ArtifactStatus artifact={r} />
                             <small className="cell-detail mono" title={r.storageKey}>
                               {r.storageKey}
                             </small>
@@ -539,6 +639,11 @@ export function DeliveryRecordsPage({
                             <span className="tag">
                               {storageLabels[r.storageType] || r.storageType}
                             </span>
+                            {serverHref && (
+                              <a className="cell-detail text-link" href={serverHref}>
+                                {r.serverName || '源服务器'}
+                              </a>
+                            )}
                             {r.sizeBytes != null && (
                               <small className="cell-detail">
                                 {(r.sizeBytes / 1024).toFixed(1)} KiB
@@ -572,6 +677,20 @@ export function DeliveryRecordsPage({
                           <td className="nowrap muted">{formatTime(r.createdAt)}</td>
                           <td>
                             <ArtifactDownload artifact={r} />
+                            {r.projectId && (
+                              <a
+                                className="button secondary small"
+                                href={
+                                  '#' +
+                                  deliveryPath(r.projectId, 'artifacts', {
+                                    ...rowScope,
+                                    recordId: artifactLogicalId(r),
+                                  })
+                                }
+                              >
+                                查看详情
+                              </a>
+                            )}
                             {user.role === 'ADMIN' &&
                               canWrite &&
                               r.prunedAt == null &&
@@ -639,7 +758,13 @@ export function DeliveryRecordsPage({
                             )}
                           </td>
                           <td className="truncate" title={r.serverId}>
-                            {r.serverName || r.serverId || '—'}
+                            {serverHref ? (
+                              <a className="text-link" href={serverHref}>
+                                {r.serverName || r.serverId}
+                              </a>
+                            ) : (
+                              '—'
+                            )}
                             {r.serverHost && (
                               <small className="cell-detail mono">
                                 {r.serverHost}
@@ -654,7 +779,10 @@ export function DeliveryRecordsPage({
                             {r.deployPath || '—'}
                             {r.composeRelease && (
                               <>
-                                <small className="cell-detail" title={r.composeRelease.template.checksum}>
+                                <small
+                                  className="cell-detail"
+                                  title={r.composeRelease.template.checksum}
+                                >
                                   Compose {r.composeRelease.template.path ?? '产物归档'}{' '}
                                   {r.composeRelease.template.source === 'SERVICE_ENVIRONMENT' &&
                                     `v${r.composeRelease.template.version} · `}
@@ -662,7 +790,11 @@ export function DeliveryRecordsPage({
                                 </small>
                                 <small
                                   className="cell-detail"
-                                  title={r.composeRelease.imageReference + ' · ' + r.composeRelease.imageId}
+                                  title={
+                                    r.composeRelease.imageReference +
+                                    ' · ' +
+                                    r.composeRelease.imageId
+                                  }
                                 >
                                   镜像 {r.composeRelease.imageId.slice(0, 19)}
                                 </small>

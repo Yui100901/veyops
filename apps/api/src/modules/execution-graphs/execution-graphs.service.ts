@@ -7,7 +7,12 @@ import { AuditService } from '../audit/audit.service';
 import { lockProjectGraph, requireProject } from '../projects/project-relations';
 import { graphResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
-import { canvasIssues, compileCanvas, withDraftCanvas } from './execution-graph-canvas';
+import {
+  canvasCatalog,
+  canvasIssues,
+  compileCanvas,
+  withDraftCanvas,
+} from './execution-graph-canvas';
 import {
   type GraphDefinition,
   type SaveGraphDraftDto,
@@ -107,9 +112,19 @@ export class ExecutionGraphsService {
       );
       return { issues: [] };
     } catch (error) {
-      if (error instanceof GraphCompileError) return { issues: [error.issue] };
+      if (error instanceof GraphCompileError) return { issues: error.issues };
       throw error;
     }
+  }
+
+  async draftCatalog(
+    projectId: string,
+    definition: GraphDefinition,
+    flowId: string,
+    nodeId: string,
+  ) {
+    await requireProject(this.database.db, projectId);
+    return canvasCatalog(withDraftCanvas(definition).canvas, flowId, nodeId);
   }
 
   async save(projectId: string, input: SaveGraphDraftDto, userId: string) {
@@ -167,7 +182,10 @@ export class ExecutionGraphsService {
       const now = Date.now();
       const draft = JSON.parse(graph.draft_json) as GraphDefinition;
       const definition = draft.canvas ? compileCanvas(draft.canvas, true) : draft;
-      if (!definition.canvas) validateGraphDefinition(definition);
+      if (!definition.canvas) {
+        const compiled = validateGraphDefinition(definition);
+        for (const flow of definition.flows) flow.compiled = compiled[flow.id];
+      }
       await this.validateReferences(tx, projectId, definition);
       await tx
         .insertInto('execution_graph_versions')

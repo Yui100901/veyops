@@ -9,6 +9,7 @@ export interface NamedArtifactDefinition {
   path?: string;
   imageReference?: string;
   required?: boolean;
+  persist?: boolean;
   composeFilePath?: string;
 }
 
@@ -102,6 +103,7 @@ export interface PipelineSnapshot {
     defaultParallel: number;
   };
   graph?: GraphExecutionScope;
+  artifactRootRunId?: string;
   targetWorkspaceRoot?: string;
   releasePolicy?: ReleasePolicy;
   rollbackOfDeploymentId?: string;
@@ -133,6 +135,7 @@ export interface PipelineSnapshot {
   definition: PipelineDefinition;
   variables: Record<string, string>;
   secretVariables: Record<string, string>;
+  secretCredentialNonces?: Record<string, string>;
 }
 export interface PipelineArtifact {
   sources?: import('../artifacts/artifact-sources').ArtifactSource[];
@@ -152,6 +155,8 @@ export interface PipelineArtifact {
   serverId?: string;
   name?: string;
   kind?: NamedArtifactDefinition['type'];
+  physical?: import('../artifacts/artifact-physical.service').ArtifactPhysical;
+  persist?: boolean;
 }
 export interface BuildOutput {
   artifacts?: { declaration: NamedArtifactDefinition; output: BuildOutput }[];
@@ -167,6 +172,7 @@ export interface BuildOutput {
   imageId?: string;
   checksum?: string;
   sizeBytes?: number;
+  physical?: import('../artifacts/artifact-physical.service').ArtifactPhysical;
   cleanup: () => Promise<void>;
 }
 

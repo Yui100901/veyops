@@ -31,6 +31,7 @@ export interface GraphEnvironmentRef {
 
 export interface GraphExecutionScope {
   runId: string;
+  rootRunId?: string;
   nodeRunId: string;
   workspace?: GraphWorkspaceRef;
   dependencies?: Record<string, GraphWorkspaceRef>;

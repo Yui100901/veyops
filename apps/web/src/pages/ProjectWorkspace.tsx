@@ -10,7 +10,7 @@ import { ProjectResources } from './ProjectResources';
 import { projectEntries, projectEntryPath, readProjectWorkspace } from './project-workspace-route';
 
 const ProjectExecutionGraph = lazy(() => import('./ProjectExecutionGraph'));
-const icons = { resources: FolderGit2, graph: GitFork, delivery: Boxes, configuration: Settings2 };
+const icons = { resources: FolderGit2, graph: GitFork, artifacts: Boxes, configuration: Settings2 };
 
 export function ProjectWorkspace({
   route,
@@ -22,12 +22,15 @@ export function ProjectWorkspace({
   const { id, entry, location, search, tab } = route;
   const graphRunDrafts = useRef<GraphRunDrafts>(new Map());
   const projectResource = useResource<ProjectDetail>(
-    `/projects/${id}${entry === 'delivery' || entry === 'graph' ? '/delivery-context' : ''}`,
+    `/projects/${id}${entry === 'artifacts' || entry === 'graph' ? '/delivery-context' : ''}`,
   );
   const project = projectResource.data;
-  const backPath = location.view ? `/views/${location.view}` : '/projects';
+  const backPath = location.view
+    ? `/views/${location.view}${location.viewSearch ? '?' + location.viewSearch : ''}`
+    : '/projects';
   const scope = {
     view: location.view,
+    viewSearch: location.viewSearch,
     serviceId: location.serviceId,
     environmentId: location.environmentId,
   };
@@ -73,7 +76,7 @@ export function ProjectWorkspace({
             search={search}
           />
         </Suspense>
-      ) : entry === 'delivery' ? (
+      ) : entry === 'artifacts' ? (
         <ProjectDelivery
           key={tab + ':' + (search ?? '')}
           id={id}

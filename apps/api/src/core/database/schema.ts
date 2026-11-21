@@ -108,6 +108,7 @@ export interface RepositoriesTable {
 
 export interface ServicesTable {
   archived_at: Generated<number | null>;
+  revision: Generated<number>;
   id: string;
   project_id: string;
   name: string;
@@ -118,6 +119,14 @@ export interface ServicesTable {
   default_deploy_config_json: Generated<string>;
   created_at: number;
   updated_at: number;
+}
+
+export interface ServiceAddressesTable {
+  id: string;
+  service_id: string;
+  name: string;
+  url: string;
+  position: number;
 }
 
 export interface ServiceRepositoriesTable {
@@ -215,6 +224,21 @@ export interface ProjectVariablesTable extends VariablesTable {
 
 export interface EnvironmentVariablesTable extends VariablesTable {
   environment_id: string;
+}
+
+export interface ProjectEnvironmentSetsTable {
+  id: string;
+  project_id: string;
+  name: string;
+  description: Generated<string>;
+  revision: Generated<number>;
+  archived_at: Generated<number | null>;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProjectEnvironmentSetVariablesTable extends VariablesTable {
+  environment_set_id: string;
 }
 
 export interface ServiceEnvironmentVariablesTable extends VariablesTable {
@@ -375,6 +399,16 @@ export interface RegistriesTable {
 }
 
 export interface ArtifactsTable {
+  logical_artifact_id: Generated<string | null>;
+  physical_json: Generated<string | null>;
+  physical_key: Generated<string | null>;
+  temporary_root_id: Generated<string | null>;
+  environment_set_id: Generated<string | null>;
+  lifecycle_state: Generated<string>;
+  verification_status: Generated<string | null>;
+  verification_reason: Generated<string | null>;
+  verified_at: Generated<number | null>;
+  verified_by: Generated<string | null>;
   source_manifest: Generated<number | null>;
   artifact_name: Generated<string | null>;
   artifact_kind: Generated<string | null>;
@@ -416,6 +450,31 @@ export interface ArtifactSourcesTable {
   workspace_run_id: string | null;
   workspace_node_run_id: string | null;
   path: string | null;
+}
+
+export interface ArtifactCleanupJobsTable {
+  id: string;
+  request_key: string;
+  request_hash: string;
+  requested_by: string | null;
+  authorized_by: string | null;
+  created_at: number;
+}
+
+export interface ArtifactCleanupItemsTable {
+  job_id: string;
+  instance_id: string;
+  artifact_id: string;
+  group_key: string;
+  action: 'REMOVE' | 'DETACH';
+  status: 'PENDING' | 'RUNNING' | 'RETRY' | 'DELETED' | 'RETAINED';
+  attempts: number;
+  cycle_attempts: number;
+  reason: string | null;
+  available_at: number | null;
+  lease_id: string | null;
+  lease_until: number | null;
+  updated_at: number;
 }
 
 export interface DeploymentRecordsTable {
@@ -785,6 +844,7 @@ export interface Database {
     child_run_id: Generated<string | null>;
     output_json: Generated<string | null>;
     dispatch_json: Generated<string | null>;
+    evidence_json: Generated<string | null>;
   };
   monitor_settings: {
     id: number;
@@ -853,6 +913,7 @@ export interface Database {
   projects: ProjectsTable;
   repositories: RepositoriesTable;
   services: ServicesTable;
+  service_addresses: ServiceAddressesTable;
   service_repositories: ServiceRepositoriesTable;
   environments: EnvironmentsTable;
   deployment_targets: DeploymentTargetsTable;
@@ -885,6 +946,8 @@ export interface Database {
     updated_at: number;
   };
   project_variables: ProjectVariablesTable;
+  project_environment_sets: ProjectEnvironmentSetsTable;
+  project_environment_set_variables: ProjectEnvironmentSetVariablesTable;
   environment_variables: EnvironmentVariablesTable;
   service_environment_variables: ServiceEnvironmentVariablesTable;
   project_addresses: ProjectAddressesTable;
@@ -898,6 +961,8 @@ export interface Database {
   pipeline_runs: PipelineRunsTable;
   registries: RegistriesTable;
   artifacts: ArtifactsTable;
+  artifact_cleanup_jobs: ArtifactCleanupJobsTable;
+  artifact_cleanup_items: ArtifactCleanupItemsTable;
   artifact_sources: ArtifactSourcesTable;
   deployment_records: DeploymentRecordsTable;
   command_templates: CommandTemplatesTable;

@@ -55,6 +55,24 @@ export interface ServerGroup {
   name: string;
   description?: string;
   serverIds: string[];
+  projects?: ServerProjectReference[];
+}
+export interface ServerProjectReference extends Pick<Project, 'id' | 'name' | 'slug'> {
+  references?: {
+    sourceKind: string;
+    sourceId: string;
+    state: string;
+    serviceId?: string;
+    version?: number;
+    flowId?: string;
+    flowName?: string;
+    nodeId?: string;
+    nodeName?: string;
+    fieldId?: string;
+    runId?: string;
+    taskId?: string;
+    label?: string;
+  }[];
 }
 export interface DeploymentSelection {
   targetId?: string | null;
@@ -111,9 +129,10 @@ export interface ReleasePolicy {
   };
 }
 export interface ServerDetail extends Server {
+  active?: boolean;
   updatedAt: number;
   groups: Pick<ServerGroup, 'id' | 'name'>[];
-  projects: Pick<Project, 'id' | 'name' | 'slug'>[];
+  projects: ServerProjectReference[];
   recentDeployments: DeploymentSummary[];
   recentCommands: {
     id: string;
@@ -149,6 +168,7 @@ export interface Project {
   createdAt: number;
   serviceCount: number;
   environmentCount: number;
+  environmentSetCount?: number;
 }
 export interface Repository {
   id: string;
@@ -161,12 +181,19 @@ export interface Repository {
   credentialId?: string | null;
   description?: string;
 }
+export interface ServiceAddress {
+  id: string;
+  name: string;
+  url: string;
+}
 export interface Service {
   id: string;
   name: string;
   slug: string;
   serviceType: string;
   description?: string;
+  revision: number;
+  addresses: ServiceAddress[];
 }
 export interface Environment {
   id: string;
@@ -185,21 +212,10 @@ export interface ProjectDetail extends Project {
   archivedServices?: Pick<Service, 'id' | 'name'>[];
   archivedEnvironments?: Pick<Environment, 'id' | 'name'>[];
   archivedRepositories?: string[];
-  addresses?: ProjectAddress[];
   dependencies?: ProjectDependency[];
   dependents?: ProjectDependent[];
   deploymentTargets?: ServerGroup[];
   recentDeployments?: DeploymentSummary[];
-}
-export interface ProjectAddress {
-  id: string;
-  name: string;
-  url: string;
-  serviceId: string | null;
-  environmentId: string | null;
-  addressType: 'WEB' | 'API' | 'DOCS';
-  visibility: 'INTERNAL' | 'PUBLIC';
-  description: string;
 }
 export interface ProjectDependency {
   id: string;

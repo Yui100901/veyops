@@ -7,6 +7,7 @@ import {
   Module,
   NotFoundException,
   Param,
+  ParseUUIDPipe,
   Patch,
   Post,
   Req,
@@ -27,6 +28,7 @@ import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { lockProjectGraph } from '../projects/project-relations';
+import { targetProjectReferences } from '../projects/project-resource-references';
 import {
   assertProjectResourceRemovable,
   unavailableReference,
@@ -43,17 +45,23 @@ class ServerGroupsController {
     private readonly servers: ServersService,
     private readonly audit: AuditService,
   ) {}
-  @Get() async list() {
-    const groups = await this.database.db.selectFrom('server_groups').selectAll().execute();
-    const members = await this.database.db
+  private members(id?: string) {
+    return this.database.db
       .selectFrom('server_group_members')
       .innerJoin('servers', 'servers.id', 'server_group_members.server_id')
       .select(['group_id', 'server_id'])
       .where('servers.is_active', '=', 1)
+      .$if(id !== undefined, (query) => query.where('group_id', '=', id!))
       .orderBy('server_group_members.sort_order')
       .orderBy('server_group_members.created_at')
       .orderBy('server_group_members.server_id')
       .execute();
+  }
+  @Get() async list() {
+    const [groups, members] = await Promise.all([
+      this.database.db.selectFrom('server_groups').selectAll().orderBy('name').orderBy('id').execute(),
+      this.members(),
+    ]);
     return groups.map((g) => ({
       id: g.id,
       name: g.name,
@@ -61,10 +69,28 @@ class ServerGroupsController {
       serverIds: members.filter((m) => m.group_id === g.id).map((m) => m.server_id),
     }));
   }
-  @Roles('ADMIN', 'OPERATOR') @Post() create(@Body() dto: GroupDto, @Req() req: AuthRequest) {
+  private async group(id: string) {
+    const group = await this.database.db.selectFrom('server_groups')
+      .select(['id', 'name', 'description']).where('id', '=', id).executeTakeFirst();
+    if (!group) throw new NotFoundException('分组不存在');
+    return group;
+  }
+  @Get(':id') async detail(@Param('id', ParseUUIDPipe) id: string) {
+    const group = await this.group(id);
+    const [members, projects] = await Promise.all([
+      this.members(id),
+      targetProjectReferences(this.database.db, 'SERVER_GROUP', id),
+    ]);
+    return { ...group, serverIds: members.map(({ server_id }) => server_id), projects };
+  }
+  @Get(':id/project-references') async projectReferences(@Param('id', ParseUUIDPipe) id: string) {
+    await this.group(id);
+    return targetProjectReferences(this.database.db, 'SERVER_GROUP', id);
+  }
+  @Roles('ADMIN') @Post() create(@Body() dto: GroupDto, @Req() req: AuthRequest) {
     return this.save(dto, req.user.id);
   }
-  @Roles('ADMIN', 'OPERATOR') @Patch(':id') update(
+  @Roles('ADMIN') @Patch(':id') update(
     @Param('id') id: string,
     @Body() dto: GroupDto,
     @Req() req: AuthRequest,
@@ -123,7 +149,7 @@ class ServerGroupsController {
     );
     return { id, ...values, serverIds };
   }
-  @Roles('ADMIN', 'OPERATOR') @Delete(':id') async remove(
+  @Roles('ADMIN') @Delete(':id') async remove(
     @Param('id') id: string,
     @Req() req: AuthRequest,
   ) {

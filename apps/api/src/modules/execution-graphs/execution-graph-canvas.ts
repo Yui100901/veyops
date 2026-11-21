@@ -1,6 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { redactTaskLog } from '../tasks/task-log.service';
+import { flowCandidateCatalog } from './graph-binding-validation';
 import {
   annotateGraphIssue,
   orderedFlowNodes,
@@ -17,14 +18,59 @@ import {
   graphModulePorts,
   graphRecord,
   safeGraphId,
+  safeGraphReference,
   type GraphDiagnostic,
 } from './graph-fields';
+
+const reservedReferenceNames = new Set(['start', 'env', 'trigger', 'context']);
+
+function withNodeReferences(canvas: GraphCanvas) {
+  const used = new Set([
+    ...reservedReferenceNames,
+    ...[...canvas.nodes, ...canvas.templates].flatMap(({ referenceName }) =>
+      typeof referenceName === 'string' ? [referenceName.toLowerCase()] : [],
+    ),
+  ]);
+  const assign = (node: GraphNode) => {
+    if (node.referenceName) return node;
+    const slug = node.type.toLowerCase().replace(/_/g, '-');
+    const base = slug + '-' + node.id.slice(0, 20);
+    let referenceName = base;
+    let suffix = 2;
+    while (used.has(referenceName.toLowerCase())) referenceName = base + '-' + suffix++;
+    used.add(referenceName.toLowerCase());
+    return { ...node, referenceName };
+  };
+  return { ...canvas, nodes: canvas.nodes.map(assign), templates: canvas.templates.map(assign) };
+}
+
+function validateNodeReferences(canvas: GraphCanvas, flows: GraphFlow[]) {
+  const references = new Map<string, GraphNode>();
+  for (const node of [...canvas.nodes, ...canvas.templates]) {
+    const reference = node.referenceName?.toLowerCase();
+    const existing = reference && references.get(reference);
+    if (
+      !safeGraphReference(node.referenceName) ||
+      reservedReferenceNames.has(reference!) ||
+      existing
+    )
+      throw new GraphCompileError({
+        flowId: flows.find((flow) => flow.nodes.some(({ id }) => id === node.id))?.id,
+        nodeId: node.id,
+        fieldId: 'referenceName',
+        sourceNodeId: existing ? existing.id : undefined,
+        severity: 'ERROR',
+        message: existing ? '节点引用名已被其他节点使用' : '节点引用名无效或已被系统保留',
+      });
+    references.set(reference!, node);
+  }
+}
 
 /** Present older drafts as one canvas while keeping the published flow IDs addressable. */
 export function withDraftCanvas(
   definition: GraphDefinition,
 ): GraphDefinition & { canvas: GraphCanvas } {
-  if (definition.canvas) return { ...definition, canvas: definition.canvas };
+  if (definition.canvas) return { ...definition, canvas: withNodeReferences(definition.canvas) };
   const canvas: GraphCanvas = { nodes: [], edges: [], endpoints: [], templates: [] };
   const taken = new Set(definition.flows.map(({ id }) => id));
   for (const flow of definition.flows) {
@@ -56,7 +102,7 @@ export function withDraftCanvas(
     for (const edge of flow.edges)
       canvas.edges.push({ ...edge, from: ids.get(edge.from)!, to: ids.get(edge.to)! });
   }
-  return { ...definition, canvas };
+  return { ...definition, canvas: withNodeReferences(canvas) };
 }
 
 function validateCanvas(canvas: GraphCanvas) {
@@ -112,7 +158,8 @@ function deriveFlow(
   byId: ReadonlyMap<string, GraphNode>,
   edges: ReadonlyMap<string, GraphEdge[]>,
 ) {
-  const { endId, inputBindings, outputBindings, edgeSelections, serviceId } = endpoint;
+  const { endId, inputBindings, environmentBindings, outputBindings, edgeSelections, serviceId } =
+    endpoint;
   const flow: GraphFlow = {
     id: start.id,
     name: start.name,
@@ -120,6 +167,7 @@ function deriveFlow(
     edges: [],
     ...(serviceId !== undefined && { serviceId }),
     ...(inputBindings !== undefined && { inputBindings }),
+    ...(environmentBindings !== undefined && { environmentBindings }),
     ...(outputBindings !== undefined && { outputBindings }),
     ...(edgeSelections !== undefined && { edgeSelections }),
   };
@@ -198,7 +246,8 @@ function deriveFlow(
 }
 
 /** Derive runnable projections from canvas data without trusting client-supplied flows. */
-export function compileCanvas(canvas: GraphCanvas, publish: boolean): GraphDefinition {
+export function compileCanvas(input: GraphCanvas, publish: boolean): GraphDefinition {
+  const canvas = withNodeReferences(input);
   const { byId, edges } = validateCanvas(canvas);
   const flows: GraphFlow[] = [];
   for (const endpoint of canvas.endpoints) {
@@ -210,8 +259,10 @@ export function compileCanvas(canvas: GraphCanvas, publish: boolean): GraphDefin
   }
   const definition = { canvas, flows };
   if (publish) {
-    validateGraphDefinition(definition);
+    validateNodeReferences(canvas, flows);
+    const compiled = validateGraphDefinition(definition);
     for (const flow of flows) {
+      flow.compiled = compiled[flow.id];
       flow.nodes = flow.nodes.map((node) => {
         const module = graphModulePorts(node);
         return module ? { ...node, moduleId: module.id, moduleVersion: module.version } : node;
@@ -221,12 +272,20 @@ export function compileCanvas(canvas: GraphCanvas, publish: boolean): GraphDefin
   return definition;
 }
 
+export function canvasCatalog(canvas: GraphCanvas, flowId: string, nodeId: string) {
+  const { flows } = compileCanvas(canvas, false);
+  const flow = flows.find(({ id }) => id === flowId);
+  return flow
+    ? { [flow.id]: flowCandidateCatalog(flow, flows, orderedFlowNodes(flow), nodeId) }
+    : {};
+}
+
 export function canvasIssues(canvas: GraphCanvas): GraphDiagnostic[] {
   try {
     compileCanvas(canvas, true);
     return [];
   } catch (error) {
-    if (error instanceof GraphCompileError) return [error.issue];
+    if (error instanceof GraphCompileError) return error.issues;
     if (!(error instanceof BadRequestException)) throw error;
     return [{ message: error.message }];
   }

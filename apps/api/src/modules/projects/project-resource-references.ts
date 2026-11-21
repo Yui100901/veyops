@@ -180,7 +180,7 @@ async function configuredReferences(
           ),
         );
     }
-    const [projectVariables, environmentVariables, serviceVariables] = await Promise.all([
+    const [projectVariables, environmentVariables, serviceVariables, environmentSetVariables] = await Promise.all([
       db
         .selectFrom('project_variables')
         .select(['id', 'key', 'credential_id'])
@@ -220,8 +220,16 @@ async function configuredReferences(
         .where('variable.credential_id', 'is not', null)
         .orderBy('variable.id')
         .execute(),
+      db
+        .selectFrom('project_environment_set_variables as variable')
+        .innerJoin('project_environment_sets as env_set', 'env_set.id', 'variable.environment_set_id')
+        .select(['variable.id', 'variable.key', 'variable.credential_id', 'env_set.archived_at'])
+        .where('env_set.project_id', '=', projectId)
+        .where('variable.credential_id', 'is not', null)
+        .orderBy('variable.id')
+        .execute(),
     ]);
-    for (const row of [...projectVariables, ...environmentVariables, ...serviceVariables]) {
+    for (const row of [...projectVariables, ...environmentVariables, ...serviceVariables, ...environmentSetVariables]) {
       const state = stateOf(
         'archived_at' in row ? row.archived_at : null,
         'environmentArchived' in row ? row.environmentArchived : null,
@@ -640,4 +648,27 @@ export async function projectResourceInventory(
     (left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
   );
   return { servers, references };
+}
+
+export async function targetProjectReferences(
+  db: Db,
+  resourceType: 'SERVER' | 'SERVER_GROUP',
+  resourceId: string,
+) {
+  const projects = await db.selectFrom('projects')
+    .select(['id', 'name', 'slug'])
+    .where('deleted_at', 'is', null)
+    .orderBy('name')
+    .orderBy('id')
+    .execute();
+  const result: (typeof projects[number] & { references: ProjectResourceReference[] })[] = [];
+  for (const project of projects) {
+    const references = await projectResourceReferences(db, project.id, {
+      resourceType,
+      resourceId,
+      historyLimit: 20,
+    });
+    if (references.length) result.push({ ...project, references });
+  }
+  return result;
 }

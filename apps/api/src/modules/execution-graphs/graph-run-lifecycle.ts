@@ -8,7 +8,7 @@ import {
   type GraphNode,
 } from './execution-graph-definition';
 import type { GraphInputsDto } from './graph-runner.controller';
-import { nodeBindings, stringValue, type GraphBindingContext } from './graph-run-bindings';
+import { inspectNodeInputs, stringValue, type GraphBindingContext } from './graph-run-bindings';
 
 export const graphTaskKeyPrefix = 'execution-flow:';
 export const activeFlowStatuses = ['QUEUED', 'RUNNING', 'WAITING', 'CANCEL_REQUESTED'];
@@ -58,7 +58,7 @@ export function branchMatch(
   if (typeof settled === 'boolean') return settled ? 'TRUE' : 'FALSE';
   if (typeof settled === 'string') return settled as GraphEdge['when'];
   const value = explicit
-    ? state && nodeBindings(flow, node, state, ['value']).value
+    ? state && inspectNodeInputs(flow, node, state).values.value
     : branchInput(inputs, configuration.key, stringValue(state?.context?.triggerCommitSha));
   if (explicit && value === undefined) return undefined;
   const commit = !explicit && configuration.key === 'commitSha';
@@ -70,7 +70,11 @@ export function branchMatch(
   return index === -1 ? 'DEFAULT' : `CASE:${index}`;
 }
 
-function branchInput(inputs: GraphInputsDto, key?: 'input' | 'commitSha', triggerCommitSha?: string) {
+function branchInput(
+  inputs: GraphInputsDto,
+  key?: 'input' | 'commitSha',
+  triggerCommitSha?: string,
+) {
   if (!key) return inputs.value;
   if (key === 'input') return inputs.value;
   const sha = inputs.commitSha ?? triggerCommitSha;

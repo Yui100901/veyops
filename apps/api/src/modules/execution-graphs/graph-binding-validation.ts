@@ -1,5 +1,6 @@
 import { redactTaskLog } from '../tasks/task-log.service';
 import type { GraphEdge, GraphFlow, GraphNode } from './execution-graph-definition';
+import { environmentFilePath } from './graph-environment';
 import {
   compatibleGraphFields,
   GraphCompileError,
@@ -7,30 +8,74 @@ import {
   graphDefaultBinding,
   graphModulePorts,
   graphRecord,
+  safeGraphEnvironmentKey,
   safeGraphId,
   validateGraphBinding,
   validateGraphField,
   validateGraphValue,
   type GraphBinding,
   type GraphField,
+  type GraphDiagnostic,
 } from './graph-fields';
+
+export interface GraphCompiledFlow {
+  order: string[];
+  nodes: Record<
+    string,
+    {
+      inputs: GraphField[];
+      outputs: GraphField[];
+      inputBindings: Record<string, GraphBinding>;
+      environmentBindings: Record<string, GraphBinding>;
+      dependencies: { nodeId: string; fieldId: string; consumerFieldId: string }[];
+    }
+  >;
+  outputBindings: Record<string, GraphBinding>;
+}
+
+export interface GraphCandidate {
+  label: string;
+  referenceName: string;
+  field: GraphField;
+  binding: GraphBinding;
+  availability: 'ALWAYS' | 'CONDITIONAL';
+  branches: string[];
+}
 
 interface PathScenario {
   active: Set<string>;
   edges: GraphEdge[];
-  branches: string[];
+  branches: { id: string; label: string }[];
 }
 
 const maxScenarios = 256;
 const scalarTypes = ['TEXT', 'NUMBER', 'BOOLEAN'];
 
-function fail(flow: GraphFlow, node: GraphNode, message: string, field?: GraphField): never {
-  throw new GraphCompileError({
+function locatedIssue(
+  flow: GraphFlow,
+  node: GraphNode,
+  message: string,
+  field?: GraphField,
+  evidence: Pick<GraphDiagnostic, 'sourceNodeId' | 'sourceFieldId' | 'branchId'> = {},
+): GraphDiagnostic {
+  return {
     flowId: flow.id,
     nodeId: node.id,
     fieldId: field?.id,
+    severity: 'ERROR',
+    ...evidence,
     message: `「${flow.name}」 → 「${node.name}」${field ? ` → 「${field.name}」` : ''} · ${message}`,
-  });
+  };
+}
+
+function fail(
+  flow: GraphFlow,
+  node: GraphNode,
+  message: string,
+  field?: GraphField,
+  evidence?: Pick<GraphDiagnostic, 'sourceNodeId' | 'sourceFieldId' | 'branchId'>,
+): never {
+  throw new GraphCompileError(locatedIssue(flow, node, message, field, evidence));
 }
 
 function checkFields(
@@ -40,11 +85,25 @@ function checkFields(
   kind: 'INPUT' | 'OUTPUT',
 ) {
   const seen = new Set<string>();
+  const references = new Map<string, GraphField>();
+  const aliases = new Map<string, GraphField>();
   for (const field of fields) {
     const error = validateGraphField(field, kind);
     if (error) fail(flow, node, error, field);
     if (seen.has(field.id)) fail(flow, node, '字段标识不可重复', field);
     seen.add(field.id);
+    for (const [value, group] of [
+      [field.referenceName ?? field.id, references],
+      [field.exportName ?? field.id, aliases],
+    ] as const) {
+      const existing = group.get(value);
+      if (existing)
+        fail(flow, node, '字段引用名或导出名不可重复', field, {
+          sourceNodeId: node.id,
+          sourceFieldId: existing.id,
+        });
+      group.set(value, field);
+    }
   }
 }
 
@@ -88,7 +147,16 @@ function possiblePaths(flow: GraphFlow, ordered: GraphNode[]) {
         edges: [...path.edges, ...edges],
         branches: [
           ...path.branches,
-          ...edges.flatMap((edge) => (edge.when ? [`${node.name} ${edge.when}`] : [])),
+          ...edges.flatMap((edge) =>
+            edge.when
+              ? [
+                  {
+                    id: `${node.id}:${edge.when}`,
+                    label: `${node.name} ${edge.when}`,
+                  },
+                ]
+              : [],
+          ),
         ],
       }));
     });
@@ -117,6 +185,7 @@ interface BindingContext {
   inputs: Map<string, GraphField>;
   nodes: Map<string, GraphNode>;
   outputs: Map<string, GraphField[]>;
+  nodeInputs: Map<string, GraphField[]>;
   flows: Map<string, GraphFlow>;
 }
 
@@ -130,6 +199,12 @@ function contextSource(context: BindingContext, id: string) {
   const definition = graphContextFields.find((field) => field.id === id);
   if (!definition) return undefined;
   if (id === 'serviceId' && context.flow.serviceId) return { ...definition, required: true };
+  if (id === 'environmentSetId') {
+    const set = context.flow.nodes.find(({ type }) => type === 'START')?.environmentSet;
+    const selected = set?.fieldId && context.inputs.get(set.fieldId);
+    if (set?.mode === 'FIXED' || (selected && guarantee(selected)))
+      return { ...definition, required: true };
+  }
   if (id === 'environmentId' || id === 'serviceId') {
     const matches = [...context.inputs.values()].filter(
       (input) => input.type === definition.type && !input.multiple,
@@ -159,20 +234,67 @@ function assertBinding(
   field: GraphField,
   binding: GraphBinding,
   ancestors: ReadonlySet<string>,
+  environment = false,
 ) {
   const { flow } = context;
+  const evidence =
+    binding.kind === 'OUTPUT'
+      ? { sourceNodeId: binding.nodeId, sourceFieldId: binding.fieldId }
+      : binding.kind === 'INPUT'
+        ? { sourceNodeId: flow.id, sourceFieldId: binding.fieldId }
+        : {};
+  if (binding.onMissing === 'OMIT' && field.required !== false)
+    fail(flow, node, '仅可选端口允许缺值时省略', field, evidence);
+  if (binding.onMissing === 'USE_DEFAULT' && field.defaultValue === undefined)
+    fail(flow, node, '端口未定义缺值默认值', field, evidence);
+  if (
+    binding.onMissing === 'REPOSITORY_DEFAULT' &&
+    (field.id !== 'version' ||
+      field.type !== 'GIT_REF' ||
+      !['CHECKOUT', 'BUILD'].includes(node.type))
+  )
+    fail(flow, node, '仓库默认版本策略仅用于检出或构建的 Git 版本端口', field, evidence);
   if (binding.kind === 'FIRST_AVAILABLE') {
-    for (const source of binding.sources) assertBinding(context, node, field, source, ancestors);
+    for (const source of binding.sources)
+      assertBinding(context, node, field, source, ancestors, environment);
+    return;
+  }
+  if (binding.kind === 'AS_GIT_REF') {
+    if (field.type !== 'GIT_REF' || field.multiple)
+      fail(flow, node, 'Git 引用转换仅用于单值 Git 版本端口', field);
+    assertBinding(
+      context,
+      node,
+      { ...field, type: 'TEXT', options: undefined },
+      binding.source,
+      ancestors,
+    );
+    return;
+  }
+  if (binding.kind === 'CREDENTIAL' || binding.kind === 'ENVIRONMENT_KEY') {
+    if (!environment) fail(flow, node, '凭据或集合变量键仅能用于脚本环境注入', field);
+    if (
+      binding.kind === 'ENVIRONMENT_KEY' &&
+      !context.flow.nodes.some(
+        (entry) =>
+          entry.type === 'START' && entry.environmentSet && entry.environmentSet.mode !== 'NONE',
+      )
+    )
+      fail(flow, node, '当前开始节点未选择变量集合来源', field);
     return;
   }
   let source: GraphField | undefined;
   let producer: GraphNode | undefined;
   if (binding.kind === 'INPUT') source = context.inputs.get(binding.fieldId);
   if (binding.kind === 'CONTEXT') source = contextSource(context, binding.fieldId);
+  if (binding.kind === 'NODE_INPUT') {
+    if (!environment) fail(flow, node, '仅节点环境注入可引用本节点的已解析输入', field);
+    source = context.nodeInputs.get(node.id)?.find((port) => port.id === binding.fieldId);
+  }
   if (binding.kind === 'OUTPUT') {
     producer = context.nodes.get(binding.nodeId);
     if (!producer || !ancestors.has(binding.nodeId))
-      fail(flow, node, '输出来源必须是控制连线上的上游节点', field);
+      fail(flow, node, '输出来源必须位于控制上游，并行支路需先汇合或连接顺序依赖', field, evidence);
     source = context.outputs.get(binding.nodeId)?.find((port) => port.id === binding.fieldId);
   }
   if (
@@ -182,7 +304,10 @@ function assertBinding(
   )
     fail(flow, node, '仅能绑定本次运行由构建或登记模块产生的产物', field);
   if (binding.kind === 'VALUE') {
-    if (!validatesLiteral(field, binding.value, node))
+    if (
+      !validatesLiteral(field, binding.value, node) &&
+      !(environment && ['number', 'boolean'].includes(typeof binding.value))
+    )
       fail(flow, node, '固定值不符合字段类型或包含明文凭据', field);
     return;
   }
@@ -192,8 +317,14 @@ function assertBinding(
     source &&
     !source.multiple &&
     scalarTypes.includes(source.type);
-  if (!source || (!scalarCondition && !compatibleGraphFields(field, source)))
-    fail(flow, node, '来源不存在，或数据类型、数量、产物类型不匹配', field);
+  const environmentScalar =
+    environment &&
+    source &&
+    !source.multiple &&
+    ([...scalarTypes, 'PATH'].includes(source.type) ||
+      (binding.kind === 'NODE_INPUT' && source.type === 'CREDENTIAL'));
+  if (!source || (!scalarCondition && !environmentScalar && !compatibleGraphFields(field, source)))
+    fail(flow, node, '来源不存在，或数据类型、数量、产物类型不匹配', field, evidence);
   if (field.type === 'RELEASE' && flow.serviceId && producer) {
     const service =
       producer.type === 'FLOW_CALL'
@@ -201,7 +332,9 @@ function assertBinding(
         : bindingAt(flow, producer, 'service');
     if (
       (typeof service === 'string' && service !== flow.serviceId) ||
-      (typeof service === 'object' && service.kind === 'VALUE' && service.value !== flow.serviceId)
+      (typeof service === 'object' &&
+        service.kind === 'VALUE' &&
+        (graphRecord(service.value) ? service.value.serviceId : service.value) !== flow.serviceId)
     )
       fail(flow, node, '发布结果来源与执行流关联的服务不一致', field);
   }
@@ -211,14 +344,25 @@ function available(
   context: BindingContext,
   binding: GraphBinding,
   ancestors: ReadonlySet<string>,
+  inputs?: ReadonlyMap<string, boolean>,
 ): boolean {
   switch (binding.kind) {
     case 'INPUT':
-      return guarantee(context.inputs.get(binding.fieldId)!);
+      return Boolean(
+        context.inputs.get(binding.fieldId) && guarantee(context.inputs.get(binding.fieldId)!),
+      );
+    case 'NODE_INPUT':
+      return inputs?.get(binding.fieldId) ?? false;
     case 'CONTEXT':
-      return guarantee(contextSource(context, binding.fieldId)!);
+      return Boolean(
+        contextSource(context, binding.fieldId) &&
+        guarantee(contextSource(context, binding.fieldId)!),
+      );
     case 'VALUE':
+    case 'CREDENTIAL':
       return true;
+    case 'ENVIRONMENT_KEY':
+      return contextSource(context, 'environmentSetId')?.required === true;
     case 'OUTPUT': {
       const output = context.outputs
         .get(binding.nodeId)
@@ -226,7 +370,9 @@ function available(
       return Boolean(output && output.required !== false && ancestors.has(binding.nodeId));
     }
     case 'FIRST_AVAILABLE':
-      return binding.sources.some((source) => available(context, source, ancestors));
+      return binding.sources.some((source) => available(context, source, ancestors, inputs));
+    case 'AS_GIT_REF':
+      return available(context, binding.source, ancestors, inputs);
   }
 }
 
@@ -265,12 +411,32 @@ export function validateFlowBindings(
   checkFields(flow, start, start.inputs ?? [], 'INPUT');
   checkFields(flow, end, end.outputs ?? [], 'OUTPUT');
   const inputs = new Map((start.inputs ?? []).map((input) => [input.id, input]));
+  const set = start.environmentSet;
+  const setField = set?.fieldId ? inputs.get(set.fieldId) : undefined;
+  if (set?.mode === 'FIXED' && (!set.environmentSetId || set.fieldId !== undefined))
+    fail(flow, start, '固定引用需要选择当前项目的变量集合');
+  if (
+    set?.mode === 'INPUT' &&
+    (set.environmentSetId !== undefined ||
+      setField?.type !== 'ENVIRONMENT_SET' ||
+      setField.multiple)
+  )
+    fail(flow, start, '运行时选择需要绑定一个单值变量集合参数', setField);
+  if (set?.mode === 'NONE' && (set.environmentSetId !== undefined || set.fieldId !== undefined))
+    fail(flow, start, '无引用模式不接收变量集合或参数绑定');
   const nodePorts = new Map(
     ordered.map((node) => [node.id, graphModulePorts(node, flows.get(node.flowId ?? ''))]),
   );
   const outputs = new Map(ordered.map((node) => [node.id, nodePorts.get(node.id)?.outputs ?? []]));
-  const context: BindingContext = { flow, inputs, nodes, outputs, flows };
-  if (!graphRecord(flow.inputBindings ?? {}) || !graphRecord(flow.outputBindings ?? {}))
+  const nodeInputs = new Map(
+    ordered.map((node) => [node.id, nodePorts.get(node.id)?.inputs ?? []]),
+  );
+  const context: BindingContext = { flow, inputs, nodes, outputs, nodeInputs, flows };
+  if (
+    !graphRecord(flow.inputBindings ?? {}) ||
+    !graphRecord(flow.outputBindings ?? {}) ||
+    !graphRecord(flow.environmentBindings ?? {})
+  )
     fail(flow, start, '流内绑定格式无效');
   for (const [nodeId, ports] of Object.entries(flow.inputBindings ?? {})) {
     const node = nodes.get(nodeId);
@@ -299,21 +465,69 @@ export function validateFlowBindings(
       );
   }
 
+  for (const [nodeId, variables] of Object.entries(flow.environmentBindings ?? {})) {
+    const node = nodes.get(nodeId);
+    if (!node || !['SHELL', 'CHECK'].includes(node.type) || !graphRecord(variables))
+      fail(flow, node ?? start, '环境绑定必须指向此流的 Shell 或检查节点');
+    if (Object.keys(variables).length > 30) fail(flow, node, '每个节点最多声明 30 个环境绑定');
+    for (const [key, binding] of Object.entries(variables)) {
+      const field: GraphField = { id: key, name: key, type: 'TEXT', required: false };
+      if (!safeGraphEnvironmentKey(key) || !validateGraphBinding(binding))
+        fail(flow, node, '环境变量名或来源格式无效', field);
+    }
+  }
+
   const paths = possiblePaths(flow, ordered);
   const staticOrder = predecessors(flow.edges, ordered);
   const pathOrders = paths.map((path) => ({ path, order: predecessors(path.edges, ordered) }));
+  const coverage = new Map<string, GraphDiagnostic>();
+  const record = (issue: GraphDiagnostic) => {
+    if (coverage.size >= 64) return;
+    const key = JSON.stringify([issue.nodeId, issue.fieldId, issue.branchId]);
+    coverage.set(key, issue);
+  };
+  const compiled: GraphCompiledFlow = {
+    order: ordered.map(({ id }) => id),
+    nodes: {},
+    outputBindings: {},
+  };
   for (const node of ordered) {
     const ports = nodePorts.get(node.id);
     if (node.inputs !== undefined && node.type !== 'START')
       fail(flow, node, '开始入参只能声明在开始节点');
+    if (node.environmentSet && node.type !== 'START')
+      fail(flow, node, '变量集合引用只能声明在开始节点');
+    if (node.type === 'LOAD_ENV') {
+      const config = node.loadEnvironment;
+      const mapping = config?.pathRule?.paths;
+      const fileField = { id: 'envFile', name: '环境文件', type: 'PATH' } as const;
+      if (
+        mapping &&
+        (config?.envFile || !Object.keys(mapping).length || Object.keys(mapping).length > 30)
+      )
+        fail(flow, node, '请选择单一路径或填写 1–30 条环境文件映射', fileField);
+      if (!mapping && !config?.envFile && config?.required === true)
+        fail(flow, node, '必需环境文件应填写路径或映射', fileField);
+      try {
+        for (const file of mapping
+          ? Object.values(mapping)
+          : config?.envFile
+            ? [config.envFile]
+            : [])
+          environmentFilePath(file);
+        if (config?.directory && config.directory !== '.') environmentFilePath(config.directory);
+      } catch {
+        fail(flow, node, '环境文件必须使用有效的仓库内相对路径', fileField);
+      }
+    }
     if (node.outputs !== undefined && !['END', 'SHELL', 'CHECK'].includes(node.type))
       fail(flow, node, '仅结束、Shell 和检查节点允许声明输出');
     if (node.type === 'SHELL' || node.type === 'CHECK') {
       checkFields(flow, node, node.shell?.params ?? [], 'INPUT');
       checkFields(flow, node, node.outputs ?? node.shell?.outputs ?? [], 'OUTPUT');
       for (const field of node.shell?.params ?? []) {
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field.id) || /^VEYOPS_/i.test(field.id))
-          fail(flow, node, '脚本入参标识须为可用的环境变量名', field);
+        if (!safeGraphEnvironmentKey(field.exportName ?? field.id))
+          fail(flow, node, '脚本输入导出名须为可用的环境变量名', field);
         if (
           !scalarTypes.includes(field.type) &&
           field.type !== 'PATH' &&
@@ -323,9 +537,16 @@ export function validateFlowBindings(
         if (field.type === 'CREDENTIAL' && field.multiple)
           fail(flow, node, '每个脚本环境变量只能关联一个凭据', field);
       }
-      for (const field of node.outputs ?? node.shell?.outputs ?? [])
+      const builtinOutputs = new Set(['workspace', 'report', 'exitCode']);
+      for (const field of node.outputs ?? node.shell?.outputs ?? []) {
         if (!scalarTypes.includes(field.type))
           fail(flow, node, '脚本自定义输出支持文本、数值、布尔值及其列表', field);
+        if (builtinOutputs.has(field.exportName ?? field.id))
+          fail(flow, node, '脚本自定义输出不得使用内置输出名', field);
+      }
+      for (const field of node.shell?.params ?? [])
+        if (Object.hasOwn(flow.environmentBindings?.[node.id] ?? {}, field.exportName ?? field.id))
+          fail(flow, node, '脚本输入的导出名与节点变量重复，请使用一个显式环境绑定', field);
     }
     for (const fields of [ports?.inputs ?? [], ports?.outputs ?? []]) {
       if (new Set(fields.map((field) => field.id)).size !== fields.length)
@@ -365,17 +586,86 @@ export function validateFlowBindings(
       const binding = bindings.get(field.id);
       if (binding) assertBinding(context, node, field, binding, staticOrder.get(node.id)!);
     }
+    const environmentBindings = flow.environmentBindings?.[node.id] ?? {};
+    for (const [key, binding] of Object.entries(environmentBindings))
+      assertBinding(
+        context,
+        node,
+        { id: key, name: key, type: 'TEXT', required: false },
+        binding,
+        staticOrder.get(node.id)!,
+        true,
+      );
+    const authored = Object.fromEntries(
+      [...bindings].filter((item): item is [string, GraphBinding] => item[1] !== undefined),
+    );
+    if (node.type === 'END') compiled.outputBindings = authored;
+    compiled.nodes[node.id] = {
+      inputs: node.type === 'START' ? (node.inputs ?? []) : (ports?.inputs ?? []),
+      outputs: node.type === 'END' ? (node.outputs ?? []) : (ports?.outputs ?? []),
+      inputBindings: node.type === 'END' ? {} : authored,
+      environmentBindings,
+      dependencies: [...Object.entries(authored), ...Object.entries(environmentBindings)].flatMap(
+        ([consumerFieldId, binding]) =>
+          producerBindings(binding).map((producer) => ({
+            nodeId: producer.nodeId,
+            fieldId: producer.fieldId,
+            consumerFieldId,
+          })),
+      ),
+    };
     for (const { path, order } of pathOrders) {
       if (!path.active.has(node.id)) continue;
       const ancestors = order.get(node.id)!;
       const has = (id: string) => {
         const binding = bindings.get(id);
-        return binding !== undefined && available(context, binding, ancestors);
+        return (
+          binding !== undefined &&
+          (binding.onMissing === 'USE_DEFAULT' || available(context, binding, ancestors))
+        );
       };
-      const branch = path.branches.length ? `（分支 ${path.branches.join(' / ')}）` : '';
+      const branch = path.branches.length
+        ? `（分支 ${path.branches.map(({ label }) => label).join(' / ')}）`
+        : '';
+      const branchId = path.branches.map(({ id }) => id).join('/') || undefined;
       for (const field of destinations) {
-        if (field.required !== false && !has(field.id) && field.defaultValue === undefined)
-          fail(flow, node, `缺少必填来源${branch}，请绑定开始参数、固定配置或上游输出`, field);
+        const binding = bindings.get(field.id);
+        const needsValue = field.required !== false || binding?.onMissing === 'ERROR';
+        const hasDefault =
+          field.defaultValue !== undefined &&
+          (binding === undefined || binding.onMissing === 'USE_DEFAULT');
+        if (needsValue && !has(field.id) && !hasDefault) {
+          const source = binding && producerBindings(binding)[0];
+          record(
+            locatedIssue(
+              flow,
+              node,
+              `缺少必填来源${branch}，请绑定开始参数、固定配置或上游输出`,
+              field,
+              {
+                branchId,
+                sourceNodeId: source?.nodeId,
+                sourceFieldId: source?.fieldId,
+              },
+            ),
+          );
+        }
+      }
+      for (const [key, binding] of Object.entries(environmentBindings)) {
+        if (binding.onMissing !== 'ERROR') continue;
+        const known = new Map(destinations.map((field) => [field.id, has(field.id)]));
+        if (!available(context, binding, ancestors, known))
+          record(
+            locatedIssue(
+              flow,
+              node,
+              `环境变量缺少可用值${branch}`,
+              { id: key, name: key, type: 'TEXT' },
+              {
+                branchId,
+              },
+            ),
+          );
       }
       if (node.type === 'BUILD' && !has('repository') && !has('source') && !has('workspace'))
         fail(
@@ -386,9 +676,9 @@ export function validateFlowBindings(
         );
       if (
         (node.type === 'SHELL' || node.type === 'CHECK') &&
-        node.shell?.location !== 'MANAGER' &&
-        !has('workspace') &&
-        !has('targets')
+        (node.shell?.location === 'TARGET'
+          ? !has('targets')
+          : node.shell?.location !== 'MANAGER' && !has('workspace') && !has('targets'))
       )
         fail(
           flow,
@@ -435,22 +725,130 @@ export function validateFlowBindings(
           `配置的镜像缺少引用${branch}`,
           destinations.find((port) => port.id === 'image'),
         );
-      if (['BUILD', 'DEPLOY_ARTIFACT', 'REGISTER_ARTIFACT'].includes(node.type)) {
-        if (!has('service'))
-          fail(
+      if (node.type === 'DEPLOY_ARTIFACT' && !has('service'))
+        record(
+          locatedIssue(
             flow,
             node,
             `缺少项目服务来源${branch}`,
             destinations.find((port) => port.id === 'service'),
-          );
-        if (!has('environment'))
-          fail(
-            flow,
-            node,
-            `缺少项目环境来源${branch}`,
-            destinations.find((port) => port.id === 'environment'),
-          );
-      }
+            { branchId },
+          ),
+        );
     }
   }
+  const missing = [...coverage.values()];
+  if (missing.length) throw new GraphCompileError(missing[0]!, missing);
+  return compiled;
+}
+
+function producerBindings(binding: GraphBinding): Extract<GraphBinding, { kind: 'OUTPUT' }>[] {
+  switch (binding.kind) {
+    case 'OUTPUT':
+      return [binding];
+    case 'FIRST_AVAILABLE':
+      return binding.sources.flatMap(producerBindings);
+    case 'AS_GIT_REF':
+      return producerBindings(binding.source);
+    default:
+      return [];
+  }
+}
+
+export function flowCandidateCatalog(
+  flow: GraphFlow,
+  flows: GraphFlow[],
+  ordered: GraphNode[],
+  nodeId: string,
+) {
+  const start = flow.nodes.find(({ type }) => type === 'START');
+  if (!start) return { nodes: {} };
+  // Only derived, acyclic control paths reach this catalog. Until validation can
+  // prove every branch, conservative candidates still let the draft be repaired.
+  const staticOrder = predecessors(flow.edges, ordered);
+  let paths: { path: PathScenario; order: Map<string, Set<string>> }[] = [];
+  try {
+    paths = possiblePaths(flow, ordered).map((path) => ({
+      path,
+      order: predecessors(path.edges, ordered),
+    }));
+  } catch (error) {
+    if (!(error instanceof GraphCompileError)) throw error;
+  }
+  const inputs = new Map((start.inputs ?? []).map((field) => [field.id, field]));
+  const called = new Map(flows.map((entry) => [entry.id, entry]));
+  const ports = new Map(
+    ordered.map((node) => [
+      node.id,
+      graphModulePorts(node, node.flowId ? called.get(node.flowId) : undefined),
+    ]),
+  );
+  const outputs = new Map(ordered.map((node) => [node.id, ports.get(node.id)?.outputs ?? []]));
+  const context: BindingContext = {
+    flow,
+    inputs,
+    outputs,
+    flows: called,
+    nodes: new Map(ordered.map((node) => [node.id, node])),
+    nodeInputs: new Map(ordered.map((node) => [node.id, ports.get(node.id)?.inputs ?? []])),
+  };
+  return {
+    nodes: Object.fromEntries(
+      ordered
+        .filter(({ id }) => id === nodeId)
+        .map((node) => {
+          const candidates: GraphCandidate[] = [];
+          for (const field of inputs.values())
+            candidates.push({
+              label: '开始参数 · ' + field.name,
+              referenceName: 'start.' + (field.referenceName ?? field.id),
+              field,
+              binding: { kind: 'INPUT', fieldId: field.id },
+              availability: guarantee(field) ? 'ALWAYS' : 'CONDITIONAL',
+              branches: [],
+            });
+          for (const { id } of graphContextFields) {
+            const field = contextSource(context, id)!;
+            candidates.push({
+              label: '系统上下文 · ' + field.name,
+              referenceName: 'context.' + id,
+              field,
+              binding: { kind: 'CONTEXT', fieldId: id },
+              availability: guarantee(field) ? 'ALWAYS' : 'CONDITIONAL',
+              branches: [],
+            });
+          }
+          const eligible = paths.filter(({ path }) => path.active.has(node.id));
+          for (const sourceId of staticOrder.get(node.id) ?? []) {
+            const producer = context.nodes.get(sourceId)!;
+            const present = eligible.filter(({ order }) => order.get(node.id)?.has(sourceId));
+            const branches = [
+              ...new Set(present.flatMap(({ path }) => path.branches.map(({ label }) => label))),
+            ];
+            for (const field of outputs.get(sourceId) ?? [])
+              candidates.push({
+                label: producer.name + ' · ' + field.name,
+                referenceName:
+                  (producer.referenceName ?? producer.id) + '.' + (field.referenceName ?? field.id),
+                field,
+                binding: { kind: 'OUTPUT', nodeId: producer.id, fieldId: field.id },
+                availability:
+                  eligible.length && eligible.length === present.length && guarantee(field)
+                    ? 'ALWAYS'
+                    : 'CONDITIONAL',
+                branches,
+              });
+          }
+          return [
+            node.id,
+            {
+              inputs:
+                node.type === 'START' ? (node.inputs ?? []) : (ports.get(node.id)?.inputs ?? []),
+              outputs: node.type === 'END' ? (node.outputs ?? []) : (outputs.get(node.id) ?? []),
+              candidates,
+            },
+          ];
+        }),
+    ),
+  };
 }

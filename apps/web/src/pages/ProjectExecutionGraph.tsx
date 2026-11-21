@@ -44,6 +44,7 @@ import {
   type GraphPane,
   type GraphWorkbenchScope,
 } from './graph-workbench-context';
+import { readProjectWorkspace } from './project-workspace-route';
 import './execution-graph.css';
 import './graph-start.css';
 
@@ -159,6 +160,7 @@ function Workspace({
     serviceId: params.get('serviceId') || undefined,
     environmentId: params.get('environmentId') || undefined,
     view: params.get('view') || undefined,
+    viewSearch: readProjectWorkspace('/projects/' + project.id, search)?.location.viewSearch,
     resourcePanel: graphResourcePanel(params.get('resourcePanel')),
   };
   const delivery = graphReturnDelivery(params);
@@ -223,7 +225,8 @@ function Workspace({
           definition: { flows: [], canvas },
         });
         setIssues(result.issues);
-        if (result.issues.length) return;
+        if (result.issues.some(({ severity }) => severity !== 'WARNING' && severity !== 'INFO'))
+          return;
         if (action === 'validate') {
           setNotice('发布检查通过');
           return;
@@ -260,6 +263,12 @@ function Workspace({
     } catch (err) {
       setError(message(err));
       setConflict(err instanceof ApiError && err.status === 409);
+      if (
+        err instanceof ApiError &&
+        err.planIssue &&
+        (action === 'publish' || action === 'validate')
+      )
+        setIssues([{ ...err.planIssue, severity: 'ERROR' }]);
     } finally {
       saving.current = false;
       setBusy(false);
@@ -933,6 +942,30 @@ function PublishedVersions({
                     </div>
                   )
                 )}
+                {!retiredAt && canRestore && !!live.definition.flows.length && (
+                  <details className="graph-field-card">
+                    <summary>从此版本发起运行</summary>
+                    <ul className="graph-edge-list">
+                      {live.definition.flows.map((flow) => (
+                        <li key={flow.id}>
+                          <a
+                            className="text-link"
+                            href={
+                              '#' +
+                              graphWorkbenchPath(project.id, {
+                                ...scope,
+                                start: flow.id,
+                                version: live.version,
+                              })
+                            }
+                          >
+                            {flow.name}
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
                 <PublishedNodes
                   key={`${live.version}:${linkedNode ?? ''}:${linkedFlow ?? ''}`}
                   definition={live.definition}
@@ -1063,17 +1096,7 @@ function PublishedNodes({
           </strong>
           {renderResources?.(node, inspectedFlow)}
           {node.message && <p>{node.message}</p>}
-          {node.checkout && (
-            <p>
-              {node.checkout.mode === 'COMMIT'
-                ? '提交 · ' + node.checkout.commitSha
-                : node.checkout.mode === 'TAG'
-                  ? '标签 · ' + node.checkout.tag
-                  : '分支 · ' + node.checkout.branch}
-              {' · '}
-              {node.checkout.fullClone ? '全量历史' : '浅拉取'}
-            </p>
-          )}
+          {node.checkout && <p>{node.checkout.fullClone ? '全量历史' : '浅拉取'}</p>}
           {node.shell?.command && <pre>{node.shell.command}</pre>}
           {node.condition && (
             <p>

@@ -4,6 +4,7 @@ import { ErrorBanner, Loading, Section, Status } from '../components';
 import type { ProjectDetail, ServerGroup } from '../models';
 import { graphWorkbenchPath } from './graph-workbench-context';
 import { projectResourcePath } from './project-workspace-route';
+import { serverResourceHref } from './server-resource-route';
 import './project-server-inventory.css';
 
 export interface ServiceEnvironmentContext {
@@ -281,14 +282,11 @@ export function ProjectServerInventory({
                     <a
                       className="button secondary small"
                       key={group.id}
-                      href={
-                        '#' +
-                        projectResourcePath(project.id, {
-                          view,
-                          resource: 'servers',
-                          groupId: group.id,
-                        })
-                      }
+                      href={serverResourceHref({
+                        groupId: group.id,
+                        projectId: project.id,
+                        returnPath: window.location.hash.slice(1),
+                      })}
                     >
                       {group.name} <span className="tag">{group.serverIds.length} 台</span>
                     </a>
@@ -296,11 +294,8 @@ export function ProjectServerInventory({
               </div>
             )}
             {(serverId || groupId) && (
-              <a
-                className="text-link"
-                href={'#' + projectResourcePath(project.id, { view, resource: 'servers' })}
-              >
-                查看全部项目服务器
+              <a className="text-link" href="#/servers">
+                查看平台服务器
               </a>
             )}
             {!servers.length && (

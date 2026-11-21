@@ -18,6 +18,7 @@ export type GraphWorkbenchScope = {
   serviceId?: string;
   environmentId?: string;
   view?: string;
+  viewSearch?: string;
   resourcePanel?: (typeof resourcePanels)[number];
 };
 export type GraphPane = 'run' | 'draft' | 'published' | 'history' | 'migration';
@@ -166,6 +167,8 @@ function knownReference(binding: GraphBinding): string | undefined | typeof dyna
   }
   if (binding.kind !== 'VALUE') return dynamicBinding;
   if (typeof binding.value === 'string') return binding.value;
+  if (binding.value && typeof binding.value === 'object' && 'serviceId' in binding.value)
+    return typeof binding.value.serviceId === 'string' ? binding.value.serviceId : dynamicBinding;
   if (binding.value && typeof binding.value === 'object' && 'id' in binding.value)
     return typeof binding.value.id === 'string' ? binding.value.id : dynamicBinding;
   return binding.value == null || (Array.isArray(binding.value) && !binding.value.length)
@@ -268,12 +271,20 @@ export function graphStartReadiness(
       resourceType &&
       !missing &&
       ((field.multiple && !Array.isArray(value)) ||
-        selections.some(
-          (selected) =>
-            typeof selected !== 'string' ||
-            (options && !options.includes(selected)) ||
-            (resources && !resources.some((resource) => resource.id === selected)),
-        ));
+        selections.some((selected) => {
+          const reference =
+            type === 'SERVICE' &&
+            selected &&
+            typeof selected === 'object' &&
+            'serviceId' in selected
+              ? selected.serviceId
+              : selected;
+          return (
+            typeof reference !== 'string' ||
+            (options && !options.includes(reference)) ||
+            (resources && !resources.some((resource) => resource.id === reference))
+          );
+        }));
     if (!hasOptions && (field.required !== false || invalidResource)) {
       issues.push({
         reason: 'NO_AVAILABLE_OPTIONS',

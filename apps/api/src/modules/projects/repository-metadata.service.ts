@@ -61,6 +61,8 @@ const gitCredentialTypes = new Set(['GIT_TOKEN', 'GIT_PASSWORD', 'USERNAME_PASSW
 type RepositoryAccess = { clone_url: string; credential_id: string | null };
 export interface GraphCheckoutSnapshot {
   repositoryId: string;
+  repositoryName?: string;
+  ref?: string;
   branch?: string;
   tag?: string;
   commitSha: string;
@@ -359,8 +361,17 @@ export class RepositoryMetadataService {
     }
     if (!commitSha || !shaPattern.test(commitSha))
       throw new BadRequestException('请选择存在的仓库分支、标签或完整 Git 提交 SHA');
+    if (input.mode === 'COMMIT')
+      await this.withRepository(
+        projectId,
+        input.repositoryId,
+        (git) => this.fetchPinnedCommit(git, commitSha!),
+        access,
+      );
     return {
       repositoryId: input.repositoryId,
+      repositoryName: row.name,
+      ref: branch ? 'refs/heads/' + branch : tag ? 'refs/tags/' + tag : commitSha,
       branch,
       tag,
       commitSha,

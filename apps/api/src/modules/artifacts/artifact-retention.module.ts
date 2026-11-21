@@ -13,6 +13,7 @@ import {
   Query,
   Req,
 } from '@nestjs/common';
+import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayMinSize,
@@ -21,16 +22,24 @@ import {
   IsArray,
   IsBoolean,
   IsInt,
+  IsString,
   IsUUID,
   Max,
   Min,
+  Matches,
   ValidateIf,
+  ValidateNested,
 } from 'class-validator';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { artifactCleanupBatch, ArtifactRetentionService } from './artifact-retention.service';
+import { ArtifactCleanupService } from './artifact-cleanup.service';
 
 class ScopeQuery {
+  @ValidateIf((_input, value) => value !== undefined)
+  @IsUUID()
+  projectId?: string;
+
   @ValidateIf((_input, value) => value !== undefined)
   @IsUUID()
   serviceId?: string;
@@ -52,16 +61,54 @@ class PolicyDto {
   maxDays!: number;
 }
 
+class ArtifactRefDto {
+  @IsUUID()
+  artifactId!: string;
+
+  @ValidateIf((_input, value) => value !== undefined)
+  @IsUUID()
+  instanceId?: string;
+}
+
+class CleanupPreviewDto {
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(artifactCleanupBatch)
+  @ValidateNested({ each: true })
+  @Type(() => ArtifactRefDto)
+  artifacts!: ArtifactRefDto[];
+}
+
 class PruneDto {
+  @ValidateIf((_input, value) => value !== undefined)
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(artifactCleanupBatch)
   @ArrayUnique()
   @IsUUID(undefined, { each: true })
-  artifactIds!: string[];
+  artifactIds?: string[];
 
+  @ValidateIf((_input, value) => value !== undefined)
   @Equals(true)
-  confirmed!: true;
+  confirmed?: true;
+
+  @ValidateIf((_input, value) => value !== undefined)
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(artifactCleanupBatch)
+  @ValidateNested({ each: true })
+  @Type(() => ArtifactRefDto)
+  artifacts?: ArtifactRefDto[];
+
+  @ValidateIf((_input, value) => value !== undefined)
+  @IsString()
+  @Matches(/^[a-f0-9]{64}$/)
+  planDigest?: string;
+
+  @ValidateIf((_input, value) => value !== undefined)
+  @IsString()
+  @Matches(/^[a-zA-Z0-9_-]{1,120}$/)
+  idempotencyKey?: string;
 }
 
 class PinDto {
@@ -69,16 +116,19 @@ class PinDto {
   pinned!: boolean;
 }
 
-function artifactScope({ serviceId, environmentId }: ScopeQuery) {
-  if (!serviceId && !environmentId) return undefined;
-  if (!serviceId || !environmentId) throw new BadRequestException('请同时指定服务和环境');
-  return { serviceId, environmentId };
+function artifactScope({ projectId, serviceId, environmentId }: ScopeQuery) {
+  if (!projectId && !serviceId && !environmentId) return undefined;
+  if (environmentId && !serviceId) throw new BadRequestException('旧服务环境策略需要同时指定服务');
+  return { projectId, serviceId, environmentId };
 }
 
 @Controller('artifact-retention')
 @Roles('ADMIN')
 class ArtifactRetentionController {
-  constructor(private readonly service: ArtifactRetentionService) {}
+  constructor(
+    private readonly service: ArtifactRetentionService,
+    private readonly cleanup: ArtifactCleanupService,
+  ) {}
 
   @Get('policy')
   policy(@Query() query: ScopeQuery) {
@@ -100,9 +150,39 @@ class ArtifactRetentionController {
     return this.service.preview();
   }
 
+  @Post('preview')
+  cleanupPreview(@Body() input: CleanupPreviewDto) {
+    return this.cleanup.preview(input.artifacts);
+  }
+
   @Post('prune')
   prune(@Body() input: PruneDto, @Req() req: AuthRequest) {
-    return this.service.prune(input.artifactIds, req.user.id);
+    if (input.artifacts && input.planDigest && input.idempotencyKey && !input.artifactIds)
+      return this.cleanup.confirm(
+        input.artifacts,
+        input.planDigest,
+        input.idempotencyKey,
+        req.user.id,
+      );
+    if (
+      input.artifactIds &&
+      input.confirmed &&
+      !input.artifacts &&
+      !input.planDigest &&
+      !input.idempotencyKey
+    )
+      return this.service.prune(input.artifactIds, req.user.id);
+    throw new BadRequestException('请提交已预览的产物、计划摘要及幂等键');
+  }
+
+  @Get('jobs/:id')
+  job(@Param('id', ParseUUIDPipe) id: string) {
+    return this.cleanup.get(id);
+  }
+
+  @Post('jobs/:id/retry')
+  retry(@Param('id', ParseUUIDPipe) id: string, @Req() req: AuthRequest) {
+    return this.cleanup.retry(id, req.user.id);
   }
 
   @Put('artifacts/:id/pin')
@@ -113,7 +193,7 @@ class ArtifactRetentionController {
 
 @Global()
 @Module({
-  providers: [ArtifactRetentionService],
+  providers: [ArtifactRetentionService, ArtifactCleanupService],
   controllers: [ArtifactRetentionController],
   exports: [ArtifactRetentionService],
 })

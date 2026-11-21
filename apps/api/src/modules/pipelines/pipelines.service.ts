@@ -56,7 +56,17 @@ import {
   validatePipelineNodes,
 } from './pipeline-node-config';
 import { safeDeployPath, validateDefinition, validateGitUrl } from './pipeline.validation';
-import { storeDeliveryProfile, type DeliveryExecutionProfile } from './delivery-execution-profile';
+import {
+  graphDeliveryEnvironment,
+  graphUnscopedArtifactService,
+  storeDeliveryProfile,
+  type DeliveryExecutionProfile,
+} from './delivery-execution-profile';
+import {
+  mergeEnvironmentSet,
+  type GraphVariableSnapshot,
+} from '../execution-graphs/graph-environment';
+import type { FrozenEnvironmentSet } from '../projects/environment-sets.service';
 import {
   ownedGraphWorkspace,
   workspaceArtifactSource,
@@ -159,6 +169,7 @@ export class PipelinesService implements OnModuleInit {
     mode?: PipelineExecutionMode,
     fromArtifact = false,
     allowArchivedSource = false,
+    graphBuild = false,
   ) {
     validateDefinition(definition, mode === 'DEPLOY' && !fromArtifact);
     validatePipelineNodes(definition);
@@ -169,12 +180,15 @@ export class PipelinesService implements OnModuleInit {
       .where('id', '=', projectId)
       .where('deleted_at', 'is', null)
       .executeTakeFirst();
-    const service = await this.database.db
-      .selectFrom('services')
-      .select(['project_id', 'name'])
-      .where('id', '=', serviceId)
-      .where('archived_at', 'is', null)
-      .executeTakeFirst();
+    const unscoped = graphBuild && serviceId === graphUnscopedArtifactService(projectId).id;
+    const service = unscoped
+      ? graphUnscopedArtifactService(projectId)
+      : await this.database.db
+          .selectFrom('services')
+          .select(['project_id', 'name'])
+          .where('id', '=', serviceId)
+          .where('archived_at', 'is', null)
+          .executeTakeFirst();
     const repositoryIds = fromArtifact
       ? [definition.repositoryId]
       : pipelineSourceRepositories(definition);
@@ -237,7 +251,7 @@ export class PipelinesService implements OnModuleInit {
       }
     }
     const registry =
-      mode !== 'BUILD_ONLY' && definition.registryId
+      (mode !== 'BUILD_ONLY' || (graphBuild && definition.imageRepository)) && definition.registryId
         ? await this.registries.get(definition.registryId)
         : undefined;
     return {
@@ -245,7 +259,7 @@ export class PipelinesService implements OnModuleInit {
       repositories,
       registry,
       projectName: project.name,
-      serviceName: service.name,
+      serviceName: unscoped ? undefined : service.name,
     };
   }
 
@@ -432,19 +446,23 @@ export class PipelinesService implements OnModuleInit {
           .where('version', '=', input.version ?? pipeline.currentVersion)
           .executeTakeFirst();
     if (!version) throw new NotFoundException('Pipeline版本不存在');
-    const environment = await this.database.db
-      .selectFrom('environments')
-      .selectAll()
-      .where('id', '=', input.environmentId)
-      .where('archived_at', 'is', null)
-      .executeTakeFirst();
-    if (environment?.project_id !== pipeline.projectId)
+    const environment = profile?.graphVariables
+      ? graphDeliveryEnvironment(pipeline.projectId)
+      : await this.database.db
+          .selectFrom('environments')
+          .selectAll()
+          .where('id', '=', input.environmentId)
+          .where('archived_at', 'is', null)
+          .executeTakeFirst();
+    if (environment?.project_id !== pipeline.projectId || environment.id !== input.environmentId)
       throw new BadRequestException('运行环境必须属于当前项目');
-    const env = await this.configs.readSnapshot(
-      pipeline.serviceId,
-      input.environmentId,
-      profile ? undefined : input.targetId,
-    );
+    const env = profile?.graphVariables
+      ? { ...profile.graphVariables, config: null }
+      : await this.configs.readSnapshot(
+          pipeline.serviceId,
+          input.environmentId,
+          profile ? undefined : input.targetId,
+        );
     const settings = profile ? await this.settings.project(pipeline.projectId) : undefined;
     const defaults = settings?.effective ?? (await this.settings.get(pipeline.projectId));
     const definition = plainToInstance(
@@ -616,6 +634,7 @@ export class PipelinesService implements OnModuleInit {
       mode,
       fromArtifact,
       fromArtifact && !!profile,
+      mode === 'BUILD_ONLY' && Boolean(profile?.graphVariables),
     );
     const sources =
       definition.nodes && !fromArtifact
@@ -674,6 +693,22 @@ export class PipelinesService implements OnModuleInit {
       },
     };
   }
+
+  async graphVariables(
+    projectId: string,
+    serviceId: string,
+    set?: FrozenEnvironmentSet,
+  ): Promise<GraphVariableSnapshot> {
+    return mergeEnvironmentSet(
+      await this.configs.resolveVariables(
+        projectId,
+        undefined,
+        serviceId === graphUnscopedArtifactService(projectId).id ? undefined : serviceId,
+      ),
+      set,
+    );
+  }
+
   private executionConfiguration(p: Awaited<ReturnType<PipelinesService['prepare']>>) {
     if (!p.graphTargets || !p.settings) return undefined;
     const build = p.graphPurpose !== 'RELEASE';
@@ -772,10 +807,11 @@ export class PipelinesService implements OnModuleInit {
       settings,
       ...(p.managedCompose && { managedCompose: p.managedCompose }),
       variables:
-        p.env.variableSources?.map(({ key, source, isSecret }) => ({
+        p.env.variableSources?.map(({ key, source, isSecret, ...meta }) => ({
           key,
           source,
           sensitive: isSecret,
+          ...meta,
         })) ?? [],
       variableFingerprint: createHmac('sha256', encryptionKey())
         .update('execution-plan:variables\0')
@@ -783,6 +819,9 @@ export class PipelinesService implements OnModuleInit {
           JSON.stringify([
             Object.entries(p.env.variables).sort(),
             Object.entries(p.env.secretVariables).sort(),
+            Object.entries(
+              ('secretCredentialNonces' in p.env && p.env.secretCredentialNonces) || {},
+            ).sort(),
           ]),
         )
         .digest('hex'),
@@ -844,6 +883,9 @@ export class PipelinesService implements OnModuleInit {
             }),
             variables: p.env.variables,
             secretVariables: p.env.secretVariables,
+            ...('secretCredentialNonces' in p.env && {
+              secretCredentialNonces: p.env.secretCredentialNonces,
+            }),
             servers: p.servers.map((s) => ({
               id: s.id,
               host: s.host,
@@ -952,6 +994,9 @@ export class PipelinesService implements OnModuleInit {
       ...(p.managedCompose && { managedCompose: p.managedCompose }),
       variables: p.env.variables,
       secretVariables: p.env.secretVariables,
+      ...('secretCredentialNonces' in p.env && {
+        secretCredentialNonces: p.env.secretCredentialNonces,
+      }),
       releasePolicy: p.env.config?.releasePolicy,
     };
   }
@@ -1281,7 +1326,16 @@ export class PipelinesService implements OnModuleInit {
         'tasks.status',
       ])
       .where('artifacts.id', 'in', artifactIds)
-      .where('pipeline_runs.environment_id', '=', input.environmentId);
+      .where('pipeline_runs.environment_id', '=', input.environmentId)
+      .where('artifacts.lifecycle_state', '=', 'ACTIVE')
+      .where((eb) =>
+        eb.or([
+          eb('artifacts.temporary_root_id', 'is', null),
+          ...(profile?.artifactRootRunId
+            ? [eb('artifacts.temporary_root_id', '=', profile.artifactRootRunId)]
+            : []),
+        ]),
+      );
     const scoped = profile
       ? query
           .where('pipeline_runs.project_id', '=', profile.projectId)
@@ -1337,14 +1391,16 @@ export class PipelinesService implements OnModuleInit {
       source.run_id,
       Boolean(profile),
       Boolean(p.managedCompose),
+      profile?.artifactRootRunId,
+      artifactIds,
     );
     const references = candidates.filter((candidate) => artifactIds.includes(candidate.id));
     if (references.length !== rows.length)
       throw artifactIssue(
         new ConflictException(
           p.definition.artifactType === 'DOCKER_IMAGE' && !p.managedCompose
-            ? '产物缺少可校验的镜像或 Compose 归档，也可以为服务环境配置独立模板'
-            : '产物缺少可校验的发布所需数据',
+            ? '镜像不可验证、正在清理，或缺少 Compose 模板'
+            : '文件或目录实物不可验证，或该产物正在清理',
         ),
       );
     if (p.managedCompose)
@@ -1524,6 +1580,7 @@ export class PipelinesService implements OnModuleInit {
     const snapshot: PipelineSnapshot = {
       ...this.snapshot(p, source.commit_sha),
       mode: 'DEPLOY_ARTIFACT',
+      artifactRootRunId: options.profile?.artifactRootRunId,
       deploymentArtifacts: references,
       sourceBuildTaskId: source.task_id,
       ...(options.profile && { artifactServiceScope: true }),
@@ -1541,8 +1598,8 @@ export class PipelinesService implements OnModuleInit {
       ),
       userId,
       async (tx) => {
+        await lockProjectGraph(tx);
         if (snapshot.definition.artifactType === 'DOCKER_IMAGE') {
-          await lockProjectGraph(tx);
           const active = managedComposeReference(
             await activeComposeRevision(tx, snapshot.serviceId, snapshot.environmentId),
           );
@@ -1610,7 +1667,7 @@ export class PipelinesService implements OnModuleInit {
         definition: p.definition,
         hasSecretVariables: Object.keys(p.env.secretVariables).length > 0,
       });
-    if (automation && p.registry)
+    if (automation && p.definition.registryId && p.definition.imageRepository)
       throw new BadRequestException('执行图自动构建只归档镜像，暂未放行构建时推送 Registry');
     if (
       input.expectedServerIds &&

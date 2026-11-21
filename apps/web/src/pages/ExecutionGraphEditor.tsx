@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { DragEvent, ReactNode } from 'react';
 import { Copy, Plus, Trash2, ArrowRight, ArrowLeft } from 'lucide-react';
-import { useResource } from '../api';
+import { post, useResource } from '../api';
 import { ErrorBanner, Field } from '../components';
 import type { ProjectDetail, Server } from '../models';
 import { graphDragType, NodeMap } from './ExecutionGraphCanvas';
@@ -11,13 +11,12 @@ import {
   DeployFields,
   graphTemplates,
 } from './ExecutionGraphPresets';
-import { GraphFieldEditor } from './ExecutionGraphFields';
+import { GraphFieldEditor, useProjectEnvironmentSets } from './ExecutionGraphFields';
 import {
   ExecutionGraphBindings,
   GraphFlowBranches,
   GraphTemplatePicker,
 } from './ExecutionGraphBindings';
-import { BranchSyncControls, useRepositoryBranches } from './RepositoryBranches';
 import { branchOptions, graphKey, graphNodeLabels } from './execution-graph-definition';
 import type {
   GraphBinding,
@@ -52,6 +51,12 @@ function focusInspectorField(inspector: HTMLElement, fieldId: string, bound: boo
     inspector.querySelector<HTMLElement>('h3');
   if (!field) return;
   if (field instanceof HTMLDetailsElement) field.open = true;
+  for (
+    let details = field.parentElement?.closest('details');
+    details;
+    details = details.parentElement?.closest('details')
+  )
+    details.open = true;
   const controls = 'select:enabled, input:enabled, textarea:enabled';
   const control = field.matches(controls) ? field : field.querySelector<HTMLElement>(controls);
   field.scrollIntoView({ block: 'nearest' });
@@ -90,18 +95,12 @@ function makeNode(type: NodeType, project: ProjectDetail): GraphNode {
     type,
     name,
     ...(type === 'LOG' && { message: name }),
-    ...(type === 'CHECKOUT' &&
-      repo && {
-        checkout: {
-          repositoryId: repo.id,
-          mode: 'BRANCH',
-          ...(repo.defaultBranch && { branch: repo.defaultBranch }),
-        },
-      }),
+    ...(type === 'CHECKOUT' && { checkout: { fullClone: false } }),
     ...(type === 'SHELL' || type === 'CHECK'
       ? { shell: { location: 'TARGET' as const, timeout: 180 } }
       : {}),
     ...(type === 'BUILD' ? { build: { repositoryId: repo?.id } } : {}),
+    ...(type === 'LOAD_ENV' ? { loadEnvironment: { required: true } } : {}),
     ...(type === 'DEPLOY_ARTIFACT' ? { deploy: {} } : {}),
     ...(type === 'CONDITION' && { condition: { key: 'input', value: 'yes' } }),
     ...(type === 'SWITCH' && { switch: { key: 'input', cases: ['release'] } }),
@@ -212,6 +211,34 @@ export function ProjectGraphEditor({
   const activeEdge = selection?.kind === 'edge' ? canvas.edges[selection.index] : undefined;
   const selectedPair = canvas.endpoints.find((pair) => pair.startId === startId);
   const selectedPath = pathHighlight(canvas, selectedPair?.startId);
+  const [catalogSnapshot, setCatalogSnapshot] = useState<{
+    canvas: GraphCanvas;
+    flows: GraphCatalog['flows'];
+  }>();
+  const hasActiveFlowNode = Boolean(activeNode && selectedPath?.nodes.has(activeNode.id));
+  const catalogNodeId = activeNode?.id;
+  const catalogFlowId = selectedPair?.startId;
+  useEffect(() => {
+    if (!hasActiveFlowNode || !catalogNodeId || !catalogFlowId) return;
+    const query = new URLSearchParams({ flow: catalogFlowId, node: catalogNodeId });
+    let current = true;
+    const timer = window.setTimeout(() => {
+      void post<GraphCatalog>('/projects/' + project.id + '/execution-graph/catalog?' + query, {
+        definition: { canvas, flows: [] },
+      }).then(
+        ({ flows }) => {
+          if (current) setCatalogSnapshot({ canvas, flows });
+        },
+        () => {
+          if (current) setCatalogSnapshot({ canvas, flows: undefined });
+        },
+      );
+    }, 300);
+    return () => {
+      current = false;
+      window.clearTimeout(timer);
+    };
+  }, [project.id, canvas, hasActiveFlowNode, catalogFlowId, catalogNodeId]);
   const highlight = pathHighlight(canvas, hovered) ?? selectedPath;
   const flow = { id: project.id, name: project.name, nodes: canvas.nodes, edges: canvas.edges };
   const boundField = Boolean(
@@ -275,7 +302,12 @@ export function ProjectGraphEditor({
   }
   function addNode(raw: GraphNode, position?: Position) {
     if (!canEdit) return;
-    const copy = { ...structuredClone(raw), id: graphKey('node'), position };
+    const copy = {
+      ...structuredClone(raw),
+      id: graphKey('node'),
+      referenceName: undefined,
+      position,
+    };
     onChange({ ...canvas, nodes: [...canvas.nodes, copy] });
     select({ kind: 'node', id: copy.id });
     setConnector(undefined);
@@ -330,6 +362,8 @@ export function ProjectGraphEditor({
     if (!activeNode || !presetEnd || !canInsertPreset || !canEdit) return;
     const start = activeNode;
     const nodes = types.map((type) => makeNode(type, project));
+    const checkout = nodes.find(({ type }) => type === 'CHECKOUT');
+    const script = nodes.find(({ type }) => type === 'SHELL');
     const build = nodes.find((node) => node.type === 'BUILD');
     const deploy = nodes.find((node) => node.type === 'DEPLOY_ARTIFACT');
     const end = canvas.nodes.find((node) => node.id === presetEnd)!;
@@ -345,27 +379,65 @@ export function ProjectGraphEditor({
     };
     const inputBindings = { ...pair.inputBindings };
     const outputBindings = { ...pair.outputBindings };
-    if (build || deploy) {
-      const environment = addField(inputs, {
-        id: 'environment',
-        name: '环境',
-        type: 'ENVIRONMENT',
-        required: true,
-      });
-      const targets = addField(inputs, {
-        id: 'targets',
-        name: '部署目标',
-        type: 'TARGETS',
+    if (checkout && script) {
+      const chosen = project.repositories.length === 1 ? project.repositories[0] : undefined;
+      const repository: GraphBinding = chosen
+        ? { kind: 'VALUE', value: chosen.id }
+        : {
+            kind: 'INPUT',
+            fieldId: addField(inputs, {
+              id: 'repository',
+              name: '仓库',
+              type: 'REPOSITORY',
+              required: true,
+            }),
+          };
+      const version = addField(inputs, {
+        id: 'gitVersion',
+        name: 'Git 版本',
+        type: 'GIT_REF',
         required: false,
       });
+      inputBindings[checkout.id] = {
+        repository,
+        version: {
+          kind: 'INPUT',
+          fieldId: version,
+          onMissing: 'REPOSITORY_DEFAULT',
+        },
+      };
+      inputBindings[script.id] = {
+        source: { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'source' },
+        workspace: { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'workspace' },
+      };
+      script.shell = {
+        ...script.shell,
+        location: 'MANAGER',
+        command: 'printf \'VEYOPS_OUTPUT={"commit":"%s"}\\n\' "$VEYOPS_GIT_COMMIT_SHA"',
+      };
+      script.outputs = [{ id: 'commit', name: '实际提交 SHA', type: 'TEXT', required: true }];
+      const result = addField(outputs, {
+        id: 'commit',
+        name: '实际提交 SHA',
+        type: 'TEXT',
+        required: true,
+      });
+      outputBindings[result] = { kind: 'OUTPUT', nodeId: script.id, fieldId: 'commit' };
+    }
+    if (build || deploy) {
       const service = pair.serviceId
         ? undefined
-        : addField(inputs, { id: 'service', name: '服务', type: 'SERVICE', required: true });
-      for (const node of nodes.filter(
-        ({ type }) => type === 'BUILD' || type === 'DEPLOY_ARTIFACT',
-      )) {
+        : addField(inputs, { id: 'service', name: '服务', type: 'SERVICE', required: !!deploy });
+      for (const node of [build, deploy]) {
+        if (!node) continue;
+        const isBuild = node.type === 'BUILD';
+        const targets = addField(inputs, {
+          id: isBuild ? 'buildTargets' : 'releaseTargets',
+          name: isBuild ? '构建目标（目标端构建时使用）' : '发布目标',
+          type: 'TARGETS',
+          required: !isBuild,
+        });
         const bindings: Record<string, GraphBinding> = {
-          environment: { kind: 'INPUT', fieldId: environment },
           targets: { kind: 'INPUT', fieldId: targets },
         };
         if (service) bindings.service = { kind: 'INPUT', fieldId: service };
@@ -474,12 +546,14 @@ export function ProjectGraphEditor({
         .map((pair) => {
           const inputBindings = { ...pair.inputBindings };
           delete inputBindings[id];
+          const environmentBindings = { ...pair.environmentBindings };
+          delete environmentBindings[id];
           const edgeSelections = Object.fromEntries(
             Object.entries(pair.edgeSelections ?? {}).filter(
               ([from, targets]) => from !== id && !targets.includes(id),
             ),
           );
-          return { ...pair, inputBindings, edgeSelections };
+          return { ...pair, inputBindings, environmentBindings, edgeSelections };
         }),
     });
     select(undefined);
@@ -551,6 +625,12 @@ export function ProjectGraphEditor({
     select({ kind: 'node', id });
     setFocusRequest(undefined);
     if (canvas.endpoints.some((pair) => pair.startId === id)) setStartId(id);
+    else if (!selectedPath?.nodes.has(id)) {
+      const affected = canvas.endpoints.filter((pair) =>
+        pathHighlight(canvas, pair.startId)?.nodes.has(id),
+      );
+      setStartId(affected.length === 1 ? affected[0]?.startId : undefined);
+    }
     setConnector(undefined);
     setSource(undefined);
     setError('');
@@ -570,7 +650,11 @@ export function ProjectGraphEditor({
   function duplicate() {
     if (!inspected || !canEdit) return;
     if (template) {
-      const copy = { ...structuredClone(template), id: graphKey('template') };
+      const copy = {
+        ...structuredClone(template),
+        id: graphKey('template'),
+        referenceName: undefined,
+      };
       onChange({ ...canvas, templates: [...canvas.templates, copy] });
       select({ kind: 'template', id: copy.id });
       return;
@@ -716,6 +800,7 @@ export function ProjectGraphEditor({
                     {issue.flowId &&
                       canvas.nodes.find(({ id }) => id === issue.flowId)?.name + ' · '}
                     {issue.message}
+                    {issue.branchId ? ' · ' + issue.branchId : ''}
                   </button>
                 </li>
               ))}
@@ -793,6 +878,9 @@ export function ProjectGraphEditor({
                 patch={patch}
                 catalog={catalog.data}
               />
+              {activeNode?.type === 'CHECKOUT' && !hasActiveFlowNode && (
+                <p className="field-note">选择包含此节点的执行流，即可绑定仓库和 Git 版本。</p>
+              )}
               {activeNode &&
                 renderResources?.(
                   activeNode,
@@ -811,8 +899,15 @@ export function ProjectGraphEditor({
                     catalog={catalog.data}
                     type="input"
                     disabled={!canEdit}
+                    title="触发器与手动运行参数"
                     fields={activeNode.inputs ?? []}
                     change={(inputs) => patch({ inputs })}
+                  />
+                  <StartEnvironmentFields
+                    projectId={project.id}
+                    node={activeNode}
+                    canEdit={canEdit}
+                    patch={patch}
                   />
                   {selectedPair?.startId === activeNode.id && (
                     <Field label="此流关联发布的服务（可选）">
@@ -883,6 +978,9 @@ export function ProjectGraphEditor({
                       endpoint={selectedPair}
                       flowEdgeIndexes={selectedPath.edges}
                       catalog={catalog.data}
+                      directory={
+                        catalogSnapshot?.canvas === canvas ? catalogSnapshot.flows : undefined
+                      }
                       project={project}
                       canEdit={canEdit}
                       update={updatePair}
@@ -1128,6 +1226,247 @@ interface FieldsProps {
   catalog?: GraphCatalog;
 }
 
+function StartEnvironmentFields({
+  node,
+  projectId,
+  canEdit,
+  patch,
+}: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'> & { projectId: string }) {
+  const configuration = node.environmentSet ?? { mode: 'NONE' as const };
+  const sets = useProjectEnvironmentSets(projectId, configuration.mode !== 'NONE');
+  const fields = (node.inputs ?? []).filter(
+    ({ type, multiple }) => type === 'ENVIRONMENT_SET' && !multiple,
+  );
+  const field =
+    configuration.mode === 'INPUT'
+      ? fields.find(({ id }) => id === configuration.fieldId)
+      : undefined;
+  function addParameter() {
+    const id = node.inputs?.some((input) => input.id === 'environmentSetId')
+      ? graphKey('field')
+      : 'environmentSetId';
+    patch({
+      inputs: [
+        ...(node.inputs ?? []),
+        { id, name: '变量集合', type: 'ENVIRONMENT_SET', required: true },
+      ],
+      environmentSet: { mode: 'INPUT', fieldId: id },
+    });
+  }
+  return (
+    <section className="graph-fields">
+      <h4>环境变量</h4>
+      <Field label="变量集合引用" hint="变量集合仅提供变量。构建和发布目标在各自节点配置。">
+        <select
+          data-graph-node-field="environmentSet"
+          disabled={!canEdit}
+          value={configuration.mode}
+          onChange={(event) => {
+            if (event.target.value === 'NONE') patch({ environmentSet: { mode: 'NONE' } });
+            else if (event.target.value === 'FIXED') patch({ environmentSet: { mode: 'FIXED' } });
+            else if (fields.length)
+              patch({ environmentSet: { mode: 'INPUT', fieldId: fields[0].id } });
+            else addParameter();
+          }}
+        >
+          <option value="NONE">无引用，使用项目公共变量</option>
+          <option value="FIXED">固定变量集合</option>
+          <option value="INPUT">由运行或触发器选择</option>
+        </select>
+      </Field>
+      {configuration.mode === 'FIXED' && (
+        <Field label="固定变量集合">
+          <select
+            disabled={!canEdit || sets.loading}
+            value={configuration.environmentSetId ?? ''}
+            onChange={(event) =>
+              patch({
+                environmentSet: {
+                  mode: 'FIXED',
+                  environmentSetId: event.target.value || undefined,
+                },
+              })
+            }
+          >
+            <option value="">请选择</option>
+            {configuration.environmentSetId &&
+              !sets.data?.some(({ id }) => id === configuration.environmentSetId) && (
+                <option value={configuration.environmentSetId} disabled>
+                  原有变量集合不可用
+                </option>
+              )}
+            {sets.data?.map(({ id, name }) => (
+              <option key={id} value={id}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </Field>
+      )}
+      {configuration.mode === 'INPUT' && (
+        <>
+          <Field label="变量集合参数">
+            <select
+              disabled={!canEdit}
+              value={field?.id ?? ''}
+              onChange={(event) =>
+                patch({
+                  environmentSet: { mode: 'INPUT', fieldId: event.target.value || undefined },
+                })
+              }
+            >
+              <option value="">请选择</option>
+              {fields.map(({ id, name }) => (
+                <option key={id} value={id}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </Field>
+          {!fields.length && canEdit && (
+            <button className="button secondary small" type="button" onClick={addParameter}>
+              添加变量集合参数
+            </button>
+          )}
+          {field && (
+            <Field label="允许选择的集合" hint="可多选，清空表示允许本项目的所有集合。">
+              <select
+                multiple
+                size={Math.max(2, Math.min(5, (sets.data ?? []).length))}
+                disabled={!canEdit || sets.loading}
+                value={field.options?.map(String) ?? []}
+                onChange={(event) => {
+                  const ids = Array.from(event.target.selectedOptions, ({ value }) => value);
+                  patch({
+                    inputs: node.inputs?.map((item) =>
+                      item.id === field.id
+                        ? {
+                            ...item,
+                            options: ids.length ? ids : undefined,
+                            defaultValue:
+                              !ids.length || ids.includes(String(item.defaultValue))
+                                ? item.defaultValue
+                                : undefined,
+                          }
+                        : item,
+                    ),
+                  });
+                }}
+              >
+                {sets.data?.map(({ id, name }) => (
+                  <option key={id} value={id}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
+        </>
+      )}
+      <ErrorBanner error={sets.error} retry={sets.reload} />
+    </section>
+  );
+}
+
+function LoadEnvironmentFields({
+  node,
+  canEdit,
+  patch,
+}: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'>) {
+  const config = node.loadEnvironment;
+  const mapping = config?.pathRule;
+  const update = (next: NonNullable<GraphNode['loadEnvironment']>) =>
+    patch({ loadEnvironment: { ...config, ...next } });
+  return (
+    <>
+      <Field label="环境文件来源">
+        <select
+          data-graph-node-field="envFile"
+          disabled={!canEdit}
+          value={mapping ? 'mapping' : 'path'}
+          onChange={(event) =>
+            update(
+              event.target.value === 'mapping'
+                ? { envFile: undefined, pathRule: { key: 'ENV', paths: {} } }
+                : { pathRule: undefined },
+            )
+          }
+        >
+          <option value="path">固定文件路径</option>
+          <option value="mapping">按入口参数或变量集合映射</option>
+        </select>
+      </Field>
+      {mapping ? (
+        <>
+          <Field label="映射键" hint="先查开始参数的稳定 ID，再查已选集合中的普通变量。">
+            <input
+              disabled={!canEdit}
+              value={mapping.key}
+              placeholder="ENV"
+              onChange={(event) => update({ pathRule: { ...mapping, key: event.target.value } })}
+            />
+          </Field>
+          <Field label="文件映射" hint="每行填写 值=仓库相对路径，例如 test=.env.test。">
+            <textarea
+              disabled={!canEdit}
+              rows={4}
+              defaultValue={Object.entries(mapping.paths)
+                .map(([key, value]) => `${key}=${value}`)
+                .join('\n')}
+              onBlur={(event) => {
+                const entries = event.target.value
+                  .split('\n')
+                  .map((line) => line.trim())
+                  .filter(Boolean);
+                const paths = new Map<string, string>();
+                for (const line of entries) {
+                  const split = line.indexOf('=');
+                  const key = line.slice(0, Math.max(0, split)).trim();
+                  const file = line.slice(split + 1).trim();
+                  if (!key || !file || paths.has(key)) {
+                    event.target.setCustomValidity('每行须有唯一的映射值及相对文件路径。');
+                    event.target.reportValidity();
+                    return;
+                  }
+                  paths.set(key, file);
+                }
+                event.target.setCustomValidity('');
+                update({ pathRule: { ...mapping, paths: Object.fromEntries(paths) } });
+              }}
+            />
+          </Field>
+        </>
+      ) : (
+        <Field label="仓库相对文件路径">
+          <input
+            disabled={!canEdit}
+            value={config?.envFile ?? ''}
+            placeholder=".env.test"
+            onChange={(event) => update({ envFile: event.target.value || undefined })}
+          />
+        </Field>
+      )}
+      <label className="checkbox-row">
+        <input
+          type="checkbox"
+          disabled={!canEdit}
+          checked={config?.required !== false}
+          onChange={(event) => update({ required: event.target.checked })}
+        />{' '}
+        文件必须存在
+      </label>
+      <Field label="工作区相对目录（可选）">
+        <input
+          disabled={!canEdit}
+          value={config?.directory ?? ''}
+          placeholder="."
+          onChange={(event) => update({ directory: event.target.value || undefined })}
+        />
+      </Field>
+    </>
+  );
+}
+
 function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsProps) {
   return (
     <>
@@ -1137,6 +1476,14 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           maxLength={100}
           value={node.name}
           onChange={(event) => patch({ name: event.target.value })}
+        />
+      </Field>
+      <Field label="节点引用名" hint="留空时系统分配。修改引用名后仍使用原有绑定。">
+        <input
+          readOnly={!canEdit}
+          maxLength={64}
+          value={node.referenceName ?? ''}
+          onChange={(event) => patch({ referenceName: event.target.value || undefined })}
         />
       </Field>
       {node.type === 'LOG' && (
@@ -1150,7 +1497,17 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
         </Field>
       )}
       {node.type === 'CHECKOUT' && (
-        <CheckoutFields project={project} node={node} canEdit={canEdit} patch={patch} />
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            disabled={!canEdit}
+            checked={Boolean(node.checkout?.fullClone)}
+            onChange={(event) =>
+              patch({ checkout: { ...node.checkout, fullClone: event.target.checked } })
+            }
+          />{' '}
+          拉取完整历史
+        </label>
       )}
       {(node.type === 'SHELL' || node.type === 'CHECK') && (
         <>
@@ -1204,38 +1561,7 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
         />
       )}
       {node.type === 'LOAD_ENV' && (
-        <>
-          <Field label="环境文件（可选）" hint="留空沿用环境配置。">
-            <input
-              disabled={!canEdit}
-              value={node.loadEnvironment?.envFile ?? ''}
-              onChange={(event) =>
-                patch({
-                  loadEnvironment: {
-                    ...node.loadEnvironment,
-                    envFile: event.target.value || undefined,
-                  },
-                })
-              }
-              placeholder=".env.test"
-            />
-          </Field>
-          <Field label="工作区相对目录（可选）">
-            <input
-              disabled={!canEdit}
-              value={node.loadEnvironment?.directory ?? ''}
-              onChange={(event) =>
-                patch({
-                  loadEnvironment: {
-                    ...node.loadEnvironment,
-                    directory: event.target.value || undefined,
-                  },
-                })
-              }
-              placeholder="."
-            />
-          </Field>
-        </>
+        <LoadEnvironmentFields key={node.id} node={node} canEdit={canEdit} patch={patch} />
       )}
       {node.type === 'CONDITION' && (
         <div className="form-grid">
@@ -1359,137 +1685,6 @@ function SwitchFields({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canE
           </button>
         </div>
       )}
-    </>
-  );
-}
-
-function CheckoutFields({ project, node, canEdit, patch }: Omit<FieldsProps, 'canvas'>) {
-  const settings = node.checkout ?? { repositoryId: '', mode: 'BRANCH' as const };
-  const repo = project.repositories.find(({ id }) => id === settings.repositoryId);
-  const path = repo
-    ? '/projects/' + encodeURIComponent(project.id) + '/repositories/' + encodeURIComponent(repo.id)
-    : null;
-  const branches = useRepositoryBranches(path && settings.mode === 'BRANCH' ? path : null);
-  const choices = new Set([
-    ...(repo?.defaultBranch ? [repo.defaultBranch] : []),
-    ...(branches.data?.branches.map(({ name }) => name) ?? []),
-    ...(settings.branch ? [settings.branch] : []),
-  ]);
-  return (
-    <>
-      <Field
-        label="项目仓库"
-        hint={project.repositories.length ? undefined : '请先在项目中登记仓库。'}
-      >
-        <select
-          data-graph-node-field="repository"
-          disabled={!canEdit}
-          value={settings.repositoryId}
-          onChange={(event) => {
-            const selected = project.repositories.find(({ id }) => id === event.target.value);
-            patch({
-              checkout: selected
-                ? {
-                    repositoryId: selected.id,
-                    mode: settings.mode,
-                    ...(settings.mode === 'BRANCH' && selected.defaultBranch
-                      ? { branch: selected.defaultBranch }
-                      : {}),
-                    fullClone: settings.fullClone,
-                  }
-                : undefined,
-            });
-          }}
-        >
-          <option value="">选择仓库</option>
-          {project.repositories.map(({ id, name }) => (
-            <option key={id} value={id}>
-              {name}
-            </option>
-          ))}
-        </select>
-      </Field>
-      <Field label="代码版本">
-        <select
-          disabled={!canEdit}
-          value={settings.mode}
-          onChange={(event) =>
-            patch({
-              checkout: {
-                repositoryId: settings.repositoryId,
-                mode: event.target.value as typeof settings.mode,
-                fullClone: settings.fullClone,
-                ...(event.target.value === 'BRANCH' && repo?.defaultBranch
-                  ? { branch: repo.defaultBranch }
-                  : {}),
-              },
-            })
-          }
-        >
-          <option value="BRANCH">分支最新提交</option>
-          <option value="TAG">Git 标签</option>
-          <option value="COMMIT">指定提交哈希</option>
-        </select>
-      </Field>
-      {repo && settings.mode === 'BRANCH' && (
-        <>
-          <Field label="仓库分支" hint="运行预览时解析分支最新提交。">
-            <select
-              disabled={!canEdit}
-              value={settings.branch ?? ''}
-              onChange={(event) =>
-                patch({ checkout: { ...settings, branch: event.target.value || undefined } })
-              }
-            >
-              <option value="">{branches.loading ? '读取分支…' : '选择分支'}</option>
-              {[...choices].map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-            </select>
-          </Field>
-          {canEdit && <BranchSyncControls branches={branches} />}
-        </>
-      )}
-      {settings.mode === 'TAG' && (
-        <Field label="Git 标签">
-          <input
-            readOnly={!canEdit}
-            value={settings.tag ?? ''}
-            onChange={(event) =>
-              patch({ checkout: { ...settings, tag: event.target.value.trim() || undefined } })
-            }
-          />
-        </Field>
-      )}
-      {settings.mode === 'COMMIT' && (
-        <Field label="Git 提交哈希" hint="填写完整 SHA。">
-          <input
-            readOnly={!canEdit}
-            maxLength={64}
-            value={settings.commitSha ?? ''}
-            onChange={(event) =>
-              patch({
-                checkout: { ...settings, commitSha: event.target.value.trim() || undefined },
-              })
-            }
-          />
-        </Field>
-      )}
-      {
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            disabled={!canEdit}
-            checked={Boolean(settings.fullClone)}
-            onChange={(event) =>
-              patch({ checkout: { ...settings, fullClone: event.target.checked } })
-            }
-          />{' '}
-          拉取完整历史
-        </label>
-      }
     </>
   );
 }

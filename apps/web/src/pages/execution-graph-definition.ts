@@ -29,6 +29,7 @@ export type GraphFieldType =
   | 'REPOSITORY'
   | 'GIT_REF'
   | 'ENVIRONMENT'
+  | 'ENVIRONMENT_SET'
   | 'SERVICE'
   | 'TARGETS'
   | 'ARTIFACT'
@@ -44,6 +45,8 @@ export type GraphArtifactType = 'FILE' | 'DIRECTORY' | 'DOCKER_IMAGE';
 export interface GraphField {
   id: string;
   name: string;
+  referenceName?: string;
+  exportName?: string;
   type: GraphFieldType;
   required?: boolean;
   multiple?: boolean;
@@ -54,11 +57,48 @@ export interface GraphField {
   options?: (string | number | boolean)[];
   acceptedTypes?: GraphFieldType[];
 }
-export type GraphBinding =
-  | { kind: 'INPUT' | 'CONTEXT'; fieldId: string }
+export type GraphMissingPolicy = 'ERROR' | 'OMIT' | 'USE_DEFAULT' | 'REPOSITORY_DEFAULT';
+export type GraphBinding = { onMissing?: GraphMissingPolicy } & (
+  | { kind: 'INPUT' | 'CONTEXT' | 'NODE_INPUT'; fieldId: string }
   | { kind: 'OUTPUT'; nodeId: string; fieldId: string }
   | { kind: 'VALUE'; value: unknown }
-  | { kind: 'FIRST_AVAILABLE'; sources: GraphBinding[] };
+  | { kind: 'ENVIRONMENT_KEY'; key: string }
+  | { kind: 'CREDENTIAL'; credentialId: string }
+  | { kind: 'AS_GIT_REF'; refKind: 'BRANCH' | 'TAG'; source: GraphBinding }
+  | { kind: 'FIRST_AVAILABLE'; sources: GraphBinding[] }
+);
+export interface GraphCandidate {
+  label: string;
+  referenceName: string;
+  field: GraphField;
+  binding: GraphBinding;
+  availability: 'ALWAYS' | 'CONDITIONAL';
+  branches: string[];
+}
+export interface GraphNodeDirectory {
+  inputs: GraphField[];
+  outputs: GraphField[];
+  candidates: GraphCandidate[];
+}
+export interface GraphFieldSource {
+  kind: string;
+  nodeId?: string;
+  fieldId?: string;
+  key?: string;
+  eventField?: string;
+  transform?: 'BRANCH' | 'TAG';
+}
+export interface GraphFieldEvidence {
+  fieldId: string;
+  name: string;
+  type: GraphFieldType;
+  state: 'RESOLVED' | 'DEFERRED' | 'OMITTED' | 'DEFAULTED' | 'ERROR';
+  source?: GraphFieldSource;
+  onMissing?: GraphMissingPolicy;
+  value?: unknown;
+  sensitive?: boolean;
+  message?: string;
+}
 export interface GraphModule {
   id: string;
   version: number;
@@ -71,11 +111,17 @@ export interface GraphCatalog {
   outputPresets: GraphField[];
   contextFields?: GraphField[];
   modules: Partial<Record<GraphNode['type'], GraphModule>>;
+  flows?: Record<string, { nodes: Record<string, GraphNodeDirectory> }>;
 }
 export interface GraphIssue {
   flowId?: string;
   nodeId?: string;
   fieldId?: string;
+  sourceNodeId?: string;
+  sourceFieldId?: string;
+  branchId?: string;
+  code?: string;
+  severity?: 'ERROR' | 'WARNING' | 'INFO';
   message: string;
 }
 export interface GraphArtifactOutput {
@@ -85,6 +131,7 @@ export interface GraphArtifactOutput {
   imageReference?: string;
   composeFilePath?: string;
   required?: boolean;
+  persist?: boolean;
 }
 export interface FlowBuildDefinition {
   dependencies?: string[];
@@ -119,21 +166,35 @@ interface GraphShell {
   continueOnFailure?: boolean;
   params?: GraphField[];
 }
+export type GraphEnvironmentSet =
+  | { mode: 'NONE' }
+  | { mode: 'FIXED'; environmentSetId?: string }
+  | { mode: 'INPUT'; fieldId?: string };
+
+export type GraphEnvironmentSetSummary = { id: string; name: string; revision: number };
+
 export interface GraphNode {
   id: string;
   type: keyof typeof graphNodeLabels;
   name: string;
+  referenceName?: string;
   message?: string;
   checkout?: {
     repositoryId?: string;
-    mode: 'BRANCH' | 'TAG' | 'COMMIT';
+    mode?: 'BRANCH' | 'TAG' | 'COMMIT';
     branch?: string;
     tag?: string;
     commitSha?: string;
     fullClone?: boolean;
   };
   shell?: GraphShell;
-  loadEnvironment?: { envFile?: string; directory?: string };
+  loadEnvironment?: {
+    envFile?: string;
+    directory?: string;
+    required?: boolean;
+    pathRule?: { key: string; paths: Record<string, string> };
+  };
+  environmentSet?: GraphEnvironmentSet;
   registerArtifacts?: { artifacts?: GraphArtifactOutput[] };
   build?: FlowBuildDefinition;
   deploy?: FlowDeployDefinition;
@@ -151,6 +212,7 @@ export interface GraphNode {
 export interface FlowBindings {
   serviceId?: string;
   inputBindings?: Record<string, Record<string, GraphBinding>>;
+  environmentBindings?: Record<string, Record<string, GraphBinding>>;
   outputBindings?: Record<string, GraphBinding>;
   edgeSelections?: Record<string, string[]>;
 }

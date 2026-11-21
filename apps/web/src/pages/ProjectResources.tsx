@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { Box, FolderGit2, Layers, Pencil, Plus, Trash2 } from 'lucide-react';
+import { Box, FolderGit2, Pencil, Plus, Trash2 } from 'lucide-react';
 import { InlineEditor } from '../InlineEditor';
 import { api, formatTime, message, navigate, post, remove, useResource } from '../api';
 import { Confirm, ErrorBanner, Field, Form, Loading, Section, Status } from '../components';
@@ -12,11 +12,13 @@ import type {
   Service,
   User,
 } from '../models';
-import { EnvironmentConfigEditor, RepositoryBinding } from './DeploymentConfig';
+import { RepositoryBinding } from './DeploymentConfig';
 import { ExecutionGraphStartList } from './ExecutionGraphStartStatus';
 import { ProjectEnvironment } from './ProjectEnvironment';
+import { ProjectEnvironmentSets } from './ProjectEnvironmentSets';
+import { ProjectAccessLinks } from './ProjectAccessLinks';
 import { ProjectRelations } from './ProjectRelations';
-import { ProjectServerInventory } from './ProjectServerInventory';
+import { ProjectServiceEditor } from './ProjectServiceEditor';
 import { RepositoryDetails } from './RepositoryBrowser';
 import { repositoryBranchLabel } from './RepositoryBranches';
 import { DeploymentHistory } from './ServerResources';
@@ -34,9 +36,10 @@ import {
   type ResourceKind,
 } from './project-workspace-route';
 
-const resourceKinds = ['repositories', 'services', 'environments'] as const;
-const icons = { repositories: FolderGit2, services: Box, environments: Layers };
-type EditableKind = (typeof resourceKinds)[number];
+const resourceKinds = ['services', 'repositories'] as const;
+const icons = { repositories: FolderGit2, services: Box };
+const resourceLabels = { ...projectResources, environments: '环境' };
+type EditableKind = (typeof resourceKinds)[number] | 'environments';
 type Resource = Repository | Service | Environment;
 type Props = { project: ProjectDetail; user: User; reload: () => Promise<void> };
 
@@ -44,10 +47,10 @@ function editable(kind: ResourceKind): kind is EditableKind {
   return kind === 'repositories' || kind === 'services' || kind === 'environments';
 }
 
-function detail(kind: EditableKind, id: string, view?: string): Location {
-  if (kind === 'repositories') return { resource: kind, repositoryId: id, view };
-  if (kind === 'environments') return { resource: kind, environmentId: id, view };
-  return { resource: kind, serviceId: id, view };
+function detail(kind: EditableKind, id: string, view?: string, viewSearch?: string): Location {
+  if (kind === 'repositories') return { resource: kind, repositoryId: id, view, viewSearch };
+  if (kind === 'environments') return { resource: kind, environmentId: id, view, viewSearch };
+  return { resource: kind, serviceId: id, view, viewSearch };
 }
 
 export function ProjectResources({
@@ -59,12 +62,12 @@ export function ProjectResources({
   const { id } = project;
   const {
     view,
+    viewSearch,
     resource,
     serviceId,
     environmentId,
     repositoryId,
-    serverId,
-    groupId,
+    environmentSetId,
     panel,
     graphPane,
     graphVersion,
@@ -100,7 +103,7 @@ export function ProjectResources({
       ? project.repositories.find((row) => row.id === repositoryId)
       : undefined;
   const missing =
-    (resource === 'services' && ((serviceId && !service) || (environmentId && !environment))) ||
+    (resource === 'services' && serviceId && !service) ||
     (resource === 'environments' && environmentId && !environment) ||
     (resource === 'repositories' && repositoryId && !repository);
   const selected = Boolean(service || (resource === 'environments' && environment) || repository);
@@ -109,7 +112,7 @@ export function ProjectResources({
   const editor =
     editing ?? (addingRepository ? { kind: 'repositories' as const, item: undefined } : undefined);
   const resourceHref = (kind?: ResourceKind) =>
-    '#' + projectResourcePath(id, { ...graphBack, view, resource: kind });
+    '#' + projectResourcePath(id, { ...graphBack, view, viewSearch, resource: kind });
   async function archive() {
     if (!deleting) return;
     setBusy(true);
@@ -120,7 +123,9 @@ export function ProjectResources({
         deleting.item.id,
       );
       if (archivedDetail)
-        navigate(projectResourcePath(id, { ...graphBack, view, resource: deleting.kind }));
+        navigate(
+          projectResourcePath(id, { ...graphBack, view, viewSearch, resource: deleting.kind }),
+        );
       setDeleting(undefined);
       await reload();
     } catch (err) {
@@ -131,7 +136,7 @@ export function ProjectResources({
   }
   function itemActions(kind: EditableKind, item: Resource) {
     if (!canEdit) return;
-    const label = projectResources[kind];
+    const label = resourceLabels[kind];
     return (
       <span className="row-actions">
         <button
@@ -158,9 +163,11 @@ export function ProjectResources({
   }
   return (
     <div className="project-resources">
-      {!resource && <ProjectResourceSummary project={project} view={view} />}
+      {!resource && (
+        <ProjectResourceSummary project={project} view={view} viewSearch={viewSearch} />
+      )}
       {graphPane && (
-        <a className="back-link" href={graphResourceReturnHref(id, graphBack, view)}>
+        <a className="back-link" href={graphResourceReturnHref(id, graphBack, view, viewSearch)}>
           {graphPane === 'run' && graphStart ? '← 返回运行参数' : '← 返回执行图'}
         </a>
       )}
@@ -168,7 +175,7 @@ export function ProjectResources({
         <a href={resourceHref()} aria-current={!resource ? 'page' : undefined}>
           全部资源
         </a>
-        {(Object.keys(projectResources) as ResourceKind[]).map((kind) => (
+        {(Object.keys(projectResources) as (keyof typeof projectResources)[]).map((kind) => (
           <a
             key={kind}
             href={resourceHref(kind)}
@@ -181,26 +188,49 @@ export function ProjectResources({
       {missing ? (
         <ErrorBanner error="该资源已归档或不属于当前项目。" />
       ) : canEdit && editor ? (
-        <ProjectResourceEditor
-          key={editor.item?.id ?? editor.kind}
-          project={project}
-          user={user}
-          adding={editor.kind}
-          editingResource={editor.item}
-          onClose={() => {
-            setEditor(undefined);
-            if (addingRepository)
-              navigate(projectResourcePath(id, { ...graphBack, view, resource }));
-          }}
-          onSaved={async (item) => {
-            setEditor(undefined);
-            await reload();
-            if (!editor.item)
-              navigate(
-                projectResourcePath(id, { ...detail(editor.kind, item.id, view), ...graphBack }),
-              );
-          }}
-        />
+        editor.kind === 'services' ? (
+          <ProjectServiceEditor
+            key={editor.item?.id ?? 'new-service'}
+            projectId={id}
+            service={editor.item as Service | undefined}
+            onClose={() => setEditor(undefined)}
+            onSaved={async (item) => {
+              setEditor(undefined);
+              await reload();
+              if (!editor.item)
+                navigate(
+                  projectResourcePath(id, {
+                    ...detail('services', item.id, view, viewSearch),
+                    ...graphBack,
+                  }),
+                );
+            }}
+          />
+        ) : (
+          <ProjectResourceEditor
+            key={editor.item?.id ?? editor.kind}
+            project={project}
+            user={user}
+            adding={editor.kind}
+            editingResource={editor.item}
+            onClose={() => {
+              setEditor(undefined);
+              if (addingRepository)
+                navigate(projectResourcePath(id, { ...graphBack, view, viewSearch, resource }));
+            }}
+            onSaved={async (item) => {
+              setEditor(undefined);
+              await reload();
+              if (!editor.item)
+                navigate(
+                  projectResourcePath(id, {
+                    ...detail(editor.kind, item.id, view, viewSearch),
+                    ...graphBack,
+                  }),
+                );
+            }}
+          />
+        )
       ) : (
         <>
           {!selected && (!resource || editable(resource)) && (
@@ -229,7 +259,10 @@ export function ProjectResources({
                       {project[kind].length ? (
                         <div className="resource-list">
                           {project[kind].map((item) => (
-                            <div key={item.id}>
+                            <div
+                              key={item.id}
+                              className={kind === 'services' ? 'project-service-card' : undefined}
+                            >
                               <span className="resource-avatar">
                                 <Icon size={17} />
                               </span>
@@ -239,7 +272,7 @@ export function ProjectResources({
                                   href={
                                     '#' +
                                     projectResourcePath(id, {
-                                      ...detail(kind, item.id, view),
+                                      ...detail(kind, item.id, view, viewSearch),
                                       ...graphBack,
                                     })
                                   }
@@ -251,11 +284,14 @@ export function ProjectResources({
                               <span className="tag">
                                 {'cloneUrl' in item
                                   ? repositoryBranchLabel(item)
-                                  : 'serviceType' in item
-                                    ? item.serviceType
-                                    : item.environmentType}
+                                  : item.serviceType}
                               </span>
                               {itemActions(kind, item)}
+                              {'serviceType' in item && (
+                                <div className="project-service-card-addresses">
+                                  <ProjectAccessLinks addresses={item.addresses ?? []} showEmpty />
+                                </div>
+                              )}
                             </div>
                           ))}
                         </div>
@@ -271,10 +307,9 @@ export function ProjectResources({
             <ServiceDetails
               project={project}
               user={user}
-              reload={reload}
               service={service}
-              environment={environment}
               view={view}
+              viewSearch={viewSearch}
               panel={panel}
               graphBack={graphBack}
               actions={itemActions('services', service)}
@@ -304,17 +339,26 @@ export function ProjectResources({
               environments={project.environments}
               onSynced={reload}
               onClose={() =>
-                navigate(projectResourcePath(id, { ...graphBack, view, resource: 'repositories' }))
+                navigate(
+                  projectResourcePath(id, {
+                    ...graphBack,
+                    view,
+                    viewSearch,
+                    resource: 'repositories',
+                  }),
+                )
               }
               actions={itemActions('repositories', repository)}
             />
           )}
-          {(!resource || resource === 'servers') && (
-            <ProjectServerInventory
-              project={project}
+          {resource === 'environment-sets' && (
+            <ProjectEnvironmentSets
+              projectId={id}
+              projectArchived={project.archived}
+              user={user}
+              environmentSetId={environmentSetId}
               view={view}
-              serverId={serverId}
-              groupId={groupId}
+              viewSearch={viewSearch}
             />
           )}
           {(!resource || resource === 'relations') && (
@@ -324,7 +368,7 @@ export function ProjectResources({
       )}
       {deleting && (
         <Confirm
-          title={`移除${projectResources[deleting.kind]}`}
+          title={`移除${resourceLabels[deleting.kind]}`}
           description={`归档「${deleting.item.name}」。配置、可运行图版本或在途任务仍引用它时会阻止归档。`}
           label="移除"
           destructive
@@ -338,7 +382,15 @@ export function ProjectResources({
   );
 }
 
-function ProjectResourceSummary({ project, view }: { project: ProjectDetail; view?: string }) {
+function ProjectResourceSummary({
+  project,
+  view,
+  viewSearch,
+}: {
+  project: ProjectDetail;
+  view?: string;
+  viewSearch?: string;
+}) {
   const runs = useResource<{ id: string; flowName: string; status: string; createdAt: number }[]>(
     `/projects/${project.id}/execution-graph/runs`,
   );
@@ -350,14 +402,24 @@ function ProjectResourceSummary({ project, view }: { project: ProjectDetail; vie
         <a
           className="text-link"
           key={kind}
-          href={'#' + projectResourcePath(project.id, { resource: kind, view })}
+          href={'#' + projectResourcePath(project.id, { resource: kind, view, viewSearch })}
         >
           {projectResources[kind]} <strong>{project[kind].length}</strong>
         </a>
       ))}
       <a
         className="text-link"
-        href={'#' + projectGraphPath(project.id, { view, pane: 'history', run: latest?.id })}
+        href={
+          '#' + projectResourcePath(project.id, { resource: 'environment-sets', view, viewSearch })
+        }
+      >
+        变量集合 <strong>{project.environmentSetCount ?? 0}</strong>
+      </a>
+      <a
+        className="text-link"
+        href={
+          '#' + projectGraphPath(project.id, { view, viewSearch, pane: 'history', run: latest?.id })
+        }
       >
         {latest ? `最近运行 · ${latest.flowName} · ${formatTime(latest.createdAt)}` : '运行记录'}
       </a>
@@ -369,33 +431,31 @@ function ProjectResourceSummary({ project, view }: { project: ProjectDetail; vie
 function ServiceDetails({
   project,
   user,
-  reload,
   service,
-  environment,
   view,
+  viewSearch,
   panel,
   actions,
   graphBack,
-}: Props & {
+}: Pick<Props, 'project' | 'user'> & {
   service: Service;
-  environment?: Environment;
   view?: string;
+  viewSearch?: string;
   panel?: string;
   actions: React.ReactNode;
   graphBack: GraphResourceReturn;
 }) {
   const { id } = project;
   const serviceId = service.id;
-  const environmentId = environment?.id;
-  const scope: ProjectScope = { serviceId, environmentId, view };
+  const scope: ProjectScope = { serviceId, view, viewSearch };
   const graphScope = { ...scope, resourcePanel: graphResourcePanel(panel) };
-  const path = (env?: string, subpanel?: string) =>
+  const path = (subpanel?: string) =>
     projectResourcePath(id, {
       ...graphBack,
       view,
+      viewSearch,
       resource: 'services',
       serviceId,
-      environmentId: env,
       panel: subpanel,
     });
   const graph = useResource<GraphDocument>(`/projects/${id}/execution-graph`);
@@ -408,8 +468,7 @@ function ServiceDetails({
     `/services/${serviceId}/repositories`,
   );
   const deployments = useResource<DeploymentSummary[]>(
-    `/projects/${id}/services/${serviceId}/recent-deployments` +
-      (environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : ''),
+    `/projects/${id}/services/${serviceId}/recent-deployments`,
   );
   const graphError = graph.error || published.error;
   return (
@@ -420,38 +479,13 @@ function ServiceDetails({
         action={actions}
         className="project-service-detail"
       >
-        <nav className="resource-section-switcher" aria-label="服务环境">
-          <a href={'#' + path()} aria-current={!environmentId ? 'page' : undefined}>
-            服务概览
-          </a>
-          {project.environments.map((env) => (
-            <a
-              key={env.id}
-              href={'#' + path(env.id)}
-              aria-current={env.id === environmentId ? 'page' : undefined}
-            >
-              {env.name}
-            </a>
-          ))}
-        </nav>
+        <div className="project-service-detail-addresses">
+          <ProjectAccessLinks addresses={service.addresses ?? []} showEmpty />
+        </div>
         <div className="row-actions">
           <a className="button secondary small" href={'#' + deliveryPath(id, 'artifacts', scope)}>
-            交付记录
+            查看服务产物
           </a>
-          {environment && (
-            <a
-              className="button secondary small"
-              href={
-                '#' +
-                projectResourcePath(id, {
-                  ...detail('environments', environment.id, view),
-                  ...graphBack,
-                })
-              }
-            >
-              环境详情
-            </a>
-          )}
         </div>
       </Section>
       <Section
@@ -480,20 +514,7 @@ function ServiceDetails({
           <p className="mini-empty">项目尚未发布执行图。</p>
         )}
       </Section>
-      {environment ? (
-        <EnvironmentConfigEditor
-          key={serviceId + ':' + environment.id}
-          project={project}
-          user={user}
-          serviceId={serviceId}
-          environmentId={environment.id}
-          panel={panel}
-          view={view}
-          graphBack={graphBack}
-          onSaved={() => void reload()}
-          onClose={() => navigate(path())}
-        />
-      ) : panel === 'repositories' && user.role !== 'VIEWER' ? (
+      {panel === 'repositories' && user.role !== 'VIEWER' && !project.archived ? (
         <RepositoryBinding
           project={project}
           serviceId={serviceId}
@@ -503,8 +524,9 @@ function ServiceDetails({
         <Section
           title="关联仓库"
           action={
-            user.role !== 'VIEWER' && (
-              <a className="button secondary small" href={'#' + path(undefined, 'repositories')}>
+            user.role !== 'VIEWER' &&
+            !project.archived && (
+              <a className="button secondary small" href={'#' + path('repositories')}>
                 设置仓库关联
               </a>
             )
@@ -520,7 +542,11 @@ function ServiceDetails({
                   className="button secondary small"
                   key={link.repositoryId}
                   href={
-                    '#' + projectResourcePath(id, detail('repositories', link.repositoryId, view))
+                    '#' +
+                    projectResourcePath(
+                      id,
+                      detail('repositories', link.repositoryId, view, viewSearch),
+                    )
                   }
                 >
                   {project.repositories.find(({ id }) => id === link.repositoryId)?.name ||
@@ -571,7 +597,7 @@ function ProjectResourceEditor({
 }: {
   project: ProjectDetail;
   user: User;
-  adding: EditableKind;
+  adding: Exclude<EditableKind, 'services'>;
   editingResource?: Resource;
   onClose: () => void;
   onSaved: (item: Resource) => Promise<void>;
@@ -581,7 +607,7 @@ function ProjectResourceEditor({
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const labels = projectResources;
+  const labels = resourceLabels;
   async function add(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -596,10 +622,7 @@ function ProjectResourceEditor({
       if (user.role === 'ADMIN') payload.credentialId = text('credentialId') || null;
     } else {
       payload.slug = text('slug');
-      if (adding === 'services') payload.serviceType = text('serviceType');
-      else {
-        payload.environmentType = text('environmentType');
-      }
+      payload.environmentType = text('environmentType');
     }
     setBusy(true);
     setError('');
@@ -702,45 +725,26 @@ function ProjectResourceEditor({
             <Field label="标识" required>
               <input
                 name="slug"
-                defaultValue={(editingResource as Service | Environment | undefined)?.slug}
+                defaultValue={(editingResource as Environment | undefined)?.slug}
                 required
                 pattern="[a-z0-9]+(?:-[a-z0-9]+)*"
-                placeholder={adding === 'services' ? 'web' : 'production'}
+                placeholder="production"
               />
             </Field>
-            {adding === 'services' ? (
-              <Field label="服务类型">
-                <select
-                  name="serviceType"
-                  defaultValue={(editingResource as Service | undefined)?.serviceType ?? 'API'}
-                >
-                  <option value="WEB">Web</option>
-                  <option value="API">API</option>
-                  <option value="WORKER">Worker</option>
-                  <option value="SCHEDULED_JOB">定时任务</option>
-                  <option value="STATIC_SITE">静态站点</option>
-                  <option value="DOCKER_SERVICE">Docker 服务</option>
-                  <option value="CUSTOM">自定义</option>
-                </select>
-              </Field>
-            ) : (
-              <>
-                <Field label="环境类型">
-                  <select
-                    name="environmentType"
-                    defaultValue={
-                      (editingResource as Environment | undefined)?.environmentType ?? 'DEVELOPMENT'
-                    }
-                  >
-                    <option value="DEVELOPMENT">开发环境</option>
-                    <option value="TESTING">测试环境</option>
-                    <option value="STAGING">预发布环境</option>
-                    <option value="PRODUCTION">生产环境</option>
-                    <option value="CUSTOM">自定义</option>
-                  </select>
-                </Field>
-              </>
-            )}
+            <Field label="环境类型">
+              <select
+                name="environmentType"
+                defaultValue={
+                  (editingResource as Environment | undefined)?.environmentType ?? 'DEVELOPMENT'
+                }
+              >
+                <option value="DEVELOPMENT">开发环境</option>
+                <option value="TESTING">测试环境</option>
+                <option value="STAGING">预发布环境</option>
+                <option value="PRODUCTION">生产环境</option>
+                <option value="CUSTOM">自定义</option>
+              </select>
+            </Field>
           </>
         )}
         <Field label="说明">

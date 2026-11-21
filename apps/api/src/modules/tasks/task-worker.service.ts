@@ -11,9 +11,10 @@ import { randomUUID } from 'node:crypto';
 import type { Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database, TasksTable } from '../../core/database/schema';
+import { ExecutionPlanIssueError } from '../../core/execution-plan-issue';
 import { TaskHandlerRegistry } from './task-handler.registry';
 import { TasksService } from './tasks.service';
-import { TaskLogService } from './task-log.service';
+import { redactTaskLog, TaskLogService } from './task-log.service';
 import type { TaskHandler, TaskPayload, TaskRecord, TaskStatus } from './tasks.types';
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
 import { graphTaskKeyPrefix } from '../execution-graphs/graph-run-lifecycle';
@@ -43,6 +44,8 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
   private timer?: NodeJS.Timeout;
   private evaluatingTriggers?: Promise<void>;
   private diagnosing?: Promise<void>;
+  private cleaningArtifacts?: Promise<void>;
+  private cleanupController?: AbortController;
   private polling?: Promise<void>;
   private readonly activeJobs = new Map<
     string,
@@ -95,6 +98,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     await this.polling?.catch(() => undefined);
     await this.evaluatingTriggers;
     await this.diagnosing;
+    await this.cleaningArtifacts;
     await Promise.all([...this.activeJobs.values()].map((job) => job.running));
     if (this.database.client === 'sqlite') {
       await this.database.db
@@ -134,6 +138,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
   }
   private async poll() {
     if (!(await this.ownSqliteLease())) {
+      this.cleanupController?.abort();
       if (this.activeJobs.size) {
         this.sqliteLeaseLost = true;
         for (const job of this.activeJobs.values()) job.controller.abort();
@@ -172,6 +177,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     }
     await this.pruneLogs();
     await this.pruneArtifacts();
+    this.tickArtifactCleanup();
     if (!this.activeJobs.size) this.sqliteLeaseLost = false;
     while (
       !this.stopping &&
@@ -208,6 +214,20 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     } catch {
       this.logger.warn('构建产物保留规则执行失败，将在下次调度重试');
     }
+  }
+
+  private tickArtifactCleanup() {
+    if (this.stopping || !this.artifactRetention || this.cleaningArtifacts) return;
+    const controller = new AbortController();
+    this.cleanupController = controller;
+    const signal = AbortSignal.any([this.shutdownController.signal, controller.signal]);
+    this.cleaningArtifacts = this.artifactRetention
+      .tickCleanup(signal)
+      .catch(() => this.logger.warn('实物清理任务将等待后续调度'))
+      .finally(() => {
+        this.cleanupController = undefined;
+        this.cleaningArtifacts = undefined;
+      });
   }
 
   private async pruneLogs() {
@@ -546,6 +566,14 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
             total: targets.length,
             success: targets.filter((target) => target.status === 'SUCCESS').length,
             ...(graphModule && status === 'SUCCESS' && result),
+            ...(graphModule &&
+              status === 'FAILED' &&
+              failure?.cause instanceof ExecutionPlanIssueError && {
+                graphIssue: {
+                  ...failure.cause.issue,
+                  message: redactTaskLog(failure.cause.issue.message),
+                },
+              }),
             ...continuation,
           }),
           finished_at: now,

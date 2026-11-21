@@ -1,4 +1,4 @@
-import type { Kysely, SelectQueryBuilder } from 'kysely';
+import { sql, type Kysely, type SelectQueryBuilder } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import { failedTaskStatuses } from '../tasks/tasks.types';
 
@@ -21,6 +21,11 @@ const summaryColumns = [
   'deployment.finished_at as finishedAt',
 ] as const;
 
+export interface DeploymentHistorySelection {
+  serviceId?: string;
+  serverIds?: readonly string[];
+}
+
 function deploymentRuns(database: Kysely<Database>) {
   return database
     .selectFrom('deployment_records as deployment')
@@ -31,10 +36,16 @@ export function deploymentRows(
   database: Kysely<Database>,
   projects: ProjectIds,
   environmentType?: string,
+  selection?: DeploymentHistorySelection,
 ) {
-  const query = deploymentRuns(database)
+  let query = deploymentRuns(database)
     .innerJoin('environments as environment', 'environment.id', 'deployment.environment_id')
     .where('run.project_id', 'in', projects);
+  if (selection?.serviceId) query = query.where('deployment.service_id', '=', selection.serviceId);
+  if (selection?.serverIds)
+    query = selection.serverIds.length
+      ? query.where('deployment.server_id', 'in', selection.serverIds)
+      : query.where(sql<boolean>`1 = 0`);
   return environmentType
     ? query.where('environment.environment_type', '=', environmentType)
     : query;
@@ -43,9 +54,13 @@ export function deploymentRows(
 export function latestDeploymentTargets(
   database: Kysely<Database>,
   projects: ProjectIds,
-  options: { environmentType?: string; activeServersOnly?: boolean } = {},
+  options: DeploymentHistorySelection & {
+    environmentType?: string;
+    activeServersOnly?: boolean;
+    byActualTarget?: boolean;
+  } = {},
 ) {
-  let query = deploymentRows(database, projects, options.environmentType).where(
+  let query = deploymentRows(database, projects, options.environmentType, options).where(
     'deployment.server_id',
     'is not',
     null,
@@ -72,7 +87,7 @@ export function latestDeploymentTargets(
             .partitionBy([
               'run.project_id',
               'deployment.service_id',
-              'deployment.environment_id',
+              ...(options.byActualTarget ? [] : ['deployment.environment_id' as const]),
               'deployment.server_id',
             ])
             .orderBy(eb.fn.coalesce('deployment.started_at', 'run.created_at'), 'desc')

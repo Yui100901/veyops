@@ -8,28 +8,50 @@ export type DeliveryTab = keyof typeof deliveryTabs;
 export type DeliveryScope = {
   serviceId?: string | null;
   environmentId?: string | null;
+  environmentSetId?: string | null;
+  serverId?: string | null;
+  kind?: string | null;
+  verificationStatus?: string | null;
+  ref?: string | null;
+  cleanupJob?: string | null;
+  cursor?: string | null;
   commit?: string | null;
   recordId?: string | null;
   pipelineRunId?: string | null;
   taskId?: string | null;
   repositoryId?: string | null;
   view?: string | null;
+  viewSearch?: string | null;
 };
 
 export function readDeliveryScope(params: URLSearchParams): DeliveryScope {
   return {
     serviceId: params.get('serviceId'),
     environmentId: params.get('environmentId'),
+    environmentSetId: params.get('environmentSetId'),
+    serverId: params.get('serverId'),
+    kind: params.get('kind'),
+    verificationStatus: params.get('verificationStatus'),
+    ref: params.get('ref'),
+    cleanupJob: params.get('cleanupJob'),
     commit: params.get('commit'),
-    recordId: params.get('recordId'),
+    recordId: params.get('artifactId') ?? params.get('recordId'),
     pipelineRunId: params.get('pipelineRunId'),
     taskId: params.get('taskId'),
     repositoryId: params.get('repositoryId'),
     view: params.get('view'),
+    viewSearch: params.get('viewSearch'),
   };
 }
 
 export function deliveryPath(projectId: string, tab: DeliveryTab, scope: DeliveryScope = {}) {
+  if (tab === 'artifacts') {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(scope)) {
+      if (value) params.set(key === 'recordId' ? 'artifactId' : key, value);
+    }
+    return `/projects/${encodeURIComponent(projectId)}/artifacts${params.size ? '?' + params : ''}`;
+  }
   const query = new URLSearchParams({ tab });
   for (const [key, value] of Object.entries(scope)) if (value) query.set(key, value);
   return `/projects/${encodeURIComponent(projectId)}/delivery?${query}`;

@@ -474,19 +474,22 @@ export function App() {
     .find((item) => navigationPath === item.path || navigationPath.startsWith(item.path + '/'));
   let page;
   if (route === '/') page = <DashboardPage />;
-  else if (routePath === '/servers' || routePath === '/targets') page = <ServersPage user={user} />;
+  else if (routePath === '/servers' || routePath === '/targets')
+    page = <ServersPage user={user} search={routeSearch} />;
   else if (route === '/credentials') page = <CredentialsPage user={user} />;
   else if (route === '/projects') page = <ProjectsPage user={user} />;
   else if (projectRoute)
     page = <ProjectWorkspace key={projectRoute.id} route={projectRoute} user={user} />;
   else if (routePath === '/views' || routePath.startsWith('/views/'))
-    page = <ProjectViewsPage user={user} id={routePath.slice(7) || undefined} />;
+    page = (
+      <ProjectViewsPage user={user} id={routePath.slice(7) || undefined} search={routeSearch} />
+    );
   else if (
     (routeRoot === 'artifacts' || routeRoot === 'deployments') &&
     !routeSection &&
     (routeId ||
-      ['recordId', 'projectId', 'artifactId', 'deploymentId', 'pipelineRunId', 'taskId'].some((key) =>
-        params.has(key),
+      ['recordId', 'projectId', 'artifactId', 'deploymentId', 'pipelineRunId', 'taskId'].some(
+        (key) => params.has(key),
       ))
   )
     page = <LegacyDeliveryLink key={route} tab={routeRoot} search={routeSearch} id={routeId} />;

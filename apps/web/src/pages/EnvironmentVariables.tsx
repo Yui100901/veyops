@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
 import { Download, Eye, EyeOff, Plus, Trash2 } from 'lucide-react';
 import { ApiError, api, message, post, useResource } from '../api';
 import { ErrorBanner, Loading } from '../components';
@@ -12,15 +12,25 @@ import {
 } from './environment-dotenv';
 import './environment-variables.css';
 
-type StoredVariable = {
+export type StoredVariable = {
   id: string;
   key: string;
   value: string | null;
   isSecret: boolean;
   description?: string;
+  secretSource?: 'VALUE' | 'CREDENTIAL';
 };
 
-type VariableSnapshot = { revision: string; variables: StoredVariable[] };
+export type VariableSnapshot<Revision extends string | number = string> = {
+  revision: Revision;
+  variables: StoredVariable[];
+};
+
+export type VariableWrite = {
+  key: string;
+  isSecret: boolean;
+  description: string;
+} & ({ value: string } | { credentialId: string } | { keepSecret: true });
 
 function toDraft(rows: StoredVariable[]): VariableDraft[] {
   return rows.map((row) => ({
@@ -30,6 +40,7 @@ function toDraft(rows: StoredVariable[]): VariableDraft[] {
     isSecret: row.isSecret,
     description: row.description ?? '',
     storedKey: row.isSecret ? row.key : undefined,
+    secretSource: row.secretSource,
   }));
 }
 
@@ -84,16 +95,30 @@ export function EnvironmentVariables({
   );
 }
 
-function VariableEditor({
+export function VariableEditor<Revision extends string | number = string>({
   path,
   initial,
   inherited,
   user,
+  metadata,
+  persistence,
+  editable = true,
+  credentialOptions,
 }: {
   path: string;
-  initial: VariableSnapshot;
+  initial: VariableSnapshot<Revision>;
   inherited?: (StoredVariable & { source: string })[];
   user: User;
+  metadata?: (busy: boolean) => ReactNode;
+  persistence?: {
+    save: (revision: Revision, variables: VariableWrite[]) => Promise<VariableSnapshot<Revision>>;
+    reload: () => Promise<VariableSnapshot<Revision>>;
+    discard: () => void;
+    conflict?: ReactNode;
+    saveLabel?: string;
+  };
+  editable?: boolean;
+  credentialOptions?: ReadonlyArray<{ id: string; name: string }>;
 }) {
   const [revision, setRevision] = useState(initial.revision);
   const [baseline, setBaseline] = useState(() => toDraft(initial.variables));
@@ -107,8 +132,8 @@ function VariableEditor({
   const [conflict, setConflict] = useState(false);
   const [saved, setSaved] = useState(false);
   const rowNumber = useRef(0);
-  const canEdit = user.role !== 'VIEWER';
-  const canReveal = user.role === 'ADMIN';
+  const canEdit = user.role !== 'VIEWER' && editable;
+  const canReveal = user.role === 'ADMIN' && editable && !!path;
 
   function edit(next: VariableDraft[]) {
     setRows(next);
@@ -151,7 +176,7 @@ function VariableEditor({
     setError('');
   }
 
-  function applySnapshot(snapshot: VariableSnapshot) {
+  function applySnapshot(snapshot: VariableSnapshot<Revision>) {
     const next = toDraft(snapshot.variables);
     setRevision(snapshot.revision);
     setBaseline(next);
@@ -162,7 +187,9 @@ function VariableEditor({
   async function reloadVariables() {
     setBusy(true);
     try {
-      applySnapshot(await api<VariableSnapshot>(path));
+      applySnapshot(
+        await (persistence ? persistence.reload() : api<VariableSnapshot<Revision>>(path)),
+      );
     } catch (err) {
       setError(message(err));
     } finally {
@@ -173,24 +200,43 @@ function VariableEditor({
   async function save() {
     setError('');
     setSaved(false);
+    let submitted: VariableDraft[] | undefined;
     try {
-      const variables = readDraft().map(({ key, value, isSecret, description }) => ({
-        key,
-        isSecret,
-        description,
-        ...(value === undefined ? { keepSecret: true } : { value }),
-      }));
+      submitted = readDraft();
+      const variables = submitted.map<VariableWrite>(
+        ({ key, value, isSecret, description, credentialId }) => {
+          const source = credentialId
+            ? { credentialId }
+            : value === undefined
+              ? { keepSecret: true as const }
+              : { value };
+          return { key, isSecret, description, ...source };
+        },
+      );
       setBusy(true);
       applySnapshot(
-        await api<VariableSnapshot>(path, {
-          method: 'PUT',
-          body: JSON.stringify({ expectedRevision: revision, variables }),
-        }),
+        await (persistence
+          ? persistence.save(revision, variables)
+          : api<VariableSnapshot<Revision>>(path, {
+              method: 'PUT',
+              body: JSON.stringify({ expectedRevision: revision, variables }),
+            })),
       );
       setSaved(true);
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) setConflict(true);
-      else setError(message(err));
+      else {
+        const fields = err instanceof ApiError ? err.details?.fieldErrors : undefined;
+        const first = Array.isArray(fields)
+          ? (fields[0] as { path?: unknown[]; message?: string } | undefined)
+          : undefined;
+        const row = first?.path?.[0] === 'variables' ? first.path[1] : undefined;
+        if (typeof row === 'number' && submitted) {
+          setMode('table');
+          setRows(submitted);
+          setError(`第 ${row + 1} 行 · ${first?.message ?? message(err)}`);
+        } else setError(message(err));
+      }
     } finally {
       setBusy(false);
     }
@@ -229,7 +275,13 @@ function VariableEditor({
       setBusy(true);
       const entries = await Promise.all(
         parsed
-          .filter((row) => row.isSecret && row.value === undefined)
+          .filter(
+            (row) =>
+              row.isSecret &&
+              row.value === undefined &&
+              row.storedKey === row.key &&
+              !row.credentialId,
+          )
           .map(async ({ key }) => [key, await readSecret(key)] as const),
       );
       setRows(parsed);
@@ -272,6 +324,7 @@ function VariableEditor({
 
   return (
     <div className="environment-variables form-body">
+      {metadata?.(busy)}
       <div className="environment-variable-header">
         <div className="heading-actions" role="group" aria-label="环境变量编辑模式">
           <button
@@ -315,7 +368,8 @@ function VariableEditor({
                   {rows.map((row, index) => {
                     const name = row.key || `第 ${index + 1} 行`;
                     const revealed = rowSecrets.get(row.id);
-                    const hasStoredValue = row.isSecret && row.key === row.storedKey;
+                    const hasStoredValue =
+                      row.isSecret && row.key === row.storedKey && !row.credentialId;
                     const showReveal = row.isSecret && (canReveal || row.value !== undefined);
                     return (
                       <tr key={row.id}>
@@ -345,7 +399,7 @@ function VariableEditor({
                                 placeholder={hasStoredValue ? hiddenVariableValue : '输入敏感值'}
                                 maxLength={65_536}
                                 value={row.value ?? ''}
-                                disabled={busy}
+                                disabled={busy || !!row.credentialId}
                                 onChange={(event) => update(row, { value: event.target.value })}
                               />
                             ) : (
@@ -373,6 +427,30 @@ function VariableEditor({
                               spellCheck={false}
                             />
                           )}
+                          {row.isSecret &&
+                            row.secretSource === 'CREDENTIAL' &&
+                            hasStoredValue &&
+                            row.value === undefined && <span className="muted">凭据引用</span>}
+                          {row.isSecret && !!credentialOptions?.length && (
+                            <select
+                              aria-label={`变量凭据 ${name}`}
+                              value={row.credentialId ?? ''}
+                              disabled={busy || !canEdit}
+                              onChange={(event) =>
+                                update(row, {
+                                  credentialId: event.target.value || undefined,
+                                  value: event.target.value ? undefined : row.value,
+                                })
+                              }
+                            >
+                              <option value="">使用输入值或保留原值</option>
+                              {credentialOptions.map((option) => (
+                                <option key={option.id} value={option.id}>
+                                  {option.name}
+                                </option>
+                              ))}
+                            </select>
+                          )}
                         </td>
                         <td>
                           {canEdit ? (
@@ -384,6 +462,7 @@ function VariableEditor({
                                 const isSecret = event.target.value === 'secret';
                                 update(row, {
                                   isSecret,
+                                  credentialId: isSecret ? row.credentialId : undefined,
                                   value: isSecret && row.value === '' ? undefined : row.value,
                                 });
                               }}
@@ -529,6 +608,7 @@ function VariableEditor({
       )}
       <ErrorBanner error={error} />
       {conflict && <ErrorBanner error="变量已在其他页面更新，当前草稿已保留。" />}
+      {conflict && persistence?.conflict}
       {canEdit && (
         <div className="heading-actions environment-variable-actions">
           <button
@@ -537,7 +617,7 @@ function VariableEditor({
             disabled={busy || conflict}
             onClick={() => void save()}
           >
-            保存变量
+            {persistence?.saveLabel ?? '保存变量'}
           </button>
           <button
             type="button"
@@ -546,7 +626,10 @@ function VariableEditor({
             onClick={() => {
               setSaved(false);
               if (conflict) void reloadVariables();
-              else clearDraft(baseline);
+              else {
+                persistence?.discard();
+                clearDraft(baseline);
+              }
             }}
           >
             {conflict ? '放弃草稿并加载最新变量' : '放弃修改'}

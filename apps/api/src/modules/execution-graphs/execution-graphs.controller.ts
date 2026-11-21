@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -7,6 +8,7 @@ import {
   ParseUUIDPipe,
   Post,
   Put,
+  Query,
   Req,
 } from '@nestjs/common';
 import { Roles } from '../auth/auth.decorators';
@@ -17,7 +19,8 @@ import {
   ValidateGraphDraftDto,
 } from './execution-graph-definition';
 import { ExecutionGraphsService } from './execution-graphs.service';
-import { graphCatalog } from './graph-fields';
+import { GraphCompileError, graphCatalog, safeGraphId } from './graph-fields';
+import { ExecutionPlanIssueError } from '../../core/execution-plan-issue';
 
 @Controller('projects/:projectId/execution-graph')
 export class ExecutionGraphsController {
@@ -42,6 +45,21 @@ export class ExecutionGraphsController {
     await this.graphs.get(projectId);
     return graphCatalog;
   }
+  @Post('catalog')
+  @Roles('ADMIN', 'OPERATOR')
+  async draftCatalog(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Query('flow') flowId: string,
+    @Query('node') nodeId: string,
+    @Body() input: ValidateGraphDraftDto,
+  ) {
+    if (!safeGraphId(flowId) || !safeGraphId(nodeId))
+      throw new BadRequestException('请选择要查看的开始节点与功能节点');
+    return {
+      ...graphCatalog,
+      flows: await this.graphs.draftCatalog(projectId, input.definition, flowId, nodeId),
+    };
+  }
   @Post('validate')
   @Roles('ADMIN', 'OPERATOR')
   validate(
@@ -61,12 +79,17 @@ export class ExecutionGraphsController {
   }
   @Post('publish')
   @Roles('ADMIN', 'OPERATOR')
-  publish(
+  async publish(
     @Param('projectId', ParseUUIDPipe) projectId: string,
     @Body() input: ExpectedGraphRevisionDto,
     @Req() req: AuthRequest,
   ) {
-    return this.graphs.publish(projectId, input.expectedRevision, req.user.id);
+    try {
+      return await this.graphs.publish(projectId, input.expectedRevision, req.user.id);
+    } catch (error) {
+      if (!(error instanceof GraphCompileError)) throw error;
+      throw new ExecutionPlanIssueError({ code: 'CONFIGURATION', ...error.issue });
+    }
   }
   @Get('versions')
   versions(@Param('projectId', ParseUUIDPipe) projectId: string) {

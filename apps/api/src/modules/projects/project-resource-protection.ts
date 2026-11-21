@@ -15,6 +15,7 @@ const resourceLabels: Record<ProjectResourceType, string> = {
   REPOSITORY: '仓库',
   SERVICE: '服务',
   ENVIRONMENT: '环境',
+  ENVIRONMENT_SET: '环境变量集合',
   CREDENTIAL: '凭据',
   REGISTRY: '镜像仓库',
   LEGACY_TARGET: '部署目标',
@@ -98,12 +99,14 @@ async function availableIds(
   switch (type) {
     case 'REPOSITORY':
     case 'SERVICE':
-    case 'ENVIRONMENT': {
+    case 'ENVIRONMENT':
+    case 'ENVIRONMENT_SET': {
       const table = {
         REPOSITORY: 'repositories',
         SERVICE: 'services',
         ENVIRONMENT: 'environments',
-      }[type] as 'repositories' | 'services' | 'environments';
+        ENVIRONMENT_SET: 'project_environment_sets',
+      }[type] as 'repositories' | 'services' | 'environments' | 'project_environment_sets';
       return db
         .selectFrom(table)
         .select('id')
@@ -135,12 +138,19 @@ async function availableIds(
     case 'ARTIFACT':
       return db
         .selectFrom('artifacts')
-        .select('id')
+        .select(['id', 'logical_artifact_id as logicalId'])
         .where('project_id', '=', projectId)
+        .where('lifecycle_state', '=', 'ACTIVE')
+        .where('temporary_root_id', 'is', null)
         .where('pruned_at', 'is', null)
         .where('archive_deleted_at', 'is', null)
-        .where('id', 'in', ids)
-        .execute();
+        .where((eb) => eb.or([eb('id', 'in', ids), eb('logical_artifact_id', 'in', ids)]))
+        .execute()
+        .then((rows) =>
+          rows.flatMap((row) =>
+            row.logicalId ? [{ id: row.id }, { id: row.logicalId }] : [{ id: row.id }],
+          ),
+        );
   }
 }
 

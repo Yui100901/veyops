@@ -15,14 +15,16 @@ import {
   Trash2,
   Wifi,
 } from 'lucide-react';
-import { api, ApiError, formatTime, message, post, remove, useResource } from '../api';
-import { ServerGroups, ServerOverview } from './ServerResources';
+import { api, ApiError, formatTime, message, navigate, post, remove, useResource } from '../api';
+import { ServerGroupOverview, ServerGroups, ServerOverview } from './ServerResources';
 import { ServerComparison } from './ServerComparison';
 import { MonitorSummary } from './ServerMonitoring';
 import { metricNames, metricValue } from './monitoring-data';
 import type { MetricKey, MonitorRow } from './monitoring-data';
 import { ProjectBasicsFields, projectBasicsValues } from './ProjectConfiguration';
 import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
+import { projectResourcePath } from './project-workspace-route';
+import { readServerResourceLocation, serverResourceHref } from './server-resource-route';
 import {
   Confirm,
   Empty,
@@ -36,7 +38,7 @@ import {
   Section,
   Status,
 } from '../components';
-import type { Credential, Project, Server, ServerGroup, User } from '../models';
+import type { Credential, Project, Server, ServerDetail, ServerGroup, User } from '../models';
 import './resources-workspace.css';
 
 function values(event: FormEvent<HTMLFormElement>) {
@@ -53,13 +55,21 @@ function tags(value: string) {
     .filter(Boolean);
 }
 
-export function ServersPage({ user }: { user: User }) {
+export function ServersPage({ user, search: routeSearch }: { user: User; search?: string }) {
+  const view = readServerResourceLocation(routeSearch);
+  const { serverId, groupId: detailGroupId } = view;
   const resource = useResource<Server[]>('/servers');
   const metrics = useResource<MonitorRow[]>('/monitoring/servers?summary=true', 30000);
   const groups = useResource<ServerGroup[]>('/server-groups');
-  const canEdit = user.role !== 'VIEWER';
+  const detail = useResource<ServerDetail>(
+    serverId ? `/servers/${encodeURIComponent(serverId)}` : null,
+  );
+  const detailGroup = useResource<ServerGroup>(
+    detailGroupId && !serverId ? `/server-groups/${encodeURIComponent(detailGroupId)}` : null,
+  );
+  const canEdit = user.role === 'ADMIN';
+  const canTest = user.role !== 'VIEWER';
   const [compare, setCompare] = useInlineEditor<true>();
-  const [openMetrics, setOpenMetrics] = useState(false);
   const [groupId, setGroupId] = useState('');
   const [tag, setTag] = useState('');
   const [sortBy, setSortBy] = useState<MetricKey | ''>('');
@@ -68,7 +78,6 @@ export function ServersPage({ user }: { user: User }) {
   const [editor, setEditor] = useInlineEditor<Server | 'new'>();
   const [checkingKey, setCheckingKey] = useState<Server>();
   const [keyMismatch, setKeyMismatch] = useState<Server>();
-  const [inspecting, setInspecting] = useInlineEditor<Server>();
   const [deleting, setDeleting] = useState<Server>();
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState('');
@@ -91,10 +100,13 @@ export function ServersPage({ user }: { user: User }) {
     };
     list.sort((left, right) => value(right.id) - value(left.id));
   }
-  const panelOpen = Boolean(editor || inspecting || compare);
+  const panelOpen = Boolean(editor || serverId || detailGroupId || compare);
   function inspect(server: Server, showMetrics: boolean) {
-    setOpenMetrics(showMetrics);
-    setInspecting(server);
+    navigate(
+      serverResourceHref({ serverId: server.id, panel: showMetrics ? 'metrics' : undefined }).slice(
+        1,
+      ),
+    );
   }
   function reloadServers() {
     void resource.reload();
@@ -169,7 +181,7 @@ export function ServersPage({ user }: { user: User }) {
           <div hidden={panelOpen}>
             <div className="row-actions">
               {section === 'servers' && <RefreshButton onClick={reloadServers} />}
-              {section === 'servers' && canEdit && (
+              {section === 'servers' && canTest && (
                 <button
                   type="button"
                   className="button secondary"
@@ -219,7 +231,7 @@ export function ServersPage({ user }: { user: User }) {
           error={resource.error || (!editor && !deleting && !checkingKey ? error : '')}
           retry={resource.error ? resource.reload : undefined}
         />
-        {keyMismatch && section === 'servers' && (
+        {canEdit && keyMismatch && section === 'servers' && (
           <div className="server-key-action">
             <button
               className="button secondary"
@@ -332,13 +344,12 @@ export function ServersPage({ user }: { user: User }) {
                               <ServerIcon size={18} />
                             </span>
                             <div>
-                              <button
-                                className="text-button"
-                                type="button"
-                                onClick={() => inspect(server, false)}
+                              <a
+                                className="text-link"
+                                href={serverResourceHref({ serverId: server.id })}
                               >
                                 {server.name}
-                              </button>
+                              </a>
                               <small>
                                 {server.osType ||
                                   (server.hostKeyFingerprint ? '操作系统待检测' : '主机指纹待确认')}
@@ -377,16 +388,18 @@ export function ServersPage({ user }: { user: User }) {
                         <td className="muted nowrap">{formatTime(server.lastCheckedAt)}</td>
                         <td>
                           <div className="row-actions">
+                            {canTest && (
+                              <button
+                                className="text-button"
+                                disabled={Boolean(testing) || !server.hostKeyFingerprint}
+                                onClick={() => test(server)}
+                              >
+                                <Wifi size={14} />
+                                {testing === server.id ? '检测中…' : '测试连接'}
+                              </button>
+                            )}
                             {canEdit && (
                               <>
-                                <button
-                                  className="text-button"
-                                  disabled={Boolean(testing) || !server.hostKeyFingerprint}
-                                  onClick={() => test(server)}
-                                >
-                                  <Wifi size={14} />
-                                  {testing === server.id ? '检测中…' : '测试连接'}
-                                </button>
                                 <button
                                   className="icon-button bare muted"
                                   aria-label={`编辑服务器 ${server.name}`}
@@ -460,16 +473,39 @@ export function ServersPage({ user }: { user: User }) {
           label="移除服务器"
         />
       )}
-      {inspecting && (
-        <ServerOverview
-          key={inspecting.id}
-          monitorRow={byServer.get(inspecting.id)}
-          server={inspecting}
-          initialMetrics={openMetrics}
-          canEdit={canEdit}
-          onMonitorChange={metrics.reload}
-          onClose={() => setInspecting(undefined)}
-        />
+      {(serverId || detailGroupId) && (
+        <>
+          <a className="back-link" href={view.returnPath ? '#' + view.returnPath : '#/servers'}>
+            {view.returnPath ? '← 返回来源' : '← 返回服务器'}
+          </a>
+          <ErrorBanner
+            error={serverId ? detail.error : detailGroup.error}
+            retry={serverId ? detail.reload : detailGroup.reload}
+          />
+          {(serverId ? detail.loading : detailGroup.loading) && <Loading />}
+          {serverId && detail.data?.id === serverId && (
+            <ServerOverview
+              key={`${serverId}:${view.panel ?? ''}`}
+              monitorRow={byServer.get(serverId)}
+              server={detail.data}
+              initialMetrics={view.panel === 'metrics'}
+              canEdit={canEdit && detail.data.active !== false}
+              onMonitorChange={metrics.reload}
+              onClose={() => navigate(view.returnPath ?? '/servers')}
+            />
+          )}
+          {!serverId && detailGroupId && detailGroup.data?.id === detailGroupId && (
+            <ServerGroupOverview
+              group={detailGroup.data}
+              search={routeSearch}
+              servers={resource.data ?? []}
+              onClose={() => {
+                setSection('groups');
+                navigate(view.returnPath ?? '/servers');
+              }}
+            />
+          )}
+        </>
       )}
       {compare && (
         <ServerComparison servers={resource.data ?? []} onClose={() => setCompare(undefined)} />
@@ -1302,7 +1338,7 @@ export function ProjectsPage({ user }: { user: User }) {
       <PageHeader
         eyebrow="PROJECT WORKSPACE"
         title="项目管理"
-        description="以项目组织代码仓库、应用服务与运行环境。"
+        description="以项目组织代码仓库、应用服务与变量集合。"
         action={
           user.role !== 'VIEWER' && (
             <button
@@ -1345,7 +1381,7 @@ export function ProjectsPage({ user }: { user: User }) {
           <Empty
             icon={<FolderGit2 size={25} />}
             title="让项目成为运维的组织中心"
-            description="创建项目后，可添加多个仓库、服务和独立环境。"
+            description="创建项目后，可添加仓库、服务和变量集合。"
             action={
               user.role !== 'VIEWER' && (
                 <button
@@ -1385,10 +1421,15 @@ export function ProjectsPage({ user }: { user: User }) {
                   ))}
                 </div>
               )}
-              <ProjectAccessLinks addresses={project.addresses ?? []} />
+              <ProjectAccessLinks
+                addresses={project.addresses ?? []}
+                serviceHref={(serviceId) =>
+                  '#' + projectResourcePath(project.id, { resource: 'services', serviceId })
+                }
+              />
               <div className="project-card-footer">
                 <span>{project.serviceCount ?? 0} 个服务</span>
-                <span>{project.environmentCount ?? 0} 个环境</span>
+                <span>{project.environmentSetCount ?? 0} 个变量集合</span>
                 <a
                   href={`#/projects/${encodeURIComponent(project.id)}`}
                   className="button secondary small"

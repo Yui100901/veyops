@@ -4,6 +4,7 @@ import { navigate, useResource } from '../api';
 import { ErrorBanner, Loading } from '../components';
 import type { ProjectDetail, User } from '../models';
 import { DeliveryRecordsPage } from './Delivery';
+import { ProjectArtifacts } from './ProjectArtifacts';
 import { ReleaseApprovals } from './ReleaseOperations';
 import {
   deliveryPath,
@@ -33,12 +34,22 @@ export function ProjectDelivery({
     providedProject ? null : `/projects/${encodeURIComponent(id)}/delivery-context`,
   );
   const scope = readDeliveryScope(new URLSearchParams(search));
-  const { serviceId, environmentId, commit, recordId, pipelineRunId, taskId, repositoryId, view } =
-    scope;
+  const {
+    serviceId,
+    environmentId,
+    commit,
+    recordId,
+    pipelineRunId,
+    taskId,
+    repositoryId,
+    view,
+    viewSearch,
+  } = scope;
   if (!providedProject && resource.loading) return <Loading />;
   const project = providedProject ?? resource.data;
   if (!project)
     return <ErrorBanner error={resource.error || '找不到这个项目。'} retry={resource.reload} />;
+  if (tab === 'artifacts') return <ProjectArtifacts project={project} user={user} scope={scope} />;
   const canApprove = !project.archived && user.role === 'ADMIN';
   const services = [...project.services, ...(project.archivedServices ?? [])];
   const environments = [...project.environments, ...(project.archivedEnvironments ?? [])];
@@ -53,12 +64,22 @@ export function ProjectDelivery({
     return (
       <>
         <ErrorBanner error="所选服务、环境或仓库不属于当前项目。" />
-        <a className="button secondary small" href={'#' + deliveryPath(id, tab, { view })}>
-          查看项目交付记录
+        <a
+          className="button secondary small"
+          href={'#' + deliveryPath(id, tab, { view, viewSearch })}
+        >
+          返回项目交付记录
         </a>
       </>
     );
-  const filters: DeliveryScope = { serviceId, environmentId, commit, repositoryId, view };
+  const filters: DeliveryScope = {
+    serviceId,
+    environmentId,
+    commit,
+    repositoryId,
+    view,
+    viewSearch,
+  };
   const returnFilters = recordId ? { ...filters, pipelineRunId, taskId } : filters;
   const query = new URLSearchParams({ projectId: id });
   if (serviceId) query.set('serviceId', serviceId);
@@ -75,6 +96,7 @@ export function ProjectDelivery({
     navigate(
       deliveryPath(id, tab, {
         view,
+        viewSearch,
         serviceId: String(values.get('serviceId') || ''),
         environmentId: String(values.get('environmentId') || ''),
         commit: String(values.get('commit') || '').trim(),
@@ -109,27 +131,32 @@ export function ProjectDelivery({
               serviceId,
               environmentId: environmentId || undefined,
               view: view || undefined,
+              viewSearch: viewSearch || undefined,
             })
           }
         >
           ← 返回服务配置
         </a>
       )}
-      <nav className="record-tabs" aria-label="交付记录分类">
-        {!embedded && !project.archived && <a href={`#/projects/${id}/execution-graph`}>执行图</a>}
-        {(Object.keys(deliveryTabs) as DeliveryTab[])
-          .filter((key) => key !== 'approvals' || canApprove)
-          .map((key) => (
-            <a
-              key={key}
-              className={key === tab ? 'active' : ''}
-              aria-current={key === tab ? 'page' : undefined}
-              href={'#' + deliveryPath(id, key, key === tab ? scope : filters)}
-            >
-              {deliveryTabs[key]}
-            </a>
-          ))}
-      </nav>
+      {
+        <nav className="record-tabs" aria-label="交付记录分类">
+          {!embedded && !project.archived && (
+            <a href={`#/projects/${id}/execution-graph`}>执行图</a>
+          )}
+          {(Object.keys(deliveryTabs) as DeliveryTab[])
+            .filter((key) => key !== 'approvals' || canApprove)
+            .map((key) => (
+              <a
+                key={key}
+                className={key === tab ? 'active' : ''}
+                aria-current={key === tab ? 'page' : undefined}
+                href={'#' + deliveryPath(id, key, key === tab ? scope : filters)}
+              >
+                {deliveryTabs[key]}
+              </a>
+            ))}
+        </nav>
+      }
       <form
         className="delivery-filters"
         onSubmit={filter}
@@ -204,7 +231,7 @@ export function ProjectDelivery({
           pipelineRunId ||
           taskId ||
           repositoryId) && (
-          <a className="text-link" href={'#' + deliveryPath(id, tab, { view })}>
+          <a className="text-link" href={'#' + deliveryPath(id, tab, { view, viewSearch })}>
             清除筛选
           </a>
         )}
@@ -220,7 +247,7 @@ export function ProjectDelivery({
           </span>
         </div>
       )}
-      {(tab === 'artifacts' || tab === 'deployments') && (
+      {tab === 'deployments' && (
         <DeliveryRecordsPage
           key={tab + searchQuery}
           type={tab}

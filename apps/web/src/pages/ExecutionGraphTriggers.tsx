@@ -17,7 +17,7 @@ const kindNames = {
 const events = {
   repository: '仓库',
   commit: '实际提交 SHA',
-  ref: '推送引用',
+  ref: 'Git 引用',
   eventId: '事件 ID',
   scheduledAt: '计划触发时间',
   upstreamRunId: '上游运行 ID',
@@ -25,7 +25,22 @@ const events = {
 } as const;
 type EventField = keyof typeof events;
 type ParameterMapping =
-  { source: 'EVENT'; field: EventField } | { source: 'VALUE'; value: unknown };
+  | { source: 'EVENT'; field: EventField }
+  | { source: 'VALUE'; value: unknown }
+  | { source: 'UPSTREAM_OUTPUT'; fieldId: string };
+
+const hasGitEvent = (kind: TriggerConfig['kind']) => kind === 'WEBHOOK' || kind === 'API';
+
+function compatibleUpstream(source: GraphField, consumer: GraphField) {
+  return (
+    !['CREDENTIAL', 'WORKSPACE', 'VARIABLES'].includes(source.type) &&
+    source.type === consumer.type &&
+    Boolean(source.multiple) === Boolean(consumer.multiple) &&
+    (!consumer.artifactType ||
+      !source.artifactType ||
+      source.artifactType === consumer.artifactType)
+  );
+}
 
 interface TriggerConfig {
   name: string;
@@ -166,6 +181,7 @@ export function ExecutionGraphTriggers({
             key={rule.id}
             path={rulesPath + '/' + rule.id}
             rule={rule}
+            project={project}
             canInvoke={canInvoke}
             onRun={onRun}
           />
@@ -214,6 +230,21 @@ function TriggerEditor({
   const flows = definition.data?.version === form.version ? definition.data.definition.flows : [];
   const target = flows.find(({ id }) => id === startId);
   const fields = target?.nodes.find(({ type }) => type === 'START')?.inputs ?? [];
+  const upstreamOutputs =
+    form.kind === 'UPSTREAM' && form.upstreamStatus === 'SUCCESS'
+      ? (flows
+          .find(({ id }) => id === form.upstreamFlowId)
+          ?.nodes.find(({ type }) => type === 'END')?.outputs ?? [])
+      : [];
+  const unavailableOutput = fields.find((field) => {
+    const mapping = form.parameterMappings?.[field.id];
+    return (
+      mapping?.source === 'UPSTREAM_OUTPUT' &&
+      !upstreamOutputs.some(
+        (source) => source.id === mapping.fieldId && compatibleUpstream(source, field),
+      )
+    );
+  });
   const missing = fields.filter(
     (field) =>
       field.required &&
@@ -225,7 +256,9 @@ function TriggerEditor({
     ? '此发布版本没有由该开始节点定义的执行流。'
     : form.enabled && missing.length
       ? '请为必填参数配置来源 · ' + missing.map(({ name }) => name).join('、')
-      : '';
+      : unavailableOutput
+        ? '参数「' + unavailableOutput.name + '」的上游输出已不可用，请重新选择。'
+        : '';
   const valid = Boolean(
     form.name.trim() &&
     target &&
@@ -419,12 +452,21 @@ function TriggerEditor({
         {!!fields.length && (
           <section className="graph-fields">
             <h4>触发参数映射</h4>
+            {form.kind === 'API' && (
+              <p className="field-note">
+                事件字段由调用方提交。映射仓库、提交或 Git 引用时，调用请求须提供相应值。
+              </p>
+            )}
+            {form.kind === 'UPSTREAM' && form.upstreamStatus !== 'SUCCESS' && (
+              <p className="field-note">触发条件为上游成功时可使用其最终输出。</p>
+            )}
             {fields.map((field) => (
               <TriggerParameterField
                 key={field.id}
                 field={field}
                 project={project}
                 kind={form.kind}
+                upstreamOutputs={upstreamOutputs}
                 value={form.parameterMappings?.[field.id]}
                 change={(mapping) => {
                   const next = { ...form.parameterMappings };
@@ -462,12 +504,14 @@ function TriggerParameterField({
   project,
   field,
   kind,
+  upstreamOutputs,
   value,
   change,
 }: {
   project: ProjectDetail;
   field: GraphField;
   kind: TriggerConfig['kind'];
+  upstreamOutputs: GraphField[];
   value?: ParameterMapping;
   change: (value?: ParameterMapping) => void;
 }) {
@@ -476,14 +520,21 @@ function TriggerParameterField({
     if (field.type === 'NUMBER' && kind === 'CRON') supported.push('scheduledAt');
     if (field.type === 'TEXT') {
       supported.push('eventId');
-      if (kind === 'WEBHOOK') supported.push('commit', 'ref');
+      if (hasGitEvent(kind)) supported.push('commit', 'ref');
       if (kind === 'UPSTREAM') supported.push('upstreamRunId', 'upstreamStatus');
     }
-    if (kind === 'WEBHOOK' && field.type === 'REPOSITORY') supported.push('repository');
-    if (kind === 'WEBHOOK' && field.type === 'GIT_REF') supported.push('commit', 'ref');
+    if (hasGitEvent(kind) && field.type === 'REPOSITORY') supported.push('repository');
+    if (hasGitEvent(kind) && field.type === 'GIT_REF') supported.push('commit', 'ref');
   }
+  const compatibleOutputs = upstreamOutputs.filter((source) => compatibleUpstream(source, field));
   const selected =
-    value?.source === 'EVENT' ? value.field : value?.source === 'VALUE' ? 'constant' : '';
+    value?.source === 'EVENT'
+      ? value.field
+      : value?.source === 'VALUE'
+        ? 'constant'
+        : value?.source === 'UPSTREAM_OUTPUT'
+          ? 'output:' + value.fieldId
+          : '';
   return (
     <div className="graph-field-card graph-fields">
       <Field label={field.name + (field.required ? '（必填）' : '')}>
@@ -492,6 +543,8 @@ function TriggerParameterField({
           onChange={(event) => {
             const id = event.target.value;
             if (id === 'constant') change({ source: 'VALUE', value: field.defaultValue ?? '' });
+            else if (id.startsWith('output:'))
+              change({ source: 'UPSTREAM_OUTPUT', fieldId: id.slice(7) });
             else if (supported.includes(id as EventField))
               change({ source: 'EVENT', field: id as EventField });
             else change(undefined);
@@ -499,9 +552,20 @@ function TriggerParameterField({
         >
           <option value="">采用开始节点默认规则</option>
           <option value="constant">设置固定值</option>
+          {value?.source === 'UPSTREAM_OUTPUT' &&
+            !compatibleOutputs.some(({ id }) => id === value.fieldId) && (
+              <option value={selected} disabled>
+                原有上游输出不可用
+              </option>
+            )}
           {supported.map((name) => (
             <option value={name} key={name}>
               {events[name]}
+            </option>
+          ))}
+          {compatibleOutputs.map(({ id, name }) => (
+            <option value={'output:' + id} key={id}>
+              上游最终输出 · {name} ({id})
             </option>
           ))}
         </select>
@@ -522,20 +586,30 @@ function TriggerParameterField({
 function TriggerDetails({
   path,
   rule,
+  project,
   canInvoke,
   onRun,
 }: {
   path: string;
   rule: TriggerRule;
+  project: ProjectDetail;
   canInvoke: boolean;
   onRun: (id: string) => void;
 }) {
   const events = useResource<TriggerEvent[]>(path + '/events', 5000);
   const [eventId, setEventId] = useState(() => graphKey('event'));
+  const [repositoryId, setRepositoryId] = useState('');
+  const [commitSha, setCommitSha] = useState('');
+  const [ref, setRef] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [invoked, setInvoked] = useState<TriggerEvent>();
   const latest = events.data?.find((item) => item.id === invoked?.id) ?? invoked;
+  const eventFields = new Set(
+    Object.values(rule.parameterMappings ?? {}).flatMap((mapping) =>
+      mapping.source === 'EVENT' ? [mapping.field] : [],
+    ),
+  );
   async function invoke(event: FormEvent) {
     event.preventDefault();
     if (busy || !eventId.trim()) return;
@@ -545,6 +619,9 @@ function TriggerDetails({
       setInvoked(
         await post<TriggerEvent>(path + '/invoke', {
           eventId: eventId.trim(),
+          ...(repositoryId && { repositoryId }),
+          ...(commitSha.trim() && { commitSha: commitSha.trim() }),
+          ...(ref.trim() && { ref: ref.trim() }),
         }),
       );
       await events.reload();
@@ -592,6 +669,46 @@ function TriggerDetails({
                 onChange={(e) => setEventId(e.target.value)}
               />
             </Field>
+            {(eventFields.has('repository') ||
+              eventFields.has('commit') ||
+              eventFields.has('ref')) && (
+              <Field label="事件仓库" hint="按事件提交检出时，仓库须与检出仓库一致。">
+                <select
+                  required={eventFields.has('repository')}
+                  value={repositoryId}
+                  onChange={(e) => setRepositoryId(e.target.value)}
+                >
+                  <option value="">请选择仓库</option>
+                  {project.repositories.map(({ id, name }) => (
+                    <option key={id} value={id}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            )}
+            {eventFields.has('commit') && (
+              <Field label="事件提交 SHA">
+                <input
+                  required
+                  maxLength={64}
+                  pattern="(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})"
+                  value={commitSha}
+                  onChange={(e) => setCommitSha(e.target.value)}
+                />
+              </Field>
+            )}
+            {eventFields.has('ref') && (
+              <Field label="事件 Git 引用">
+                <input
+                  required
+                  maxLength={500}
+                  placeholder="refs/heads/main"
+                  value={ref}
+                  onChange={(e) => setRef(e.target.value)}
+                />
+              </Field>
+            )}
           </div>
           <div className="heading-actions">
             <button type="submit" className="button primary small" disabled={busy}>

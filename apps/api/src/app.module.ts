@@ -9,6 +9,7 @@ import { CredentialsModule } from './modules/credentials/credentials.service';
 import { ServersModule } from './modules/servers/servers.service';
 import { ServerGroupsModule } from './modules/servers/server-groups';
 import { ProjectsModule } from './modules/projects/projects.service';
+import { EnvironmentSetsModule } from './modules/projects/environment-sets.service';
 import { SshModule } from './infrastructure/ssh/ssh.module';
 import { TasksModule } from './modules/tasks/tasks.module';
 import { CommandCenterModule } from './modules/command-center/command-center.module';
@@ -39,6 +40,7 @@ import { SourceReviewModule } from './modules/deployments/source-review.service'
     ServersModule,
     ServerGroupsModule,
     ProjectsModule,
+    EnvironmentSetsModule,
     ViewsModule,
     DeploymentTargetsModule,
     ServiceConfigsModule,

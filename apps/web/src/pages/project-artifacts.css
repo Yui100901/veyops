@@ -1,0 +1,32 @@
+.project-artifacts .artifact-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  align-items: end;
+  margin-bottom: 1rem;
+}
+
+.artifact-instance-line,
+.artifact-detail-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.artifact-instance-line + .artifact-instance-line {
+  margin-top: 0.3rem;
+}
+
+.artifact-detail-summary {
+  gap: 0.75rem;
+  margin-bottom: 0.8rem;
+}
+
+.artifact-object-name {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.project-artifacts .heading-actions + .table-scroll {
+  margin-top: 0.75rem;
+}

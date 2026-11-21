@@ -26,6 +26,7 @@ const nodeProperties: [keyof GraphNode, string][] = [
   ['shell', '脚本配置'],
   ['registerArtifacts', '登记配置'],
   ['loadEnvironment', '环境配置'],
+  ['environmentSet', '变量集合引用'],
   ['flowId', '子流'],
   ['position', '位置'],
 ];

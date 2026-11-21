@@ -3,17 +3,21 @@ import type { Database } from '../../core/database/schema';
 
 export function projectAddressLinks(db: Kysely<Database>) {
   return db
-    .selectFrom('project_addresses as address')
-    .leftJoin('services as service', 'service.id', 'address.service_id')
-    .leftJoin('environments as environment', 'environment.id', 'address.environment_id')
+    .selectFrom('service_addresses as address')
+    .innerJoin('services as service', 'service.id', 'address.service_id')
+    .where('service.archived_at', 'is', null)
     .select([
-      'address.project_id as projectId',
+      'service.project_id as projectId',
       'address.id as id',
       'address.name as name',
       'address.url as url',
+      'service.id as serviceId',
       'service.name as serviceName',
-      'environment.name as environmentName',
-    ]);
+    ])
+    .select((eb) => eb.val(null).as('environmentName'))
+    .orderBy('service.name')
+    .orderBy('service.id')
+    .orderBy('address.position');
 }
 
 export function byProject<Row extends { projectId: string }>(rows: Row[]) {

@@ -1,4 +1,10 @@
-import { ConflictException, HttpException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  HttpException,
+  Injectable,
+  NotFoundException,
+  Optional,
+} from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { posix } from 'node:path';
 import { SshExecutionError, SshService, SshTarget } from '../../infrastructure/ssh/ssh.service';
@@ -16,6 +22,11 @@ import {
   resolveRepositoryFile,
 } from '../builds/builds.service';
 import { ArtifactsService, type DeploymentArtifact } from '../artifacts/artifacts.service';
+import {
+  ArtifactOutputMissing,
+  ArtifactPhysicalService,
+} from '../artifacts/artifact-physical.service';
+import { artifactIdentity } from '../artifacts/artifact-identities';
 import { DeploymentHealth, DeploymentsService } from '../deployments/deployments.service';
 import { deploymentLock } from '../deployments/deployment-lock';
 import type { TaskExecutionContext, TaskRecord, TaskStatus } from '../tasks/tasks.types';
@@ -28,7 +39,7 @@ import type {
   PipelineSnapshot,
 } from './pipeline.types';
 import { isStandaloneGraphBuild } from './pipeline.types';
-import { deploymentGuard, shellQuote as q } from './pipeline.validation';
+import { deploymentGuard, relativePath, shellQuote as q } from './pipeline.validation';
 import { serializeComposeEnvironment } from './environment.serialization';
 import { createTargetWorkspace, targetWorkspacePath } from './target-workspace';
 import { composeHealthCheck, httpHealthCheck, waitForReleaseHealth } from './release-health';
@@ -107,6 +118,7 @@ export class PipelineExecutor {
     private readonly ssh: SshService,
     private readonly artifacts: ArtifactsService,
     private readonly deployments: DeploymentsService,
+    @Optional() private readonly physical?: ArtifactPhysicalService,
   ) {}
   async execute(task: TaskRecord, context: TaskExecutionContext) {
     const snapshot = task.payload.pipeline;
@@ -166,7 +178,8 @@ export class PipelineExecutor {
       try {
         for (const target of task.payload.targets) {
           if (context.signal.aborted) return;
-          const artifact = shared ?? (await this.artifacts.forDeployment(snapshot, target.id));
+          const artifact =
+            shared ?? (await this.artifacts.forDeployment(snapshot, target.id, target));
           deploymentInputs.set(target.id, artifact);
           if (
             snapshot.deploymentArtifacts?.length === 1 &&
@@ -218,6 +231,8 @@ export class PipelineExecutor {
               storageType: entry.output.imageId ? 'LOCAL_IMAGE' : undefined,
               name: entry.declaration?.name,
               kind: entry.declaration?.type,
+              persist: entry.declaration?.persist,
+              physical: entry.output.physical,
             });
             managerArtifact ??= artifact;
           }
@@ -501,8 +516,10 @@ export class PipelineExecutor {
                   } catch (error) {
                     if (
                       declaration.required !== false ||
-                      !(error instanceof BuildCommandError) ||
-                      error.exitCode !== 44
+                      !(
+                        error instanceof ArtifactOutputMissing ||
+                        (error instanceof BuildCommandError && error.exitCode === 44)
+                      )
                     )
                       throw error;
                     context.log(`可选产物 ${declaration.name} 不存在，已略过\n`, target.id);
@@ -521,7 +538,16 @@ export class PipelineExecutor {
                 let checksum = deploymentInput?.checksum ?? manager?.checksum,
                   sizeBytes = manager?.sizeBytes;
                 const localArchive = deploymentInput?.localArchive ?? manager?.localArchive;
-                if (localArchive) {
+                if (deploymentInput?.physical?.location === 'SERVER_PATH') {
+                  const source = deploymentInput.physical;
+                  if (!this.physical) throw new ConflictException('目标端产物适配器不可用');
+                  ({ checksum, sizeBytes } = await step(
+                    'TRANSFER',
+                    '在目标端校验并准备登记产物',
+                    () =>
+                      this.physical!.stageServerArchive(source, target, archive, context.signal),
+                  ));
+                } else if (localArchive) {
                   await step('TRANSFER', 'SFTP分发已归档的构建产物', () =>
                     this.ssh.upload(target, localArchive, archive, {
                       timeout: 300,
@@ -785,6 +811,41 @@ export class PipelineExecutor {
     const { snapshot } = session;
     const { repoPath, outputPath, artifactType, registryId, imageRepository } = snapshot.definition;
     if (artifactType === 'FILE') {
+      if (snapshot.graph && this.physical) {
+        let kind =
+          declaration?.type === 'FILE' || declaration?.type === 'DIRECTORY'
+            ? declaration.type
+            : undefined;
+        if (!kind) {
+          const kindFromWorkspace = await this.builds.remoteCapture(
+            target,
+            `set -eu; ${enterRepositoryDirectory(work, repoPath)}; path=${q(relativePath(outputPath))}; if test -f "$path"; then printf FILE; elif test -d "$path"; then printf DIRECTORY; else exit 44; fi`,
+            session,
+          );
+          kind = kindFromWorkspace.trim() === 'FILE' ? 'FILE' : 'DIRECTORY';
+        }
+        const physical = await step('ARTIFACT', '在构建服务器保存并校验产物', () =>
+          this.physical!.collectServerPath({
+            target,
+            workspace: posix.join(work, 'repo'),
+            relativePath: posix.join(repoPath, outputPath),
+            kind,
+            instanceId: artifactIdentity(snapshot, declaration?.name, target.id).instanceId,
+            signal: session.context.signal,
+          }),
+        );
+        return this.artifacts.create(snapshot, {
+          storageType: 'REMOTE_FILE',
+          storageKey: physical.path!,
+          serverId: target.id,
+          kind,
+          name: declaration?.name,
+          persist: declaration?.persist,
+          physical,
+          checksum: physical.sha256,
+          sizeBytes: physical.sizeBytes,
+        });
+      }
       const archive =
         work + (declaration ? `/artifact-${session.taskId}.tar.gz` : '/artifact.tar.gz');
       const output = await step('PACKAGE', '打包与校验文件产物', () =>
@@ -822,7 +883,7 @@ export class PipelineExecutor {
     const composeYaml = await step('PACKAGE', '归档 Compose 配置', () =>
       this.builds.remoteComposeSnapshot(target, work, session, Boolean(declaration)),
     );
-    if (snapshot.deployAfterBuild && registryId && imageRepository) {
+    if ((snapshot.deployAfterBuild || snapshot.graph) && registryId && imageRepository) {
       const image = await step('IMAGE', '构建镜像、推送并固定Digest', () =>
         this.targetImage(target, work, session),
       );
@@ -834,6 +895,19 @@ export class PipelineExecutor {
         ...image.archive,
         composeYaml,
         serverId: target.id,
+        name: declaration?.name,
+        kind: declaration?.type,
+        persist: declaration?.persist,
+        physical: snapshot.graph
+          ? {
+              kind: 'DOCKER_IMAGE',
+              location: 'REGISTRY',
+              owner: 'EXTERNAL',
+              imageReference: image.reference,
+              digest: image.digest,
+              registryId,
+            }
+          : undefined,
       });
     }
     const image = await step('IMAGE', '构建并记录本地Docker镜像', () =>
@@ -847,6 +921,7 @@ export class PipelineExecutor {
       serverId: target.id,
       name: declaration?.name,
       kind: declaration?.type,
+      persist: declaration?.persist,
     });
   }
   private async finishDeployment(
@@ -951,7 +1026,7 @@ export class PipelineExecutor {
     );
     let health: DeploymentHealth = 'NOT_CHECKED';
     try {
-      const artifact = await this.artifacts.forDeployment(snapshot, target.id);
+      const artifact = await this.artifacts.forDeployment(snapshot, target.id, target);
       const resolved = await this.builds.resolveVariables(snapshot);
       const session: BuildSession = {
         snapshot,
@@ -970,14 +1045,24 @@ export class PipelineExecutor {
       let compose: ComposeRelease | undefined;
       let composeEvidence: ComposeReleaseEvidence | undefined;
       if (snapshot.definition.artifactType === 'FILE') {
-        if (!artifact.localArchive || !artifact.checksum)
-          throw new ConflictException('缺少已校验的回滚文件归档');
         const archive = `${rollbackWork}/artifact.tar.gz`;
-        await this.ssh.upload(target, artifact.localArchive, archive, {
-          timeout: 300,
-          signal: session.context.signal,
-        });
-        await this.prepareFileRelease(target, archive, artifact.checksum, session);
+        let checksum = artifact.checksum;
+        if (artifact.physical?.location === 'SERVER_PATH' && this.physical) {
+          ({ checksum } = await this.physical.stageServerArchive(
+            artifact.physical,
+            target,
+            archive,
+            session.context.signal,
+          ));
+        } else {
+          if (!artifact.localArchive || !checksum)
+            throw new ConflictException('缺少已校验的回滚文件归档');
+          await this.ssh.upload(target, artifact.localArchive, archive, {
+            timeout: 300,
+            signal: session.context.signal,
+          });
+        }
+        await this.prepareFileRelease(target, archive, checksum, session);
         await this.deployments.assertSourceReview(snapshot);
         await this.activateFileRelease(
           target,
@@ -1241,7 +1326,24 @@ fi
       }
     } else await this.builds.remote(target, `umask 077; mkdir -- ${q(config)}`, session, 30);
     const { compose } = await configure(image);
-    if (artifact?.imageId) await this.loadArchivedImage(target, work, docker, artifact, session);
+    if (
+      artifact?.imageId &&
+      artifact.physical?.location === 'DOCKER_ENGINE' &&
+      artifact.physical.serverId === target.id
+    ) {
+      const physical = artifact.physical;
+      const verified = await this.physical?.verify(physical, target, session.context.signal);
+      if (verified?.status !== 'AVAILABLE')
+        throw new ConflictException(verified?.reason ?? '目标端登记镜像无法验证');
+      await this.builds.remote(
+        target,
+        `test "$(${docker} image inspect --format '{{.Id}}' -- ${q(image)})" = ${q(artifact.imageId)}`,
+        session,
+        30,
+        '登记镜像的引用已变化，请重新选择产物',
+      );
+    } else if (artifact?.imageId)
+      await this.loadArchivedImage(target, work, docker, artifact, session);
     try {
       await this.builds.remote(
         target,

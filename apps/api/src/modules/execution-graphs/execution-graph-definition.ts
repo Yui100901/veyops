@@ -28,11 +28,12 @@ import {
   GraphField,
   graphArtifactTypes,
   graphModulePorts,
+  graphReferenceFormat,
   safeGraphId,
   type GraphArtifactType,
   type GraphBinding,
 } from './graph-fields';
-import { validateFlowBindings } from './graph-binding-validation';
+import { validateFlowBindings, type GraphCompiledFlow } from './graph-binding-validation';
 
 const idFormat = /^[A-Za-z0-9_-]{1,64}$/;
 const maxFlows = 50;
@@ -134,6 +135,7 @@ export class GraphArtifactDeclaration {
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) path?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(512) imageReference?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() required?: boolean;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() persist?: boolean;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) composeFilePath?: string;
 }
 
@@ -145,9 +147,26 @@ class GraphRegisterArtifacts {
   artifacts!: GraphArtifactDeclaration[];
 }
 
+class GraphEnvironmentPathRule {
+  @Matches(idFormat) key!: string;
+  @IsObject() paths!: Record<string, string>;
+}
+
 class GraphLoadEnvironment {
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) envFile?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) directory?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() required?: boolean;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphEnvironmentPathRule)
+  pathRule?: GraphEnvironmentPathRule;
+}
+
+export class GraphEnvironmentSet {
+  @IsIn(['NONE', 'FIXED', 'INPUT']) mode!: 'NONE' | 'FIXED' | 'INPUT';
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() environmentSetId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) fieldId?: string;
 }
 
 export class GraphBuildSettings {
@@ -191,6 +210,7 @@ export class GraphDeploySettings {
 export class GraphNode {
   @Matches(idFormat) id!: string;
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) referenceName?: string;
   @IsIn(nodeTypes) type!: (typeof nodeTypes)[number];
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(80) moduleId?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsInt() @Min(1) moduleVersion?: number;
@@ -226,6 +246,11 @@ export class GraphNode {
   @ValidateNested()
   @Type(() => GraphLoadEnvironment)
   loadEnvironment?: GraphLoadEnvironment;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphEnvironmentSet)
+  environmentSet?: GraphEnvironmentSet;
   @ValidateIf((_o, v) => v !== undefined)
   @IsString()
   @Length(1, 2000)
@@ -279,9 +304,11 @@ class GraphFlowConfiguration {
   @IsOptional() @IsUUID() serviceId?: string;
   @IsOptional() @IsObject() inputBindings?: Record<string, Record<string, GraphBinding>>;
   @IsOptional() @IsObject() outputBindings?: Record<string, GraphBinding>;
+  @IsOptional() @IsObject() environmentBindings?: Record<string, Record<string, GraphBinding>>;
   @IsOptional() @IsObject() edgeSelections?: Record<string, string[]>;
 }
 export class GraphFlow extends GraphFlowConfiguration {
+  compiled?: GraphCompiledFlow;
   @Matches(idFormat) id!: string;
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
   @IsArray()
@@ -533,7 +560,8 @@ export function validateGraphDefinition(definition: GraphDefinition) {
           (node.build !== undefined && node.type !== 'BUILD') ||
           (node.deploy !== undefined && node.type !== 'DEPLOY_ARTIFACT') ||
           (node.registerArtifacts !== undefined && node.type !== 'REGISTER_ARTIFACT') ||
-          (node.loadEnvironment !== undefined && node.type !== 'LOAD_ENV')
+          (node.loadEnvironment !== undefined && node.type !== 'LOAD_ENV') ||
+          (node.environmentSet !== undefined && node.type !== 'START')
         )
           throw new BadRequestException('功能配置与节点模块不匹配');
         if (node.type === 'DEPLOY_ARTIFACT' && node.deploy?.deployPath)
@@ -597,6 +625,10 @@ export function validateGraphDefinition(definition: GraphDefinition) {
     return total;
   };
   for (const flowId of calls.keys()) count(flowId);
-  for (const flow of definition.flows)
-    validateFlowBindings(flow, definition.flows, orderedFlowNodes(flow));
+  return Object.fromEntries(
+    definition.flows.map((flow) => [
+      flow.id,
+      validateFlowBindings(flow, definition.flows, orderedFlowNodes(flow)),
+    ]),
+  );
 }

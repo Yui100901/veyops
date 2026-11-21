@@ -15,8 +15,10 @@ import {
   Section,
   Status,
 } from '../components';
-import type { DeploymentSummary, Environment, Project, User } from '../models';
+import type { DeploymentSummary, Project, Server, ServerGroup, Service, User } from '../models';
 import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
+import { projectResourcePath } from './project-workspace-route';
+import { serverResourceHref } from './server-resource-route';
 
 interface ViewSummary {
   id: string;
@@ -39,7 +41,7 @@ interface ViewProject extends Pick<
   Project,
   'id' | 'name' | 'slug' | 'description' | 'status' | 'tags'
 > {
-  environments: Pick<Environment, 'id' | 'name' | 'environmentType'>[];
+  services: Pick<Service, 'id' | 'name'>[];
   deploymentStatus: keyof typeof deploymentStates;
   recentDeployments: (Omit<DeploymentSummary, 'serverId' | 'releaseVersion'> & {
     serverId: string | null;
@@ -55,8 +57,19 @@ interface ViewDetail extends ViewSummary {
   projects: ViewProject[];
 }
 
-function ProjectViewCard({ project, viewId }: { project: ViewProject; viewId: string }) {
+function ProjectViewCard({
+  project,
+  viewId,
+  viewSearch,
+}: {
+  project: ViewProject;
+  viewId: string;
+  viewSearch?: string;
+}) {
   const deploymentState = deploymentStates[project.deploymentStatus];
+  const serviceHref = (serviceId: string) =>
+    '#' +
+    projectResourcePath(project.id, { resource: 'services', serviceId, view: viewId, viewSearch });
   return (
     <article className="project-view-card">
       <header className="project-view-card-header">
@@ -67,7 +80,7 @@ function ProjectViewCard({ project, viewId }: { project: ViewProject; viewId: st
           <h3>
             <a
               className="text-link"
-              href={`#/projects/${encodeURIComponent(project.id)}?view=${encodeURIComponent(viewId)}`}
+              href={'#' + projectResourcePath(project.id, { view: viewId, viewSearch })}
             >
               {project.name}
             </a>
@@ -83,12 +96,12 @@ function ProjectViewCard({ project, viewId }: { project: ViewProject; viewId: st
         </span>
       </header>
       {project.description && <p className="project-view-description">{project.description}</p>}
-      {project.environments.length > 0 && (
-        <div className="tags project-view-environments" aria-label="运行环境">
-          {project.environments.map((environment) => (
-            <span key={environment.id} className="tag">
-              {environment.name}
-            </span>
+      {project.services?.length > 0 && (
+        <div className="tags project-view-environments" aria-label="项目服务">
+          {project.services.map((service) => (
+            <a key={service.id} className="tag text-link" href={serviceHref(service.id)}>
+              {service.name}
+            </a>
           ))}
         </div>
       )}
@@ -100,14 +113,6 @@ function ProjectViewCard({ project, viewId }: { project: ViewProject; viewId: st
         ) : (
           <ul className="project-view-deployments">
             {project.recentDeployments.map((deployment) => {
-              const context = [
-                deployment.environmentName ??
-                  project.environments.find(({ id }) => id === deployment.environmentId)?.name,
-                deployment.serviceName,
-                deployment.serverName,
-              ]
-                .filter(Boolean)
-                .join(' · ');
               return (
                 <li key={deployment.id}>
                   <div>
@@ -115,8 +120,16 @@ function ProjectViewCard({ project, viewId }: { project: ViewProject; viewId: st
                       className="text-link"
                       href={`#/tasks/${encodeURIComponent(deployment.taskId)}`}
                     >
-                      {context || '查看部署任务'}
+                      {deployment.serviceName || '查看部署任务'}
                     </a>
+                    {deployment.serverId && (
+                      <a
+                        className="text-link project-view-server-link"
+                        href={serverResourceHref({ serverId: deployment.serverId })}
+                      >
+                        {deployment.serverName || deployment.serverId}
+                      </a>
+                    )}
                     <small className="muted">
                       {formatTime(deployment.finishedAt ?? deployment.startedAt)}
                       {deployment.releaseVersion && (
@@ -327,18 +340,47 @@ function ViewEditor({
   );
 }
 
-export function ProjectViewsPage({ user, id }: { user: User; id?: string }) {
+export function ProjectViewsPage({
+  user,
+  id,
+  search,
+}: {
+  user: User;
+  id?: string;
+  search?: string;
+}) {
   const catalog = useResource<{ views: ViewSummary[]; defaultViewId: string }>('/views');
   const selectedId = id || catalog.data?.defaultViewId;
+  const filters = new URLSearchParams(search);
+  const serviceId = filters.get('serviceId') ?? '';
+  const serverId = filters.get('serverId') ?? '';
+  const groupId = filters.get('groupId') ?? '';
+  const viewPath = selectedId ? `/views/${encodeURIComponent(selectedId)}` : null;
+  const viewSearch = filters.toString();
+  const unfiltered = useResource<ViewDetail>(viewSearch ? viewPath : null);
   const detail = useResource<ViewDetail>(
-    selectedId ? `/views/${encodeURIComponent(selectedId)}` : null,
+    viewPath && viewSearch ? `${viewPath}?${viewSearch}` : viewPath,
   );
+  const servers = useResource<Server[]>('/servers');
+  const groups = useResource<ServerGroup[]>('/server-groups');
   const selected = detail.data?.id === selectedId ? detail.data : undefined;
+  const serviceProjects = (unfiltered.data ?? selected)?.projects ?? [];
   const [editor, setEditor] = useInlineEditor<ViewSummary | 'new'>();
   const [deleting, setDeleting] = useState<ViewSummary>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const canEdit = user.role !== 'VIEWER';
+
+  function applyFilters(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const params = new URLSearchParams();
+    const service = String(data.get('service') ?? '');
+    const [kind, target] = String(data.get('target') ?? '').split(':');
+    if (service) params.set('serviceId', service);
+    if (target && (kind === 'serverId' || kind === 'groupId')) params.set(kind, target);
+    if (viewPath) navigate(viewPath + (params.size ? '?' + params : ''));
+  }
 
   async function deleteView() {
     if (!deleting || busy) return;
@@ -374,13 +416,14 @@ export function ProjectViewsPage({ user, id }: { user: User; id?: string }) {
     <>
       <PageHeader
         title="项目视图"
-        description="按环境、部署状态或自选项目查看最近交付。"
+        description="按项目服务、服务器分组或实际服务器查看最近发布。"
         action={
           <>
             <RefreshButton
               onClick={() => {
                 void catalog.reload();
                 void detail.reload();
+                if (viewSearch) void unfiltered.reload();
               }}
             />
             {canEdit && (
@@ -454,10 +497,87 @@ export function ProjectViewsPage({ user, id }: { user: User; id?: string }) {
                     )
                   }
                 >
+                  <form
+                    className="delivery-filters project-view-filters"
+                    key={viewSearch}
+                    onSubmit={applyFilters}
+                  >
+                    <label>
+                      服务
+                      <select name="service" defaultValue={serviceId}>
+                        <option value="">全部服务</option>
+                        {serviceId &&
+                          !serviceProjects.some((project) =>
+                            project.services?.some(({ id }) => id === serviceId),
+                          ) && <option value={serviceId}>所选服务</option>}
+                        {serviceProjects.map((project) => (
+                          <optgroup key={project.id} label={project.name}>
+                            {project.services?.map((service) => (
+                              <option key={service.id} value={service.id}>
+                                {service.name}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      部署目标
+                      <select
+                        name="target"
+                        defaultValue={
+                          serverId ? `serverId:${serverId}` : groupId ? `groupId:${groupId}` : ''
+                        }
+                      >
+                        <option value="">全部目标</option>
+                        {serverId && !servers.data?.some(({ id }) => id === serverId) && (
+                          <option value={`serverId:${serverId}`}>所选服务器</option>
+                        )}
+                        {groupId && !groups.data?.some(({ id }) => id === groupId) && (
+                          <option value={`groupId:${groupId}`}>所选分组</option>
+                        )}
+                        <optgroup label="服务器分组">
+                          {groups.data?.map((group) => (
+                            <option key={group.id} value={`groupId:${group.id}`}>
+                              {group.name}
+                            </option>
+                          ))}
+                        </optgroup>
+                        <optgroup label="服务器">
+                          {servers.data?.map((server) => (
+                            <option key={server.id} value={`serverId:${server.id}`}>
+                              {server.name}
+                            </option>
+                          ))}
+                        </optgroup>
+                      </select>
+                    </label>
+                    <button type="submit" className="button secondary small">
+                      筛选
+                    </button>
+                    {viewSearch && (
+                      <a className="text-link" href={'#' + viewPath}>
+                        清除筛选
+                      </a>
+                    )}
+                  </form>
+                  <ErrorBanner
+                    error={servers.error || groups.error || unfiltered.error}
+                    retry={() => {
+                      void servers.reload();
+                      void groups.reload();
+                      if (viewSearch) void unfiltered.reload();
+                    }}
+                  />
                   {selected.projects.length ? (
                     <div className="project-views-grid">
                       {selected.projects.map((project) => (
-                        <ProjectViewCard key={project.id} project={project} viewId={selected.id} />
+                        <ProjectViewCard
+                          key={project.id}
+                          project={project}
+                          viewId={selected.id}
+                          viewSearch={viewSearch || undefined}
+                        />
                       ))}
                     </div>
                   ) : (

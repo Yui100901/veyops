@@ -15,7 +15,10 @@ import { redactTaskLog } from '../tasks/task-log.service';
 import type { GraphFlow, GraphNode } from './execution-graph-definition';
 
 export const graphIdFormat = /^[A-Za-z0-9_-]{1,64}$/;
+export const graphReferenceFormat = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
+export const graphEnvironmentKeyFormat = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 export const graphArtifactTypes = ['FILE', 'DIRECTORY', 'DOCKER_IMAGE'] as const;
+export const graphMissingPolicies = ['ERROR', 'OMIT', 'USE_DEFAULT', 'REPOSITORY_DEFAULT'] as const;
 export const graphFieldTypes = {
   TEXT: '文本',
   NUMBER: '数值',
@@ -23,6 +26,7 @@ export const graphFieldTypes = {
   REPOSITORY: '项目仓库',
   GIT_REF: 'Git 版本',
   ENVIRONMENT: '项目环境',
+  ENVIRONMENT_SET: '环境变量集合',
   SERVICE: '项目服务',
   TARGETS: '服务器或分组',
   ARTIFACT: '构建产物',
@@ -42,6 +46,8 @@ export type GraphArtifactType = (typeof graphArtifactTypes)[number];
 export class GraphField {
   @Matches(graphIdFormat) id!: string;
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) referenceName?: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) exportName?: string;
   @IsIn(Object.keys(graphFieldTypes)) type!: GraphFieldType;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() required?: boolean;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() multiple?: boolean;
@@ -58,22 +64,35 @@ export class GraphField {
   source?: 'CURRENT_RUN';
 }
 
-export type GraphBinding =
+export type GraphMissingPolicy = (typeof graphMissingPolicies)[number];
+export type GraphBinding = (
   | { kind: 'INPUT'; fieldId: string }
+  | { kind: 'NODE_INPUT'; fieldId: string }
   | { kind: 'OUTPUT'; nodeId: string; fieldId: string }
   | { kind: 'CONTEXT'; fieldId: string }
   | { kind: 'VALUE'; value: unknown }
-  | { kind: 'FIRST_AVAILABLE'; sources: GraphBinding[] };
+  | { kind: 'ENVIRONMENT_KEY'; key: string }
+  | { kind: 'CREDENTIAL'; credentialId: string }
+  | { kind: 'FIRST_AVAILABLE'; sources: GraphBinding[] }
+  | { kind: 'AS_GIT_REF'; refKind: 'BRANCH' | 'TAG'; source: GraphBinding }
+) & { onMissing?: GraphMissingPolicy };
 
 export interface GraphDiagnostic {
   flowId?: string;
   nodeId?: string;
   fieldId?: string;
+  sourceNodeId?: string;
+  sourceFieldId?: string;
+  branchId?: string;
+  severity?: 'ERROR' | 'WARNING';
   message: string;
 }
 
 export class GraphCompileError extends BadRequestException {
-  constructor(readonly issue: GraphDiagnostic) {
+  constructor(
+    readonly issue: GraphDiagnostic,
+    readonly issues = [issue],
+  ) {
     super(issue.message);
   }
 }
@@ -83,6 +102,19 @@ export function safeGraphId(value: unknown): value is string {
     typeof value === 'string' &&
     graphIdFormat.test(value) &&
     !['__proto__', 'prototype', 'constructor'].includes(value)
+  );
+}
+
+export function safeGraphReference(value: unknown): value is string {
+  return typeof value === 'string' && graphReferenceFormat.test(value) && safeGraphId(value);
+}
+
+export function safeGraphEnvironmentKey(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    graphEnvironmentKeyFormat.test(value) &&
+    safeGraphId(value) &&
+    !/^VEYOPS_/i.test(value)
   );
 }
 
@@ -118,9 +150,14 @@ function scalar(field: GraphField, value: unknown): boolean {
       return typeof value === 'boolean';
     case 'REPOSITORY':
     case 'ENVIRONMENT':
-    case 'SERVICE':
+    case 'ENVIRONMENT_SET':
     case 'CREDENTIAL':
       return uuid(value);
+    case 'SERVICE':
+      return (
+        uuid(value) ||
+        (graphRecord(value) && Object.keys(value).length === 1 && uuid(value.serviceId))
+      );
     case 'GIT_REF':
       return (
         graphRecord(value) &&
@@ -170,10 +207,20 @@ function scalar(field: GraphField, value: unknown): boolean {
       return (
         uuid(value) ||
         (graphRecord(value) &&
-          uuid(value.id) &&
-          (value.checksum === undefined ||
-            value.checksum === null ||
-            typeof value.checksum === 'string'))
+          ((uuid(value.temporaryArtifactId) &&
+            value.artifactId === undefined &&
+            value.instanceId === undefined &&
+            value.id === undefined) ||
+            (uuid(value.artifactId ?? value.id) &&
+              value.temporaryArtifactId === undefined &&
+              (value.artifactId === undefined ||
+                value.id === undefined ||
+                value.artifactId === value.id ||
+                value.instanceId === value.id) &&
+              (value.instanceId === undefined || uuid(value.instanceId)) &&
+              (value.checksum === undefined ||
+                value.checksum === null ||
+                typeof value.checksum === 'string'))))
       );
     case 'SOURCE':
       return graphRecord(value) && uuid(value.repositoryId) && sha(value.commitSha);
@@ -210,6 +257,7 @@ export function validateGraphField(field: GraphField, declaration: 'INPUT' | 'OU
     return '仅输出产物可以选择本次运行的来源约束';
   if (field.selection && (declaration !== 'INPUT' || field.type !== 'ARTIFACT'))
     return '仅产物输入可以使用最新兼容产物规则';
+  if (declaration === 'OUTPUT' && field.type === 'CREDENTIAL') return '凭据引用仅可用于执行输入';
   if (
     field.artifactType &&
     (field.type !== 'ARTIFACT' || !graphArtifactTypes.includes(field.artifactType))
@@ -219,7 +267,7 @@ export function validateGraphField(field: GraphField, declaration: 'INPUT' | 'OU
     field.options &&
     (!Array.isArray(field.options) ||
       field.options.length > 100 ||
-      !['TEXT', 'NUMBER', 'BOOLEAN'].includes(field.type) ||
+      !['TEXT', 'NUMBER', 'BOOLEAN', 'ENVIRONMENT_SET'].includes(field.type) ||
       field.options.some(
         (option) =>
           !scalar(field, option) ||
@@ -228,6 +276,10 @@ export function validateGraphField(field: GraphField, declaration: 'INPUT' | 'OU
       new Set(field.options).size !== field.options.length)
   )
     return '选项须为符合字段类型的不同值';
+  if (field.referenceName !== undefined && !safeGraphReference(field.referenceName))
+    return '字段引用名无效';
+  if (field.exportName !== undefined && !safeGraphReference(field.exportName))
+    return '字段导出名无效';
   if (
     field.defaultValue !== undefined &&
     (declaration !== 'INPUT' ||
@@ -246,25 +298,38 @@ export function validateGraphField(field: GraphField, declaration: 'INPUT' | 'OU
 
 export function validateGraphBinding(binding: unknown, depth = 0): binding is GraphBinding {
   if (depth > 3 || !graphRecord(binding)) return false;
+  const keys = Object.keys(binding).filter((key) => key !== 'onMissing');
+  if (
+    Object.hasOwn(binding, 'onMissing') &&
+    (depth !== 0 || !graphMissingPolicies.includes(binding.onMissing as GraphMissingPolicy))
+  )
+    return false;
   switch (binding.kind) {
     case 'INPUT':
+    case 'NODE_INPUT':
     case 'CONTEXT':
-      return safeGraphId(binding.fieldId) && Object.keys(binding).length === 2;
+      return safeGraphId(binding.fieldId) && keys.length === 2;
     case 'OUTPUT':
-      return (
-        safeGraphId(binding.nodeId) &&
-        safeGraphId(binding.fieldId) &&
-        Object.keys(binding).length === 3
-      );
+      return safeGraphId(binding.nodeId) && safeGraphId(binding.fieldId) && keys.length === 3;
     case 'VALUE':
-      return Object.hasOwn(binding, 'value') && Object.keys(binding).length === 2;
+      return Object.hasOwn(binding, 'value') && keys.length === 2;
+    case 'ENVIRONMENT_KEY':
+      return safeGraphEnvironmentKey(binding.key) && keys.length === 2;
+    case 'CREDENTIAL':
+      return uuid(binding.credentialId) && keys.length === 2;
+    case 'AS_GIT_REF':
+      return (
+        (binding.refKind === 'BRANCH' || binding.refKind === 'TAG') &&
+        validateGraphBinding(binding.source, depth + 1) &&
+        keys.length === 3
+      );
     case 'FIRST_AVAILABLE':
       return (
         Array.isArray(binding.sources) &&
-        binding.sources.length >= 2 &&
+        binding.sources.length >= 1 &&
         binding.sources.length <= 16 &&
         binding.sources.every((source) => validateGraphBinding(source, depth + 1)) &&
-        Object.keys(binding).length === 2
+        keys.length === 2
       );
     default:
       return false;
@@ -292,6 +357,7 @@ export const graphContextFields = [
   field('projectId', 'TEXT', true, '项目 ID'),
   field('serviceId', 'SERVICE'),
   field('environmentId', 'ENVIRONMENT'),
+  field('environmentSetId', 'ENVIRONMENT_SET'),
   field('triggeredAt', 'NUMBER', true, '触发时间'),
   field('triggerCommitSha', 'TEXT', false, '触发事件提交 SHA'),
 ];
@@ -303,6 +369,7 @@ const serviceEnvTargets = [
 const shellInputs = [
   field('workspace', 'WORKSPACE'),
   field('source', 'SOURCE'),
+  field('service', 'SERVICE'),
   field('environment', 'ENVIRONMENT'),
   field('targets', 'TARGETS'),
   field('variables', 'VARIABLES'),
@@ -338,8 +405,18 @@ const branchValue = {
 const graphModules = {
   CHECKOUT: modulePorts(
     'git.checkout',
-    [field('repository', 'REPOSITORY', true), field('version', 'GIT_REF', true)],
-    [field('source', 'SOURCE', true), field('workspace', 'WORKSPACE', true)],
+    [field('repository', 'REPOSITORY', true), field('version', 'GIT_REF')],
+    [
+      field('source', 'SOURCE', true),
+      field('workspace', 'WORKSPACE', true),
+      field('repositoryId', 'REPOSITORY', true, '实际仓库 ID'),
+      field('repositoryName', 'TEXT', true, '实际仓库名称'),
+      field('ref', 'TEXT', true, '实际 Git 引用'),
+      field('branch', 'TEXT', false, '实际分支'),
+      field('tag', 'TEXT', false, '实际标签'),
+      field('commitSha', 'TEXT', true, '实际 Git SHA'),
+      field('subject', 'TEXT', false, '提交摘要'),
+    ],
   ),
   LOAD_ENV: modulePorts(
     'environment.load',
@@ -387,11 +464,12 @@ const graphModules = {
 
 export const graphCatalog = {
   fieldTypes: graphFieldTypes,
+  missingPolicies: graphMissingPolicies,
   contextFields: graphContextFields,
   inputPresets: [
     field('repository', 'REPOSITORY', true),
-    field('version', 'GIT_REF', true),
-    field('environment', 'ENVIRONMENT', true),
+    field('version', 'GIT_REF'),
+    field('environmentSet', 'ENVIRONMENT_SET', true),
     field('service', 'SERVICE', true),
     field('targets', 'TARGETS', true),
     field('artifact', 'ARTIFACT', true, '输入构建产物'),

@@ -50,7 +50,17 @@
   color: #3c5361;
   font-size: 0.84rem;
   font-weight: 600;
-  margin: 0 0 0.4rem;
+  margin: 0;
+}
+.project-access-toolbar,
+.project-access-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+.project-access-toolbar {
+  margin-bottom: 0.45rem;
 }
 .project-view-card > .project-access {
   margin-top: 0.9rem;
@@ -67,7 +77,7 @@
   min-width: 0;
   max-width: 100%;
 }
-.project-access li > a {
+.project-access .project-access-link {
   display: inline-flex;
   gap: 0.6rem;
   align-items: center;
@@ -83,21 +93,34 @@
   line-height: 1.35;
   text-decoration: none;
 }
-.project-access a small {
-  display: block;
-  font-size: 0.78rem;
-  font-weight: 400;
-}
-.project-access a > span {
+.project-access-link > span {
   overflow-wrap: anywhere;
   min-width: 0;
 }
-.project-access a > svg {
+.project-access-link > svg {
   flex-shrink: 0;
 }
-.project-access a:hover,
-.project-access a:focus-visible {
+.project-access-link:hover,
+.project-access-link:focus-visible {
   background: #d9f1e8;
   border-color: #518975;
   text-decoration: underline;
+}
+.project-access .project-access-expanded {
+  display: grid;
+}
+.project-access-url,
+.project-access-service {
+  display: block;
+  margin-top: 0.3rem;
+  overflow-wrap: anywhere;
+}
+.project-access-feedback,
+.project-access-empty {
+  color: #526675;
+  font-size: 0.85rem;
+  margin: 0.5rem 0 0;
+}
+.project-view-server-link {
+  margin-left: 0.6rem;
 }

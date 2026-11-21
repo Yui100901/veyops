@@ -1,7 +1,9 @@
 import type { ProjectDetail } from '../models';
 import type { FlowBindings, GraphField, GraphNode } from './execution-graph-definition';
 import type { GraphPane, GraphWorkbenchScope } from './graph-workbench-context';
+import { graphWorkbenchPath } from './graph-workbench-context';
 import { projectResourcePath } from './project-workspace-route';
+import { serverResourceHref } from './server-resource-route';
 
 export function ExecutionGraphResourceLinks({
   node,
@@ -24,6 +26,7 @@ export function ExecutionGraphResourceLinks({
 }) {
   const context = {
     view: scope.view,
+    viewSearch: scope.viewSearch,
     graphPane: pane,
     graphVersion: version === undefined ? undefined : String(version),
     graphNode: node.id,
@@ -32,14 +35,39 @@ export function ExecutionGraphResourceLinks({
     graphEnvironmentId: scope.environmentId,
     graphResourcePanel: scope.resourcePanel,
   };
-  type Resource = 'repositories' | 'services' | 'environments' | 'servers';
+  type Resource = 'repositories' | 'services' | 'environments' | 'environment-sets' | 'servers';
   const links = new Map<string, { href: string; label: string }>();
   function add(resource: Resource, value: unknown) {
-    const id = typeof value === 'string' ? value : undefined;
+    const id =
+      typeof value === 'string'
+        ? value
+        : value &&
+            typeof value === 'object' &&
+            'serviceId' in value &&
+            typeof value.serviceId === 'string'
+          ? value.serviceId
+          : undefined;
     if (!id) return;
+    if (resource === 'servers') {
+      links.set('servers:' + id, {
+        href: serverResourceHref({
+          serverId: id,
+          projectId: project.id,
+          returnPath: graphWorkbenchPath(project.id, {
+            ...scope,
+            pane,
+            node: node.id,
+            flow: flowId,
+            version,
+          }),
+        }),
+        label: '服务器及来源',
+      });
+      return;
+    }
     const label =
-      resource === 'servers'
-        ? '服务器及来源'
+      resource === 'environment-sets'
+        ? '变量集合'
         : project[resource].find((item) => item.id === id)?.name;
     if (!label) return;
     const location = {
@@ -48,7 +76,7 @@ export function ExecutionGraphResourceLinks({
       repositoryId: resource === 'repositories' ? id : undefined,
       serviceId: resource === 'services' ? id : undefined,
       environmentId: resource === 'environments' ? id : undefined,
-      serverId: resource === 'servers' ? id : undefined,
+      environmentSetId: resource === 'environment-sets' ? id : undefined,
     };
     links.set(`${resource}:${id}`, {
       href: '#' + projectResourcePath(project.id, location),
@@ -59,6 +87,7 @@ export function ExecutionGraphResourceLinks({
     REPOSITORY: 'repositories',
     SERVICE: 'services',
     ENVIRONMENT: 'environments',
+    ENVIRONMENT_SET: 'environment-sets',
   } as const;
   const ports = {
     repository: 'REPOSITORY',
@@ -75,6 +104,8 @@ export function ExecutionGraphResourceLinks({
   add('servers', node.shell?.serverId);
   if (node.type === 'START') {
     add('services', flow?.serviceId);
+    if (node.environmentSet?.mode === 'FIXED')
+      add('environment-sets', node.environmentSet.environmentSetId);
     for (const field of node.inputs ?? []) addField(field);
   }
   const bindings = flow?.inputBindings?.[node.id];

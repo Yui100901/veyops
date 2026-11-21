@@ -30,6 +30,7 @@ export async function lockAvailableArtifacts(tx: Transaction<Database>, ids: rea
       .updateTable('artifacts')
       .set((eb) => ({ pinned_at: eb.ref('pinned_at') }))
       .where('id', '=', id)
+      .where('lifecycle_state', '=', 'ACTIVE')
       .where((eb) =>
         eb.or([eb('pruned_at', 'is', null), eb('storage_type', '=', 'REGISTRY_IMAGE')]),
       )

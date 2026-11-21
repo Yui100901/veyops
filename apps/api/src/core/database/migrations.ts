@@ -1722,7 +1722,11 @@ export const migrationProvider: MigrationProvider = {
                 columns: [
                   ['id', 'text', { primaryKey: true }],
                   ['service_id', 'text', { references: 'services.id', onDelete: 'cascade' }],
-                  ['environment_id', 'text', { references: 'environments.id', onDelete: 'cascade' }],
+                  [
+                    'environment_id',
+                    'text',
+                    { references: 'environments.id', onDelete: 'cascade' },
+                  ],
                   ['version', 'integer'],
                   ['content', 'text', { nullable: true }],
                   ['checksum', 'text', { nullable: true }],
@@ -1744,8 +1748,219 @@ export const migrationProvider: MigrationProvider = {
             .execute();
         },
         async down(db) {
-          await db.schema.alterTable('deployment_records').dropColumn('compose_release_json').execute();
+          await db.schema
+            .alterTable('deployment_records')
+            .dropColumn('compose_release_json')
+            .execute();
           await db.schema.dropTable('service_compose_templates').execute();
+        },
+      } satisfies Migration,
+      '028_service_addresses': {
+        async up(db) {
+          await db.schema
+            .alterTable('services')
+            .addColumn('revision', 'integer', (column) => column.notNull().defaultTo(1))
+            .execute();
+          await createTables(
+            db,
+            [
+              {
+                name: 'service_addresses',
+                columns: [
+                  ['id', 'text', { primaryKey: true }],
+                  ['service_id', 'text', { references: 'services.id', onDelete: 'cascade' }],
+                  ['name', 'text'],
+                  ['url', 'text'],
+                  ['position', 'integer'],
+                ],
+                unique: [['service_id', 'position']],
+                checks: ['position >= 0'],
+              },
+            ],
+            [],
+          );
+        },
+        async down(db) {
+          await db.schema.dropTable('service_addresses').execute();
+          await db.schema.alterTable('services').dropColumn('revision').execute();
+        },
+      } satisfies Migration,
+      '029_project_environment_sets': {
+        async up(db) {
+          await createTables(
+            db,
+            [
+              {
+                name: 'project_environment_sets',
+                columns: [
+                  ['id', 'text', { primaryKey: true }],
+                  ['project_id', 'text', { references: 'projects.id', onDelete: 'cascade' }],
+                  ['name', 'text'],
+                  ['description', 'text', { default: '' }],
+                  ['revision', 'integer', { default: 1 }],
+                  ['archived_at', 'bigint', { nullable: true }],
+                  ['created_at', 'bigint'],
+                  ['updated_at', 'bigint'],
+                ],
+                checks: ['revision >= 1', 'length(name) between 1 and 100'],
+              },
+              {
+                name: 'project_environment_set_variables',
+                columns: [
+                  ['id', 'text', { primaryKey: true }],
+                  [
+                    'environment_set_id',
+                    'text',
+                    { references: 'project_environment_sets.id', onDelete: 'cascade' },
+                  ],
+                  ['key', 'text'],
+                  ['value_text', 'text', { nullable: true }],
+                  [
+                    'credential_id',
+                    'text',
+                    { references: 'credentials.id', onDelete: 'restrict', nullable: true },
+                  ],
+                  ['is_secret', 'integer', { default: 0 }],
+                  ['description', 'text', { default: '' }],
+                  ['created_at', 'bigint'],
+                  ['updated_at', 'bigint'],
+                ],
+                unique: [['environment_set_id', 'key']],
+                checks: [
+                  'length(key) between 1 and 128',
+                  '(is_secret = 0 and value_text is not null and credential_id is null) or (is_secret = 1 and value_text is null and credential_id is not null)',
+                ],
+              },
+            ],
+            [['project_environment_sets', ['project_id', 'archived_at', 'name']]],
+          );
+        },
+        async down(db) {
+          await db.schema.dropTable('project_environment_set_variables').execute();
+          await db.schema.dropTable('project_environment_sets').execute();
+        },
+      } satisfies Migration,
+      '030_graph_node_evidence': {
+        async up(db) {
+          await db.schema
+            .alterTable('execution_node_runs')
+            .addColumn('evidence_json', 'text')
+            .execute();
+        },
+        async down(db) {
+          await db.schema.alterTable('execution_node_runs').dropColumn('evidence_json').execute();
+        },
+      } satisfies Migration,
+      '031_artifact_physical_instances': {
+        async up(db) {
+          for (const column of [
+            'logical_artifact_id',
+            'physical_json',
+            'physical_key',
+            'temporary_root_id',
+            'environment_set_id',
+            'verification_status',
+            'verification_reason',
+            'verified_by',
+          ])
+            await db.schema.alterTable('artifacts').addColumn(column, 'text').execute();
+          await db.schema.alterTable('artifacts').addColumn('verified_at', 'bigint').execute();
+          await db.schema
+            .alterTable('artifacts')
+            .addColumn('lifecycle_state', 'text', (column) => column.notNull().defaultTo('ACTIVE'))
+            .execute();
+          await db.schema
+            .createIndex('artifacts_logical_instance')
+            .on('artifacts')
+            .columns(['project_id', 'logical_artifact_id', 'lifecycle_state'])
+            .execute();
+          await db.schema
+            .createIndex('artifacts_physical_location')
+            .on('artifacts')
+            .columns(['physical_key', 'lifecycle_state'])
+            .execute();
+          await db.schema
+            .createIndex('artifacts_temporary_root')
+            .on('artifacts')
+            .columns(['temporary_root_id', 'lifecycle_state'])
+            .execute();
+        },
+        async down(db) {
+          for (const index of [
+            'artifacts_temporary_root',
+            'artifacts_physical_location',
+            'artifacts_logical_instance',
+          ])
+            await db.schema.dropIndex(index).execute();
+          for (const column of [
+            'verified_by',
+            'verified_at',
+            'verification_reason',
+            'verification_status',
+            'lifecycle_state',
+            'environment_set_id',
+            'temporary_root_id',
+            'physical_key',
+            'physical_json',
+            'logical_artifact_id',
+          ])
+            await db.schema.alterTable('artifacts').dropColumn(column).execute();
+        },
+      } satisfies Migration,
+      '032_artifact_cleanup_jobs': {
+        async up(db) {
+          await createTables(
+            db,
+            [
+              {
+                name: 'artifact_cleanup_jobs',
+                columns: [
+                  ['id', 'text', { primaryKey: true }],
+                  ['request_key', 'text'],
+                  ['request_hash', 'text'],
+                  ['requested_by', 'text', { nullable: true }],
+                  ['authorized_by', 'text', { nullable: true }],
+                  ['created_at', 'bigint'],
+                ],
+                unique: [['request_key']],
+              },
+              {
+                name: 'artifact_cleanup_items',
+                columns: [
+                  [
+                    'job_id',
+                    'text',
+                    { references: 'artifact_cleanup_jobs.id', onDelete: 'cascade' },
+                  ],
+                  ['instance_id', 'text', { references: 'artifacts.id', onDelete: 'restrict' }],
+                  ['artifact_id', 'text'],
+                  ['group_key', 'text'],
+                  ['action', 'text'],
+                  ['status', 'text'],
+                  ['attempts', 'integer', { default: 0 }],
+                  ['cycle_attempts', 'integer', { default: 0 }],
+                  ['reason', 'text', { nullable: true }],
+                  ['available_at', 'bigint', { nullable: true }],
+                  ['lease_id', 'text', { nullable: true }],
+                  ['lease_until', 'bigint', { nullable: true }],
+                  ['updated_at', 'bigint'],
+                ],
+                primaryKey: ['job_id', 'instance_id'],
+                checks: [
+                  "action in ('REMOVE', 'DETACH')",
+                  "status in ('PENDING', 'RUNNING', 'RETRY', 'DELETED', 'RETAINED')",
+                ],
+              },
+            ],
+            [
+              ['artifact_cleanup_items', ['status', 'available_at', 'lease_until']],
+              ['artifact_cleanup_items', ['job_id', 'group_key']],
+            ],
+          );
+        },
+        async down(db) {
+          await db.schema.dropTable('artifact_cleanup_items').execute();
+          await db.schema.dropTable('artifact_cleanup_jobs').execute();
         },
       } satisfies Migration,
     };

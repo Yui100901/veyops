@@ -8,6 +8,7 @@ export const executionVariableName = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export interface ExecutionVariables {
   variables: Record<string, string>;
   secretVariables: Record<string, string>;
+  secretCredentialNonces?: Record<string, string>;
 }
 
 export const credentialSecrets = (secret: Record<string, string>) =>
@@ -20,8 +21,9 @@ export async function resolveVariableCredential(
   name: string,
   id: string,
   secrets: string[],
+  expectedNonce?: string,
 ) {
-  const credential = await credentials.decrypt(id);
+  const credential = await credentials.decrypt(id, expectedNonce);
   const value = variableCredentialValue(credential);
   if (value === undefined || value.includes('\0'))
     throw new Error(`敏感变量 ${name} 的凭据不含支持的值`);
@@ -31,7 +33,7 @@ export async function resolveVariableCredential(
 
 export async function resolveExecutionVariables(
   credentials: CredentialsService,
-  { variables, secretVariables }: ExecutionVariables,
+  { variables, secretVariables, secretCredentialNonces }: ExecutionVariables,
 ) {
   const values: Record<string, string> = Object.assign(Object.create(null), variables);
   if (
@@ -42,7 +44,13 @@ export async function resolveExecutionVariables(
     throw new Error('无效环境变量名');
   const secrets: string[] = [];
   for (const [name, id] of Object.entries(secretVariables)) {
-    values[name] = await resolveVariableCredential(credentials, name, id, secrets);
+    values[name] = await resolveVariableCredential(
+      credentials,
+      name,
+      id,
+      secrets,
+      secretCredentialNonces?.[name],
+    );
   }
   return { values, secrets };
 }

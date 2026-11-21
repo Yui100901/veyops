@@ -1,0 +1,306 @@
+format: veyops-refactor-demo-v1
+
+project:
+  id: starbridge
+  name: 星桥商城 · 重构演示
+  variables:
+    LOG_LEVEL: info
+    SITE_NAME: 星桥商城
+
+services:
+  - id: storefront
+    name: 商城网关
+    revision: 1
+    repositoryId: web-repo
+    addresses:
+      - { id: web-test, name: 联调前端, url: 'http://web.test.demo.invalid:8080/' }
+      - { id: web-production, name: 生产模拟前端, url: 'https://web.prod.demo.invalid/' }
+      - { id: web-manual, name: 使用说明, url: 'https://web.prod.demo.invalid/docs?lang=zh#start' }
+
+environmentSets:
+  - id: test-config
+    name: 联调配置
+    revision: 1
+    variables:
+      - { key: ENV, value: test }
+      - { key: LOG_LEVEL, value: debug }
+      - { key: POSTGRES_URL, credentialId: test-database, isSecret: true }
+  - id: production-config
+    name: 生产模拟配置
+    revision: 1
+    variables:
+      - { key: ENV, value: production }
+      - { key: LOG_LEVEL, value: warn }
+      - { key: POSTGRES_URL, credentialId: production-database, isSecret: true }
+
+credentialPlaceholders:
+  - { id: test-ssh, purpose: 联调服务器连接 }
+  - { id: production-ssh, purpose: 生产模拟服务器连接 }
+  - { id: test-database, purpose: 联调敏感变量 }
+  - { id: production-database, purpose: 生产模拟敏感变量 }
+
+platformResources:
+  servers:
+    - { id: test-a, name: 联调主机 A, host: test-a.demo.invalid, credentialId: test-ssh }
+    - { id: test-b, name: 联调主机 B, host: test-b.demo.invalid, credentialId: test-ssh }
+    - { id: production-a, name: 生产模拟 A, host: prod-a.demo.invalid, credentialId: production-ssh }
+    - { id: production-b, name: 生产模拟 B, host: prod-b.demo.invalid, credentialId: production-ssh }
+  groups:
+    - { id: web-test-group, name: 联调 Web 组, serverIds: [test-a, test-b] }
+    - { id: web-production-group, name: 生产模拟 Web 组, serverIds: [production-a, production-b] }
+
+repositories:
+  - id: web-repo
+    cloneUrl: https://git.demo.invalid/starbridge/storefront.git
+    sourceSnapshot:
+      defaultBranch: main
+      commitSha: &source_sha 5038e89acaeb008526d112afc3d68b812e2a10ff
+      author: 'VeyOps Fixture <fixture@demo.invalid>'
+      committer: 'VeyOps Fixture <fixture@demo.invalid>'
+      timestamp: '1795219200 +0000'
+      message: 'Stage 0 storefront fixture'
+      files:
+        .env.test: |
+          FILE_PROFILE=test
+          LOG_LEVEL=trace
+        .env.prod: |
+          FILE_PROFILE=production
+          LOG_LEVEL=error
+        index.html: |
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>星桥商城</title>
+          <h1>星桥商城 · 演示</h1>
+        Dockerfile: |
+          FROM busybox:1.36
+          COPY index.html /site/index.html
+          CMD ["httpd", "-f", "-p", "8080", "-h", "/site"]
+        compose.yaml: |
+          services:
+            web:
+              image: ${VEYOPS_IMAGE}
+              ports:
+                - '8080:8080'
+
+graph:
+  projectId: starbridge
+  version: 1
+  nodes:
+    - id: checkout
+      module: git.checkout
+      moduleVersion: 1
+    - id: load-files
+      module: environment.load
+      moduleVersion: 1
+      configuration:
+        required: true
+        pathRule:
+          key: ENV
+          paths: { test: .env.test, production: .env.prod }
+    - id: build-manager
+      module: delivery.build
+      moduleVersion: 1
+      configuration: { location: MANAGER, preset: copy-static-site }
+      outputs:
+        - { id: webFile, type: FILE, path: dist/index.html, required: true, persist: true }
+        - { id: webDirectory, type: DIRECTORY, path: dist, required: true, persist: true }
+    - id: build-files
+      module: delivery.build
+      moduleVersion: 1
+      configuration: { location: TARGET, preset: copy-static-site }
+      outputs:
+        - { id: webFile, type: FILE, path: dist/index.html, required: true, persist: true }
+        - { id: webDirectory, type: DIRECTORY, path: dist, required: true, persist: true }
+        - { id: runReport, type: FILE, path: reports/summary.json, required: false, persist: false }
+      environment:
+        GIT_SHA: { kind: OUTPUT, nodeId: checkout, fieldId: commitSha }
+    - id: build-image
+      module: delivery.build
+      moduleVersion: 1
+      configuration: { location: TARGET, preset: docker-image, dockerfilePath: Dockerfile }
+      outputs:
+        - { id: image, type: DOCKER_IMAGE, required: true, persist: true }
+    - id: deploy-files
+      module: deploy.artifact
+      moduleVersion: 1
+      configuration: { method: FILE, destination: /srv/veyops-stage0/storefront }
+    - id: deploy-image
+      module: deploy.artifact
+      moduleVersion: 1
+      configuration:
+        method: COMPOSE
+        destination: /srv/veyops-stage0/storefront-container
+        composeSource: { kind: REPOSITORY_FILE, repositoryId: web-repo, gitSha: *source_sha, path: compose.yaml }
+    - id: rollback-files
+      module: deploy.rollback
+      moduleVersion: 1
+      configuration: { method: FILE, destination: /srv/veyops-stage0/storefront }
+
+  flows:
+    - id: manager-build
+      name: 管理端仅构建
+      start:
+        id: manager-build
+        environmentSet: &fixed_test { mode: FIXED, environmentSetId: test-config }
+        parameters:
+          - &service { id: service, type: SERVICE, required: true, defaultValue: { serviceId: storefront } }
+          - id: gitVersion
+            type: GIT_REF
+            required: false
+            defaultValue: &fixed_commit { kind: COMMIT, value: *source_sha }
+      path: [checkout, load-files, build-manager]
+      bindings:
+        checkout: &checkout_inputs
+          repository: { kind: VALUE, value: web-repo }
+          version: { kind: INPUT, fieldId: gitVersion, onMissing: REPOSITORY_DEFAULT }
+        load-files: &load_inputs
+          workspace: { kind: OUTPUT, nodeId: checkout, fieldId: workspace }
+        build-manager: &source_inputs
+          service: { kind: INPUT, fieldId: service }
+          source: { kind: OUTPUT, nodeId: checkout, fieldId: source }
+          workspace: { kind: OUTPUT, nodeId: checkout, fieldId: workspace }
+          variables: { kind: OUTPUT, nodeId: load-files, fieldId: variables }
+      end:
+        id: end-manager-build
+        outputs:
+          - { id: directory, type: ARTIFACT, source: { kind: OUTPUT, nodeId: build-manager, fieldId: webDirectory } }
+
+    - id: target-files
+      name: 目标端构建文件与目录
+      start:
+        id: target-files
+        environmentSet: { mode: INPUT, fieldId: environmentSet }
+        parameters:
+          - *service
+          - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
+          - id: environmentSet
+            type: ENVIRONMENT_SET
+            required: true
+            defaultValue: test-config
+            options: [test-config, production-config]
+          - &test_build_targets
+            id: buildTargets
+            type: TARGETS
+            required: true
+            defaultValue: { groupIds: [web-test-group] }
+      path: [checkout, load-files, build-files]
+      bindings:
+        checkout: *checkout_inputs
+        load-files: *load_inputs
+        build-files: &target_build_inputs
+          service: { kind: INPUT, fieldId: service }
+          source: { kind: OUTPUT, nodeId: checkout, fieldId: source }
+          workspace: { kind: OUTPUT, nodeId: checkout, fieldId: workspace }
+          variables: { kind: OUTPUT, nodeId: load-files, fieldId: variables }
+          targets: { kind: INPUT, fieldId: buildTargets }
+      end:
+        id: end-target-files
+        outputs:
+          - { id: file, type: ARTIFACT, source: { kind: OUTPUT, nodeId: build-files, fieldId: webFile } }
+          - { id: directory, type: ARTIFACT, source: { kind: OUTPUT, nodeId: build-files, fieldId: webDirectory } }
+
+    - id: target-image
+      name: 目标端构建镜像
+      start:
+        id: target-image
+        environmentSet: &fixed_production { mode: FIXED, environmentSetId: production-config }
+        parameters:
+          - *service
+          - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
+          - { id: buildTargets, type: TARGETS, required: true, defaultValue: { groupIds: [web-production-group] } }
+      path: [checkout, load-files, build-image]
+      bindings:
+        checkout: *checkout_inputs
+        load-files: *load_inputs
+        build-image: *target_build_inputs
+      end:
+        id: end-target-image
+        outputs:
+          - { id: image, type: ARTIFACT, source: { kind: OUTPUT, nodeId: build-image, fieldId: image } }
+
+    - id: build-and-deploy
+      name: 构建并部署本次目录
+      start:
+        id: build-and-deploy
+        environmentSet: *fixed_test
+        parameters:
+          - *service
+          - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
+          - *test_build_targets
+          - &test_release_targets
+            id: releaseTargets
+            type: TARGETS
+            required: true
+            defaultValue: { groupIds: [web-test-group] }
+      path: [checkout, load-files, build-files, deploy-files]
+      bindings:
+        checkout: *checkout_inputs
+        load-files: *load_inputs
+        build-files: *target_build_inputs
+        deploy-files:
+          service: { kind: INPUT, fieldId: service }
+          targets: { kind: INPUT, fieldId: releaseTargets }
+          artifact: { kind: OUTPUT, nodeId: build-files, fieldId: webDirectory }
+      end:
+        id: end-build-and-deploy
+        outputs: &file_release_outputs
+          - { id: release, type: SERVICE_RESULT, source: { kind: OUTPUT, nodeId: deploy-files, fieldId: release } }
+
+    - id: deploy-existing
+      name: 部署已登记目录
+      start:
+        id: deploy-existing
+        environmentSet: { mode: NONE }
+        parameters:
+          - *service
+          - *test_release_targets
+          - &directory_parameter { id: artifact, type: ARTIFACT, artifactType: DIRECTORY, required: true }
+      path: [deploy-files]
+      bindings:
+        deploy-files: &historic_release_inputs
+          service: { kind: INPUT, fieldId: service }
+          targets: { kind: INPUT, fieldId: releaseTargets }
+          artifact: { kind: INPUT, fieldId: artifact }
+      end: { id: end-deploy-existing, outputs: *file_release_outputs }
+
+    - id: deploy-compose
+      name: 用已登记镜像发布 Compose
+      start:
+        id: deploy-compose
+        environmentSet: *fixed_production
+        parameters:
+          - *service
+          - { id: releaseTargets, type: TARGETS, required: true, defaultValue: { groupIds: [web-production-group] } }
+          - { id: artifact, type: ARTIFACT, artifactType: DOCKER_IMAGE, required: true }
+      path: [deploy-image]
+      bindings:
+        deploy-image: *historic_release_inputs
+      end:
+        id: end-deploy-compose
+        outputs:
+          - { id: release, type: SERVICE_RESULT, source: { kind: OUTPUT, nodeId: deploy-image, fieldId: release } }
+
+    - id: rollback-existing
+      name: 按历史目录回滚
+      start:
+        id: rollback-existing
+        environmentSet: *fixed_test
+        parameters:
+          - *service
+          - *test_release_targets
+          - *directory_parameter
+      path: [rollback-files]
+      bindings:
+        rollback-files: *historic_release_inputs
+      end:
+        id: end-rollback-existing
+        outputs:
+          - { id: release, type: SERVICE_RESULT, source: { kind: OUTPUT, nodeId: rollback-files, fieldId: release } }
+
+reuseExamples:
+  - producer: { flowId: target-files, nodeId: build-files, fieldId: webDirectory }
+    consumer: { flowId: deploy-existing, fieldId: artifact }
+    targets: [test-a, test-b]
+  - producer: { flowId: target-image, nodeId: build-image, fieldId: image }
+    consumer: { flowId: deploy-compose, fieldId: artifact }
+    targets: [production-a, production-b]

@@ -26,8 +26,8 @@ import { unavailableReference } from '../projects/project-resource-protection';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { redactTaskLog } from '../tasks/task-log.service';
 import type { GraphDefinition } from './execution-graph-definition';
-import { flowStart, type Values } from './graph-run-bindings';
-import { validateGraphValue, type GraphField } from './graph-fields';
+import { flowEnd, flowStart, type GraphFieldSource, type Values } from './graph-run-bindings';
+import { compatibleGraphFields, validateGraphValue, type GraphField } from './graph-fields';
 import {
   graphDeliveryId,
   triggerEventFields,
@@ -80,8 +80,13 @@ function mappedValue(
   mapping: GraphParameterMapping,
   event: TriggerEventInput,
   eventId: string,
+  upstream?: Values,
 ) {
   if (mapping.source === 'VALUE') return mapping.value;
+  if (mapping.source === 'UPSTREAM_OUTPUT')
+    return upstream && Object.hasOwn(upstream, mapping.fieldId)
+      ? upstream[mapping.fieldId]
+      : undefined;
   switch (mapping.field) {
     case 'repository':
       return event.repositoryId;
@@ -261,7 +266,11 @@ export class GraphTriggersService implements OnModuleInit {
     return flowStart(flow).inputs ?? [];
   }
 
-  private validateMappings(fields: GraphField[], input: GraphTriggerDto) {
+  private validateMappings(
+    fields: GraphField[],
+    input: GraphTriggerDto,
+    definition: GraphDefinition,
+  ) {
     const mappings = Object.entries(input.parameterMappings ?? {});
     if (mappings.length > 64 || JSON.stringify(mappings).length > 32768)
       throw new BadRequestException('触发参数映射过大');
@@ -278,8 +287,39 @@ export class GraphTriggersService implements OnModuleInit {
     };
     for (const [id, mapping] of mappings) {
       const field = fields.find((candidate) => candidate.id === id);
-      if (!field || !mapping || !['VALUE', 'EVENT'].includes(mapping.source))
+      if (!field || !mapping || !['VALUE', 'EVENT', 'UPSTREAM_OUTPUT'].includes(mapping.source))
         throw new BadRequestException('触发参数映射未引用有效的开始参数');
+      if (mapping.source === 'UPSTREAM_OUTPUT') {
+        const upstream = definition.flows.find(({ id }) => id === input.upstreamFlowId);
+        const output =
+          upstream && flowEnd(upstream).outputs?.find(({ id }) => id === mapping.fieldId);
+        if (
+          input.kind !== 'UPSTREAM' ||
+          input.upstreamStatus !== 'SUCCESS' ||
+          !output ||
+          ![
+            'TEXT',
+            'NUMBER',
+            'BOOLEAN',
+            'REPOSITORY',
+            'GIT_REF',
+            'SERVICE',
+            'ARTIFACT',
+            'PATH',
+            'IMAGE',
+          ].includes(output.type) ||
+          !compatibleGraphFields(field, output) ||
+          (field.required !== false &&
+            field.defaultValue === undefined &&
+            output.required === false)
+        )
+          throw new BadRequestException(
+            '参数「' + field.name + '」需要同版本上游成功且可独立验证的兼容输出',
+          );
+        continue;
+      }
+      if (field.type === 'ENVIRONMENT_SET' && mapping.source === 'EVENT')
+        throw new BadRequestException('变量集合参数需要指定项目集合或沿用字段默认值');
       if (mapping.source === 'EVENT' && !triggerEventFields.includes(mapping.field))
         throw new BadRequestException('触发参数引用了未知事件字段');
       const sample = mappedValue(field, mapping, samples, 'example');
@@ -352,7 +392,7 @@ export class GraphTriggersService implements OnModuleInit {
       this.database.db,
       input.enabled,
     );
-    this.validateMappings(this.startFields(definition, input.flowId), input);
+    this.validateMappings(this.startFields(definition, input.flowId), input, definition);
     if (input.enabled) assertAutomaticGraphFlow(definition, input.flowId, input.kind);
     const now = Date.now();
     const settings: TriggerConfig = {
@@ -565,14 +605,20 @@ export class GraphTriggersService implements OnModuleInit {
     const flow = definition.flows.find(({ id }) => id === rule.flow_id);
     if (!flow) throw new ConflictException('切换版本中没有触发器关联的执行流');
     const fields = flowStart(flow).inputs ?? [];
-    this.validateMappings(fields, {
-      name: rule.name,
-      kind: rule.kind as GraphTriggerKind,
-      version,
-      flowId: rule.flow_id,
-      enabled: active,
-      parameterMappings: settings.parameterMappings,
-    });
+    this.validateMappings(
+      fields,
+      {
+        name: rule.name,
+        kind: rule.kind as GraphTriggerKind,
+        version,
+        flowId: rule.flow_id,
+        enabled: active,
+        parameterMappings: settings.parameterMappings,
+        upstreamFlowId: settings.upstreamFlowId,
+        upstreamStatus: settings.upstreamStatus,
+      },
+      definition,
+    );
     if (!active) return;
     assertAutomaticGraphFlow(definition, rule.flow_id, rule.kind as GraphTriggerKind);
     if (settings.upstreamFlowId) {
@@ -852,12 +898,30 @@ export class GraphTriggersService implements OnModuleInit {
       const settings = config(rule);
       const authorization = { kind, ruleId: rule.id, revision: settings.revision, invokedBy };
       const mappings = settings.parameterMappings ?? {};
+      const parameterSources: Record<string, GraphFieldSource> = Object.create(null);
+      const upstream = Object.values(mappings).some(({ source }) => source === 'UPSTREAM_OUTPUT')
+        ? await this.upstreamValues(rule, settings, eventInput.upstreamRunId)
+        : undefined;
       const parameters = Object.fromEntries(
         fields.flatMap((field) => {
           const mapping = Object.hasOwn(mappings, field.id) ? mappings[field.id] : undefined;
           if (!mapping) return [];
-          const value = mappedValue(field, mapping, eventInput, event.event_key);
-          return value === undefined ? [] : [[field.id, value]];
+          const value = mappedValue(field, mapping, eventInput, event.event_key, upstream);
+          if (value === undefined) {
+            if (
+              mapping.source === 'EVENT' &&
+              (field.required !== false || field.type === 'GIT_REF')
+            )
+              throw new BadRequestException('触发事件未提供参数「' + field.name + '」选定的来源');
+            return [];
+          }
+          parameterSources[field.id] =
+            mapping.source === 'EVENT'
+              ? { kind: 'TRIGGER_EVENT', eventField: mapping.field }
+              : mapping.source === 'UPSTREAM_OUTPUT'
+                ? { kind: 'UPSTREAM_OUTPUT', fieldId: mapping.fieldId }
+                : { kind: 'TRIGGER_VALUE' };
+          return [[field.id, value]];
         }),
       );
       const inputs = {
@@ -870,6 +934,7 @@ export class GraphTriggersService implements OnModuleInit {
         eventId: event.event_key,
         kind: rule.kind,
         triggeredAt: eventInput.scheduledAt ?? event.created_at,
+        parameterSources,
       };
       const preview = await this.runner.preview(
         rule.project_id,
@@ -939,6 +1004,26 @@ export class GraphTriggersService implements OnModuleInit {
         .where('status', '=', 'PENDING')
         .execute();
     }
+  }
+
+  private async upstreamValues(rule: Rule, settings: TriggerConfig, upstreamRunId?: string) {
+    if (!upstreamRunId || !settings.upstreamFlowId || rule.kind !== 'UPSTREAM')
+      throw new BadRequestException('缺少上游执行记录');
+    const output = await this.database.db
+      .selectFrom('execution_flow_runs as run')
+      .innerJoin('execution_node_runs as node', 'node.run_id', 'run.id')
+      .select('node.output_json')
+      .where('run.id', '=', upstreamRunId)
+      .where('run.project_id', '=', rule.project_id)
+      .where('run.version', '=', rule.version)
+      .where('run.flow_id', '=', settings.upstreamFlowId)
+      .where('run.parent_run_id', 'is', null)
+      .where('run.status', '=', 'SUCCESS')
+      .where('node.node_type', '=', 'END')
+      .where('node.status', '=', 'SUCCESS')
+      .executeTakeFirst();
+    if (!output) throw new ConflictException('上游执行记录已失效或未成功完成');
+    return JSON.parse(output.output_json ?? '{}') as Values;
   }
 
   private async pump(now: number) {

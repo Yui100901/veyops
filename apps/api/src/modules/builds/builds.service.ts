@@ -25,6 +25,9 @@ import {
 } from '../../infrastructure/build-runner/process-runner.service';
 import { CredentialsService } from '../credentials/credentials.service';
 import { maxComposeBytes } from '../artifacts/artifacts.service';
+import { ArtifactPhysicalService } from '../artifacts/artifact-physical.service';
+import { artifactIdentity } from '../artifacts/artifact-identities';
+import { graphUnscopedArtifactService } from '../pipelines/delivery-execution-profile';
 import { RegistriesService } from '../registries/registries.service';
 import { gitCredentialHelper } from '../projects/git-credential';
 import { RepositoryMetadataService } from '../projects/repository-metadata.service';
@@ -80,7 +83,9 @@ export function namedArtifactSession(
   const definition = session.snapshot.definition;
   return {
     ...session,
-    taskId: randomUUID(),
+    taskId: session.snapshot.graph
+      ? artifactIdentity(session.snapshot, artifact.name).instanceId
+      : randomUUID(),
     snapshot: {
       ...session.snapshot,
       definition: {
@@ -282,6 +287,7 @@ export class BuildsService {
     private readonly credentials: CredentialsService,
     private readonly registries: RegistriesService,
     @Optional() private readonly repositories?: RepositoryMetadataService,
+    @Optional() private readonly physical?: ArtifactPhysicalService,
   ) {}
   async gitSecret(credentialId: string | null): Promise<GitSecret | undefined> {
     if (!credentialId) return undefined;
@@ -300,7 +306,8 @@ export class BuildsService {
   async resolveVariables(snapshot: PipelineSnapshot) {
     const { values, secrets } = await resolveExecutionVariables(this.credentials, snapshot);
     values.VEYOPS_PROJECT_ID = snapshot.projectId;
-    values.VEYOPS_SERVICE_ID = snapshot.serviceId;
+    if (snapshot.serviceId !== graphUnscopedArtifactService(snapshot.projectId).id)
+      values.VEYOPS_SERVICE_ID = snapshot.serviceId;
     if (snapshot.projectName !== undefined) values.VEYOPS_PROJECT_NAME = snapshot.projectName;
     if (snapshot.serviceName !== undefined) values.VEYOPS_SERVICE_NAME = snapshot.serviceName;
     if (snapshot.graph) {
@@ -679,6 +686,18 @@ export class BuildsService {
       30,
     );
     const imageId = inspectedImageId(output);
+    if (session.snapshot.graph && this.physical) {
+      return {
+        imageReference,
+        imageId,
+        physical: await this.physical.describeImage({
+          target,
+          reference: imageReference,
+          owner: source ? 'EXTERNAL' : 'MANAGED',
+          signal: session.context.signal,
+        }),
+      };
+    }
     return {
       imageReference,
       imageId,
@@ -1008,6 +1027,7 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     command: string,
     directory: string,
     timeout: number,
+    onData: NonNullable<ProcessOptions['onData']>,
   ) {
     const secrets = await mkdtemp(join(tmpdir(), 'veyops-graph-shell-'));
     try {
@@ -1017,12 +1037,13 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
       return await this.container(
         session,
         workspace,
-        `set +e\n( set -e; ${enterRepositoryDirectory('/workspace', relativePath(directory))}; . /run/veyops/shell.env\n${command}\n)\ncode=$?\nprintf '\\nVEYOPS_EXIT_CODE=%s\\n' "$code"`,
+        `${enterRepositoryDirectory('/workspace', relativePath(directory))}; . /run/veyops/shell.env\n${command}`,
         secrets,
         undefined,
         undefined,
         timeout,
-        'Shell 容器无法执行',
+        undefined,
+        onData,
       );
     } finally {
       await rm(secrets, { recursive: true, force: true });
@@ -1093,6 +1114,23 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
         localArchive: stored.path,
         checksum: stored.checksum,
         sizeBytes: stored.sizeBytes,
+        physical:
+          session.snapshot.graph && this.physical
+            ? await this.physical.collectBuilderPath({
+                workspace: resolve(workspace, 'repo'),
+                relativePath: posix.join(d.repoPath, d.outputPath),
+                kind:
+                  declaration?.type === 'FILE' || declaration?.type === 'DIRECTORY'
+                    ? declaration.type
+                    : (
+                          await lstat(resolve(workspace, 'repo', d.repoPath, d.outputPath))
+                        ).isDirectory()
+                      ? 'DIRECTORY'
+                      : 'FILE',
+                instanceId: artifactIdentity(session.snapshot, declaration?.name).instanceId,
+                signal: session.context.signal,
+              })
+            : undefined,
         cleanup,
       };
     }
@@ -1118,7 +1156,10 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     if (buildOnly) {
       const composePath = await realpath(resolve(buildContext, d.composeFilePath)).catch(
         (error: NodeJS.ErrnoException) => {
-          if (error.code === 'ENOENT' && (!session.snapshot.deployAfterBuild || session.snapshot.managedCompose))
+          if (
+            error.code === 'ENOENT' &&
+            (!session.snapshot.deployAfterBuild || session.snapshot.managedCompose)
+          )
             return undefined;
           throw new Error('无法读取 Compose 配置，请确认配置文件位于仓库内');
         },
@@ -1130,7 +1171,14 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
         composeYaml = await readComposeSnapshot(composePath);
       }
     }
-    if (buildOnly && !(session.snapshot.deployAfterBuild && d.registryId && d.imageRepository)) {
+    if (
+      buildOnly &&
+      !(
+        (session.snapshot.deployAfterBuild || session.snapshot.graph) &&
+        d.registryId &&
+        d.imageRepository
+      )
+    ) {
       const imageReference = localImageTag(session);
       if (declaration?.imageReference) {
         const source = checkedImageReference(declaration.imageReference);
@@ -1166,6 +1214,15 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
       return {
         imageReference,
         imageId,
+        physical:
+          session.snapshot.graph && this.physical
+            ? await this.physical.describeImage({
+                reference: imageReference,
+                owner: declaration?.imageReference ? 'EXTERNAL' : 'MANAGED',
+                builderId: session.webhookDocker ? 'manager-webhook' : 'manager',
+                signal: session.context.signal,
+              })
+            : undefined,
         ...(await this.retainManagerImageArchive(session, root, imageReference)),
         composeYaml,
         cleanup,
@@ -1203,6 +1260,17 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
       return {
         ...offline,
         imageReference: `${repository}@${imageDigest}`,
+        physical:
+          session.snapshot.graph && d.registryId
+            ? {
+                kind: 'DOCKER_IMAGE',
+                location: 'REGISTRY',
+                owner: 'EXTERNAL',
+                registryId: d.registryId,
+                imageReference: `${repository}@${imageDigest}`,
+                digest: imageDigest,
+              }
+            : undefined,
         imageTag,
         imageDigest,
         composeYaml,
@@ -1211,7 +1279,13 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     }
     const localCompose = join(workspace, 'compose.yaml');
     if (session.snapshot.managedCompose)
-      return { ...offline, imageReference: `${repository}@${imageDigest}`, imageTag, imageDigest, cleanup };
+      return {
+        ...offline,
+        imageReference: `${repository}@${imageDigest}`,
+        imageTag,
+        imageDigest,
+        cleanup,
+      };
     await this.container(
       session,
       workspace,
@@ -1321,6 +1395,7 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     image?: string,
     timeout = 1200,
     failureMessage = '管理端容器步骤失败。请检查镜像和步骤日志',
+    scriptOutput?: ProcessOptions['onData'],
   ) {
     const name = `veyops-${session.taskId}-${Math.random().toString(16).slice(2, 10)}`;
     const args = [
@@ -1353,6 +1428,11 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     if (envFile) args.push('--env-file', envFile);
     args.push(image ?? session.snapshot.definition.buildImage, 'sh', '-eu', '-c', script);
     try {
+      if (scriptOutput)
+        return await this.runDocker(session, args, timeout, {
+          signal: session.context.signal,
+          onData: scriptOutput,
+        });
       return await this.local(session, args, timeout, failureMessage);
     } finally {
       await this.runDocker(session, ['rm', '-f', name], 30).catch(() => undefined);
@@ -1365,6 +1445,7 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     options: {
       signal?: AbortSignal;
       log?: boolean;
+      onData?: ProcessOptions['onData'];
       stdin?: string;
       gzipOutput?: ProcessOptions['gzipOutput'];
     } = {},
@@ -1380,7 +1461,7 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
       secrets: session.secrets,
       stdin: options.stdin,
       gzipOutput: options.gzipOutput,
-      onData: options.log ? (text) => session.context.log(text) : undefined,
+      onData: options.onData ?? (options.log ? (text) => session.context.log(text) : undefined),
     });
   }
   private async local(

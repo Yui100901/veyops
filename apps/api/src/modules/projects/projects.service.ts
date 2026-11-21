@@ -22,15 +22,18 @@ import { Type } from 'class-transformer';
 import type { Selectable } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import {
+  Allow,
   ArrayMaxSize,
   IsArray,
   IsIn,
+  IsInt,
   IsObject,
   IsOptional,
   IsString,
   IsUUID,
   Matches,
   MaxLength,
+  Min,
   MinLength,
   ValidateIf,
   ValidateNested,
@@ -43,8 +46,14 @@ import type { CurrentUser } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { recentDeployments } from '../deployments/deployment-history';
 import { byProject, projectAddressLinks } from './project-card-data';
+import { projectServices, saveServiceAddresses, serviceDto } from './service-addresses';
 import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
+import {
+  graphDeliveryEnvironment,
+  graphDeliveryEnvironmentSlug,
+  graphUnscopedArtifactServiceSlug,
+} from '../pipelines/delivery-execution-profile';
 import { assertProjectResourceRemovable } from './project-resource-protection';
 import { projectResourceInventory } from './project-resource-references';
 import { relativePath } from '../pipelines/pipeline.validation';
@@ -86,11 +95,18 @@ class RepositoryDto {
   @IsOptional() @IsString() @MaxLength(2000) description?: string;
 }
 class ServiceDto {
-  @IsString() @MinLength(1) @MaxLength(100) name!: string;
-  @IsString() @Matches(/^[a-z0-9][a-z0-9-]{0,62}$/) slug!: string;
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsString() @MinLength(1) @MaxLength(100) name?: string;
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsString() @Matches(/^[a-z0-9][a-z0-9-]{0,62}$/) slug?: string;
+  @ValidateIf((_object, value) => value !== undefined)
   @IsIn(['WEB', 'API', 'WORKER', 'SCHEDULED_JOB', 'STATIC_SITE', 'DOCKER_SERVICE', 'CUSTOM'])
-  serviceType = 'WEB';
+  serviceType?: string;
   @IsOptional() @IsString() @MaxLength(2000) description?: string;
+  @Allow() addresses?: unknown;
+}
+class UpdateServiceDto extends ServiceDto {
+  @IsInt() @Min(1) expectedRevision!: number;
 }
 class EnvironmentDto {
   @ValidateIf((_object, value) => value !== undefined)
@@ -125,13 +141,6 @@ const repositoryDto = (row: Selectable<Database['repositories']>, cache = branch
   credentialId: row.credential_id,
   description: row.description,
 });
-const serviceDto = (row: Selectable<Database['services']>) => ({
-  id: row.id,
-  name: row.name,
-  slug: row.slug,
-  serviceType: row.service_type,
-  description: row.description,
-});
 const environmentDto = (row: Selectable<Database['environments']>) => ({
   id: row.id,
   name: row.name,
@@ -158,23 +167,28 @@ export class ProjectsService {
   async list(includeAddresses = false) {
     const db = this.database.db;
     const activeProjects = db.selectFrom('projects').where('deleted_at', 'is', null);
-    const [rows, services, envs, addresses] = await Promise.all([
+    const [rows, services, envs, environmentSets, addresses] = await Promise.all([
       activeProjects.selectAll().orderBy('created_at', 'desc').execute(),
       db.selectFrom('services').select(['project_id']).where('archived_at', 'is', null).execute(),
       db
         .selectFrom('environments')
         .select(['project_id'])
         .where('archived_at', 'is', null)
+        .where('slug', '!=', graphDeliveryEnvironmentSlug)
+        .execute(),
+      db
+        .selectFrom('project_environment_sets')
+        .select('project_id as projectId')
+        .where('archived_at', 'is', null)
         .execute(),
       includeAddresses
         ? projectAddressLinks(db)
-            .where('address.project_id', 'in', activeProjects.select('id'))
-            .orderBy('address.name')
-            .orderBy('address.id')
+            .where('service.project_id', 'in', activeProjects.select('id'))
             .execute()
         : [],
     ]);
     const links = byProject(addresses);
+    const sets = byProject(environmentSets);
     return rows.map((r) => ({
       id: r.id,
       name: r.name,
@@ -185,6 +199,7 @@ export class ProjectsService {
       createdAt: r.created_at,
       serviceCount: services.filter((s) => s.project_id === r.id).length,
       environmentCount: envs.filter((e) => e.project_id === r.id).length,
+      environmentSetCount: sets.get(r.id)?.length ?? 0,
       ...(includeAddresses && { addresses: links.get(r.id) ?? [] }),
     }));
   }
@@ -194,7 +209,7 @@ export class ProjectsService {
     if (!includeArchived) query = query.where('deleted_at', 'is', null);
     const project = await query.executeTakeFirst();
     if (!project) throw new NotFoundException('项目不存在');
-    const [repositories, services, environments] = await Promise.all([
+    const [repositories, services, environments, environmentSets] = await Promise.all([
       db
         .selectFrom('repositories')
         .selectAll()
@@ -202,20 +217,21 @@ export class ProjectsService {
         .where('archived_at', 'is', null)
         .orderBy('created_at')
         .execute(),
-      db
-        .selectFrom('services')
-        .selectAll()
-        .where('project_id', '=', id)
-        .where('archived_at', 'is', null)
-        .orderBy('created_at')
-        .execute(),
+      projectServices(db, id),
       db
         .selectFrom('environments')
         .selectAll()
         .where('project_id', '=', id)
         .where('archived_at', 'is', null)
+        .where('slug', '!=', graphDeliveryEnvironmentSlug)
         .orderBy('created_at')
         .execute(),
+      db
+        .selectFrom('project_environment_sets')
+        .select((eb) => eb.fn.countAll<number>().as('count'))
+        .where('project_id', '=', id)
+        .where('archived_at', 'is', null)
+        .executeTakeFirstOrThrow(),
     ]);
     return {
       id: project.id,
@@ -228,8 +244,9 @@ export class ProjectsService {
       createdAt: project.created_at,
       serviceCount: services.length,
       environmentCount: environments.length,
+      environmentSetCount: Number(environmentSets.count),
       repositories: repositories.map((row) => repositoryDto(row)),
-      services: services.map(serviceDto),
+      services,
       environments: environments.map(environmentDto),
     };
   }
@@ -242,6 +259,7 @@ export class ProjectsService {
         .select(['id', 'name'])
         .where('project_id', '=', id)
         .where('archived_at', 'is not', null)
+        .where('slug', '!=', graphUnscopedArtifactServiceSlug)
         .orderBy('name')
         .execute(),
       db
@@ -249,6 +267,7 @@ export class ProjectsService {
         .select(['id', 'name'])
         .where('project_id', '=', id)
         .where('archived_at', 'is not', null)
+        .where('slug', '!=', graphDeliveryEnvironmentSlug)
         .orderBy('name')
         .execute(),
       db
@@ -268,8 +287,7 @@ export class ProjectsService {
   async detail(id: string) {
     const project = await this.get(id);
     const db = this.database.db;
-    const [addresses, dependencies, dependents, deploymentRows, deployments] = await Promise.all([
-      this.relations.addresses(id),
+    const [dependencies, dependents, deploymentRows, deployments] = await Promise.all([
       this.relations.dependencies(id),
       this.relations.dependents(id),
       db
@@ -310,7 +328,6 @@ export class ProjectsService {
     }
     return {
       ...project,
-      addresses,
       dependencies,
       dependents,
       deploymentTargets: [...deploymentTargets.values()],
@@ -336,6 +353,7 @@ export class ProjectsService {
         .where('id', '=', environmentId)
         .where('project_id', '=', projectId)
         .where('archived_at', 'is', null)
+        .where('slug', '!=', graphDeliveryEnvironmentSlug)
         .executeTakeFirst();
       if (!environment) throw new NotFoundException('环境不在当前项目中');
     }
@@ -523,46 +541,99 @@ export class ProjectsService {
         : await this.metadata.refreshBranches(projectId, id, 5_000),
     );
   }
-  async service(projectId: string, dto: ServiceDto, userId: string, serviceId?: string) {
+  async listServices(projectId: string) {
     const db = this.database.db;
     await requireProject(db, projectId);
-    const now = Date.now();
+    return projectServices(db, projectId);
+  }
+  async serviceDetail(projectId: string, serviceId: string) {
+    const db = this.database.db;
+    await requireProject(db, projectId);
+    const [service] = await projectServices(db, projectId, serviceId);
+    if (!service) throw new NotFoundException('服务不存在');
+    return service;
+  }
+  async service(
+    projectId: string,
+    dto: ServiceDto | UpdateServiceDto,
+    userId: string,
+    serviceId?: string,
+  ) {
+    const db = this.database.db;
     const id = serviceId ?? randomUUID();
-    const values = {
-      name: dto.name,
-      slug: dto.slug,
-      service_type: dto.serviceType,
-      description: dto.description ?? undefined,
-      updated_at: now,
-    };
-    const row = await (
-      serviceId
-        ? db
+    const name = dto.name?.trim();
+    if (dto.name !== undefined && !name) throw new BadRequestException('请输入服务名称');
+    const expectedRevision = 'expectedRevision' in dto ? dto.expectedRevision : undefined;
+    return db
+      .transaction()
+      .execute(async (tx) => {
+        await lockProjectGraph(tx);
+        await requireProject(tx, projectId);
+        const now = Date.now();
+        const values = {
+          name,
+          slug: dto.slug,
+          service_type: dto.serviceType,
+          description: dto.description ?? undefined,
+          updated_at: now,
+        };
+        const previous = serviceId
+          ? await tx
+              .selectFrom('services')
+              .select('revision')
+              .where('id', '=', serviceId)
+              .where('project_id', '=', projectId)
+              .where('archived_at', 'is', null)
+              .executeTakeFirst()
+          : undefined;
+        if (serviceId && !previous) throw new NotFoundException('服务不存在');
+        if (previous && previous.revision !== expectedRevision) {
+          throw new ConflictException({
+            message: '服务已被其他用户修改，请重新载入当前版本',
+            details: { currentRevision: previous.revision },
+          });
+        }
+        let row: Selectable<Database['services']>;
+        if (previous) {
+          row = await tx
             .updateTable('services')
-            .set(values)
+            .set({ ...values, revision: previous.revision + 1 })
             .where('id', '=', id)
-            .where('project_id', '=', projectId)
-            .where('archived_at', 'is', null)
-        : db
+            .where('revision', '=', previous.revision)
+            .returningAll()
+            .executeTakeFirstOrThrow();
+        } else {
+          if (!name || !dto.slug) throw new BadRequestException('新服务必须设置名称和标识');
+          row = await tx
             .insertInto('services')
-            .values({ id, project_id: projectId, created_at: now, ...values })
-    )
-      .returningAll()
-      .executeTakeFirst()
+            .values({
+              ...values,
+              id,
+              name,
+              slug: dto.slug,
+              project_id: projectId,
+              service_type: dto.serviceType ?? 'WEB',
+              created_at: now,
+            })
+            .returningAll()
+            .executeTakeFirstOrThrow();
+        }
+        const { addresses, removedIds } = await saveServiceAddresses(tx, id, dto.addresses);
+        await this.audit.record(
+          userId,
+          serviceId ? 'service.update' : 'service.create',
+          'project',
+          projectId,
+          { serviceId: id, revision: row.revision, removedAddressIds: removedIds },
+          tx,
+        );
+        return serviceDto(row, addresses);
+      })
       .catch((error: unknown) => {
         if (hasConstraint(error, 'SQLITE_CONSTRAINT_UNIQUE', '23505'))
           throw new ConflictException('该项目中服务标识已存在');
         throw error;
       });
-    if (!row) throw new NotFoundException('服务不存在');
-    await this.audit.record(
-      userId,
-      serviceId ? 'service.update' : 'service.create',
-      'project',
-      projectId,
-      { serviceId: id },
-    );
-    return serviceDto(row);
   }
   async environment(
     projectId: string,
@@ -570,6 +641,8 @@ export class ProjectsService {
     userId: string,
     environmentId?: string,
   ) {
+    if (environmentId === graphDeliveryEnvironment(projectId).id)
+      throw new NotFoundException('环境不存在');
     const db = this.database.db;
     await requireProject(db, projectId);
     const now = Date.now();
@@ -652,6 +725,8 @@ export class ProjectsService {
     id: string,
     userId: string,
   ) {
+    if (table === 'environments' && id === graphDeliveryEnvironment(projectId).id)
+      throw new NotFoundException('环境不存在');
     const resourceType = {
       repositories: 'REPOSITORY',
       services: 'SERVICE',
@@ -697,15 +772,6 @@ export class ProjectsService {
         )
           throw new ConflictException('资源被可运行的旧交付配置引用');
       }
-      if (table !== 'repositories') {
-        const address = await tx
-          .selectFrom('project_addresses')
-          .select('id')
-          .where('project_id', '=', projectId)
-          .where(table === 'services' ? 'service_id' : 'environment_id', '=', id)
-          .executeTakeFirst();
-        if (address) throw new ConflictException('资源被项目访问地址引用，请先调整访问地址');
-      }
       const now = Date.now();
       await tx
         .updateTable(table)
@@ -738,6 +804,15 @@ class ProjectsController {
   }
   @Get(':id/delivery-context') deliveryContext(@Param('id') id: string) {
     return this.service.deliveryContext(id);
+  }
+  @Get(':id/services') listServices(@Param('id', ParseUUIDPipe) id: string) {
+    return this.service.listServices(id);
+  }
+  @Get(':id/services/:serviceId') serviceDetail(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('serviceId', ParseUUIDPipe) serviceId: string,
+  ) {
+    return this.service.serviceDetail(id, serviceId);
   }
   @Get(':id/services/:serviceId/recent-deployments') serviceRecentDeployments(
     @Param('id', ParseUUIDPipe) id: string,
@@ -794,7 +869,7 @@ class ProjectsController {
   @Roles('ADMIN', 'OPERATOR') @Patch(':id/services/:resourceId') updateService(
     @Param('id') id: string,
     @Param('resourceId') resourceId: string,
-    @Body() dto: ServiceDto,
+    @Body() dto: UpdateServiceDto,
     @Req() req: AuthRequest,
   ) {
     return this.service.service(id, dto, req.user.id, resourceId);

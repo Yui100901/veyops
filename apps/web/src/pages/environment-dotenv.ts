@@ -1,7 +1,7 @@
 export const hiddenVariableValue = '••••••••••••';
 
 const variableName = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
-const reservedName = /^VEYOPS_(?:PROJECT|SERVICE)_(?:ID|SLUG)$/i;
+const reservedName = /^VEYOPS_/i;
 
 export type VariableDraft = {
   id: string;
@@ -10,18 +10,21 @@ export type VariableDraft = {
   isSecret: boolean;
   description: string;
   storedKey?: string;
+  credentialId?: string;
+  secretSource?: 'VALUE' | 'CREDENTIAL';
 };
 
 export function variableDraftError(rows: VariableDraft[]) {
   if (rows.length > 100) return '每个项目或环境最多可配置 100 个变量。';
   const names = new Set<string>();
   for (const row of rows) {
-    const { key, value, isSecret, storedKey, description } = row;
+    const { key, value, isSecret, storedKey, description, credentialId } = row;
     if (!variableName.test(key)) return '变量名须由英文字母、数字或下划线组成，且不能以数字开头。';
     if (reservedName.test(key)) return `${key} 由系统提供。`;
     if (names.has(key)) return `变量 ${key} 重复。`;
     names.add(key);
-    if (value === undefined && (!isSecret || key !== storedKey)) return `请输入变量 ${key} 的值。`;
+    if (value === undefined && (!isSecret || (key !== storedKey && !credentialId)))
+      return `请输入变量 ${key} 的值。`;
     if (isSecret && value === hiddenVariableValue) return `请输入变量 ${key} 的实际值。`;
     if (value && (value.length > 65_536 || value.includes('\0')))
       return `变量 ${key} 的值不能超过 65536 个字符或包含空字符。`;

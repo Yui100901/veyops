@@ -1,16 +1,22 @@
 import {
+  BadRequestException,
+  Body,
   ConflictException,
   Controller,
   Get,
   Header,
   Injectable,
   NotFoundException,
+  Optional,
   Param,
   ParseUUIDPipe,
+  Post,
   Query,
+  Req,
   Res,
   StreamableFile,
 } from '@nestjs/common';
+import { ArrayMaxSize, ArrayUnique, IsArray, IsOptional, IsUUID } from 'class-validator';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
@@ -22,9 +28,22 @@ import type { ArtifactsTable, Database } from '../../core/database/schema';
 import type { Kysely, Selectable } from 'kysely';
 import type { PipelineSnapshot, PipelineArtifact } from '../pipelines/pipeline.types';
 import type { TaskPayload } from '../tasks/tasks.types';
+import type { EnvironmentSetSummary } from '../projects/environment-sets.service';
 import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
 import { archiveKey, isLocalImage } from './artifact-availability';
-import { DeliveryRecordFilters } from '../projects/delivery-filters';
+import { ArtifactFilters } from '../projects/delivery-filters';
+import { lockProjectGraph } from '../projects/project-relations';
+import { AuditService } from '../audit/audit.service';
+import { Roles } from '../auth/auth.decorators';
+import type { AuthRequest } from '../auth/auth.guard';
+import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
+import {
+  ArtifactPhysicalService,
+  physicalKey,
+  type ArtifactPhysical,
+} from './artifact-physical.service';
+import { artifactIdentity } from './artifact-identities';
+import { graphUnscopedArtifactService } from '../pipelines/delivery-execution-profile';
 import { readArtifactSources } from './artifact-sources';
 import {
   maxComposeBytes,
@@ -48,6 +67,12 @@ function sourceEvent(value: string | null) {
         : [],
     ),
   );
+}
+
+function artifactEnvironmentSet(value: string | null) {
+  if (!value) return null;
+  const set = (JSON.parse(value) as { environmentSet?: EnvironmentSetSummary }).environmentSet;
+  return set ? { id: set.id, name: set.name, revision: set.revision } : null;
 }
 
 function historicalServerSelection(value: string | null) {
@@ -99,6 +124,7 @@ export interface DeploymentArtifact {
   checksum?: string;
   imageReference?: string;
   imageId?: string;
+  physical?: ArtifactPhysical;
   composeYaml?: string;
   composeTemplate?: ComposeTemplateReference;
   offlineImage?: {
@@ -109,7 +135,28 @@ export interface DeploymentArtifact {
   };
 }
 
+type Instance = Selectable<ArtifactsTable>;
+type Verification = {
+  status: 'AVAILABLE' | 'MISSING' | 'CHANGED' | 'UNVERIFIABLE';
+  reason?: string;
+};
+
+function physicalOf(row: Pick<Instance, 'physical_json'>) {
+  return row.physical_json ? (JSON.parse(row.physical_json) as ArtifactPhysical) : undefined;
+}
+
+function applicationServer(row: Pick<Instance, 'physical_json' | 'server_id'>) {
+  return physicalOf(row)?.location === 'REGISTRY' ? null : row.server_id;
+}
+function displayPhysical(row: Pick<Instance, 'physical_json'>) {
+  const real = physicalOf(row);
+  if (!real) return undefined;
+  const { ownerToken: _ownerToken, hostKeyFingerprint: _hostKeyFingerprint, ...display } = real;
+  return display;
+}
+
 function hasDeployableMetadata(row: Selectable<ArtifactsTable>, managedCompose: boolean) {
+  if (row.lifecycle_state !== 'ACTIVE') return false;
   if (row.pruned_at !== null && row.storage_type !== 'REGISTRY_IMAGE') return false;
   const hasArchive = Boolean(
     archiveKey(row) &&
@@ -119,7 +166,11 @@ function hasDeployableMetadata(row: Selectable<ArtifactsTable>, managedCompose: 
     Number.isSafeInteger(row.size_bytes) &&
     row.size_bytes > 0,
   );
-  if (row.artifact_type === 'FILE') return hasArchive && row.storage_type === 'LOCAL_FILE';
+  const physical = physicalOf(row);
+  if (row.artifact_type === 'FILE')
+    return (
+      physical?.location === 'SERVER_PATH' || (hasArchive && row.storage_type === 'LOCAL_FILE')
+    );
   if (
     row.artifact_type !== 'DOCKER_IMAGE' ||
     (!managedCompose &&
@@ -135,7 +186,11 @@ function hasDeployableMetadata(row: Selectable<ArtifactsTable>, managedCompose: 
     return (
       registryReference.test(row.storage_key) && row.storage_key.endsWith(`@${row.image_digest}`)
     );
-  return hasArchive && isLocalImage(row.storage_type) && localImageReference.test(row.storage_key);
+  return (
+    (hasArchive || (physical?.location === 'DOCKER_ENGINE' && !!row.server_id)) &&
+    isLocalImage(row.storage_type) &&
+    localImageReference.test(row.storage_key)
+  );
 }
 
 function checksumOf(text: string) {
@@ -163,15 +218,27 @@ function deploymentFingerprint(row: Selectable<ArtifactsTable>) {
       row.archive_image_id,
       row.archive_image_platform,
       row.compose_checksum,
+      row.physical_json,
     ]),
   );
 }
 
 @Injectable()
 export class ArtifactsService {
-  constructor(private readonly database: DatabaseService) {}
+  constructor(
+    private readonly database: DatabaseService,
+    @Optional() private readonly physical?: ArtifactPhysicalService,
+    @Optional() private readonly audit?: AuditService,
+  ) {}
   async create(snapshot: PipelineSnapshot, artifact: Omit<PipelineArtifact, 'id'>) {
-    const id = randomUUID();
+    const grouped = snapshot.graph
+      ? artifactIdentity(snapshot, artifact.name, artifact.serverId)
+      : undefined;
+    const id = grouped?.instanceId ?? randomUUID();
+    const temporaryRootId =
+      artifact.persist === false ? (snapshot.graph?.rootRunId ?? snapshot.graph?.runId) : undefined;
+    if (artifact.persist === false && !temporaryRootId)
+      throw new BadRequestException('临时产物只能在执行图运行中登记');
     const d = snapshot.definition;
     const artifactType = artifact.kind
       ? artifact.kind === 'DOCKER_IMAGE'
@@ -192,11 +259,73 @@ export class ArtifactsService {
       artifactType === 'DOCKER_IMAGE' && declared?.imageReference
         ? []
         : (artifact.sources ?? snapshot.artifactSources);
+    const physicalJson = artifact.physical ? JSON.stringify(artifact.physical) : null;
+    const locationKey = artifact.physical ? physicalKey(artifact.physical) : null;
     await this.database.db.transaction().execute(async (tx) => {
+      if (grouped || locationKey) await lockProjectGraph(tx);
+      if (
+        temporaryRootId &&
+        !(await tx
+          .selectFrom('execution_flow_runs')
+          .select('id')
+          .where('id', '=', temporaryRootId)
+          .where('project_id', '=', snapshot.projectId)
+          .where('status', 'in', ['QUEUED', 'RUNNING', 'WAITING'])
+          .executeTakeFirst())
+      )
+        throw new ConflictException('临时产物的根运行已结束');
+      if (
+        locationKey &&
+        (await tx
+          .selectFrom('artifacts')
+          .select('id')
+          .where('physical_key', '=', locationKey)
+          .where('lifecycle_state', '=', 'CLEANING')
+          .executeTakeFirst())
+      )
+        throw new ConflictException('产物实物正在清理，请稍后恢复登记');
+      if (grouped) {
+        const previous = await tx
+          .selectFrom('artifacts')
+          .select([
+            'project_id',
+            'pipeline_run_id',
+            'physical_json',
+            'source_commit',
+            'lifecycle_state',
+          ])
+          .where('id', '=', id)
+          .executeTakeFirst();
+        if (previous) {
+          if (
+            previous.project_id !== snapshot.projectId ||
+            previous.pipeline_run_id !== snapshot.runId ||
+            previous.physical_json !== physicalJson ||
+            previous.source_commit !== snapshot.commitSha ||
+            previous.lifecycle_state !== 'ACTIVE'
+          )
+            throw new ConflictException('已登记的产物与本次恢复的实物不一致');
+          return;
+        }
+      }
+      const origin = snapshot.graph
+        ? await tx
+            .selectFrom('execution_flow_runs')
+            .select('inputs_json')
+            .where('id', '=', snapshot.graph.runId)
+            .executeTakeFirst()
+        : undefined;
       await tx
         .insertInto('artifacts')
         .values({
           id,
+          logical_artifact_id: grouped?.artifactId ?? id,
+          physical_json: physicalJson,
+          physical_key: locationKey,
+          temporary_root_id: temporaryRootId ?? null,
+          environment_set_id: artifactEnvironmentSet(origin?.inputs_json ?? null)?.id ?? null,
+          verification_status: artifact.physical ? 'AVAILABLE' : null,
+          verified_at: artifact.physical ? Date.now() : null,
           project_id: snapshot.projectId,
           service_id: snapshot.serviceId,
           pipeline_run_id: snapshot.runId,
@@ -245,10 +374,29 @@ export class ArtifactsService {
             })),
           )
           .execute();
+      if (grouped && this.audit)
+        await this.audit.record(
+          null,
+          'artifact.register',
+          'artifact',
+          id,
+          {
+            projectId: snapshot.projectId,
+            artifactId: grouped.artifactId,
+            serverId: artifact.serverId,
+            temporary: Boolean(temporaryRootId),
+          },
+          tx,
+        );
     });
     return { ...artifact, id };
   }
-  async list(projectId?: string, pipelineRunId?: string, filters: DeliveryRecordFilters = {}) {
+  async list(
+    projectId?: string,
+    pipelineRunId?: string,
+    filters: ArtifactFilters = {},
+    includeTemporary = false,
+  ) {
     let query = this.database.db
       .selectFrom('artifacts')
       .leftJoin('pipeline_runs', 'pipeline_runs.id', 'artifacts.pipeline_run_id')
@@ -279,6 +427,7 @@ export class ArtifactsService {
         'flow.inputs_json as graphInputs',
         'node.name as graphNodeName',
         'node.node_type as graphNodeType',
+        'node.node_id as graphNodeId',
       ])
       .select((eb) =>
         eb
@@ -291,14 +440,36 @@ export class ArtifactsService {
           .as('managedComposeChecksum'),
       );
     if (projectId) query = query.where('artifacts.project_id', '=', projectId);
+    if (!includeTemporary) query = query.where('artifacts.temporary_root_id', 'is', null);
     if (pipelineRunId) query = query.where('artifacts.pipeline_run_id', '=', pipelineRunId);
     if (filters.taskId) query = query.where('pipeline_runs.task_id', '=', filters.taskId);
-    if (filters.recordId) query = query.where('artifacts.id', '=', filters.recordId);
+    if (filters.recordId)
+      query = query.where((eb) =>
+        eb.or([
+          eb('artifacts.id', '=', filters.recordId!),
+          eb('artifacts.logical_artifact_id', '=', filters.recordId!),
+        ]),
+      );
     if (filters.serviceId) query = query.where('artifacts.service_id', '=', filters.serviceId);
     if (filters.environmentId)
       query = query.where('pipeline_runs.environment_id', '=', filters.environmentId);
-    if (filters.commit || filters.repositoryId) {
-      const sha = filters.commit?.toLowerCase();
+    if (filters.environmentSetId)
+      query = query.where('artifacts.environment_set_id', '=', filters.environmentSetId);
+    if (filters.serverId) query = query.where('artifacts.server_id', '=', filters.serverId);
+    if (filters.kind)
+      query = query.where(
+        (eb) => eb.fn.coalesce('artifacts.artifact_kind', 'artifacts.artifact_type'),
+        '=',
+        filters.kind,
+      );
+    if (filters.verificationStatus)
+      query = query.where(
+        (eb) => eb.fn.coalesce('artifacts.verification_status', eb.val('NOT_CHECKED')),
+        '=',
+        filters.verificationStatus!,
+      );
+    if (filters.commit || filters.commitSha || filters.repositoryId || filters.ref) {
+      const sha = (filters.commitSha ?? filters.commit)?.toLowerCase();
       query = query.where((eb) => {
         const matched = eb.exists(
           eb
@@ -308,9 +479,10 @@ export class ArtifactsService {
             .$if(Boolean(filters.repositoryId), (q) =>
               q.where('source.repository_id', '=', filters.repositoryId!),
             )
+            .$if(Boolean(filters.ref), (q) => q.where('source.git_ref', '=', filters.ref!))
             .$if(Boolean(sha), (q) => q.where('source.commit_sha', 'like', sha + '%')),
         );
-        return !filters.repositoryId && sha
+        return !filters.repositoryId && !filters.ref && sha
           ? eb.or([
               matched,
               eb.and([
@@ -321,15 +493,45 @@ export class ArtifactsService {
           : matched;
       });
     }
-    const rows = await query.orderBy('artifacts.created_at', 'desc').limit(200).execute();
+    if (filters.cursor) {
+      const cursor = await this.database.db
+        .selectFrom('artifacts')
+        .select(['id', 'created_at'])
+        .where('id', '=', filters.cursor)
+        .executeTakeFirst();
+      if (!cursor) throw new BadRequestException('无效的产物分页位置');
+      query = query.where((eb) =>
+        eb.or([
+          eb('artifacts.created_at', '<', cursor.created_at),
+          eb.and([
+            eb('artifacts.created_at', '=', cursor.created_at),
+            eb('artifacts.id', '<', cursor.id),
+          ]),
+        ]),
+      );
+    }
+    const rows = await query
+      .orderBy('artifacts.created_at', 'desc')
+      .orderBy('artifacts.id', 'desc')
+      .limit(filters.limit ?? 200)
+      .execute();
     const sources = await readArtifactSources(
       this.database.db,
       rows.map(({ id }) => id),
     );
     return rows.map((r) => ({
       id: r.id,
+      artifactId: r.logical_artifact_id ?? r.id,
+      instanceId: r.id,
+      physical: displayPhysical(r),
+      lifecycleState: r.lifecycle_state,
+      verificationStatus: r.verification_status ?? 'NOT_CHECKED',
+      verificationReason: r.verification_reason,
+      verifiedAt: r.verified_at,
+      temporary: Boolean(r.temporary_root_id),
       projectId: r.project_id,
-      serviceId: r.service_id,
+      serviceId:
+        r.service_id === graphUnscopedArtifactService(r.project_id).id ? null : r.service_id,
       pipelineRunId: r.pipeline_run_id,
       taskId: r.taskId,
       pipelineId: r.pipelineId,
@@ -341,12 +543,14 @@ export class ArtifactsService {
         storedDeploymentSelection(r.targetSelectionJson),
       deployable:
         (r.taskStatus === 'SUCCESS' || r.taskStatus === 'PARTIAL_FAILED') &&
+        r.service_id !== graphUnscopedArtifactService(r.project_id).id &&
         hasDeployableMetadata(r, Boolean(r.managedComposeChecksum)),
       artifactType: r.artifact_type,
       name: r.artifact_name,
       kind: r.artifact_kind ?? r.artifact_type,
       graphRunId: r.graph_run_id,
       graphNodeRunId: r.graph_node_run_id,
+      graphNodeId: r.graphNodeId,
       graphVersion: r.graphVersion,
       graphFlowName: r.graphFlowName,
       graphNodeName: r.graphNodeName,
@@ -368,6 +572,7 @@ export class ArtifactsService {
       sourceCommit: r.source_commit,
       sources: sources.get(r.id),
       sourceEvent: sourceEvent(r.graphInputs),
+      environmentSet: artifactEnvironmentSet(r.graphInputs),
       composeTemplate: archivedComposeTemplate(
         r.sourceTaskPayload,
         r.artifact_name,
@@ -390,37 +595,121 @@ export class ArtifactsService {
     }));
   }
 
-  async deployableIn(db: Kysely<Database>, runId: string, checkArchive = false, managedCompose = false) {
+  async detail(id: string) {
+    const row = await this.database.db
+      .selectFrom('artifacts')
+      .select(['project_id', 'logical_artifact_id', 'id'])
+      .where((eb) => eb.or([eb('id', '=', id), eb('logical_artifact_id', '=', id)]))
+      .executeTakeFirst();
+    if (!row) throw new NotFoundException('产物不存在');
+    const artifactId = row.logical_artifact_id ?? row.id;
+    return {
+      artifactId,
+      instances: await this.list(row.project_id, undefined, { recordId: artifactId }, true),
+    };
+  }
+
+  async checkInstances(id: string, instanceIds: string[] | undefined, userId: string) {
+    const { artifactId, instances } = await this.detail(id);
+    const chosen = instances.filter(
+      (entry) => !instanceIds?.length || instanceIds.includes(entry.id),
+    );
+    if (instanceIds?.length && chosen.length !== instanceIds.length)
+      throw new BadRequestException('部分实物实例不属于该产物');
+    for (const instance of chosen) {
+      const row = await this.database.db
+        .selectFrom('artifacts')
+        .selectAll()
+        .where('id', '=', instance.id)
+        .where('lifecycle_state', '=', 'ACTIVE')
+        .executeTakeFirst();
+      if (!row) continue;
+      const check = await this.check(row);
+      await this.recordCheck(row, check, userId);
+      await this.audit?.record(userId, 'artifact.verify', 'artifact', instance.id, {
+        artifactId,
+        status: check.status,
+      });
+    }
+    return this.detail(artifactId);
+  }
+
+  private async check(row: Instance, target?: SshTarget): Promise<Verification> {
+    const physical = physicalOf(row);
+    if (physical)
+      return this.physical
+        ? this.physical.verify(physical, target)
+        : {
+            status: 'UNVERIFIABLE',
+            reason: '产物实物验证服务不可用',
+          };
+    const key = archiveKey(row);
+    if (!key) return { status: 'UNVERIFIABLE', reason: '缺少可验证的实物描述' };
+    try {
+      await this.verifiedArchive(key, row);
+      return { status: 'AVAILABLE' };
+    } catch (error) {
+      if (error instanceof NotFoundException) return { status: 'MISSING', reason: error.message };
+      if (error instanceof ConflictException) return { status: 'CHANGED', reason: error.message };
+      return { status: 'UNVERIFIABLE', reason: '产物归档无法读取' };
+    }
+  }
+
+  private async recordCheck(row: Instance, check: Verification, userId?: string) {
+    await this.database.db
+      .updateTable('artifacts')
+      .set({
+        verification_status: check.status,
+        verification_reason: check.reason?.slice(0, 500) ?? null,
+        verified_at: Date.now(),
+        verified_by: userId ?? null,
+      })
+      .where('id', '=', row.id)
+      .where('lifecycle_state', '=', 'ACTIVE')
+      .execute();
+  }
+
+  async deployableIn(
+    db: Kysely<Database>,
+    runId: string,
+    checkArchive = false,
+    managedCompose = false,
+    rootRunId?: string,
+    instanceIds?: readonly string[],
+  ) {
     const rows = await db
       .selectFrom('artifacts')
       .selectAll()
       .where('pipeline_run_id', '=', runId)
+      .$if(Boolean(instanceIds), (query) => query.where('id', 'in', [...instanceIds!]))
+      .where((eb) =>
+        eb.or([
+          eb('temporary_root_id', 'is', null),
+          ...(rootRunId ? [eb('temporary_root_id', '=', rootRunId)] : []),
+        ]),
+      )
       .orderBy('id')
       .execute();
     const eligible = rows.filter((row) => hasDeployableMetadata(row, managedCompose));
     const available = checkArchive
       ? (
           await Promise.all(
-            eligible.map(async (row) => ((await this.archiveAvailable(row)) ? row : null)),
+            eligible.map(async (row) => {
+              if (!row.physical_json && row.storage_type === 'REGISTRY_IMAGE') return row;
+              const check = await this.check(row);
+              if (db === this.database.db) await this.recordCheck(row, check);
+              return check.status === 'AVAILABLE' ? row : null;
+            }),
           )
         ).filter((row) => row !== null)
       : eligible;
     return available.map((row) => ({
       id: row.id,
-      serverId: row.server_id,
+      serverId: applicationServer(row),
       fingerprint: deploymentFingerprint(row),
       name: row.artifact_name,
       kind: row.artifact_kind ?? row.artifact_type,
     }));
-  }
-
-  private async archiveAvailable(row: Selectable<ArtifactsTable>) {
-    if (row.storage_type === 'REGISTRY_IMAGE') return true;
-    const key = archiveKey(row);
-    if (!key) return false;
-    const archive = await this.resolveArchive(key).catch(() => null);
-    const stat = archive ? await lstat(archive).catch(() => null) : null;
-    return Boolean(stat?.isFile() && stat.size === row.size_bytes);
   }
 
   async managedCompose(snapshot: PipelineSnapshot) {
@@ -433,7 +722,11 @@ export class ArtifactsService {
     );
   }
 
-  async forDeployment(snapshot: PipelineSnapshot, serverId: string): Promise<DeploymentArtifact> {
+  async forDeployment(
+    snapshot: PipelineSnapshot,
+    serverId: string,
+    target?: SshTarget,
+  ): Promise<DeploymentArtifact> {
     const candidates = snapshot.deploymentArtifacts?.filter(
       (artifact) => artifact.serverId === null || artifact.serverId === serverId,
     );
@@ -464,12 +757,20 @@ export class ArtifactsService {
     ).executeTakeFirst();
     if (
       !row ||
-      row.server_id !== candidate.serverId ||
+      applicationServer(row) !== candidate.serverId ||
+      (row.temporary_root_id && row.temporary_root_id !== snapshot.artifactRootRunId) ||
       !hasDeployableMetadata(row, Boolean(snapshot.managedCompose))
     )
       throw new ConflictException('构建产物不可发布或与当前任务范围不一致');
     if (candidate.fingerprint && candidate.fingerprint !== deploymentFingerprint(row))
       throw new ConflictException('已确认的构建产物校验信息发生变化');
+    const physical = physicalOf(row);
+    if (physical) {
+      const check = await this.check(row, physical.serverId ? target : undefined);
+      await this.recordCheck(row, check);
+      if (check.status !== 'AVAILABLE')
+        throw new ConflictException(check.reason ?? '已确认的产物实物不可用');
+    }
     if (row.server_id) {
       const successful = await this.database.db
         .selectFrom('task_targets')
@@ -480,7 +781,11 @@ export class ArtifactsService {
         .executeTakeFirst();
       if (!successful) throw new ConflictException('产物来源目标构建未成功');
     }
-    if (!snapshot.managedCompose && row.compose_yaml && checksumOf(row.compose_yaml) !== row.compose_checksum)
+    if (
+      !snapshot.managedCompose &&
+      row.compose_yaml &&
+      checksumOf(row.compose_yaml) !== row.compose_checksum
+    )
       throw new ConflictException('Compose 配置未通过完整性校验');
     const key = row.pruned_at === null ? archiveKey(row) : null;
     const registry = row.storage_type === 'REGISTRY_IMAGE';
@@ -503,10 +808,15 @@ export class ArtifactsService {
         : undefined;
     return {
       id: row.id,
+      physical,
       ...archive,
       offlineImage,
       composeYaml: row.compose_yaml ?? undefined,
-      composeTemplate: archivedComposeTemplate(row.build_payload, row.artifact_name, row.compose_checksum),
+      composeTemplate: archivedComposeTemplate(
+        row.build_payload,
+        row.artifact_name,
+        row.compose_checksum,
+      ),
       imageReference: row.artifact_type === 'DOCKER_IMAGE' ? row.storage_key : undefined,
       imageId: isLocalImage(row.storage_type) ? (row.image_digest ?? undefined) : undefined,
     };
@@ -550,7 +860,12 @@ export class ArtifactsService {
       .selectAll()
       .where('id', '=', id)
       .executeTakeFirst();
-    const key = row && row.pruned_at === null && archiveKey(row);
+    const key =
+      row &&
+      row.pruned_at === null &&
+      row.lifecycle_state === 'ACTIVE' &&
+      row.temporary_root_id === null &&
+      archiveKey(row);
     if (!key) throw new NotFoundException('该产物没有可下载的归档');
     const resolved = await this.resolveArchive(key);
     const file = await open(resolved, constants.O_RDONLY | (constants.O_NOFOLLOW || 0)).catch(
@@ -562,13 +877,20 @@ export class ArtifactsService {
       if (!stat.isFile()) throw new NotFoundException('产物归档不存在');
       if (row.size_bytes !== null && stat.size !== row.size_bytes)
         throw new ConflictException('产物归档大小与记录不一致');
+      if (row.checksum && sha256.test(row.checksum)) {
+        const hash = createHash('sha256');
+        for await (const chunk of file.createReadStream({ start: 0, autoClose: false }))
+          hash.update(chunk as Buffer);
+        if (hash.digest('hex') !== row.checksum)
+          throw new ConflictException('产物归档未通过完整性校验');
+      }
       const extension = key.endsWith('.tar.gz') ? 'tar.gz' : 'tar';
       const commit = /^[a-f0-9]{40,64}$/i.test(row.source_commit ?? '')
         ? row.source_commit!.slice(0, 12) + '-'
         : '';
       const filename = `veyops-${commit}${id}.${extension}`;
       return {
-        file: new StreamableFile(file.createReadStream(), {
+        file: new StreamableFile(file.createReadStream({ start: 0 }), {
           type: extension === 'tar.gz' ? 'application/gzip' : 'application/x-tar',
           disposition: `attachment; filename="${filename}"`,
           length: stat.size,
@@ -592,11 +914,33 @@ export class ArtifactsService {
     return resolved;
   }
 }
+class VerifyArtifactsDto {
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ArrayUnique()
+  @IsUUID(undefined, { each: true })
+  instanceIds?: string[];
+}
+
 @Controller('artifacts')
 export class ArtifactsController {
   constructor(private readonly service: ArtifactsService) {}
-  @Get() list(@Query() filters: DeliveryRecordFilters) {
+  @Get() list(@Query() filters: ArtifactFilters) {
     return this.service.list(filters.projectId, filters.pipelineRunId, filters);
+  }
+  @Get(':id')
+  detail(@Param('id', ParseUUIDPipe) id: string) {
+    return this.service.detail(id);
+  }
+  @Post(':id/verify')
+  @Roles('ADMIN', 'OPERATOR')
+  verify(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: VerifyArtifactsDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.checkInstances(id, body.instanceIds, req.user.id);
   }
   @Get(':id/download')
   @Header('Cache-Control', 'private, no-store')

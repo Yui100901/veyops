@@ -10,8 +10,9 @@ interface RetentionPolicy {
 }
 
 interface RetentionScope {
-  serviceId: string;
-  environmentId: string;
+  projectId?: string;
+  serviceId?: string;
+  environmentId?: string;
 }
 
 export function ArtifactRetentionPolicy({
@@ -21,9 +22,9 @@ export function ArtifactRetentionPolicy({
   scope?: RetentionScope;
   onClose: () => void;
 }) {
-  const path = scope
-    ? `/artifact-retention/policy?${new URLSearchParams({ ...scope })}`
-    : '/artifact-retention/policy';
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(scope ?? {})) if (value) query.set(key, value);
+  const path = '/artifact-retention/policy' + (query.size ? '?' + query : '');
   const policy = useResource<RetentionPolicy>(path);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -64,7 +65,13 @@ export function ArtifactRetentionPolicy({
 
   return (
     <Modal
-      title={scope ? '环境产物保留策略' : '系统产物保留策略'}
+      title={
+        scope?.serviceId
+          ? '服务产物保留策略'
+          : scope?.projectId
+            ? '项目产物保留策略'
+            : '系统产物保留策略'
+      }
       onClose={() => {
         if (!busy) onClose();
       }}
@@ -100,11 +107,11 @@ export function ArtifactRetentionPolicy({
             </Field>
           </div>
           <p className="field-note">
-            超过任一限制的归档进入清理候选。当前运行版本、回滚基线及已固定产物优先保留。
+            超过配置限制的产物进入清理候选。活动引用、回滚基线及已固定产物受保留保护。
           </p>
           {scope &&
             (policy.data.inherited ? (
-              <p className="field-note">当前继承系统策略。保存后应用于此服务环境。</p>
+              <p className="field-note">当前继承上级策略。保存后将应用单独的保留设置。</p>
             ) : (
               <button
                 className="button secondary small"
@@ -112,7 +119,7 @@ export function ArtifactRetentionPolicy({
                 disabled={busy}
                 onClick={inherit}
               >
-                恢复继承系统策略
+                恢复继承上级策略
               </button>
             ))}
         </Form>

@@ -14,6 +14,7 @@ export const projectResourceTypes = [
   'REPOSITORY',
   'SERVICE',
   'ENVIRONMENT',
+  'ENVIRONMENT_SET',
   'CREDENTIAL',
   'REGISTRY',
   'LEGACY_TARGET',
@@ -82,7 +83,9 @@ function samples(value: unknown): unknown[] {
 }
 
 function idValue(value: unknown) {
-  const candidate = typeof value === 'string' ? value : objectValue(value).id;
+  const object = objectValue(value);
+  const candidate =
+    typeof value === 'string' ? value : (object.id ?? object.serviceId ?? object.artifactId);
   return typeof candidate === 'string' && candidate.length > 0 ? candidate : undefined;
 }
 
@@ -112,6 +115,7 @@ const referenceFields = new Set<string>([
   'REPOSITORY',
   'SERVICE',
   'ENVIRONMENT',
+  'ENVIRONMENT_SET',
   'ARTIFACT',
   'CREDENTIAL',
 ]);
@@ -131,6 +135,8 @@ function bindingReferences(
   binding?: GraphBinding,
 ): ProjectResourceReference[] {
   if (binding?.kind === 'VALUE') return fieldReferences(source, field, binding.value);
+  if (binding?.kind === 'CREDENTIAL')
+    return referenceRows({ ...source, fieldId: field.id }, 'CREDENTIAL', binding.credentialId);
   if (binding?.kind === 'FIRST_AVAILABLE')
     return binding.sources.flatMap((candidate) => bindingReferences(source, field, candidate));
   return [];
@@ -140,6 +146,11 @@ function nodeReferences(source: ReferenceSource, node: GraphNode) {
   const legacy = objectValue((node as GraphNode & { delivery?: unknown }).delivery);
   const oldBuild = objectValue(legacy.build);
   return [
+    ...referenceRows(
+      { ...source, fieldId: 'environmentSet' },
+      'ENVIRONMENT_SET',
+      node.environmentSet?.mode === 'FIXED' ? node.environmentSet.environmentSetId : undefined,
+    ),
     ...referenceRows(
       { ...source, fieldId: 'repository' },
       'REPOSITORY',
@@ -152,9 +163,10 @@ function nodeReferences(source: ReferenceSource, node: GraphNode) {
     ),
     ...referenceRows({ ...source, fieldId: 'serverId' }, 'SERVER', node.shell?.serverId),
     ...referenceRows({ ...source, fieldId: 'service' }, 'SERVICE', legacy.serviceId),
-    ...[...(node.inputs ?? []), ...(node.shell?.params ?? [])].flatMap((field) =>
-      fieldReferences(source, field, field.defaultValue),
-    ),
+    ...[...(node.inputs ?? []), ...(node.shell?.params ?? [])].flatMap((field) => [
+      ...fieldReferences(source, field, field.defaultValue),
+      ...(field.type === 'ENVIRONMENT_SET' ? fieldReferences(source, field, field.options) : []),
+    ]),
   ];
 }
 
@@ -237,6 +249,9 @@ function flowReferences(source: ReferenceSource, flow: GraphFlow, flows: Map<str
       return [
         ...nodeReferences(nodeSource, node),
         ...ports.flatMap((field) => bindingReferences(nodeSource, field, bindings?.[field.id])),
+        ...Object.entries(flow.environmentBindings?.[node.id] ?? {}).flatMap(([key, binding]) =>
+          bindingReferences(nodeSource, { id: key, name: key, type: 'TEXT' }, binding),
+        ),
         ...(node.type === 'END'
           ? (node.outputs ?? []).flatMap((field) =>
               bindingReferences(nodeSource, field, flow.outputBindings?.[field.id]),
@@ -358,7 +373,8 @@ function preparedNodeReferences(
   const target = objectValue(plan.targetInputs);
   const resolution = objectValue(plan.configuration);
   const checkout = objectValue(plan.source);
-  const definition = objectValue(objectValue(plan.profile).definition);
+  const profile = objectValue(plan.profile);
+  const definition = objectValue(profile.definition);
   const readsRepository =
     source.state === 'HISTORY' ||
     !(
@@ -374,6 +390,7 @@ function preparedNodeReferences(
   };
   return [
     ...selectionReferences(context, plan),
+    ...selectionReferences(context, plan.targetSelection),
     ...selectionReferences(context, { groupIds: target.groupIds, targetId: target.targetId }),
     ...selectionReferences(context, {
       ...objectValue(resolution.targetSelection),
@@ -399,6 +416,7 @@ function preparedNodeReferences(
         ]
       : []),
     ...credentialReferences(context, plan.environment),
+    ...credentialReferences(context, profile.graphVariables),
     ...samples(plan.alternatives)
       .filter(Boolean)
       .flatMap((alternative) => preparedNodeReferences(context, alternative, deploy)),
@@ -437,6 +455,9 @@ export function runResourceReferences(
     return [
       ...selectionReferences(context, inputs),
       ...referenceRows(context, 'ENVIRONMENT', inputs.environmentId),
+      ...referenceRows(context, 'ENVIRONMENT_SET', prepared.environmentSet),
+      ...referenceRows(context, 'CREDENTIAL', Object.keys(objectValue(prepared.credentials))),
+      ...credentialReferences(context, prepared.frozenEnvironment),
       ...referenceRows(context, 'ARTIFACT', inputs.artifactIds),
       ...(context.state === 'HISTORY'
         ? referenceRows(context, 'REPOSITORY', objectValue(prepared.trigger).repositoryId)

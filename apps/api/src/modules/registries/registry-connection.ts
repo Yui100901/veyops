@@ -1,4 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 
 const authOrigins: Record<string, { origin: string; path: string }> = {
   'https://registry-1.docker.io': { origin: 'https://auth.docker.io', path: '/token' },
@@ -177,5 +178,92 @@ export async function checkRegistryConnection(
       false,
       signal.aborted ? '连接镜像仓库超时' : '无法建立 HTTPS 连接，请检查仓库地址、网络及 TLS 证书',
     );
+  }
+}
+
+export async function checkRegistryManifest(
+  address: string,
+  repository: string,
+  digest: string,
+  credentials?: RegistryCredentials,
+  cancellation?: AbortSignal,
+): Promise<'AVAILABLE' | 'MISSING' | 'CHANGED' | 'UNVERIFIABLE'> {
+  if (
+    !/^[a-z0-9]+(?:[._-]+[a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-]+[a-z0-9]+)*)*$/.test(repository) ||
+    !/^sha256:[a-f0-9]{64}$/.test(digest)
+  )
+    return 'UNVERIFIABLE';
+  const host = hubAliases.has(address) ? 'registry-1.docker.io' : registryAddress(address);
+  const endpoint = new URL('https://' + host + '/v2/' + repository + '/manifests/' + digest);
+  const timeout = AbortSignal.timeout(15_000);
+  const signal = cancellation ? AbortSignal.any([cancellation, timeout]) : timeout;
+  const basic = credentials
+    ? 'Basic ' + Buffer.from(credentials.username + ':' + credentials.password).toString('base64')
+    : undefined;
+  const request = (url: URL, authorization?: string, manifest = false) =>
+    fetch(url, {
+      signal,
+      redirect: 'manual',
+      headers: {
+        ...(authorization && { Authorization: authorization }),
+        ...(manifest && {
+          Accept: [
+            'application/vnd.oci.image.manifest.v1+json',
+            'application/vnd.oci.image.index.v1+json',
+            'application/vnd.docker.distribution.manifest.v2+json',
+            'application/vnd.docker.distribution.manifest.list.v2+json',
+          ].join(', '),
+        }),
+      },
+    });
+  try {
+    let response = await request(endpoint, undefined, true);
+    if (response.status === 401) {
+      const header = response.headers.get('www-authenticate') ?? '';
+      await response.body?.cancel().catch(() => undefined);
+      const challenge = challengeParameters(header);
+      let authorization: string | undefined;
+      if (challenge) {
+        const tokenUrl = tokenEndpoint(endpoint, challenge);
+        if (!tokenUrl) return 'UNVERIFIABLE';
+        tokenUrl.searchParams.set('scope', 'repository:' + repository + ':pull');
+        const tokenResponse = await request(tokenUrl, basic);
+        if (!tokenResponse.ok) {
+          await tokenResponse.body?.cancel().catch(() => undefined);
+          return 'UNVERIFIABLE';
+        }
+        const token = await readToken(tokenResponse);
+        if (token) authorization = 'Bearer ' + token;
+      } else if (/(?:^|,)\s*Basic(?:\s|,|$)/i.test(header)) {
+        authorization = basic;
+      }
+      if (!authorization) return 'UNVERIFIABLE';
+      response = await request(endpoint, authorization, true);
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      return response.status === 404 &&
+        response.headers.get('docker-distribution-api-version') === registryVersion
+        ? 'MISSING'
+        : 'UNVERIFIABLE';
+    }
+    const reader = response.body?.getReader();
+    if (!reader) return 'UNVERIFIABLE';
+    try {
+      const hash = createHash('sha256');
+      let size = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 4 * 1024 * 1024) return 'UNVERIFIABLE';
+        hash.update(value);
+      }
+      return 'sha256:' + hash.digest('hex') === digest ? 'AVAILABLE' : 'CHANGED';
+    } finally {
+      await reader.cancel().catch(() => undefined);
+    }
+  } catch {
+    return 'UNVERIFIABLE';
   }
 }

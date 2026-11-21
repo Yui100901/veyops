@@ -54,6 +54,7 @@ function scopeReason(
 
 const missingLabels = {
   ARTIFACT: '选择历史制品',
+  ENVIRONMENT_SET: '选择变量集合',
   TARGETS: '配置目标',
   REPOSITORY: '选择仓库',
 } as const;

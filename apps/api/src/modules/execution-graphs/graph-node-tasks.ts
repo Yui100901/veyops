@@ -7,7 +7,6 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
-import { lstat } from 'node:fs/promises';
 import { posix } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { Database } from '../../core/database/schema';
@@ -18,15 +17,22 @@ import {
   resolveExecutionVariables,
   type ExecutionVariables,
 } from '../../infrastructure/execution-variables';
-import { SshService } from '../../infrastructure/ssh/ssh.service';
+import { SshExecutionError, SshService } from '../../infrastructure/ssh/ssh.service';
 import { TargetResolver } from '../command-center/target-resolver.service';
 import { BuildsService, type BuildSession } from '../builds/builds.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { CredentialsService } from '../credentials/credentials.service';
-import type { DeploymentSelection } from '../deployment-targets/deployment-selection';
+import {
+  directDeploymentSelection,
+  type DeploymentSelection,
+} from '../deployment-targets/deployment-selection';
 import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
 import { relativePath, shellQuote } from '../pipelines/pipeline.validation';
-import { deliveryExecutionProfile } from '../pipelines/delivery-execution-profile';
+import {
+  deliveryExecutionProfile,
+  graphDeliveryEnvironment,
+  graphUnscopedArtifactService,
+} from '../pipelines/delivery-execution-profile';
 import type { PipelineSnapshot, NamedArtifactDefinition } from '../pipelines/pipeline.types';
 import { withPlanIssue } from './graph-execution-plan-issues';
 import {
@@ -37,19 +43,21 @@ import { ServiceConfigsService } from '../service-configs/service-configs.servic
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import type { CreateTaskInput, TaskExecutionContext, TaskRecord } from '../tasks/tasks.types';
 import type { GraphNode } from './execution-graph-definition';
+import { validateGraphValue, type GraphField } from './graph-fields';
 import { graphNodeRequiresIsolation, isGraphTriggerKind } from './graph-automatic-delivery';
+import { GraphScriptOutput } from './graph-script-output';
 import {
   environmentFilePath,
   graphVariableSources,
-  type GraphEnvironmentFileSource,
+  mergeEnvironmentSet,
   type GraphEnvironmentPlan,
   type GraphEnvironmentSource,
   type GraphVariableSource,
 } from './graph-environment';
+import type { FrozenEnvironmentSet } from '../projects/environment-sets.service';
 import {
   createGraphWorkspace,
   graphTriggerVariables,
-  graphWorkspaceEntry,
   openGraphWorkspace,
   ownedGraphWorkspace,
   unversionedArtifactCommit,
@@ -70,11 +78,17 @@ type NativeModule = 'CHECKOUT' | ScriptNode | 'LOAD_ENV' | 'REGISTER_ARTIFACT';
 
 export interface GraphNodeScope {
   environmentId?: string;
+  environmentSet?: FrozenEnvironmentSet | null;
+  parameters?: Record<string, unknown>;
   serviceId?: string;
   values?: Record<string, unknown>;
   runId?: string;
+  rootRunId?: string;
   nodeRunId?: string;
   trigger?: Record<string, unknown>;
+  nodeEnvironment?: ExecutionVariables;
+  nodeEnvironmentSources?: GraphVariableSource[];
+  credentialNonces?: Readonly<Record<string, string>>;
 }
 
 export type GraphNodePlan =
@@ -84,9 +98,11 @@ export type GraphNodePlan =
       serverId?: string;
       serverName?: string;
       targetHash?: string;
+      targetSelection?: DeploymentSelection;
       serviceId?: string;
       environmentId?: string;
       environment?: ExecutionVariables;
+      configuredVariableSources?: GraphVariableSource[];
       variableSources?: GraphVariableSource[];
       environmentFile?: GraphEnvironmentPlan;
     }
@@ -107,8 +123,8 @@ export interface GraphModulePayload {
   source?: GraphCheckoutSnapshot;
   variables?: GraphEnvironmentRef;
   targetDirectory?: string;
-  envFile?: string;
   environmentFile?: GraphEnvironmentPlan;
+  variableSources?: GraphVariableSource[];
   shell?: {
     command: string;
     timeout: number;
@@ -121,7 +137,10 @@ export interface GraphModulePayload {
 
 const text = (value: unknown) => (typeof value === 'string' ? value : undefined);
 const resourceId = (value: unknown) =>
-  text(value) ?? (value && typeof value === 'object' && 'id' in value ? text(value.id) : undefined);
+  text(value) ??
+  (value && typeof value === 'object'
+    ? text('serviceId' in value ? value.serviceId : 'id' in value ? value.id : undefined)
+    : undefined);
 const workspaceOf = (value: unknown) =>
   value &&
   typeof value === 'object' &&
@@ -135,6 +154,80 @@ const sourceOf = (value: unknown) =>
   value && typeof value === 'object' ? (value as GraphEnvironmentSource) : undefined;
 const variablesOf = (value: unknown) =>
   value && typeof value === 'object' ? (value as GraphEnvironmentRef) : undefined;
+
+export function graphCheckoutOutputs(
+  snapshot: GraphCheckoutSnapshot,
+  workspace?: GraphWorkspaceRef,
+  subject?: string,
+): Record<string, unknown> {
+  const { repositoryId, repositoryName, branch, tag, commitSha, fullClone } = snapshot;
+  const ref =
+    snapshot.ref ?? (branch ? 'refs/heads/' + branch : tag ? 'refs/tags/' + tag : commitSha);
+  const metadata = { repositoryId, repositoryName, ref, branch, tag, commitSha, subject };
+  const source = { ...metadata, fullClone };
+  return { ...metadata, source, workspace: workspace ? { ...workspace, subject } : source };
+}
+
+function scriptInputSources(fields: readonly GraphField[], values: Record<string, unknown>) {
+  return fields.flatMap(({ id, exportName, type }) =>
+    !Object.hasOwn(values, id) || values[id] === undefined
+      ? []
+      : [
+          {
+            key: exportName ?? id,
+            source: 'NODE' as const,
+            isSecret: type === 'CREDENTIAL',
+          },
+        ],
+  );
+}
+
+function scriptVariables(
+  fields: readonly GraphField[],
+  values: Record<string, unknown>,
+  nodeEnvironment?: ExecutionVariables,
+  credentialNonces?: Readonly<Record<string, string>>,
+): ExecutionVariables {
+  const variables: Record<string, string> = Object.create(null);
+  const secretVariables: Record<string, string> = Object.create(null);
+  const secretCredentialNonces: Record<string, string> = Object.assign(
+    Object.create(null),
+    nodeEnvironment?.secretCredentialNonces,
+  );
+  for (const field of fields) {
+    const key = field.exportName ?? field.id;
+    if (!executionVariableName.test(key) || /^VEYOPS_/i.test(key))
+      throw new BadRequestException('脚本参数必须使用可导出的环境变量名');
+    const value = Object.hasOwn(values, field.id) ? values[field.id] : undefined;
+    if (value === undefined && field.required === false) continue;
+    if (!validateGraphValue({ ...field, required: true }, value))
+      throw new ExecutionPlanIssueError({
+        code: 'INPUT',
+        fieldId: field.id,
+        fieldName: field.name,
+        message: '脚本需要有效的「' + field.name + '」输入',
+      });
+    if (field.type === 'CREDENTIAL') {
+      const id = resourceId(value)!;
+      secretVariables[key] = id;
+      if (credentialNonces && Object.hasOwn(credentialNonces, id))
+        secretCredentialNonces[key] = credentialNonces[id]!;
+    } else variables[key] = typeof value === 'string' ? value : JSON.stringify(value);
+  }
+  for (const [key, value] of Object.entries(nodeEnvironment?.variables ?? {})) {
+    delete secretVariables[key];
+    delete secretCredentialNonces[key];
+    variables[key] = value;
+  }
+  for (const [key, id] of Object.entries(nodeEnvironment?.secretVariables ?? {})) {
+    delete variables[key];
+    secretVariables[key] = id;
+    const nonce = nodeEnvironment?.secretCredentialNonces?.[key];
+    if (nonce) secretCredentialNonces[key] = nonce;
+    else delete secretCredentialNonces[key];
+  }
+  return { variables, secretVariables, secretCredentialNonces };
+}
 
 @Injectable()
 export class GraphNodeTasks implements OnModuleInit {
@@ -166,56 +259,64 @@ export class GraphNodeTasks implements OnModuleInit {
 
   async prepareEnvironment(
     projectId: string,
-    options: {
-      environmentId?: string;
-      source?: GraphEnvironmentSource;
-      directory?: string;
-      envFile?: string;
-    },
+    input: GraphEnvironmentSource,
+    config?: GraphNode['loadEnvironment'],
+    scope?: GraphNodeScope,
   ): Promise<GraphEnvironmentPlan | undefined> {
-    const environment = options.environmentId
-      ? await this.database.db
-          .selectFrom('environments')
-          .select(['slug', 'repository_env_file'])
-          .where('id', '=', options.environmentId)
-          .where('project_id', '=', projectId)
-          .where('archived_at', 'is', null)
-          .executeTakeFirst()
-      : undefined;
-    if (options.environmentId && !environment)
-      throw new ExecutionPlanIssueError({
-        code: 'CONFIGURATION',
-        fieldId: 'environment',
-        message: '环境必须属于当前项目',
-      });
-    const directory = options.directory ? relativePath(options.directory) : '.';
-    const explicit = options.envFile
-      ? environmentFilePath(posix.join(directory, relativePath(options.envFile)))
-      : undefined;
-    const configured = environment?.repository_env_file;
-    const source: GraphEnvironmentFileSource = explicit
-      ? 'NODE'
-      : configured
-        ? 'ENVIRONMENT'
-        : 'CONVENTION';
-    const required = source !== 'CONVENTION';
-    const { repositoryId, commitSha, branch, tag } = options.source ?? {};
+    if (!config?.envFile && !config?.pathRule) return undefined;
+    const { repositoryId, commitSha, branch, tag } = input;
     const origin = { repositoryId, commitSha, branch, tag };
-    if (!repositoryId || !commitSha) {
-      if (required)
+    const required = config.required !== false;
+    const source = 'NODE' as const;
+    const key = config.pathRule?.key;
+    const skipped = {
+      ...origin,
+      status: 'SKIPPED' as const,
+      source,
+      required,
+      mappingKey: key,
+      variables: [],
+    };
+    let requestedPath = config.envFile;
+    if (config.pathRule && key) {
+      const parameters = scope?.parameters ?? {};
+      const variables = scope?.environmentSet?.variables ?? {};
+      if (
+        !Object.hasOwn(parameters, key) &&
+        Object.hasOwn(scope?.environmentSet?.secretVariables ?? {}, key)
+      )
         throw new ExecutionPlanIssueError({
-          code: 'REPOSITORY',
-          fieldId: 'source',
-          message: '加载仓库环境文件需要绑定固定提交的 Git 源码',
+          code: 'CONFIGURATION',
+          fieldId: 'envFile',
+          message: '环境文件映射不能读取敏感变量',
         });
-      return undefined;
+      const selector = Object.hasOwn(parameters, key)
+        ? parameters[key]
+        : Object.hasOwn(variables, key)
+          ? variables[key]
+          : undefined;
+      const paths = config.pathRule.paths;
+      requestedPath =
+        typeof selector === 'string' && Object.hasOwn(paths, selector)
+          ? paths[selector]
+          : undefined;
+      if (!requestedPath && required)
+        throw new ExecutionPlanIssueError({
+          code: 'CONFIGURATION',
+          fieldId: 'envFile',
+          message: '必需环境文件的路径映射未命中 · ' + key,
+        });
     }
-    const path =
-      explicit ??
-      (configured
-        ? environmentFilePath(configured)
-        : environment && environmentFilePath(posix.join(directory, '.env.' + environment.slug)));
-    if (!path) return undefined;
+    if (!requestedPath) return skipped;
+    const path = environmentFilePath(
+      posix.join(config.directory ?? '.', environmentFilePath(requestedPath)),
+    );
+    if (!repositoryId || !commitSha)
+      throw new ExecutionPlanIssueError({
+        code: 'REPOSITORY',
+        fieldId: 'source',
+        message: '加载仓库环境文件需要绑定固定提交的 Git 源码',
+      });
     const entry = await this.repositories
       .inspectGraphEnvironmentFile(projectId, { repositoryId, commitSha }, [path])
       .catch((error: unknown) =>
@@ -237,7 +338,7 @@ export class GraphNodeTasks implements OnModuleInit {
           commitSha,
           message: '固定 Git 提交中缺少必需的环境文件 ' + path,
         });
-      return { ...origin, status: 'SKIPPED', source, path, required, variables: [] };
+      return { ...skipped, path };
     }
     return {
       ...origin,
@@ -247,6 +348,7 @@ export class GraphNodeTasks implements OnModuleInit {
       source,
       path: entry.path,
       required,
+      mappingKey: key,
       variables: entry.keys.map((key) => ({ key, source: 'FILE', isSecret: true })),
     };
   }
@@ -255,7 +357,7 @@ export class GraphNodeTasks implements OnModuleInit {
     const values = scope.values ?? {};
     if (node.type === 'CHECKOUT') {
       const config = node.checkout;
-      const repositoryId = resourceId(values.repository) ?? config?.repositoryId;
+      const repositoryId = resourceId(values.repository);
       if (!repositoryId)
         throw new ExecutionPlanIssueError({
           code: 'REPOSITORY',
@@ -263,11 +365,24 @@ export class GraphNodeTasks implements OnModuleInit {
           message: 'Git 拉取需要项目仓库',
         });
       const value = values.version;
+      if (
+        value !== undefined &&
+        !validateGraphValue(
+          { id: 'version', name: 'Git 版本', type: 'GIT_REF', required: true },
+          value,
+        )
+      )
+        throw new ExecutionPlanIssueError({
+          code: 'REPOSITORY',
+          fieldId: 'version',
+          repositoryId,
+          message: 'Git 版本必须为有效分支、标签或完整提交 SHA',
+        });
       const ref =
         value && typeof value === 'object' && 'kind' in value && 'value' in value
           ? value
           : undefined;
-      const kind = ref?.kind ?? config?.mode ?? 'BRANCH';
+      const kind = ref?.kind ?? 'BRANCH';
       if (kind !== 'BRANCH' && kind !== 'TAG' && kind !== 'COMMIT')
         throw new ExecutionPlanIssueError({
           code: 'REPOSITORY',
@@ -282,9 +397,9 @@ export class GraphNodeTasks implements OnModuleInit {
           .planGraphCheckout(projectId, {
             repositoryId,
             mode: kind,
-            branch: kind === 'BRANCH' ? (version ?? config?.branch) : undefined,
-            tag: kind === 'TAG' ? (version ?? config?.tag) : undefined,
-            commitSha: kind === 'COMMIT' ? (version ?? config?.commitSha) : undefined,
+            branch: kind === 'BRANCH' ? version : undefined,
+            tag: kind === 'TAG' ? version : undefined,
+            commitSha: kind === 'COMMIT' ? version : undefined,
             fullClone: config?.fullClone,
           })
           .catch((error: unknown) =>
@@ -310,16 +425,15 @@ export class GraphNodeTasks implements OnModuleInit {
           message: '环境文件所绑定的源码与工作区来自不同 Git 提交',
         });
       const environmentId = resourceId(values.environment) ?? scope.environmentId;
-      const environmentFile = await this.prepareEnvironment(projectId, {
-        environmentId,
-        source: workspace?.repositoryId ? workspace : source,
-        directory: node.loadEnvironment?.directory,
-        envFile: node.loadEnvironment?.envFile,
-      });
-      const configured = await this.configs.resolveVariables(
+      const environmentFile = await this.prepareEnvironment(
         projectId,
-        environmentId,
-        scope.serviceId,
+        (workspace?.repositoryId ? workspace : source) ?? {},
+        node.loadEnvironment,
+        scope,
+      );
+      const configured = mergeEnvironmentSet(
+        await this.configs.resolveVariables(projectId, undefined, scope.serviceId),
+        scope.environmentSet ?? undefined,
       );
       return {
         type: 'LOAD_ENV',
@@ -337,10 +451,9 @@ export class GraphNodeTasks implements OnModuleInit {
     const variableRef = variablesOf(values.variables);
     const environmentId =
       resourceId(values.environment) ?? variableRef?.environmentId ?? scope.environmentId;
-    const { variableSources: configured, ...environment } = await this.configs.resolveVariables(
-      projectId,
-      environmentId,
-      serviceId,
+    const { variableSources: configured, ...environment } = mergeEnvironmentSet(
+      await this.configs.resolveVariables(projectId, undefined, serviceId),
+      scope.environmentSet ?? undefined,
     );
     const targetValue = values.targets;
     const serverId = node.shell?.serverId;
@@ -351,23 +464,17 @@ export class GraphNodeTasks implements OnModuleInit {
       : serverId
         ? { serverIds: [serverId] }
         : undefined;
-    const boundParameters = (node.shell?.params ?? []).filter(
-      (field) => values[field.id] !== undefined,
-    );
-    const variableSources = graphVariableSources(
-      variableRef?.environmentFile,
-      configured,
-      boundParameters.map(({ id, type }) => ({
-        key: id,
-        source: 'NODE',
-        isSecret: type === 'CREDENTIAL',
-      })),
-    );
+    const scriptInputs = scriptInputSources(node.shell?.params ?? [], values);
+    const variableSources = graphVariableSources(variableRef?.environmentFile, configured, [
+      ...scriptInputs,
+      ...(scope.nodeEnvironmentSources ?? []),
+    ]);
     const base = {
       type: node.type,
       serviceId,
       environmentId,
       environment,
+      configuredVariableSources: configured,
       variableSources,
       environmentFile: variableRef?.environmentFile,
     };
@@ -380,6 +487,7 @@ export class GraphNodeTasks implements OnModuleInit {
       serverId: target.targets[0]!.id,
       serverName: target.targets[0]!.name,
       targetHash: target.targetHash,
+      targetSelection: directDeploymentSelection(selection, defaults.maxParallel),
     };
   }
 
@@ -399,11 +507,11 @@ export class GraphNodeTasks implements OnModuleInit {
     const values = scope.values ?? {};
     const environmentRef = values.variables;
     const environmentId =
-      resourceId(values.environment) ??
-      (environmentRef && typeof environmentRef === 'object' && 'environmentId' in environmentRef
-        ? text(environmentRef.environmentId)
-        : undefined) ??
-      scope.environmentId;
+      plan.type === 'REGISTER_ARTIFACT'
+        ? graphDeliveryEnvironment(projectId).id
+        : (resourceId(values.environment) ??
+          variablesOf(environmentRef)?.environmentId ??
+          scope.environmentId);
     const serviceId = resourceId(values.service) ?? scope.serviceId;
     const identity = { projectId, environmentId, serviceId };
     const self =
@@ -436,61 +544,26 @@ export class GraphNodeTasks implements OnModuleInit {
       };
     }
     if (plan.type === 'LOAD_ENV') {
-      if (plan.variables) {
-        if (plan.environmentId !== environmentId)
-          throw new ConflictException('环境节点实际环境与已确认计划不一致');
-        if (plan.environmentFile?.status === 'PINNED') {
-          const source = workspace?.repositoryId ? workspace : sourceOf(values.source);
-          if (
-            source?.repositoryId !== plan.environmentFile.repositoryId ||
-            source.commitSha !== plan.environmentFile.commitSha
-          )
-            throw new ConflictException('环境节点实际源码与已确认计划不一致');
-        }
-        return {
-          ...base,
-          payload: {
-            ...base.payload,
-            graphModule: { ...settings, environmentFile: plan.environmentFile },
-          },
-        };
+      if (plan.environmentFile?.status === 'PINNED') {
+        const source = workspace?.repositoryId ? workspace : sourceOf(values.source);
+        if (
+          source?.repositoryId !== plan.environmentFile.repositoryId ||
+          source.commitSha !== plan.environmentFile.commitSha
+        )
+          throw new ConflictException('环境节点实际源码与已确认计划不一致');
       }
-      let envFile = node.loadEnvironment?.envFile;
-      const directory = node.loadEnvironment?.directory;
-      if (envFile && directory)
-        envFile = posix.join(relativePath(directory), relativePath(envFile));
-      if (environmentId) await this.configs.resolveVariables(projectId, environmentId, serviceId);
-      if (!envFile && environmentId) {
-        const environment = await this.database.db
-          .selectFrom('environments')
-          .select(['slug', 'repository_env_file'])
-          .where('id', '=', environmentId)
-          .where('project_id', '=', projectId)
-          .executeTakeFirst();
-        if (environment) {
-          const candidate = directory
-            ? posix.join(relativePath(directory), '.env.' + environment.slug)
-            : '.env.' + environment.slug;
-          envFile =
-            environment.repository_env_file ??
-            (workspace && (await graphWorkspaceEntry(workspace, candidate).catch(() => undefined))
-              ? candidate
-              : undefined);
-        }
-      }
-      if (envFile && !workspace) throw new BadRequestException('加载仓库环境文件需要绑定工作区');
       return {
         ...base,
         payload: {
           ...base.payload,
-          graphModule: { ...settings, workspace, envFile: envFile && relativePath(envFile) },
+          graphModule: { ...settings, environmentFile: plan.environmentFile },
         },
       };
     }
     if (plan.type === 'REGISTER_ARTIFACT') {
-      if (!self || !environmentId || !serviceId)
-        throw new BadRequestException('登记产物需要服务和环境');
-      await this.configs.resolveVariables(projectId, environmentId, serviceId);
+      if (!self || !environmentId) throw new BadRequestException('登记产物需要已确认的执行图运行');
+      const ownerServiceId = serviceId ?? graphUnscopedArtifactService(projectId).id;
+      await this.configs.resolveVariables(projectId, undefined, serviceId);
       const boundPath = text(values.path);
       const boundImage = text(values.image);
       const files = plan.declarations.filter(({ type }) => type !== 'DOCKER_IMAGE').length;
@@ -521,7 +594,7 @@ export class GraphNodeTasks implements OnModuleInit {
       });
       const profile = deliveryExecutionProfile(
         projectId,
-        serviceId,
+        ownerServiceId,
         scope.nodeRunId!,
         1,
         node.name,
@@ -529,13 +602,18 @@ export class GraphNodeTasks implements OnModuleInit {
         [],
       );
       const pipeline: PipelineSnapshot = {
-        graph: { runId: scope.runId!, nodeRunId: scope.nodeRunId!, workspace },
+        graph: {
+          runId: scope.runId!,
+          rootRunId: scope.rootRunId ?? scope.runId,
+          nodeRunId: scope.nodeRunId!,
+          workspace,
+        },
         artifactSources: workspaceArtifactSource(workspace),
         runId: randomUUID(),
         pipelineId: profile.id,
         pipelineVersionId: profile.versionId,
         projectId,
-        serviceId,
+        serviceId: ownerServiceId,
         environmentId,
         commitSha: workspace?.commitSha ?? unversionedArtifactCommit,
         mode: 'BUILD_ONLY',
@@ -602,23 +680,12 @@ export class GraphNodeTasks implements OnModuleInit {
             environmentId,
           }
         : undefined;
-    const parameters: ExecutionVariables = {
-      variables: Object.create(null),
-      secretVariables: Object.create(null),
-    };
-    for (const field of config.params ?? []) {
-      if (!executionVariableName.test(field.id) || /^VEYOPS_/i.test(field.id))
-        throw new BadRequestException('脚本参数必须使用可导出的环境变量名');
-      const value = values[field.id];
-      if (value === undefined) continue;
-      if (field.type === 'CREDENTIAL') {
-        const id = resourceId(value);
-        if (!id) throw new BadRequestException('脚本参数必须引用有效的凭据');
-        parameters.secretVariables[field.id] = id;
-      } else {
-        parameters.variables[field.id] = typeof value === 'string' ? value : JSON.stringify(value);
-      }
-    }
+    const parameters = scriptVariables(
+      config.params ?? [],
+      values,
+      scope.nodeEnvironment,
+      scope.credentialNonces,
+    );
     const source = values.source;
     const commitSha =
       source && typeof source === 'object' && 'commitSha' in source
@@ -628,6 +695,19 @@ export class GraphNodeTasks implements OnModuleInit {
       ...graphTriggerVariables(scope.trigger),
       ...(commitSha && { VEYOPS_GIT_COMMIT_SHA: commitSha }),
     };
+    const variableSources = graphVariableSources(
+      plan.environmentFile,
+      plan.configuredVariableSources ?? plan.variableSources ?? [],
+      [
+        ...scriptInputSources(config.params ?? [], values),
+        ...(scope.nodeEnvironmentSources ?? []),
+        ...Object.keys(platform).map((key) => ({
+          key,
+          source: 'SYSTEM' as const,
+          isSecret: false,
+        })),
+      ],
+    );
     return {
       ...base,
       payload: {
@@ -635,12 +715,13 @@ export class GraphNodeTasks implements OnModuleInit {
         targets,
         environment:
           plan.environmentId !== environmentId || plan.serviceId !== serviceId
-            ? await this.configs.resolveVariables(projectId, environmentId, serviceId)
+            ? await this.configs.resolveVariables(projectId, undefined, serviceId)
             : plan.environment,
         graphModule: {
           ...settings,
           workspace: workspace ?? (!targets.length ? self : undefined),
           variables,
+          variableSources,
           targetDirectory: config.directory,
           shell: {
             command: config.command,
@@ -662,7 +743,7 @@ export class GraphNodeTasks implements OnModuleInit {
     if (isGraphTriggerKind(module.trigger?.kind) && graphNodeRequiresIsolation(module.type))
       throw new ConflictException('该执行图节点尚未启用隔离自动执行');
     if (module.type === 'CHECKOUT') {
-      const { repositoryId, commitSha, branch, tag, fullClone } = module.source!;
+      const { commitSha, branch, tag } = module.source!;
       let subject: string | undefined;
       await createGraphWorkspace(module.workspace!, async (destination) => {
         const checkout = await this.repositories.checkoutGraphSource(
@@ -680,21 +761,11 @@ export class GraphNodeTasks implements OnModuleInit {
           commitSha +
           '\n',
       );
-      return {
-        source: { repositoryId, commitSha, branch, tag, fullClone, subject },
-        workspace: { ...module.workspace!, subject },
-      };
+      return graphCheckoutOutputs(module.source!, module.workspace!, subject);
     }
     if (module.type === 'LOAD_ENV') {
-      if (module.workspace && module.envFile) {
-        const file = await graphWorkspaceEntry(module.workspace, module.envFile);
-        const info = await lstat(file);
-        if (!info.isFile() || info.size > 64 * 1024) throw new Error('环境文件不可读或超过 64 KiB');
-      }
       return {
         variables: {
-          workspace: module.workspace,
-          envFile: module.envFile,
           environmentFile: module.environmentFile,
           environmentId: module.environmentId,
         } satisfies GraphEnvironmentRef,
@@ -722,6 +793,8 @@ export class GraphNodeTasks implements OnModuleInit {
             sizeBytes: output.sizeBytes,
             composeYaml: output.composeYaml,
             storageType: output.imageId ? 'LOCAL_IMAGE' : 'LOCAL_FILE',
+            physical: output.physical,
+            persist: declaration.persist,
           });
           context.log('已登记产物 ' + declaration.name + '\n');
         }
@@ -742,6 +815,7 @@ export class GraphNodeTasks implements OnModuleInit {
       ...scoped,
       variables: inherited(scoped.variables),
       secretVariables: inherited(scoped.secretVariables),
+      secretCredentialNonces: inherited(scoped.secretCredentialNonces ?? {}),
       graph: module.variables
         ? { runId: '', nodeRunId: '', variables: module.variables }
         : undefined,
@@ -755,90 +829,68 @@ export class GraphNodeTasks implements OnModuleInit {
       JSON.stringify(value).slice(1, -1),
     ]);
     const target = task.payload.targets.at(0);
-    let exitCode: number;
-    let stdout = '';
-    if (target) {
-      const directory = module.targetDirectory
-        ? 'cd -P -- ' + shellQuote(relativePath(module.targetDirectory)) + '\n'
-        : '';
-      const result = await this.ssh.execute(target, directory + shell.command, {
-        timeout: shell.timeout,
-        signal: context.signal,
-        variables: { variables: values, secretVariables: {} },
-        secrets,
-        onData: (chunk, stream) => {
-          if (stream === 'stdout') stdout += chunk;
-          context.log(chunk, target.id);
-        },
-      });
-      exitCode = result.exitCode;
-    } else if (module.workspace) {
-      const workspace = await openGraphWorkspace(module.workspace).catch(() =>
-        createGraphWorkspace(module.workspace!),
-      );
-      const result = await this.builds.managerGraphShell(
-        this.session(task, context, snapshot, values, secrets),
-        workspace,
-        shell.command,
-        module.targetDirectory ?? '.',
-        shell.timeout,
-      );
-      const match = /(?:^|\n)VEYOPS_EXIT_CODE=(\d+)\s*$/.exec(result.stdout);
-      if (!match) throw new Error('脚本退出状态未返回');
-      stdout = result.stdout.slice(0, match.index);
-      exitCode = Number(match[1]);
-    } else {
-      throw new Error('缺少脚本工作区');
+    const output = new GraphScriptOutput((line) => context.log(line, target?.id), secrets);
+    const onData = output.write.bind(output);
+    const targetRunId = target && (await context.startTarget(target.id));
+    let exitCode: number | null = null;
+    let declared: Record<string, unknown>;
+    try {
+      if (target) {
+        const directory = module.targetDirectory
+          ? 'cd -P -- ' + shellQuote(relativePath(module.targetDirectory)) + ' || exit $?\n'
+          : '';
+        const result = await this.ssh.execute(target, directory + shell.command, {
+          timeout: shell.timeout,
+          signal: context.signal,
+          variables: { variables: values, secretVariables: {} },
+          secrets,
+          onData,
+        });
+        exitCode = result.exitCode;
+        output.finish();
+      } else if (module.workspace) {
+        const workspace = await openGraphWorkspace(module.workspace).catch(() =>
+          createGraphWorkspace(module.workspace!),
+        );
+        const result = await this.builds.managerGraphShell(
+          this.session(task, context, snapshot, values, secrets),
+          workspace,
+          shell.command,
+          module.targetDirectory ?? '.',
+          shell.timeout,
+          onData,
+        );
+        exitCode = result.exitCode;
+        output.finish(result);
+      } else {
+        throw new Error('缺少脚本工作区');
+      }
+      if (exitCode !== 0 && !shell.continueOnFailure) throw new Error('脚本退出码 ' + exitCode);
+      declared = output.values(shell.outputs);
+    } catch (error) {
+      output.finish();
+      if (targetRunId)
+        await context.finishTarget(
+          targetRunId,
+          error instanceof SshExecutionError ? error.kind : 'FAILED',
+          exitCode,
+          error instanceof Error ? error.message : '脚本执行失败',
+        );
+      throw error;
     }
-    if (exitCode !== 0 && !shell.continueOnFailure) throw new Error('脚本退出码 ' + exitCode);
-    const report = { exitCode, passed: exitCode === 0 };
+    if (targetRunId)
+      await context.finishTarget(
+        targetRunId,
+        exitCode === 0 ? 'SUCCESS' : 'FAILED',
+        exitCode,
+        exitCode === 0 ? undefined : '脚本退出码 ' + exitCode,
+      );
     return {
       exitCode,
-      report,
+      report: { exitCode, passed: exitCode === 0, ...(target && { serverId: target.id }) },
       ...(!target && module.workspace && { workspace: module.workspace }),
-      ...this.scriptOutputs(shell.outputs, stdout),
+      ...declared,
     };
-  }
-
-  private scriptOutputs(fields: NonNullable<GraphNode['outputs']>, stdout: string) {
-    if (!fields.length) return {};
-    const lines = stdout.split(/\r?\n/).filter((line) => line.startsWith('VEYOPS_OUTPUT='));
-    const declaration = lines.at(-1)?.slice('VEYOPS_OUTPUT='.length);
-    if (
-      lines.length > 1 ||
-      (declaration?.length ?? 0) > 65_536 ||
-      declaration?.includes('[REDACTED]')
-    )
-      throw new Error('脚本输出必须为唯一、不含敏感值的 VEYOPS_OUTPUT JSON 对象');
-    let values: Record<string, unknown>;
-    try {
-      const parsed = declaration ? (JSON.parse(declaration) as unknown) : {};
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw Error();
-      values = parsed as Record<string, unknown>;
-    } catch {
-      throw new Error('脚本输出不是有效的 JSON 对象');
-    }
-    return Object.fromEntries(
-      fields.flatMap((field) => {
-        const value = Object.hasOwn(values, field.id) ? values[field.id] : undefined;
-        if (value === undefined && field.required === false) return [];
-        const type =
-          field.type === 'TEXT'
-            ? 'string'
-            : field.type === 'NUMBER'
-              ? 'number'
-              : field.type === 'BOOLEAN'
-                ? 'boolean'
-                : undefined;
-        const matches = (item: unknown) =>
-          type !== undefined &&
-          typeof item === type &&
-          (typeof item !== 'number' || Number.isFinite(item));
-        if (field.multiple ? !Array.isArray(value) || !value.every(matches) : !matches(value))
-          throw new Error('脚本未提供声明的 ' + field.name + ' 输出');
-        return [[field.id, value]];
-      }),
-    );
   }
 
   private shellSnapshot(task: TaskRecord, module: GraphModulePayload): PipelineSnapshot {
@@ -854,6 +906,7 @@ export class GraphNodeTasks implements OnModuleInit {
       definition: Object.assign(new PipelineDefinitionDto(), { buildLocation: 'MANAGER' }),
       variables: task.payload.environment?.variables ?? {},
       secretVariables: task.payload.environment?.secretVariables ?? {},
+      secretCredentialNonces: task.payload.environment?.secretCredentialNonces,
     };
   }
 
@@ -878,6 +931,8 @@ export class GraphNodeTasks implements OnModuleInit {
         .innerJoin('pipeline_runs', 'pipeline_runs.id', 'artifacts.pipeline_run_id')
         .select([
           'artifacts.id',
+          'artifacts.logical_artifact_id',
+          'artifacts.temporary_root_id',
           'artifacts.artifact_name',
           'artifacts.artifact_type',
           'artifacts.artifact_kind',
@@ -894,7 +949,9 @@ export class GraphNodeTasks implements OnModuleInit {
         .orderBy('artifacts.id')
         .execute();
       const refs = rows.map((row) => ({
-        id: row.id,
+        ...(row.temporary_root_id
+          ? { temporaryArtifactId: row.id }
+          : { id: row.id, artifactId: row.logical_artifact_id ?? row.id, instanceId: row.id }),
         name: row.artifact_name ?? 'artifact',
         type: row.artifact_kind ?? row.artifact_type,
         serverId: row.server_id,
@@ -923,16 +980,60 @@ export class GraphNodeTasks implements OnModuleInit {
           'deployment_records.health_status',
           'deployment_records.service_id',
           'deployment_records.environment_id',
+          'deployment_records.rollback_of_deployment_id',
         ])
         .where('pipeline_runs.task_id', '=', taskId)
+        .orderBy('deployment_records.started_at', 'asc')
         .orderBy('deployment_records.id')
         .execute();
+      const targets = [
+        ...new Map(
+          rows.flatMap((row) =>
+            row.server_id
+              ? [
+                  [
+                    row.server_id,
+                    {
+                      serverId: row.server_id,
+                      deploymentId: row.id,
+                      rollbackOfDeploymentId: row.rollback_of_deployment_id ?? undefined,
+                      status: ['SUCCESS', 'CANCELLED', 'SKIPPED', 'NEEDS_ATTENTION'].includes(
+                        row.status,
+                      )
+                        ? row.status
+                        : 'FAILED',
+                      health:
+                        row.health_status === 'FAILED'
+                          ? 'UNHEALTHY'
+                          : row.health_status === 'HEALTHY'
+                            ? 'HEALTHY'
+                            : row.health_status === 'UNKNOWN'
+                              ? 'UNKNOWN'
+                              : 'NOT_CHECKED',
+                      consumedArtifacts: row.artifact_id ? [{ artifactId: row.artifact_id }] : [],
+                    },
+                  ] as const,
+                ]
+              : [],
+          ),
+        ).values(),
+      ];
+      const successes = targets.filter((target) => target.status === 'SUCCESS').length;
+      const status = targets.some((target) => target.status === 'NEEDS_ATTENTION')
+        ? 'NEEDS_ATTENTION'
+        : !successes
+          ? 'FAILED'
+          : successes === targets.length
+            ? 'SUCCESS'
+            : 'PARTIAL_SUCCESS';
       return {
         release: {
+          operation: 'DEPLOY',
+          service: { serviceId: rows[0]?.service_id },
           serviceId: rows[0]?.service_id,
           environmentId: rows[0]?.environment_id,
-          status:
-            rows.length && rows.every((row) => row.status === 'SUCCESS') ? 'SUCCESS' : 'FAILED',
+          status,
+          targets,
           deployments: rows.map((row) => ({
             id: row.id,
             artifactId: row.artifact_id,

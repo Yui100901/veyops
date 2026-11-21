@@ -3,6 +3,7 @@ import { PipelinesService } from './pipelines.service';
 import { PipelineExecutor } from './pipeline-executor.service';
 import { BuildsService } from '../builds/builds.service';
 import { ArtifactsController, ArtifactsService } from '../artifacts/artifacts.service';
+import { ArtifactPhysicalService } from '../artifacts/artifact-physical.service';
 import { DeploymentsController, DeploymentsService } from '../deployments/deployments.service';
 import { RegistriesController, RegistriesService } from '../registries/registries.service';
 import {
@@ -22,6 +23,7 @@ import {
     PipelineExecutor,
     BuildsService,
     ArtifactsService,
+    ArtifactPhysicalService,
     DeploymentsService,
     ReleaseRequestsService,
     RegistriesService,
@@ -30,6 +32,7 @@ import {
     PipelinesService,
     BuildsService,
     ArtifactsService,
+    ArtifactPhysicalService,
     DeploymentsService,
     RegistriesService,
   ],

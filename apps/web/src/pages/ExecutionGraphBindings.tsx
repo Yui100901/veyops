@@ -5,6 +5,7 @@ import { GraphBindingField } from './ExecutionGraphFields';
 import type { BindingChoice } from './ExecutionGraphFields';
 import type {
   GraphCanvas,
+  GraphCandidate,
   GraphCatalog,
   GraphEndpoint,
   GraphField,
@@ -76,8 +77,9 @@ function configuredFallback(
   endpoint: GraphEndpoint,
 ) {
   const config = node.checkout ?? node.build;
-  if (field.id === 'repository' && config?.repositoryId) return '节点已指定项目仓库。';
-  if (field.id === 'version' && config?.repositoryId) return '节点已指定 Git 版本规则。';
+  if (field.id === 'repository' && config?.repositoryId) return '使用节点已有的仓库值。';
+  if (field.id === 'version' && (node.type === 'CHECKOUT' || node.type === 'BUILD'))
+    return '未指定版本时，预览解析仓库默认分支并固定实际提交。';
   if (field.id === 'service' && endpoint.serviceId) return '使用执行流关联的服务。';
   if (field.id === 'targets' && node.shell?.serverId) return '节点已指定执行服务器。';
   if (
@@ -92,12 +94,32 @@ function configuredFallback(
   return undefined;
 }
 
+function matchingChoices(candidates: GraphCandidate[], field: GraphField) {
+  return candidates.flatMap((source): BindingChoice[] => {
+    if (field.source === 'CURRENT_RUN' && source.binding.kind !== 'OUTPUT') return [];
+    if (compatible(source.field, field)) return [source];
+    if (
+      field.type !== 'GIT_REF' ||
+      field.multiple ||
+      source.field.type !== 'TEXT' ||
+      source.field.multiple
+    )
+      return [];
+    return (['BRANCH', 'TAG'] as const).map((refKind) => ({
+      ...source,
+      label: source.label + (refKind === 'BRANCH' ? ' → 分支' : ' → 标签'),
+      binding: { kind: 'AS_GIT_REF', refKind, source: source.binding },
+    }));
+  });
+}
+
 export function ExecutionGraphBindings({
   canvas,
   node,
   endpoint,
   flowEdgeIndexes,
   catalog,
+  directory,
   project,
   canEdit,
   update,
@@ -107,6 +129,7 @@ export function ExecutionGraphBindings({
   endpoint: GraphEndpoint;
   flowEdgeIndexes: Set<number>;
   catalog?: GraphCatalog;
+  directory?: GraphCatalog['flows'];
   project: ProjectDetail;
   canEdit: boolean;
   update: (newEndpoint: GraphEndpoint) => void;
@@ -123,19 +146,28 @@ export function ExecutionGraphBindings({
     }
   }
   const isEnd = node.type === 'END';
-  const fields = isEnd ? (node.outputs ?? []) : moduleFields(node, 'inputs', canvas, catalog);
+  const compiled = directory?.[endpoint.startId]?.nodes[node.id];
+  const fields = isEnd
+    ? (compiled?.outputs ?? node.outputs ?? [])
+    : (compiled?.inputs ?? moduleFields(node, 'inputs', canvas, catalog));
   const bindings = isEnd ? endpoint.outputBindings : endpoint.inputBindings?.[node.id];
   const context = catalog?.contextFields ?? [];
-  const candidates = [
+  const fallbackCandidates: GraphCandidate[] = [
     ...(start?.inputs ?? []).map((field) => ({
       field,
       label: '开始 · ' + field.name,
       binding: { kind: 'INPUT' as const, fieldId: field.id },
+      referenceName: 'start.' + (field.referenceName ?? field.id),
+      availability: 'ALWAYS' as const,
+      branches: [],
     })),
     ...context.map((field) => ({
       field,
       label: '运行上下文 · ' + field.name,
       binding: { kind: 'CONTEXT' as const, fieldId: field.id },
+      referenceName: 'context.' + (field.referenceName ?? field.id),
+      availability: 'ALWAYS' as const,
+      branches: [],
     })),
     ...canvas.nodes
       .filter(({ id }) => ancestors.has(id))
@@ -144,42 +176,180 @@ export function ExecutionGraphBindings({
           field,
           label: source.name + ' · ' + field.name,
           binding: { kind: 'OUTPUT' as const, nodeId: source.id, fieldId: field.id },
+          referenceName:
+            (source.referenceName ?? source.id) + '.' + (field.referenceName ?? field.id),
+          availability: 'ALWAYS' as const,
+          branches: [],
         })),
       ),
   ];
-  if (!fields.length) return null;
+  const candidates = compiled?.candidates ?? fallbackCandidates;
+  const outputs = !isEnd
+    ? (compiled?.outputs ?? moduleFields(node, 'outputs', canvas, catalog))
+    : [];
+  const supportsEnvironment = node.type === 'SHELL' || node.type === 'CHECK';
+  if (!fields.length && !supportsEnvironment && !outputs.length) return null;
+  const repository = bindings?.repository;
+  const repositoryValue =
+    repository?.kind === 'VALUE'
+      ? repository.value
+      : repository?.kind === 'INPUT'
+        ? start?.inputs?.find(({ id }) => id === repository.fieldId)?.defaultValue
+        : !repository
+          ? (node.checkout?.repositoryId ?? node.build?.repositoryId)
+          : undefined;
   return (
     <section className="graph-fields">
-      <h4>{isEnd ? '本流输出绑定' : '本流输入绑定'}</h4>
-      {fields.map((field) => {
-        const choices: BindingChoice[] = candidates.filter((source) => {
-          if (isEnd && field.source === 'CURRENT_RUN' && source.binding.kind !== 'OUTPUT')
-            return false;
-          return compatible(source.field, field);
-        });
-        return (
-          <GraphBindingField
-            key={field.id}
-            field={field}
-            value={bindings?.[field.id]}
-            project={project}
-            disabled={!canEdit}
-            choices={choices}
-            fallback={isEnd ? undefined : configuredFallback(node, field, start, endpoint)}
-            change={(value) => {
-              const next = { ...bindings };
-              if (value) next[field.id] = value;
-              else delete next[field.id];
-              update(
-                isEnd
-                  ? { ...endpoint, outputBindings: next }
-                  : { ...endpoint, inputBindings: { ...endpoint.inputBindings, [node.id]: next } },
-              );
-            }}
-          />
-        );
-      })}
+      {!!fields.length && <h4>{isEnd ? '最终输出' : '输入'}</h4>}
+      {fields.map((field) => (
+        <GraphBindingField
+          key={node.id + ':' + field.id}
+          field={field}
+          value={bindings?.[field.id]}
+          project={project}
+          disabled={!canEdit}
+          choices={matchingChoices(candidates, field)}
+          scope={{
+            repositoryId: typeof repositoryValue === 'string' ? repositoryValue : undefined,
+          }}
+          canRegisterRepository={canEdit}
+          allowRepositoryDefault={
+            field.id === 'version' && (node.type === 'CHECKOUT' || node.type === 'BUILD')
+          }
+          fallback={isEnd ? undefined : configuredFallback(node, field, start, endpoint)}
+          change={(value) => {
+            const next = { ...bindings };
+            if (value) next[field.id] = value;
+            else delete next[field.id];
+            update(
+              isEnd
+                ? { ...endpoint, outputBindings: next }
+                : { ...endpoint, inputBindings: { ...endpoint.inputBindings, [node.id]: next } },
+            );
+          }}
+        />
+      ))}
+      {!!outputs.length && (
+        <details className="graph-field-card">
+          <summary>输出接口 · {outputs.length} 项</summary>
+          <dl className="graph-field-values">
+            {outputs.map((field) => (
+              <div key={field.id}>
+                <dt>{field.name}</dt>
+                <dd>
+                  <code>{field.referenceName ?? field.id}</code> ·{' '}
+                  {catalog?.fieldTypes[field.type] ?? field.type}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </details>
+      )}
+      {supportsEnvironment && (
+        <GraphNodeEnvironment
+          key={node.id}
+          project={project}
+          node={node}
+          fields={fields}
+          candidates={candidates}
+          bindings={endpoint.environmentBindings?.[node.id] ?? {}}
+          update={(next) =>
+            update({
+              ...endpoint,
+              environmentBindings: { ...endpoint.environmentBindings, [node.id]: next },
+            })
+          }
+          canEdit={canEdit}
+        />
+      )}
     </section>
+  );
+}
+
+function GraphNodeEnvironment({
+  project,
+  node,
+  fields,
+  candidates,
+  bindings,
+  update,
+  canEdit,
+}: {
+  project: ProjectDetail;
+  node: GraphNode;
+  fields: GraphField[];
+  candidates: GraphCandidate[];
+  bindings: Record<string, import('./execution-graph-definition').GraphBinding>;
+  update: (bindings: Record<string, import('./execution-graph-definition').GraphBinding>) => void;
+  canEdit: boolean;
+}) {
+  const [key, setKey] = useState('');
+  const valid =
+    /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(key) &&
+    !/^VEYOPS_/i.test(key) &&
+    !Object.hasOwn(bindings, key) &&
+    !['constructor', '__proto__', 'prototype'].includes(key);
+  const sources: GraphCandidate[] = [
+    ...fields.map((field): GraphCandidate => ({
+      label: '本节点输入 · ' + field.name,
+      referenceName: (node.referenceName ?? node.id) + '.' + (field.referenceName ?? field.id),
+      field,
+      binding: { kind: 'NODE_INPUT', fieldId: field.id },
+      availability: 'ALWAYS',
+      branches: [],
+    })),
+    ...candidates,
+  ];
+  return (
+    <details className="graph-field-card" open={Object.keys(bindings).length > 0 || undefined}>
+      <summary>环境变量</summary>
+      <div className="graph-fields">
+        {Object.entries(bindings).map(([name, value]) => {
+          const field: GraphField = {
+            id: name,
+            name,
+            type: 'TEXT',
+            required: false,
+            acceptedTypes: ['NUMBER', 'BOOLEAN', 'PATH', 'IMAGE', 'CREDENTIAL'],
+          };
+          return (
+            <GraphBindingField
+              key={name}
+              field={field}
+              value={value}
+              project={project}
+              choices={matchingChoices(sources, field)}
+              environment
+              disabled={!canEdit}
+              change={(next) => {
+                const copied = { ...bindings };
+                if (next) copied[name] = next;
+                else delete copied[name];
+                update(copied);
+              }}
+            />
+          );
+        })}
+        {canEdit && (
+          <div className="graph-field-pair">
+            <Field label="变量名">
+              <input value={key} maxLength={64} onChange={(event) => setKey(event.target.value)} />
+            </Field>
+            <button
+              type="button"
+              className="button secondary small"
+              disabled={!valid}
+              onClick={() => {
+                update({ ...bindings, [key]: { kind: 'VALUE', value: '' } });
+                setKey('');
+              }}
+            >
+              添加环境变量
+            </button>
+          </div>
+        )}
+      </div>
+    </details>
   );
 }
 

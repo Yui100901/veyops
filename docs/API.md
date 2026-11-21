@@ -44,8 +44,8 @@
 | --- | --- |
 | 构建位置、并发、工作区根目录、日志保留 | 系统默认，项目可覆盖。构建节点可选择执行位置，已声明且允许调整的运行参数可指定并发。 |
 | 代码与构建产物 | Git 节点固定仓库、ref 和实际 SHA。构建节点声明工作目录、命令及具名产物，部署节点绑定已登记产物。 |
-| 环境文件和变量 | 节点显式文件、环境配置路径、约定探测依次尝试。变量由低到高为文件、项目、环境、服务环境、节点绑定。平台保留键由系统赋值。 |
-| 发布目标和策略 | 允许运行选择、服务环境覆盖、项目环境默认目标依次生效。发布方式、目录、健康检查、审核、审批和回滚由服务环境管理。 |
+| 环境文件和变量 | 执行图通过加载节点选择明确路径或映射。变量由低到高为绑定的仓库文件、项目公共变量、开始节点的变量集合、节点绑定。平台保留键由系统赋值。 |
+| 构建和发布目标 | 功能节点各自绑定平台服务器或分组。发布目录及启停配置由部署节点声明。 |
 
 | 方法                 | 路径                       | 请求 / 说明                                                                                                  |
 | -------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------ |
@@ -55,15 +55,17 @@
 | GET / POST           | /servers                   | 列表 / 创建时提交 `{name,host,port?:22,username,credentialId,hostKeyAcceptanceToken,tags?,description?}` |
 | POST                 | /servers/host-key/probe    | 提交 `{host,port?,serverId?}`，握手读取公钥并返回算法、指纹、一次性接受令牌及有效期 |
 | POST                 | /servers/:id/host-key/accept | 对已有服务器提交 `{hostKeyAcceptanceToken}`，确认探测到的新指纹 |
-| GET / PATCH          | /servers/:id               | 详情含分组、所属项目、探测与执行历史 / 完整服务器配置                                                        |
+| GET / PATCH          | /servers/:id               | 详情含 `active`、分组、项目引用、探测及执行历史，停用服务器仍可查看历史 / 完整服务器配置 |
 | DELETE               | /servers/:id               | 软移除，不删除历史                                                                                           |
 | POST                 | /servers/:id/test          | 只读连接检查，返回 `{success,server,result:{exitCode,output}}`                                               |
 | GET / POST           | /server-groups             | 列表 / `{name,description?,serverIds:[]}`                                                                    |
-| PATCH / DELETE       | /server-groups/:id         | 更新分组和成员 / 删除分组关联                                                                                |
-| GET / POST           | /projects                  | 列表支持 `?include=addresses`，每个项目附带已配置的访问地址及服务、环境名称。创建时提交 `{name,slug,description?,tags?}` |
+| GET / PATCH / DELETE | /server-groups/:id         | 详情含有序的启用成员 `serverIds` 和项目引用 `projects` / 更新分组和成员 / 删除分组 |
+| GET                  | /servers/:id/project-references、/server-groups/:id/project-references | 查询该全局目标被项目使用的来源 |
+| GET / POST           | /projects                  | 列表支持 `?include=addresses`，追加按服务和服务内顺序排列的地址，含 `serviceId`、`serviceName`。创建时提交 `{name,slug,description?,tags?}` |
 | GET / PATCH / DELETE | /projects/:id              | 详情 / 完整基本配置 / 软删除                                                                                 |
 | POST                 | /projects/:id/repositories | `{name,cloneUrl,defaultBranch?,credentialId?}`                                                               |
-| POST                 | /projects/:id/services     | `{name,slug,serviceType:'WEB'\|'API'\|'WORKER'\|'SCHEDULED_JOB'\|'STATIC_SITE'\|'DOCKER_SERVICE'\|'CUSTOM'}` |
+| GET / POST           | /projects/:id/services     | 读取项目的可用服务 / 创建服务及有序地址 |
+| GET / PATCH / DELETE | /projects/:id/services/:serviceId | 读取服务及地址 / 按共同修订保存 / 归档服务 |
 | POST                 | /projects/:id/environments | `{name,slug,environmentType:'DEVELOPMENT'\|'TESTING'\|'STAGING'\|'PRODUCTION'\|'CUSTOM'}`                    |
 | GET                  | /dashboard                 | 服务器、项目、服务和任务统计，最近部署、最近任务及失败任务                                                   |
 | GET                  | /audit                     | 最近200条非敏感操作审计                                                                                      |
@@ -71,11 +73,37 @@
 
 凭据 `type` 包括 SSH_PASSWORD、SSH_KEY、GIT_TOKEN、GIT_PASSWORD、API_KEY、API_SECRET、DOCKER_REGISTRY、USERNAME_PASSWORD、CUSTOM_SECRET。SSH_PASSWORD 使用 `secret:{password}`；SSH_KEY 使用 `{privateKey,passphrase?}`；GIT_TOKEN 使用 `{token}`；API_KEY 使用 `{apiKey}`。GET 永不返回 secret、ciphertext、nonce、auth_tag。
 
-仓库、服务和环境可通过 `PATCH /projects/:id/{repositories,services,environments}/:resourceId` 更新，或通过同路径的 `DELETE` 归档。仓库凭据传 `null` 可解除关联。有效配置、可运行版本或在途任务仍引用资源时返回 409。只有已完成历史引用的资源可归档，历史继续使用原 ID 和快照。
+仓库和环境可通过 `PATCH /projects/:id/{repositories,environments}/:resourceId` 更新，或通过同路径的 `DELETE` 归档。仓库凭据传 `null` 可解除关联。有效配置、可运行版本或在途任务仍引用资源时返回 409。只有已完成历史引用的资源可归档，历史继续使用原 ID 和快照。
 
-项目详情返回 `addresses`、`dependencies`、`dependents`、`deploymentTargets` 和 `recentDeployments`。`dependents` 中的 `projectId` 指向依赖本项目的项目，修改依赖需从其所属项目发起。通过 `POST /projects/:id/addresses` 或 `POST /projects/:id/dependencies` 新增记录，带记录 ID 的路径支持 `PATCH` 和 `DELETE`。地址可关联项目内的服务和环境，依赖提交时会检查循环引用。
+项目详情在 `services` 中返回服务及地址，并包含 `dependencies`、`dependents`、`deploymentTargets` 和 `recentDeployments`。`dependents` 中的 `projectId` 指向依赖本项目的项目，修改依赖需从其所属项目发起。通过 `POST /projects/:id/dependencies` 新增依赖，带记录 ID 的路径支持 `PATCH` 和 `DELETE`。提交依赖时会检查循环引用。
+
+### 服务与访问地址
+
+创建服务提交 `{name,slug,serviceType?,description?,addresses?}`。`serviceType` 默认为 `WEB`，也可选 `API`、`WORKER`、`SCHEDULED_JOB`、`STATIC_SITE`、`DOCKER_SERVICE` 或 `CUSTOM`。服务响应包含 `projectId`、`revision` 与有序的 `addresses:[{id,name,url}]`。创建后 `revision` 为 1。所有登录角色可读取，管理员和操作员可保存及归档。
+
+更新时传入 `expectedRevision` 和需要修改的字段。省略 `addresses` 时保留地址，传空列表时清空，传非空列表时按所给顺序完整保存。已有行携带所属服务的地址 ID，新行省略 ID。每次可保存最多 100 条地址，链接使用不含凭据的绝对 HTTP(S) URL。服务、地址和审计在同一事务内更新，每次保存成功递增一次修订。
+
+地址校验失败返回 400，`error.details.fieldErrors` 包含 `{path,code,message}`，例如第二条地址的 URL 路径为 `['addresses',1,'url']`。修订冲突返回 409 及 `error.details.currentRevision`，可重新读取服务后核对草稿。归档前检查仍生效的引用，冲突响应使用 `error.references`。
 
 `GET /projects/:id/services/:serviceId/recent-deployments` 返回该服务最近五条逐目标部署记录。传入 `environmentId` 时先按环境过滤。服务和环境须为该项目的可用资源。
+
+### 全局服务器与分组
+
+服务器和分组列表供各项目选择同一全局资源 ID。服务器详情和分组详情中的 `projects`，以及独立的 `project-references` 接口，使用 `{id,name,slug,references}` 对应引用该目标的项目。每条引用可定位配置、图版本、运行、任务或用于选择该服务器的组。管理员管理服务器登记、连接配置、指纹、停用和分组。管理员和操作员可发起连接检查与配置对比。
+
+### 环境变量集合
+
+以下接口位于 `/projects/:projectId/environment-sets`。
+
+| 方法及路径 | 请求和结果 |
+| --- | --- |
+| `GET /`、`GET /:setId` | 列出可用集合或读取包含变量项的详情。集合响应含 `id`、`name`、`description` 和 `revision`。 |
+| `POST /` | 创建集合，提交 `{name,description?,variables?}`。 |
+| `PATCH /:setId` | 提交 `{expectedRevision,name?,description?,variables?}`。省略变量数组时保留，空数组清空。 |
+| `DELETE /:setId` | 提交 `{expectedRevision}`，归档集合。 |
+| `POST /:setId/variables/:key/reveal` | 管理员临时读取该敏感值，写入查看审计。 |
+
+每个变量提交 `key`、可选 `description` 和普通 `value`。敏感项使用 `isSecret:true`，同时提交一个新 `value`、管理员绑定的 `credentialId` 或 `keepSecret:true`。集合详情与导出默认掩码。写入校验失败返回 `error.details.fieldErrors`，修订冲突返回 `error.details.currentRevision`。归档集合从新计划选择中退出，已确认的运行及历史继续读取其快照。
 
 ### 项目内交付
 
@@ -122,12 +150,12 @@
 
 | 入口 | 页面地址 |
 | --- | --- |
-| 项目资源 | `#/projects/:id`。用 `resource`、资源 ID 和 `panel` 定位服务环境、仓库、环境或服务器分组。 |
-| 执行图 | `#/projects/:id/execution-graph`。保留 `start`、`run`、`pane`、`version`、`node` 和 `flow` 深链接。服务环境入口可附带 `serviceId`、`environmentId` 和 `resourcePanel`。 |
-| 交付记录 | `#/projects/:id/delivery?tab=artifacts`。`tab` 可取 `artifacts`、`deployments`、`approvals`。服务、环境、提交和记录定位通过查询参数保留。 |
+| 项目资源 | `#/projects/:id` 默认入口。`resource` 选择 `repositories`、`services`、`environment-sets` 或 `relations`，可用 `repositoryId`、`serviceId`、`environmentSetId` 定位。 |
+| 执行图 | `#/projects/:id/execution-graph`。使用 `start`、`run`、`pane`、`version`、`node` 和 `flow` 定位。服务详情打开开始节点时带入 `serviceId`。 |
+| 产物 | `#/projects/:id/artifacts`。`artifactId` 定位记录，可按服务及源码等条件筛选。部署与回滚或待审批记录可通过 `/delivery?tab=deployments` 或 `/delivery?tab=approvals` 查看。 |
 | 项目配置 | `#/projects/:id/configuration`。同页维护基本信息、执行默认值、项目公共变量和 AI 策略。 |
 
-`view` 保留返回的项目视图。旧的项目交付地址 `/artifacts`、`/deployments`、`/approvals` 及 `?section=deployment` 服务环境地址继续可用。由已发布开始节点链接传入的服务或环境按该节点声明的输入预填，图中固定绑定继续随版本生效。
+`view` 和 `viewSearch` 保留返回的项目视图及筛选。平台服务器通过 `#/servers?serverId=:serverId` 或 `#/servers?groupId=:groupId` 打开详情。项目来的链接可附 `projectId` 和该项目的 `returnPath`。由服务链接传入的服务按已发布开始节点声明的输入预填，图中固定绑定继续随版本生效。
 
 ## 项目执行图
 
@@ -137,27 +165,36 @@
 | --- | --- |
 | `GET /` | 查询项目图、草稿修订号和当前发布版本。 |
 | `GET /catalog` | 返回内置字段、功能模块版本和端口定义。 |
+| `POST /catalog?flow=:flowId&node=:nodeId` | 提交 `{definition}`，返回所选草稿节点的端口、候选来源、类型、可用性和分支信息。 |
 | `POST /validate` | 提交 `{definition}`。响应的 `issues` 用 `flowId`、`nodeId`、`fieldId` 和 `message` 定位发布问题。 |
 | `PUT /draft` | 提交 `{expectedRevision, definition:{flows:[],canvas:{nodes,edges,endpoints,templates}}}`。 |
 | `POST /publish` | 提交 `{expectedRevision}`，校验并固定已保存的图版本。 |
 | `GET /versions`、`GET /versions/:version` | 查询发布历史和具体发布版本。 |
 | `POST /versions/:version/retire` | 管理员或操作员停用旧发布版。先发布替代版本，再停用绑定该旧版的启用触发器。返回 `{version,retiredAt}`。停用版保留定义和运行历史，在途计划继续保护其资源。 |
 | `POST /versions/:version/restore` | 提交 `{expectedRevision}`，将发布版本载入草稿。 |
-| `POST /flows/:flowId/preview` | 提交 `{version,inputs:{parameters}}`。返回 `configurationHash`、`planSections`、实际参数和 `executionPlan`，包括分开的构建与发布目标、配置来源、环境文件、变量元数据及运行期绑定。 |
+| `POST /flows/:flowId/preview` | 提交 `{version,inputs:{parameters}}`。返回 `configurationHash`、`planSections`、参数和来源、`environmentSet`、`checkouts` 及节点端口证据。 |
 | `POST /flows/:flowId/run` | 提交同样的版本和输入，附 `expectedConfigurationHash` 和 `idempotencyKey`。可原样传回 `planSections` 为 `expectedPlanSections`。配置变更返回 409，`error.changes` 给出失效字段或计划段落，重新预览后方可确认。相同确认可取回原运行。 |
-| `GET /runs`、`GET /runs/:runId` | 查询运行、节点结果、任务、触发元数据和结束节点的 `outputs`。 |
+| `GET /runs`、`GET /runs/:runId` | 查询运行、任务和结束节点的 `outputs`。节点详情含 `inputs`、`environment`、`output`、逐目标状态和可定位的 `issue`。 |
 | `POST /runs/:runId/cancel` | 取消运行及尚未完成的节点和子流。 |
 | `POST /runs/:runId/nodes/:nodeId/decision` | 管理员提交 `{decision:"APPROVE"}` 或 `{decision:"REJECT"}`。 |
 
 预览或确认时发现明确的运行条件问题，可通过 `error.planIssue` 获取 `code`、`message` 和已知的 `flowId`、`flowName`、`nodeId`、`nodeName`、`fieldId`、`fieldName`。问题类别包括 `INPUT`、`REPOSITORY`、`BUILD_TARGET`、`RELEASE_TARGET`、`ARTIFACT`、`SOURCE_REVIEW` 和 `CONFIGURATION`。绑定到开始参数时可附 `parameterId`，定位目标问题时可附 `serviceId`、`environmentId` 和 `targetSource`。源码审核问题可附 `repositoryId` 与完整的 `commitSha`。成功预览会提供本次运行的产物节点及输出字段，或已固定的历史制品。存在多个候选来源时，各候选可附实际源码快照和对应审核记录。发布审批以 `requireApproval` 单独表示。
 
-开始节点 `inputs` 和结束节点 `outputs` 使用同一字段结构 `{id,name,type,required?,multiple?,defaultValue?,options?,artifactType?,selection?,source?}`。Git 版本值为 `{kind:"BRANCH"|"TAG"|"COMMIT",value}`。产物参数接受已登记 ID，预览返回具体产物引用。`LATEST_COMPATIBLE` 在预览中按作用域及目标固定记录，`CURRENT_RUN` 约束结束产物的来源。
+开始节点 `inputs` 和结束节点 `outputs` 使用同一字段结构 `{id,name,type,required?,multiple?,defaultValue?,options?,artifactType?,selection?,source?}`。Git 版本值为 `{kind:"BRANCH"|"TAG"|"COMMIT",value}`。产物参数接受 `{artifactId,instanceId?}`，预览按目标固定实际实例。`LATEST_COMPATIBLE` 在预览中依次定位并验证目标匹配的记录，`CURRENT_RUN` 约束结束产物的来源。
 
-画布的 `endpoints` 保存 `{startId,endId,serviceId?,edgeSelections?,inputBindings?,outputBindings?}`。端口可引用 `INPUT.fieldId`、`OUTPUT.nodeId` 和 `fieldId`、`CONTEXT.fieldId`、`VALUE.value`，或按顺序选择 `FIRST_AVAILABLE.sources`。普通路径的 `edgeSelections` 按源节点 ID 写入允许的下游节点 ID。`FLOW_CALL` 的端口取子流的开始和结束字段 ID。
+开始节点的 `environmentSet` 支持 `{mode:"NONE"}`、`{mode:"FIXED",environmentSetId}` 和 `{mode:"INPUT",fieldId}`。运行时选择的字段类型为单值 `ENVIRONMENT_SET`，值为集合 ID。响应的集合摘要是 `null` 或 `{id,name,revision}`，确认时复核修订和凭据版本。
+
+`LOAD_ENV.loadEnvironment` 可用 `envFile` 指定相对路径，或用 `pathRule:{key,paths}` 根据开始参数及集合中的普通值映射出相对路径。`required:false` 允许跳过未匹配或不存在的文件。节点从绑定的固定 Git 提交读取文件，消费者通过 `variables` 端口接入。文件的实际路径和覆盖来源随计划记录。
+
+画布的 `endpoints` 保存 `{startId,endId,serviceId?,edgeSelections?,inputBindings?,environmentBindings?,outputBindings?}`。端口可引用 `INPUT.fieldId`、`OUTPUT.nodeId` 和 `fieldId`、`CONTEXT.fieldId`、`VALUE.value`，或按顺序选择 `FIRST_AVAILABLE.sources`。`AS_GIT_REF` 可把普通文本明确转换成分支或 Tag。端口的 `onMissing` 可声明报告缺项、省略、使用字段默认值或 Git 仓库默认版本。分支候选存在尚未完成的前序生产者时等待，已确认无值时继续选择。
+
+Shell 和检查节点的 `environmentBindings[nodeId][key]` 还支持 `NODE_INPUT.fieldId`、`ENVIRONMENT_KEY.key` 和 `CREDENTIAL.credentialId`。先解析输入再做环境注入。脚本每执行单元可返回一条 `VEYOPS_OUTPUT=` JSON 对象，通过声明的输出名转成稳定字段 ID。未知键、重复键、类型错误、超限或敏感输出会阻止节点成功。原始结果行独立解析，节点日志保存普通输出。
+
+普通路径的 `edgeSelections` 按源节点 ID 写入允许的下游节点 ID。`FLOW_CALL` 的端口取子流的开始和结束字段 ID。含外部执行资源或变量集合的子流需要在父流预览时解析其参数。运行证据中的字段状态可区分已解析、默认值、等待上游、省略或错误。来源通过稳定节点与字段 ID 回查。
 
 `BUILD.build.dependencies` 最多声明八个额外源码工作区别名。每个别名用小写字母开头，可包含小写字母、数字和连字符。流需将 Git 来源工作区绑定到主 `workspace` 和各 `dependency_<别名>` 端口。额外工作区复制到构建任务独立目录，命令可通过 `$VEYOPS_GRAPH_DEPENDENCY_ROOT/<别名>` 访问。镜像构建的 Dockerfile 需要使用依赖时，先在构建命令中将所需文件复制到主仓库的构建上下文。
 
-构建、登记和部署配置分别保存在 `BUILD.build`、`REGISTER_ARTIFACT.registerArtifacts` 和 `DEPLOY_ARTIFACT.deploy`。构建和登记支持 `artifacts` 列表，条目包含 `name`、`type`、`path` 或 `imageReference`，以及可选 `required`、`composeFilePath`。每个名称输出一组可匹配执行目标的产物引用。部署节点从 `artifact` 端口取得待部署记录。归档下载使用 `GET /artifacts/:id/download`。
+构建、登记和部署配置分别保存在 `BUILD.build`、`REGISTER_ARTIFACT.registerArtifacts` 和 `DEPLOY_ARTIFACT.deploy`。构建和登记支持 `artifacts` 列表，条目包含 `name`、`type`、`path` 或 `imageReference`，以及可选 `required`、`composeFilePath` 和 `persist`。`persist:false` 输出 `{temporaryArtifactId}`，当前根运行及其子流可以引用。部署节点从 `artifact` 端口取得待部署记录。归档下载使用 `GET /artifacts/:id/download`。
 
 ### 执行图存量迁移
 
@@ -179,24 +216,24 @@
 
 - `CRON` 使用 `cron` 和 IANA `timeZone`。
 - `API` 经 `POST /triggers/:triggerId/invoke` 提交 `{eventId,inputValue?,repositoryId?,ref?,commitSha?}`。
-- `UPSTREAM` 指定同一发布版本的 `upstreamFlowId` 和 `upstreamStatus`。
+- `UPSTREAM` 指定同一发布版本的 `upstreamFlowId` 和 `upstreamStatus`。成功规则可用 `{source:"UPSTREAM_OUTPUT",fieldId}` 传递可独立验证的同类型结束字段。
 - `WEBHOOK` 使用签名凭据，可设置 `repositoryId` 和 `refPrefix` 过滤。向 `/api/v1/graph-webhooks/:triggerId` 提交 JSON，携带 `X-Veyops-Timestamp`、`X-Veyops-Delivery`、`X-Veyops-Signature`，签名对 `timestamp + "." + eventId + "." + 原始请求体` 计算 HMAC-SHA256，以 `sha256=` 加十六进制值发送。
 
 `GET /triggers/:triggerId/events` 返回事件状态与元数据。同一规则的事件 ID 去重。
 
-执行构建或部署的触发入口默认关闭。对应入口通过验收后，在 API 和执行器进程设置 `VEYOPS_AUTO_DELIVERY_TRIGGERS`，以逗号列出获准的类型，例如 `API,WEBHOOK`。自动构建使用 `WEBHOOK_BUILD_DOCKER_SOCKET` 指定的隔离管理端运行器，镜像仅做归档。自动发布消费已归档产物，沿用服务环境的源码审核与发布审批策略。启用审批时由管理员确认后执行。审批和执行前复核规则、调用者权限和目标快照。事件提交用于保存触发来源、参数映射及提交条件判断。需要按事件提交检出时，将 `commit` 映射为开始字段并绑定到检出或构建节点的 Git 版本端口。
+执行构建或部署的触发入口默认关闭。对应入口通过验收后，在 API 和执行器进程设置 `VEYOPS_AUTO_DELIVERY_TRIGGERS`，以逗号列出获准的类型，例如 `API,WEBHOOK`。自动构建使用 `WEBHOOK_BUILD_DOCKER_SOCKET` 指定的隔离管理端运行器，镜像仅做归档。自动发布消费已归档产物，遵循已发布图中的审批节点和目标绑定。变量集合参数可在规则中绑定明确的集合 ID，也可用开始字段默认值。事件提交用于保存触发来源、参数映射及提交条件判断。需要按事件提交检出时，将 `commit` 映射为开始字段并绑定到检出或构建节点的 Git 版本端口。
 
 ## 项目视图
 
 | 方法   | 路径       | 请求 / 说明                                                                |
 | ------ | ---------- | -------------------------------------------------------------------------- |
-| GET    | /views     | 返回 `{views,defaultViewId}`，包含四个预设和当前账号的自定义视图           |
-| GET    | /views/:id | 返回视图详情、排序后的项目和各项目的发布状态、近期发布与访问地址           |
+| GET    | /views     | 返回 `{views,defaultViewId}`，包含全部项目、异常项目及当前账号的自定义视图 |
+| GET    | /views/:id | 返回视图详情、排序后的项目、各项目的服务、发布状态、近期发布和访问地址 |
 | POST   | /views     | `{name,description?,projectIds,isDefault?}`，`projectIds` 的顺序即显示顺序 |
 | PATCH  | /views/:id | 使用同一请求结构更新自定义视图与项目列表                                   |
 | DELETE | /views/:id | 删除当前账号的自定义视图                                                   |
 
-预设 ID 为 `all`、`production`、`testing` 和 `abnormal`。生产与测试视图按环境类型筛选项目，发布记录只覆盖所选环境。异常状态按每个服务、环境和目标服务器的最新部署判断。没有验证过的成功发布显示为待验证。
+预设 ID 为 `all`、`abnormal`。详情可用 `serviceId`、`serverId` 或 `groupId` 筛选。`serverId` 和 `groupId` 二选一，分组按当前启用成员展开。目标筛选考虑项目引用和实际部署，发布记录按所选服务和服务器过滤。发布状态按同一项目、服务和实际服务器的最新部署判断。未经健康验证的成功发布显示为待验证。
 
 所有登录角色均可读取预设。管理员或运维人员可保存和设置自己的自定义视图为默认。无自定义默认时打开「全部项目」。设为默认会替换当前账号的旧默认，删除视图只移除它和项目的关联。
 
@@ -328,7 +365,9 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 | `GET /environments/:envId/variables/inherited` | 查询未被该环境覆盖的项目公共变量。 |
 | `GET /services/:serviceId/environments/:envId/variables`、`PUT /services/:serviceId/environments/:envId/variables` | 独立查询或保存服务环境变量，覆盖同名环境变量。 |
 | `POST /projects/:projectId/variables/:key/reveal`、`POST /environments/:envId/variables/:key/reveal`、`POST /services/:serviceId/environments/:envId/variables/:key/reveal` | 管理员临时读取敏感值 `{value}`，读取动作记入审计。 |
-| `GET /artifacts` | 查看构建产物和下载、部署可用性，可按项目、服务、环境和任务筛选。 |
+| `GET /artifacts` | 按项目、服务、变量集合、服务器、类型、源码或验证状态筛选已登记实例。使用 `limit` 和最后一个实例 ID `cursor` 分页。 |
+| `GET /artifacts/:id` | 通过逻辑或实例 ID 查看 `{artifactId,instances}`、实物状态和生产运行。 |
+| `POST /artifacts/:id/verify` | 管理员、操作员可提交 `{instanceIds?}`，重新核对实物并记录结果和操作者。 |
 | `GET /artifacts/:id/download` | 登录后下载文件或镜像归档，响应头 `X-Artifact-SHA256` 提供校验值。 |
 | `GET /deployments` | 查询逐服务器发布记录。 |
 | `GET /registries`、`POST /registries` | 查询、登记镜像仓库，创建限管理员。 |
@@ -366,14 +405,17 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 | --- | --- |
 | `GET /artifact-retention/policy` | 读取有效保留策略和 `inherited` 状态。 |
 | `PUT /artifact-retention/policy` | 保存 `{maxBuilds,maxDays}`，限制分别为 1–1000 批和 1–3650 天。 |
-| `DELETE /artifact-retention/policy` | 删除服务环境覆盖，恢复继承系统策略。 |
+| `DELETE /artifact-retention/policy` | 删除指定项目或服务覆盖，恢复上一级策略。 |
 | `PUT /artifact-retention/artifacts/:id/pin` | 以 `{pinned:true}` 固定产物，以 `{pinned:false}` 解除固定。 |
-| `GET /artifact-retention/preview` | 返回候选总组数 `total` 和最多 50 组 `candidates`，相同归档文件的记录归在一组。每组返回 `artifactIds`、`createdAt` 和 `sizeBytes`。 |
-| `POST /artifact-retention/prune` | 接受 `{artifactIds,confirmed:true}`，每组选一个 ID。执行时复核保护并返回 `pruned`、`skipped` 和 `failed` 的产物 ID。 |
+| `GET /artifact-retention/preview` | 查看保留策略的自动清理候选。 |
+| `POST /artifact-retention/preview` | 接受 `{artifacts:[{artifactId,instanceId?}]}`，返回 `planDigest`、实例位置和保护原因。 |
+| `POST /artifact-retention/prune` | 再提交 `artifacts`、`planDigest` 和 `idempotencyKey`，返回持久化任务及实例状态。 |
+| `GET /artifact-retention/jobs/:id` | 查看清理任务、逐实例结果、失败和保留原因。 |
+| `POST /artifact-retention/jobs/:id/retry` | 复核当前保护关系后重试未完成实例。 |
 
-这些接口需要管理员权限。策略接口同时传入 `serviceId` 和 `environmentId` 查询参数可管理服务环境覆盖，省略时操作全局策略，删除覆盖时必须指定服务环境。
+这些接口需要管理员权限。策略支持系统、项目和服务逐级继承，查询可使用 `projectId` 或 `serviceId` 指定范围。
 
-默认保留最近 20 批且在 30 天内的构建产物。Worker 定期清理超限的托管归档，保护当前运行版本、回滚基线、排队或执行中的任务和人工固定的产物。外部 Registry 与旧目标端归档由各自的存储策略保留。`GET /artifacts` 保留已清理记录，`prunedAt` 表示托管归档停止使用，`archiveDeletedAt` 记录本地文件清理完成的时间。Registry Digest 可用时仍能用于发布。物理删除失败的归档会在后续清理时重试。
+默认保留最近 20 批且在 30 天内的构建产物。保留策略和运行结束后的临时产物共用清理任务。当前发布、回滚基线、在途执行计划和人工固定均受保护。Worker 清理前核对实物身份和所有权，外部引用只解除登记，仍有使用者的实物保留。清理前先将实例置为 `CLEANING`，新运行只能使用 `ACTIVE` 实例。历史详情保留生产来源、验证和清理结果。
 
 ## AI 接口
 

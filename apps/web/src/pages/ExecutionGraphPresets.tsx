@@ -12,6 +12,7 @@ import type {
 } from './execution-graph-definition';
 
 export const graphTemplates: { name: string; nodes: GraphNode['type'][] }[] = [
+  { name: '检出源码并核对提交', nodes: ['CHECKOUT', 'SHELL'] },
   { name: '构建并部署', nodes: ['BUILD', 'DEPLOY_ARTIFACT'] },
   { name: '仅构建', nodes: ['BUILD'] },
   { name: '仅部署', nodes: ['DEPLOY_ARTIFACT'] },
@@ -344,6 +345,20 @@ export function ArtifactOutputEditor({
               />{' '}
               必需产物
             </label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                disabled={!canEdit}
+                checked={output.persist !== false}
+                onChange={(event) =>
+                  patch(index, { persist: event.target.checked ? undefined : false })
+                }
+              />
+              登记供后续运行使用
+            </label>
+            {output.persist === false && (
+              <p className="field-note">临时产物可在本次运行和子流中使用。</p>
+            )}
             {canEdit && (
               <button
                 type="button"

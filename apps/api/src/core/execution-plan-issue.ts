@@ -17,6 +17,13 @@ export interface ExecutionPlanIssue {
   fieldId?: string;
   fieldName?: string;
   parameterId?: string;
+  sourceNodeId?: string;
+  sourceFieldId?: string;
+  branchId?: string;
+  entityType?: string;
+  entityId?: string;
+  environmentSetId?: string;
+  serverId?: string;
   serviceId?: string;
   environmentId?: string;
   targetSource?:

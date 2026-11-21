@@ -19,6 +19,9 @@ export interface ExecutionPlanIssue {
   nodeName?: string;
   fieldId?: string;
   fieldName?: string;
+  sourceNodeId?: string;
+  sourceFieldId?: string;
+  branchId?: string;
   repositoryId?: string;
   commitSha?: string;
   parameterId?: string;
@@ -41,6 +44,9 @@ function readPlanIssue(value: unknown): ExecutionPlanIssue | undefined {
     'nodeName',
     'fieldId',
     'fieldName',
+    'sourceNodeId',
+    'sourceFieldId',
+    'branchId',
     'repositoryId',
     'commitSha',
     'parameterId',
@@ -67,16 +73,19 @@ export class ApiError extends Error {
   status: number;
   changes: string[];
   readonly planIssue?: ExecutionPlanIssue;
+  readonly details?: Record<string, unknown>;
   constructor(
     message: string,
     status: number,
     changes: string[] = [],
     planIssue?: ExecutionPlanIssue,
+    details?: Record<string, unknown>,
   ) {
     super(message);
     this.status = status;
     this.changes = changes;
     this.planIssue = planIssue;
+    this.details = details;
   }
 }
 
@@ -88,7 +97,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   });
   let body: {
     data?: T;
-    error?: { message?: string; changes?: unknown; planIssue?: unknown };
+    error?: { message?: string; changes?: unknown; planIssue?: unknown; details?: unknown };
     message?: string;
   };
   try {
@@ -106,6 +115,11 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
         ? body.error.changes.filter((change): change is string => typeof change === 'string')
         : [],
       readPlanIssue(body.error?.planIssue),
+      body.error?.details &&
+        typeof body.error.details === 'object' &&
+        !Array.isArray(body.error.details)
+        ? (body.error.details as Record<string, unknown>)
+        : undefined,
     );
   }
   return body.data as T;

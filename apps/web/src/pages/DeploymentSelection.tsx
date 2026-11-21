@@ -4,6 +4,7 @@ import { useResource } from '../api';
 import { ErrorBanner, Field, Loading } from '../components';
 import type { DeploymentSelection, Server, ServerGroup } from '../models';
 import { BatchStrategy, ServerPicker, defaultExecutionOptions } from './BatchTargets';
+import { serverResourceHref } from './server-resource-route';
 import './deployment-selection.css';
 
 export function useDeploymentInventory(enabled = true) {
@@ -73,6 +74,7 @@ export function DeploymentSelectionPicker({
   const unavailableGroups =
     !groups.loading && !groups.error ? groupIds.filter((id) => !groupNames.has(id)) : [];
   const selectedServers = selectedDeploymentServers(value, groupList);
+  const origin = { projectId, returnPath: window.location.hash.slice(1) };
   return (
     <fieldset className="deployment-source-picker" disabled={disabled}>
       <legend>选择服务器或服务器分组</legend>
@@ -106,7 +108,7 @@ export function DeploymentSelectionPicker({
                   '没有匹配的服务器。'
                 ) : (
                   <>
-                    还没有服务器。 <a href="#/servers">添加服务器</a>
+                    还没有可选服务器。 <a href="#/servers">查看平台服务器</a>
                   </>
                 )}
               </p>
@@ -158,7 +160,7 @@ export function DeploymentSelectionPicker({
                   '没有匹配的服务器分组。'
                 ) : (
                   <>
-                    还没有分组。 <a href="#/servers">管理服务器分组</a>
+                    还没有可选分组。 <a href="#/servers">查看平台服务器</a>
                   </>
                 )}
               </p>
@@ -186,9 +188,30 @@ export function DeploymentSelectionPicker({
       )}
       <div className="deployment-source-selection" role="status">
         <strong>当前成员 · {selectedServers.length} 台</strong>
-        {selectedServers.length > 0 && (
-          <p>{selectedServers.map((id) => serverNames.get(id) ?? id).join('、')}</p>
-        )}
+        <div className="tags">
+          {selectedServers.map((id) => (
+            <a
+              key={id}
+              className="tag text-link"
+              href={serverResourceHref({ ...origin, serverId: id })}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              {serverNames.get(id) ?? id}
+            </a>
+          ))}
+          {groupIds.map((id) => (
+            <a
+              key={id}
+              className="tag text-link"
+              href={serverResourceHref({ ...origin, groupId: id })}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              {groupNames.get(id) ?? id} · 分组
+            </a>
+          ))}
+        </div>
       </div>
       <details className="advanced-options">
         <summary>执行策略</summary>

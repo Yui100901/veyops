@@ -424,20 +424,14 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   });
   assert.equal(environmentFiles.text.includes('env-file-private'), false);
   const graphNodes = app.get(GraphNodeTasks);
-  const selectedEnvironment = (
-    await operator
-      .post(`/api/v1/projects/${project}/environments`)
-      .send({ name: 'Configured', slug: 'configured', repositoryEnvFile: 'services/web/.env' })
-      .expect(201)
-  ).body.data.id;
   const currentSource = { repositoryId: id, commitSha: main, branch: 'main' };
-  const configured = await graphNodes.prepareEnvironment(project, {
-    environmentId: selectedEnvironment,
-    source: { ...currentSource, commitSha: first },
-    directory: 'services/web',
-  });
+  const configured = await graphNodes.prepareEnvironment(
+    project,
+    { ...currentSource, commitSha: first },
+    { envFile: 'services/web/.env' },
+  );
   assert.equal(configured?.status, 'PINNED');
-  assert.equal(configured.source, 'ENVIRONMENT');
+  assert.equal(configured.source, 'NODE');
   assert.equal(configured.path, 'services/web/.env');
   assert.deepEqual(configured.variables, [
     { key: 'SHOULD_NOT_SEND', source: 'FILE', isSecret: true },
@@ -449,7 +443,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     pipelineVersionId: 'fixture-version',
     projectId: project,
     serviceId: 'fixture-service',
-    environmentId: selectedEnvironment,
+    environmentId: 'fixture-scope',
     commitSha: main,
     repository: { url: create.cloneUrl, credentialId: credential },
     definition: new PipelineDefinitionDto(),
@@ -464,9 +458,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   assert.equal(resolved.values.SHOULD_NOT_SEND, 'higher-layer-value');
   assert.equal(resolved.secrets.includes('env-file-private'), true);
   assert.equal(resolved.secrets.includes('new-private-value'), false);
-  const explicit = await graphNodes.prepareEnvironment(project, {
-    environmentId: selectedEnvironment,
-    source: currentSource,
+  const explicit = await graphNodes.prepareEnvironment(project, currentSource, {
     directory: 'services//web',
     envFile: './.env.test',
   });
@@ -478,11 +470,13 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     ['TEST_KEY'],
   );
   await assert.rejects(
-    graphNodes.prepareEnvironment(project, {
-      environmentId: selectedEnvironment,
-      source: { ...currentSource, commitSha: first },
-      envFile: 'services/web/.env.test',
-    }),
+    graphNodes.prepareEnvironment(
+      project,
+      { ...currentSource, commitSha: first },
+      {
+        envFile: 'services/web/.env.test',
+      },
+    ),
     /缺少必需的环境文件/,
   );
   await assert.rejects(
@@ -498,32 +492,25 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     ['prod', 'PROD_KEY'],
     ['staging', undefined],
   ] as const) {
-    const environmentId = (
-      await operator
-        .post(`/api/v1/projects/${project}/environments`)
-        .send({ name: slug, slug })
-        .expect(201)
-    ).body.data.id;
-    const plan = await graphNodes.prepareEnvironment(project, {
-      environmentId,
-      source: currentSource,
-      directory: 'services/web',
+    const plan = await graphNodes.prepareEnvironment(project, currentSource, {
+      envFile: `services/web/.env.${slug}`,
+      required: false,
     });
     assert.equal(plan?.commitSha, main);
-    assert.equal(plan.source, 'CONVENTION');
+    assert.equal(plan.source, 'NODE');
     assert.equal(plan.path, `services/web/.env.${slug}`);
     assert.equal(plan.status, key ? 'PINNED' : 'SKIPPED');
-    assert.deepEqual(plan.variables.map(({ key }) => key), key ? [key] : []);
+    assert.deepEqual(
+      plan.variables.map(({ key }) => key),
+      key ? [key] : [],
+    );
   }
   assert.equal(
-    await graphNodes.prepareEnvironment(project, {
-      source: currentSource,
-      directory: 'services/web',
-    }),
+    await graphNodes.prepareEnvironment(project, currentSource, { directory: 'services/web' }),
     undefined,
   );
   await assert.rejects(
-    graphNodes.prepareEnvironment(project, { source: currentSource, envFile: '../.env' }),
+    graphNodes.prepareEnvironment(project, currentSource, { envFile: '../.env' }),
     /相对路径/,
   );
   const requestsBeforeInvalidQueries = fixture.authenticatedRequests();

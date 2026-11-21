@@ -41,6 +41,7 @@ export class NamedArtifactDefinitionDto implements NamedArtifactDefinition {
   @IsOptional() @IsString() @Length(1, 1024) path?: string;
   @IsOptional() @IsString() @Length(1, 512) imageReference?: string;
   @IsOptional() @IsBoolean() required?: boolean;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() persist?: boolean;
   @IsOptional() @IsString() @Length(1, 1024) composeFilePath?: string;
 }
 class PipelineNodeVariableDto {

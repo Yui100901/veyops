@@ -1,6 +1,18 @@
 import type { ProjectDetail } from '../models';
-import type { GraphNode } from './execution-graph-definition';
+import type {
+  GraphEnvironmentSetSummary,
+  GraphFieldEvidence,
+  GraphFieldSource,
+  GraphNode,
+} from './execution-graph-definition';
 import { deliveryPath } from './delivery-route';
+import {
+  artifactVerificationLabels,
+  type ArtifactPhysical,
+  type ArtifactVerification,
+} from './Delivery';
+import { projectResourcePath } from './project-workspace-route';
+import { serverResourceHref } from './server-resource-route';
 import './execution-graph-preview.css';
 
 interface NodeScope {
@@ -35,12 +47,15 @@ interface PlanEnvironmentFile extends NodeScope {
   source: string;
   required?: boolean;
   status?: string;
+  mappingKey?: string;
 }
 
 interface PlanVariable extends NodeScope {
   key: string;
   source: string;
   sensitive: boolean;
+  overriddenSources?: string[];
+  value?: string;
 }
 
 interface DeferredBinding extends NodeScope {
@@ -51,6 +66,13 @@ interface DeferredBinding extends NodeScope {
 
 interface ArtifactPreview {
   id: string;
+  artifactId?: string;
+  instanceId?: string;
+  serverId?: string | null;
+  physical?: ArtifactPhysical | null;
+  verificationStatus?: ArtifactVerification;
+  verificationReason?: string | null;
+  temporary?: boolean;
   name?: string;
   type?: string;
   kind?: string;
@@ -111,11 +133,26 @@ export interface Preview extends DeliveryPreview {
   planSections?: Record<string, string>;
   version: number;
   flowId: string;
+  environmentSet?: GraphEnvironmentSetSummary | null;
   parameters?: Record<string, unknown>;
-  nodes: { nodeId: string; name: string; type: GraphNode['type']; selected?: boolean }[];
+  parameterSources?: Record<string, GraphFieldSource>;
+  nodes: {
+    nodeId: string;
+    name: string;
+    type: GraphNode['type'];
+    selected?: boolean;
+    inputs?: GraphFieldEvidence[];
+    outputFields?: GraphFieldEvidence[];
+    environment?: GraphFieldEvidence[];
+  }[];
   deliveries?: DeliveryPreview[];
   checkouts?: (NodeScope & {
     repositoryId: string;
+    repositoryName?: string;
+    ref?: string;
+    versionSource?: string;
+    triggerRepositoryId?: string;
+    triggerCommitSha?: string;
     branch?: string;
     tag?: string;
     commitSha: string;
@@ -139,6 +176,18 @@ export interface Preview extends DeliveryPreview {
 const sourceNames: Record<string, string> = {
   RUN_INPUT: '运行参数',
   INPUT: '运行参数',
+  TRIGGER_VALUE: '触发规则固定值',
+  TRIGGER_EVENT: '触发事件',
+  TRIGGER_COMMIT: '触发事件固定提交',
+  TRIGGER_REF: '触发事件 Git 引用',
+  UPSTREAM_OUTPUT: '上游最终输出',
+  DEFAULT: '字段默认值',
+  VALUE: '节点固定值',
+  NODE_INPUT: '本节点输入',
+  ENVIRONMENT_KEY: '入口变量集合',
+  CREDENTIAL: '凭据引用',
+  AS_GIT_REF: '转换为 Git 版本',
+  REPOSITORY_DEFAULT: '仓库默认分支',
   NODE: '节点配置',
   SYSTEM: '系统默认',
   SYSTEM_DEFAULT: '系统默认',
@@ -147,6 +196,7 @@ const sourceNames: Record<string, string> = {
   SERVICE_ENVIRONMENT: '服务环境覆盖',
   PROJECT_ENVIRONMENT: '项目环境默认',
   ENVIRONMENT: '项目环境',
+  ENVIRONMENT_SET: '入口变量集合',
   ENVIRONMENT_CONFIG: '项目环境',
   LEGACY_TARGET: '旧部署目标',
   MANAGER: '管理端',
@@ -258,7 +308,110 @@ function names({ project, preview }: { project: ProjectDetail; preview: Preview 
   };
 }
 
-const sourceName = (source: string) => sourceNames[source] ?? source;
+export const sourceName = (source: string) => sourceNames[source] ?? source;
+
+const fieldStates: Record<GraphFieldEvidence['state'], string> = {
+  RESOLVED: '已解析',
+  DEFERRED: '运行时解析',
+  OMITTED: '已省略',
+  DEFAULTED: '使用默认值',
+  ERROR: '解析失败',
+};
+const policyNames = {
+  ERROR: '缺值报错',
+  OMIT: '缺值时省略',
+  USE_DEFAULT: '缺值时采用默认值',
+  REPOSITORY_DEFAULT: '缺值时采用仓库默认分支',
+};
+
+function displayEvidenceValue(field: GraphFieldEvidence) {
+  if (field.sensitive || field.type === 'CREDENTIAL' || field.source?.kind === 'CREDENTIAL')
+    return '敏感引用';
+  const value = field.value;
+  if (typeof value === 'string') return value === '' ? '空字符串' : value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return value.length + ' 项';
+  if (value && typeof value === 'object') {
+    if (
+      field.type === 'GIT_REF' &&
+      'kind' in value &&
+      'value' in value &&
+      typeof value.value === 'string'
+    )
+      return String(value.kind) + ' · ' + value.value;
+    if (field.type === 'SOURCE' && 'commitSha' in value && typeof value.commitSha === 'string')
+      return value.commitSha;
+    return '结构化值';
+  }
+  return undefined;
+}
+
+export function FieldEvidenceList({
+  title,
+  fields,
+  linkSource,
+  nameSource,
+}: {
+  title: string;
+  fields?: GraphFieldEvidence[];
+  linkSource?: (source: GraphFieldSource) => string | undefined;
+  nameSource?: (id: string) => string | undefined;
+}) {
+  if (!fields?.length) return null;
+  return (
+    <details className="graph-field-card">
+      <summary>
+        {title} · {fields.length} 项
+      </summary>
+      <dl className="graph-field-values">
+        {fields.map((field) => {
+          const source = field.source;
+          const href = source && linkSource?.(source);
+          const label =
+            source &&
+            [
+              sourceName(source.kind),
+              source.nodeId && (nameSource?.(source.nodeId) ?? source.nodeId),
+              source.fieldId ?? source.key ?? source.eventField,
+              source.transform && (source.transform === 'BRANCH' ? '转为分支' : '转为标签'),
+            ]
+              .filter(Boolean)
+              .join(' · ');
+          const value = displayEvidenceValue(field);
+          return (
+            <div key={field.fieldId}>
+              <dt>
+                {field.name} <small>{field.type}</small>
+              </dt>
+              <dd>
+                {fieldStates[field.state]}
+                {value !== undefined && (
+                  <>
+                    {' '}
+                    · <code>{value}</code>
+                  </>
+                )}
+                {label && (
+                  <small>
+                    {href ? (
+                      <a className="text-link" href={href}>
+                        {label}
+                      </a>
+                    ) : (
+                      label
+                    )}
+                  </small>
+                )}
+                {field.onMissing && <small>{policyNames[field.onMissing]}</small>}
+                {field.message && <small>{field.message}</small>}
+              </dd>
+            </div>
+          );
+        })}
+      </dl>
+    </details>
+  );
+}
 const fieldName = (field: string) => fieldNames[field] ?? field;
 const scopeKey = (scope: NodeScope) => `${scope.flowId ?? ''}:${scope.nodeId ?? ''}`;
 const targetName = (purpose: PlanTarget['purpose']) =>
@@ -286,7 +439,7 @@ function targetGroups(target: PlanTarget) {
 }
 
 function fileStatus(file: PlanEnvironmentFile) {
-  if (['SKIPPED', 'MISSING', 'ABSENT'].includes(file.status ?? '')) return '未找到约定文件，已跳过';
+  if (['SKIPPED', 'MISSING', 'ABSENT'].includes(file.status ?? '')) return '未找到可选文件，已跳过';
   if (!file.commitSha) return '在运行中确定';
   return file.required ? '必需 · 已固定' : '可选 · 已固定';
 }
@@ -376,18 +529,47 @@ function DeliveryArtifacts({
             <div key={artifact.id}>
               <a
                 className="text-link"
-                href={'#' + deliveryPath(projectId, 'artifacts', { recordId: artifact.id })}
+                href={
+                  '#' +
+                  deliveryPath(projectId, 'artifacts', {
+                    recordId: artifact.instanceId ?? artifact.artifactId ?? artifact.id,
+                  })
+                }
               >
                 {artifact.name ?? artifact.id}
               </a>
               {(artifact.type || artifact.kind) &&
                 ` · ${settingValue((artifact.type ?? artifact.kind)!)}`}
-              {(artifact.digest || artifact.checksum) && (
+              {artifact.verificationStatus && (
+                <span className="tag" title={artifact.verificationReason ?? undefined}>
+                  {artifactVerificationLabels[artifact.verificationStatus]}
+                </span>
+              )}
+              {artifact.temporary && <span className="tag">运行内临时产物</span>}
+              {(artifact.serverId || artifact.physical?.serverId) && (
+                <a
+                  className="text-link"
+                  href={serverResourceHref({
+                    serverId: artifact.serverId ?? artifact.physical?.serverId,
+                    projectId,
+                    returnPath: window.location.hash.slice(1),
+                  })}
+                >
+                  实物服务器
+                </a>
+              )}
+              {(artifact.physical?.sha256 ||
+                artifact.physical?.imageId ||
+                artifact.digest ||
+                artifact.checksum) && (
                 <small>
                   <code>
                     {artifact.imageReference ??
                       (artifact.imageRepository ? artifact.imageRepository + ' · ' : '') +
-                        (artifact.digest ?? artifact.checksum)}
+                        (artifact.physical?.sha256 ??
+                          artifact.physical?.imageId ??
+                          artifact.digest ??
+                          artifact.checksum)}
                   </code>
                 </small>
               )}
@@ -426,12 +608,42 @@ function DeliveryArtifacts({
   );
 }
 
-export function ExecutionPlan({ preview, project }: { preview: Preview; project: ProjectDetail }) {
+export function ExecutionPlan({
+  preview,
+  project,
+  returnPath,
+  view,
+}: {
+  preview: Preview;
+  project: ProjectDetail;
+  returnPath?: string;
+  view?: string;
+}) {
   const plan = preview.executionPlan;
   const name = names({ project, preview });
   const deliveries = preview.deliveries ?? (preview.serviceId ? [preview] : []);
   return (
     <div className="execution-plan">
+      <section>
+        <h4>入口变量集合</h4>
+        {preview.environmentSet ? (
+          <a
+            className="text-link"
+            href={
+              '#' +
+              projectResourcePath(project.id, {
+                resource: 'environment-sets',
+                environmentSetId: preview.environmentSet.id,
+                view,
+              })
+            }
+          >
+            {preview.environmentSet.name} · 修订 {preview.environmentSet.revision}
+          </a>
+        ) : (
+          <span>使用项目公共变量</span>
+        )}
+      </section>
       {!!preview.checkouts?.length && (
         <section>
           <h4>源码与检出版本</h4>
@@ -439,15 +651,70 @@ export function ExecutionPlan({ preview, project }: { preview: Preview; project:
             <div className="execution-plan-row" key={`${scopeKey(checkout)}:${index}`}>
               <strong>{name.node(checkout)}</strong>
               <span>
-                {name.repository(checkout.repositoryId)} ·{' '}
+                {checkout.repositoryName ?? name.repository(checkout.repositoryId)} ·{' '}
                 {checkout.branch ?? (checkout.tag ? `标签 ${checkout.tag}` : '指定提交')} ·{' '}
                 {checkout.fullClone ? '完整历史' : '浅拉取'}
               </span>
               <code>{checkout.commitSha}</code>
+              {(checkout.ref || checkout.versionSource) && (
+                <small>
+                  {[checkout.ref, checkout.versionSource && sourceName(checkout.versionSource)]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </small>
+              )}
+              {checkout.triggerCommitSha && (
+                <small>
+                  触发事件提交 ·{' '}
+                  {checkout.triggerRepositoryId && name.repository(checkout.triggerRepositoryId)}{' '}
+                  <code>{checkout.triggerCommitSha}</code>
+                </small>
+              )}
             </div>
           ))}
         </section>
       )}
+      {preview.parameterSources && Object.keys(preview.parameterSources).length > 0 && (
+        <details className="graph-field-card">
+          <summary>开始参数来源</summary>
+          <dl className="graph-field-values">
+            {Object.entries(preview.parameterSources).map(([id, source]) => (
+              <div key={id}>
+                <dt>{id}</dt>
+                <dd>
+                  {sourceName(source.kind)} {source.eventField}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </details>
+      )}
+      {preview.nodes
+        .filter(
+          (node) =>
+            node.selected !== false &&
+            (node.inputs?.length || node.environment?.length || node.outputFields?.length),
+        )
+        .map((node) => (
+          <section key={node.nodeId}>
+            <h4>{node.name}</h4>
+            <FieldEvidenceList
+              title="节点输入"
+              fields={node.inputs}
+              nameSource={(id) => preview.nodes.find(({ nodeId }) => id === nodeId)?.name}
+            />
+            <FieldEvidenceList
+              title="节点环境绑定"
+              fields={node.environment}
+              nameSource={(id) => preview.nodes.find(({ nodeId }) => id === nodeId)?.name}
+            />
+            <FieldEvidenceList
+              title="最终输出"
+              fields={node.outputFields}
+              nameSource={(id) => preview.nodes.find(({ nodeId }) => id === nodeId)?.name}
+            />
+          </section>
+        ))}
       {plan &&
         plan.targets.length > 0 &&
         (['BUILD', 'RELEASE'] as const).map((purpose) => (
@@ -465,7 +732,16 @@ export function ExecutionPlan({ preview, project }: { preview: Preview; project:
                     <ul className="execution-plan-list">
                       {target.servers.map((server) => (
                         <li key={server.id}>
-                          {server.name}{' '}
+                          <a
+                            className="text-link"
+                            href={serverResourceHref({
+                              serverId: server.id,
+                              projectId: project.id,
+                              returnPath,
+                            })}
+                          >
+                            {server.name}
+                          </a>{' '}
                           {server.host && <code>{address(server.host, server.port)}</code>}
                         </li>
                       ))}
@@ -475,7 +751,24 @@ export function ExecutionPlan({ preview, project }: { preview: Preview; project:
                   ) : (
                     <span>运行时解析目标</span>
                   )}
-                  {targetGroups(target) && <small>{targetGroups(target)}</small>}
+                  {!!target.groupIds?.length && (
+                    <ul className="execution-plan-list">
+                      {target.groupIds.map((groupId) => (
+                        <li key={groupId}>
+                          <a
+                            className="text-link"
+                            href={serverResourceHref({
+                              groupId,
+                              projectId: project.id,
+                              returnPath,
+                            })}
+                          >
+                            查看目标分组
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                   {targetPolicy(target) && <small>{targetPolicy(target)}</small>}
                 </div>
               ))}
@@ -496,6 +789,11 @@ export function ExecutionPlan({ preview, project }: { preview: Preview; project:
                 <span className="tag">{sourceName(file.source)}</span>
               </div>
               {file.path && <code>{file.path}</code>}
+              {file.mappingKey && (
+                <small>
+                  映射键 · <code>{file.mappingKey}</code>
+                </small>
+              )}
               <span>{fileStatus(file)}</span>
               {file.repositoryId && (
                 <small>
@@ -517,7 +815,8 @@ export function ExecutionPlan({ preview, project }: { preview: Preview; project:
               <strong>{name.node(script)}</strong>
               <span>{script.serverName ?? script.serverId ?? '管理端工作区'}</span>
               <small>
-                {script.environmentId ? name.environment(script.environmentId) : '项目公共变量'}
+                {preview.environmentSet?.name ??
+                  (script.environmentId ? name.environment(script.environmentId) : '项目公共变量')}
                 {script.serviceId && ` · ${name.service(script.serviceId)}`}
               </small>
             </div>
@@ -556,7 +855,12 @@ export function ExecutionPlan({ preview, project }: { preview: Preview; project:
                     {name.node(entry)} · {sourceName(entry.source)}
                   </small>
                 </dt>
-                <dd>{entry.sensitive ? '敏感引用' : '普通变量'}</dd>
+                <dd>
+                  {entry.sensitive ? '敏感引用' : (entry.value ?? '普通变量')}
+                  {!!entry.overriddenSources?.length && (
+                    <small>覆盖 {entry.overriddenSources.map(sourceName).join('、')}</small>
+                  )}
+                </dd>
               </div>
             ))}
           </dl>
@@ -616,6 +920,15 @@ function reviewRows(preview: Preview, project: ProjectDetail) {
     const existing = rows.get(key);
     rows.set(key, { title, value: existing ? `${existing.value}\n${value}` : value });
   };
+  add(
+    'variables',
+    {},
+    'environmentSet',
+    '入口变量集合',
+    preview.environmentSet
+      ? `${preview.environmentSet.name} · 修订 ${preview.environmentSet.revision}`
+      : '使用项目公共变量',
+  );
   for (const target of plan?.targets ?? []) {
     const members = target.servers.map((server) =>
       [server.name, address(server.host, server.port)].filter(Boolean).join(' '),
@@ -646,6 +959,7 @@ function reviewRows(preview: Preview, project: ProjectDetail) {
       '环境文件',
       [
         file.path,
+        file.mappingKey && `映射键 ${file.mappingKey}`,
         name.repository(file.repositoryId),
         file.commitSha,
         fileStatus(file),
@@ -660,7 +974,13 @@ function reviewRows(preview: Preview, project: ProjectDetail) {
       variable,
       variable.key,
       variable.key,
-      `${sourceName(variable.source)} · ${variable.sensitive ? '敏感引用' : '普通变量'}`,
+      [
+        sourceName(variable.source),
+        variable.sensitive ? '敏感引用' : (variable.value ?? '普通变量'),
+        variable.overriddenSources?.map(sourceName).join('、'),
+      ]
+        .filter(Boolean)
+        .join(' · '),
     );
   for (const checkout of preview.checkouts ?? [])
     add(

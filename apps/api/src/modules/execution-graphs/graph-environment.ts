@@ -1,7 +1,11 @@
 import { BadRequestException } from '@nestjs/common';
 import { posix } from 'node:path';
 import { parseEnv } from 'node:util';
-import { executionVariableName } from '../../infrastructure/execution-variables';
+import {
+  executionVariableName,
+  type ExecutionVariables,
+} from '../../infrastructure/execution-variables';
+import type { FrozenEnvironmentSet } from '../projects/environment-sets.service';
 import { relativePath } from '../pipelines/pipeline.validation';
 
 export const graphEnvironmentMaxBytes = 64 * 1024;
@@ -19,17 +23,77 @@ export interface GraphEnvironmentFilePin extends GraphEnvironmentSource {
   path: string;
 }
 
-export type GraphEnvironmentFileSource = 'NODE' | 'ENVIRONMENT' | 'CONVENTION';
+export type GraphEnvironmentFileSource = 'NODE';
 
 export interface GraphVariableSource {
   key: string;
-  source: 'FILE' | 'PROJECT' | 'ENVIRONMENT' | 'SERVICE_ENVIRONMENT' | 'NODE' | 'SYSTEM';
+  source:
+    | 'FILE'
+    | 'PROJECT'
+    | 'ENVIRONMENT_SET'
+    | 'ENVIRONMENT'
+    | 'SERVICE_ENVIRONMENT'
+    | 'NODE'
+    | 'SYSTEM';
   isSecret: boolean;
+  overriddenSources?: GraphVariableSource['source'][];
+}
+
+export function environmentSetSummary(set?: FrozenEnvironmentSet) {
+  return set ? { id: set.id, name: set.name, revision: set.revision } : null;
+}
+
+export interface GraphVariableSnapshot extends ExecutionVariables {
+  variableSources: GraphVariableSource[];
+}
+
+export function mergeEnvironmentSet(
+  project: GraphVariableSnapshot,
+  set?: FrozenEnvironmentSet,
+): GraphVariableSnapshot {
+  if (!set) return project;
+  const variables: Record<string, string> = Object.assign(Object.create(null), project.variables);
+  const secretVariables: Record<string, string> = Object.assign(
+    Object.create(null),
+    project.secretVariables,
+  );
+  const secretCredentialNonces: Record<string, string> = Object.assign(
+    Object.create(null),
+    project.secretCredentialNonces,
+  );
+  const entries = new Map(project.variableSources.map((entry) => [entry.key, entry]));
+  for (const key of [...Object.keys(set.variables), ...Object.keys(set.secretVariables)]) {
+    const isSecret = Object.hasOwn(set.secretVariables, key);
+    delete variables[key];
+    delete secretVariables[key];
+    delete secretCredentialNonces[key];
+    if (isSecret) {
+      secretVariables[key] = set.secretVariables[key]!;
+      const nonce = set.secretCredentialNonces[key];
+      if (nonce) secretCredentialNonces[key] = nonce;
+    } else {
+      variables[key] = set.variables[key]!;
+    }
+    const previous = entries.get(key);
+    entries.set(key, {
+      key,
+      source: 'ENVIRONMENT_SET',
+      isSecret,
+      ...(previous && { overriddenSources: [previous.source] }),
+    });
+  }
+  return {
+    variables,
+    secretVariables,
+    secretCredentialNonces,
+    variableSources: [...entries.values()],
+  };
 }
 
 export type GraphEnvironmentPlan = {
   source: GraphEnvironmentFileSource;
   required: boolean;
+  mappingKey?: string;
   variables: GraphVariableSource[];
 } & (
   | ({ status: 'PINNED' } & GraphEnvironmentFilePin)
@@ -75,6 +139,7 @@ export function publicEnvironmentFile(plan?: GraphEnvironmentPlan) {
     branch: plan.branch,
     tag: plan.tag,
     path: plan.path,
+    mappingKey: plan.mappingKey,
   };
 }
 
@@ -86,7 +151,20 @@ export function graphVariableSources(
   const sources = new Map<string, GraphVariableSource>();
   for (const item of [...(file?.variables ?? []), ...configured, ...node]) {
     if (/^VEYOPS_/i.test(item.key) && item.source !== 'SYSTEM') continue;
-    sources.set(item.key, item);
+    const previous = sources.get(item.key);
+    sources.set(
+      item.key,
+      previous
+        ? {
+            ...item,
+            overriddenSources: [
+              ...(previous.overriddenSources ?? []),
+              previous.source,
+              ...(item.overriddenSources ?? []),
+            ],
+          }
+        : item,
+    );
   }
   return [...sources.values()].sort((left, right) => left.key.localeCompare(right.key, 'en'));
 }

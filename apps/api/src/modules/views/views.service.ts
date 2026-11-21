@@ -9,12 +9,10 @@ import { AuditService } from '../audit/audit.service';
 import { byProject } from '../projects/project-card-data';
 import { SaveViewDto } from './views.dto';
 import { failedDeploymentStatuses, failedHealthStatuses } from '../deployments/deployment-history';
-import { type ViewScope, ViewsRepository } from './views.repository';
+import { type ViewScope, type ViewSelection, ViewsRepository } from './views.repository';
 
 const presets = [
   { id: 'all', kind: 'ALL', name: '全部项目', description: '' },
-  { id: 'production', kind: 'PRODUCTION', name: '生产环境', description: '' },
-  { id: 'testing', kind: 'TESTING', name: '测试环境', description: '' },
   { id: 'abnormal', kind: 'ABNORMAL', name: '异常项目', description: '' },
 ] as const;
 type Preset = (typeof presets)[number];
@@ -28,11 +26,9 @@ export interface ViewSummary {
   projectIds: string[];
 }
 
-function presetScope(preset: Preset): ViewScope {
-  if (preset.kind === 'PRODUCTION' || preset.kind === 'TESTING')
-    return { type: 'environment', environmentType: preset.kind };
-  return { type: preset.kind === 'ABNORMAL' ? 'abnormal' : 'all' };
-}
+const presetScope = (preset: Preset): ViewScope => ({
+  type: preset.kind === 'ABNORMAL' ? 'abnormal' : 'all',
+});
 
 function deploymentStatus(rows: { status: string; healthStatus: string | null }[]) {
   if (!rows.length) return 'NOT_DEPLOYED';
@@ -101,16 +97,16 @@ export class ViewsService {
     };
   }
 
-  async detail(userId: string, id: string) {
+  async detail(userId: string, id: string, selection?: ViewSelection) {
     const preset = presets.find((entry) => entry.id === id);
     const scope = preset ? presetScope(preset) : { type: 'custom' as const, viewId: id };
     const custom = preset ? undefined : (await this.customViews(userId, id))[0];
     if (!preset && !custom) throw new NotFoundException('项目视图不存在');
     const [data, defaultViewId] = await Promise.all([
-      this.repository.projectDetails(scope),
+      this.repository.projectDetails(scope, selection),
       this.repository.defaultViewId(userId),
     ]);
-    const environments = byProject(data.environments);
+    const services = byProject(data.services);
     const addresses = byProject(data.addresses);
     const latest = byProject(data.latest);
     const recent = byProject(data.recent);
@@ -124,7 +120,8 @@ export class ViewsService {
           description,
           status,
           tags: JSON.parse(tags_json) as string[],
-          environments: environments.get(id) ?? [],
+          environments: [],
+          services: services.get(id) ?? [],
           addresses: addresses.get(id) ?? [],
           deploymentStatus: deploymentStatus(latest.get(id) ?? []),
           recentDeployments: recent.get(id) ?? [],

@@ -36,6 +36,25 @@ export class ApiExceptionFilter implements ExceptionFilter {
       typeof body === 'string'
         ? body
         : validation || (status === 500 ? '服务器内部错误，请检查服务日志' : '请求失败');
+    const details =
+      body && typeof body === 'object' && 'details' in body && body.details &&
+      typeof body.details === 'object' ? body.details : null;
+    const fieldErrors =
+      status === 400 && details && 'fieldErrors' in details && Array.isArray(details.fieldErrors)
+        ? details.fieldErrors.flatMap((entry: unknown) => {
+            if (!entry || typeof entry !== 'object') return [];
+            const { path, code, message } = entry as Record<string, unknown>;
+            return typeof code === 'string' && typeof message === 'string' &&
+              Array.isArray(path) && path.every((part: unknown) =>
+                typeof part === 'string' || (typeof part === 'number' && Number.isInteger(part) && part >= 0),
+              ) ? [{ path, code, message }] : [];
+          })
+        : undefined;
+    const currentRevision =
+      status === 409 && details && 'currentRevision' in details &&
+      typeof details.currentRevision === 'number' && Number.isInteger(details.currentRevision)
+        ? details.currentRevision
+        : undefined;
     if (status >= 500) {
       // Never print request bodies, database statements, or driver errors which may contain secrets.
       console.error(
@@ -46,6 +65,8 @@ export class ApiExceptionFilter implements ExceptionFilter {
       error: {
         code: `HTTP_${status}`,
         message: Array.isArray(message) ? message.join('；') : message,
+        ...(fieldErrors?.length && { details: { fieldErrors } }),
+        ...(currentRevision !== undefined && { details: { currentRevision } }),
         ...(error instanceof ExecutionPlanIssueError && { planIssue: error.issue }),
         ...(status === 409 &&
           body &&

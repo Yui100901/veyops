@@ -1,12 +1,25 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import type { Kysely, Transaction } from 'kysely';
-import { lstat, realpath, unlink } from 'node:fs/promises';
-import { join } from 'node:path';
-import { dataDirectory } from '../../core/config';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
 import { archiveKey, lockAvailableArtifacts } from './artifact-availability';
+import { lockProjectGraph } from '../projects/project-relations';
+import {
+  archivePeers,
+  ArtifactCleanupService,
+  removeArtifactArchive,
+} from './artifact-cleanup.service';
+import {
+  activeArtifactTaskStatuses,
+  graphArtifactProtection,
+  protectedArtifacts,
+} from './artifact-cleanup-protection';
 
 export interface ArtifactRetentionPolicy {
   maxBuilds: number;
@@ -14,8 +27,9 @@ export interface ArtifactRetentionPolicy {
 }
 
 export interface ArtifactRetentionScope {
-  serviceId: string;
-  environmentId: string;
+  projectId?: string;
+  serviceId?: string;
+  environmentId?: string;
 }
 
 const prefix = 'artifacts:retention';
@@ -23,27 +37,24 @@ const retentionLock = 'artifacts:cleanup-lock';
 const defaults: Readonly<ArtifactRetentionPolicy> = { maxBuilds: 20, maxDays: 30 };
 const day = 86_400_000;
 export const artifactCleanupBatch = 50;
-const activeTaskStatuses = ['PENDING', 'RUNNING', 'CANCEL_REQUESTED', 'NEEDS_ATTENTION'];
 
 function settingsKey(scope?: ArtifactRetentionScope) {
-  return scope ? `${prefix}:${scope.serviceId}:${scope.environmentId}` : prefix;
+  if (scope?.environmentId) return `${prefix}:${scope.serviceId}:${scope.environmentId}`;
+  if (scope?.serviceId) return `${prefix}:service:${scope.serviceId}`;
+  if (scope?.projectId) return `${prefix}:project:${scope.projectId}`;
+  return prefix;
 }
 
-function isMissing(error: unknown) {
-  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
-}
-
-async function removeArchive(dataDir: string, key: string) {
-  const root = join(await realpath(dataDir), 'artifacts');
-  if ((await realpath(root)) !== root) throw new Error('Unsafe artifact directory');
-  const file = join(root, key);
-  try {
-    const entry = await lstat(file);
-    if (!entry.isFile() || (await realpath(file)) !== file) throw new Error('Unsafe artifact path');
-    await unlink(file);
-  } catch (error) {
-    if (!isMissing(error)) throw error;
-  }
+function policyFor(policies: Map<string, ArtifactRetentionPolicy>, scope?: ArtifactRetentionScope) {
+  return (
+    policies.get(settingsKey(scope)) ??
+    (scope?.environmentId
+      ? policies.get(settingsKey({ serviceId: scope.serviceId }))
+      : undefined) ??
+    (scope?.projectId ? policies.get(settingsKey({ projectId: scope.projectId })) : undefined) ??
+    policies.get(prefix) ??
+    defaults
+  );
 }
 
 async function reserveCleanup(tx: Transaction<Database>) {
@@ -69,76 +80,6 @@ async function retentionPolicies(db: Kysely<Database>) {
   );
 }
 
-async function protectedArtifacts(db: Kysely<Database>) {
-  const [deployments, configs, tasks] = await Promise.all([
-    db
-      .selectFrom('deployment_records')
-      .select([
-        'id',
-        'artifact_id',
-        'pipeline_run_id',
-        'service_id',
-        'environment_id',
-        'server_id',
-        'status',
-        'health_status',
-        'previous_deployment_id',
-      ])
-      .where('status', 'in', ['SUCCESS', 'RUNNING', 'NEEDS_ATTENTION'])
-      .orderBy('started_at', (order) => order.desc().nullsLast())
-      .orderBy('id', 'desc')
-      .execute(),
-    db.selectFrom('service_environment_configs').select('release_policy_json').execute(),
-    db
-      .selectFrom('tasks')
-      .select('payload_json')
-      .where('task_type', '=', 'PIPELINE')
-      .where('status', 'in', activeTaskStatuses)
-      .execute(),
-  ]);
-  const protectedIds = new Set<string>();
-  const previousIds = new Set<string>();
-  const current = new Set<string>();
-  const healthy = new Set<string>();
-  const pinnedDeploymentIds = new Set<string>();
-  for (const config of configs) {
-    const policy = JSON.parse(config.release_policy_json ?? '{}') as {
-      pinnedDeploymentId?: string;
-    };
-    if (policy.pinnedDeploymentId) pinnedDeploymentIds.add(policy.pinnedDeploymentId);
-  }
-  const pinnedRuns = new Set(
-    deployments
-      .filter((deployment) => pinnedDeploymentIds.has(deployment.id))
-      .map((deployment) => deployment.pipeline_run_id),
-  );
-  for (const d of deployments) {
-    const scope = `${d.service_id}:${d.environment_id}:${d.server_id ?? ''}`;
-    if (d.status === 'SUCCESS') {
-      if ((!current.has(scope) || pinnedRuns.has(d.pipeline_run_id)) && d.artifact_id)
-        protectedIds.add(d.artifact_id);
-      current.add(scope);
-      if (d.health_status === 'HEALTHY' && !healthy.has(scope) && d.artifact_id) {
-        protectedIds.add(d.artifact_id);
-        healthy.add(scope);
-      }
-    } else {
-      if (d.artifact_id) protectedIds.add(d.artifact_id);
-      if (d.previous_deployment_id) previousIds.add(d.previous_deployment_id);
-    }
-  }
-  for (const d of deployments)
-    if (previousIds.has(d.id) && d.artifact_id) protectedIds.add(d.artifact_id);
-  for (const task of tasks) {
-    const payload = JSON.parse(task.payload_json) as {
-      pipeline?: { deploymentArtifacts?: { id: string }[] };
-    };
-    for (const artifact of payload.pipeline?.deploymentArtifacts ?? [])
-      protectedIds.add(artifact.id);
-  }
-  return protectedIds;
-}
-
 interface CleanupMember {
   id: string;
   createdAt: number;
@@ -162,6 +103,9 @@ async function archiveGroups(db: Kysely<Database>, now: number) {
       .leftJoin('tasks', 'tasks.id', 'pipeline_runs.task_id')
       .select([
         'artifacts.id',
+        'artifacts.project_id',
+        'artifacts.graph_run_id',
+        'artifacts.logical_artifact_id',
         'artifacts.service_id',
         'artifacts.pipeline_run_id',
         'artifacts.storage_type',
@@ -182,11 +126,28 @@ async function archiveGroups(db: Kysely<Database>, now: number) {
           eb('artifacts.storage_type', '=', 'REGISTRY_IMAGE'),
         ]),
       )
+      .where('artifacts.physical_json', 'is', null)
+      .where('artifacts.temporary_root_id', 'is', null)
+      .where('artifacts.lifecycle_state', '=', 'ACTIVE')
       .orderBy('artifacts.created_at', 'desc')
       .orderBy('artifacts.id', 'desc')
       .execute(),
   ]);
-  const defaultPolicy = policies.get(settingsKey()) ?? defaults;
+  if (artifacts.length) {
+    const graph = await graphArtifactProtection(
+      db,
+      artifacts.map(({ project_id }) => project_id),
+      artifacts.flatMap(({ graph_run_id }) => (graph_run_id ? [graph_run_id] : [])),
+      [],
+    );
+    for (const row of artifacts)
+      if (
+        graph.references.has(row.id) ||
+        graph.references.has(row.logical_artifact_id ?? row.id) ||
+        (row.graph_run_id && graph.activeProduction.has(row.graph_run_id))
+      )
+        protectedIds.add(row.id);
+  }
   const runs = new Map<string, Map<string, number>>();
   const groups = new Map<string, CleanupGroup>();
   const digestMembers = new Map<string, string[]>();
@@ -205,7 +166,11 @@ async function archiveGroups(db: Kysely<Database>, now: number) {
     }
     const scope =
       a.environment_id && settingsKey({ serviceId: a.service_id, environmentId: a.environment_id });
-    const policy = (scope && policies.get(scope)) || defaultPolicy;
+    const policy = policyFor(policies, {
+      projectId: a.project_id,
+      serviceId: a.service_id,
+      environmentId: a.environment_id ?? undefined,
+    });
     let overCount = false;
     if (
       scope &&
@@ -229,7 +194,7 @@ async function archiveGroups(db: Kysely<Database>, now: number) {
       canPrune: Boolean(
         scope &&
         a.taskStatus &&
-        !activeTaskStatuses.includes(a.taskStatus) &&
+        !activeArtifactTaskStatuses.includes(a.taskStatus) &&
         a.pinned_at === null &&
         !protectedIds.has(a.id) &&
         (!digest || !protectedDigests.has(digest)) &&
@@ -242,30 +207,56 @@ async function archiveGroups(db: Kysely<Database>, now: number) {
 
 @Injectable()
 export class ArtifactRetentionService {
+  private nextTemporaryScanAt = 0;
   constructor(
     private readonly database: DatabaseService,
     private readonly audit: AuditService,
+    private readonly cleanup?: ArtifactCleanupService,
   ) {}
 
   private async checkScope(db: Kysely<Database>, scope?: ArtifactRetentionScope) {
     if (!scope) return;
-    const match = await db
-      .selectFrom('services')
-      .innerJoin('environments', 'environments.project_id', 'services.project_id')
-      .select('services.id')
-      .where('services.id', '=', scope.serviceId)
-      .where('environments.id', '=', scope.environmentId)
-      .executeTakeFirst();
-    if (!match) throw new NotFoundException('服务环境不存在');
+    const service = scope.serviceId
+      ? await db
+          .selectFrom('services')
+          .select('project_id')
+          .where('id', '=', scope.serviceId)
+          .executeTakeFirst()
+      : undefined;
+    if (
+      scope.serviceId &&
+      (!service || (scope.projectId && service.project_id !== scope.projectId))
+    )
+      throw new NotFoundException('项目服务不存在');
+    const projectId = service?.project_id ?? scope.projectId;
+    const project = projectId
+      ? await db
+          .selectFrom('projects')
+          .select('id')
+          .where('id', '=', projectId)
+          .where('deleted_at', 'is', null)
+          .executeTakeFirst()
+      : undefined;
+    if (!project) throw new NotFoundException('项目不存在');
+    if (scope.environmentId) {
+      const match = await db
+        .selectFrom('environments')
+        .select('id')
+        .where('project_id', '=', project.id)
+        .where('id', '=', scope.environmentId)
+        .executeTakeFirst();
+      if (!match) throw new NotFoundException('服务环境不存在');
+    }
+    return { ...scope, projectId: project.id };
   }
 
   async settings(scope?: ArtifactRetentionScope) {
-    await this.checkScope(this.database.db, scope);
+    const resolved = await this.checkScope(this.database.db, scope);
     const policies = await retentionPolicies(this.database.db);
-    const own = policies.get(settingsKey(scope));
+    const own = policies.get(settingsKey(resolved));
     return {
-      ...(own ?? policies.get(settingsKey()) ?? defaults),
-      inherited: Boolean(scope && !own),
+      ...policyFor(policies, resolved),
+      inherited: Boolean(resolved && !own),
     };
   }
 
@@ -276,9 +267,10 @@ export class ArtifactRetentionService {
   ) {
     if (!policy && !scope) throw new BadRequestException('全局产物保留策略需要配置限制');
     await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
       await reserveCleanup(tx);
-      await this.checkScope(tx, scope);
-      const key = settingsKey(scope);
+      const resolved = await this.checkScope(tx, scope);
+      const key = settingsKey(resolved);
       if (policy) {
         const value = { key, value_json: JSON.stringify(policy), updated_at: Date.now() };
         await tx
@@ -301,15 +293,31 @@ export class ArtifactRetentionService {
 
   async pin(id: string, pinned: boolean, userId: string) {
     return this.database.db.transaction().execute(async (tx) => {
-      await lockAvailableArtifacts(tx, [id]);
+      await lockProjectGraph(tx);
+      const rows = await tx
+        .selectFrom('artifacts')
+        .select(['id', 'temporary_root_id'])
+        .where((eb) => eb.or([eb('id', '=', id), eb('logical_artifact_id', '=', id)]))
+        .where('lifecycle_state', '!=', 'DELETED')
+        .orderBy('id')
+        .execute();
+      if (!rows.length) throw new NotFoundException('产物不存在或已清理');
+      if (rows.some(({ temporary_root_id }) => temporary_root_id !== null))
+        throw new ConflictException('运行临时产物随本次运行保留，不能单独固定');
+      const ids = rows.map((row) => row.id);
+      await lockAvailableArtifacts(tx, ids);
       const pinnedAt = pinned ? Date.now() : null;
-      await tx.updateTable('artifacts').set({ pinned_at: pinnedAt }).where('id', '=', id).execute();
+      await tx
+        .updateTable('artifacts')
+        .set({ pinned_at: pinnedAt })
+        .where('id', 'in', ids)
+        .execute();
       await this.audit.record(
         userId,
         pinned ? 'artifact.pin' : 'artifact.unpin',
         'artifact',
         id,
-        {},
+        { instanceIds: ids },
         tx,
       );
       return { id, pinnedAt };
@@ -336,11 +344,111 @@ export class ArtifactRetentionService {
   async pruneExpired() {
     await this.deleteRetiredArchives();
     const preview = await this.preview();
-    if (preview.total)
+    if (preview.total && this.cleanup) {
+      const refs = preview.candidates
+        .flatMap(({ artifactIds }) =>
+          artifactIds.map((artifactId) => ({ artifactId, instanceId: artifactId })),
+        )
+        .slice(0, 500);
+      const plan = await this.cleanup.preview(refs);
+      if (plan.eligibleCount)
+        await this.cleanup.confirm(refs, plan.planDigest, 'archives:' + plan.planDigest, null);
+    } else if (preview.total) {
       await this.prune(
         preview.candidates.map((candidate) => candidate.artifactIds[0]!),
         null,
       );
+    }
+    await this.queuePhysicalRetention(true);
+  }
+
+  async tickCleanup(signal: AbortSignal) {
+    if (signal.aborted) return;
+    const now = Date.now();
+    if (now >= this.nextTemporaryScanAt) {
+      this.nextTemporaryScanAt = now + 60_000;
+      await this.queuePhysicalRetention(false, now);
+    }
+    await this.cleanup?.tick(signal);
+  }
+
+  private async queuePhysicalRetention(includesPersistent: boolean, now = Date.now()) {
+    if (!this.cleanup) return;
+    const db = this.database.db;
+    const rows = await db
+      .selectFrom('artifacts as artifact')
+      .leftJoin('execution_flow_runs as root', 'root.id', 'artifact.temporary_root_id')
+      .leftJoin('pipeline_runs as build', 'build.id', 'artifact.pipeline_run_id')
+      .leftJoin('tasks as task', 'task.id', 'build.task_id')
+      .select([
+        'artifact.id',
+        'artifact.logical_artifact_id',
+        'artifact.project_id',
+        'artifact.service_id',
+        'artifact.pipeline_run_id',
+        'artifact.created_at',
+        'artifact.temporary_root_id',
+        'artifact.pinned_at',
+        'task.status as taskStatus',
+      ])
+      .where('artifact.lifecycle_state', '=', 'ACTIVE')
+      .where((eb) =>
+        eb.or([
+          eb.and([
+            eb('artifact.temporary_root_id', 'is not', null),
+            eb('root.status', 'in', [
+              'SUCCESS',
+              'FAILED',
+              'PARTIAL_FAILED',
+              'TIMED_OUT',
+              'CANCELLED',
+            ]),
+          ]),
+          ...(includesPersistent
+            ? [
+                eb.and([
+                  eb('artifact.temporary_root_id', 'is', null),
+                  eb('artifact.physical_json', 'is not', null),
+                ]),
+              ]
+            : []),
+        ]),
+      )
+      .orderBy('artifact.created_at', 'desc')
+      .orderBy('artifact.id', 'desc')
+      .execute();
+    if (!rows.length) return;
+    const policies = await retentionPolicies(db);
+    const ranks = new Map<string, Map<string, number>>();
+    const candidates = rows.filter((row) => {
+      if (row.temporary_root_id) return true;
+      const scope = { projectId: row.project_id, serviceId: row.service_id };
+      const policy = policyFor(policies, scope);
+      const key = settingsKey(scope);
+      const perScope = ranks.get(key) ?? new Map<string, number>();
+      ranks.set(key, perScope);
+      let rank = 0;
+      if (row.pipeline_run_id && ['SUCCESS', 'PARTIAL_FAILED'].includes(row.taskStatus ?? '')) {
+        if (!perScope.has(row.pipeline_run_id))
+          perScope.set(row.pipeline_run_id, perScope.size + 1);
+        rank = perScope.get(row.pipeline_run_id)!;
+      }
+      return (
+        row.pinned_at === null &&
+        (rank > policy.maxBuilds || row.created_at < now - policy.maxDays * day)
+      );
+    });
+    for (let offset = candidates.length; offset > 0; offset -= artifactCleanupBatch) {
+      const batch = candidates.slice(Math.max(0, offset - artifactCleanupBatch), offset);
+      const refs = batch.map((row) => ({
+        artifactId: row.logical_artifact_id ?? row.id,
+        instanceId: row.id,
+      }));
+      const plan = await this.cleanup.preview(refs);
+      if (!plan.eligibleCount) continue;
+      await this.cleanup.confirm(refs, plan.planDigest, 'retention:' + plan.planDigest, null);
+      break;
+    }
   }
 
   private async deleteRetiredArchives(ids?: string[], now = Date.now()) {
@@ -351,7 +459,9 @@ export class ArtifactRetentionService {
       .selectFrom('artifacts')
       .select(['id', 'storage_type', 'storage_key', 'archive_key'])
       .where('pruned_at', 'is not', null)
-      .where('archive_deleted_at', 'is', null);
+      .where('archive_deleted_at', 'is', null)
+      .where('physical_json', 'is', null)
+      .where('lifecycle_state', '=', 'ACTIVE');
     if (ids) query = query.where('id', 'in', ids);
     else query = query.orderBy('pruned_at', 'asc').limit(artifactCleanupBatch);
     const rows = await query.execute();
@@ -369,13 +479,22 @@ export class ArtifactRetentionService {
     for (const [key, members] of groups) {
       try {
         if (!key) throw new Error('Invalid artifact archive key');
-        await removeArchive(dataDirectory, key);
-        await db
-          .updateTable('artifacts')
-          .set({ archive_deleted_at: now })
-          .where('id', 'in', members)
-          .execute();
-        pruned.push(...members);
+        const removed = await db.transaction().execute(async (tx) => {
+          await lockProjectGraph(tx);
+          const live = (await archivePeers(tx, key)).some(
+            (row) => row.pruned_at === null || row.lifecycle_state === 'CLEANING',
+          );
+          if (live) return false;
+          await removeArtifactArchive(key);
+          await tx
+            .updateTable('artifacts')
+            .set({ archive_deleted_at: now })
+            .where('id', 'in', members)
+            .execute();
+          return true;
+        });
+        if (removed) pruned.push(...members);
+        else failed.push(...members);
       } catch {
         failed.push(...members);
       }
@@ -385,6 +504,7 @@ export class ArtifactRetentionService {
 
   async prune(ids: string[], userId: string | null, now = Date.now()) {
     const retired = await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
       await reserveCleanup(tx);
       const requested = new Set(ids);
       const plan = await archiveGroups(tx, now);

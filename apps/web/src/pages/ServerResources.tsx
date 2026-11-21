@@ -13,10 +13,19 @@ import {
   Section,
   Status,
 } from '../components';
-import type { DeploymentSummary, Server, ServerDetail, ServerGroup } from '../models';
+import type {
+  DeploymentSummary,
+  Server,
+  ServerDetail,
+  ServerGroup,
+  ServerProjectReference,
+} from '../models';
 import { ServerPicker } from './BatchTargets';
 import { ServerMonitoring } from './ServerMonitoring';
 import type { MonitorRow } from './monitoring-data';
+import { graphWorkbenchPath } from './graph-workbench-context';
+import { projectResourcePath } from './project-workspace-route';
+import { readServerResourceLocation, serverResourceHref } from './server-resource-route';
 
 export function ServerGroups({
   servers,
@@ -76,13 +85,19 @@ export function ServerGroups({
                     <Users size={18} />
                   </span>
                   <div>
-                    <strong>{group.name}</strong>
+                    <a className="text-link" href={serverResourceHref({ groupId: group.id })}>
+                      {group.name}
+                    </a>
                     {group.description && <small>{group.description}</small>}
                     <div className="tags">
                       {group.serverIds.map((id) => (
-                        <span className="tag" key={id}>
+                        <a
+                          className="tag text-link"
+                          key={id}
+                          href={serverResourceHref({ serverId: id })}
+                        >
                           {servers.find((server) => server.id === id)?.name ?? id}
-                        </span>
+                        </a>
                       ))}
                     </div>
                   </div>
@@ -259,6 +274,90 @@ export function DeploymentHistory({
   );
 }
 
+function ServerProjectReferences({ projects }: { projects?: ServerProjectReference[] }) {
+  if (!projects?.length) return <p className="mini-empty">当前没有可查看的项目引用。</p>;
+  return (
+    <div className="server-project-references">
+      {projects.map((project) => (
+        <section key={project.id}>
+          <a className="text-link" href={'#' + projectResourcePath(project.id)}>
+            {project.name}
+          </a>
+          <ul>
+            {project.references?.map((ref, index) => {
+              const href = ref.runId
+                ? '#' + graphWorkbenchPath(project.id, { run: ref.runId, node: ref.nodeId })
+                : ref.taskId
+                  ? `#/tasks/${encodeURIComponent(ref.taskId)}`
+                  : ref.sourceKind === 'GRAPH' || ref.sourceKind === 'TRIGGER'
+                    ? '#' +
+                      graphWorkbenchPath(project.id, {
+                        pane: ref.state === 'DRAFT' ? 'draft' : 'published',
+                        version: ref.version,
+                        flow: ref.flowId,
+                        node: ref.nodeId,
+                        field: ref.fieldId,
+                      })
+                    : '#' +
+                      projectResourcePath(project.id, {
+                        resource: ref.serviceId ? 'services' : undefined,
+                        serviceId: ref.serviceId,
+                      });
+              return (
+                <li key={`${ref.sourceId}:${index}`}>
+                  <a className="text-link" href={href}>
+                    {ref.label ||
+                      [ref.flowName, ref.nodeName].filter(Boolean).join(' · ') ||
+                      '查看项目引用'}
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+export function ServerGroupOverview({
+  group,
+  servers,
+  onClose,
+  search,
+}: {
+  group: ServerGroup;
+  servers: Server[];
+  onClose: () => void;
+  search?: string;
+}) {
+  const { projectId, returnPath } = readServerResourceLocation(search);
+  return (
+    <InlineEditor title={group.name} description={group.description} onClose={onClose} wide>
+      <div className="form-body">
+        <h3 className="field-title">分组成员</h3>
+        {group.serverIds.length ? (
+          <div className="tags">
+            {group.serverIds.map((id) => (
+              <a
+                className="tag text-link"
+                key={id}
+                href={serverResourceHref({ serverId: id, projectId, returnPath })}
+              >
+                {servers.find((server) => server.id === id)?.name || id}
+              </a>
+            ))}
+          </div>
+        ) : (
+          <p className="mini-empty">该分组暂无成员。</p>
+        )}
+        <h3 className="field-title">项目引用</h3>
+        <ServerProjectReferences projects={group.projects} />
+      </div>
+    </InlineEditor>
+  );
+}
+
 export function ServerOverview({
   server,
   onClose,
@@ -267,15 +366,14 @@ export function ServerOverview({
   canEdit,
   onMonitorChange,
 }: {
-  server: Server;
+  server: ServerDetail;
   onClose: () => void;
   initialMetrics: boolean;
   monitorRow?: MonitorRow;
   canEdit: boolean;
   onMonitorChange: () => void;
 }) {
-  const detail = useResource<ServerDetail>(`/servers/${server.id}`);
-  const entry = detail.data;
+  const entry = server;
   const [metrics, setMetrics] = useState(initialMetrics);
   return (
     <InlineEditor
@@ -293,6 +391,7 @@ export function ServerOverview({
             资源监控
           </button>
         </nav>
+        {entry.active === false && <p className="field-note">此服务器已停用，历史引用仍可查看。</p>}
         {metrics ? (
           <ServerMonitoring
             id={server.id}
@@ -302,104 +401,96 @@ export function ServerOverview({
           />
         ) : (
           <>
-            <ErrorBanner error={detail.error} retry={detail.reload} />
-            {detail.loading ? (
-              <Loading />
+            <div className="task-meta">
+              <Status value={entry.status} />
+              <span>{entry.osType || '操作系统待检测'}</span>
+              <span>最近检测 {formatTime(entry.lastCheckedAt)}</span>
+            </div>
+            {entry.description && <p>{entry.description}</p>}
+            <div className="tags">
+              {(entry.groups ?? []).map((group) => (
+                <a
+                  className="tag text-link"
+                  key={group.id}
+                  href={serverResourceHref({ groupId: group.id })}
+                >
+                  {group.name}
+                </a>
+              ))}
+            </div>
+            <h3 className="field-title">项目引用</h3>
+            <ServerProjectReferences projects={entry.projects} />
+            <h3 className="field-title">连接检测</h3>
+            {entry.probeHistory?.length ? (
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>状态</th>
+                      <th>系统与资源</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {entry.probeHistory.map((probe) => (
+                      <tr key={probe.id}>
+                        <td>{formatTime(probe.checkedAt)}</td>
+                        <td>
+                          <Status value={probe.status} />
+                        </td>
+                        <td>
+                          {probe.osType ?? '—'}
+                          {probe.metrics && (
+                            <small className="cell-sub">
+                              负载 {probe.metrics.loadAverage} · 内存可用{' '}
+                              {Math.round(probe.metrics.memoryAvailableKb / 1024)} MiB · 磁盘可用{' '}
+                              {Math.round(probe.metrics.diskAvailableKb / 1024)} MiB
+                            </small>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             ) : (
-              entry && (
-                <>
-                  <div className="task-meta">
-                    <Status value={entry.status} />
-                    <span>{entry.osType || '操作系统待检测'}</span>
-                    <span>最近检测 {formatTime(entry.lastCheckedAt)}</span>
-                  </div>
-                  {entry.description && <p>{entry.description}</p>}
-                  <div className="tags">
-                    {(entry.groups ?? []).map((group) => (
-                      <span className="tag" key={group.id}>
-                        {group.name}
-                      </span>
-                    ))}
-                    {(entry.projects ?? []).map((project) => (
-                      <a className="text-link" key={project.id} href={`#/projects/${project.id}`}>
-                        {project.name}
-                      </a>
-                    ))}
-                  </div>
-                  <h3 className="field-title">连接检测</h3>
-                  {entry.probeHistory?.length ? (
-                    <div className="table-scroll">
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>时间</th>
-                            <th>状态</th>
-                            <th>系统与资源</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {entry.probeHistory.map((probe) => (
-                            <tr key={probe.id}>
-                              <td>{formatTime(probe.checkedAt)}</td>
-                              <td>
-                                <Status value={probe.status} />
-                              </td>
-                              <td>
-                                {probe.osType ?? '—'}
-                                {probe.metrics && (
-                                  <small className="cell-sub">
-                                    负载 {probe.metrics.loadAverage} · 内存可用{' '}
-                                    {Math.round(probe.metrics.memoryAvailableKb / 1024)} MiB ·
-                                    磁盘可用 {Math.round(probe.metrics.diskAvailableKb / 1024)} MiB
-                                  </small>
-                                )}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : (
-                    <p className="mini-empty">暂无检测记录</p>
-                  )}
-                  <h3 className="field-title">最近命令与运维</h3>
-                  {entry.recentCommands?.length ? (
-                    <div className="table-scroll">
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>任务</th>
-                            <th>状态</th>
-                            <th>退出码</th>
-                            <th>时间</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {entry.recentCommands.map((command) => (
-                            <tr key={command.id}>
-                              <td>
-                                <a className="text-link" href={`#/tasks/${command.taskId}`}>
-                                  {command.name}
-                                </a>
-                              </td>
-                              <td>
-                                <Status value={command.status} />
-                              </td>
-                              <td>{command.exitCode ?? '—'}</td>
-                              <td>{formatTime(command.finishedAt ?? command.startedAt)}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : (
-                    <p className="mini-empty">暂无命令记录</p>
-                  )}
-                  <h3 className="field-title">最近部署</h3>
-                  <DeploymentHistory rows={entry.recentDeployments ?? []} />
-                </>
-              )
+              <p className="mini-empty">暂无检测记录</p>
             )}
+            <h3 className="field-title">最近命令与运维</h3>
+            {entry.recentCommands?.length ? (
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>任务</th>
+                      <th>状态</th>
+                      <th>退出码</th>
+                      <th>时间</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {entry.recentCommands.map((command) => (
+                      <tr key={command.id}>
+                        <td>
+                          <a className="text-link" href={`#/tasks/${command.taskId}`}>
+                            {command.name}
+                          </a>
+                        </td>
+                        <td>
+                          <Status value={command.status} />
+                        </td>
+                        <td>{command.exitCode ?? '—'}</td>
+                        <td>{formatTime(command.finishedAt ?? command.startedAt)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="mini-empty">暂无命令记录</p>
+            )}
+            <h3 className="field-title">最近部署</h3>
+            <DeploymentHistory rows={entry.recentDeployments ?? []} />
           </>
         )}
       </div>

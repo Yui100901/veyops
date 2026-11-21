@@ -30,6 +30,7 @@ export const triggerEventFields = [
 ] as const;
 export type GraphParameterMapping =
   | { source: 'VALUE'; value: unknown }
+  | { source: 'UPSTREAM_OUTPUT'; fieldId: string }
   | { source: 'EVENT'; field: (typeof triggerEventFields)[number] };
 
 export class GraphTriggerDto {

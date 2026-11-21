@@ -71,3 +71,13 @@
 .environment-variable-inheritance h3 {
   margin: 0 0 10px;
 }
+
+.environment-set-fields {
+  display: grid;
+  gap: 12px;
+  width: 100%;
+}
+
+.environment-set-fields h3 {
+  margin: 0;
+}

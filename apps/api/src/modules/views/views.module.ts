@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Module, Param, Patch, Post, Req } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Module, Param, ParseUUIDPipe, Patch, Post, Query, Req } from '@nestjs/common';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { SaveViewDto } from './views.dto';
@@ -13,8 +13,14 @@ class ViewsController {
     return this.views.list(req.user.id);
   }
 
-  @Get(':id') detail(@Param('id') id: string, @Req() req: AuthRequest) {
-    return this.views.detail(req.user.id, id);
+  @Get(':id') detail(
+    @Param('id') id: string,
+    @Req() req: AuthRequest,
+    @Query('serviceId', new ParseUUIDPipe({ optional: true })) serviceId?: string,
+    @Query('serverId', new ParseUUIDPipe({ optional: true })) serverId?: string,
+    @Query('groupId', new ParseUUIDPipe({ optional: true })) groupId?: string,
+  ) {
+    return this.views.detail(req.user.id, id, { serviceId, serverId, groupId });
   }
 
   @Roles('ADMIN', 'OPERATOR') @Post() create(@Body() input: SaveViewDto, @Req() req: AuthRequest) {
