@@ -16,6 +16,7 @@ import { PipelineAnalysisService } from './pipeline-analysis.service';
 import { AiRepositoryAnalysisService } from './ai-repository-analysis.service';
 import { AiDeploymentToolsService } from './ai-deployment-tools.service';
 import { AiSourceChangeService } from './ai-source-change.service';
+import { AiGraphActionsService } from './ai-graph-actions.service';
 import { OperationPlansModule } from '../operation-plans/operation-plans.module';
 @Global()
 @Module({
@@ -36,6 +37,7 @@ import { OperationPlansModule } from '../operation-plans/operation-plans.module'
     AiRepositoryAnalysisService,
     AiDeploymentToolsService,
     AiSourceChangeService,
+    AiGraphActionsService,
   ],
   exports: [AiProvidersService, AiService, PipelineAnalysisService, AiFailureHandlingService],
 })

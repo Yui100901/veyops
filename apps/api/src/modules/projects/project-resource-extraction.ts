@@ -157,6 +157,13 @@ function nodeReferences(source: ReferenceSource, node: GraphNode) {
       node.checkout?.repositoryId ?? node.build?.repositoryId ?? oldBuild.repositoryId,
     ),
     ...referenceRows(
+      { ...source, fieldId: 'composeSource' },
+      'REPOSITORY',
+      node.deploy?.composeSource?.kind === 'REPOSITORY_FILE'
+        ? node.deploy.composeSource.repositoryId
+        : undefined,
+    ),
+    ...referenceRows(
       { ...source, fieldId: 'registryId' },
       'REGISTRY',
       node.build?.registryId ?? oldBuild.registryId,
@@ -380,6 +387,7 @@ function preparedNodeReferences(
     !(
       deploy ||
       plan.type === 'DEPLOY_ARTIFACT' ||
+      plan.type === 'ROLLBACK_ARTIFACT' ||
       (Array.isArray(plan.artifactIds) && plan.artifactIds.length > 0)
     );
   const context = {
@@ -404,6 +412,11 @@ function preparedNodeReferences(
     ...referenceRows(context, 'SERVICE', plan.serviceId),
     ...referenceRows(context, 'ENVIRONMENT', plan.environmentId),
     ...referenceRows(context, 'REPOSITORY', objectValue(plan.environmentFile).repositoryId),
+    ...referenceRows(
+      context,
+      'REPOSITORY',
+      objectValue(objectValue(profile.delivery).composeSource).repositoryId,
+    ),
     ...referenceRows(context, 'ARTIFACT', plan.artifactIds),
     ...referenceRows(context, 'REGISTRY', definition.registryId),
     ...(readsRepository
@@ -469,7 +482,11 @@ export function runResourceReferences(
           return preparedNodeReferences(
             { ...context, nodeId },
             plan,
-            lookup?.nodes.some((node) => node.id === nodeId && node.type === 'DEPLOY_ARTIFACT'),
+            lookup?.nodes.some(
+              (node) =>
+                node.id === nodeId &&
+                (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT'),
+            ),
           );
         },
       ),

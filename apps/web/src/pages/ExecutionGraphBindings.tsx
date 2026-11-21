@@ -149,7 +149,9 @@ export function ExecutionGraphBindings({
   const compiled = directory?.[endpoint.startId]?.nodes[node.id];
   const fields = isEnd
     ? (compiled?.outputs ?? node.outputs ?? [])
-    : (compiled?.inputs ?? moduleFields(node, 'inputs', canvas, catalog));
+    : node.type === 'SOURCE_REVIEW' && node.approval?.buildNodeId
+      ? []
+      : (compiled?.inputs ?? moduleFields(node, 'inputs', canvas, catalog));
   const bindings = isEnd ? endpoint.outputBindings : endpoint.inputBindings?.[node.id];
   const context = catalog?.contextFields ?? [];
   const fallbackCandidates: GraphCandidate[] = [
@@ -183,11 +185,28 @@ export function ExecutionGraphBindings({
         })),
       ),
   ];
-  const candidates = compiled?.candidates ?? fallbackCandidates;
+  const scopedReviews = canvas.nodes.filter(
+    ({ type, approval }) => type === 'SOURCE_REVIEW' && approval?.buildNodeId,
+  );
+  const requiredReview =
+    node.type === 'BUILD'
+      ? scopedReviews.find(
+          ({ id, approval }) => ancestors.has(id) && approval?.buildNodeId === node.id,
+        )
+      : undefined;
+  const candidates = (compiled?.candidates ?? fallbackCandidates).filter(
+    ({ binding }) =>
+      binding.kind !== 'OUTPUT' ||
+      binding.fieldId !== 'review' ||
+      !scopedReviews.some(
+        ({ id, approval }) => id === binding.nodeId && approval?.buildNodeId !== node.id,
+      ),
+  );
   const outputs = !isEnd
     ? (compiled?.outputs ?? moduleFields(node, 'outputs', canvas, catalog))
     : [];
-  const supportsEnvironment = node.type === 'SHELL' || node.type === 'CHECK';
+  const supportsEnvironment =
+    node.type === 'BUILD' || node.type === 'SHELL' || node.type === 'CHECK';
   if (!fields.length && !supportsEnvironment && !outputs.length) return null;
   const repository = bindings?.repository;
   const repositoryValue =
@@ -201,34 +220,45 @@ export function ExecutionGraphBindings({
   return (
     <section className="graph-fields">
       {!!fields.length && <h4>{isEnd ? '最终输出' : '输入'}</h4>}
-      {fields.map((field) => (
-        <GraphBindingField
-          key={node.id + ':' + field.id}
-          field={field}
-          value={bindings?.[field.id]}
-          project={project}
-          disabled={!canEdit}
-          choices={matchingChoices(candidates, field)}
-          scope={{
-            repositoryId: typeof repositoryValue === 'string' ? repositoryValue : undefined,
-          }}
-          canRegisterRepository={canEdit}
-          allowRepositoryDefault={
-            field.id === 'version' && (node.type === 'CHECKOUT' || node.type === 'BUILD')
-          }
-          fallback={isEnd ? undefined : configuredFallback(node, field, start, endpoint)}
-          change={(value) => {
-            const next = { ...bindings };
-            if (value) next[field.id] = value;
-            else delete next[field.id];
-            update(
-              isEnd
-                ? { ...endpoint, outputBindings: next }
-                : { ...endpoint, inputBindings: { ...endpoint.inputBindings, [node.id]: next } },
-            );
-          }}
-        />
-      ))}
+      {fields.map((field) => {
+        const review = requiredReview && field.id === 'review' ? requiredReview : undefined;
+        const choices = matchingChoices(candidates, field);
+        return (
+          <GraphBindingField
+            key={node.id + ':' + field.id}
+            field={review ? { ...field, required: true } : field}
+            value={bindings?.[field.id]}
+            project={project}
+            disabled={!canEdit}
+            choices={
+              review
+                ? choices.filter(
+                    ({ binding }) => binding.kind === 'OUTPUT' && binding.nodeId === review.id,
+                  )
+                : choices
+            }
+            directSource={Boolean(review)}
+            scope={{
+              repositoryId: typeof repositoryValue === 'string' ? repositoryValue : undefined,
+            }}
+            canRegisterRepository={canEdit}
+            allowRepositoryDefault={
+              field.id === 'version' && (node.type === 'CHECKOUT' || node.type === 'BUILD')
+            }
+            fallback={isEnd ? undefined : configuredFallback(node, field, start, endpoint)}
+            change={(value) => {
+              const next = { ...bindings };
+              if (value) next[field.id] = value;
+              else delete next[field.id];
+              update(
+                isEnd
+                  ? { ...endpoint, outputBindings: next }
+                  : { ...endpoint, inputBindings: { ...endpoint.inputBindings, [node.id]: next } },
+              );
+            }}
+          />
+        );
+      })}
       {!!outputs.length && (
         <details className="graph-field-card">
           <summary>输出接口 · {outputs.length} 项</summary>
@@ -304,13 +334,18 @@ function GraphNodeEnvironment({
     <details className="graph-field-card" open={Object.keys(bindings).length > 0 || undefined}>
       <summary>环境变量</summary>
       <div className="graph-fields">
+        {node.type === 'BUILD' && (
+          <p className="field-note">
+            此处的绑定只生效于当前执行流的构建节点，可将检出的提交传为 GIT_SHA。
+          </p>
+        )}
         {Object.entries(bindings).map(([name, value]) => {
           const field: GraphField = {
             id: name,
             name,
             type: 'TEXT',
             required: false,
-            acceptedTypes: ['NUMBER', 'BOOLEAN', 'PATH', 'IMAGE', 'CREDENTIAL'],
+            acceptedTypes: ['NUMBER', 'BOOLEAN', 'PATH', 'CREDENTIAL'],
           };
           return (
             <GraphBindingField
@@ -318,7 +353,13 @@ function GraphNodeEnvironment({
               field={field}
               value={value}
               project={project}
-              choices={matchingChoices(sources, field)}
+              choices={matchingChoices(
+                sources.filter(
+                  ({ field: sourceField, binding }) =>
+                    sourceField.type !== 'CREDENTIAL' || binding.kind === 'NODE_INPUT',
+                ),
+                field,
+              )}
               environment
               disabled={!canEdit}
               change={(next) => {

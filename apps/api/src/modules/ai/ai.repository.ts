@@ -9,6 +9,7 @@ import type { PipelineDefinition } from '../pipelines/pipeline.types';
 import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
 import type { TaskPayload } from '../tasks/tasks.types';
 import type { AiContextDto, AiPolicyDto, AiRoutesDto } from './ai.dto';
+import { lockProjectGraph } from '../projects/project-relations';
 
 const contextRole = 'PAGE_CONTEXT';
 
@@ -59,8 +60,8 @@ export class AiRepository {
   deleteProvider(id: string) {
     return this.database.db.deleteFrom('ai_providers').where('id', '=', id).execute();
   }
-  async policies() {
-    return this.database.db.selectFrom('ai_permission_policies').selectAll().execute();
+  async policies(db = this.database.db) {
+    return db.selectFrom('ai_permission_policies').selectAll().execute();
   }
   async setPolicy(input: AiPolicyDto) {
     const now = Date.now();
@@ -68,6 +69,7 @@ export class AiRepository {
     const { mode, projectId, ...scope } = input;
     const values = { mode, scope_json: JSON.stringify(scope), updated_at: now };
     await this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
       const current = await tx
         .insertInto('ai_permission_policies')
         .values({
@@ -101,11 +103,14 @@ export class AiRepository {
     });
   }
   deleteProjectPolicy(projectId: string) {
-    return this.database.db
-      .deleteFrom('ai_permission_policies')
-      .where('scope_type', '=', 'PROJECT')
-      .where('project_id', '=', projectId)
-      .execute();
+    return this.database.db.transaction().execute(async (tx) => {
+      await lockProjectGraph(tx);
+      return tx
+        .deleteFrom('ai_permission_policies')
+        .where('scope_type', '=', 'PROJECT')
+        .where('project_id', '=', projectId)
+        .execute();
+    });
   }
 
   async resolveContext(
@@ -288,8 +293,14 @@ export class AiRepository {
       .orderBy('id')
       .execute();
   }
-  async addMessage(conversationId: string, role: string, content: unknown, toolCall?: unknown) {
-    const last = await this.database.db
+  async addMessage(
+    conversationId: string,
+    role: string,
+    content: unknown,
+    toolCall?: unknown,
+    db = this.database.db,
+  ) {
+    const last = await db
       .selectFrom('ai_messages')
       .select('created_at')
       .where('conversation_id', '=', conversationId)
@@ -297,7 +308,7 @@ export class AiRepository {
       .limit(1)
       .executeTakeFirst();
     const at = Math.max(Date.now(), (last?.created_at ?? 0) + 1);
-    await this.database.db
+    await db
       .insertInto('ai_messages')
       .values({
         id: randomUUID(),
@@ -308,7 +319,7 @@ export class AiRepository {
         created_at: at,
       })
       .execute();
-    await this.database.db
+    await db
       .updateTable('ai_conversations')
       .set({ updated_at: at })
       .where('id', '=', conversationId)
@@ -367,8 +378,8 @@ export class AiRepository {
       .limit(100)
       .execute();
   }
-  async approve(id: string, userId: string, snapshot: unknown) {
-    return this.database.db
+  async approve(id: string, userId: string, snapshot: unknown, db = this.database.db) {
+    return db
       .updateTable('ai_action_proposals')
       .set({
         status: 'APPROVED',
@@ -411,8 +422,8 @@ export class AiRepository {
       .where('status', '=', 'APPROVED')
       .execute();
   }
-  recordSourceChange(id: string, preview: Record<string, unknown>) {
-    return this.database.db
+  recordProposalPreview(id: string, preview: Record<string, unknown>, db = this.database.db) {
+    return db
       .updateTable('ai_action_proposals')
       .set({ preview_json: JSON.stringify(preview) })
       .where('id', '=', id)

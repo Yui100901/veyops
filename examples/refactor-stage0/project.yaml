@@ -81,6 +81,15 @@ repositories:
               image: ${VEYOPS_IMAGE}
               ports:
                 - '8080:8080'
+    nextSnapshot:
+      timestamp: '1795219260 +0000'
+      message: 'Stage 0 storefront replacement fixture'
+      files:
+        index.html: |
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>星桥商城 · 候选</title>
+          <h1>星桥商城 · 候选版本</h1>
 
 graph:
   projectId: starbridge
@@ -123,18 +132,38 @@ graph:
     - id: deploy-files
       module: deploy.artifact
       moduleVersion: 1
-      configuration: { method: FILE, destination: /srv/veyops-stage0/storefront }
+      configuration: { method: FILE, deployPath: /srv/veyops-stage0/storefront }
+    - id: review-source
+      module: delivery.source-review
+      moduleVersion: 1
+      configuration: { buildNodeId: build-manager }
+    - id: approve-storefront
+      type: APPROVAL
+      configuration: { releaseNodeId: deploy-files }
     - id: deploy-image
       module: deploy.artifact
       moduleVersion: 1
       configuration:
         method: COMPOSE
-        destination: /srv/veyops-stage0/storefront-container
-        composeSource: { kind: REPOSITORY_FILE, repositoryId: web-repo, gitSha: *source_sha, path: compose.yaml }
+        deployPath: /srv/veyops-stage0/storefront-container
+        composeSource: { kind: REPOSITORY_FILE, repositoryId: web-repo, commitSha: *source_sha, path: compose.yaml }
     - id: rollback-files
       module: deploy.rollback
       moduleVersion: 1
-      configuration: { method: FILE, destination: /srv/veyops-stage0/storefront }
+      configuration: { method: FILE, deployPath: /srv/veyops-stage0/storefront }
+    - id: probe-files
+      module: deploy.health
+      moduleVersion: 1
+      configuration:
+        command: |
+          test -r index.html || exit 2
+          if grep -q '候选版本' index.html; then exit 10; else status=$?; fi
+          test "$status" -eq 1
+        timeoutSeconds: 15
+    - id: healthy-files
+      module: control.condition
+      moduleVersion: 1
+      configuration: { value: 'true' }
 
   flows:
     - id: manager-build
@@ -162,6 +191,29 @@ graph:
           variables: { kind: OUTPUT, nodeId: load-files, fieldId: variables }
       end:
         id: end-manager-build
+        outputs:
+          - { id: directory, type: ARTIFACT, source: { kind: OUTPUT, nodeId: build-manager, fieldId: webDirectory } }
+
+    - id: reviewed-build
+      name: 审核源码后构建
+      start:
+        id: reviewed-build
+        environmentSet: *fixed_test
+        parameters:
+          - *service
+          - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
+      path: [checkout, load-files, review-source, build-manager]
+      bindings:
+        checkout: *checkout_inputs
+        load-files: *load_inputs
+        build-manager:
+          service: { kind: INPUT, fieldId: service }
+          source: { kind: OUTPUT, nodeId: checkout, fieldId: source }
+          workspace: { kind: OUTPUT, nodeId: checkout, fieldId: workspace }
+          variables: { kind: OUTPUT, nodeId: load-files, fieldId: variables }
+          review: { kind: OUTPUT, nodeId: review-source, fieldId: review }
+      end:
+        id: end-reviewed-build
         outputs:
           - { id: directory, type: ARTIFACT, source: { kind: OUTPUT, nodeId: build-manager, fieldId: webDirectory } }
 
@@ -232,7 +284,7 @@ graph:
             type: TARGETS
             required: true
             defaultValue: { groupIds: [web-test-group] }
-      path: [checkout, load-files, build-files, deploy-files]
+      path: [checkout, load-files, build-files, approve-storefront, deploy-files]
       bindings:
         checkout: *checkout_inputs
         load-files: *load_inputs
@@ -296,6 +348,40 @@ graph:
         id: end-rollback-existing
         outputs:
           - { id: release, type: SERVICE_RESULT, source: { kind: OUTPUT, nodeId: rollback-files, fieldId: release } }
+
+    - id: health-rollback
+      name: 候选不健康时恢复上一版目录
+      start:
+        id: health-rollback
+        environmentSet: *fixed_test
+        parameters:
+          - *service
+          - *test_release_targets
+          - *directory_parameter
+          - { id: rollbackArtifact, type: ARTIFACT, artifactType: DIRECTORY, required: true }
+      path: [deploy-files, probe-files, healthy-files]
+      onUnhealthy: [rollback-files]
+      bindings:
+        deploy-files: *historic_release_inputs
+        probe-files:
+          release: { kind: OUTPUT, nodeId: deploy-files, fieldId: release }
+        healthy-files:
+          value: { kind: OUTPUT, nodeId: probe-files, fieldId: healthy }
+        rollback-files:
+          service: { kind: INPUT, fieldId: service }
+          targets: { kind: INPUT, fieldId: releaseTargets }
+          artifact: { kind: INPUT, fieldId: rollbackArtifact }
+          afterRelease: { kind: OUTPUT, nodeId: probe-files, fieldId: release }
+      end:
+        id: end-health-rollback
+        outputs:
+          - id: release
+            type: SERVICE_RESULT
+            source:
+              kind: FIRST_AVAILABLE
+              sources:
+                - { kind: OUTPUT, nodeId: rollback-files, fieldId: release }
+                - { kind: OUTPUT, nodeId: probe-files, fieldId: release }
 
 reuseExamples:
   - producer: { flowId: target-files, nodeId: build-files, fieldId: webDirectory }

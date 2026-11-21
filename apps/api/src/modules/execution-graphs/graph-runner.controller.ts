@@ -20,6 +20,7 @@ import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { DeploymentSelectionDto } from '../deployment-targets/deployment-selection';
 import { GraphRunnerService } from './graph-runner.service';
+import { GraphReleaseInspectionService } from './graph-release-inspection.service';
 
 export class GraphInputsDto extends DeploymentSelectionDto {
   @IsOptional() @IsObject() parameters?: Record<string, unknown>;
@@ -46,11 +47,15 @@ export class GraphRunDto extends GraphPreviewDto {
 
 export class GraphApprovalDecisionDto {
   @IsIn(['APPROVE', 'REJECT']) decision!: 'APPROVE' | 'REJECT';
+  @IsOptional() @Matches(/^[a-f0-9]{64}$/) expectedScopeHash?: string;
 }
 
 @Controller('projects/:id/execution-graph')
 export class GraphRunnerController {
-  constructor(private readonly runner: GraphRunnerService) {}
+  constructor(
+    private readonly runner: GraphRunnerService,
+    private readonly inspections: GraphReleaseInspectionService,
+  ) {}
 
   @Post('flows/:flowId/preview')
   @Roles('ADMIN', 'OPERATOR')
@@ -95,7 +100,14 @@ export class GraphRunnerController {
     @Body() body: GraphApprovalDecisionDto,
     @Req() req: AuthRequest,
   ) {
-    return this.runner.decideApproval(projectId, runId, nodeId, body.decision, req.user.id);
+    return this.runner.decideApproval(
+      projectId,
+      runId,
+      nodeId,
+      body.decision,
+      req.user.id,
+      body.expectedScopeHash,
+    );
   }
 
   @Post('runs/:runId/cancel')
@@ -106,5 +118,17 @@ export class GraphRunnerController {
     @Req() req: AuthRequest,
   ) {
     return this.runner.cancel(projectId, runId, req.user.id);
+  }
+
+  @Post('runs/:runId/nodes/:nodeId/targets/:serverId/inspect-release')
+  @Roles('ADMIN', 'OPERATOR')
+  inspectRelease(
+    @Param('id', ParseUUIDPipe) projectId: string,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @Param('nodeId') nodeId: string,
+    @Param('serverId', ParseUUIDPipe) serverId: string,
+    @Req() req: AuthRequest,
+  ) {
+    return this.inspections.inspect(projectId, runId, nodeId, serverId, req.user);
   }
 }

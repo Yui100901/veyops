@@ -111,6 +111,7 @@ export default function ProjectExecutionGraph({
       path={base + '/execution-graph'}
       canEdit={user.role !== 'VIEWER' && !project.archived}
       isAdmin={user.role === 'ADMIN'}
+      userId={user.id}
       runId={runId}
       search={search}
       embedded={embedded}
@@ -125,6 +126,7 @@ function Workspace({
   path,
   canEdit,
   isAdmin,
+  userId,
   runId,
   search,
   embedded,
@@ -135,6 +137,7 @@ function Workspace({
   path: string;
   canEdit: boolean;
   isAdmin: boolean;
+  userId: string;
   runId?: string;
   search?: string;
   embedded?: boolean;
@@ -609,10 +612,12 @@ function Workspace({
       {pane === 'history' && (
         <ExecutionGraphHistory
           path={path}
-          projectId={project.id}
+          project={project}
           canCancel={canEdit}
           canApprove={canEdit && isAdmin}
+          userId={userId}
           selected={selectedRun}
+          selectedNodeId={linkedNode}
           onSelect={openRun}
           scope={scope}
           delivery={delivery}
@@ -1110,8 +1115,21 @@ function PublishedNodes({
             </p>
           )}
           {node.type === 'DELAY' && <p>等待 {node.delaySeconds} 秒</p>}
-          {node.type === 'APPROVAL' && (
+          {(node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW') && (
             <p>管理员审批 · {node.approval?.timeoutSeconds ?? 86400} 秒后超时</p>
+          )}
+          {node.type === 'APPROVAL' && node.approval?.releaseNodeId && (
+            <p>
+              审批范围 ·{' '}
+              {definition.flows
+                .flatMap((flow) => flow.nodes)
+                .find(({ id }) => id === node.approval?.releaseNodeId)?.name ??
+                node.approval.releaseNodeId}
+            </p>
+          )}
+          {node.healthCheck?.command && <pre>{node.healthCheck.command}</pre>}
+          {node.deploy?.method && (
+            <p>{node.deploy.method === 'COMPOSE' ? 'Docker Compose 部署' : '文件部署'}</p>
           )}
           {node.flowId && (
             <p>

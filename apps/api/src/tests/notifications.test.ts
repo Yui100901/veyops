@@ -94,6 +94,8 @@ async function verifyNotifications(databaseUrl?: string) {
   process.env.ADMIN_PASSWORD = initialPassword;
 
   const { AppModule } = await import('../app.module.js');
+  const { LegacyDeliveryWriteFixtureModule } =
+    await import('./helpers/legacy-delivery-write-fixture.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { DatabaseService } = await import('../core/database/database.service.js');
   const { NotificationsService } =
@@ -101,7 +103,9 @@ async function verifyNotifications(databaseUrl?: string) {
   const { NotificationMailService } =
     await import('../modules/notifications/notification-mail.service.js');
   const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
-  const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+  const moduleRef = await Test.createTestingModule({
+    imports: [AppModule, LegacyDeliveryWriteFixtureModule],
+  }).compile();
   const app = moduleRef.createNestApplication<NestExpressApplication>({ logger: false });
   configureApp(app);
   try {

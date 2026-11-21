@@ -1,4 +1,4 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ConflictException } from '@nestjs/common';
 import { posix } from 'node:path';
 import { parseEnv } from 'node:util';
 import {
@@ -7,6 +7,7 @@ import {
 } from '../../infrastructure/execution-variables';
 import type { FrozenEnvironmentSet } from '../projects/environment-sets.service';
 import { relativePath } from '../pipelines/pipeline.validation';
+import { safeGraphEnvironmentKey } from './graph-fields';
 
 export const graphEnvironmentMaxBytes = 64 * 1024;
 
@@ -88,6 +89,39 @@ export function mergeEnvironmentSet(
     secretCredentialNonces,
     variableSources: [...entries.values()],
   };
+}
+
+export function mergeGraphNodeEnvironment(
+  inherited: ExecutionVariables,
+  node: ExecutionVariables,
+): ExecutionVariables {
+  const variables: Record<string, string> = Object.assign(Object.create(null), inherited.variables);
+  const secretVariables: Record<string, string> = Object.assign(
+    Object.create(null),
+    inherited.secretVariables,
+  );
+  const secretCredentialNonces: Record<string, string> = Object.assign(
+    Object.create(null),
+    inherited.secretCredentialNonces,
+  );
+
+  for (const [key, value] of Object.entries(node.variables)) {
+    if (!safeGraphEnvironmentKey(key) || value.includes('\0') || value.length > 65_536)
+      throw new BadRequestException('构建节点环境变量名称或普通值无效');
+    variables[key] = value;
+    delete secretVariables[key];
+    delete secretCredentialNonces[key];
+  }
+  for (const [key, credentialId] of Object.entries(node.secretVariables)) {
+    if (!safeGraphEnvironmentKey(key) || !credentialId || Object.hasOwn(node.variables, key))
+      throw new BadRequestException('构建节点敏感变量名称或凭据引用无效');
+    const nonce = node.secretCredentialNonces?.[key];
+    if (!nonce) throw new ConflictException('构建节点敏感变量缺少已确认的凭据版本');
+    delete variables[key];
+    secretVariables[key] = credentialId;
+    secretCredentialNonces[key] = nonce;
+  }
+  return { variables, secretVariables, secretCredentialNonces };
 }
 
 export type GraphEnvironmentPlan = {

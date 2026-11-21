@@ -10,6 +10,7 @@ import { CommandCenterModule } from '../command-center/command-center.module';
 import { GraphNodeTasks } from './graph-node-tasks';
 import { GraphMigrationController } from './graph-migration.controller';
 import { GraphMigrationService } from './graph-migration.service';
+import { GraphReleaseInspectionService } from './graph-release-inspection.service';
 
 @Module({
   imports: [PipelinesModule, CommandCenterModule],
@@ -26,6 +27,7 @@ import { GraphMigrationService } from './graph-migration.service';
     GraphTriggersService,
     GraphNodeTasks,
     GraphMigrationService,
+    GraphReleaseInspectionService,
   ],
 })
 export class ExecutionGraphsModule {}

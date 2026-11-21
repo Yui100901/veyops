@@ -25,12 +25,16 @@ async function checkMigration(url?: string) {
     WORKER_ENABLED: 'false',
   });
   const { AppModule } = await import('../app.module.js');
+  const { LegacyDeliveryWriteFixtureModule } =
+    await import('./helpers/legacy-delivery-write-fixture.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { DatabaseService } = await import('../core/database/database.service.js');
   const { GraphTriggersService } =
     await import('../modules/execution-graphs/graph-triggers.service.js');
   const app = (
-    await Test.createTestingModule({ imports: [AppModule] }).compile()
+    await Test.createTestingModule({
+      imports: [AppModule, LegacyDeliveryWriteFixtureModule],
+    }).compile()
   ).createNestApplication<NestExpressApplication>({ logger: false });
   try {
     configureApp(app);

@@ -4,6 +4,14 @@ import type { Database } from '../../core/database/schema';
 import type { PipelineDefinition } from './pipeline.types';
 import type { GraphVariableSnapshot } from '../execution-graphs/graph-environment';
 
+export type GraphDeliveryConfiguration = {
+  method: 'FILE' | 'COMPOSE';
+  composeSource?:
+    | { kind: 'ARTIFACT' }
+    | { kind: 'REPOSITORY_FILE'; repositoryId: string; commitSha: string; path: string };
+  rollback?: 'CURRENT' | 'AFTER_RELEASE';
+};
+
 /**
  * The published graph defines delivery configuration. The execution engine stores
  * a backing key only when a task is queued, so previews never create resources.
@@ -18,6 +26,7 @@ export interface DeliveryExecutionProfile {
   authoredFields: string[];
   graphVariables?: GraphVariableSnapshot;
   artifactRootRunId?: string;
+  delivery?: GraphDeliveryConfiguration;
 }
 
 export const graphDeliveryEnvironmentSlug = '_veyops_graph';

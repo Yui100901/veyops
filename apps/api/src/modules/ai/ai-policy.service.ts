@@ -4,6 +4,8 @@ import { AiActionRuleDto, AiMode, AiPolicyDto } from './ai.dto';
 import { CurrentUser } from '../auth/auth.decorators';
 import { ProjectsService } from '../projects/projects.service';
 import { AuditService } from '../audit/audit.service';
+import type { Kysely } from 'kysely';
+import type { Database } from '../../core/database/schema';
 
 export interface AiScope {
   serverIds?: string[];
@@ -35,6 +37,8 @@ export interface AiActionScope {
 const validActions = new Set([
   'execute_command',
   'run_pipeline',
+  'run_execution_flow',
+  'list_execution_flows',
   'inspect_servers',
   'initialize_component',
   'diagnose_deployment',
@@ -59,8 +63,8 @@ export class AiPolicyService {
     private readonly projects: ProjectsService,
     private readonly audit: AuditService,
   ) {}
-  async list() {
-    const rows = await this.repository.policies();
+  async list(db?: Kysely<Database>) {
+    const rows = await this.repository.policies(db);
     const policies = rows.map((r) => ({
       ...(JSON.parse(r.scope_json) as AiScope),
       mode: r.mode as AiMode,
@@ -101,11 +105,11 @@ export class AiPolicyService {
     await this.audit.record(user.id, 'ai.policy.inherit', 'ai_policy', projectId);
     return this.list();
   }
-  async snapshot(projectId?: string): Promise<AiPolicySnapshot> {
-    return (await this.projectSnapshots())(projectId);
+  async snapshot(projectId?: string, db?: Kysely<Database>): Promise<AiPolicySnapshot> {
+    return (await this.projectSnapshots(db))(projectId);
   }
-  async projectSnapshots() {
-    const all = await this.list();
+  async projectSnapshots(db?: Kysely<Database>) {
+    const all = await this.list(db);
     const byId = new Map(all.projects.map((policy) => [policy.projectId, policy]));
     return (projectId?: string): AiPolicySnapshot => {
       const project = projectId ? byId.get(projectId) : undefined;
@@ -173,6 +177,10 @@ export class AiPolicyService {
     for (const id of input.sourceRepositoryIds ?? []) this.assertRepository(id, snapshot);
     const sourceWrite =
       input.action === 'publish_source_branch' || input.action === 'open_pull_request';
+    if (input.action === 'run_execution_flow') {
+      if (!input.projectId) throw new BadRequestException('执行流必须明确指定项目');
+      return 'REQUIRE_CONFIRM';
+    }
     if (sourceWrite && (!input.projectId || !input.repositoryId))
       throw new BadRequestException('AI 源代码写操作必须明确指定项目和仓库');
     if (!sourceWrite && !input.serverIds.length)

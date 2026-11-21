@@ -650,6 +650,44 @@ export class RepositoryMetadataService {
     });
   }
 
+  async readGraphComposeFile(
+    projectId: string,
+    repositoryId: string,
+    commitSha: string,
+    path: string,
+  ) {
+    const sha = commitSha.toLowerCase();
+    if (!shaPattern.test(sha) || !isAnalysisPath(path) || !/\.ya?ml$/i.test(path))
+      throw new BadRequestException('Compose 模板须为固定提交中的 YAML 相对路径');
+    const maxBytes = 256 * 1024;
+    return this.withRepository(projectId, repositoryId, async (repository) => {
+      const gitDir = await this.fetchPinnedCommit(repository, sha, maxBytes);
+      const entry = await repository.run([
+        gitDir,
+        '--literal-pathspecs',
+        'ls-tree',
+        '-z',
+        sha,
+        '--',
+        path,
+      ]);
+      if (!entry) throw new NotFoundException('指定提交中不存在 Compose 模板');
+      const [descriptor, filePath] = entry.split('\t');
+      const [mode, kind, object] = descriptor.split(' ');
+      if (
+        filePath !== `${path}\0` ||
+        kind !== 'blob' ||
+        (mode !== '100644' && mode !== '100755') ||
+        !shaPattern.test(object)
+      )
+        throw new BadRequestException('Compose 模板必须是仓库中的普通文件');
+      const content = await this.readAnalysisBlob(repository, gitDir, object, maxBytes);
+      if (!content.trim() || content.includes('[REDACTED]'))
+        throw new BadRequestException('Compose 模板为空或包含应通过凭据引用的内容');
+      return content;
+    });
+  }
+
   async readAnalysisContext(
     projectId: string,
     repositoryId: string,

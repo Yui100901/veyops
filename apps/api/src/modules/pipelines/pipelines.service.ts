@@ -64,6 +64,7 @@ import {
 } from './delivery-execution-profile';
 import {
   mergeEnvironmentSet,
+  mergeGraphNodeEnvironment,
   type GraphVariableSnapshot,
 } from '../execution-graphs/graph-environment';
 import type { FrozenEnvironmentSet } from '../projects/environment-sets.service';
@@ -84,10 +85,15 @@ import { redactTaskLog } from '../tasks/task-log.service';
 import { encryptionKey } from '../../core/config';
 import {
   activeComposeRevision,
+  composeChecksum,
   managedComposeReference,
   readManagedCompose,
 } from '../service-configs/compose-template-reference';
 import { lockProjectGraph } from '../projects/project-relations';
+import type { GraphReleaseGate } from '../execution-graphs/graph-release-gates';
+import { graphComposeProject, graphRollbackBaselines } from './graph-release-context';
+import { assertGraphCompose } from './graph-compose';
+import { normalizeReleasePath } from '../deployments/deployment-scope';
 
 @Injectable()
 export class PipelinesService implements OnModuleInit {
@@ -436,6 +442,8 @@ export class PipelinesService implements OnModuleInit {
           currentVersion: 1,
         }
       : await this.get(id);
+    if (profile?.delivery && !profile.graphVariables)
+      throw new BadRequestException('图内发布缺少已确认的变量快照');
     if (!pipeline.enabled) throw new BadRequestException('Pipeline已禁用');
     const version = profile
       ? { id: profile.versionId, version: 1, definition_json: JSON.stringify(profile.definition) }
@@ -469,6 +477,42 @@ export class PipelinesService implements OnModuleInit {
       PipelineDefinitionDto,
       JSON.parse(version.definition_json),
     ) as PipelineDefinition;
+    let graphDeployment: PipelineSnapshot['graphDeployment'];
+    if (profile?.delivery && fromArtifact) {
+      const { method, composeSource } = profile.delivery;
+      definition.deployPath = normalizeReleasePath(definition.deployPath);
+      if (
+        definition.deployPath
+          .split('/')
+          .some((part) => ['.artifacts', '.veyops-managed', 'current', 'releases'].includes(part))
+      )
+        throw new BadRequestException('部署路径不能使用受管发布目录保留名称');
+      if ((method === 'COMPOSE') !== (definition.artifactType === 'DOCKER_IMAGE'))
+        throw new BadRequestException('部署方式与所选产物类型不兼容');
+      if ((method === 'FILE' && composeSource) || (method === 'COMPOSE' && !composeSource))
+        throw new BadRequestException('Compose 部署须明确选择模板来源');
+      graphDeployment = { method };
+      if (method === 'COMPOSE')
+        graphDeployment.composeProject = graphComposeProject({ ...pipeline, definition });
+      if (composeSource?.kind === 'REPOSITORY_FILE') {
+        const { repositoryId, path, commitSha } = composeSource;
+        const pinned = commitSha.toLowerCase();
+        const yaml = await this.metadata.readGraphComposeFile(
+          pipeline.projectId,
+          repositoryId,
+          pinned,
+          path,
+        );
+        assertGraphCompose(yaml);
+        graphDeployment.template = {
+          source: 'REPOSITORY_FILE',
+          repositoryId,
+          commitSha: pinned,
+          path,
+          checksum: composeChecksum(yaml),
+        };
+      }
+    }
     const buildOnlyNodes =
       definition.nodes && !definition.nodes.some((node) => node.type === 'DEPLOY');
     if (definition.inheritBuildLocation) definition.buildLocation = defaults.defaultBuildLocation;
@@ -520,7 +564,7 @@ export class PipelinesService implements OnModuleInit {
           ? 'MANAGER_BUILD'
           : 'TARGET_BUILD';
     const managedCompose =
-      graphPurpose === 'RELEASE' && definition.artifactType === 'DOCKER_IMAGE'
+      !graphDeployment && graphPurpose === 'RELEASE' && definition.artifactType === 'DOCKER_IMAGE'
         ? managedComposeReference(
             await activeComposeRevision(this.database.db, pipeline.serviceId, environment.id),
           )
@@ -627,6 +671,20 @@ export class PipelinesService implements OnModuleInit {
         new BadRequestException('执行目标必须配置SSH凭据和已确认指纹'),
         graphTargets?.source,
       );
+    const rollbackBaseline =
+      profile?.delivery?.rollback === 'CURRENT'
+        ? await graphRollbackBaselines(
+            this.database.db,
+            {
+              projectId: pipeline.projectId,
+              serviceId: pipeline.serviceId,
+              environmentId: environment.id,
+              definition,
+              graphDeployment,
+            },
+            servers.map(({ id }) => id),
+          )
+        : undefined;
     const { repository, repositories, registry, projectName, serviceName } = await this.resources(
       pipeline.projectId,
       pipeline.serviceId,
@@ -681,6 +739,8 @@ export class PipelinesService implements OnModuleInit {
       allowPartialDeploy: input.allowPartialDeploy === true,
       graphTargets,
       graphPurpose,
+      graphDeployment,
+      rollbackBaseline,
       managedCompose,
       settings,
       requestedTargets: {
@@ -755,32 +815,56 @@ export class PipelinesService implements OnModuleInit {
               source: p.env.config?.[field] ? 'SERVICE_ENVIRONMENT' : 'NODE',
             }),
           ),
+          ...(p.graphDeployment
+            ? [{ field: 'method', value: p.graphDeployment.method, source: 'NODE' }]
+            : []),
+          ...(p.graphDeployment?.composeProject
+            ? [{ field: 'composeProject', value: p.graphDeployment.composeProject, source: 'NODE' }]
+            : []),
           ...(p.definition.artifactType === 'DOCKER_IMAGE'
-            ? p.managedCompose
+            ? p.graphDeployment?.template
               ? [
                   {
                     field: 'composeFile',
-                    value: p.managedCompose.path,
-                    source: 'SERVICE_ENVIRONMENT',
+                    value: p.graphDeployment.template.path,
+                    source: 'REPOSITORY',
                   },
                   {
-                    field: 'composeVersion',
-                    value: p.managedCompose.version,
-                    source: 'SERVICE_ENVIRONMENT',
+                    field: 'composeCommitSha',
+                    value: p.graphDeployment.template.commitSha,
+                    source: 'REPOSITORY',
                   },
                   {
                     field: 'composeChecksum',
-                    value: p.managedCompose.checksum,
-                    source: 'SERVICE_ENVIRONMENT',
+                    value: p.graphDeployment.template.checksum,
+                    source: 'REPOSITORY',
                   },
                 ]
-              : [
-                  {
-                    field: 'composeSource',
-                    value: '产物归档',
-                    source: 'ARTIFACT',
-                  },
-                ]
+              : p.managedCompose
+                ? [
+                    {
+                      field: 'composeFile',
+                      value: p.managedCompose.path,
+                      source: 'SERVICE_ENVIRONMENT',
+                    },
+                    {
+                      field: 'composeVersion',
+                      value: p.managedCompose.version,
+                      source: 'SERVICE_ENVIRONMENT',
+                    },
+                    {
+                      field: 'composeChecksum',
+                      value: p.managedCompose.checksum,
+                      source: 'SERVICE_ENVIRONMENT',
+                    },
+                  ]
+                : [
+                    {
+                      field: 'composeSource',
+                      value: '产物归档',
+                      source: 'ARTIFACT',
+                    },
+                  ]
             : []),
           ...(p.env.config?.releasePolicy
             ? [
@@ -847,6 +931,8 @@ export class PipelinesService implements OnModuleInit {
           canonical({
             definition: p.definition,
             ...(p.managedCompose && { managedCompose: p.managedCompose }),
+            ...(p.graphDeployment && { graphDeployment: p.graphDeployment }),
+            ...(p.rollbackBaseline && { rollbackBaseline: p.rollbackBaseline }),
             ...(p.graphTargets && {
               targetSource: p.graphTargets.source,
               targetId: p.graphTargets.legacyId,
@@ -992,6 +1078,7 @@ export class PipelinesService implements OnModuleInit {
       }),
       definition: p.definition,
       ...(p.managedCompose && { managedCompose: p.managedCompose }),
+      ...(p.graphDeployment && { graphDeployment: p.graphDeployment }),
       variables: p.env.variables,
       secretVariables: p.env.secretVariables,
       ...('secretCredentialNonces' in p.env && {
@@ -1390,7 +1477,7 @@ export class PipelinesService implements OnModuleInit {
       db,
       source.run_id,
       Boolean(profile),
-      Boolean(p.managedCompose),
+      Boolean(p.managedCompose || p.graphDeployment?.template),
       profile?.artifactRootRunId,
       artifactIds,
     );
@@ -1398,11 +1485,32 @@ export class PipelinesService implements OnModuleInit {
     if (references.length !== rows.length)
       throw artifactIssue(
         new ConflictException(
-          p.definition.artifactType === 'DOCKER_IMAGE' && !p.managedCompose
+          p.definition.artifactType === 'DOCKER_IMAGE' &&
+            !p.managedCompose &&
+            !p.graphDeployment?.template
             ? '镜像不可验证、正在清理，或缺少 Compose 模板'
             : '文件或目录实物不可验证，或该产物正在清理',
         ),
       );
+    if (p.graphDeployment?.method === 'COMPOSE' && !p.graphDeployment.template) {
+      const templates = await db
+        .selectFrom('artifacts')
+        .select(['id', 'compose_yaml', 'compose_checksum'])
+        .where('id', 'in', artifactIds)
+        .execute();
+      if (templates.length !== rows.length)
+        throw artifactIssue(new ConflictException('归档模板缺失'));
+      for (const template of templates) {
+        const checksum = rows.find((row) => row.id === template.id)?.compose_checksum;
+        if (
+          !template.compose_yaml ||
+          template.compose_checksum !== checksum ||
+          composeChecksum(template.compose_yaml) !== checksum
+        )
+          throw artifactIssue(new ConflictException('归档 Compose 模板已变化'));
+        assertGraphCompose(template.compose_yaml);
+      }
+    }
     if (p.managedCompose)
       await readManagedCompose(db, p.pipeline.serviceId, p.environment.id, p.managedCompose);
     if (
@@ -1416,6 +1524,19 @@ export class PipelinesService implements OnModuleInit {
     const targets = p.servers.map((server) => server.id);
     if (!this.artifactsMatchTargets(references, targets))
       throw artifactIssue(new BadRequestException('目标端构建产物须与所选部署目标逐一匹配'));
+    if (profile?.delivery?.rollback)
+      await graphRollbackBaselines(
+        db,
+        {
+          projectId: p.pipeline.projectId,
+          serviceId: p.pipeline.serviceId,
+          environmentId: p.environment.id,
+          definition: p.definition,
+          graphDeployment: p.graphDeployment,
+        },
+        targets,
+        artifactIds,
+      );
     const reviewRequired = p.env.config?.releasePolicy?.requireCodeReview;
     const scope = {
       projectId: p.pipeline.projectId,
@@ -1519,6 +1640,8 @@ export class PipelinesService implements OnModuleInit {
       artifactIds,
       artifactDetails,
       managedCompose: p.managedCompose,
+      graphDeployment: p.graphDeployment,
+      rollbackBaseline: p.rollbackBaseline,
       executionConfiguration: this.executionConfiguration(p),
     };
   }
@@ -1548,6 +1671,8 @@ export class PipelinesService implements OnModuleInit {
       requireCodeReview,
       sourceReviewPendingMaterialization: requireCodeReview,
       configurationHash: this.configurationHash(p),
+      graphDeployment: p.graphDeployment,
+      rollbackBaseline: p.rollbackBaseline,
       executionConfiguration: this.executionConfiguration(p),
     };
   }
@@ -1561,6 +1686,8 @@ export class PipelinesService implements OnModuleInit {
       expectedPlanHash?: string;
       profile?: DeliveryExecutionProfile;
       graphAutomation?: GraphAutomation;
+      graphGate?: GraphReleaseGate;
+      rollbackExpected?: Record<string, string>;
       afterInsert?: (tx: Transaction<Database>, taskId: string) => Promise<void>;
     } = {},
   ) {
@@ -1577,12 +1704,32 @@ export class PipelinesService implements OnModuleInit {
     const automation = options.graphAutomation;
     if (automation && Object.keys(p.env.secretVariables).length)
       throw new BadRequestException('自动发布不能使用敏感环境变量');
+    const scope = {
+      projectId: p.pipeline.projectId,
+      serviceId: p.pipeline.serviceId,
+      environmentId: p.environment.id,
+      definition: p.definition,
+      graphDeployment: p.graphDeployment,
+    };
+    if (options.profile?.delivery?.rollback && !options.rollbackExpected)
+      throw new ConflictException('缺少经过确认的逐目标回滚基线');
+    const graphRollback = options.profile?.delivery?.rollback
+      ? await graphRollbackBaselines(
+          this.database.db,
+          scope,
+          targets,
+          artifactIds,
+          options.rollbackExpected,
+        )
+      : undefined;
     const snapshot: PipelineSnapshot = {
       ...this.snapshot(p, source.commit_sha),
       mode: 'DEPLOY_ARTIFACT',
       artifactRootRunId: options.profile?.artifactRootRunId,
       deploymentArtifacts: references,
       sourceBuildTaskId: source.task_id,
+      graphGate: options.graphGate,
+      graphRollback,
       ...(options.profile && { artifactServiceScope: true }),
       ...(automation && {
         graphAutomation: automation,
@@ -1599,19 +1746,21 @@ export class PipelinesService implements OnModuleInit {
       userId,
       async (tx) => {
         await lockProjectGraph(tx);
-        if (snapshot.definition.artifactType === 'DOCKER_IMAGE') {
+        if (snapshot.definition.artifactType === 'DOCKER_IMAGE' && !snapshot.graphDeployment) {
           const active = managedComposeReference(
             await activeComposeRevision(tx, snapshot.serviceId, snapshot.environmentId),
           );
           if (active?.id !== snapshot.managedCompose?.id)
             throw new ConflictException('Compose 模板版本已变化，请重新预览发布产物');
         }
+        if (graphRollback)
+          await graphRollbackBaselines(tx, scope, targets, artifactIds, graphRollback);
         if (automation) await assertGraphAutomation(tx, snapshot.projectId, userId, automation);
         if (options.profile) await storeDeliveryProfile(tx, options.profile, userId);
         if (snapshot.graphReleaseTargets) await assertCurrentTargets(tx, snapshot, p.servers);
         if (snapshot.targetSelection)
           await confirmDeploymentMembers(tx, snapshot.targetSelection, targets);
-        if (this.sourceReviews) {
+        if (this.sourceReviews && !snapshot.graphDeployment) {
           const current = await this.sourceReviews.requireReleaseReviewed(snapshot, tx);
           if (JSON.stringify(current ?? undefined) !== JSON.stringify(sourceReviews))
             throw new SourceReviewConflict('代码审核结果已变化，请重新预览发布产物');
@@ -1641,6 +1790,7 @@ export class PipelinesService implements OnModuleInit {
       profile?: DeliveryExecutionProfile;
       graph?: GraphExecutionScope;
       graphAutomation?: GraphAutomation;
+      graphGate?: GraphReleaseGate;
       afterInsert?: (tx: Transaction<Database>, taskId: string, created: boolean) => Promise<void>;
     } = {},
   ) {
@@ -1661,11 +1811,16 @@ export class PipelinesService implements OnModuleInit {
     );
     if ((p.target.selection || p.definition.nodes) && !input.expectedConfigurationHash)
       throw new ConflictException('请先预览并确认服务器、分组和执行配置');
+    const nodeEnvironment = options.graph?.nodeEnvironment;
+    if (nodeEnvironment && (!options.profile || p.mode !== 'BUILD_ONLY'))
+      throw new BadRequestException('构建节点环境变量只能用于执行图的独立构建');
+    const effectiveEnvironment =
+      nodeEnvironment && mergeGraphNodeEnvironment(p.env, nodeEnvironment);
     const automation = options.graphAutomation;
     if (options.triggerType || automation)
       this.assertAutomaticBuild({
         definition: p.definition,
-        hasSecretVariables: Object.keys(p.env.secretVariables).length > 0,
+        hasSecretVariables: Object.keys((effectiveEnvironment ?? p.env).secretVariables).length > 0,
       });
     if (automation && p.definition.registryId && p.definition.imageRepository)
       throw new BadRequestException('执行图自动构建只归档镜像，暂未放行构建时推送 Registry');
@@ -1681,7 +1836,8 @@ export class PipelinesService implements OnModuleInit {
     )
       throw new ConflictException('执行配置已变化，请重新确认');
     const commit = p.commitSha;
-    let graph = options.graph;
+    let graph = options.graph && { ...options.graph };
+    if (graph) delete graph.nodeEnvironment;
     if (graph?.workspace) {
       const workspace = await ownedGraphWorkspace(
         this.database.db,
@@ -1750,6 +1906,7 @@ export class PipelinesService implements OnModuleInit {
       });
     const snapshot: PipelineSnapshot = {
       ...this.snapshot(p, commit),
+      ...effectiveEnvironment,
       mode: 'BUILD_ONLY',
       ...(p.mode === 'DEPLOY' && {
         deployAfterBuild: true,
@@ -1757,6 +1914,7 @@ export class PipelinesService implements OnModuleInit {
       }),
       triggerType: automation?.kind ?? options.triggerType ?? 'MANUAL',
       graphAutomation: automation,
+      graphGate: options.graphGate,
       graph,
       artifactSources,
     };

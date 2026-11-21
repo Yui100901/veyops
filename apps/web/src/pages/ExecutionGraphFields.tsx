@@ -35,6 +35,7 @@ export type FieldScope = {
   environmentId?: string;
   serviceId?: string;
   targets?: DeploymentSelection;
+  deliveryMethod?: 'FILE' | 'COMPOSE';
 };
 
 interface ValueProps {
@@ -288,7 +289,9 @@ function ArtifactValue({
 }: ValueProps) {
   const query = new URLSearchParams({ projectId: project.id });
   if (scope?.serviceId) query.set('serviceId', scope.serviceId);
-  if (field.artifactType) query.set('kind', field.artifactType);
+  const requestedKind =
+    field.artifactType ?? (scope?.deliveryMethod === 'COMPOSE' ? 'DOCKER_IMAGE' : undefined);
+  if (requestedKind) query.set('kind', requestedKind);
   const versions = useResource<Artifact[]>('/artifacts?' + query);
   const inventory = useDeploymentInventory();
   const servers = new Set([
@@ -308,12 +311,17 @@ function ArtifactValue({
     .filter(Boolean);
   const groups = new Map<string, Artifact[]>();
   const serverNames = new Map((inventory.servers.data ?? []).map(({ id, name }) => [id, name]));
-  const targetOf = (artifact: Artifact) => artifact.serverId ?? artifact.physical?.serverId;
+  const isRegistry = (artifact: Artifact) =>
+    artifact.physical?.location === 'REGISTRY' || artifact.storageType === 'REGISTRY_IMAGE';
+  const targetOf = (artifact: Artifact) =>
+    isRegistry(artifact) ? undefined : (artifact.serverId ?? artifact.physical?.serverId);
   for (const artifact of versions.data ?? []) {
     const server = targetOf(artifact);
+    const kind = artifact.kind ?? artifact.artifactType;
     if (
       !isDeployableArtifact(artifact) ||
-      (field.artifactType && field.artifactType !== (artifact.kind ?? artifact.artifactType)) ||
+      (requestedKind && requestedKind !== kind) ||
+      (scope?.deliveryMethod === 'FILE' && kind === 'DOCKER_IMAGE') ||
       (scope?.serviceId && artifact.serviceId !== scope.serviceId) ||
       (server && servers.size > 0 && !servers.has(server))
     )
@@ -335,11 +343,7 @@ function ArtifactValue({
       .join(' · ');
     const selectableInstances = instances.filter(
       (instance) =>
-        targetOf(instance) ||
-        !servers.size ||
-        instance.downloadAvailable ||
-        instance.physical?.location === 'REGISTRY' ||
-        instance.storageType === 'REGISTRY_IMAGE',
+        targetOf(instance) || !servers.size || instance.downloadAvailable || isRegistry(instance),
     );
     const compatible =
       !servers.size ||
@@ -357,8 +361,13 @@ function ArtifactValue({
       for (const instance of selectableInstances) {
         const instanceId = artifactInstanceId(instance);
         const server = targetOf(instance);
+        const location = isRegistry(instance)
+          ? '镜像仓库'
+          : server
+            ? (serverNames.get(server) ?? server)
+            : '管理端';
         selectable.set(artifactId + ':' + instanceId, {
-          name: title + ' · ' + (server ? (serverNames.get(server) ?? server) : '管理端'),
+          name: title + ' · ' + location,
           ref: { artifactId, instanceId },
         });
       }
@@ -952,6 +961,7 @@ export function GraphBindingField({
   environment,
   canRegisterRepository,
   allowRepositoryDefault,
+  directSource,
 }: {
   field: GraphField;
   choices: BindingChoice[];
@@ -964,13 +974,14 @@ export function GraphBindingField({
   environment?: boolean;
   canRegisterRepository?: boolean;
   allowRepositoryDefault?: boolean;
+  directSource?: boolean;
 }) {
   const [search, setSearch] = useState('');
   const selected = value ? bindingKey(value) : '';
   const special = ['VALUE', 'FIRST_AVAILABLE', 'ENVIRONMENT_KEY', 'CREDENTIAL'];
   const unavailable =
     selected &&
-    !special.includes(selected) &&
+    (directSource || !special.includes(selected)) &&
     !choices.some(({ binding }) => bindingKey(binding) === selected);
   const query = search.trim().toLocaleLowerCase();
   const visible = choices.filter(
@@ -985,8 +996,11 @@ export function GraphBindingField({
     ...(field.defaultValue !== undefined ? ['USE_DEFAULT' as const] : []),
     ...(allowRepositoryDefault ? ['REPOSITORY_DEFAULT' as const] : []),
   ];
+  const incompatibleMissing = directSource && value?.onMissing && value.onMissing !== 'ERROR';
   const update = (next?: GraphBinding) =>
-    change(next && value?.onMissing ? { ...next, onMissing: value.onMissing } : next);
+    change(
+      next && value?.onMissing && !directSource ? { ...next, onMissing: value.onMissing } : next,
+    );
   return (
     <div className="graph-binding-field" data-graph-field={field.id}>
       {choices.length > 3 && (
@@ -1026,12 +1040,12 @@ export function GraphBindingField({
               {choiceLabel(choice)}
             </option>
           ))}
-          {!['SOURCE', 'WORKSPACE', 'REPORT', 'RELEASE', 'VARIABLES'].includes(field.type) && (
-            <option value="VALUE">固定值</option>
-          )}
+          {!['SOURCE', 'WORKSPACE', 'REPORT', 'RELEASE', 'REVIEW', 'VARIABLES'].includes(
+            field.type,
+          ) && <option value="VALUE">固定值</option>}
           {environment && <option value="ENVIRONMENT_KEY">入口变量集合中的键</option>}
           {environment && <option value="CREDENTIAL">凭据引用</option>}
-          {(choices.length > 1 || value?.kind === 'FIRST_AVAILABLE') && (
+          {!directSource && (choices.length > 1 || value?.kind === 'FIRST_AVAILABLE') && (
             <option value="FIRST_AVAILABLE">按分支取第一个可用来源</option>
           )}
         </select>
@@ -1071,7 +1085,7 @@ export function GraphBindingField({
           disabled={disabled}
         />
       )}
-      {value?.kind === 'FIRST_AVAILABLE' && (
+      {!directSource && value?.kind === 'FIRST_AVAILABLE' && (
         <fieldset disabled={disabled}>
           <legend>候选优先顺序</legend>
           <ol className="graph-edge-list">
@@ -1130,7 +1144,7 @@ export function GraphBindingField({
           </select>
         </fieldset>
       )}
-      {value && (
+      {value && (!directSource || incompatibleMissing) && (
         <Field label="来源缺失时">
           <select
             disabled={disabled}

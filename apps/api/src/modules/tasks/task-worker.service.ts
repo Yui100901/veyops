@@ -490,6 +490,13 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         (task.task_type === 'PIPELINE' &&
           !targets.length &&
           isStandaloneGraphBuild((JSON.parse(task.payload_json) as TaskPayload).pipeline));
+      const graphHealth = Boolean(
+        result &&
+        task.task_type === 'GRAPH_MODULE' &&
+        (JSON.parse(task.payload_json) as TaskPayload).graphModule?.type === 'HEALTH_CHECK',
+      );
+      const healthNeedsAttention =
+        graphHealth && targets.some(({ status }) => status === 'NEEDS_ATTENTION');
       const abandoned =
         !cancelled &&
         (Boolean(activeStep || activeDeployment) ||
@@ -509,7 +516,9 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
             ? 'CANCELLED'
             : executionFailed
               ? (sshError?.kind ?? 'FAILED')
-              : 'SUCCESS'
+              : healthNeedsAttention
+                ? 'NEEDS_ATTENTION'
+                : 'SUCCESS'
           : aggregateStatus(
               targets.map((target) => target.status),
               cancelled,
@@ -565,7 +574,9 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
           result_json: JSON.stringify({
             total: targets.length,
             success: targets.filter((target) => target.status === 'SUCCESS').length,
-            ...(graphModule && status === 'SUCCESS' && result),
+            ...(graphModule &&
+              (status === 'SUCCESS' || (graphHealth && status === 'NEEDS_ATTENTION')) &&
+              result),
             ...(graphModule &&
               status === 'FAILED' &&
               failure?.cause instanceof ExecutionPlanIssueError && {

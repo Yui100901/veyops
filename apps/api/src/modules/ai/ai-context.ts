@@ -53,6 +53,8 @@ const contextualTools: Record<AiContextKind, string[]> = {
   SERVICE: [
     'list_projects',
     'get_project',
+    'list_execution_flows',
+    'run_execution_flow',
     'query_pipeline',
     'analyze_repository_deployment',
     'draft_pipeline',
@@ -95,7 +97,8 @@ export function scopeAiToolArguments(
   const { input } = context;
   if (!aiContextAllows(input.kind, name)) throw new ForbiddenException('AI 操作超出当前页面的范围');
   const scoped = { ...args };
-  if (name === 'get_project') pinAiContextField(scoped, 'projectId', context.projectId);
+  if (name === 'get_project' || name === 'list_execution_flows' || name === 'run_execution_flow')
+    pinAiContextField(scoped, 'projectId', context.projectId);
   if (name === 'get_task' || name === 'diagnose_deployment')
     pinAiContextField(scoped, 'taskId', input.taskId);
   if (name === 'query_pipeline' || name === 'run_pipeline')

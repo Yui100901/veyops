@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { executionGraphsMigration } from './execution-graphs-migration';
 import { executionGraphTriggersMigration } from './execution-graph-triggers-migration';
+import { recordedDeploymentLocation } from '../../modules/deployments/deployment-scope';
+import type { Database } from './schema';
 import {
   sql,
   type Kysely,
@@ -1961,6 +1963,69 @@ export const migrationProvider: MigrationProvider = {
         async down(db) {
           await db.schema.dropTable('artifact_cleanup_items').execute();
           await db.schema.dropTable('artifact_cleanup_jobs').execute();
+        },
+      } satisfies Migration,
+      '033_deployment_release_scope': {
+        async up(database) {
+          await database.schema
+            .alterTable('deployment_records')
+            .addColumn('release_scope_key', 'text')
+            .execute();
+          await database.schema
+            .alterTable('deployment_records')
+            .addColumn('release_path_key', 'text')
+            .execute();
+          const db = database as Kysely<Database>;
+          let after: string | undefined;
+          for (;;) {
+            const rows = await db
+              .selectFrom('deployment_records as deployment')
+              .innerJoin('pipeline_runs as run', 'run.id', 'deployment.pipeline_run_id')
+              .select([
+                'deployment.id',
+                'run.project_id',
+                'deployment.service_id',
+                'deployment.environment_id',
+                'deployment.server_id',
+                'deployment.deploy_path',
+                'run.artifact_type_snapshot',
+                'deployment.release_snapshot_json',
+              ])
+              .$if(after !== undefined, (query) => query.where('deployment.id', '>', after!))
+              .orderBy('deployment.id')
+              .limit(250)
+              .execute();
+            if (!rows.length) break;
+            for (const row of rows) {
+              const location = recordedDeploymentLocation(row);
+              if (location)
+                await db
+                  .updateTable('deployment_records')
+                  .set({ release_scope_key: location.scope, release_path_key: location.path })
+                  .where('id', '=', row.id)
+                  .execute();
+            }
+            after = rows[rows.length - 1]!.id;
+          }
+          await db.schema
+            .createIndex('deployment_records_release_scope')
+            .on('deployment_records')
+            .column('release_scope_key')
+            .execute();
+          await db.schema
+            .createIndex('deployment_records_server_release_path')
+            .on('deployment_records')
+            .columns(['server_id', 'release_path_key'])
+            .execute();
+        },
+        async down(db) {
+          await db.schema.dropIndex('deployment_records_server_release_path').execute();
+          await db.schema.dropIndex('deployment_records_release_scope').execute();
+          await db.schema.alterTable('deployment_records').dropColumn('release_path_key').execute();
+          await db.schema
+            .alterTable('deployment_records')
+            .dropColumn('release_scope_key')
+            .execute();
         },
       } satisfies Migration,
     };

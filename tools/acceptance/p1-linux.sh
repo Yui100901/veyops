@@ -1,169 +1,199 @@
 #!/bin/sh
 set -eu
+umask 077
 
-# Run on the Linux Docker host from a fresh acceptance directory.
-# The acceptance daemon and SSH service share this directory and have no host Docker socket.
-work=$(pwd -P)
-case "$work" in
-  /tmp/veyops-p1-*) ;;
-  *) printf '%s\n' 'Run inside a dedicated /tmp/veyops-p1-* directory.' >&2; exit 2 ;;
-esac
-suffix=$(basename "$work" | sed 's/^veyops-p1-//')
-case "$suffix" in
-  ''|*[!a-zA-Z0-9]*) exit 2 ;;
-esac
-engine="veyops-p1-engine-$suffix"
-network="veyops-p1-net-$suffix"
-base=${VEYOPS_ACCEPT_RUNTIME_IMAGE:-veyops:1.0.0}
-engine_base=${VEYOPS_ACCEPT_ENGINE_IMAGE:-node:24-slim}
-site_base=${VEYOPS_ACCEPT_SITE_IMAGE:-busybox:latest}
-manager="veyops-p1-api-$suffix"
-production="veyops-p1-prod-$suffix"
-revision=${1:?Pass the candidate Git revision}
-case "$revision" in
-  *[!a-f0-9]*) exit 2 ;;
-esac
-test "${#revision}" -eq 40
+# Use a local Linux Docker host. Only the labeled, temporary resources below
+# are started or removed. The existing host Docker socket is never mounted.
+revision=${1:?Pass the full candidate Git SHA}
+database=${2:-sqlite}
+case "$revision" in *[!a-f0-9]*) exit 2 ;; esac
+test "${#revision}" -eq 40 || exit 2
+case "$database" in sqlite|postgres) ;; *) printf '%s\n' 'Choose sqlite or postgres.' >&2; exit 2 ;; esac
 
+repo=$(git rev-parse --show-toplevel)
+test "$(git -C "$repo" rev-parse --verify "$revision^{commit}")" = "$revision"
+if ! git -C "$repo" diff --quiet "$revision" -- tools/acceptance/p1-linux.sh; then
+  printf '%s\n' 'Run the Linux harness from the candidate commit.' >&2
+  exit 2
+fi
+candidate=${VEYOPS_ACCEPT_RUNTIME_IMAGE:?Set VeyOps candidate image built from the specified revision}
+target_image=${VEYOPS_ACCEPT_ENGINE_IMAGE:-node:24-bookworm-slim}
+site_image=busybox:1.36
+postgres_image=${VEYOPS_ACCEPT_POSTGRES_IMAGE:-postgres:17-bookworm}
+for image in "$candidate" "$target_image" "$postgres_image"; do
+  case "$image" in ''|-*|*[!a-zA-Z0-9.:/@_-]*) printf '%s\n' 'Invalid fixture image reference.' >&2; exit 2 ;; esac
+done
+context_host=$(docker context inspect --format '{{(index .Endpoints "docker").Host}}' "$(docker context show)")
+for endpoint in "$context_host" "${DOCKER_HOST:-unix:///var/run/docker.sock}"; do
+  case "$endpoint" in unix:///*) ;; *) printf '%s\n' 'Use a local Unix-socket Docker context.' >&2; exit 2 ;; esac
+done
+if [ "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$candidate")" != "$revision" ]; then
+  printf '%s\n' 'The candidate image revision label must match the supplied Git SHA.' >&2
+  exit 2
+fi
+if [ "$(docker info --format '{{.OSType}}/{{.CgroupVersion}}')" != linux/2 ]; then
+  printf '%s\n' 'This harness requires a local Linux Docker Engine using cgroup v2.' >&2
+  exit 2
+fi
+docker image inspect "$target_image" "$site_image" >/dev/null
+if [ "$database" = postgres ]; then docker image inspect "$postgres_image" >/dev/null; fi
+
+work=$(mktemp -d /tmp/veyops-candidate-XXXXXX)
+prefix=$(basename "$work")
+network="$prefix-net"
+manager="$prefix-api"
+postgres="$prefix-db"
+targets='test-a test-b production-a production-b'
 cleanup() {
-  for name in "$manager" "$production" "$engine"; do
-    if [ "$(docker inspect --format '{{index .Config.Labels "veyops.acceptance"}}' "$name" 2>/dev/null || :)" = "$suffix" ]; then
-      docker rm -fv "$name" >/dev/null
+  status=$?
+  trap - EXIT INT TERM
+  for name in "$manager" "$postgres" "$prefix-test-a" "$prefix-test-b" "$prefix-production-a" "$prefix-production-b"; do
+    if [ "$(docker inspect --type container --format '{{index .Config.Labels "veyops.acceptance"}}' "$name" 2>/dev/null || :)" = "$prefix" ]; then
+      docker rm -fv "$name" >/dev/null || :
     fi
   done
-  if [ "$(docker network inspect --format '{{index .Labels "veyops.acceptance"}}' "$network" 2>/dev/null || :)" = "$suffix" ]; then
-    docker network rm "$network" >/dev/null
+  if [ "$(docker network inspect --format '{{index .Labels "veyops.acceptance"}}' "$network" 2>/dev/null || :)" = "$prefix" ]; then
+    docker network rm "$network" >/dev/null || :
   fi
-  rm -f -- "$work/bootstrap.env"
+  rm -f -- "$work/bootstrap.env" "$work/postgres.env"
+  rm -f -- "$work/host-ssh/fixture-admin" "$work/host-ssh/test-a" "$work/host-ssh/test-b" \
+    "$work/host-ssh/production-a" "$work/host-ssh/production-b"
+  printf 'Candidate artifacts and logs: %s\n' "$work"
+  exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for image in "$base" "$engine_base" "$site_base"; do
-  docker image inspect "$image" >/dev/null
-done
-mkdir -p bin plugins host-ssh target app repo
+git -C "$repo" archive "$revision" tools/acceptance examples/refactor-stage0 | tar -x -C "$work"
+test -f "$work/tools/acceptance/refactor-demo.cjs"
+test -f "$work/tools/acceptance/p1-delivery.cjs"
+test -f "$work/tools/acceptance/target-start.sh"
+mkdir -p "$work/bin" "$work/plugins" "$work/host-ssh" "$work/targets" "$work/app" "$work/repo"
 for tool in dockerd docker containerd containerd-shim-runc-v2 runc; do
   source_path=$(command -v "$tool")
-  cp -L -- "$source_path" "bin/$tool"
+  cp -L -- "$source_path" "$work/bin/$tool"
 done
+dockerd_dir=$(dirname "$(command -v dockerd)")
+proxy=$(command -v docker-proxy || :)
+if [ -z "$proxy" ]; then
+  for path in "$dockerd_dir/docker-proxy" /usr/libexec/docker/docker-proxy /usr/lib/docker/docker-proxy; do
+    if [ -x "$path" ]; then proxy=$path; break; fi
+  done
+fi
+test -x "$proxy"
+cp -L -- "$proxy" "$work/bin/docker-proxy"
 for plugin in compose buildx; do
   source_path=$(docker info --format "{{range .ClientInfo.Plugins}}{{if eq .Name \"$plugin\"}}{{.Path}}{{end}}{{end}}")
   test -f "$source_path"
-  cp -L -- "$source_path" "plugins/docker-$plugin"
+  cp -L -- "$source_path" "$work/plugins/docker-$plugin"
 done
-cp -L -- "$(command -v sshd)" host-ssh/sshd
-ldd host-ssh/sshd | awk '/=> \/.*\(/ {print $3}' | while IFS= read -r file; do
-  case "$(basename "$file")" in
-    libc.so.*|libpthread.so.*|libdl.so.*|libm.so.*|libresolv.so.*|libutil.so.*|librt.so.*) ;;
-    *) cp -L -- "$file" host-ssh/ ;;
-  esac
-done
-ssh-keygen -q -t ed25519 -N '' -f "$work/host-ssh/fixture-host"
-ssh-keygen -q -t ed25519 -N '' -f "$work/host-ssh/fixture-prod"
-ssh-keygen -q -t ed25519 -N '' -f "$work/host-ssh/fixture-admin"
-chmod 600 "$work/host-ssh/fixture-host" "$work/host-ssh/fixture-prod" "$work/host-ssh/fixture-admin"
-
-cat >engine-start.sh <<'SH'
-#!/bin/sh
-set -eu
-export PATH=/accept/bin:$PATH
-mode=${1:-engine}
-if [ "$mode" = engine ]; then
-parent=$(sed -n 's/^0:://p' /proc/self/cgroup | head -n 1)
-case "$parent" in
-  /docker/*|*/docker-*.scope) ;;
-  *) printf '%s\n' 'Cannot identify the acceptance container cgroup.' >&2; exit 2 ;;
-esac
-# Keep the private daemon's supervisor and its resource-limited builds in sibling cgroups.
-group="/sys/fs/cgroup$parent"
-mkdir "$group/acceptance-supervisor"
-printf '%s\n' "$$" >"$group/acceptance-supervisor/cgroup.procs"
-for controller in cpu memory pids; do
-  printf '+%s\n' "$controller" >"$group/cgroup.subtree_control"
-done
-fi
-mkdir -p /run/sshd /root/.ssh /usr/local/lib/docker /accept/target
-chmod 700 /root/.ssh
-cp /accept/host-ssh/fixture-admin.pub /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys
-if ! id sshd >/dev/null 2>&1; then
-  useradd -r -s /usr/sbin/nologin sshd
-fi
-passwd -d root >/dev/null
-ln -s /accept/plugins /usr/local/lib/docker/cli-plugins
-ln -s /accept/docker.sock /var/run/docker.sock
-ln -s /accept/bin/docker /usr/local/bin/docker
-key=fixture-host
-if [ "$mode" = ssh ]; then key=fixture-prod; fi
-cat >/etc/ssh-acceptance <<CONFIG
-Port 22
-PermitRootLogin prohibit-password
-PasswordAuthentication no
-PubkeyAuthentication yes
-UsePAM no
-HostKey /accept/host-ssh/$key
-Subsystem sftp internal-sftp
-CONFIG
-# Keep dependencies for the host sshd in a separate search path.
-if [ "$mode" = ssh ]; then
-  LD_LIBRARY_PATH=/accept/host-ssh exec /accept/host-ssh/sshd -D -f /etc/ssh-acceptance
-fi
-LD_LIBRARY_PATH=/accept/host-ssh /accept/host-ssh/sshd -f /etc/ssh-acceptance
-node -e 'const {createServer}=require("node:http"); const {readFile}=require("node:fs"); createServer((_,res)=>readFile("/srv/veyops-acceptance/test/current/index.html",(error,body)=>{res.statusCode=error?503:200;res.end(error?"not ready":body)})).listen(18080,"0.0.0.0");' &
-rm -f -- /accept/docker.sock
-exec dockerd --host=unix:///accept/docker.sock --storage-driver=vfs --iptables=false --ip6tables=false --userland-proxy=false \
-  --cgroup-parent="$parent" --exec-opt native.cgroupdriver=cgroupfs \
-  --data-root=/accept/engine-data --exec-root=/run/veyops-p1 --pidfile=/run/veyops-p1.pid
-SH
-docker network create --internal --label "veyops.acceptance=$suffix" "$network" >/dev/null
-docker run --pull=never -d --privileged --cgroupns=host --name "$engine" --network "$network" --network-alias target \
-  --label "veyops.acceptance=$suffix" --mount "type=bind,src=$work,dst=/accept" --entrypoint /bin/sh \
-  --mount "type=bind,src=$work/target,dst=/srv/veyops-acceptance" \
-  "$engine_base" /accept/engine-start.sh >/dev/null
-engine_docker() {
-  docker --host "unix://$work/docker.sock" "$@"
+cp -L -- "$(command -v sshd)" "$work/host-ssh/sshd"
+copy_ssh_libraries() {
+  libraries=$(ldd "$1")
+  if printf '%s\n' "$libraries" | grep -q 'not found'; then
+    printf 'Missing SSH library for %s\n' "$1" >&2
+    exit 2
+  fi
+  printf '%s\n' "$libraries" | awk '/=> \/.*\(/ {print $3}' | while IFS= read -r file; do
+    case "$(basename "$file")" in
+      libc.so.*|libpthread.so.*|libdl.so.*|libresolv.so.*|libutil.so.*|librt.so.*|libm.so.*) ;;
+      *) cp -L -- "$file" "$work/host-ssh/" ;;
+    esac
+  done
 }
-for attempt in $(seq 1 45); do
-  if engine_docker info >/dev/null 2>&1; then break; fi
-  if [ "$(docker inspect --format '{{.State.Running}}' "$engine")" != true ]; then break; fi
-  sleep 1
+copy_ssh_libraries "$work/host-ssh/sshd"
+for helper_dir in /usr/lib/openssh /usr/libexec/openssh /usr/libexec; do
+  for helper in sshd-session sshd-auth; do
+    if [ -x "$helper_dir/$helper" ]; then
+      mkdir -p "$work/host-ssh/helpers$helper_dir"
+      cp -L -- "$helper_dir/$helper" "$work/host-ssh/helpers$helper_dir/$helper"
+      copy_ssh_libraries "$helper_dir/$helper"
+    fi
+  done
 done
-if ! engine_docker info >/dev/null 2>&1; then
-  docker logs --tail 35 "$engine" >&2
-  exit 1
-fi
-docker image save "$site_base" | engine_docker image load >image-load.log
-if [ "$engine_base" != "$site_base" ]; then
-  docker image save "$engine_base" | engine_docker image load >>image-load.log
-fi
-engine_docker run --pull=never --rm --cpus 2 --memory 1g --pids-limit 128 "$site_base" sh -c 'printf engine-ready'
-printf '\n'
-if [ "${VEYOPS_ACCEPT_ENGINE_ONLY:-}" = 1 ]; then exit 0; fi
-docker run --pull=never -d --name "$production" --network "$network" --network-alias target-prod \
-  --label "veyops.acceptance=$suffix" --mount "type=bind,src=$work,dst=/accept" --entrypoint /bin/sh \
-  --mount "type=bind,src=$work/target,dst=/srv/veyops-acceptance" \
-  "$engine_base" /accept/engine-start.sh ssh >/dev/null
+ssh-keygen -q -t ed25519 -N '' -f "$work/host-ssh/fixture-admin"
 
-umask 077
+docker network create --internal --label "veyops.acceptance=$prefix" "$network" >/dev/null
+for target in $targets; do
+  mkdir -p "$work/targets/$target/deploy"
+  ssh-keygen -q -t ed25519 -N '' -f "$work/host-ssh/$target"
+  docker run --pull=never -d --privileged --cgroupns=host --name "$prefix-$target" \
+    --network "$network" --network-alias "$target" --label "veyops.acceptance=$prefix" \
+    --mount "type=bind,src=$work,dst=/accept" \
+    --mount "type=bind,src=$work/targets/$target/deploy,dst=/srv/veyops-stage0" \
+    --entrypoint /bin/sh "$target_image" /accept/tools/acceptance/target-start.sh "$target" >/dev/null
+done
+
+target_docker() {
+  socket="$work/targets/$1/docker.sock"
+  shift
+  env -u DOCKER_CONTEXT -u DOCKER_HOST -u DOCKER_TLS_VERIFY docker --host "unix://$socket" "$@"
+}
+for target in $targets; do
+  for attempt in $(seq 1 45); do
+    if target_docker "$target" info >/dev/null 2>&1; then break; fi
+    if [ "$(docker inspect --format '{{.State.Running}}' "$prefix-$target")" != true ]; then break; fi
+    sleep 1
+  done
+  if ! target_docker "$target" info >/dev/null 2>&1; then
+    docker logs --tail 45 "$prefix-$target" >&2
+    exit 1
+  fi
+done
+
+# Copy image archives locally before loading them to avoid masking a failed save in a pipeline.
+docker image save -o "$work/images.tar" "$site_image" "$target_image"
+for target in $targets; do
+  target_docker "$target" image load -i "$work/images.tar" >"$work/targets/$target/image-load.log"
+done
+rm -f -- "$work/images.tar"
+
+if [ "$database" = postgres ]; then
+  password=$(openssl rand -hex 24)
+  {
+    printf 'POSTGRES_DB=veyops_acceptance\nPOSTGRES_USER=veyops\n'
+    printf 'POSTGRES_PASSWORD=%s\n' "$password"
+  } >"$work/postgres.env"
+  docker run --pull=never -d --name "$postgres" --network "$network" --network-alias database \
+    --label "veyops.acceptance=$prefix" --env-file "$work/postgres.env" "$postgres_image" >/dev/null
+  for attempt in $(seq 1 45); do
+    if docker exec "$postgres" pg_isready -h 127.0.0.1 -U veyops -d veyops_acceptance >/dev/null 2>&1; then break; fi
+    sleep 1
+  done
+  docker exec "$postgres" pg_isready -h 127.0.0.1 -U veyops -d veyops_acceptance >/dev/null
+  docker exec "$postgres" createdb -U veyops veyops_restore
+fi
+
 {
-  printf 'NODE_ENV=production\nHOST=0.0.0.0\nPORT=3000\n'
-  printf 'DATABASE_CLIENT=sqlite\nDATABASE_PATH=/accept/app/app.db\nDATA_DIR=/accept/app\nWORKER_ENABLED=true\n'
+  printf 'NODE_ENV=production\nHOST=0.0.0.0\nPORT=3000\nCOOKIE_SECURE=false\nWORKER_ENABLED=true\n'
+  printf 'DATABASE_CLIENT=%s\nDATABASE_PATH=/accept/app/app.db\nDATA_DIR=/accept/app\n' "$database"
+  if [ "$database" = postgres ]; then
+    printf 'DATABASE_URL=postgresql://veyops:%s@database:5432/veyops_acceptance\n' "$password"
+    printf 'VEYOPS_ACCEPT_RESTORE_DATABASE_URL=postgresql://veyops:%s@database:5432/veyops_restore\n' "$password"
+  fi
   printf 'ADMIN_PASSWORD=%s\n' "$(openssl rand -hex 24)"
   printf 'ENCRYPTION_KEY=%s\n' "$(openssl rand -hex 32)"
-  printf 'DOCKER_HOST=unix:///accept/docker.sock\n'
-  printf 'BUILD_HELPER_IMAGE=%s\n' "$engine_base"
-} >bootstrap.env
-test -f dist/apps/api/dist/bootstrap.js
-test -f dist/apps/web/dist/index.html
+  printf 'DOCKER_HOST=unix:///accept/targets/test-a/docker.sock\nNODE_PATH=/app/node_modules\n'
+  printf 'BUILD_HELPER_IMAGE=%s\nVEYOPS_ACCEPT_BUILD_IMAGE=%s\n' "$target_image" "$target_image"
+} >"$work/bootstrap.env"
+{
+  printf 'revision=%s\ndatabase=%s\n' "$revision" "$database"
+  for image in "$candidate" "$target_image" "$site_image"; do
+    printf '%s=%s\n' "$image" "$(docker image inspect --format '{{.Id}}' "$image")"
+  done
+  if [ "$database" = postgres ]; then
+    printf '%s=%s\n' "$postgres_image" "$(docker image inspect --format '{{.Id}}' "$postgres_image")"
+  fi
+} >"$work/candidate.txt"
+
 docker run --pull=never -d --name "$manager" --user root --network "$network" --network-alias manager \
-  --label "veyops.acceptance=$suffix" --env-file bootstrap.env --mount "type=bind,src=$work,dst=/accept" \
-  --mount "type=bind,src=$work/target,dst=/srv/veyops-acceptance" \
+  --label "veyops.acceptance=$prefix" --env-file "$work/bootstrap.env" \
+  --mount "type=bind,src=$work,dst=/accept" \
   --mount "type=bind,src=$work/plugins,dst=/usr/local/lib/docker/cli-plugins,readonly" \
-  --mount "type=bind,src=$work/dist/apps/api/dist,dst=/app/apps/api/dist,readonly" \
-  --mount "type=bind,src=$work/dist/apps/web/dist,dst=/app/apps/web/dist,readonly" \
-  --entrypoint /bin/sh "$base" -eu -c 'export PATH=/accept/bin:$PATH; exec node /accept/p1-delivery.cjs "$@"' sh "$revision" "$site_base" >/dev/null
+  --entrypoint /bin/sh "$candidate" -eu -c 'export PATH=/accept/bin:$PATH; exec node /accept/tools/acceptance/p1-delivery.cjs "$@"' sh "$revision" "$site_image" >/dev/null
 exit_code=$(docker wait "$manager")
-docker logs "$manager"
+docker logs "$manager" >"$work/manager.log" 2>&1
+cat "$work/manager.log"
 test "$exit_code" -eq 0
+test -s "$work/evidence.json"

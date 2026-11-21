@@ -23,7 +23,6 @@ import type {
   ProjectDetail,
   User,
 } from '../models';
-import { ReleaseApprovals, RollbackRelease } from './ReleaseOperations';
 import { ArtifactCleanup, ArtifactRetentionPolicy } from './ArtifactRetention';
 import {
   deliveryGraphRunPath,
@@ -401,12 +400,14 @@ export function DeliveryRecordsPage({
   project,
   query = '',
   scope = {},
+  readOnly = false,
 }: {
   type: 'artifacts' | 'deployments';
   user: User;
   project?: ProjectDetail;
   query?: string;
   scope?: DeliveryScope;
+  readOnly?: boolean;
 }) {
   const records = useResource<
     (Artifact &
@@ -416,11 +417,10 @@ export function DeliveryRecordsPage({
         serverPort?: number | null;
       })[]
   >(`/${type}?${query}`);
-  const [rollback, setRollback] = useState<DeploymentRecord>();
   const [retention, setRetention] = useState<'policy' | 'cleanup'>();
   const [pinning, setPinning] = useState<string>();
   const [pinError, setPinError] = useState('');
-  const canWrite = user.role !== 'VIEWER' && !project?.archived;
+  const canWrite = !readOnly && user.role !== 'VIEWER' && !project?.archived;
   const scopeParams = new URLSearchParams(query);
   const serviceId = scopeParams.get('serviceId');
   const environmentId = scopeParams.get('environmentId');
@@ -457,7 +457,7 @@ export function DeliveryRecordsPage({
         description={
           type === 'artifacts'
             ? '记录构建来源、存储位置和校验信息，追踪每一份交付物。'
-            : '每台服务器独立记录部署与健康检查结果。'
+            : '每台服务器独立记录部署与健康检查结果。审批和回滚在项目执行图中完成。'
         }
         action={
           <div className="row-actions">
@@ -493,7 +493,6 @@ export function DeliveryRecordsPage({
       )}
       <ErrorBanner error={records.error} retry={records.reload} />
       {type === 'artifacts' && <ErrorBanner error={pinError} />}
-      {!project && type === 'deployments' && user.role === 'ADMIN' && <ReleaseApprovals />}
       <Section
         title={type === 'artifacts' ? '产物历史' : '部署历史'}
         subtitle="由构建与部署执行流生成"
@@ -553,7 +552,6 @@ export function DeliveryRecordsPage({
                       <th>结果</th>
                       <th>健康检查</th>
                       <th>结束时间</th>
-                      {canWrite && <th>操作</th>}
                     </>
                   )}
                 </tr>
@@ -582,9 +580,6 @@ export function DeliveryRecordsPage({
                     project?.services.find(({ id }) => id === r.serviceId)?.name ||
                     project?.archivedServices?.find(({ id }) => id === r.serviceId)?.name ||
                     (project ? r.serviceId : '查看所属项目');
-                  const archivedScope =
-                    project?.archivedServices?.some(({ id }) => id === r.serviceId) ||
-                    project?.archivedEnvironments?.some(({ id }) => id === r.environmentId);
                   return (
                     <tr key={r.id}>
                       <td>
@@ -786,6 +781,8 @@ export function DeliveryRecordsPage({
                                   Compose {r.composeRelease.template.path ?? '产物归档'}{' '}
                                   {r.composeRelease.template.source === 'SERVICE_ENVIRONMENT' &&
                                     `v${r.composeRelease.template.version} · `}
+                                  {r.composeRelease.template.source === 'REPOSITORY_FILE' &&
+                                    `${r.composeRelease.template.commitSha.slice(0, 12)} · `}
                                   {r.composeRelease.template.checksum.slice(0, 12)}
                                 </small>
                                 <small
@@ -813,22 +810,6 @@ export function DeliveryRecordsPage({
                             {healthStatusLabels[r.healthStatus] || r.healthStatus || '未配置'}
                           </td>
                           <td className="nowrap muted">{formatTime(r.finishedAt)}</td>
-                          {canWrite && (
-                            <td>
-                              {r.isCurrent || archivedScope ? null : r.rollbackAvailable ? (
-                                <button
-                                  className="button secondary small"
-                                  onClick={() => setRollback(r)}
-                                >
-                                  回滚到此版本
-                                </button>
-                              ) : r.status === 'SUCCESS' ? (
-                                <span className="muted">
-                                  {r.rollbackUnavailableReason || '缺少可用的回滚快照'}
-                                </span>
-                              ) : null}
-                            </td>
-                          )}
                         </>
                       )}
                     </tr>
@@ -839,9 +820,6 @@ export function DeliveryRecordsPage({
           </div>
         )}
       </Section>
-      {type === 'deployments' && rollback && (
-        <RollbackRelease record={rollback} onClose={() => setRollback(undefined)} scope={scope} />
-      )}
       {type === 'artifacts' && retention === 'policy' && (
         <ArtifactRetentionPolicy scope={retentionScope} onClose={() => setRetention(undefined)} />
       )}

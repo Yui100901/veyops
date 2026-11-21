@@ -49,11 +49,13 @@ export function EnvironmentVariables({
   environmentId,
   serviceId,
   user,
+  editable = true,
 }: {
   projectId: string;
   environmentId?: string;
   serviceId?: string;
   user: User;
+  editable?: boolean;
 }) {
   const projectPath = `/projects/${encodeURIComponent(projectId)}/variables`;
   const path = environmentId
@@ -87,6 +89,7 @@ export function EnvironmentVariables({
             left.key.localeCompare(right.key),
           )}
           user={user}
+          editable={editable}
         />
       )}
       <ErrorBanner error={projectVariables.error} retry={projectVariables.reload} />

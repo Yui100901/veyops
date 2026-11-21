@@ -24,10 +24,14 @@ async function checkReviews(databaseUrl?: string) {
     WORKER_ENABLED: 'false',
   });
   const { AppModule } = await import('../app.module.js');
+  const { LegacyDeliveryWriteFixtureModule } =
+    await import('./helpers/legacy-delivery-write-fixture.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { DatabaseService } = await import('../core/database/database.service.js');
   const { SourceReviewService } = await import('../modules/deployments/source-review.service.js');
-  const module = await Test.createTestingModule({ imports: [AppModule] }).compile();
+  const module = await Test.createTestingModule({
+    imports: [AppModule, LegacyDeliveryWriteFixtureModule],
+  }).compile();
   const app = module.createNestApplication<NestExpressApplication>({ logger: false });
   configureApp(app);
   try {

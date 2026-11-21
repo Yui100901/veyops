@@ -16,7 +16,9 @@ export function isGraphTriggerKind(value: unknown): value is GraphTriggerKind {
 }
 
 export function graphNodeRequiresIsolation(type: string): boolean {
-  return type === 'SHELL' || type === 'CHECK' || type === 'REGISTER_ARTIFACT';
+  return (
+    type === 'SHELL' || type === 'CHECK' || type === 'REGISTER_ARTIFACT' || type === 'HEALTH_CHECK'
+  );
 }
 
 function requireEnabled(kind: GraphTriggerKind) {
@@ -36,7 +38,11 @@ export function assertAutomaticGraphFlow(
       if (node.type === 'FLOW_CALL' && node.flowId) flows.add(node.flowId);
       if (graphNodeRequiresIsolation(node.type))
         throw new ForbiddenException(`节点「${node.name}」的自动执行尚未通过隔离验收`);
-      if (node.type === 'BUILD' || node.type === 'DEPLOY_ARTIFACT') {
+      if (
+        node.type === 'BUILD' ||
+        node.type === 'DEPLOY_ARTIFACT' ||
+        node.type === 'ROLLBACK_ARTIFACT'
+      ) {
         requireEnabled(kind);
         hasDelivery = true;
       }

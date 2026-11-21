@@ -9,7 +9,7 @@ import {
   Optional,
 } from '@nestjs/common';
 import { createHash, createHmac, randomUUID } from 'node:crypto';
-import type { Selectable, Transaction } from 'kysely';
+import type { Kysely, Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import { encryptionKey } from '../../core/config';
 import type { Database } from '../../core/database/schema';
@@ -18,9 +18,10 @@ import type { ExecutionVariables } from '../../infrastructure/execution-variable
 import { AuditService } from '../audit/audit.service';
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
 import { artifactSourceRef } from '../artifacts/artifact-sources';
-import { archivedComposeTemplate } from '../artifacts/artifacts.service';
+import { archivedComposeTemplate, deploymentFingerprint } from '../artifacts/artifacts.service';
 import { PipelinesService } from '../pipelines/pipelines.service';
 import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
+import { unhealthyGraphProbeExitCode } from '../pipelines/graph-release-health';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
 import {
   deliveryExecutionProfile,
@@ -32,6 +33,7 @@ import {
 } from '../pipelines/delivery-execution-profile';
 import { pendingReleaseApprovalTime } from '../deployments/release-policy';
 import { SourceReviewConflict } from '../deployments/release-source-policy';
+import type { ComposeTemplateReference } from '../service-configs/compose-template-reference';
 import type { SourceReviewProof } from '../deployments/source-review.service';
 import { lockProjectGraph, requireProject } from '../projects/project-relations';
 import { runResourceReferences } from '../projects/project-resource-references';
@@ -61,6 +63,7 @@ import {
 import type { GraphInputsDto, GraphPreviewDto, GraphRunDto } from './graph-runner.controller';
 import { graphInputIssue, withNodePlanIssue, withPlanIssue } from './graph-execution-plan-issues';
 import { GraphNodeTasks, graphCheckoutOutputs, type GraphNodePlan } from './graph-node-tasks';
+import { latestReleaseInspections } from './graph-release-inspection.service';
 import {
   assertAutomaticGraphFlow,
   assertGraphAutomation,
@@ -115,8 +118,22 @@ import {
   graphNodeOutput,
   graphTaskKeyPrefix,
   isDelivery,
+  isRelease,
   isNodeTerminal,
 } from './graph-run-lifecycle';
+import {
+  artifactReviewSources,
+  assertReviewedSources,
+  graphGateHash,
+  graphReleaseResult,
+  readGraphGate,
+  reviewSources,
+  sameIds,
+  type GraphGateDecision,
+  type GraphGateProof,
+  type GraphGateScope,
+  type GraphReleaseGate,
+} from './graph-release-gates';
 
 type Run = Selectable<Database['execution_flow_runs']>;
 type NodeRun = Selectable<Database['execution_node_runs']>;
@@ -154,6 +171,10 @@ interface Delivery {
   targetInputs?: GraphInputsDto;
   configuration?: DeliveryConfiguration;
   environmentFile?: GraphEnvironmentPlan;
+  buildEnvironment?: {
+    fixed: Record<string, string>;
+    sources: GraphVariableSource[];
+  };
   dependencySources?: Record<string, { repositoryId: string; commitSha: string }>;
   sourceSnapshot?: {
     id?: string;
@@ -166,6 +187,8 @@ interface Delivery {
   }[];
   pipelineHash: string;
   profile?: DeliveryExecutionProfile;
+  rollbackBaseline?: Record<string, string>;
+  composeTemplate?: ComposeTemplateReference;
 }
 interface RunSnapshot {
   inputs: GraphInputsDto;
@@ -300,11 +323,14 @@ function publicDelivery(delivery: Delivery, definition: GraphDefinition) {
     artifactFromNodeName: nodeName(delivery.artifactFromNodeId),
     pipelineHash: undefined,
     profile: undefined,
+    method: delivery.profile?.delivery?.method,
+    composeSource: delivery.profile?.delivery?.composeSource,
     alternatives: undefined,
     artifactBinding: undefined,
     targetInputs: undefined,
     configuration: undefined,
     environmentFile: undefined,
+    buildEnvironment: undefined,
     possibleArtifacts: delivery.alternatives?.map((candidate) => ({
       nodeId: candidate.artifactFromNodeId,
       nodeName: nodeName(candidate.artifactFromNodeId),
@@ -320,7 +346,9 @@ function publicDelivery(delivery: Delivery, definition: GraphDefinition) {
   };
 }
 function isNativeTask(node: Pick<GraphNode, 'type'>) {
-  return ['CHECKOUT', 'SHELL', 'CHECK', 'LOAD_ENV', 'REGISTER_ARTIFACT'].includes(node.type);
+  return ['CHECKOUT', 'SHELL', 'CHECK', 'LOAD_ENV', 'REGISTER_ARTIFACT', 'HEALTH_CHECK'].includes(
+    node.type,
+  );
 }
 
 interface AutomaticRunOrigin {
@@ -331,11 +359,27 @@ interface AutomaticRunOrigin {
   afterInsert?: (tx: Transaction<Database>, runId: string) => Promise<void>;
 }
 
+export interface GraphPlanAccessScope {
+  serverIds: string[];
+  repositoryIds: string[];
+  serviceIds: string[];
+  unbounded: boolean;
+}
+
+export type GraphPlanAuthorizer = (scope: GraphPlanAccessScope) => void | Promise<void>;
+
+export interface GraphRunControl {
+  authorizePlan?: GraphPlanAuthorizer;
+  beforeInsert?: (tx: Transaction<Database>) => Promise<void>;
+  afterInsert?: (tx: Transaction<Database>, runId: string) => Promise<void>;
+}
+
 interface PlanContext {
   trigger?: Values;
   automation?: GraphAutomation;
   allowRetired?: boolean;
   rootId?: string;
+  authorizePlan?: GraphPlanAuthorizer;
 }
 
 function digest(value: unknown) {
@@ -344,6 +388,20 @@ function digest(value: unknown) {
     return Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)));
   });
   return createHash('sha256').update(encoded).digest('hex');
+}
+
+function buildVariableFingerprint(variables: ExecutionVariables, key: string) {
+  return createHmac('sha256', encryptionKey())
+    .update('execution-plan:build-node-variable\0')
+    .update(
+      digest([
+        key,
+        variables.variables[key],
+        variables.secretVariables[key],
+        variables.secretCredentialNonces?.[key],
+      ]),
+    )
+    .digest('hex');
 }
 
 function checkRequest(previous: { request_hash: string }, hash: string) {
@@ -421,7 +479,7 @@ export class GraphRunnerService implements OnModuleInit {
     projectId: string,
     refs: GraphArtifactRef[],
     field?: GraphField,
-    options: { targets?: readonly string[]; rootId?: string } = {},
+    options: { targets?: readonly string[]; rootId?: string; db?: Kysely<Database> } = {},
   ) {
     if (!refs.length) return [];
     const ids = refs.map((ref) =>
@@ -430,7 +488,7 @@ export class GraphRunnerService implements OnModuleInit {
     const logical = refs.flatMap((ref) =>
       'artifactId' in ref && !ref.instanceId ? [ref.artifactId] : [],
     );
-    const rows = await this.database.db
+    const rows = await (options.db ?? this.database.db)
       .selectFrom('artifacts')
       .leftJoin('pipeline_runs as build', 'build.id', 'artifacts.pipeline_run_id')
       .leftJoin('tasks as build_task', 'build_task.id', 'build.task_id')
@@ -748,6 +806,8 @@ export class GraphRunnerService implements OnModuleInit {
       requireCodeReview: 'requireCodeReview' in preview && preview.requireCodeReview === true,
       ...('sourceReviews' in preview && { sourceReviews: preview.sourceReviews }),
       artifactIds: 'artifactIds' in preview ? preview.artifactIds : [],
+      rollbackBaseline: 'rollbackBaseline' in preview ? preview.rollbackBaseline : undefined,
+      composeTemplate: 'graphDeployment' in preview ? preview.graphDeployment?.template : undefined,
       sourceSnapshot: preview.nodeSources ?? [
         {
           repositoryId: preview.definition.repositoryId,
@@ -868,21 +928,48 @@ export class GraphRunnerService implements OnModuleInit {
       };
     }
 
-    const fromBuild = (definition: PipelineDefinition, type?: string) =>
-      makeProfile(
+    const { method: configuredMethod, composeSource, ...deploySettings } = node.deploy ?? {};
+    const afterRelease =
+      flow.compiled?.nodes[node.id]?.inputBindings.afterRelease ??
+      flow.inputBindings?.[node.id]?.afterRelease;
+    const fromBuild = (definition: PipelineDefinition, type?: string): DeliveryExecutionProfile => {
+      const artifactType =
+        type === 'DOCKER_IMAGE' ? 'DOCKER_IMAGE' : type ? 'FILE' : definition.artifactType;
+      const method = configuredMethod ?? (artifactType === 'DOCKER_IMAGE' ? 'COMPOSE' : 'FILE');
+      const profile = makeProfile(
         Object.assign(
           new PipelineDefinitionDto(),
           {
             repositoryId: definition.repositoryId,
-            artifactType:
-              type === 'DOCKER_IMAGE' ? 'DOCKER_IMAGE' : type ? 'FILE' : definition.artifactType,
+            artifactType,
             registryId: definition.registryId,
             imageRepository: definition.imageRepository,
           },
-          node.deploy,
+          deploySettings,
         ),
-        Object.keys(node.deploy ?? {}),
+        Object.keys(deploySettings),
       );
+      return {
+        ...profile,
+        delivery: {
+          method,
+          ...(method === 'COMPOSE' && {
+            composeSource:
+              composeSource?.kind === 'REPOSITORY_FILE'
+                ? {
+                    kind: 'REPOSITORY_FILE',
+                    repositoryId: composeSource.repositoryId!,
+                    commitSha: composeSource.commitSha!,
+                    path: composeSource.path!,
+                  }
+                : { kind: 'ARTIFACT' },
+          }),
+          ...(node.type === 'ROLLBACK_ARTIFACT' && {
+            rollback: afterRelease ? 'AFTER_RELEASE' : 'CURRENT',
+          }),
+        },
+      };
+    };
     const binding =
       flow.compiled?.nodes[node.id]?.inputBindings.artifact ??
       flow.inputBindings?.[node.id]?.artifact;
@@ -923,8 +1010,19 @@ export class GraphRunnerService implements OnModuleInit {
         { ...base, artifactIds: ids },
         profile,
       );
+      const wrapped = wrap(preview, profile);
+      const archives = refs.flatMap((ref) => (ref.composeTemplate ? [ref.composeTemplate] : []));
+      const archive = archives[0];
       return {
-        ...wrap(preview, profile),
+        ...wrapped,
+        composeTemplate:
+          wrapped.composeTemplate ??
+          (profile.delivery?.method === 'COMPOSE' &&
+          archive &&
+          archives.length === refs.length &&
+          archives.every(({ checksum }) => checksum === archive.checksum)
+            ? archive
+            : undefined),
         artifactRefs: refs.map((ref) => ({
           ...ref,
           verificationStatus: 'AVAILABLE',
@@ -1000,6 +1098,8 @@ export class GraphRunnerService implements OnModuleInit {
         requireApproval: plan.requireApproval,
         requireCodeReview: plan.requireCodeReview,
         sourceReviewPendingMaterialization: plan.sourceReviewPendingMaterialization,
+        rollbackBaseline: plan.rollbackBaseline,
+        composeTemplate: plan.graphDeployment?.template,
         artifactIds: [],
         artifactFromNodeId: source.nodeId,
         artifactFromField: source.fieldId,
@@ -1079,7 +1179,7 @@ export class GraphRunnerService implements OnModuleInit {
     projectId: string,
     flowId: string,
     request: GraphPreviewDto,
-    { trigger, automation, allowRetired = false, rootId }: PlanContext = {},
+    { trigger, automation, allowRetired = false, rootId, authorizePlan }: PlanContext = {},
   ) {
     await requireProject(this.database.db, projectId);
     const { graphId, definition } = await this.published(
@@ -1118,6 +1218,15 @@ export class GraphRunnerService implements OnModuleInit {
       environmentId?: string;
     }[] = [];
     const publishedDeliveries: Delivery[] = [];
+    const plannedServices = new Set<string>();
+    const gates: {
+      flowId: string;
+      nodeId: string;
+      name: string;
+      kind: 'SOURCE_REVIEW' | 'APPROVAL' | 'HEALTH_CHECK' | 'ROLLBACK_ARTIFACT';
+      releaseNodeId?: string;
+      buildNodeId?: string;
+    }[] = [];
     const scriptsPrepared: { flowId: string; nodeId: string; plan: GraphNodePlan }[] = [];
     const environmentFiles: ({ flowId: string; nodeId: string } & NonNullable<
       ReturnType<typeof publicEnvironmentFile>
@@ -1138,6 +1247,7 @@ export class GraphRunnerService implements OnModuleInit {
       producerField?: string;
     }[] = [];
     let invocations = 0;
+    let unbounded = false;
     const sets = new Map<string, Promise<FrozenEnvironmentSet>>();
     const credentials: Record<string, string> = Object.create(null);
     const evidenceByNode = new Map<string, NodeEvidence>();
@@ -1253,6 +1363,21 @@ export class GraphRunnerService implements OnModuleInit {
           serviceId: referenceId(values.service) ?? scope.serviceId,
           environmentId: referenceId(values.environment) ?? scope.environmentId,
         };
+        if (nodeScope.serviceId) plannedServices.add(nodeScope.serviceId);
+        if (
+          node.type === 'SOURCE_REVIEW' ||
+          node.type === 'APPROVAL' ||
+          node.type === 'HEALTH_CHECK' ||
+          node.type === 'ROLLBACK_ARTIFACT'
+        )
+          gates.push({
+            flowId: current.id,
+            nodeId: node.id,
+            name: node.name,
+            kind: node.type,
+            releaseNodeId: node.approval?.releaseNodeId,
+            buildNodeId: node.approval?.buildNodeId,
+          });
         if (node.type === 'CHECKOUT' || (node.type === 'BUILD' && values.version))
           checkouts[node.id] = checkoutProvenance(current, node, values, input.evidence, trigger);
         if (isDelivery(node)) {
@@ -1268,6 +1393,28 @@ export class GraphRunnerService implements OnModuleInit {
             rootId,
             parameterProduction,
           ).catch((error: unknown) => withNodePlanIssue(error, current, node, nodeScope));
+          if (node.type === 'BUILD' && environment.evidence.length) {
+            for (const field of environment.evidence.filter(({ state }) => state === 'DEFERRED')) {
+              deferred.push({
+                flowId: current.id,
+                nodeId: node.id,
+                field: field.fieldId,
+                producerNodeId: field.source?.nodeId,
+                producerField: field.source?.fieldId,
+              });
+            }
+            delivery.buildEnvironment = {
+              fixed: Object.fromEntries(
+                environment.evidence
+                  .filter(({ state }) => state !== 'DEFERRED')
+                  .map(({ fieldId }) => [
+                    fieldId,
+                    buildVariableFingerprint(environment.variables, fieldId),
+                  ]),
+              ),
+              sources: environment.sources,
+            };
+          }
           plans.set(key, delivery);
           publishedDeliveries.push(delivery);
           if (node.type === 'BUILD' && delivery.profile) {
@@ -1293,6 +1440,8 @@ export class GraphRunnerService implements OnModuleInit {
               ]);
           }
         } else if (isNativeTask(node)) {
+          if (['SHELL', 'CHECK', 'HEALTH_CHECK', 'REGISTER_ARTIFACT'].includes(node.type))
+            unbounded = true;
           if (!this.nodeTasks)
             withNodePlanIssue(new BadRequestException('执行节点服务不可用'), current, node);
           const plan = await this.nodeTasks
@@ -1418,6 +1567,7 @@ export class GraphRunnerService implements OnModuleInit {
               sourceFieldId: unresolved.source?.fieldId,
               message: '子流使用外部资源，该参数需要在预览时固定',
             });
+          if (unresolved) unbounded = true;
           if (!unresolved) {
             const childArgs = await this.resolveParameters(
               projectId,
@@ -1487,6 +1637,45 @@ export class GraphRunnerService implements OnModuleInit {
       };
     };
     const prepared = await prepareFlow(flow, inputs, '', parameterSources);
+    if (authorizePlan) {
+      const deliveries = publishedDeliveries.flatMap((plan) => [
+        plan,
+        ...(plan.alternatives ?? []),
+      ]);
+      const unique = (values: (string | undefined)[]) => [
+        ...new Set(values.filter((value): value is string => Boolean(value))),
+      ];
+      await authorizePlan({
+        serverIds: unique([
+          ...deliveries.flatMap(({ serverIds, artifactRefs }) => [
+            ...serverIds,
+            ...(artifactRefs ?? []).map((ref) => stringValue(ref.serverId)),
+          ]),
+          ...scripts.map(({ serverId }) => serverId),
+        ]),
+        repositoryIds: unique([
+          ...checkoutRows.map(({ repositoryId }) => repositoryId),
+          ...environmentFiles.map((file) =>
+            'repositoryId' in file ? file.repositoryId : undefined,
+          ),
+          ...deliveries.flatMap((plan) => {
+            const source = plan.profile?.delivery?.composeSource;
+            return [
+              ...(plan.sourceSnapshot ?? []).map(({ repositoryId }) => repositoryId),
+              source?.kind === 'REPOSITORY_FILE' ? source.repositoryId : undefined,
+            ];
+          }),
+        ]).filter((id) => id !== unversionedArtifactRepository),
+        serviceIds: unique([
+          ...deliveries
+            .filter(({ serviceUnscoped }) => !serviceUnscoped)
+            .map(({ serviceId }) => serviceId),
+          ...plannedServices,
+          flow.serviceId,
+        ]),
+        unbounded,
+      });
+    }
     const selectedNodes = new Set(prepared.selectedNodeIds);
     const publicDeliveries = publishedDeliveries.map((delivery) =>
       publicDelivery(delivery, definition),
@@ -1507,23 +1696,25 @@ export class GraphRunnerService implements OnModuleInit {
       ],
       variables: [
         ...nativeVariables,
-        ...publishedDeliveries.flatMap(({ flowId, nodeId, configuration, environmentFile }) =>
-          graphVariableSources(
-            environmentFile,
-            (configuration?.variables ?? []).map(({ key, source, sensitive, ...meta }) => ({
+        ...publishedDeliveries.flatMap(
+          ({ flowId, nodeId, configuration, environmentFile, buildEnvironment }) =>
+            graphVariableSources(
+              environmentFile,
+              (configuration?.variables ?? []).map(({ key, source, sensitive, ...meta }) => ({
+                key,
+                source,
+                isSecret: sensitive,
+                ...meta,
+              })),
+              buildEnvironment?.sources,
+            ).map(({ key, source, isSecret, overriddenSources }) => ({
+              flowId,
+              nodeId,
               key,
               source,
-              isSecret: sensitive,
-              ...meta,
+              sensitive: isSecret,
+              overriddenSources,
             })),
-          ).map(({ key, source, isSecret, overriddenSources }) => ({
-            flowId,
-            nodeId,
-            key,
-            source,
-            sensitive: isSecret,
-            overriddenSources,
-          })),
         ),
       ],
       deferred,
@@ -1558,6 +1749,7 @@ export class GraphRunnerService implements OnModuleInit {
     for (const row of publishedDeliveries) {
       section(row.flowId, row.nodeId, '变量及其来源', [
         row.configuration?.variableFingerprint,
+        row.buildEnvironment?.fixed,
         executionPlan.variables.filter(
           (item) => item.flowId === row.flowId && item.nodeId === row.nodeId,
         ),
@@ -1572,6 +1764,9 @@ export class GraphRunnerService implements OnModuleInit {
         row.sourceReviews,
         row.sourceReviewPendingMaterialization,
         row.requireApproval,
+        row.profile?.delivery,
+        row.rollbackBaseline,
+        row.composeTemplate,
       ]);
     }
     const configurationHash = digest([
@@ -1604,6 +1799,7 @@ export class GraphRunnerService implements OnModuleInit {
       deliveries: publicDeliveries,
       checkouts: checkoutRows,
       scripts,
+      gates,
       executionPlan,
       planSections,
     };
@@ -1712,6 +1908,7 @@ export class GraphRunnerService implements OnModuleInit {
     request: GraphRunDto,
     userId: string,
     origin?: AutomaticRunOrigin,
+    control?: GraphRunControl,
   ) {
     const db = this.database.db;
     const requestHash = digest([
@@ -1733,7 +1930,7 @@ export class GraphRunnerService implements OnModuleInit {
     const old = await previous();
     if (old) {
       checkRequest(old, requestHash);
-      await this.advance(old.id);
+      if (!control) await this.advance(old.id);
       return this.get(projectId, old.id);
     }
     const {
@@ -1751,6 +1948,7 @@ export class GraphRunnerService implements OnModuleInit {
     } = await this.prepare(projectId, flowId, request, {
       trigger: origin?.metadata,
       automation: origin?.authorization,
+      authorizePlan: control?.authorizePlan,
     }).catch((error: unknown) => {
       if (request.expectedPlanSections && error instanceof HttpException && error.getStatus() < 500)
         throw new ConflictException({
@@ -1858,6 +2056,7 @@ export class GraphRunnerService implements OnModuleInit {
       )
         throw new ConflictException('计划引用的资源已变化，请重新预览');
       await origin?.beforeInsert?.(tx);
+      await control?.beforeInsert?.(tx);
       const inserted = await this.insertRun(
         tx,
         {
@@ -1890,14 +2089,17 @@ export class GraphRunnerService implements OnModuleInit {
         inputs,
         plans,
       );
-      if (inserted) await origin?.afterInsert?.(tx, inserted.id);
+      if (inserted) {
+        await origin?.afterInsert?.(tx, inserted.id);
+        await control?.afterInsert?.(tx, inserted.id);
+      }
       return inserted;
     });
     if (!row) {
       const stored = (await previous())!;
       checkRequest(stored, requestHash);
       // The other submitter may have committed the graph but not yet dispatched its ready nodes.
-      await this.advance(stored.id);
+      if (!control) await this.advance(stored.id);
       return this.get(projectId, stored.id);
     }
     await this.advance(row.id);
@@ -1950,7 +2152,121 @@ export class GraphRunnerService implements OnModuleInit {
       .execute();
   }
 
-  private async waitAtNode(tx: Transaction<Database>, row: NodeRun, node: GraphNode, now: number) {
+  private rollbackExpected(delivery: Delivery, value: unknown) {
+    if (delivery.profile?.delivery?.rollback !== 'AFTER_RELEASE') return delivery.rollbackBaseline;
+    const result = graphReleaseResult(value);
+    if (
+      result.operation !== 'CHECK' ||
+      result.healthStatus !== 'UNHEALTHY' ||
+      !result.targets.some(
+        ({ health, probeExitCode }) =>
+          health === 'UNHEALTHY' && probeExitCode === unhealthyGraphProbeExitCode,
+      ) ||
+      result.serviceId !== delivery.serviceId ||
+      !sameIds(
+        result.targets.map(({ serverId }) => serverId),
+        delivery.serverIds,
+      ) ||
+      result.targets.some(
+        ({ health, status, probeExitCode }) =>
+          status !== 'SUCCESS' ||
+          !(
+            (health === 'HEALTHY' && probeExitCode === 0) ||
+            (health === 'UNHEALTHY' && probeExitCode === unhealthyGraphProbeExitCode)
+          ),
+      )
+    )
+      throw new ConflictException('回滚需要同一服务和目标上明确不健康的发布结果');
+    return Object.fromEntries(
+      result.targets.map(({ serverId, deploymentId }) => [serverId, deploymentId]),
+    );
+  }
+
+  private async releaseScope(
+    db: Kysely<Database>,
+    run: Run,
+    rootId: string,
+    releaseNodeId: string,
+    plan: Delivery,
+    values: Values,
+  ): Promise<Extract<GraphGateScope, { kind: 'RELEASE' }>> {
+    const refs = await this.artifactReferences(
+      run.project_id,
+      artifactBindingRefs(values.artifact ?? plan.artifactIds),
+      undefined,
+      { db, rootId, targets: plan.serverIds },
+    );
+    if (!refs.length || refs.some(({ serviceId }) => serviceId !== plan.serviceId))
+      throw new ConflictException('审批需要已登记且归属当前服务的实际产物');
+    const artifactIds = refs.map(({ id }) => id).sort();
+    const artifacts = await db
+      .selectFrom('artifacts')
+      .selectAll()
+      .where('id', 'in', artifactIds)
+      .execute();
+    if (artifacts.length !== artifactIds.length)
+      throw new ConflictException('待审批的产物实例已变化');
+    return {
+      kind: 'RELEASE',
+      releaseNodeId,
+      serviceId: plan.serviceId,
+      serverIds: [...plan.serverIds].sort(),
+      artifactIds,
+      artifactFingerprints: artifacts.map(deploymentFingerprint).sort(),
+      rollbackBaseline: this.rollbackExpected(plan, values.afterRelease),
+    };
+  }
+
+  private async sourceReviewScope(
+    db: Kysely<Database>,
+    run: Run,
+    node: GraphNode,
+    rootId: string,
+    nodes: ReadonlyMap<string, NodeRun>,
+    flow: GraphFlow,
+    bindings: Parameters<typeof inspectNodeInputs>[2],
+  ): Promise<Extract<GraphGateScope, { kind: 'SOURCE_REVIEW' }>> {
+    const buildNodeId = node.approval?.buildNodeId;
+    if (buildNodeId) {
+      const target = nodes.get(buildNodeId);
+      if (target?.node_type !== 'BUILD' || !target.dispatch_json || target.status === 'SKIPPED')
+        throw new ConflictException('找不到待审核的已确认构建计划');
+      const build = JSON.parse(target.dispatch_json) as Delivery;
+      if (build.nodeId !== buildNodeId || build.flowId !== run.flow_id)
+        throw new ConflictException('已确认的构建计划与本次审核范围不一致');
+      const sources = reviewSources(build.sourceSnapshot ?? []);
+      if (!sources.length) throw new ConflictException('构建计划缺少已固定的源码来源');
+      return { kind: 'SOURCE_REVIEW', buildNodeId, sources, artifactIds: [] };
+    }
+
+    const input = inspectNodeInputs(flow, node, bindings);
+    const invalid = input.evidence.find(({ state }) => state === 'ERROR' || state === 'DEFERRED');
+    if (invalid) throw fieldIssue(flow, node, invalid);
+    const source = input.values.source as { repositoryId: string; commitSha: string } | undefined;
+    if (source) return { kind: 'SOURCE_REVIEW', sources: reviewSources([source]), artifactIds: [] };
+
+    const refs = await this.artifactReferences(
+      run.project_id,
+      artifactBindingRefs(input.values.artifact),
+      undefined,
+      { db, rootId },
+    );
+    const artifactIds = refs.map(({ id }) => id).sort();
+    return {
+      kind: 'SOURCE_REVIEW',
+      sources: await artifactReviewSources(db, artifactIds),
+      artifactIds,
+    };
+  }
+
+  private async waitAtNode(
+    tx: Transaction<Database>,
+    row: NodeRun,
+    node: GraphNode,
+    now: number,
+    scope?: GraphGateScope,
+    configurationHash?: string,
+  ) {
     const startedAt = row.started_at ?? now;
     if (node.type === 'DELAY') {
       const wakeAt = startedAt + node.delaySeconds! * 1000;
@@ -1966,7 +2282,19 @@ export class GraphRunnerService implements OnModuleInit {
     if (expiresAt <= now) {
       await this.expireApproval(tx, row, expiresAt, now);
     } else if (row.status !== 'WAITING') {
-      await this.markWaiting(tx, row, startedAt, '等待管理员审批。', { expiresAt });
+      await this.markWaiting(
+        tx,
+        row,
+        startedAt,
+        node.type === 'SOURCE_REVIEW' ? '等待管理员审核实际源码。' : '等待管理员审批。',
+        {
+          expiresAt,
+          ...(scope && {
+            scope,
+            scopeHash: graphGateHash(row.run_id, node.id, configurationHash!, scope),
+          }),
+        },
+      );
     }
   }
 
@@ -1975,7 +2303,7 @@ export class GraphRunnerService implements OnModuleInit {
     row: NodeRun,
     startedAt: number,
     log: string,
-    output: { wakeAt: number } | { expiresAt: number },
+    output: { wakeAt: number } | GraphGateDecision,
   ) {
     await tx
       .updateTable('execution_node_runs')
@@ -1997,6 +2325,7 @@ export class GraphRunnerService implements OnModuleInit {
       'TIMED_OUT',
       '审批等待已超时。',
       {
+        ...(JSON.parse(row.output_json ?? '{}') as GraphGateDecision),
         decision: 'EXPIRED',
         expiresAt,
         decidedAt: now,
@@ -2087,17 +2416,25 @@ export class GraphRunnerService implements OnModuleInit {
         if (isNodeTerminal(row.status)) continue;
         if (row.task_id) {
           const task = byTask.get(row.task_id)!;
-          const status = taskStatus(task.status, task.available_at);
+          let status = taskStatus(task.status, task.available_at);
           if (isNodeTerminal(status)) {
             const output =
-              status === 'SUCCESS' && this.nodeTasks
+              (status === 'SUCCESS' ||
+                isRelease(node) ||
+                (node.type === 'HEALTH_CHECK' && status === 'NEEDS_ATTENTION')) &&
+              this.nodeTasks
                 ? await this.nodeTasks.output(task.id, node, tx)
                 : undefined;
+            if (node.type === 'HEALTH_CHECK' && output?.status === 'UNKNOWN')
+              status = 'NEEDS_ATTENTION';
             await this.terminalNode(
               tx,
               row,
               status,
               task.error_summary ??
+                (node.type === 'HEALTH_CHECK' && status === 'NEEDS_ATTENTION'
+                  ? '健康状态未知，需人工核查当前发布。'
+                  : undefined) ??
                 (status === 'SUCCESS'
                   ? '节点任务已完成，详情见关联任务。'
                   : '节点任务已结束，详情见关联任务。'),
@@ -2180,8 +2517,43 @@ export class GraphRunnerService implements OnModuleInit {
         if (parents.some((parent) => !isNodeTerminal(parent.status))) continue;
         if (parents.some((parent) => parent.status !== 'SUCCESS')) {
           await this.terminalNode(tx, row, 'SKIPPED', '上游节点未成功。');
-        } else if (node.type === 'DELAY' || node.type === 'APPROVAL') {
-          await this.waitAtNode(tx, row, node, now);
+        } else if (
+          node.type === 'DELAY' ||
+          node.type === 'APPROVAL' ||
+          node.type === 'SOURCE_REVIEW'
+        ) {
+          try {
+            const rootId = snapshot.rootId ?? run.id;
+            let scope: GraphGateScope | undefined;
+            if (row.status !== 'WAITING' && node.type === 'SOURCE_REVIEW') {
+              scope = await this.sourceReviewScope(tx, run, node, rootId, byId, flow, bindings);
+            } else if (row.status !== 'WAITING' && node.approval?.releaseNodeId) {
+              const releaseId = node.approval.releaseNodeId;
+              const release = flow.nodes.find(({ id }) => id === releaseId);
+              const target = byId.get(releaseId);
+              if (!release || !target?.dispatch_json)
+                throw new ConflictException('没有待审批的已确认发布计划');
+              const input = inspectNodeInputs(flow, release, bindings);
+              const invalid = input.evidence.find(
+                ({ fieldId, state }) =>
+                  ['artifact', 'afterRelease'].includes(fieldId) &&
+                  ['ERROR', 'DEFERRED'].includes(state),
+              );
+              if (invalid) throw fieldIssue(flow, release, invalid);
+              scope = await this.releaseScope(
+                tx,
+                run,
+                rootId,
+                releaseId,
+                JSON.parse(target.dispatch_json) as Delivery,
+                input.values,
+              );
+            }
+            await this.waitAtNode(tx, row, node, now, scope, run.configuration_hash);
+          } catch (error) {
+            if (!(error instanceof HttpException)) throw error;
+            await this.terminalNode(tx, row, 'FAILED', error.message, undefined, now);
+          }
         } else if (isDelivery(node) || isNativeTask(node) || node.type === 'FLOW_CALL') {
           const child = node.type === 'FLOW_CALL' ? this.flow(definition, node.flowId!) : undefined;
           const input = inspectNodeInputs(flow, node, bindings, child);
@@ -2239,6 +2611,9 @@ export class GraphRunnerService implements OnModuleInit {
                   typeof value === 'object' &&
                   'status' in value &&
                   value.status === 'SUCCESS' &&
+                  (!('operation' in value) ||
+                    value.operation !== 'CHECK' ||
+                    ('healthStatus' in value && value.healthStatus === 'HEALTHY')) &&
                   'serviceId' in value &&
                   value.serviceId === flow.serviceId &&
                   (!scope.environmentId ||
@@ -2524,18 +2899,25 @@ export class GraphRunnerService implements OnModuleInit {
     );
   }
 
-  private async dispatch(run: Run, node: NodeRun, snapshot: RunSnapshot, bindings: Values) {
+  private async dispatch(
+    run: Run,
+    node: NodeRun,
+    flow: GraphFlow,
+    snapshot: RunSnapshot,
+    bindings: Values,
+    environment: ReturnType<typeof inspectNodeEnvironment>,
+  ) {
     const stored = JSON.parse(node.dispatch_json!) as Delivery;
     const rootId = snapshot.rootId ?? run.id;
-    const revisions =
-      node.node_type === 'DEPLOY_ARTIFACT'
-        ? await this.artifactReferences(
-            run.project_id,
-            artifactBindingRefs(bindings.artifact ?? stored.artifactIds),
-            undefined,
-            { rootId, targets: stored.serverIds },
-          )
-        : [];
+    const release = node.node_type === 'DEPLOY_ARTIFACT' || node.node_type === 'ROLLBACK_ARTIFACT';
+    const revisions = release
+      ? await this.artifactReferences(
+          run.project_id,
+          artifactBindingRefs(bindings.artifact ?? stored.artifactIds),
+          undefined,
+          { rootId, targets: stored.serverIds },
+        )
+      : [];
     const artifacts = revisions.map(({ id }) => id);
     let delivery = stored;
     if (stored.alternatives) {
@@ -2583,6 +2965,61 @@ export class GraphRunnerService implements OnModuleInit {
       if (!picked) throw new ConflictException('实际产物与已确认的来源不匹配');
       delivery = picked;
     }
+    const db = this.database.db;
+    const gate: GraphReleaseGate = { runId: run.id, nodeId: node.node_id };
+    const linkedReview =
+      node.node_type === 'BUILD'
+        ? flow.nodes.find(
+            ({ type, approval }) =>
+              type === 'SOURCE_REVIEW' && approval?.buildNodeId === node.node_id,
+          )
+        : undefined;
+    const review = bindings.review as (GraphGateProof & { runId: string }) | undefined;
+    if (linkedReview && review?.nodeId !== linkedReview.id)
+      throw new ConflictException('构建缺少本次计划对应的源码审核凭证');
+    if (review) {
+      if (review.runId !== run.id) throw new ConflictException('源码审核凭证必须来自本次运行');
+      const scope = await readGraphGate(db, run.project_id, run.id, review, 'SOURCE_REVIEW');
+      if (node.node_type === 'BUILD') {
+        assertReviewedSources(scope, delivery.sourceSnapshot ?? [], node.node_id);
+        if (scope.kind === 'SOURCE_REVIEW' && scope.artifactIds.length)
+          throw new ConflictException('构建需要审核实际源码，已有产物的审核凭证仅可用于发布');
+      } else if (scope.kind === 'SOURCE_REVIEW' && scope.buildNodeId) {
+        throw new ConflictException('此审核凭证绑定了本次构建');
+      }
+      gate.review = { nodeId: review.nodeId, actorId: review.actorId, hash: review.hash };
+    }
+    if (release) {
+      const approvalNodes = flow.nodes.filter(
+        ({ type, approval }) => type === 'APPROVAL' && approval?.releaseNodeId === node.node_id,
+      );
+      if (approvalNodes.length) {
+        const approved = await db
+          .selectFrom('execution_node_runs')
+          .select(['node_id', 'output_json'])
+          .where('run_id', '=', run.id)
+          .where(
+            'node_id',
+            'in',
+            approvalNodes.map(({ id }) => id),
+          )
+          .where('status', '=', 'SUCCESS')
+          .executeTakeFirst();
+        const decision: GraphGateDecision = JSON.parse(approved?.output_json ?? '{}');
+        if (!approved || !decision.actorId || !decision.scopeHash)
+          throw new ConflictException('发布缺少本次运行的管理员审批');
+        const proof = {
+          nodeId: approved.node_id,
+          actorId: decision.actorId,
+          hash: decision.scopeHash,
+        };
+        await readGraphGate(db, run.project_id, run.id, proof, 'APPROVAL');
+        const scope = await this.releaseScope(db, run, rootId, node.node_id, delivery, bindings);
+        if (graphGateHash(run.id, approved.node_id, run.configuration_hash, scope) !== proof.hash)
+          throw new ConflictException('发布范围已变化，需重新预览和审批');
+        gate.approval = proof;
+      }
+    }
     const inputs = delivery.targetInputs ?? snapshot.inputs;
     const { targetId, serverIds, groupIds, strategy, maxParallel, failurePolicy } = inputs;
     const values = {
@@ -2606,10 +3043,27 @@ export class GraphRunnerService implements OnModuleInit {
           ? { ...delivery.profile, artifactRootRunId: rootId }
           : delivery.profile),
       graphAutomation: snapshot.automation,
+      graphGate: gate.approval || gate.review ? gate : undefined,
+      rollbackExpected: release
+        ? this.rollbackExpected(delivery, bindings.afterRelease)
+        : undefined,
       afterInsert: (tx: Transaction<Database>, taskId: string) =>
         this.linkTask(tx, run, node, taskId, delivery.pipelineId),
     };
     if (node.node_type === 'BUILD') {
+      if (environment.evidence.length && !delivery.buildEnvironment)
+        throw new ConflictException('此构建缺少已确认的节点环境计划，请重新预览');
+      const changed = Object.entries(delivery.buildEnvironment?.fixed ?? {}).find(
+        ([key, expected]) => buildVariableFingerprint(environment.variables, key) !== expected,
+      );
+      if (changed)
+        throw new ExecutionPlanIssueError({
+          code: 'CONFIGURATION',
+          flowId: flow.id,
+          nodeId: node.node_id,
+          fieldId: changed[0],
+          message: '已确认的构建变量或凭据发生变化，请重新预览',
+        });
       const dependencies = Object.fromEntries(
         Object.entries(delivery.dependencySources ?? {}).map(([alias, source]) => {
           const workspace = bindings['dependency_' + alias] as GraphWorkspaceRef | undefined;
@@ -2654,6 +3108,10 @@ export class GraphRunnerService implements OnModuleInit {
             workspace: bindings.workspace as GraphWorkspaceRef | undefined,
             ...(Object.keys(dependencies).length ? { dependencies } : {}),
             variables,
+            ...(environment.sources.length && {
+              nodeEnvironment: environment.variables,
+              nodeEnvironmentSources: environment.sources,
+            }),
             trigger: snapshot.trigger ?? { triggeredAt: run.created_at },
           },
         },
@@ -2748,7 +3206,7 @@ export class GraphRunnerService implements OnModuleInit {
             environment,
           );
         } else {
-          await this.dispatch(state.run, node, state.snapshot, values);
+          await this.dispatch(state.run, node, state.flow, state.snapshot, values, environment);
         }
       } catch (error) {
         // A task id proves a committed dispatch even if a response or post-commit audit failed.
@@ -2868,6 +3326,7 @@ export class GraphRunnerService implements OnModuleInit {
     nodeId: string,
     decision: 'APPROVE' | 'REJECT',
     userId: string,
+    expectedScopeHash?: string,
   ) {
     const expired = await this.database.db.transaction().execute(async (tx) => {
       // Serialize the decision with cancellation, timeout, and worker advancement.
@@ -2886,7 +3345,7 @@ export class GraphRunnerService implements OnModuleInit {
         .selectAll()
         .where('run_id', '=', runId)
         .where('node_id', '=', nodeId)
-        .where('node_type', '=', 'APPROVAL')
+        .where('node_type', 'in', ['APPROVAL', 'SOURCE_REVIEW'])
         .executeTakeFirst();
       if (!row) throw new NotFoundException('审批节点不存在');
       if (row.status !== 'WAITING' || row.started_at === null)
@@ -2899,30 +3358,51 @@ export class GraphRunnerService implements OnModuleInit {
         await this.expireApproval(tx, row, expiresAt, now);
         return true;
       }
+      const waiting: GraphGateDecision = JSON.parse(row.output_json ?? '{}');
+      if (
+        waiting.scopeHash !== expectedScopeHash ||
+        (waiting.scope &&
+          graphGateHash(runId, nodeId, run.configuration_hash, waiting.scope) !== expectedScopeHash)
+      )
+        throw new ConflictException('审批范围已变化，请刷新并核对当前范围');
+      if (node.type === 'SOURCE_REVIEW' && waiting.scope?.kind !== 'SOURCE_REVIEW')
+        throw new ConflictException('源码审核缺少有效的固定来源');
       const approved = decision === 'APPROVE';
       await this.terminalNode(
         tx,
         row,
         approved ? 'SUCCESS' : 'FAILED',
-        approved ? '管理员已批准。' : '管理员已拒绝。',
+        approved
+          ? node.type === 'SOURCE_REVIEW'
+            ? '管理员已审核通过。'
+            : '管理员已批准。'
+          : '管理员已拒绝。',
         {
+          ...waiting,
           decision,
           actorId: userId,
           decidedAt: now,
           expiresAt,
+          ...(approved &&
+            node.type === 'SOURCE_REVIEW' && {
+              review: { runId, nodeId, actorId: userId, hash: waiting.scopeHash },
+            }),
         },
         row.started_at,
         now,
       );
       await this.audit.record(
         userId,
-        'execution-flow.approval.decision',
+        node.type === 'SOURCE_REVIEW'
+          ? 'execution-flow.source-review.decision'
+          : 'execution-flow.approval.decision',
         'flow-run',
         runId,
         {
           projectId,
           nodeId,
           decision,
+          scopeHash: waiting.scopeHash,
         },
         tx,
       );
@@ -3020,7 +3500,8 @@ export class GraphRunnerService implements OnModuleInit {
       row.inputs_json,
     ) as RunSnapshot;
     const deliveries = rows.flatMap(({ dispatch, type }) => {
-      if (!dispatch || (type !== 'BUILD' && type !== 'DEPLOY_ARTIFACT')) return [];
+      if (!dispatch || (type !== 'BUILD' && !isRelease({ type: type as GraphNode['type'] })))
+        return [];
       const delivery = JSON.parse(dispatch) as Delivery;
       return [publicDelivery(delivery, definition)];
     });
@@ -3029,6 +3510,7 @@ export class GraphRunnerService implements OnModuleInit {
       ? await this.database.db
           .selectFrom('task_targets')
           .select([
+            'id as targetRowId',
             'task_id as taskId',
             'server_id as serverId',
             'server_name_snapshot as serverName',
@@ -3041,8 +3523,25 @@ export class GraphRunnerService implements OnModuleInit {
           .orderBy('server_name_snapshot')
           .execute()
       : [];
-    const targetsByTask = new Map<string, typeof targetRows>();
-    for (const target of targetRows) {
+    const inspectionTasks = new Set(
+      rows
+        .filter(({ type }) =>
+          ['DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT', 'HEALTH_CHECK'].includes(type),
+        )
+        .map(({ nodeTaskId }) => nodeTaskId),
+    );
+    const observations = await latestReleaseInspections(
+      this.database.db,
+      targetRows.flatMap(({ taskId, targetRowId }) =>
+        inspectionTasks.has(taskId) ? [targetRowId] : [],
+      ),
+    );
+    type TargetDetail = Omit<(typeof targetRows)[number], 'targetRowId'> & {
+      inspection?: ReturnType<typeof observations.get>;
+    };
+    const targetsByTask = new Map<string, TargetDetail[]>();
+    for (const { targetRowId, ...value } of targetRows) {
+      const target: TargetDetail = { ...value, inspection: observations.get(targetRowId) };
       const saved = targetsByTask.get(target.taskId);
       if (saved) saved.push(target);
       else targetsByTask.set(target.taskId, [target]);
@@ -3072,7 +3571,13 @@ export class GraphRunnerService implements OnModuleInit {
         checkout: checkoutProvenance?.[n.nodeId],
         variableSources:
           task?.graphModule?.variableSources ??
-          (n.dispatch ? this.nodeVariableSources(n.dispatch, n.type) : undefined),
+          (n.dispatch
+            ? this.nodeVariableSources(
+                n.dispatch,
+                n.type,
+                task?.pipeline?.graph?.nodeEnvironmentSources,
+              )
+            : undefined),
       };
     });
     const built = await this.taskArtifacts(
@@ -3118,7 +3623,11 @@ export class GraphRunnerService implements OnModuleInit {
     };
   }
 
-  private nodeVariableSources(dispatch: string, type: string) {
+  private nodeVariableSources(
+    dispatch: string,
+    type: string,
+    actualBuildSources?: readonly GraphVariableSource[],
+  ) {
     const plan = JSON.parse(dispatch) as GraphNodePlan | Delivery;
     if ('pipelineId' in plan) {
       return graphVariableSources(
@@ -3127,6 +3636,7 @@ export class GraphRunnerService implements OnModuleInit {
           ...entry,
           isSecret: sensitive,
         })),
+        actualBuildSources ?? plan.buildEnvironment?.sources,
       );
     }
     if (type === 'LOAD_ENV' && plan.type === 'LOAD_ENV') return plan.variables;

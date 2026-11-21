@@ -35,6 +35,7 @@ export const graphFieldTypes = {
   WORKSPACE: '运行工作区',
   SOURCE: '实际源码版本',
   RELEASE: '服务发布结果',
+  REVIEW: '源码审核凭证',
   REPORT: '检查结果或报告',
   CREDENTIAL: '凭据引用',
   VARIABLES: '加载的环境变量',
@@ -229,6 +230,15 @@ function scalar(field: GraphField, value: unknown): boolean {
     case 'REPORT':
     case 'VARIABLES':
       return graphRecord(value);
+    case 'REVIEW':
+      return (
+        graphRecord(value) &&
+        uuid(value.runId) &&
+        safeGraphId(value.nodeId) &&
+        uuid(value.actorId) &&
+        typeof value.hash === 'string' &&
+        /^[a-f0-9]{64}$/.test(value.hash)
+      );
   }
 }
 
@@ -290,7 +300,7 @@ export function validateGraphField(field: GraphField, declaration: 'INPUT' | 'OU
     return '默认值不符合字段类型或与取值规则冲突';
   if (
     declaration === 'INPUT' &&
-    ['WORKSPACE', 'SOURCE', 'RELEASE', 'REPORT', 'VARIABLES'].includes(field.type)
+    ['WORKSPACE', 'SOURCE', 'RELEASE', 'REVIEW', 'REPORT', 'VARIABLES'].includes(field.type)
   )
     return '执行期间生成的数据须绑定上游模块输出';
   return undefined;
@@ -380,6 +390,9 @@ const shellOutputs = [
   field('workspace', 'WORKSPACE'),
 ];
 const allArtifacts = { ...field('artifacts', 'ARTIFACT', true), multiple: true };
+const artifactsInput = { ...field('artifact', 'ARTIFACT', true), multiple: true };
+const reviewInput = field('review', 'REVIEW');
+const releaseOutput = field('release', 'RELEASE', true);
 
 interface ModulePorts {
   id: string;
@@ -437,6 +450,7 @@ const graphModules = {
       field('source', 'SOURCE'),
       field('workspace', 'WORKSPACE'),
       field('variables', 'VARIABLES'),
+      reviewInput,
       ...serviceEnvTargets,
     ],
     [allArtifacts],
@@ -454,8 +468,23 @@ const graphModules = {
   ),
   DEPLOY_ARTIFACT: modulePorts(
     'deploy.artifact',
-    [{ ...field('artifact', 'ARTIFACT', true), multiple: true }, ...serviceEnvTargets],
+    [artifactsInput, reviewInput, ...serviceEnvTargets],
+    [releaseOutput],
+  ),
+  ROLLBACK_ARTIFACT: modulePorts(
+    'deploy.rollback',
+    [artifactsInput, reviewInput, field('afterRelease', 'RELEASE'), ...serviceEnvTargets],
+    [releaseOutput],
+  ),
+  HEALTH_CHECK: modulePorts(
+    'deploy.health',
     [field('release', 'RELEASE', true)],
+    [releaseOutput, field('status', 'TEXT', true), field('healthy', 'BOOLEAN', true)],
+  ),
+  SOURCE_REVIEW: modulePorts(
+    'delivery.source-review',
+    [field('source', 'SOURCE'), { ...artifactsInput, required: false }],
+    [field('review', 'REVIEW', true)],
   ),
   CONDITION: modulePorts('control.condition', [branchValue], []),
   SWITCH: modulePorts('control.switch', [branchValue], []),
@@ -493,6 +522,8 @@ export const graphCatalog = {
 export function graphModulePorts(node: GraphNode, calledFlow?: GraphFlow): ModulePorts | undefined {
   const definition = (graphModules as Partial<Record<GraphNode['type'], ModulePorts>>)[node.type];
   if (!definition) return undefined;
+  if (node.type === 'SOURCE_REVIEW' && node.approval?.buildNodeId)
+    return { ...definition, inputs: [] };
   if (node.type === 'FLOW_CALL')
     return {
       ...definition,

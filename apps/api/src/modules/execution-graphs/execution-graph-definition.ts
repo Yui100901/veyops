@@ -22,7 +22,7 @@ import {
 } from 'class-validator';
 import { isGitBranchName } from '../projects/git-ref';
 import { redactTaskLog } from '../tasks/task-log.service';
-import { safeDeployPath } from '../pipelines/pipeline.validation';
+import { relativePath, safeDeployPath } from '../pipelines/pipeline.validation';
 import {
   GraphCompileError,
   GraphField,
@@ -50,6 +50,9 @@ const nodeTypes = [
   'BUILD',
   'REGISTER_ARTIFACT',
   'DEPLOY_ARTIFACT',
+  'ROLLBACK_ARTIFACT',
+  'HEALTH_CHECK',
+  'SOURCE_REVIEW',
   'CONDITION',
   'SWITCH',
   'DELAY',
@@ -88,6 +91,8 @@ class GraphApproval {
   @Min(1)
   @Max(maxApprovalSeconds)
   timeoutSeconds?: number;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) releaseNodeId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) buildNodeId?: string;
 }
 
 class GraphNodePosition {
@@ -199,7 +204,25 @@ export class GraphBuildSettings {
   artifacts?: GraphArtifactDeclaration[];
 }
 
+class GraphComposeSource {
+  @IsIn(['ARTIFACT', 'REPOSITORY_FILE']) kind!: 'ARTIFACT' | 'REPOSITORY_FILE';
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() repositoryId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(commitFormat) commitSha?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @Length(1, 300) path?: string;
+}
+
+class GraphHealthCheck {
+  @IsString() @Length(1, 65536) @Matches(/\S/) command!: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsInt() @Min(1) @Max(180) timeoutSeconds?: number;
+}
+
 export class GraphDeploySettings {
+  @ValidateIf((_o, v) => v !== undefined) @IsIn(['FILE', 'COMPOSE']) method?: 'FILE' | 'COMPOSE';
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphComposeSource)
+  composeSource?: GraphComposeSource;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) deployPath?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(300) composeFilePath?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(65536) startCommand?: string;
@@ -236,6 +259,11 @@ export class GraphNode {
   @ValidateNested()
   @Type(() => GraphDeploySettings)
   deploy?: GraphDeploySettings;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => GraphHealthCheck)
+  healthCheck?: GraphHealthCheck;
   @ValidateIf((_o, v) => v !== undefined)
   @IsObject()
   @ValidateNested()
@@ -483,7 +511,7 @@ function validateAdvancedNode(node: GraphNode) {
   } else if (node.delaySeconds !== undefined) {
     throw new BadRequestException('仅延时节点可配置等待秒数');
   }
-  if (node.type === 'APPROVAL') {
+  if (node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW') {
     const timeout = node.approval?.timeoutSeconds;
     if (
       node.approval === null ||
@@ -491,6 +519,11 @@ function validateAdvancedNode(node: GraphNode) {
         (!Number.isInteger(timeout) || timeout < 1 || timeout > maxApprovalSeconds))
     )
       throw new BadRequestException('审批超时须在 1 到 604800 秒之间');
+    const { buildNodeId, releaseNodeId } = node.approval ?? {};
+    if (releaseNodeId !== undefined && (node.type !== 'APPROVAL' || !safeGraphId(releaseNodeId)))
+      throw new BadRequestException('仅人工审批节点可关联有效的发布节点 ID');
+    if (buildNodeId !== undefined && (node.type !== 'SOURCE_REVIEW' || !safeGraphId(buildNodeId)))
+      throw new BadRequestException('仅源码审核节点可关联有效的构建节点 ID');
   } else if (node.approval !== undefined) {
     throw new BadRequestException('仅审批节点可配置审批超时');
   }
@@ -558,14 +591,35 @@ export function validateGraphDefinition(definition: GraphDefinition) {
           throw new BadRequestException('请使用功能节点配置构建和部署');
         if (
           (node.build !== undefined && node.type !== 'BUILD') ||
-          (node.deploy !== undefined && node.type !== 'DEPLOY_ARTIFACT') ||
+          (node.deploy !== undefined &&
+            node.type !== 'DEPLOY_ARTIFACT' &&
+            node.type !== 'ROLLBACK_ARTIFACT') ||
+          (node.healthCheck !== undefined && node.type !== 'HEALTH_CHECK') ||
           (node.registerArtifacts !== undefined && node.type !== 'REGISTER_ARTIFACT') ||
           (node.loadEnvironment !== undefined && node.type !== 'LOAD_ENV') ||
           (node.environmentSet !== undefined && node.type !== 'START')
         )
           throw new BadRequestException('功能配置与节点模块不匹配');
-        if (node.type === 'DEPLOY_ARTIFACT' && node.deploy?.deployPath)
+        if (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') {
+          if (!node.deploy?.deployPath) throw new BadRequestException('请填写节点的发布目录');
           safeDeployPath(node.deploy.deployPath);
+          const template = node.deploy.composeSource;
+          if (template && node.deploy.method === 'FILE')
+            throw new BadRequestException('文件发布不能声明 Compose 模板');
+          if (template?.kind === 'REPOSITORY_FILE') {
+            if (!template.repositoryId || !template.commitSha || !template.path)
+              throw new BadRequestException('仓库 Compose 模板需要仓库、完整提交 SHA 和路径');
+            relativePath(template.path);
+          } else if (template && (template.repositoryId || template.commitSha || template.path)) {
+            throw new BadRequestException('产物 Compose 模板不能包含仓库字段');
+          }
+        }
+        if (
+          node.type === 'HEALTH_CHECK' &&
+          (!node.healthCheck?.command?.trim() ||
+            redactTaskLog(node.healthCheck.command) !== node.healthCheck.command)
+        )
+          throw new BadRequestException('请填写健康检查命令并通过变量引用传入凭据');
         if (node.build?.branch && (!isGitBranchName(node.build.branch) || node.build.commitSha))
           throw new BadRequestException('构建须使用有效分支或固定提交 SHA');
         const ports = graphModulePorts(node);

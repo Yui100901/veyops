@@ -197,7 +197,7 @@ function checksumOf(text: string) {
   return createHash('sha256').update(text).digest('hex');
 }
 
-function deploymentFingerprint(row: Selectable<ArtifactsTable>) {
+export function deploymentFingerprint(row: Selectable<ArtifactsTable>) {
   return checksumOf(
     JSON.stringify([
       row.id,
@@ -759,7 +759,10 @@ export class ArtifactsService {
       !row ||
       applicationServer(row) !== candidate.serverId ||
       (row.temporary_root_id && row.temporary_root_id !== snapshot.artifactRootRunId) ||
-      !hasDeployableMetadata(row, Boolean(snapshot.managedCompose))
+      !hasDeployableMetadata(
+        row,
+        Boolean(snapshot.managedCompose || snapshot.graphDeployment?.template),
+      )
     )
       throw new ConflictException('构建产物不可发布或与当前任务范围不一致');
     if (candidate.fingerprint && candidate.fingerprint !== deploymentFingerprint(row))
@@ -783,6 +786,7 @@ export class ArtifactsService {
     }
     if (
       !snapshot.managedCompose &&
+      !snapshot.graphDeployment?.template &&
       row.compose_yaml &&
       checksumOf(row.compose_yaml) !== row.compose_checksum
     )

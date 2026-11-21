@@ -1,23 +1,16 @@
 import {
-  Body,
   ConflictException,
   Controller,
   Get,
   Injectable,
   NotFoundException,
-  Param,
-  ParseUUIDPipe,
-  Post,
   Query,
-  Req,
 } from '@nestjs/common';
-import { Matches } from 'class-validator';
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseService } from '../../core/database/database.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
-import type { AuthRequest } from '../auth/auth.guard';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
 import { assertGraphAutomation } from '../execution-graphs/graph-automatic-delivery';
 import { ServersService } from '../servers/servers.service';
@@ -32,10 +25,6 @@ import {
   pendingReleaseApprovalTime,
   serviceReleasePolicy,
 } from './release-policy';
-
-class RollbackConfirmationDto {
-  @Matches(/^[a-f0-9]{64}$/) confirmationHash!: string;
-}
 
 @Injectable()
 export class ReleaseRequestsService {
@@ -174,12 +163,7 @@ export class ReleaseRequestsService {
     await assertCurrentTargets(db, { ...source.snapshot, rollbackOfDeploymentId: row.id }, [
       server,
     ]);
-    const current = await this.deployments.current(
-      db,
-      row.service_id,
-      row.environment_id,
-      row.server_id,
-    );
+    const current = await this.deployments.currentSnapshot(db, source.snapshot, row.server_id);
     const { policy, deployPath } = await serviceReleasePolicy(
       db,
       row.service_id,
@@ -187,6 +171,7 @@ export class ReleaseRequestsService {
     );
     if (
       !current ||
+      current.status !== 'SUCCESS' ||
       current.deploy_path !== row.deploy_path ||
       (deployPath && deployPath !== row.deploy_path)
     )
@@ -281,13 +266,8 @@ export class ReleaseRequestsService {
       const currentReviews = await this.deployments.assertSourceReview(snapshot, { db: tx });
       if (JSON.stringify(sourceReviews) !== JSON.stringify(currentReviews))
         throw new ConflictException('代码审核结果已变化，请重新预览回滚');
-      const current = await this.deployments.current(
-        tx,
-        snapshot.serviceId,
-        snapshot.environmentId,
-        server.id,
-      );
-      if (current?.id !== snapshot.expectedCurrentDeploymentId)
+      const current = await this.deployments.currentSnapshot(tx, snapshot, server.id);
+      if (current?.id !== snapshot.expectedCurrentDeploymentId || current?.status !== 'SUCCESS')
         throw new ConflictException('当前发布已变化，请重新预览回滚');
       const taskId = await this.tasks.createInTransaction(
         tx,
@@ -341,23 +321,5 @@ export class ReleaseRequestsController {
   constructor(private readonly releases: ReleaseRequestsService) {}
   @Roles('ADMIN') @Get('approvals') approvals(@Query() filters: DeliveryRecordFilters) {
     return this.releases.listApprovals(filters);
-  }
-  @Roles('ADMIN') @Post('approvals/:id/approve') approve(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: AuthRequest,
-  ) {
-    return this.releases.approve(id, req.user.id);
-  }
-  @Roles('ADMIN', 'OPERATOR') @Post(':id/rollback/preview') preview(
-    @Param('id', ParseUUIDPipe) id: string,
-  ) {
-    return this.releases.preview(id);
-  }
-  @Roles('ADMIN', 'OPERATOR') @Post(':id/rollback') rollback(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Body() dto: RollbackConfirmationDto,
-    @Req() req: AuthRequest,
-  ) {
-    return this.releases.rollback(id, dto.confirmationHash, req.user.id);
   }
 }

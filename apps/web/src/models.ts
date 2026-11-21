@@ -108,6 +108,13 @@ export interface DeploymentRecord extends DeploymentSummary {
 }
 export type ComposeTemplateReference =
   | { source: 'ARCHIVE'; path?: string; checksum: string }
+  | {
+      source: 'REPOSITORY_FILE';
+      path: string;
+      repositoryId: string;
+      commitSha: string;
+      checksum: string;
+    }
   | { source: 'SERVICE_ENVIRONMENT'; path: string; version: number; checksum: string };
 export type ComposeReleaseEvidence = {
   template: ComposeTemplateReference;

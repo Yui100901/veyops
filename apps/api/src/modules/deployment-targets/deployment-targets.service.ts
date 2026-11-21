@@ -1,18 +1,13 @@
 import {
   BadRequestException,
-  Body,
   ConflictException,
   Controller,
-  Delete,
   Get,
   Global,
   Injectable,
   Module,
   NotFoundException,
   Param,
-  Patch,
-  Post,
-  Req,
 } from '@nestjs/common';
 import {
   ArrayMaxSize,
@@ -34,8 +29,6 @@ import { DatabaseService } from '../../core/database/database.service';
 import { ServersService } from '../servers/servers.service';
 import { AuditService } from '../audit/audit.service';
 import { SystemSettingsService } from '../system/system-settings.service';
-import { Roles } from '../auth/auth.decorators';
-import type { AuthRequest } from '../auth/auth.guard';
 import { lockProjectGraph } from '../projects/project-relations';
 import {
   assertProjectResourceRemovable,
@@ -189,25 +182,6 @@ class DeploymentTargetsController {
   }
   @Get(':id') get(@Param('id') id: string) {
     return this.service.get(id);
-  }
-  @Roles('ADMIN', 'OPERATOR') @Post() create(
-    @Body() dto: DeploymentTargetDto,
-    @Req() req: AuthRequest,
-  ) {
-    return this.service.save(dto, req.user.id);
-  }
-  @Roles('ADMIN', 'OPERATOR') @Patch(':id') update(
-    @Param('id') id: string,
-    @Body() dto: DeploymentTargetDto,
-    @Req() req: AuthRequest,
-  ) {
-    return this.service.save(dto, req.user.id, id);
-  }
-  @Roles('ADMIN', 'OPERATOR') @Delete(':id') remove(
-    @Param('id') id: string,
-    @Req() req: AuthRequest,
-  ) {
-    return this.service.remove(id, req.user.id);
   }
 }
 @Global()

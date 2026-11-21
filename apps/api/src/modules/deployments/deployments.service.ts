@@ -4,6 +4,7 @@ import type { Kysely, Selectable } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database, DeploymentRecordsTable } from '../../core/database/schema';
 import type { PipelineSnapshot, PipelineTarget } from '../pipelines/pipeline.types';
+import type { TaskPayload } from '../tasks/tasks.types';
 import { lockTaskLease, TaskLeaseUnavailableError } from '../tasks/task-lease';
 import { assertCurrentTargets, serviceReleasePolicy } from './release-policy';
 import {
@@ -14,6 +15,8 @@ import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
 import { DeliveryRecordFilters } from '../projects/delivery-filters';
 import { SourceReviewService } from './source-review.service';
 import type { ComposeReleaseEvidence } from '../service-configs/compose-template-reference';
+import { assertGraphReleaseGate } from '../execution-graphs/graph-release-gates';
+import { deploymentScopeKey, normalizeReleasePath, type ReleaseScope } from './deployment-scope';
 
 export type DeploymentHealth = 'NOT_CHECKED' | 'HEALTHY' | 'FAILED' | 'UNKNOWN';
 @Injectable()
@@ -22,17 +25,43 @@ export class DeploymentsService {
     private readonly database: DatabaseService,
     @Optional() private readonly sourceReviews?: SourceReviewService,
   ) {}
-  async current(db: Kysely<Database>, serviceId: string, environmentId: string, serverId: string) {
+  async currentSnapshot(db: Kysely<Database>, scope: ReleaseScope, serverId: string) {
     return db
       .selectFrom('deployment_records')
-      .select(['id', 'deploy_path', 'release_snapshot_json'])
-      .where('service_id', '=', serviceId)
-      .where('environment_id', '=', environmentId)
-      .where('server_id', '=', serverId)
+      .select([
+        'id',
+        'deploy_path',
+        'release_snapshot_json',
+        'compose_release_json',
+        'status',
+        'activated_at',
+      ])
+      .where('release_scope_key', '=', deploymentScopeKey(scope, serverId))
       .where((eb) => eb.or([eb('activated_at', 'is not', null), eb('status', '=', 'SUCCESS')]))
-      .orderBy((eb) => eb.fn.coalesce('activated_at', 'started_at'), 'desc')
+      .orderBy(
+        (eb) => eb.fn.coalesce('activated_at', 'started_at'),
+        (order) => order.desc().nullsLast(),
+      )
       .orderBy('id', 'desc')
       .executeTakeFirst();
+  }
+
+  async assertGraphReleasePath(db: Kysely<Database>, scope: ReleaseScope, serverId: string) {
+    if (!scope.graphDeployment) return;
+    const occupied = await db
+      .selectFrom('deployment_records')
+      .select('release_scope_key')
+      .where('server_id', '=', serverId)
+      .where('release_path_key', '=', normalizeReleasePath(scope.definition.deployPath))
+      .where((eb) => eb.or([eb('activated_at', 'is not', null), eb('status', '=', 'SUCCESS')]))
+      .orderBy(
+        (eb) => eb.fn.coalesce('activated_at', 'started_at'),
+        (order) => order.desc().nullsLast(),
+      )
+      .orderBy('id', 'desc')
+      .executeTakeFirst();
+    if (occupied && occupied.release_scope_key !== deploymentScopeKey(scope, serverId))
+      throw new ConflictException('部署目录已有其他发布，请先核查当前部署方式及归属');
   }
 
   async assertAutomaticDelivery(taskId: string, snapshot: PipelineSnapshot) {
@@ -64,12 +93,18 @@ export class DeploymentsService {
   async assertApproval(taskId: string, snapshot: PipelineSnapshot, targets?: PipelineTarget[]) {
     await this.assertAutomaticDelivery(taskId, snapshot);
     const db = this.database.db;
-    const { policy } = await serviceReleasePolicy(db, snapshot.serviceId, snapshot.environmentId);
+    const { policy } = snapshot.graphDeployment
+      ? { policy: { requireApproval: false, requireCodeReview: false } }
+      : await serviceReleasePolicy(db, snapshot.serviceId, snapshot.environmentId);
+    if (snapshot.graphGate) await assertGraphReleaseGate(db, snapshot, taskId);
     await this.assertSourceReview(snapshot, { db, required: policy.requireCodeReview });
     const requiresApproval = policy.requireApproval || snapshot.releasePolicy?.requireApproval;
     if (!requiresApproval && snapshot.mode !== 'DEPLOY_ARTIFACT') return;
     const automatic = snapshot.triggerType && snapshot.triggerType !== 'MANUAL';
-    if (targets && (automatic || requiresApproval || snapshot.rollbackOfDeploymentId))
+    if (
+      targets &&
+      (automatic || requiresApproval || snapshot.rollbackOfDeploymentId || snapshot.graphDeployment)
+    )
       await assertCurrentTargets(db, snapshot, targets);
     let query = db
       .selectFrom('tasks')
@@ -96,6 +131,7 @@ export class DeploymentsService {
     snapshot: PipelineSnapshot,
     { db = this.database.db, required }: { db?: Kysely<Database>; required?: boolean } = {},
   ) {
+    if (snapshot.graphDeployment) return null;
     if (
       !snapshot.releasePolicy?.requireCodeReview &&
       !(
@@ -112,16 +148,24 @@ export class DeploymentsService {
   async activeSnapshot(
     snapshot: PipelineSnapshot,
     serverId: string,
-  ): Promise<PipelineSnapshot | undefined> {
-    const current = await this.current(
-      this.database.db,
-      snapshot.serviceId,
-      snapshot.environmentId,
-      serverId,
-    );
-    if (!current?.release_snapshot_json || current.deploy_path !== snapshot.definition.deployPath)
+  ): Promise<(PipelineSnapshot & { composeRelease?: ComposeReleaseEvidence }) | undefined> {
+    await this.assertGraphReleasePath(this.database.db, snapshot, serverId);
+    const current = await this.currentSnapshot(this.database.db, snapshot, serverId);
+    if (snapshot.graphDeployment && current && current.status !== 'SUCCESS')
+      throw new ConflictException('当前发布状态待核查，暂不能覆盖');
+    if (
+      !current?.release_snapshot_json ||
+      !current.deploy_path ||
+      normalizeReleasePath(current.deploy_path) !==
+        normalizeReleasePath(snapshot.definition.deployPath)
+    )
       return undefined;
-    return JSON.parse(current.release_snapshot_json) as PipelineSnapshot;
+    return {
+      ...(JSON.parse(current.release_snapshot_json) as PipelineSnapshot),
+      composeRelease: current.compose_release_json
+        ? (JSON.parse(current.compose_release_json) as ComposeReleaseEvidence)
+        : undefined,
+    };
   }
 
   rollbackSnapshot(row: Selectable<DeploymentRecordsTable>) {
@@ -145,15 +189,12 @@ export class DeploymentsService {
     let query = db
       .selectFrom('deployment_records')
       .selectAll()
-      .where('service_id', '=', snapshot.serviceId)
-      .where('environment_id', '=', snapshot.environmentId)
-      .where('server_id', '=', serverId)
-      .where('deploy_path', '=', snapshot.definition.deployPath)
+      .where('release_scope_key', '=', deploymentScopeKey(snapshot, serverId))
       .where('release_snapshot_json', 'is not', null)
       .where('artifact_id', 'is not', null)
       .where('status', '=', 'SUCCESS')
       .where('health_status', '=', 'HEALTHY');
-    const current = await this.current(db, snapshot.serviceId, snapshot.environmentId, serverId);
+    const current = await this.currentSnapshot(db, snapshot, serverId);
     if (policy.rollbackMode === 'PINNED') {
       if (!policy.pinnedDeploymentId) return undefined;
       query = query.where(
@@ -166,7 +207,11 @@ export class DeploymentsService {
       );
     }
     const row = await query
-      .orderBy((eb) => eb.fn.coalesce('activated_at', 'started_at'), 'desc')
+      .orderBy(
+        (eb) => eb.fn.coalesce('activated_at', 'started_at'),
+        (order) => order.desc().nullsLast(),
+      )
+      .orderBy('id', 'desc')
       .executeTakeFirst();
     const candidate = row && this.rollbackSnapshot(row);
     if (
@@ -208,7 +253,10 @@ export class DeploymentsService {
           .where('task_targets.status', '=', 'RUNNING')
           .executeTakeFirstOrThrow();
       }
-      const previous = await this.current(tx, s.serviceId, s.environmentId, serverId);
+      await this.assertGraphReleasePath(tx, s, serverId);
+      const previous = await this.currentSnapshot(tx, s, serverId);
+      if (s.graphDeployment && previous && previous.status !== 'SUCCESS')
+        throw new ConflictException('当前发布状态待核查，暂不能覆盖');
       if (
         s.expectedCurrentDeploymentId !== undefined &&
         (previous?.id ?? null) !== s.expectedCurrentDeploymentId
@@ -227,6 +275,8 @@ export class DeploymentsService {
           status: 'RUNNING',
           release_version: s.commitSha,
           deploy_path: s.definition.deployPath,
+          release_path_key: normalizeReleasePath(s.definition.deployPath),
+          release_scope_key: deploymentScopeKey(s, serverId),
           health_status: 'PENDING',
           previous_deployment_id: previous?.id ?? null,
           rollback_of_deployment_id: s.rollbackOfDeploymentId,
@@ -238,6 +288,100 @@ export class DeploymentsService {
         .execute();
     });
     return id;
+  }
+
+  async assertGraphBuildGate(taskId: string, snapshot: PipelineSnapshot) {
+    if (snapshot.graphGate) await assertGraphReleaseGate(this.database.db, snapshot, taskId);
+  }
+
+  async assertGraphHealthRequester(taskId: string, projectId: string, serverId: string) {
+    const permission = await this.database.db
+      .selectFrom('tasks as task')
+      .innerJoin('users as requester', 'requester.id', 'task.created_by')
+      .innerJoin('execution_node_runs as node', 'node.task_id', 'task.id')
+      .innerJoin('execution_flow_runs as run', 'run.id', 'node.run_id')
+      .innerJoin('task_targets as target', 'target.task_id', 'task.id')
+      .select('task.id')
+      .where('task.id', '=', taskId)
+      .where('task.status', '=', 'RUNNING')
+      .where('run.project_id', '=', projectId)
+      .where('run.status', 'in', ['QUEUED', 'RUNNING', 'WAITING'])
+      .whereRef('run.created_by', '=', 'requester.id')
+      .where('node.node_type', '=', 'HEALTH_CHECK')
+      .where('target.server_id', '=', serverId)
+      .where('target.status', '=', 'RUNNING')
+      .where('requester.role', 'in', ['ADMIN', 'OPERATOR'])
+      .where('requester.status', '=', 'ACTIVE')
+      .where('requester.must_change_password', '=', 0)
+      .executeTakeFirst();
+    if (!permission) throw new ConflictException('健康检查发起人权限或运行状态已失效');
+  }
+
+  async graphHealthRelease(projectId: string, serverId: string, deploymentId: string) {
+    const db = this.database.db;
+    const row = await db
+      .selectFrom('deployment_records as release')
+      .innerJoin('pipeline_runs as run', 'run.id', 'release.pipeline_run_id')
+      .innerJoin('tasks as task', 'task.id', 'run.task_id')
+      .innerJoin('projects as project', 'project.id', 'run.project_id')
+      .select(['release.release_snapshot_json', 'release.deploy_path', 'task.payload_json'])
+      .where('release.id', '=', deploymentId)
+      .where('run.project_id', '=', projectId)
+      .where('project.deleted_at', 'is', null)
+      .where('release.server_id', '=', serverId)
+      .where('release.status', '=', 'SUCCESS')
+      .where('release.activated_at', 'is not', null)
+      .executeTakeFirst();
+    if (!row?.release_snapshot_json) throw new ConflictException('检查目标没有成功激活的发布记录');
+    const snapshot = JSON.parse(row.release_snapshot_json) as PipelineSnapshot;
+    const target = (JSON.parse(row.payload_json) as TaskPayload).targets.find(
+      (entry) => entry.id === serverId,
+    );
+    const server = await db
+      .selectFrom('servers as server')
+      .innerJoin('credentials as credential', 'credential.id', 'server.credential_id')
+      .select([
+        'server.host',
+        'server.port',
+        'server.username',
+        'server.host_key_fingerprint',
+        'server.credential_id',
+        'credential.nonce',
+      ])
+      .where('server.id', '=', serverId)
+      .where('server.is_active', '=', 1)
+      .where('credential.status', '=', 'ACTIVE')
+      .executeTakeFirst();
+    if (
+      !snapshot.graphDeployment ||
+      snapshot.projectId !== projectId ||
+      !snapshot.releaseKey ||
+      !/^[a-f0-9-]{36}$/i.test(snapshot.releaseKey) ||
+      !row.deploy_path ||
+      normalizeReleasePath(row.deploy_path) !==
+        normalizeReleasePath(snapshot.definition.deployPath) ||
+      !target?.credentialNonce ||
+      !server ||
+      target.host !== server.host ||
+      target.port !== server.port ||
+      target.username !== server.username ||
+      target.credentialId !== server.credential_id ||
+      target.hostKeyFingerprint !== server.host_key_fingerprint ||
+      target.credentialNonce !== server.nonce
+    )
+      throw new ConflictException('发布位置或服务器身份已失效，请重新确认');
+    const current = await this.currentSnapshot(db, snapshot, serverId);
+    if (current?.id !== deploymentId) throw new ConflictException('该记录已不是当前激活的发布');
+    return { target, snapshot };
+  }
+
+  async recordGraphHealth(deploymentId: string, status: DeploymentHealth) {
+    await this.database.db
+      .updateTable('deployment_records')
+      .set({ health_status: status })
+      .where('id', '=', deploymentId)
+      .where('status', '=', 'SUCCESS')
+      .execute();
   }
 
   async markActivated(
@@ -321,16 +465,17 @@ export class DeploymentsService {
         eb
           .selectFrom('deployment_records as active')
           .select('active.id')
-          .whereRef('active.service_id', '=', 'deployment_records.service_id')
-          .whereRef('active.environment_id', '=', 'deployment_records.environment_id')
-          .whereRef('active.server_id', '=', 'deployment_records.server_id')
+          .whereRef('active.release_scope_key', '=', 'deployment_records.release_scope_key')
           .where((filter) =>
             filter.or([
               filter('active.activated_at', 'is not', null),
               filter('active.status', '=', 'SUCCESS'),
             ]),
           )
-          .orderBy((value) => value.fn.coalesce('active.activated_at', 'active.started_at'), 'desc')
+          .orderBy(
+            (value) => value.fn.coalesce('active.activated_at', 'active.started_at'),
+            (order) => order.desc().nullsLast(),
+          )
           .orderBy('active.id', 'desc')
           .limit(1)
           .as('current_id'),

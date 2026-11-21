@@ -1,4 +1,5 @@
 import type { ProjectDetail } from '../models';
+import { isReleaseNode } from './execution-graph-definition';
 import type { GraphBinding, GraphField, GraphFlow, GraphNode } from './execution-graph-definition';
 import type { DeliveryScope, DeliveryTab } from './delivery-route';
 
@@ -327,7 +328,10 @@ export function graphStartReadiness(
           if (typeof repositoryId === 'string')
             checkFixed('REPOSITORY', repositoryId, node.id, 'repository');
         }
-        if (node.type === 'BUILD' || node.type === 'DEPLOY_ARTIFACT' || node.type === 'LOAD_ENV') {
+        const composeSource = node.deploy?.composeSource;
+        if (isReleaseNode(node) && composeSource?.kind === 'REPOSITORY_FILE')
+          checkFixed('REPOSITORY', composeSource.repositoryId, node.id, 'composeSource');
+        if (node.type === 'BUILD' || isReleaseNode(node) || node.type === 'LOAD_ENV') {
           const service = bindings?.service && knownReference(bindings.service);
           const environment = bindings?.environment && knownReference(bindings.environment);
           if (node.type !== 'LOAD_ENV' && typeof service === 'string')

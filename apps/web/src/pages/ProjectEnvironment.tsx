@@ -1,15 +1,12 @@
-import { useState, type FormEvent, type ReactNode } from 'react';
-import { api, message } from '../api';
-import { Field, Form, Section } from '../components';
+import { ErrorBanner, Section } from '../components';
 import type { Environment, ProjectDetail, User } from '../models';
-import {
-  DeploymentSelectionPicker,
-  deploymentSelection,
-  hasDeploymentSelection,
-  useDeploymentInventory,
-} from './DeploymentSelection';
+import { useDeploymentInventory } from './DeploymentSelection';
 import { EnvironmentVariables } from './EnvironmentVariables';
-import { projectResourcePath, type GraphResourceReturn } from './project-workspace-route';
+import {
+  projectGraphPath,
+  projectResourcePath,
+  type GraphResourceReturn,
+} from './project-workspace-route';
 
 const panels = { file: '环境文件', variables: '环境变量', targets: '默认发布目标' };
 
@@ -18,161 +15,102 @@ export function ProjectEnvironment({
   environment,
   user,
   view,
+  viewSearch,
   panel,
-  reload,
-  actions,
   graphBack,
 }: {
   project: ProjectDetail;
   environment: Environment;
   user: User;
   view?: string;
+  viewSearch?: string;
   panel?: string;
-  reload: () => Promise<void>;
-  actions: ReactNode;
   graphBack: GraphResourceReturn;
 }) {
   const active = panel === 'variables' || panel === 'targets' ? panel : 'file';
-  const path = (tab?: string) =>
+  const inventory = useDeploymentInventory(active === 'targets');
+  const path = (tab: string) =>
     '#' +
     projectResourcePath(project.id, {
       ...graphBack,
       view,
+      viewSearch,
       resource: 'environments',
       environmentId: environment.id,
       panel: tab,
     });
+  const servers = environment.defaultTargetSelection?.serverIds ?? [];
+  const groups = environment.defaultTargetSelection?.groupIds ?? [];
   return (
     <>
-      <Section
-        title={environment.name}
-        subtitle={environment.description || environment.slug}
-        action={actions}
-        className="project-service-detail"
-      >
-        <nav className="resource-section-switcher" aria-label="环境详情">
+      <Section title={environment.name} subtitle={environment.description || environment.slug}>
+        <p className="field-note">此页面保留历史环境配置。新的发布目标和环境文件在执行图中维护。</p>
+        <nav className="resource-section-switcher" aria-label="历史环境详情">
           {Object.entries(panels).map(([key, label]) => (
             <a key={key} href={path(key)} aria-current={active === key ? 'page' : undefined}>
               {label}
             </a>
           ))}
         </nav>
+        <div className="row-actions">
+          <a
+            className="button secondary small"
+            href={'#' + projectGraphPath(project.id, { view, viewSearch })}
+          >
+            打开执行图
+          </a>
+          <a
+            className="button secondary small"
+            href={
+              '#' +
+              projectResourcePath(project.id, { resource: 'environment-sets', view, viewSearch })
+            }
+          >
+            查看变量集合
+          </a>
+        </div>
       </Section>
-      {active === 'variables' ? (
-        <Section title="环境变量" subtitle="同名变量覆盖项目公共变量。">
-          <EnvironmentVariables projectId={project.id} environmentId={environment.id} user={user} />
+      {active === 'variables' && (
+        <Section title="历史环境变量">
+          <EnvironmentVariables
+            projectId={project.id}
+            environmentId={environment.id}
+            user={user}
+            editable={false}
+          />
         </Section>
-      ) : (
-        <EnvironmentSettings
-          key={environment.id}
-          projectId={project.id}
-          environment={environment}
-          user={user}
-          reload={reload}
-          targets={active === 'targets'}
-        />
+      )}
+      {active === 'file' && (
+        <Section title="历史仓库环境文件">
+          {environment.repositoryEnvFile ? (
+            <code>{environment.repositoryEnvFile}</code>
+          ) : (
+            <p className="muted">未指定环境文件。</p>
+          )}
+        </Section>
+      )}
+      {active === 'targets' && (
+        <Section title="历史默认发布目标">
+          <ErrorBanner error={inventory.servers.error} retry={inventory.servers.reload} />
+          <ErrorBanner error={inventory.groups.error} retry={inventory.groups.reload} />
+          {servers.length || groups.length ? (
+            <ul>
+              {servers.map((id) => (
+                <li key={'server-' + id}>
+                  服务器 · {inventory.servers.data?.find((server) => server.id === id)?.name ?? id}
+                </li>
+              ))}
+              {groups.map((id) => (
+                <li key={'group-' + id}>
+                  分组 · {inventory.groups.data?.find((group) => group.id === id)?.name ?? id}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">未设置默认发布目标。</p>
+          )}
+        </Section>
       )}
     </>
-  );
-}
-
-function EnvironmentSettings({
-  projectId,
-  environment,
-  user,
-  reload,
-  targets,
-}: {
-  projectId: string;
-  environment: Environment;
-  user: User;
-  reload: () => Promise<void>;
-  targets: boolean;
-}) {
-  const inventory = useDeploymentInventory(targets);
-  const [selection, setSelection] = useState(() =>
-    deploymentSelection(environment.defaultTargetSelection),
-  );
-  const [envFile, setEnvFile] = useState(environment.repositoryEnvFile || '');
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState(false);
-  const [error, setError] = useState('');
-  const readOnly = user.role === 'VIEWER';
-  async function save(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (readOnly || busy) return;
-    setBusy(true);
-    setNotice(false);
-    setError('');
-    try {
-      const saved = await api<Environment>(
-        `/projects/${projectId}/environments/${environment.id}`,
-        {
-          method: 'PATCH',
-          body: JSON.stringify({
-            ...(targets
-              ? { defaultTargetSelection: hasDeploymentSelection(selection) ? selection : null }
-              : { repositoryEnvFile: envFile.trim() || null }),
-          }),
-        },
-      );
-      setEnvFile(saved.repositoryEnvFile || '');
-      setSelection(deploymentSelection(saved.defaultTargetSelection));
-      setNotice(true);
-      await reload();
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <Section
-      title={targets ? '环境默认发布目标' : '仓库环境文件'}
-      subtitle={
-        targets ? '发布流程未指定目标且服务未设置覆盖时，使用这里选择的服务器或分组。' : undefined
-      }
-    >
-      <Form
-        onSubmit={save}
-        busy={busy}
-        submitDisabled={
-          readOnly || (targets && (inventory.servers.loading || inventory.groups.loading))
-        }
-        submit={readOnly ? '只读用户' : targets ? '保存默认发布目标' : '保存环境文件'}
-        error={error}
-      >
-        {targets ? (
-          <DeploymentSelectionPicker
-            projectId={projectId}
-            inventory={inventory}
-            value={selection}
-            onChange={(value) => {
-              setSelection(value);
-              setNotice(false);
-            }}
-            disabled={readOnly || busy}
-          />
-        ) : (
-          <Field label="仓库环境文件" hint="填写仓库工作区的相对路径。留空时按环境标识查找。">
-            <input
-              value={envFile}
-              disabled={readOnly || busy}
-              maxLength={300}
-              placeholder=".env.test"
-              onChange={(event) => {
-                setEnvFile(event.target.value);
-                setNotice(false);
-              }}
-            />
-          </Field>
-        )}
-        {notice && (
-          <p className="success-notice" role="status">
-            {targets ? '默认发布目标已保存。' : '环境文件路径已保存。'}
-          </p>
-        )}
-      </Form>
-    </Section>
   );
 }

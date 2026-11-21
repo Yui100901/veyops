@@ -21,6 +21,7 @@ import { OperationPlansService } from '../operation-plans/operation-plans.servic
 import { assertAiPipelineScope, pinAiContextField, type ResolvedAiContext } from './ai-context';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
 import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
+import { AiGraphActionsService, aiGraphAction } from './ai-graph-actions.service';
 
 function aiPipelineDefinition(definition: PipelineDefinition) {
   if (!definition.nodes) return definition;
@@ -167,6 +168,23 @@ export const aiToolDefinitions = [
     ['pipelineId', 'environmentId', 'commitSha'],
   ),
   tool(
+    'list_execution_flows',
+    '列出指定项目最新已发布的执行流、版本和可填写的参数',
+    { projectId: str },
+    ['projectId'],
+  ),
+  tool(
+    aiGraphAction,
+    '为已发布的执行流生成预览和待人工确认的提案，沿用图中已配置的节点与发布门禁',
+    {
+      projectId: str,
+      flowId: str,
+      version: { type: 'integer', minimum: 1 },
+      parameters: { type: 'object' },
+    },
+    ['projectId', 'flowId', 'version'],
+  ),
+  tool(
     'draft_source_change',
     '给出源代码修改建议，供用户审阅；不写入仓库',
     {
@@ -224,6 +242,7 @@ export type PreparedAiAction = {
     | 'execute_command'
     | 'inspect_servers'
     | 'run_pipeline'
+    | typeof aiGraphAction
     | 'initialize_component'
     | 'publish_source_branch'
     | 'open_pull_request';
@@ -257,6 +276,9 @@ export class AiToolsService {
     const { PipelinesService } = await import('../pipelines/pipelines.service.js');
     return this.moduleRef.get(PipelinesService, { strict: false });
   }
+  graphActions() {
+    return this.moduleRef.get(AiGraphActionsService, { strict: false });
+  }
   parse(argumentsJson: string): Record<string, unknown> {
     if (argumentsJson.length > 65536) throw new BadRequestException('AI 工具参数过大');
     let data: unknown;
@@ -289,7 +311,12 @@ export class AiToolsService {
     action: string,
     data: Record<string, unknown>,
     user?: CurrentUser,
+    context?: ResolvedAiContext,
   ): Promise<PreparedAiAction> {
+    if (action === aiGraphAction) {
+      if (!user) throw new ForbiddenException('请先登录');
+      return this.graphActions().prepare(data, user, context);
+    }
     if (action === 'execute_command' || action === 'inspect_servers') {
       const targets = await this.servers.snapshot(this.serverIds(data, 100));
       const command =
@@ -453,15 +480,8 @@ export class AiToolsService {
       );
       return { sourceChange };
     }
-    if (prepared.action === 'run_pipeline') {
-      const { pipelineId, ...input } = prepared.payload;
-      const pipelines = await this.pipelines();
-      return pipelines.run(
-        String(pipelineId),
-        input as unknown as Parameters<typeof pipelines.run>[1],
-        user.id,
-      );
-    }
+    if (prepared.action === 'run_pipeline' || prepared.action === aiGraphAction)
+      throw new BadRequestException('仅可通过已发布执行流提案的人工确认启动交付');
     return this.commands.execute(plainToInstance(ExecuteCommandDto, prepared.payload), user.id);
   }
   async continuation(taskIds: string[], projectId: string | undefined, user: CurrentUser) {
@@ -504,6 +524,11 @@ export class AiToolsService {
   ) {
     this.policy.assertRead(name, snapshot, projectId);
     switch (name) {
+      case 'list_execution_flows': {
+        const id = this.string(data, 'projectId');
+        if (projectId && id !== projectId) throw new ForbiddenException('项目与当前对话项目不一致');
+        return this.graphActions().list(id, context);
+      }
       case 'list_servers':
         return (await this.servers.list())
           .filter((s) => this.policy.allowedServer(s.id, snapshot))

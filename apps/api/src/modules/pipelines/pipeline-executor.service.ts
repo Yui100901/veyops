@@ -27,6 +27,7 @@ import {
   ArtifactPhysicalService,
 } from '../artifacts/artifact-physical.service';
 import { artifactIdentity } from '../artifacts/artifact-identities';
+import { RepositoryMetadataService } from '../projects/repository-metadata.service';
 import { DeploymentHealth, DeploymentsService } from '../deployments/deployments.service';
 import { deploymentLock } from '../deployments/deployment-lock';
 import type { TaskExecutionContext, TaskRecord, TaskStatus } from '../tasks/tasks.types';
@@ -47,6 +48,14 @@ import type {
   ComposeReleaseEvidence,
   ComposeTemplateReference,
 } from '../service-configs/compose-template-reference';
+import { composeChecksum } from '../service-configs/compose-template-reference';
+import { graphComposeProject } from './graph-release-context';
+import { assertGraphCompose } from './graph-compose';
+import {
+  graphProbeResult,
+  unknownGraphHealth,
+  type GraphProbeResult,
+} from './graph-release-health';
 
 type PipelinePhase =
   | 'PREPARE'
@@ -70,6 +79,8 @@ type ComposeRelease = {
   image: string;
   imageId?: string;
   template?: ComposeTemplateReference;
+  composeProject?: string;
+  dockerEngineId?: string;
 };
 type RollbackCandidate = {
   artifactId: string;
@@ -119,7 +130,101 @@ export class PipelineExecutor {
     private readonly artifacts: ArtifactsService,
     private readonly deployments: DeploymentsService,
     @Optional() private readonly physical?: ArtifactPhysicalService,
+    @Optional() private readonly metadata?: RepositoryMetadataService,
   ) {}
+  async checkGraphRelease(
+    projectId: string,
+    serverId: string,
+    deploymentId: string,
+    command: string,
+    timeoutSeconds: number,
+    context: TaskExecutionContext,
+    taskId: string,
+  ): Promise<GraphProbeResult> {
+    let result = unknownGraphHealth('健康状态尚未核对');
+    let locked = false;
+    let checkedIdentity = false;
+    let lock: ReturnType<typeof deploymentLock> | undefined;
+    let target: SshTarget | undefined;
+    try {
+      await this.deployments.assertGraphHealthRequester(taskId, projectId, serverId);
+      const release = await this.deployments.graphHealthRelease(projectId, serverId, deploymentId);
+      target = release.target;
+      lock = deploymentLock(release.snapshot);
+      const acquire = await this.ssh.execute(target, lock.acquire, {
+        timeout: 30,
+        signal: context.signal,
+      });
+      if (acquire.signal || acquire.exitCode !== 0) return unknownGraphHealth('无法取得目标发布锁');
+      locked = true;
+      const { snapshot } = await this.deployments.graphHealthRelease(
+        projectId,
+        serverId,
+        deploymentId,
+      );
+      const path = snapshot.definition.deployPath;
+      const expectedLink = `releases/${snapshot.releaseKey}`;
+      const activePath = `${path}/${expectedLink}`;
+      const guard = await this.ssh.execute(
+        target,
+        `test "$(readlink -- ${q(path + '/current')})" = ${q(expectedLink)} && test "$(realpath -e -- ${q(activePath)})" = ${q(activePath)} && test -d ${q(activePath)}`,
+        { timeout: 30, signal: context.signal },
+      );
+      if (guard.signal || guard.exitCode !== 0) {
+        result = unknownGraphHealth('目标上的活动版本与发布记录不一致');
+      } else {
+        const { values, secrets } = await this.builds.resolveVariables(snapshot);
+        await this.deployments.assertGraphHealthRequester(taskId, projectId, serverId);
+        checkedIdentity = true;
+        const check = await this.ssh.execute(
+          target,
+          `cd -- ${q(activePath)} || exit 90\n${command}`,
+          {
+            timeout: timeoutSeconds,
+            signal: context.signal,
+            secrets,
+            variables: { variables: values, secretVariables: {} },
+            onData: (text) => context.log(redactTaskLog(text), serverId),
+          },
+        );
+        result = graphProbeResult(check);
+      }
+    } catch (error) {
+      result = unknownGraphHealth(
+        error instanceof SshExecutionError && error.kind === 'TIMED_OUT'
+          ? '健康检查超时'
+          : '无法完成健康检查，请核对目标日志',
+      );
+      context.log(
+        `健康状态无法确认：${redactTaskLog(error instanceof Error ? error.message : '检查失败')}\n`,
+        serverId,
+      );
+    } finally {
+      // Record the observation before letting a later release or probe take the lock.
+      if (checkedIdentity) {
+        try {
+          await this.deployments.recordGraphHealth(
+            deploymentId,
+            result.health === 'UNHEALTHY' ? 'FAILED' : result.health,
+          );
+        } catch {
+          result = unknownGraphHealth('健康检查结果未能保存', result.probeExitCode);
+        }
+      }
+      if (locked && target && lock) {
+        try {
+          // Release ownership even when the parent health task was canceled.
+          const released = await this.ssh.execute(target, lock.release, { timeout: 30 });
+          if (released.signal || released.exitCode !== 0)
+            result = unknownGraphHealth('发布锁释放结果不明确', result.probeExitCode);
+        } catch {
+          result = unknownGraphHealth('发布锁释放结果不明确', result.probeExitCode);
+        }
+      }
+    }
+    return result;
+  }
+
   async execute(task: TaskRecord, context: TaskExecutionContext) {
     const snapshot = task.payload.pipeline;
     if (!snapshot) throw new Error('缺少固定Pipeline快照');
@@ -147,6 +252,7 @@ export class PipelineExecutor {
     }
     if (buildOnly && (snapshot.graphAutomation || snapshot.graph?.trigger?.kind))
       await this.deployments.assertAutomaticDelivery(task.id, snapshot);
+    if (buildOnly) await this.deployments.assertGraphBuildGate(task.id, snapshot);
     const siblingCancellation = new AbortController();
     context = { ...context, signal: AbortSignal.any([context.signal, siblingCancellation.signal]) };
     const lease = context.leaseOwner ? { taskId: task.id, owner: context.leaseOwner } : undefined;
@@ -325,6 +431,7 @@ export class PipelineExecutor {
           const workName = `veyops-${task.id}-${target.id}`;
           let work = `/tmp/${workName}`;
           let createdWork = false;
+          let activeDockerEngineId: string | undefined;
           let stepIndex = managerBuilt ? managerStepCount : 0;
           const phases = new Map<PipelinePhase, number>();
           const step = async <T>(
@@ -381,8 +488,22 @@ export class PipelineExecutor {
               }
             });
             let currentReleaseKey: string | undefined;
+            const active =
+              snapshot.graphDeployment || snapshot.definition.artifactType === 'FILE'
+                ? await this.deployments.activeSnapshot(snapshot, target.id)
+                : undefined;
+            if (snapshot.graphDeployment && active) {
+              if (
+                active.definition.artifactType !== snapshot.definition.artifactType ||
+                (snapshot.graphDeployment.method === 'COMPOSE' && !active.graphDeployment)
+              )
+                throw new ConflictException(
+                  '部署路径已由其他部署方式或 Compose 项目使用，请先核查',
+                );
+              currentReleaseKey = active.releaseKey;
+              activeDockerEngineId = active.composeRelease?.dockerEngineId;
+            }
             if (snapshot.definition.artifactType === 'FILE') {
-              const active = await this.deployments.activeSnapshot(snapshot, target.id);
               if (!active) stoppedRelease = session;
               else if (
                 posix.normalize(active.definition.deployPath) ===
@@ -417,9 +538,27 @@ export class PipelineExecutor {
                 if (link.trim() !== `releases/${currentReleaseKey}`)
                   throw new BuildCommandError(1, '远端当前发布与已记录版本不一致，请先核查');
               });
+            } else if (snapshot.graphDeployment) {
+              const current = q(`${snapshot.definition.deployPath}/current`);
+              await step('PREPARE', '确认部署位置没有其他当前版本', () =>
+                this.builds.remote(
+                  target,
+                  `test ! -e ${current} && test ! -L ${current}`,
+                  session,
+                  30,
+                  '远端已有未登记的当前版本，请核查部署位置',
+                ),
+              );
             }
             deploymentId = await this.deployments.start(
-              { ...snapshot, releaseKey: task.id },
+              {
+                ...snapshot,
+                releaseKey: task.id,
+                ...(snapshot.graphRollback && {
+                  rollbackOfDeploymentId: snapshot.graphRollback[target.id],
+                  expectedCurrentDeploymentId: snapshot.graphRollback[target.id],
+                }),
+              },
               target.id,
               targetId,
               lease,
@@ -608,6 +747,7 @@ export class PipelineExecutor {
                     session,
                     manager,
                     deploymentInput,
+                    activeDockerEngineId,
                   ),
                 );
                 await activate('启动Compose发布版本', () =>
@@ -1166,9 +1306,12 @@ fi
   private async activateComposeRelease(
     target: SshTarget,
     session: BuildSession,
-    { compose, docker, image, imageId, template }: ComposeRelease,
+    { compose, docker, image, imageId, template, composeProject, dockerEngineId }: ComposeRelease,
   ) {
-    const action = `set -eu\n${compose} up -d --no-build${imageId ? ' --pull never' : ''}\n${verifyComposeImage(compose, docker, image, imageId)}\n${this.switchRelease(session)}`;
+    const engineGuard = dockerEngineId
+      ? `test "$(${docker} info --format '{{.ID}}')" = ${q(dockerEngineId)}\n`
+      : '';
+    const action = `set -eu\n${engineGuard}${compose} up -d --no-build${imageId ? ' --pull never' : ''}\n${verifyComposeImage(compose, docker, image, imageId)}\n${this.switchRelease(session)}`;
     const failure = 'Compose 发布激活失败。请检查宿主机端口占用、Compose 容器状态和当前版本链接';
     if (!template) {
       await this.builds.remote(target, action, session, 600, failure);
@@ -1183,7 +1326,7 @@ fi
     );
     const verified = /^VEYOPS_COMPOSE_IMAGE_ID=(sha256:[a-f0-9]{64})\s*$/m.exec(output)?.[1];
     if (!verified) throw new Error('Compose 激活未返回已验证的镜像 ID');
-    return { template, imageReference: image, imageId: verified };
+    return { template, imageReference: image, imageId: verified, composeProject, dockerEngineId };
   }
   private async targetImage(target: SshTarget, work: string, session: BuildSession) {
     const d = session.snapshot.definition;
@@ -1218,6 +1361,7 @@ fi
     session: BuildSession,
     manager?: BuildOutput,
     artifact?: DeploymentArtifact,
+    activeDockerEngineId?: string,
   ) {
     if (!artifact?.imageId && !/^[a-zA-Z0-9._:/-]+@sha256:[a-f0-9]{64}$/.test(image))
       throw new Error('Docker部署必须使用不可变Digest');
@@ -1226,14 +1370,29 @@ fi
       p = d.deployPath,
       release = p + '/releases/' + session.taskId;
     const managed = s.managedCompose ? await this.artifacts.managedCompose(s) : undefined;
-    const template = s.managedCompose ?? artifact?.composeTemplate;
+    const template = s.graphDeployment?.template ?? s.managedCompose ?? artifact?.composeTemplate;
+    let composeYaml = managed ?? artifact?.composeYaml;
+    if (template?.source === 'REPOSITORY_FILE') {
+      if (!this.metadata) throw new ConflictException('无法加载已确认的仓库 Compose 模板');
+      composeYaml = await this.metadata.readGraphComposeFile(
+        s.projectId,
+        template.repositoryId,
+        template.commitSha,
+        template.path,
+      );
+      if (composeChecksum(composeYaml) !== template.checksum)
+        throw new ConflictException('仓库 Compose 模板已与计划不一致');
+    }
+    if (s.graphDeployment) {
+      if (!composeYaml) throw new ConflictException('缺少已确认的 Compose 模板');
+      assertGraphCompose(composeYaml);
+    }
     await this.builds.remote(
       target,
       `set -eu; ${deploymentGuard(p, `${s.projectId}:${s.serviceId}:${s.environmentId}`)}; test ! -e ${q(release)} && test ! -L ${q(release)}; mkdir ${q(release)}`,
       session,
       30,
     );
-    const composeYaml = managed ?? artifact?.composeYaml;
     if (composeYaml)
       await this.ssh.uploadContent(target, composeYaml, release + '/compose.yaml', {
         timeout: 60,
@@ -1254,8 +1413,26 @@ fi
         30,
       );
     const config = work + '/docker-config';
-    const project = `veyops-${s.serviceId.slice(0, 8)}-${s.environmentId.slice(0, 8)}`;
+    const composeProject = s.graphDeployment?.composeProject;
+    if (s.graphDeployment && composeProject !== graphComposeProject(s))
+      throw new ConflictException('Compose 项目名与已确认发布位置不一致');
+    const project =
+      composeProject ?? `veyops-${s.serviceId.slice(0, 8)}-${s.environmentId.slice(0, 8)}`;
     const docker = `docker --config ${q(config)}`;
+    let dockerEngineId: string | undefined;
+    if (s.graphDeployment) {
+      dockerEngineId = (
+        await this.builds.remoteCapture(target, `${docker} info --format '{{.ID}}'`, session, 30)
+      ).trim();
+      const physicalEngine =
+        artifact?.physical?.location === 'DOCKER_ENGINE' ? artifact.physical.engineId : undefined;
+      if (
+        !/^[A-Za-z0-9:_-]{1,180}$/.test(dockerEngineId) ||
+        (activeDockerEngineId && dockerEngineId !== activeDockerEngineId) ||
+        (physicalEngine && dockerEngineId !== physicalEngine)
+      )
+        throw new ConflictException('Docker 引擎与当前发布或已确认镜像的引擎不一致');
+    }
 
     const configure = async (reference: string) => {
       const env = serializeComposeEnvironment({ ...session.variables, VEYOPS_IMAGE: reference });
@@ -1315,7 +1492,15 @@ fi
         '离线 Compose 还需要目标预先缓存其余镜像',
       );
       session.context.log(`离线归档镜像已校验，使用 ${reference} (${imageId}) 激活\n`);
-      return { compose, docker, image: reference, imageId, template };
+      return {
+        compose,
+        docker,
+        image: reference,
+        imageId,
+        template,
+        composeProject,
+        dockerEngineId,
+      };
     };
 
     if (d.registryId || !artifact?.imageId) {
@@ -1355,7 +1540,15 @@ fi
     } catch (error) {
       return offline(error);
     }
-    return { compose, docker, image, imageId: artifact?.imageId, template };
+    return {
+      compose,
+      docker,
+      image,
+      imageId: artifact?.imageId,
+      template,
+      composeProject,
+      dockerEngineId,
+    };
   }
   private async loadArchivedImage(
     target: SshTarget,

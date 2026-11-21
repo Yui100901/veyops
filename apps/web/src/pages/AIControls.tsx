@@ -80,6 +80,7 @@ export function ModelRouting({ providers, admin }: { providers: Provider[]; admi
 const writeActions = {
   initialize_component: '初始化组件',
   execute_command: '执行命令',
+  run_execution_flow: '启动已发布执行流',
   publish_source_branch: '提交评审分支',
   open_pull_request: '创建 PR',
 };

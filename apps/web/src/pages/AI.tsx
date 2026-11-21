@@ -118,6 +118,13 @@ type Draft = DefinitionDraft | RepositoryDraft | SourceDraft;
 type SourceChange =
   | { id: string; kind: 'SOURCE_BRANCH'; branch: string; commitSha: string }
   | { id: string; kind: 'PULL_REQUEST'; number: number; url: string };
+type AiGraphRun = {
+  id: string;
+  projectId: string;
+  flowId: string;
+  flowName: string;
+  version: number;
+};
 interface ChatResponse {
   conversationId: string;
   projectId?: string | null;
@@ -145,6 +152,7 @@ const actionLabels: Record<string, string> = {
   execute_command: '执行远程命令',
   inspect_servers: '只读服务器巡检',
   initialize_component: '初始化目标环境',
+  run_execution_flow: '启动已发布执行流',
   publish_source_branch: '推送代码审查分支',
   open_pull_request: '创建 Pull Request',
 };
@@ -1216,13 +1224,17 @@ export function AIPage({
     setProposalBusy(true);
     setProposalError('');
     try {
-      const r = await post<{ proposal: Proposal; task?: Task; sourceChange?: SourceChange }>(
-        `/ai/proposals/${proposal.id}/${approve ? 'confirm' : 'reject'}`,
-      );
+      const r = await post<{
+        proposal: Proposal;
+        task?: Task;
+        sourceChange?: SourceChange;
+        graphRun?: AiGraphRun;
+      }>(`/ai/proposals/${proposal.id}/${approve ? 'confirm' : 'reject'}`);
       if (r.task) setTasks((v) => [...v, r.task!]);
       if (r.sourceChange) setSourceChanges((v) => [...v, r.sourceChange!]);
       setProposalId('');
-      void proposals.reload();
+      if (r.graphRun) await proposals.reload();
+      else void proposals.reload();
       if (conversationId) void messages.reload();
     } catch (err) {
       setProposalError(message(err));
@@ -1231,6 +1243,17 @@ export function AIPage({
       setProposalBusy(false);
     }
   }
+  const graphRuns = (proposals.data ?? []).flatMap((item) => {
+    const run = item.preview.graphRun as AiGraphRun | undefined;
+    return item.actionType === 'run_execution_flow' &&
+      item.status === 'APPROVED' &&
+      !item.scopeRevoked &&
+      run &&
+      conversationId &&
+      item.conversationId === conversationId
+      ? [run]
+      : [];
+  });
   const pending = (proposals.data || []).filter(
     (p) =>
       p.status === 'PENDING' &&
@@ -1448,6 +1471,20 @@ export function AIPage({
                   <span>
                     {t.name || '已创建执行任务'}
                     <small>{t.id}</small>
+                  </span>
+                  <ChevronRight size={16} />
+                </a>
+              ))}
+              {graphRuns.map((run) => (
+                <a
+                  className="ai-task-result"
+                  key={run.id}
+                  href={`#/projects/${encodeURIComponent(run.projectId)}/execution-graph?run=${encodeURIComponent(run.id)}`}
+                >
+                  <Check size={16} />
+                  <span>
+                    {run.flowName}
+                    <small>执行流已启动 · v{run.version}</small>
                   </span>
                   <ChevronRight size={16} />
                 </a>
@@ -1675,6 +1712,14 @@ export function ProposalPreview({ proposal, servers }: { proposal: Proposal; ser
       </p>
     );
   const preview = proposal.preview || proposal.payload;
+  const graphNodes =
+    proposal.actionType === 'run_execution_flow' && Array.isArray(preview.nodes)
+      ? (preview.nodes as { nodeId: string; name: string }[])
+      : [];
+  const graphDeliveries =
+    proposal.actionType === 'run_execution_flow' && Array.isArray(preview.deliveries)
+      ? (preview.deliveries as { requireApproval?: boolean; requireCodeReview?: boolean }[])
+      : [];
   const targets = Array.isArray(preview.targets)
     ? (preview.targets as { id?: string; name?: string; host?: string }[])
     : Array.isArray(preview.serverIds)
@@ -1685,6 +1730,31 @@ export function ProposalPreview({ proposal, servers }: { proposal: Proposal; ser
       : [];
   return (
     <>
+      {proposal.actionType === 'run_execution_flow' && (
+        <div className="deployment-review">
+          <span>执行流</span>
+          <strong>
+            {String(preview.flowName ?? '')} · v{String(preview.version ?? '')}
+          </strong>
+          <span>本次节点</span>
+          <span>{graphNodes.map((node) => node.name).join('、')}</span>
+          {graphDeliveries.some(
+            (delivery) => delivery.requireApproval || delivery.requireCodeReview,
+          ) && (
+            <>
+              <span>发布门禁</span>
+              <span>
+                {[
+                  graphDeliveries.some((delivery) => delivery.requireCodeReview) && '代码审核',
+                  graphDeliveries.some((delivery) => delivery.requireApproval) && '部署审批',
+                ]
+                  .filter(Boolean)
+                  .join('、')}
+              </span>
+            </>
+          )}
+        </div>
+      )}
       {!!targets.length && (
         <div className="scope-options">
           {targets.map((t, i) => (

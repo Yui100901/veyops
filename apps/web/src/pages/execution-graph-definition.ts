@@ -7,7 +7,10 @@ export const graphNodeLabels = {
   CHECK: '代码检查',
   BUILD: '构建并归档',
   REGISTER_ARTIFACT: '登记产物',
+  SOURCE_REVIEW: '源码审核',
   DEPLOY_ARTIFACT: '部署产物',
+  HEALTH_CHECK: '发布健康检查',
+  ROLLBACK_ARTIFACT: '按产物回滚',
   CONDITION: '条件判断',
   SWITCH: '多路判断',
   DELAY: '等待',
@@ -38,6 +41,7 @@ export type GraphFieldType =
   | 'WORKSPACE'
   | 'SOURCE'
   | 'RELEASE'
+  | 'REVIEW'
   | 'REPORT'
   | 'CREDENTIAL'
   | 'VARIABLES';
@@ -151,6 +155,10 @@ export interface FlowBuildDefinition {
   artifacts?: GraphArtifactOutput[];
 }
 export interface FlowDeployDefinition {
+  method?: 'FILE' | 'COMPOSE';
+  composeSource?:
+    | { kind: 'ARTIFACT' }
+    | { kind: 'REPOSITORY_FILE'; repositoryId: string; commitSha: string; path: string };
   deployPath?: string;
   startCommand?: string;
   stopCommand?: string;
@@ -205,7 +213,8 @@ export interface GraphNode {
   condition?: { key: 'input' | 'commitSha'; value: string };
   switch?: { key: 'input' | 'commitSha'; cases: string[] };
   delaySeconds?: number;
-  approval?: { timeoutSeconds?: number };
+  approval?: { timeoutSeconds?: number; releaseNodeId?: string; buildNodeId?: string };
+  healthCheck?: { command: string; timeoutSeconds?: number };
   flowId?: string;
   position?: { x: number; y: number };
 }
@@ -286,7 +295,11 @@ export function orderedNodes(flow: GraphFlow) {
 }
 
 export function isDeliveryNode(node: GraphNode) {
-  return node.type === 'BUILD' || node.type === 'DEPLOY_ARTIFACT';
+  return node.type === 'BUILD' || isReleaseNode(node);
+}
+
+export function isReleaseNode(node: { type: string }) {
+  return node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT';
 }
 
 export function branchOptions(

@@ -4,6 +4,7 @@ import {
   Injectable,
   NotFoundException,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
@@ -27,6 +28,7 @@ import {
   type DeploymentSelection,
 } from '../deployment-targets/deployment-selection';
 import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
+import { PipelineExecutor } from '../pipelines/pipeline-executor.service';
 import { relativePath, shellQuote } from '../pipelines/pipeline.validation';
 import {
   deliveryExecutionProfile,
@@ -46,6 +48,7 @@ import type { GraphNode } from './execution-graph-definition';
 import { validateGraphValue, type GraphField } from './graph-fields';
 import { graphNodeRequiresIsolation, isGraphTriggerKind } from './graph-automatic-delivery';
 import { GraphScriptOutput } from './graph-script-output';
+import { graphReleaseResult, type GraphReleaseResult } from './graph-release-gates';
 import {
   environmentFilePath,
   graphVariableSources,
@@ -74,7 +77,7 @@ const defaults = {
   timeout: 180,
 } as const;
 type ScriptNode = 'SHELL' | 'CHECK';
-type NativeModule = 'CHECKOUT' | ScriptNode | 'LOAD_ENV' | 'REGISTER_ARTIFACT';
+type NativeModule = 'CHECKOUT' | ScriptNode | 'LOAD_ENV' | 'REGISTER_ARTIFACT' | 'HEALTH_CHECK';
 
 export interface GraphNodeScope {
   environmentId?: string;
@@ -93,6 +96,7 @@ export interface GraphNodeScope {
 
 export type GraphNodePlan =
   | { type: 'CHECKOUT'; source: GraphCheckoutSnapshot }
+  | { type: 'HEALTH_CHECK' }
   | {
       type: ScriptNode;
       serverId?: string;
@@ -133,6 +137,7 @@ export interface GraphModulePayload {
     outputs: NonNullable<GraphNode['outputs']>;
   };
   trigger?: Record<string, unknown>;
+  healthCheck?: { command: string; timeoutSeconds: number; release: GraphReleaseResult };
 }
 
 const text = (value: unknown) => (typeof value === 'string' ? value : undefined);
@@ -241,6 +246,7 @@ export class GraphNodeTasks implements OnModuleInit {
     private readonly artifacts: ArtifactsService,
     private readonly ssh: SshService,
     private readonly credentials: CredentialsService,
+    @Optional() private readonly pipelineExecutor?: PipelineExecutor,
   ) {}
 
   onModuleInit() {
@@ -355,6 +361,7 @@ export class GraphNodeTasks implements OnModuleInit {
 
   async prepare(projectId: string, node: GraphNode, scope: GraphNodeScope): Promise<GraphNodePlan> {
     const values = scope.values ?? {};
+    if (node.type === 'HEALTH_CHECK') return { type: 'HEALTH_CHECK' };
     if (node.type === 'CHECKOUT') {
       const config = node.checkout;
       const repositoryId = resourceId(values.repository);
@@ -532,6 +539,41 @@ export class GraphNodeTasks implements OnModuleInit {
       idempotencyKey,
       payload: { ...defaults, targets: [], steps: [] },
     };
+
+    if (plan.type === 'HEALTH_CHECK') {
+      const release = graphReleaseResult(values.release);
+      if (
+        release.operation === 'CHECK' ||
+        release.status !== 'SUCCESS' ||
+        (serviceId && release.serviceId !== serviceId) ||
+        release.targets.some(({ status }) => status !== 'SUCCESS')
+      )
+        throw new ConflictException('健康检查只能核对当前服务已成功激活的发布');
+      if (!node.healthCheck?.command || !this.pipelineExecutor)
+        throw new BadRequestException('健康检查命令或执行器不可用');
+      const targets = await this.targets.resolveForExecution({
+        ...defaults,
+        serverIds: release.targets.map(({ serverId }) => serverId),
+        confirmed: true,
+      });
+      return {
+        ...base,
+        scope: { ...identity, serviceId: release.serviceId },
+        payload: {
+          ...base.payload,
+          targets,
+          graphModule: {
+            ...settings,
+            serviceId: release.serviceId,
+            healthCheck: {
+              release,
+              command: node.healthCheck.command,
+              timeoutSeconds: node.healthCheck.timeoutSeconds ?? 30,
+            },
+          },
+        },
+      };
+    }
 
     if (plan.type === 'CHECKOUT') {
       if (!self) throw new BadRequestException('缺少源码工作区标识');
@@ -742,6 +784,44 @@ export class GraphNodeTasks implements OnModuleInit {
     const module = task.payload.graphModule!;
     if (isGraphTriggerKind(module.trigger?.kind) && graphNodeRequiresIsolation(module.type))
       throw new ConflictException('该执行图节点尚未启用隔离自动执行');
+    if (module.type === 'HEALTH_CHECK') {
+      const { release, command, timeoutSeconds } = module.healthCheck!;
+      if (!this.pipelineExecutor) throw new ConflictException('健康检查执行器不可用');
+      const targets: GraphReleaseResult['targets'] = [];
+      for (const target of release.targets) {
+        context.signal.throwIfAborted();
+        const id = await context.startTarget(target.serverId);
+        const result = await this.pipelineExecutor.checkGraphRelease(
+          module.projectId,
+          target.serverId,
+          target.deploymentId,
+          command,
+          timeoutSeconds,
+          context,
+          task.id,
+        );
+        // A confirmed negative health verdict is a successful probe for branch dispatch.
+        const status = result.health === 'UNKNOWN' ? 'NEEDS_ATTENTION' : 'SUCCESS';
+        await context.finishTarget(id, status, result.probeExitCode, result.healthReason);
+        targets.push({ ...target, ...result, status });
+      }
+      const status = targets.some(({ health }) => health === 'UNKNOWN')
+        ? 'UNKNOWN'
+        : targets.some(({ health }) => health === 'UNHEALTHY')
+          ? 'UNHEALTHY'
+          : 'HEALTHY';
+      return {
+        healthy: status === 'HEALTHY',
+        status,
+        release: {
+          ...release,
+          operation: 'CHECK',
+          status: status === 'UNKNOWN' ? 'NEEDS_ATTENTION' : 'SUCCESS',
+          healthStatus: status,
+          targets,
+        },
+      };
+    }
     if (module.type === 'CHECKOUT') {
       const { commitSha, branch, tag } = module.source!;
       let subject: string | undefined;
@@ -968,7 +1048,7 @@ export class GraphNodeTasks implements OnModuleInit {
       for (const ref of refs) named.set(ref.name, [...(named.get(ref.name) ?? []), ref]);
       return { artifacts: refs, ...Object.fromEntries(named) };
     }
-    if (node.type === 'DEPLOY_ARTIFACT') {
+    if (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') {
       const rows = await db
         .selectFrom('deployment_records')
         .innerJoin('pipeline_runs', 'pipeline_runs.id', 'deployment_records.pipeline_run_id')
@@ -1028,7 +1108,7 @@ export class GraphNodeTasks implements OnModuleInit {
             : 'PARTIAL_SUCCESS';
       return {
         release: {
-          operation: 'DEPLOY',
+          operation: node.type === 'ROLLBACK_ARTIFACT' ? 'ROLLBACK' : 'DEPLOY',
           service: { serviceId: rows[0]?.service_id },
           serviceId: rows[0]?.service_id,
           environmentId: rows[0]?.environment_id,

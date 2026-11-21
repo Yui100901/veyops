@@ -12,10 +12,12 @@ import type {
 } from './execution-graph-definition';
 
 export const graphTemplates: { name: string; nodes: GraphNode['type'][] }[] = [
-  { name: '检出源码并核对提交', nodes: ['CHECKOUT', 'SHELL'] },
-  { name: '构建并部署', nodes: ['BUILD', 'DEPLOY_ARTIFACT'] },
   { name: '仅构建', nodes: ['BUILD'] },
-  { name: '仅部署', nodes: ['DEPLOY_ARTIFACT'] },
+  { name: '源码审核后构建', nodes: ['CHECKOUT', 'SOURCE_REVIEW', 'BUILD'] },
+  { name: '构建并部署', nodes: ['BUILD', 'APPROVAL', 'DEPLOY_ARTIFACT'] },
+  { name: '仅部署', nodes: ['APPROVAL', 'DEPLOY_ARTIFACT'] },
+  { name: '按历史产物回滚', nodes: ['APPROVAL', 'ROLLBACK_ARTIFACT'] },
+  { name: '检出源码并核对提交', nodes: ['CHECKOUT', 'SHELL'] },
   { name: '审批后执行脚本', nodes: ['APPROVAL', 'SHELL'] },
 ];
 
@@ -216,31 +218,119 @@ export function BuildFields({
 }
 
 export function DeployFields({
+  project,
   value,
   canEdit,
   change,
 }: {
+  project: ProjectDetail;
   value: FlowDeployDefinition;
   canEdit: boolean;
   change: (value: FlowDeployDefinition) => void;
 }) {
+  const template = value.composeSource;
+  const repositoryFile = template?.kind === 'REPOSITORY_FILE' ? template : undefined;
+  function patchRepositoryFile(patch: Partial<NonNullable<typeof repositoryFile>>) {
+    if (repositoryFile) change({ ...value, composeSource: { ...repositoryFile, ...patch } });
+  }
   return (
-    <details className="advanced-options">
-      <summary>默认部署配置</summary>
-      <p className="field-note">服务环境可以单独配置发布路径、命令和健康检查。</p>
+    <fieldset className="graph-fields">
+      <legend>部署配置</legend>
       <div className="form-grid graph-preset-fields">
+        <Field label="发布方式">
+          <select
+            data-graph-node-field="method"
+            disabled={!canEdit}
+            value={value.method ?? ''}
+            onChange={(event) => {
+              const method = event.target.value as FlowDeployDefinition['method'];
+              change({
+                ...value,
+                method: method || undefined,
+                composeSource:
+                  method === 'COMPOSE' ? (template ?? { kind: 'ARTIFACT' }) : undefined,
+              });
+            }}
+          >
+            <option value="">从产物类型确定</option>
+            <option value="FILE">文件或目录</option>
+            <option value="COMPOSE">Docker Compose</option>
+          </select>
+        </Field>
         <Text
           label="发布路径"
+          fieldId="deployPath"
+          placeholder="目标主机上的绝对路径"
           value={value.deployPath}
           canEdit={canEdit}
           onChange={(deployPath) => change({ ...value, deployPath })}
         />
-        <Text
-          label="Compose 配置路径"
-          value={value.composeFilePath}
-          canEdit={canEdit}
-          onChange={(composeFilePath) => change({ ...value, composeFilePath })}
-        />
+        {value.method !== 'FILE' && (
+          <Field label="Compose 模板来源" hint="Compose 发布会锁定模板摘要。">
+            <select
+              data-graph-node-field="composeSource"
+              disabled={!canEdit}
+              value={template?.kind ?? ''}
+              onChange={(event) =>
+                change({
+                  ...value,
+                  composeSource:
+                    event.target.value === 'REPOSITORY_FILE'
+                      ? {
+                          kind: 'REPOSITORY_FILE',
+                          repositoryId:
+                            project.repositories.length === 1 ? project.repositories[0].id : '',
+                          commitSha: '',
+                          path: value.composeFilePath ?? 'compose.yaml',
+                        }
+                      : event.target.value === 'ARTIFACT'
+                        ? { kind: 'ARTIFACT' }
+                        : undefined,
+                })
+              }
+            >
+              <option value="">默认使用产物自带模板</option>
+              <option value="ARTIFACT">产物自带模板</option>
+              <option value="REPOSITORY_FILE">固定提交中的仓库文件</option>
+            </select>
+          </Field>
+        )}
+        {repositoryFile && (
+          <>
+            <Field label="模板仓库">
+              <select
+                disabled={!canEdit}
+                value={repositoryFile.repositoryId}
+                onChange={(event) =>
+                  patchRepositoryFile({ repositoryId: event.target.value, commitSha: '' })
+                }
+              >
+                <option value="">选择仓库</option>
+                {project.repositories.map(({ id, name }) => (
+                  <option key={id} value={id}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Text
+              label="模板提交 SHA"
+              fieldId="composeCommitSha"
+              value={repositoryFile.commitSha}
+              placeholder="完整提交 SHA"
+              canEdit={canEdit}
+              onChange={(commitSha) => patchRepositoryFile({ commitSha: commitSha ?? '' })}
+            />
+            <Text
+              label="模板文件相对路径"
+              fieldId="composeFilePath"
+              value={repositoryFile.path}
+              placeholder="compose.yaml"
+              canEdit={canEdit}
+              onChange={(path) => patchRepositoryFile({ path: path ?? '' })}
+            />
+          </>
+        )}
         <Text
           label="启动命令"
           multiline
@@ -255,15 +345,8 @@ export function DeployFields({
           canEdit={canEdit}
           onChange={(stopCommand) => change({ ...value, stopCommand })}
         />
-        <Text
-          label="健康检查命令"
-          multiline
-          value={value.healthCheckCommand}
-          canEdit={canEdit}
-          onChange={(healthCheckCommand) => change({ ...value, healthCheckCommand })}
-        />
       </div>
-    </details>
+    </fieldset>
   );
 }
 
@@ -390,6 +473,7 @@ export function ArtifactOutputEditor({
 
 function Text({
   label,
+  fieldId,
   value,
   canEdit,
   multiline,
@@ -397,6 +481,7 @@ function Text({
   onChange,
 }: {
   label: string;
+  fieldId?: string;
   value?: string;
   canEdit: boolean;
   multiline?: boolean;
@@ -407,6 +492,7 @@ function Text({
     value: value ?? '',
     readOnly: !canEdit,
     placeholder,
+    'data-graph-node-field': fieldId,
   };
   return (
     <Field label={label}>

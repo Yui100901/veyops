@@ -221,7 +221,8 @@ function validatesLiteral(field: GraphField, value: unknown, node: GraphNode) {
     ['number', 'boolean'].includes(typeof value)
   )
     return true;
-  if (['WORKSPACE', 'SOURCE', 'RELEASE', 'REPORT', 'VARIABLES'].includes(field.type)) return false;
+  if (['WORKSPACE', 'SOURCE', 'RELEASE', 'REVIEW', 'REPORT', 'VARIABLES'].includes(field.type))
+    return false;
   return (
     validateGraphValue({ ...field, required: true }, value) &&
     redactTaskLog(JSON.stringify(value)) === JSON.stringify(value)
@@ -295,6 +296,13 @@ function assertBinding(
     producer = context.nodes.get(binding.nodeId);
     if (!producer || !ancestors.has(binding.nodeId))
       fail(flow, node, '输出来源必须位于控制上游，并行支路需先汇合或连接顺序依赖', field, evidence);
+    if (
+      producer.type === 'SOURCE_REVIEW' &&
+      producer.approval?.buildNodeId &&
+      binding.fieldId === 'review' &&
+      (node.type !== 'BUILD' || node.id !== producer.approval.buildNodeId || field.id !== 'review')
+    )
+      fail(flow, node, '此审核凭证只可供关联构建使用', field, evidence);
     source = context.outputs.get(binding.nodeId)?.find((port) => port.id === binding.fieldId);
   }
   if (
@@ -442,6 +450,15 @@ export function validateFlowBindings(
     const node = nodes.get(nodeId);
     if (!node || !safeGraphId(nodeId) || !graphRecord(ports))
       fail(flow, node ?? start, '输入绑定必须指向此流的功能节点');
+    if (node.type === 'SOURCE_REVIEW' && node.approval?.buildNodeId) {
+      const alternate = Object.keys(ports).find((id) => id === 'source' || id === 'artifact');
+      if (alternate)
+        fail(flow, node, '关联构建计划时不能同时绑定源码或产物', {
+          id: alternate,
+          name: alternate === 'source' ? '源码' : '产物',
+          type: alternate === 'source' ? 'SOURCE' : 'ARTIFACT',
+        });
+    }
     const knownPorts = nodePorts.get(node.id)?.inputs ?? [];
     for (const [portId, binding] of Object.entries(ports)) {
       const port = knownPorts.find((candidate) => candidate.id === portId);
@@ -467,8 +484,8 @@ export function validateFlowBindings(
 
   for (const [nodeId, variables] of Object.entries(flow.environmentBindings ?? {})) {
     const node = nodes.get(nodeId);
-    if (!node || !['SHELL', 'CHECK'].includes(node.type) || !graphRecord(variables))
-      fail(flow, node ?? start, '环境绑定必须指向此流的 Shell 或检查节点');
+    if (!node || !['BUILD', 'SHELL', 'CHECK'].includes(node.type) || !graphRecord(variables))
+      fail(flow, node ?? start, '环境绑定必须指向此流的构建、Shell 或检查节点');
     if (Object.keys(variables).length > 30) fail(flow, node, '每个节点最多声明 30 个环境绑定');
     for (const [key, binding] of Object.entries(variables)) {
       const field: GraphField = { id: key, name: key, type: 'TEXT', required: false };
@@ -569,6 +586,7 @@ export function validateFlowBindings(
       ordered.some(
         (candidate) =>
           candidate.type === 'DEPLOY_ARTIFACT' ||
+          candidate.type === 'ROLLBACK_ARTIFACT' ||
           (candidate.type === 'FLOW_CALL' &&
             outputs.get(candidate.id)?.some((port) => port.type === 'RELEASE')),
       ) &&
@@ -725,7 +743,7 @@ export function validateFlowBindings(
           `配置的镜像缺少引用${branch}`,
           destinations.find((port) => port.id === 'image'),
         );
-      if (node.type === 'DEPLOY_ARTIFACT' && !has('service'))
+      if ((node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') && !has('service'))
         record(
           locatedIssue(
             flow,
@@ -735,6 +753,76 @@ export function validateFlowBindings(
             { branchId },
           ),
         );
+      if (
+        node.type === 'SOURCE_REVIEW' &&
+        !node.approval?.buildNodeId &&
+        Number(has('source')) + Number(has('artifact')) !== 1
+      )
+        fail(flow, node, '源码审核须关联构建，或绑定一个实际源码来源或一组产物');
+    }
+  }
+  const gated = new Set<string>();
+  for (const gate of ordered) {
+    if (gate.type === 'SOURCE_REVIEW' && gate.approval?.buildNodeId) {
+      const buildId = gate.approval.buildNodeId;
+      const selection = { id: 'buildNodeId', name: '关联构建节点', type: 'TEXT' } as const;
+      const build = nodes.get(buildId);
+      const review = build && bindingAt(flow, build, 'review');
+      if (!build || build.type !== 'BUILD' || !staticOrder.get(buildId)?.has(gate.id))
+        fail(flow, gate, '请选择当前执行流中位于下游的构建节点', selection);
+      if (
+        review?.kind !== 'OUTPUT' ||
+        review.nodeId !== gate.id ||
+        review.fieldId !== 'review' ||
+        (review.onMissing !== undefined && review.onMissing !== 'ERROR')
+      )
+        fail(
+          flow,
+          build,
+          '关联构建须直接使用对应审核节点的审核凭证，且凭证不可省略',
+          { id: 'review', name: '审核凭证', type: 'REVIEW' },
+          { sourceNodeId: gate.id, sourceFieldId: 'review' },
+        );
+      for (const { path, order } of pathOrders) {
+        const reachesReview = path.active.has(gate.id);
+        const reachesBuild = path.active.has(buildId);
+        if (reachesReview !== reachesBuild || (reachesBuild && !order.get(buildId)?.has(gate.id)))
+          fail(
+            flow,
+            gate,
+            '关联构建与源码审核必须处于同一执行路径，且构建须经过该审核',
+            selection,
+            {
+              sourceNodeId: buildId,
+              branchId: path.branches.map(({ id }) => id).join('/') || undefined,
+            },
+          );
+      }
+    }
+    if (gate.type !== 'APPROVAL' || !gate.approval?.releaseNodeId) continue;
+    const releaseId = gate.approval.releaseNodeId;
+    const release = ordered.find(({ id }) => id === releaseId);
+    if (
+      !release ||
+      (release.type !== 'DEPLOY_ARTIFACT' && release.type !== 'ROLLBACK_ARTIFACT') ||
+      !staticOrder.get(releaseId)?.has(gate.id) ||
+      gated.has(releaseId)
+    )
+      fail(flow, gate, '请选择唯一关联且位于下游的部署或回滚节点');
+    gated.add(releaseId);
+    const artifact = bindingAt(flow, release, 'artifact');
+    const previous = bindingAt(flow, release, 'afterRelease');
+    for (const { path, order } of pathOrders) {
+      if (!path.active.has(releaseId)) continue;
+      const earlier = order.get(gate.id);
+      if (
+        !earlier ||
+        !order.get(releaseId)?.has(gate.id) ||
+        !artifact ||
+        !available(context, artifact, earlier) ||
+        (previous && !available(context, previous, earlier))
+      )
+        fail(flow, gate, '每条发布路径都须经过对应审批，审批时必须已经取得产物和关联发布结果');
     }
   }
   const missing = [...coverage.values()];

@@ -25,6 +25,8 @@ async function checkPlan(t: TestContext, url?: string) {
     WORKER_ENABLED: 'false',
   });
   const { AppModule } = await import('../app.module.js');
+  const { LegacyDeliveryWriteFixtureModule } =
+    await import('./helpers/legacy-delivery-write-fixture.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { GraphRunnerService } =
     await import('../modules/execution-graphs/graph-runner.service.js');
@@ -32,7 +34,9 @@ async function checkPlan(t: TestContext, url?: string) {
     await import('../modules/projects/repository-metadata.service.js');
   const { ServersService } = await import('../modules/servers/servers.service.js');
   const app = (
-    await Test.createTestingModule({ imports: [AppModule] }).compile()
+    await Test.createTestingModule({
+      imports: [AppModule, LegacyDeliveryWriteFixtureModule],
+    }).compile()
   ).createNestApplication<NestExpressApplication>({ logger: false });
   try {
     configureApp(app);
@@ -209,7 +213,9 @@ async function checkPlan(t: TestContext, url?: string) {
       path: '.env.empty',
     });
     assert.ok(
-      !previewOnly.executionPlan.variables.some((v: { key: string }) => v.key === 'UNEXPECTED_FALLBACK'),
+      !previewOnly.executionPlan.variables.some(
+        (v: { key: string }) => v.key === 'UNEXPECTED_FALLBACK',
+      ),
     );
     assert.equal(previewWithDefaults.executionPlan.targets[0].source, 'MANAGER');
     assert.equal(previewWithDefaults.executionPlan.environmentFiles[0].path, '.env.test');
@@ -233,12 +239,11 @@ async function checkPlan(t: TestContext, url?: string) {
     const combined = flow('combined');
     const defaultPlan = await create(combined + '/preview', args(env.id));
     assert.equal(defaultPlan.deliveries[1].requireApproval, false);
-    const automaticPlan = await app.get(GraphRunnerService).preview(
-      project.id,
-      'combined',
-      args(env.id),
-      { automation: { kind: 'API', ruleId: 'fixture', revision: '1' } },
-    );
+    const automaticPlan = await app
+      .get(GraphRunnerService)
+      .preview(project.id, 'combined', args(env.id), {
+        automation: { kind: 'API', ruleId: 'fixture', revision: '1' },
+      });
     assert.equal(automaticPlan.deliveries[0]?.requireApproval, false);
     assert.equal(automaticPlan.deliveries[1]?.requireApproval, true);
     assert.notEqual(automaticPlan.configurationHash, defaultPlan.configurationHash);

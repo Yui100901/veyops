@@ -1,6 +1,6 @@
 # 阶段 0 演示定义
 
-[project.yaml](project.yaml) 描述新库演示项目「星桥商城」、资源及七个开始节点。主机、仓库和访问地址均使用 `.invalid` 占位域名。凭据只声明用途及引用 ID。阶段 1 至 5 接通初始化器和各执行模块后，使用授权的演示资源映射这些占位项。
+[project.yaml](project.yaml) 描述演示项目「星桥商城」。主机、仓库和访问地址使用 `.invalid` 占位域名，凭据只声明用途及引用 ID。初始化器使用实际演示资源替换这些引用，保持节点、字段和固定提交可追溯。也可以在画布通过预设手工搭建。
 
 ## 三条主路径
 
@@ -10,25 +10,59 @@
 | 开始节点选变量并执行 | 从商城网关或执行图打开 `target-files`，先选 `test-config`，另一次只换成 `production-config`。两个运行都使用 `web-repo` 的固定 SHA `5038e89acaeb008526d112afc3d68b812e2a10ff` 及 `web-test-group`。 | `load-files` 分别选 `.env.test` 与 `.env.prod`。`FILE_PROFILE` 来自文件，`LOG_LEVEL` 分别取集合的 `debug` 和 `warn`。`POSTGRES_URL` 显示掩码。目标均为 `test-a`、`test-b`。构建节点从实际 `checkout.commitSha` 注入 `GIT_SHA`。 |
 | 产物同机复用 | 在 `target-files` 产出的 `build-files.webDirectory` 记录中选择实际 `artifactId`，打开 `deploy-existing`，填入 `{artifactId}`。保留独立的 `releaseTargets` 为联调 Web 组。 | 预览分别固定 `test-a`、`test-b` 上的目录实例及摘要。运行前重新验证实例。部署结束返回商城网关的 `ServiceResult`，可按记录跳到消费目标、原件及生产节点。 |
 
-## 七个执行入口
+## 九个执行入口
 
 | 流 ID | 变量集合 | 实际操作 |
 | --- | --- | --- |
 | `manager-build` | 固定联调配置 | 管理端构建文件和目录。开始参数只需服务及可选 Git 版本。 |
+| `reviewed-build` | 固定联调配置 | 源码审核关联 `build-manager`，管理员在运行详情核对该构建的全部固定仓库及 SHA，并决定是否继续。 |
 | `target-files` | 运行时选择 | 按联调组逐目标构建文件和目录。`runReport` 仅供本次运行及子流使用。 |
 | `target-image` | 固定生产模拟配置 | 在生产模拟组的 Docker 主机分别构建和登记 Image ID。 |
-| `build-and-deploy` | 固定联调配置 | 明确区分 `buildTargets`、`releaseTargets`。复用构建节点与文件部署节点，部署消费 `webDirectory`。 |
+| `build-and-deploy` | 固定联调配置 | 区分 `buildTargets` 和 `releaseTargets`。构建成功后管理员核对 `webDirectory` 实例、服务和目标，再批准发布。 |
 | `deploy-existing` | 无引用 | 选用已登记目录，通过同一部署节点在匹配主机发布。 |
 | `deploy-compose` | 固定生产模拟配置 | 选用与主机相符的已登记镜像，Compose 模板读取同一固定提交的 `compose.yaml`。 |
 | `rollback-existing` | 固定联调配置 | 在同一服务、目标和目的地已有两次发布后，选择较早发布使用的目录并执行图内回滚，逐目标返回回滚关系。 |
+| `health-rollback` | 固定联调配置 | 遇到演示候选页面时，探针显式返回 `10`，按条件选择历史目录回滚。在健康分支直接返回检查结果。 |
+
+## 从画布预设运行文件交付示例
+
+1. 在项目中登记一个含 `index.html` 的 Git 仓库、一个服务和一台专用演示服务器。服务器需要可执行 SSH 和写入演示发布目录，项目仓库需要可信的可用提交。
+2. 在「仅构建」「审核并构建」或「构建并部署」预设中，将构建命令设为 `mkdir -p dist && cp index.html dist/index.html`，并登记目录 `dist`。有部署步骤时使用 `FILE`，将演示目录设为 `/srv/veyops-stage0/storefront`。目标端构建与部署选择同一演示服务器。
+3. 发布图后，从各开始节点预览并运行。使用「仅部署」时选择已登记的产物。仅构建成功时可从产物详情返回生产节点。出现待审核或待审批时，管理员在运行详情核对实际来源与目标后决定。
+4. 更改仓库文件并构建、发布第二版。使用「回滚」预设选择第一版的登记产物，并选择同一服务、目标及部署路径。回滚结果中的 `rollbackOfDeploymentId` 指向被替换的发布。
+
+需要多仓构建时，可从「源码审核后构建」预设扩展。增加一个 Git 检出节点，分别绑定依赖仓库和完整 SHA，在构建节点添加依赖别名 `shared`，将 `dependency_shared` 绑定到这个检出的工作区。构建脚本可从 `$VEYOPS_GRAPH_DEPENDENCY_ROOT/shared` 读取依赖。若绑定了另一仓库的变量加载结果，也应先固定该仓库及提交。运行详情的审核范围会列出构建实际计划使用的全部仓库及 SHA。构建专用变量 `GIT_SHA` 仍从主仓检出的 `commitSha` 输出绑定。
 
 ## 初始化器映射
 
-- 资源 ID 是演示别名。后续初始化器将它们解析成 API 返回的实体 ID。图中节点 ID、开始节点 ID 和字段 ID 保留，用于产物生产来源和定位。单个流的 ID 与开始节点 ID 相同。
+- 资源 ID 是演示别名。初始化器将它们解析成 API 返回的实体 ID。图中节点 ID、开始节点 ID 和字段 ID 保留，用于产物生产来源和定位。单个流的 ID 与开始节点 ID 相同。
 - `path` 是该流从开始到结束的有序功能节点简写，初始化器将其展开成控制边。`bindings` 按节点 ID 与端口 ID 对应 `inputBindings`，`environment` 对应节点进程注入，结束节点的 `source` 对应该流的最终输出绑定。模块的端口目录按指定版本解析。构建输出声明的 `type` 指实物 `kind`，端口值统一使用 `ARTIFACT` 引用。`copy-static-site` 和 `docker-image` 是演示动作名，由初始化器映射为相应的模块执行配置。
+- `approve-storefront.configuration` 对应 `APPROVAL.approval`，`review-source.configuration` 对应 `SOURCE_REVIEW.approval`，`SERVICE_RESULT` 对应实际 API 的 `RELEASE` 字段。将 `configuration.deployPath`、`method` 和 `composeSource` 放入发布节点的 `deploy`。
 - `load-files.configuration` 对应 `LOAD_ENV.loadEnvironment`。当前图 API 用 `envFile` 表示单一路径，映射直接使用 `pathRule`。
 - `copy-static-site` 将仓库中的 `index.html` 复制到工作区的 `dist/index.html`。目标构建另生成声明为临时输出的 `reports/summary.json`，内容只记录实际 Git SHA 和非敏感的 `FILE_PROFILE`。`docker-image` 以工作区中的 `Dockerfile` 构建镜像并记录实际 Image ID。初始化器需映射访问地址，并在专用联调目标上为文件发布目录准备静态站点入口。
-- `sourceSnapshot.files` 按 UTF-8 与 LF 写入同一个无父提交的 Git 快照，文件模式均为 `100644`。使用 YAML 中的作者、提交者、UTC 偏移、时间戳及提交说明，说明以换行结尾。以 Git SHA-1 对象格式生成提交，固定 SHA 为 `5038e89acaeb008526d112afc3d68b812e2a10ff`。各构建开始参数默认引用此提交。
+- `sourceSnapshot.files` 按 UTF-8 与 LF 写入同一个无父提交的 Git 快照，文件模式均为 `100644`。以 Git SHA-1 对象格式生成的固定提交为 `5038e89acaeb008526d112afc3d68b812e2a10ff`，各构建开始参数默认引用此提交。`nextSnapshot` 可重复生成替换版本，用于观察健康失败和回滚前后的真实页面变化。
 - `reuseExamples` 指向应从实际运行结果读取的产物 ID。构建完成后使用返回的 `artifactId`，验证具体物理实例，再提交历史部署或回滚参数。产物位置、大小、摘要和镜像 ID 由执行模块记录。
 
 初始化器的接口和安全边界见 [阶段 0 契约](../../docs/阶段0-重构契约与演示.md)。
+
+## 导入专用演示实例
+
+1. 在装有项目依赖的 checkout 运行 `node tools/acceptance/refactor-demo.cjs git <仓库目录>`，生成 `storefront.git` 及两个固定提交。把该裸仓库通过演示实例可访问的 HTTP Git 服务提供。Linux 脚本会自动负责这一步。
+2. 准备本地配置 JSON。`apiBase` 指向以 `/api/v1` 结尾的演示 API，`repositoryBaseUrl` 指向 `storefront.git` 所在的 HTTP Git 根路径。`targets` 包含 `test-a`、`test-b`、`production-a`、`production-b`。每个目标填写 `host`、`username`、独立核对的 `hostKeyFingerprint` 和 `privateKey` 或 `password`，可选自定义 `port`。`addresses` 可按地址别名替换服务卡片中的占位 URL。将配置保留在仓库外。
+3. 在当前进程设置 `VEYOPS_DEMO_ADMIN_PASSWORD`，使用已完成首次改密的演示管理员。运行 `node tools/acceptance/refactor-demo.cjs init <配置.json>`。它会登记资源、校验并发布演示图，返回项目、目标和固定版本。重复导入复用属于这一演示的匹配项，遇到不匹配资源或已编辑的图时停止。导入流程结束后，可在工作台选择开始节点预览。
+
+## Linux 候选验收
+
+[p1-linux.sh](../../tools/acceptance/p1-linux.sh) 从给定提交加载演示定义、初始化器和验收脚本。候选镜像须标注同一提交。下面的命令用于验收恢复后，在候选提交所在的 Linux checkout 执行。
+
+```sh
+revision=$(git rev-parse HEAD)
+image="veyops:candidate-$revision"
+git archive "$revision" | docker build --label "org.opencontainers.image.revision=$revision" -t "$image" -
+VEYOPS_ACCEPT_RUNTIME_IMAGE="$image" sh tools/acceptance/p1-linux.sh "$revision" sqlite
+VEYOPS_ACCEPT_RUNTIME_IMAGE="$image" sh tools/acceptance/p1-linux.sh "$revision" postgres
+```
+
+执行前需在本地 Linux Docker Engine 准备 `node:24-bookworm-slim`、`busybox:1.36`，使用 PostgreSQL 时还需 `postgres:17-bookworm`。宿主机需要 cgroup v2、Docker Compose 和 Buildx 插件，以及与目标基础镜像兼容的 SSH 服务端、`ssh-keygen`、OpenSSL 和 Git。脚本会验证并复制所用的本地工具。
+
+每次执行创建新目录、内部网络、四个 SSH 目标及其私有 Docker 引擎。测试组和生产模拟组使用各自服务器、发布目录和 SSH 指纹。远端发布仅发生在这些临时目标。脚本保留 `candidate.txt`、`manager.log` 和成功运行的 `evidence.json`，清理带本次标签的容器、网络和临时登录密钥。手工浏览器、断连、Worker 重启及其他 A01–A34 验收结果仍需按实施计划记载。

@@ -1,11 +1,10 @@
 import { useEffect } from 'react';
 import type { FormEvent } from 'react';
 import { navigate, useResource } from '../api';
-import { ErrorBanner, Loading } from '../components';
+import { ErrorBanner, Loading, Section } from '../components';
 import type { ProjectDetail, User } from '../models';
 import { DeliveryRecordsPage } from './Delivery';
 import { ProjectArtifacts } from './ProjectArtifacts';
-import { ReleaseApprovals } from './ReleaseOperations';
 import {
   deliveryPath,
   deliveryTabs,
@@ -13,7 +12,7 @@ import {
   type DeliveryScope,
   type DeliveryTab,
 } from './delivery-route';
-import { projectResourcePath } from './project-workspace-route';
+import { projectGraphPath, projectResourcePath } from './project-workspace-route';
 
 export function ProjectDelivery({
   id,
@@ -50,7 +49,6 @@ export function ProjectDelivery({
   if (!project)
     return <ErrorBanner error={resource.error || '找不到这个项目。'} retry={resource.reload} />;
   if (tab === 'artifacts') return <ProjectArtifacts project={project} user={user} scope={scope} />;
-  const canApprove = !project.archived && user.role === 'ADMIN';
   const services = [...project.services, ...(project.archivedServices ?? [])];
   const environments = [...project.environments, ...(project.archivedEnvironments ?? [])];
   const service = services.find((s) => s.id === serviceId);
@@ -80,12 +78,31 @@ export function ProjectDelivery({
     view,
     viewSearch,
   };
+  const historyHref =
+    '#' +
+    projectGraphPath(id, {
+      serviceId: serviceId ?? undefined,
+      environmentId: environmentId ?? undefined,
+      view: view ?? undefined,
+      viewSearch: viewSearch ?? undefined,
+      pane: 'history',
+    });
+  if (tab === 'approvals') {
+    return (
+      <Section title="执行流审批">
+        <p>在运行记录中打开等待中的源码审核或发布审批节点。</p>
+        <a className="button primary small" href={historyHref}>
+          查看执行流运行
+        </a>
+      </Section>
+    );
+  }
   const returnFilters = recordId ? { ...filters, pipelineRunId, taskId } : filters;
   const query = new URLSearchParams({ projectId: id });
   if (serviceId) query.set('serviceId', serviceId);
   if (environmentId) query.set('environmentId', environmentId);
   if (commit) query.set('commit', commit);
-  if (repositoryId && tab !== 'approvals') query.set('repositoryId', repositoryId);
+  if (repositoryId) query.set('repositoryId', repositoryId);
   if (recordId) query.set('recordId', recordId);
   if (pipelineRunId) query.set('pipelineRunId', pipelineRunId);
   if (taskId) query.set('taskId', taskId);
@@ -140,21 +157,17 @@ export function ProjectDelivery({
       )}
       {
         <nav className="record-tabs" aria-label="交付记录分类">
-          {!embedded && !project.archived && (
-            <a href={`#/projects/${id}/execution-graph`}>执行图</a>
-          )}
-          {(Object.keys(deliveryTabs) as DeliveryTab[])
-            .filter((key) => key !== 'approvals' || canApprove)
-            .map((key) => (
-              <a
-                key={key}
-                className={key === tab ? 'active' : ''}
-                aria-current={key === tab ? 'page' : undefined}
-                href={'#' + deliveryPath(id, key, key === tab ? scope : filters)}
-              >
-                {deliveryTabs[key]}
-              </a>
-            ))}
+          {!project.archived && <a href={historyHref}>执行流运行</a>}
+          {(['artifacts', 'deployments'] as const).map((key) => (
+            <a
+              key={key}
+              className={key === tab ? 'active' : ''}
+              aria-current={key === tab ? 'page' : undefined}
+              href={'#' + deliveryPath(id, key, key === tab ? scope : filters)}
+            >
+              {deliveryTabs[key]}
+            </a>
+          ))}
         </nav>
       }
       <form
@@ -194,24 +207,22 @@ export function ProjectDelivery({
             ))}
           </select>
         </label>
-        {tab !== 'approvals' && (
-          <label>
-            源码仓库
-            <select name="repositoryId" defaultValue={repositoryId || ''}>
-              <option value="">全部仓库</option>
-              {project.repositories.map((repository) => (
-                <option key={repository.id} value={repository.id}>
-                  {repository.name}
-                </option>
-              ))}
-              {project.archivedRepositories?.map((repository) => (
-                <option key={repository} value={repository}>
-                  {repository}（已归档）
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
+        <label>
+          源码仓库
+          <select name="repositoryId" defaultValue={repositoryId || ''}>
+            <option value="">全部仓库</option>
+            {project.repositories.map((repository) => (
+              <option key={repository.id} value={repository.id}>
+                {repository.name}
+              </option>
+            ))}
+            {project.archivedRepositories?.map((repository) => (
+              <option key={repository} value={repository}>
+                {repository}（已归档）
+              </option>
+            ))}
+          </select>
+        </label>
         <label>
           固定 Commit
           <input
@@ -255,14 +266,9 @@ export function ProjectDelivery({
           project={project}
           query={searchQuery}
           scope={scope}
+          readOnly
         />
       )}
-      {tab === 'approvals' &&
-        (canApprove ? (
-          <ReleaseApprovals key={searchQuery} query={searchQuery} scope={scope} />
-        ) : (
-          <ErrorBanner error="仅管理员可审批发布。" />
-        ))}
     </div>
   );
 }

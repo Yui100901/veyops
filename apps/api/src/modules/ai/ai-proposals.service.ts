@@ -14,6 +14,9 @@ import { AiPolicyService, AiPolicySnapshot } from './ai-policy.service';
 import { AiToolsService, PreparedAiAction } from './ai-tools.service';
 import { assertAiPipelineScope, scopeAiToolArguments } from './ai-context';
 import { AiFailureGuard } from './ai-failure-guard.service';
+import { aiGraphAction } from './ai-graph-actions.service';
+import type { GraphPlanAccessScope } from '../execution-graphs/graph-runner.service';
+import type { ResolvedAiContext } from './ai-context';
 
 export function proposalDto(row: Selectable<AiActionProposalsTable>) {
   const stored = JSON.parse(row.payload_json) as PreparedAiAction;
@@ -76,6 +79,15 @@ export class AiProposalsService {
       (proposal) => proposal.conversationId === conversationId && proposal.status === 'PENDING',
     );
   }
+  async waitingForGraph(conversationId: string, user: CurrentUser) {
+    const ids = (await this.repository.proposals(user.id)).flatMap((row) => {
+      if (row.action_type !== aiGraphAction || row.status !== 'APPROVED') return [];
+      const { graphRun } = JSON.parse(row.preview_json) as { graphRun?: { id: string } };
+      const { conversationId: source } = JSON.parse(row.payload_json) as PreparedAiAction;
+      return source === conversationId && graphRun ? [graphRun.id] : [];
+    });
+    return ids.length > 0 && this.tools.graphActions().ongoing(ids, user);
+  }
   async create(prepared: PreparedAiAction, snapshot: AiPolicySnapshot, user: CurrentUser) {
     const id = randomUUID();
     const now = Date.now();
@@ -103,12 +115,22 @@ export class AiProposalsService {
   }
   async confirm(id: string, user: CurrentUser, automatic = false) {
     const row = await this.repository.proposal(id, user.id);
+    const stored = JSON.parse(row.payload_json) as PreparedAiAction;
+    if (stored.action === aiGraphAction) {
+      if (automatic) throw new ForbiddenException('执行流提案必须由用户确认');
+      if (row.status === 'APPROVED') {
+        const proposal = this.scopedPreview(row, await this.policy.projectSnapshots(), user);
+        if ('scopeRevoked' in proposal) throw new ForbiddenException('执行流提案授权已失效');
+        const graphRun = proposal.preview.graphRun;
+        if (!graphRun) throw new ConflictException('该提案已处理，无法读取执行流记录');
+        return { proposal, graphRun, sourceChange: undefined, task: undefined };
+      }
+    }
     if (row.expires_at <= Date.now()) {
       await this.repository.expire(id);
       throw new ConflictException('操作提案已过期，请重新生成');
     }
     if (row.status !== 'PENDING') throw new ConflictException('操作提案已处理，不能重复确认');
-    const stored = JSON.parse(row.payload_json) as PreparedAiAction;
     if (stored.action === 'run_pipeline')
       throw new ConflictException('请从项目执行图预览并确认交付流程');
     const repair = stored.failureTaskId
@@ -137,6 +159,7 @@ export class AiProposalsService {
       stored.action,
       scopeAiToolArguments(context, stored.action, stored.payload),
       user,
+      context,
     );
     if (prepared.action === 'run_pipeline') assertAiPipelineScope(context, prepared.preview);
     prepared.projectId ??= stored.projectId;
@@ -145,18 +168,22 @@ export class AiProposalsService {
       prepared.projectId !== stored.projectId ||
       prepared.repositoryId !== stored.repositoryId ||
       JSON.stringify([...prepared.serverIds].sort()) !==
-        JSON.stringify([...stored.serverIds].sort())
+        JSON.stringify([...stored.serverIds].sort()) ||
+      JSON.stringify([...(prepared.sourceRepositoryIds ?? [])].sort()) !==
+        JSON.stringify([...(stored.sourceRepositoryIds ?? [])].sort())
     )
       throw new ConflictException('服务器配置或部署目标已改变，请重新生成提案');
     const snapshot = await this.policy.snapshot(prepared.projectId);
     this.policy.evaluate(user, prepared, snapshot);
+    if (prepared.action === aiGraphAction)
+      return this.confirmGraph(id, user, snapshot, stored, prepared, context);
     if (!(await this.repository.approve(id, user.id, snapshot)))
       throw new ConflictException('操作提案已处理或过期');
     try {
       // Consume first. If the process crashes here, a human must inspect rather than replay a write.
       const task = await this.tools.execute(prepared, user, repair);
       if ('sourceChange' in task) {
-        await this.repository.recordSourceChange(id, {
+        await this.repository.recordProposalPreview(id, {
           ...prepared.preview,
           sourceChange: task.sourceChange,
         });
@@ -194,6 +221,86 @@ export class AiProposalsService {
         '提案执行未完成，确认状态已保存；请先核查任务中心，不会自动重试',
       );
     }
+  }
+  private async confirmGraph(
+    id: string,
+    user: CurrentUser,
+    snapshot: AiPolicySnapshot,
+    stored: PreparedAiAction,
+    prepared: PreparedAiAction,
+    context: ResolvedAiContext | undefined,
+  ) {
+    const projectId = prepared.projectId!;
+    const graph = this.tools.graphActions();
+    const receipt = (runId: string, status: string) => ({
+      id: runId,
+      projectId,
+      flowId: prepared.preview.flowId,
+      flowName: prepared.preview.flowName,
+      version: prepared.preview.version,
+      status,
+    });
+    let authorizedScope: GraphPlanAccessScope | undefined;
+    const run = await graph.run(prepared, id, user, {
+      authorizePlan: (scope) => {
+        graph.authorize(user, snapshot, projectId, scope, context);
+        authorizedScope = scope;
+      },
+      beforeInsert: async (transaction) => {
+        const actor = await transaction
+          .selectFrom('users')
+          .select(['role', 'status', 'must_change_password'])
+          .where('id', '=', user.id)
+          .executeTakeFirst();
+        if (
+          !actor ||
+          actor.status !== 'ACTIVE' ||
+          actor.must_change_password ||
+          actor.role !== user.role
+        )
+          throw new ForbiddenException('用户权限已变化，请重新登录');
+        if (!authorizedScope) throw new ForbiddenException('执行流未提供完整授权范围');
+        const current = await this.policy.snapshot(projectId, transaction);
+        graph.authorize(user, current, projectId, authorizedScope, context);
+        if (!(await this.repository.approve(id, user.id, current, transaction)))
+          throw new ConflictException('操作提案已处理或过期');
+      },
+      afterInsert: async (transaction, runId) => {
+        const graphRun = receipt(runId, 'QUEUED');
+        await this.repository.recordProposalPreview(
+          id,
+          { ...prepared.preview, graphRun },
+          transaction,
+        );
+        await this.audit.record(
+          user.id,
+          'ai.proposal.confirm',
+          'ai_proposal',
+          id,
+          {
+            graphRunId: runId,
+          },
+          transaction,
+        );
+        if (stored.conversationId)
+          await this.repository.addMessage(
+            stored.conversationId,
+            'TOOL',
+            {
+              text: JSON.stringify({ status: 'GRAPH_RUN_CREATED', proposalId: id, graphRun }),
+              name: aiGraphAction,
+            },
+            undefined,
+            transaction,
+          );
+      },
+    });
+    return {
+      proposal: proposalDto(await this.repository.proposal(id, user.id)),
+      graphRun: receipt(run.id, run.status),
+      sourceChange: undefined,
+      task: undefined,
+    };
   }
   async reject(id: string, user: CurrentUser) {
     await this.repository.proposal(id, user.id);

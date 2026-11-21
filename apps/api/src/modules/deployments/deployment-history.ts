@@ -89,6 +89,7 @@ export function latestDeploymentTargets(
               'deployment.service_id',
               ...(options.byActualTarget ? [] : ['deployment.environment_id' as const]),
               'deployment.server_id',
+              'deployment.release_scope_key',
             ])
             .orderBy(eb.fn.coalesce('deployment.started_at', 'run.created_at'), 'desc')
             .orderBy('run.created_at', 'desc')

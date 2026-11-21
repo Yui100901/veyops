@@ -66,14 +66,14 @@
 | POST                 | /projects/:id/repositories | `{name,cloneUrl,defaultBranch?,credentialId?}`                                                               |
 | GET / POST           | /projects/:id/services     | 读取项目的可用服务 / 创建服务及有序地址 |
 | GET / PATCH / DELETE | /projects/:id/services/:serviceId | 读取服务及地址 / 按共同修订保存 / 归档服务 |
-| POST                 | /projects/:id/environments | `{name,slug,environmentType:'DEVELOPMENT'\|'TESTING'\|'STAGING'\|'PRODUCTION'\|'CUSTOM'}`                    |
+| GET / POST           | /projects/:id/environment-sets | 查询或创建可由开始节点引用的项目变量集合 |
 | GET                  | /dashboard                 | 服务器、项目、服务和任务统计，最近部署、最近任务及失败任务                                                   |
 | GET                  | /audit                     | 最近200条非敏感操作审计                                                                                      |
 | GET / PATCH          | /system                    | 查看版本、数据库和当前 API 进程的 Worker / 管理员更新执行默认值和日志保留期                                  |
 
 凭据 `type` 包括 SSH_PASSWORD、SSH_KEY、GIT_TOKEN、GIT_PASSWORD、API_KEY、API_SECRET、DOCKER_REGISTRY、USERNAME_PASSWORD、CUSTOM_SECRET。SSH_PASSWORD 使用 `secret:{password}`；SSH_KEY 使用 `{privateKey,passphrase?}`；GIT_TOKEN 使用 `{token}`；API_KEY 使用 `{apiKey}`。GET 永不返回 secret、ciphertext、nonce、auth_tag。
 
-仓库和环境可通过 `PATCH /projects/:id/{repositories,environments}/:resourceId` 更新，或通过同路径的 `DELETE` 归档。仓库凭据传 `null` 可解除关联。有效配置、可运行版本或在途任务仍引用资源时返回 409。只有已完成历史引用的资源可归档，历史继续使用原 ID 和快照。
+仓库可通过 `PATCH /projects/:id/repositories/:resourceId` 更新，或通过同路径的 `DELETE` 归档。仓库凭据传 `null` 可解除关联。有效配置、可运行版本或在途任务仍引用资源时返回 409。只有已完成历史引用的资源可归档，历史继续使用原 ID 和快照。
 
 项目详情在 `services` 中返回服务及地址，并包含 `dependencies`、`dependents`、`deploymentTargets` 和 `recentDeployments`。`dependents` 中的 `projectId` 指向依赖本项目的项目，修改依赖需从其所属项目发起。通过 `POST /projects/:id/dependencies` 新增依赖，带记录 ID 的路径支持 `PATCH` 和 `DELETE`。提交依赖时会检查循环引用。
 
@@ -113,17 +113,16 @@
 | --- | --- |
 | `GET /projects/:id/execution-graph/runs` | 读取执行流运行记录，通过运行详情获取关联任务和日志。 |
 | `GET /artifacts`、`GET /deployments` | 支持 `projectId`、上述三个条件及 `taskId`、`recordId`。有执行图来源时返回 `graphRunId`、`graphVersion`、`graphFlowName` 和 `graphNodeName`。逐服务器发布还返回当次的 `serverName`、`serverHost`、`serverPort` 快照和实际使用的 `artifactId`。 |
-| `GET /deployments/approvals` | 管理员可按相同条件查看待审批发布，其中 `recordId` 是待审批任务 ID。审批、重新部署及回滚继续调用原有操作接口。 |
+| `GET /deployments/approvals` | 管理员可查询旧交付的待审批记录。新的审核、审批和回滚通过执行图运行接口处理。 |
 
 产物和部署列表可附加 `repositoryId`。同时传入提交前缀 `commit` 时，两个条件匹配同一项产物来源。产物的 `sources` 列出实际绑定并供构建使用的源码工作区及额外文件来源，包含 `repositoryId`、`commitSha`、可用的 `ref`、提交说明 `subject`、相对路径 `path` 和 `workspace` 节点引用。空列表表示当前产物缺少可核实来源，旧记录可以省略该字段。触发事件另由 `sourceEvent` 返回。镜像档案可返回 `imageOrigin` 及归档内的 `composeTemplate` 路径与摘要。登记现有镜像时，`sourceImageReference` 记录登记来源，Git 来源列表为空。
 
-### 服务环境 Compose 模板
+### 历史服务环境 Compose 模板
 
 - `GET /services/:serviceId/environments/:environmentId/compose-templates` 返回 `revision` 和最近 100 个 `versions` 的元数据。修订号 0 表示默认使用产物归档。
-- `POST /services/:serviceId/environments/:environmentId/compose-templates` 接收 `expectedVersion`、`source` 和可选的 `content`。来源 `SERVICE_ENVIRONMENT` 使用 YAML 内容，`ARCHIVE` 使用产物归档。同一内容保存复用当前版本。旧修订号提交返回 HTTP 409。
-- `GET /services/:serviceId/environments/:environmentId/compose-templates/:id` 获取指定模板版本内容。管理员和操作员可以写入与读取内容，查看者可以查看版本元数据。模板内容的读取与来源变更记入审计。
+- `GET /services/:serviceId/environments/:environmentId/compose-templates/:id` 供管理员和操作员读取指定历史版本的内容，读取记入审计。新部署在图节点选择归档模板或固定仓库文件。
 
-交付预览包含所选 Compose 来源。管理模板记录固定版本、路径与 SHA-256。历史产物显示归档路径、摘要和固定镜像引用。成功激活的交付记录可返回 `composeRelease`，包括校验过的 `template`、实际使用的 `imageReference` 和 `imageId`。回滚预览中的 `composeTemplate` 与 `previousCompose` 分别记录待复用的模板与历史激活结果。
+图内交付预览包含所选 Compose 来源。历史产物显示归档路径、摘要和固定镜像引用。成功激活的交付记录可返回 `composeRelease`，包括校验过的 `template`、实际使用的 `imageReference` 和 `imageId`。
 
 ### 首页汇总
 
@@ -152,7 +151,7 @@
 | --- | --- |
 | 项目资源 | `#/projects/:id` 默认入口。`resource` 选择 `repositories`、`services`、`environment-sets` 或 `relations`，可用 `repositoryId`、`serviceId`、`environmentSetId` 定位。 |
 | 执行图 | `#/projects/:id/execution-graph`。使用 `start`、`run`、`pane`、`version`、`node` 和 `flow` 定位。服务详情打开开始节点时带入 `serviceId`。 |
-| 产物 | `#/projects/:id/artifacts`。`artifactId` 定位记录，可按服务及源码等条件筛选。部署与回滚或待审批记录可通过 `/delivery?tab=deployments` 或 `/delivery?tab=approvals` 查看。 |
+| 产物 | `#/projects/:id/artifacts`。`artifactId` 定位产物，可按服务及源码筛选，验证、固定保留、提交清理或跳转到生产节点。部署、回滚和待审批事项从执行图运行详情查看。 |
 | 项目配置 | `#/projects/:id/configuration`。同页维护基本信息、执行默认值、项目公共变量和 AI 策略。 |
 
 `view` 和 `viewSearch` 保留返回的项目视图及筛选。平台服务器通过 `#/servers?serverId=:serverId` 或 `#/servers?groupId=:groupId` 打开详情。项目来的链接可附 `projectId` 和该项目的 `returnPath`。由服务链接传入的服务按已发布开始节点声明的输入预填，图中固定绑定继续随版本生效。
@@ -172,11 +171,14 @@
 | `GET /versions`、`GET /versions/:version` | 查询发布历史和具体发布版本。 |
 | `POST /versions/:version/retire` | 管理员或操作员停用旧发布版。先发布替代版本，再停用绑定该旧版的启用触发器。返回 `{version,retiredAt}`。停用版保留定义和运行历史，在途计划继续保护其资源。 |
 | `POST /versions/:version/restore` | 提交 `{expectedRevision}`，将发布版本载入草稿。 |
-| `POST /flows/:flowId/preview` | 提交 `{version,inputs:{parameters}}`。返回 `configurationHash`、`planSections`、参数和来源、`environmentSet`、`checkouts` 及节点端口证据。 |
+| `POST /flows/:flowId/preview` | 提交 `{version,inputs:{parameters}}`。返回 `configurationHash`、`planSections`、参数和来源、`environmentSet`、`checkouts`、`deliveries`、图内审核及保护节点 `gates` 与节点端口证据。 |
 | `POST /flows/:flowId/run` | 提交同样的版本和输入，附 `expectedConfigurationHash` 和 `idempotencyKey`。可原样传回 `planSections` 为 `expectedPlanSections`。配置变更返回 409，`error.changes` 给出失效字段或计划段落，重新预览后方可确认。相同确认可取回原运行。 |
 | `GET /runs`、`GET /runs/:runId` | 查询运行、任务和结束节点的 `outputs`。节点详情含 `inputs`、`environment`、`output`、逐目标状态和可定位的 `issue`。 |
 | `POST /runs/:runId/cancel` | 取消运行及尚未完成的节点和子流。 |
-| `POST /runs/:runId/nodes/:nodeId/decision` | 管理员提交 `{decision:"APPROVE"}` 或 `{decision:"REJECT"}`。 |
+| `POST /runs/:runId/nodes/:nodeId/decision` | 管理员提交 `{decision:"APPROVE"\|"REJECT",expectedScopeHash?}`。源码审核与绑定发布的审批必须传回等待节点 `output.scopeHash`。响应保留实际范围、决定、操作者及时间。 |
+| `POST /runs/:runId/nodes/:nodeId/targets/:serverId/inspect-release` | 管理员或原发起操作员核查已结束的失败或待核查目标。返回 `CURRENT`、`PREVIOUS`、`NO_ACTIVE_RELEASE` 或 `UNKNOWN`，附时间及可确认的发布和锁信息。仅执行远端读取并写审计；运行详情的逐目标 `inspection` 返回最近一次核查。 |
+
+服务卡片通过 `GET /projects/:id/recent-service-graph-runs` 读取最近的相关图运行。可对单个服务请求 `GET /projects/:id/services/:serviceId/recent-graph-runs`。关联来自实际任务或仍在等待的已确认交付节点。
 
 预览或确认时发现明确的运行条件问题，可通过 `error.planIssue` 获取 `code`、`message` 和已知的 `flowId`、`flowName`、`nodeId`、`nodeName`、`fieldId`、`fieldName`。问题类别包括 `INPUT`、`REPOSITORY`、`BUILD_TARGET`、`RELEASE_TARGET`、`ARTIFACT`、`SOURCE_REVIEW` 和 `CONFIGURATION`。绑定到开始参数时可附 `parameterId`，定位目标问题时可附 `serviceId`、`environmentId` 和 `targetSource`。源码审核问题可附 `repositoryId` 与完整的 `commitSha`。成功预览会提供本次运行的产物节点及输出字段，或已固定的历史制品。存在多个候选来源时，各候选可附实际源码快照和对应审核记录。发布审批以 `requireApproval` 单独表示。
 
@@ -188,13 +190,22 @@
 
 画布的 `endpoints` 保存 `{startId,endId,serviceId?,edgeSelections?,inputBindings?,environmentBindings?,outputBindings?}`。端口可引用 `INPUT.fieldId`、`OUTPUT.nodeId` 和 `fieldId`、`CONTEXT.fieldId`、`VALUE.value`，或按顺序选择 `FIRST_AVAILABLE.sources`。`AS_GIT_REF` 可把普通文本明确转换成分支或 Tag。端口的 `onMissing` 可声明报告缺项、省略、使用字段默认值或 Git 仓库默认版本。分支候选存在尚未完成的前序生产者时等待，已确认无值时继续选择。
 
-Shell 和检查节点的 `environmentBindings[nodeId][key]` 还支持 `NODE_INPUT.fieldId`、`ENVIRONMENT_KEY.key` 和 `CREDENTIAL.credentialId`。先解析输入再做环境注入。脚本每执行单元可返回一条 `VEYOPS_OUTPUT=` JSON 对象，通过声明的输出名转成稳定字段 ID。未知键、重复键、类型错误、超限或敏感输出会阻止节点成功。原始结果行独立解析，节点日志保存普通输出。
+构建、Shell 和检查节点可用 `environmentBindings[nodeId][key]` 选择固定值、开始参数、上游输出、节点输入 `NODE_INPUT.fieldId`、变量集合键 `ENVIRONMENT_KEY.key` 或凭据 `CREDENTIAL.credentialId`。构建先解析输入，再将节点变量应用于管理端或目标端。节点变量优先于仓库变量文件、项目公共变量和开始节点变量集合。预览固定可解析的值与凭据版本，尚无结果的上游值标为等待。运行详情记录来源和覆盖关系，敏感值保持掩码。`VEYOPS_*` 系统键禁止绑定。
+
+Shell 和检查脚本每执行单元可返回一条 `VEYOPS_OUTPUT=` JSON 对象，通过声明的输出名转成稳定字段 ID。未知键、重复键、类型错误、超限或敏感输出会阻止节点成功。原始结果行独立解析，节点日志保存普通输出。
 
 普通路径的 `edgeSelections` 按源节点 ID 写入允许的下游节点 ID。`FLOW_CALL` 的端口取子流的开始和结束字段 ID。含外部执行资源或变量集合的子流需要在父流预览时解析其参数。运行证据中的字段状态可区分已解析、默认值、等待上游、省略或错误。来源通过稳定节点与字段 ID 回查。
 
 `BUILD.build.dependencies` 最多声明八个额外源码工作区别名。每个别名用小写字母开头，可包含小写字母、数字和连字符。流需将 Git 来源工作区绑定到主 `workspace` 和各 `dependency_<别名>` 端口。额外工作区复制到构建任务独立目录，命令可通过 `$VEYOPS_GRAPH_DEPENDENCY_ROOT/<别名>` 访问。镜像构建的 Dockerfile 需要使用依赖时，先在构建命令中将所需文件复制到主仓库的构建上下文。
 
-构建、登记和部署配置分别保存在 `BUILD.build`、`REGISTER_ARTIFACT.registerArtifacts` 和 `DEPLOY_ARTIFACT.deploy`。构建和登记支持 `artifacts` 列表，条目包含 `name`、`type`、`path` 或 `imageReference`，以及可选 `required`、`composeFilePath` 和 `persist`。`persist:false` 输出 `{temporaryArtifactId}`，当前根运行及其子流可以引用。部署节点从 `artifact` 端口取得待部署记录。归档下载使用 `GET /artifacts/:id/download`。
+构建和登记配置保存在 `BUILD.build` 和 `REGISTER_ARTIFACT.registerArtifacts`。`artifacts` 条目包含 `name`、`type`、`path` 或 `imageReference`，以及可选 `required`、`composeFilePath` 和 `persist`。`persist:false` 输出 `{temporaryArtifactId}`，当前根运行及其子流可以引用。归档下载使用 `GET /artifacts/:id/download`。
+
+- `DEPLOY_ARTIFACT` 和 `ROLLBACK_ARTIFACT` 从 `artifact` 端口取得产物。`deploy` 声明 `method`（`FILE` 或 `COMPOSE`）和 `deployPath`。Compose 来源可为 `{kind:"ARTIFACT"}` 或 `{kind:"REPOSITORY_FILE",repositoryId,commitSha,path}`。仓库模板的固定提交、路径和内容摘要随预览确认。
+- `SOURCE_REVIEW` 可绑定单个固定 Git 来源 `source`，或含源码记录的 `artifact`。构建前审核也可设置 `approval.buildNodeId` 关联下游 `BUILD`，并将构建的 `review` 端口绑定到此审核节点的 `review` 输出。关联构建后，审核范围使用已确认计划中的主仓、依赖仓和异仓变量文件的仓库与 SHA。凭证只对所关联的本次构建有效，Worker 再核对执行快照中的完整源码列表。
+- `APPROVAL.approval.releaseNodeId` 绑定下游发布。等待时固定服务、逐目标成员、实物实例与指纹，回滚还固定被替代的发布记录。
+- `HEALTH_CHECK.healthCheck` 声明 `command` 和可选的 `timeoutSeconds`，从 `release` 端口接入同一服务成功激活的发布结果。退出码 `0` 表示健康，`10` 专用于探针明确判断应用不健康。缺少命令、权限错误、超时、连接断开或其他不明确结果进入 `NEEDS_ATTENTION`。只有明确的 `UNHEALTHY` 可经条件进入绑定 `afterRelease` 的回滚。逐目标结果保留探针判定、退出码及已知原因。
+- 不绑定 `afterRelease` 的回滚在预览固定当前发布。新运行必须选择同一服务、目标和目的地曾成功使用的历史产物。发布前再次核对活动发布身份和实物。
+- 目标核查确认发布链接及受管目录。Compose 还需核对已登记的 Docker 引擎和实际容器。当远端与平台记录一致、未发现发布锁且无待核对的自定义发布命令时，`canReplan` 提供重新预览入口。核查不会重放发布或改写历史任务结果。
 
 ### 执行图存量迁移
 
@@ -353,17 +364,17 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 
 ## 交付记录与保护
 
-服务环境和执行流运行可提交 `serverIds` 或 `groupIds`，可同时使用两者，并配置 `strategy`、`maxParallel` 和 `failurePolicy`。执行预览返回去重后的目标和配置摘要，成员变化后需重新预览。
+执行流的目标参数或节点目标绑定可提交 `serverIds` 或 `groupIds`，可同时使用两者，并配置 `strategy`、`maxParallel` 和 `failurePolicy`。执行预览返回去重后的目标和配置摘要，成员变化后需重新预览。
 
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /services/:serviceId/repositories`、`PUT /services/:serviceId/repositories` | 查询或保存服务与仓库关联，传入 `{repositories:[{repositoryId,repoPath,isPrimary}]}`。 |
-| `POST /projects/:projectId/environments`、`PATCH /projects/:projectId/environments/:envId` | 创建或更新环境。`repositoryEnvFile` 指定仓库相对路径。`defaultTargetSelection` 指定默认发布服务器、分组和批次策略，传 `null` 清除默认目标。 |
-| `GET /services/:serviceId/environments/:envId/config`、`PUT /services/:serviceId/environments/:envId/config` | 读取或保存服务环境配置。 |
+| `GET /deployment-targets`、`GET /deployment-targets/:id` | 查询历史独立部署目标。新计划直接引用服务器和分组。 |
+| `GET /services/:serviceId/environments/:envId/config` | 读取历史服务环境配置。 |
 | `GET /projects/:projectId/variables`、`PUT /projects/:projectId/variables` | 查询或保存项目公共变量。 |
-| `GET /environments/:envId/variables`、`PUT /environments/:envId/variables` | 查询或保存环境本地变量。 |
+| `GET /environments/:envId/variables` | 查询旧环境的本地变量。 |
 | `GET /environments/:envId/variables/inherited` | 查询未被该环境覆盖的项目公共变量。 |
-| `GET /services/:serviceId/environments/:envId/variables`、`PUT /services/:serviceId/environments/:envId/variables` | 独立查询或保存服务环境变量，覆盖同名环境变量。 |
+| `GET /services/:serviceId/environments/:envId/variables` | 查询旧服务环境变量。 |
 | `POST /projects/:projectId/variables/:key/reveal`、`POST /environments/:envId/variables/:key/reveal`、`POST /services/:serviceId/environments/:envId/variables/:key/reveal` | 管理员临时读取敏感值 `{value}`，读取动作记入审计。 |
 | `GET /artifacts` | 按项目、服务、变量集合、服务器、类型、源码或验证状态筛选已登记实例。使用 `limit` 和最后一个实例 ID `cursor` 分页。 |
 | `GET /artifacts/:id` | 通过逻辑或实例 ID 查看 `{artifactId,instances}`、实物状态和生产运行。 |
@@ -374,9 +385,9 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 | `PATCH /registries/:id`、`POST /registries/:id/test` | 管理员编辑、测试 HTTPS Registry V2 连通和认证，`credentialId:null` 解除凭据绑定。 |
 | `DELETE /registries/:id` | 管理员删除未被有效配置或镜像产物引用的镜像仓库，仍有引用时返回 409。 |
 
-项目公共、环境和服务环境的变量查询与保存都返回 `{revision, variables}`。保存整份作用域变量时需提交 `{expectedRevision, variables:[{key,value?,isSecret?,description?,keepSecret?,credentialId?}]}`，其中 `expectedRevision` 取自本次编辑所用的读取结果。作用域已更新时，接口返回 `409` 并保留数据库中的现有变量。重新读取最新版本后再核对并提交改动。继承变量的专用查询仍返回变量列表。
+项目公共变量的查询和保存返回 `{revision, variables}`。保存整份变量时提交 `{expectedRevision, variables:[{key,value?,isSecret?,description?,keepSecret?,credentialId?}]}`，其中 `expectedRevision` 取自本次编辑所用的读取结果。作用域已更新时，接口返回 `409`。继承变量的历史查询仍返回变量列表。新变量集合使用项目变量集合接口。
 
-敏感变量以加密凭据引用存储，查询接口隐藏值。`keepSecret: true` 保留当前敏感值，提供新值可替换。运行时项目公共变量先加载，同名环境变量覆盖，服务环境变量再覆盖。Shell 节点可通过 `inputs.environmentId` 指定环境，默认使用项目公共变量。管理端和目标端构建、部署及 SSH 脚本注入 `VEYOPS_PROJECT_ID`、`VEYOPS_PROJECT_SLUG`，关联服务时注入 `VEYOPS_SERVICE_ID`、`VEYOPS_SERVICE_SLUG`。构建和部署还提供 `VEYOPS_PROJECT_NAME` 和 `VEYOPS_SERVICE_NAME`。目录、文件和镜像交付详见 [执行流交付说明](执行流交付.md)。
+敏感变量以加密凭据引用存储，查询接口隐藏值。`keepSecret: true` 保留当前敏感值，提供新值可替换。新图的变量按仓库文件、项目公共变量、变量集合及节点绑定逐层覆盖。构建和部署会注入项目及已关联服务的标识。目录、文件和镜像交付详见 [执行流交付说明](执行流交付.md)。
 
 管理员和操作员可调用 `/projects/:projectId/repositories/:repositoryId/connection`、`/branches` 和 `/commits` 的 GET 接口检查仓库、读取分支和查询最近提交。`/commits` 接受 `branch` 和 `limit`，默认 20 条，最多 50 条。给仓库绑定凭据需要管理员角色。
 
@@ -384,20 +395,9 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 
 ### 发布保护与回滚
 
-启用服务环境的 `releasePolicy.requireCodeReview` 后，发布按产物实际依赖的仓库及完整 SHA 复核。属于同一服务环境的每项来源均需有效审核，审批发布和激活前会重新核对。
+新发布通过执行图节点确定源码审核、审批、健康检查和回滚条件。管理员从对应运行节点提交决定，独立回滚使用已发布的回滚执行流。运行详情保存逐目标结果和核查记录。
 
-`GET /projects/:projectId/services/:serviceId/environments/:environmentId/source-reviews` 返回审核记录，可按 `repositoryId` 和 `commitSha` 筛选。管理员使用同一路径下的 `PUT /:commitSha` 提交 `{repositoryId,decision:"APPROVED"|"REVOKED",reason?}`。只有项目历史中恰有一个当前可用仓库时，省略仓库的请求才可定位。旧记录保留并以 `repositoryId: null` 返回，需经管理员确认仓库后重新审核。预览上游将产出的制品时会标记待登记，登记完成后按实际来源执行检查。
-
-管理员通过服务环境配置的 `releasePolicy` 设置 `requireApproval`、`rollbackMode`（`OFF`、`PREVIOUS_HEALTHY`、`PINNED`）、可选的 `pinnedDeploymentId`、`archivePushedImage` 和 `healthCheck`。健康检查包含可选的 `httpUrl`、`compose`，以及 `attempts`、`intervalSeconds`、`timeoutSeconds`。文件服务环境可另配置 `stopCommand`。
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/deployments/approvals` | 管理员查看等待批准的发布任务及提交、产物和服务器 ID。 |
-| `POST` | `/deployments/approvals/:id/approve` | 管理员批准固定目标和产物。返回任务。 |
-| `POST` | `/deployments/:id/rollback/preview` | 预览使用历史发布快照回滚的范围，返回 `confirmationHash`。 |
-| `POST` | `/deployments/:id/rollback` | 提交预览的 `confirmationHash` 开始回滚，返回可能仍待审批的任务。 |
-
-执行流发布预览的 `requireApproval` 表示部署是否需要管理员批准。部署任务的 `approvalStatus` 为 `PENDING`、`APPROVED` 或 `null`。`GET /deployments` 提供 `isCurrent`、`rollbackAvailable`、`rollbackOfDeploymentId` 和关联任务 ID。
+`GET /projects/:projectId/services/:serviceId/environments/:environmentId/source-reviews` 保留历史审核，可按 `repositoryId` 和 `commitSha` 筛选。`GET /deployments/approvals` 保留管理员可见的旧审批记录。`GET /deployments` 提供 `isCurrent`、`rollbackOfDeploymentId` 和关联任务及图运行 ID。旧环境发布配置、独立部署目标、审批和回滚的写接口已退出正式应用。
 
 ### 产物保留
 

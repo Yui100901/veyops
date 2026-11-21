@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  Body,
   ConflictException,
   Controller,
   Get,
@@ -9,11 +8,9 @@ import {
   Module,
   NotFoundException,
   Param,
-  Post,
   Req,
 } from '@nestjs/common';
 import { IsIn, IsInt, IsOptional, IsString, MaxLength, Min } from 'class-validator';
-import { load, CORE_SCHEMA, mergeTag } from 'js-yaml';
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
@@ -28,47 +25,14 @@ import {
   managedComposePath,
   managedComposeReference,
   maxComposeBytes,
+  parseComposeTemplate,
   readManagedCompose,
 } from './compose-template-reference';
 
-class SaveComposeRevisionDto {
+export class SaveComposeRevisionDto {
   @IsInt() @Min(0) expectedVersion!: number;
   @IsIn(['ARCHIVE', 'SERVICE_ENVIRONMENT']) source!: 'ARCHIVE' | 'SERVICE_ENVIRONMENT';
   @IsOptional() @IsString() @MaxLength(maxComposeBytes) content?: string;
-}
-
-function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
-}
-
-function validateContent(content?: string) {
-  if (!content?.trim() || Buffer.byteLength(content) > maxComposeBytes || /\0/.test(content))
-    throw new BadRequestException('Compose 模板不能为空，且大小不能超过 256 KiB');
-  let parsed: unknown;
-  try {
-    parsed = load(content, {
-      schema: CORE_SCHEMA.withTags(mergeTag),
-      maxDepth: 64,
-      maxAliases: 100,
-    });
-  } catch {
-    throw new BadRequestException('Compose 模板必须是单份有效的 YAML 文档');
-  }
-  if (!object(parsed) || !object(parsed.services) || !Object.keys(parsed.services).length)
-    throw new BadRequestException('Compose 模板至少需要定义一个服务');
-  const services = Object.values(parsed.services);
-  if (services.some((service) => !object(service)))
-    throw new BadRequestException('Compose 模板中每个服务都必须是键值映射');
-  if (
-    !services.some(
-      (service) =>
-        object(service) &&
-        typeof service.image === 'string' &&
-        /^(?:\$VEYOPS_IMAGE|\$\{VEYOPS_IMAGE(?:(?::?[-?])[^}]*)?\})$/.test(service.image),
-    )
-  )
-    throw new BadRequestException('至少一个 Compose 服务必须通过 ${VEYOPS_IMAGE} 使用发布镜像');
-  return content;
 }
 
 const metadataFields = ['id', 'version', 'checksum', 'created_by', 'created_at'] as const;
@@ -151,7 +115,8 @@ export class ComposeTemplatesService {
   ) {
     if (input.source === 'ARCHIVE' && input.content !== undefined)
       throw new BadRequestException('使用归档时无需提供模板内容');
-    const content = input.source === 'SERVICE_ENVIRONMENT' ? validateContent(input.content) : null;
+    const content =
+      input.source === 'SERVICE_ENVIRONMENT' ? parseComposeTemplate(input.content).content : null;
     const checksum = content === null ? null : composeChecksum(content);
     const db = this.database.db;
     return db.transaction().execute(async (tx) => {
@@ -208,18 +173,11 @@ class ComposeTemplatesController {
   ) {
     return this.templates.content(serviceId, environmentId, id, request.user.id);
   }
-
-  @Roles('ADMIN', 'OPERATOR')
-  @Post()
-  save(
-    @Param('serviceId') serviceId: string,
-    @Param('environmentId') environmentId: string,
-    @Body() input: SaveComposeRevisionDto,
-    @Req() request: AuthRequest,
-  ) {
-    return this.templates.save(serviceId, environmentId, input, request.user.id);
-  }
 }
 
-@Module({ providers: [ComposeTemplatesService], controllers: [ComposeTemplatesController] })
+@Module({
+  providers: [ComposeTemplatesService],
+  controllers: [ComposeTemplatesController],
+  exports: [ComposeTemplatesService],
+})
 export class ComposeTemplatesModule {}

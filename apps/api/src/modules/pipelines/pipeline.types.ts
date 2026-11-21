@@ -96,6 +96,16 @@ export interface PipelineDefinition {
 }
 export interface PipelineSnapshot {
   managedCompose?: import('../service-configs/compose-template-reference').ManagedComposeReference;
+  graphDeployment?: {
+    method: 'FILE' | 'COMPOSE';
+    composeProject?: string;
+    template?: Extract<
+      import('../service-configs/compose-template-reference').ComposeTemplateReference,
+      { source: 'REPOSITORY_FILE' }
+    >;
+  };
+  graphGate?: import('../execution-graphs/graph-release-gates').GraphReleaseGate;
+  graphRollback?: Record<string, string>;
   artifactSources?: import('../artifacts/artifact-sources').ArtifactSource[];
   graphReleaseTargets?: {
     source: import('./delivery-targets').DeliveryTargetSource;

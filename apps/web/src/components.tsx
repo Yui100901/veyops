@@ -86,6 +86,7 @@ const statusNames: Record<string, string> = {
   SUCCESS: '成功',
   FAILED: '失败',
   PARTIAL_FAILED: '部分失败',
+  PARTIAL_SUCCESS: '部分成功',
   CANCEL_REQUESTED: '正在取消',
   CANCELLED: '已取消',
   TIMED_OUT: '已超时',
@@ -93,18 +94,27 @@ const statusNames: Record<string, string> = {
   ONLINE: '连接正常',
   OFFLINE: '连接失败',
   UNKNOWN: '未检测',
+  HEALTHY: '检查通过',
+  UNHEALTHY: '检查失败',
+  NOT_CHECKED: '尚未检查',
   ACTIVE: '已启用',
   DISABLED: '已禁用',
   SKIPPED: '已跳过',
 };
 export function Status({ value }: { value: string }) {
-  const tone = ['SUCCESS', 'ONLINE', 'ACTIVE'].includes(value)
+  const tone = ['SUCCESS', 'ONLINE', 'ACTIVE', 'HEALTHY'].includes(value)
     ? 'green'
-    : ['FAILED', 'OFFLINE', 'TIMED_OUT', 'PARTIAL_FAILED'].includes(value)
+    : ['FAILED', 'OFFLINE', 'TIMED_OUT', 'PARTIAL_FAILED', 'UNHEALTHY'].includes(value)
       ? 'red'
-      : ['RUNNING', 'PENDING', 'QUEUED', 'WAITING', 'CANCEL_REQUESTED', 'NEEDS_ATTENTION'].includes(
-            value,
-          )
+      : [
+            'RUNNING',
+            'PENDING',
+            'QUEUED',
+            'WAITING',
+            'CANCEL_REQUESTED',
+            'NEEDS_ATTENTION',
+            'PARTIAL_SUCCESS',
+          ].includes(value)
         ? 'amber'
         : 'gray';
   return (

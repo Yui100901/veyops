@@ -157,6 +157,11 @@ button.graph-node[aria-pressed='true'] {
   padding-left: 1.6rem;
   margin: 0;
 }
+.graph-logs > li[aria-current='location'] {
+  outline: 2px solid var(--accent);
+  outline-offset: 0.35rem;
+  border-radius: 0.3rem;
+}
 .graph-logs pre {
   overflow: auto;
   white-space: pre-wrap;
@@ -318,6 +323,25 @@ button.graph-node[aria-pressed='true'] {
 
 .graph-field-card[open] > summary {
   margin-bottom: 0.65rem;
+}
+
+.graph-run-targets > li:has(.graph-release-inspection) {
+  flex-basis: 100%;
+  min-width: 0;
+}
+
+.graph-release-inspection {
+  display: grid;
+  gap: 0.45rem;
+  margin-top: 0.45rem;
+  padding: 0.65rem;
+  border: 1px solid var(--line, #dce4ee);
+  border-radius: 0.45rem;
+  overflow-wrap: anywhere;
+}
+
+.graph-release-inspection .field-note {
+  margin: 0;
 }
 
 .graph-field-pair,

@@ -68,35 +68,10 @@ export function ExecutionGraphRepairLinks({
   });
   const links: { href: string; label: string }[] = [];
 
-  if (issue.kind === 'DEPLOY_TARGET' && issue.targetSource !== 'NODE') {
-    const serviceId = issue.serviceId ?? start.serviceId ?? flow.serviceId;
-    const environmentId = issue.environmentId ?? start.environmentId;
-    const environment = project.environments.find(({ id }) => id === environmentId);
-    const service = project.services.find(({ id }) => id === serviceId);
-    if (environment && service) {
-      links.push(
-        resourceLink('配置服务环境发布目标', {
-          resource: 'services',
-          serviceId: service.id,
-          environmentId: environment.id,
-          panel: 'settings',
-        }),
-      );
-    }
-    if (environment) {
-      const inherited = resourceLink('配置环境默认发布目标', {
-        resource: 'environments',
-        environmentId: environment.id,
-        panel: 'targets',
-      });
-      if (issue.targetSource === 'PROJECT_ENVIRONMENT') links.unshift(inherited);
-      else links.push(inherited);
-    }
-  }
   if (issue.kind === 'REPOSITORY' && (parameter || !issue.nodeId || !project.repositories.length)) {
     links.push(resourceLink('登记项目仓库', { resource: 'repositories', panel: 'new' }));
   }
-  if (!parameter && (issue.kind !== 'DEPLOY_TARGET' || !links.length)) {
+  if (!parameter) {
     const label = {
       REPOSITORY: '编辑仓库绑定',
       BUILD_TARGET: '编辑构建目标',

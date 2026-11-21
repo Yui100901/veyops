@@ -19,7 +19,7 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { Type } from 'class-transformer';
-import type { Selectable } from 'kysely';
+import { sql, type Selectable } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import {
   Allow,
@@ -96,9 +96,14 @@ class RepositoryDto {
 }
 class ServiceDto {
   @ValidateIf((_object, value) => value !== undefined)
-  @IsString() @MinLength(1) @MaxLength(100) name?: string;
+  @IsString()
+  @MinLength(1)
+  @MaxLength(100)
+  name?: string;
   @ValidateIf((_object, value) => value !== undefined)
-  @IsString() @Matches(/^[a-z0-9][a-z0-9-]{0,62}$/) slug?: string;
+  @IsString()
+  @Matches(/^[a-z0-9][a-z0-9-]{0,62}$/)
+  slug?: string;
   @ValidateIf((_object, value) => value !== undefined)
   @IsIn(['WEB', 'API', 'WORKER', 'SCHEDULED_JOB', 'STATIC_SITE', 'DOCKER_SERVICE', 'CUSTOM'])
   serviceType?: string;
@@ -108,7 +113,7 @@ class ServiceDto {
 class UpdateServiceDto extends ServiceDto {
   @IsInt() @Min(1) expectedRevision!: number;
 }
-class EnvironmentDto {
+export class EnvironmentDto {
   @ValidateIf((_object, value) => value !== undefined)
   @IsString()
   @MinLength(1)
@@ -358,6 +363,90 @@ export class ProjectsService {
       if (!environment) throw new NotFoundException('环境不在当前项目中');
     }
     return recentDeployments(db, { projectId, serviceId, environmentId }, 5);
+  }
+
+  async serviceRecentGraphRuns(projectId: string, serviceId: string) {
+    await this.serviceDetail(projectId, serviceId);
+    return this.graphRunsByService(projectId, 5, serviceId);
+  }
+
+  async recentServiceGraphRuns(projectId: string) {
+    await requireProject(this.database.db, projectId);
+    const rows = await this.graphRunsByService(projectId, 1);
+    return Object.fromEntries(rows.map((row) => [row.serviceId, row]));
+  }
+
+  private graphRunsByService(projectId: string, limit: number, serviceId?: string) {
+    const db = this.database.db;
+    const actual = db
+      .selectFrom('execution_node_runs as node')
+      .innerJoin('tasks as task', 'task.id', 'node.task_id')
+      .select(['node.run_id as runId', 'task.service_id as serviceId'])
+      .where('task.project_id', '=', projectId)
+      .where('task.service_id', 'is not', null);
+    const planService =
+      this.database.client === 'postgres'
+        ? sql<string>`cast(${sql.ref('node.dispatch_json')} as jsonb) ->> 'serviceId'`
+        : sql<string>`json_extract(${sql.ref('node.dispatch_json')}, '$.serviceId')`;
+    const pending = db
+      .selectFrom('execution_node_runs as node')
+      .innerJoin('execution_flow_runs as graphRun', 'graphRun.id', 'node.run_id')
+      .select(['node.run_id as runId', planService.as('serviceId')])
+      .where('graphRun.project_id', '=', projectId)
+      .where('graphRun.status', 'in', ['QUEUED', 'WAITING', 'RUNNING'])
+      .where('node.status', 'in', ['PENDING', 'WAITING', 'QUEUED', 'RUNNING'])
+      .where('node.node_type', 'in', ['BUILD', 'DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT'])
+      .where('node.dispatch_json', 'is not', null);
+    const serviceTasks = db
+      .selectFrom(actual.union(pending).as('linked'))
+      .innerJoin('services as service', 'service.id', 'linked.serviceId')
+      .select(['linked.runId', 'service.id as serviceId'])
+      .where('service.project_id', '=', projectId)
+      .where('service.archived_at', 'is', null)
+      .where('service.slug', '!=', graphUnscopedArtifactServiceSlug)
+      .$if(!!serviceId, (query) => query.where('service.id', '=', serviceId!));
+    const ranked = db
+      .selectFrom('execution_flow_runs as run')
+      .innerJoin(serviceTasks.as('serviceRun'), 'serviceRun.runId', 'run.id')
+      .select([
+        'run.id',
+        'run.project_id as projectId',
+        'run.flow_id as flowId',
+        'run.flow_name as flowName',
+        'run.version',
+        'run.status',
+        'run.created_at as createdAt',
+        'run.finished_at as finishedAt',
+        'serviceRun.serviceId',
+      ])
+      .where('run.project_id', '=', projectId)
+      .select(({ fn }) =>
+        fn
+          .agg<number>('row_number', [])
+          .over((window) =>
+            window
+              .partitionBy('serviceRun.serviceId')
+              .orderBy('run.created_at', 'desc')
+              .orderBy('run.id', 'desc'),
+          )
+          .as('rank'),
+      );
+    return db
+      .selectFrom(ranked.as('ranked'))
+      .select([
+        'id',
+        'projectId',
+        'flowId',
+        'flowName',
+        'version',
+        'status',
+        'createdAt',
+        'finishedAt',
+        'serviceId',
+      ])
+      .where('rank', '<=', limit)
+      .orderBy('rank')
+      .execute();
   }
 
   async resourceReferences(projectId: string) {
@@ -821,6 +910,17 @@ class ProjectsController {
   ) {
     return this.service.serviceRecentDeployments(id, serviceId, environmentId);
   }
+  @Get(':id/services/:serviceId/recent-graph-runs') serviceRecentGraphRuns(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('serviceId', ParseUUIDPipe) serviceId: string,
+  ) {
+    return this.service.serviceRecentGraphRuns(id, serviceId);
+  }
+  @Get(':id/recent-service-graph-runs') recentServiceGraphRuns(
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    return this.service.recentServiceGraphRuns(id);
+  }
   @Roles('ADMIN', 'OPERATOR') @Post() create(@Body() dto: ProjectDto, @Req() req: AuthRequest) {
     return this.service.create(dto, req.user.id);
   }
@@ -851,13 +951,6 @@ class ProjectsController {
   ) {
     return this.service.service(id, dto, req.user.id);
   }
-  @Roles('ADMIN', 'OPERATOR') @Post(':id/environments') environment(
-    @Param('id') id: string,
-    @Body() dto: EnvironmentDto,
-    @Req() req: AuthRequest,
-  ) {
-    return this.service.environment(id, dto, req.user.id);
-  }
   @Roles('ADMIN', 'OPERATOR') @Patch(':id/repositories/:resourceId') updateRepository(
     @Param('id') id: string,
     @Param('resourceId') resourceId: string,
@@ -874,14 +967,6 @@ class ProjectsController {
   ) {
     return this.service.service(id, dto, req.user.id, resourceId);
   }
-  @Roles('ADMIN', 'OPERATOR') @Patch(':id/environments/:resourceId') updateEnvironment(
-    @Param('id') id: string,
-    @Param('resourceId') resourceId: string,
-    @Body() dto: EnvironmentDto,
-    @Req() req: AuthRequest,
-  ) {
-    return this.service.environment(id, dto, req.user.id, resourceId);
-  }
   @Roles('ADMIN', 'OPERATOR') @Delete(':id/repositories/:resourceId') removeRepository(
     @Param('id') id: string,
     @Param('resourceId') resourceId: string,
@@ -895,13 +980,6 @@ class ProjectsController {
     @Req() req: AuthRequest,
   ) {
     return this.service.removeResource(id, 'services', resourceId, req.user.id);
-  }
-  @Roles('ADMIN', 'OPERATOR') @Delete(':id/environments/:resourceId') removeEnvironment(
-    @Param('id') id: string,
-    @Param('resourceId') resourceId: string,
-    @Req() req: AuthRequest,
-  ) {
-    return this.service.removeResource(id, 'environments', resourceId, req.user.id);
   }
 }
 @Global()

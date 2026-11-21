@@ -4,11 +4,12 @@ import { PipelinesController } from '../../modules/pipelines/pipelines.controlle
 import { PipelineTriggersController } from '../../modules/pipeline-triggers/pipeline-triggers.controller';
 import { PipelineTriggersService } from '../../modules/pipeline-triggers/pipeline-triggers.service';
 import { PipelineHooksModule } from '../../modules/pipeline-hooks/pipeline-hooks.module';
+import { LegacyDeliveryWriteFixtureModule } from './legacy-delivery-write-fixture.module';
 
 /** Historical delivery and trigger regressions can still exercise the underlying executor. */
 @Global()
 @Module({
-  imports: [PipelinesModule, PipelineHooksModule],
+  imports: [PipelinesModule, PipelineHooksModule, LegacyDeliveryWriteFixtureModule],
   controllers: [PipelinesController, PipelineTriggersController],
   providers: [PipelineTriggersService],
   exports: [PipelineTriggersService],

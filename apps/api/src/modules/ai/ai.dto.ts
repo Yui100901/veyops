@@ -44,6 +44,7 @@ export class AiRoutesDto {
 export const aiWriteActions = [
   'execute_command',
   'run_pipeline',
+  'run_execution_flow',
   'initialize_component',
   'publish_source_branch',
   'open_pull_request',

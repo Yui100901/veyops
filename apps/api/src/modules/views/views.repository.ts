@@ -149,6 +149,12 @@ export class ViewsRepository {
     const rankedRecent = deploymentRows(this.db, projectIds, undefined, actualSelection)
       .innerJoin('services as service', 'service.id', 'deployment.service_id')
       .leftJoin('servers as server', 'server.id', 'deployment.server_id')
+      .leftJoin('execution_node_runs as graphNode', 'graphNode.task_id', 'run.task_id')
+      .leftJoin('execution_flow_runs as graphRun', (join) =>
+        join
+          .onRef('graphRun.id', '=', 'graphNode.run_id')
+          .onRef('graphRun.project_id', '=', 'run.project_id'),
+      )
       .select([
         'run.project_id as projectId',
         'run.task_id as taskId',
@@ -164,6 +170,10 @@ export class ViewsRepository {
         'service.name as serviceName',
         'environment.name as environmentName',
         'server.name as serverName',
+        'graphRun.id as graphRunId',
+        'graphRun.flow_id as graphFlowId',
+        'graphRun.version as graphVersion',
+        'graphNode.node_id as graphNodeId',
       ])
       .select((eb) =>
         eb.fn
@@ -211,6 +221,10 @@ export class ViewsRepository {
           'serviceName',
           'environmentName',
           'serverName',
+          'graphRunId',
+          'graphFlowId',
+          'graphVersion',
+          'graphNodeId',
         ])
         .where('recentRank', '<=', 3)
         .orderBy('recentRank')

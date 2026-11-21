@@ -30,10 +30,12 @@ import {
   ],
   exports: [
     PipelinesService,
+    PipelineExecutor,
     BuildsService,
     ArtifactsService,
     ArtifactPhysicalService,
     DeploymentsService,
+    ReleaseRequestsService,
     RegistriesService,
   ],
 })

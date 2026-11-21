@@ -17,6 +17,7 @@ import {
 } from '../components';
 import type { DeploymentSummary, Project, Server, ServerGroup, Service, User } from '../models';
 import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
+import { graphWorkbenchPath } from './graph-workbench-context';
 import { projectResourcePath } from './project-workspace-route';
 import { serverResourceHref } from './server-resource-route';
 
@@ -49,6 +50,10 @@ interface ViewProject extends Pick<
     serviceName?: string | null;
     environmentName?: string | null;
     serverName?: string | null;
+    graphRunId?: string | null;
+    graphFlowId?: string | null;
+    graphNodeId?: string | null;
+    graphVersion?: number | null;
   })[];
   addresses: ProjectAccessLink[];
 }
@@ -118,9 +123,24 @@ function ProjectViewCard({
                   <div>
                     <a
                       className="text-link"
-                      href={`#/tasks/${encodeURIComponent(deployment.taskId)}`}
+                      href={
+                        deployment.graphRunId
+                          ? '#' +
+                            graphWorkbenchPath(project.id, {
+                              pane: 'history',
+                              serviceId: deployment.serviceId,
+                              view: viewId,
+                              viewSearch,
+                              run: deployment.graphRunId,
+                              flow: deployment.graphFlowId ?? undefined,
+                              node: deployment.graphNodeId ?? undefined,
+                              version: deployment.graphVersion ?? undefined,
+                            })
+                          : `#/tasks/${encodeURIComponent(deployment.taskId)}`
+                      }
                     >
-                      {deployment.serviceName || '查看部署任务'}
+                      {deployment.serviceName ||
+                        (deployment.graphRunId ? '查看发布节点' : '查看部署任务')}
                     </a>
                     {deployment.serverId && (
                       <a

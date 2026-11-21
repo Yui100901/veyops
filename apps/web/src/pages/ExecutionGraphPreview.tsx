@@ -1,4 +1,5 @@
 import type { ProjectDetail } from '../models';
+import { graphNodeLabels } from './execution-graph-definition';
 import type {
   GraphEnvironmentSetSummary,
   GraphFieldEvidence,
@@ -12,6 +13,7 @@ import {
   type ArtifactVerification,
 } from './Delivery';
 import { projectResourcePath } from './project-workspace-route';
+import { graphWorkbenchPath } from './graph-workbench-context';
 import { serverResourceHref } from './server-resource-route';
 import './execution-graph-preview.css';
 
@@ -126,7 +128,21 @@ interface DeliveryPreview extends NodeScope {
   possibleArtifacts?: ArtifactChoice[];
   serviceId?: string;
   sourceSnapshot?: PreviewSource[];
+  method?: 'FILE' | 'COMPOSE';
+  composeSource?: { kind: 'ARTIFACT' | 'REPOSITORY_FILE' };
+  composeTemplate?:
+    | { source: 'ARCHIVE'; checksum: string }
+    | {
+        source: 'REPOSITORY_FILE';
+        repositoryId: string;
+        commitSha: string;
+        path: string;
+        checksum: string;
+      };
+  rollbackBaseline?: Record<string, string>;
 }
+
+type ReleaseGateKind = 'SOURCE_REVIEW' | 'APPROVAL' | 'HEALTH_CHECK' | 'ROLLBACK_ARTIFACT';
 
 export interface Preview extends DeliveryPreview {
   configurationHash: string;
@@ -146,6 +162,14 @@ export interface Preview extends DeliveryPreview {
     environment?: GraphFieldEvidence[];
   }[];
   deliveries?: DeliveryPreview[];
+  gates?: {
+    flowId: string;
+    nodeId: string;
+    name: string;
+    kind: ReleaseGateKind;
+    releaseNodeId?: string;
+    buildNodeId?: string;
+  }[];
   checkouts?: (NodeScope & {
     repositoryId: string;
     repositoryName?: string;
@@ -227,12 +251,14 @@ const fieldNames: Record<string, string> = {
   installCommand: '依赖安装命令',
   deployMode: '发布方式',
   deployMethod: '发布方式',
+  method: '发布方式',
   deployPath: '发布目录',
   composeFile: 'Compose 文件',
   composeFilePath: 'Compose 文件',
   composeSource: 'Compose 来源',
   composeVersion: 'Compose 模板版本',
   composeChecksum: 'Compose 模板 SHA-256',
+  composeCommitSha: 'Compose 模板提交',
   dockerfilePath: 'Dockerfile 路径',
   startCommand: '启动命令',
   stopCommand: '停止命令',
@@ -256,6 +282,7 @@ const valueNames: Record<string, string> = {
   MANAGER: '管理端',
   TARGET: '目标端',
   FILE: '文件',
+  COMPOSE: 'Docker Compose',
   DIRECTORY: '目录',
   DOCKER_IMAGE: 'Docker 镜像',
   PARALLEL: '并行',
@@ -469,8 +496,7 @@ function artifactChoices(delivery: DeliveryPreview): ArtifactChoice[] {
   ];
 }
 
-function sourceReviewStatus(needed: boolean, source: ArtifactChoice) {
-  if (!needed) return '当前策略无需源码审核';
+function sourceReviewStatus(source: ArtifactChoice) {
   if (source.sourceReviewPendingMaterialization) return '本次产物登记后按实际仓库及提交复核';
   if (source.sourceReviews?.length) return '已核对产物来源，发布前再次复核';
   return '发布前按产物实际来源复核';
@@ -582,29 +608,53 @@ function DeliveryArtifacts({
             </div>
           ))}
           <SourceDetails source={source} name={name} />
-          <div className="execution-plan-policy">
-            <strong>源码审核</strong>
-            <span>{sourceReviewStatus(Boolean(delivery.requireCodeReview), source)}</span>
-            {!!source.sourceReviews?.length && (
-              <ul className="execution-plan-list">
-                {source.sourceReviews.map((review) => (
-                  <li key={review.reviewId}>
-                    {name.repository(review.repositoryId)} · <code>{review.commitSha}</code> ·
-                    审核通过
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
+          {(delivery.requireCodeReview || !!source.sourceReviews?.length) && (
+            <div className="execution-plan-policy">
+              <strong>源码审核</strong>
+              {delivery.requireCodeReview && <span>{sourceReviewStatus(source)}</span>}
+              {!!source.sourceReviews?.length && (
+                <ul className="execution-plan-list">
+                  {source.sourceReviews.map((review) => (
+                    <li key={review.reviewId}>
+                      {name.repository(review.repositoryId)} · <code>{review.commitSha}</code> ·
+                      审核通过
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </div>
       ))}
-      <div className="execution-plan-policy execution-plan-approval">
-        <strong>发布审批</strong>
-        <span>
-          {delivery.requireApproval ? '执行到发布步骤时等待管理员审批' : '当前策略无需发布审批'}
-        </span>
-      </div>
+      {delivery.requireApproval && (
+        <div className="execution-plan-policy execution-plan-approval">
+          <strong>发布审批</strong>
+          <span>执行到发布步骤时等待管理员审批</span>
+        </div>
+      )}
     </>
+  );
+}
+
+const releaseStepNotes: Record<ReleaseGateKind, string> = {
+  SOURCE_REVIEW: '管理员核对实际仓库与固定提交后继续。',
+  APPROVAL: '执行到此节点时等待管理员确认。',
+  HEALTH_CHECK: '在发布结果关联的目标上执行健康检查并记录状态。',
+  ROLLBACK_ARTIFACT: '使用选定的历史产物执行回滚，并保留各目标结果。',
+};
+
+function isReleaseGate(type: GraphNode['type']): type is ReleaseGateKind {
+  return Object.hasOwn(releaseStepNotes, type);
+}
+
+function previewGates(preview: Preview): NonNullable<Preview['gates']> {
+  return (
+    preview.gates ??
+    preview.nodes.flatMap((node) =>
+      node.selected !== false && isReleaseGate(node.type)
+        ? [{ flowId: preview.flowId, nodeId: node.nodeId, name: node.name, kind: node.type }]
+        : [],
+    )
   );
 }
 
@@ -622,6 +672,7 @@ export function ExecutionPlan({
   const plan = preview.executionPlan;
   const name = names({ project, preview });
   const deliveries = preview.deliveries ?? (preview.serviceId ? [preview] : []);
+  const releaseSteps = previewGates(preview);
   return (
     <div className="execution-plan">
       <section>
@@ -644,6 +695,42 @@ export function ExecutionPlan({
           <span>使用项目公共变量</span>
         )}
       </section>
+      {!!releaseSteps.length && (
+        <section>
+          <h4>审核与发布步骤</h4>
+          {releaseSteps.map((gate) => (
+            <div className="execution-plan-row" key={`${gate.flowId}:${gate.nodeId}`}>
+              <a
+                className="text-link"
+                href={
+                  '#' +
+                  graphWorkbenchPath(project.id, {
+                    view,
+                    pane: 'published',
+                    version: preview.version,
+                    flow: gate.flowId,
+                    node: gate.nodeId,
+                  })
+                }
+              >
+                {gate.name} · {graphNodeLabels[gate.kind]}
+              </a>
+              <span>{releaseStepNotes[gate.kind]}</span>
+              {gate.releaseNodeId && (
+                <small>
+                  审批范围 · {name.node({ flowId: gate.flowId, nodeId: gate.releaseNodeId })}
+                </small>
+              )}
+              {gate.buildNodeId && (
+                <small>
+                  审核整个构建的源码 ·{' '}
+                  {name.node({ flowId: gate.flowId, nodeId: gate.buildNodeId })}
+                </small>
+              )}
+            </div>
+          ))}
+        </section>
+      )}
       {!!preview.checkouts?.length && (
         <section>
           <h4>源码与检出版本</h4>
@@ -882,7 +969,41 @@ export function ExecutionPlan({
                     .join(' · ')}
                 </small>
               )}
+              {delivery.method && <small>发布方式 · {settingValue(delivery.method)}</small>}
+              {delivery.composeTemplate ? (
+                <small>
+                  Compose 模板 ·{' '}
+                  {delivery.composeTemplate.source === 'REPOSITORY_FILE' ? (
+                    <>
+                      {name.repository(delivery.composeTemplate.repositoryId)} ·{' '}
+                      <code>{delivery.composeTemplate.path}</code> ·{' '}
+                      <code>{delivery.composeTemplate.commitSha}</code>
+                    </>
+                  ) : (
+                    '产物存档模板'
+                  )}{' '}
+                  · SHA-256 <code>{delivery.composeTemplate.checksum}</code>
+                </small>
+              ) : delivery.composeSource?.kind === 'ARTIFACT' ? (
+                <small>读取实际产物中的存档 Compose 模板。</small>
+              ) : null}
               <DeliveryArtifacts delivery={delivery} projectId={project.id} name={name} />
+              {delivery.rollbackBaseline && Object.keys(delivery.rollbackBaseline).length > 0 && (
+                <div className="heading-actions">
+                  <small>回滚基线</small>
+                  {Object.entries(delivery.rollbackBaseline).map(([serverId, recordId]) => (
+                    <a
+                      key={serverId}
+                      className="text-link"
+                      href={'#' + deliveryPath(project.id, 'deployments', { recordId, view })}
+                    >
+                      {plan?.targets
+                        .flatMap(({ servers }) => servers)
+                        .find(({ id }) => id === serverId)?.name ?? serverId}
+                    </a>
+                  ))}
+                </div>
+              )}
               {!plan?.targets.some((target) => scopeKey(target) === scopeKey(delivery)) &&
                 !!delivery.serverIds?.length && (
                   <span>目标服务器 · {delivery.serverIds.join('、')}</span>
@@ -992,7 +1113,21 @@ function reviewRows(preview: Preview, project: ProjectDetail) {
         .filter(Boolean)
         .join(' · '),
     );
+  for (const gate of previewGates(preview))
+    add(
+      'policies',
+      { ...gate, nodeName: gate.name },
+      gate.kind,
+      graphNodeLabels[gate.kind],
+      gate.buildNodeId
+        ? `构建源码 · ${name.node({ flowId: gate.flowId, nodeId: gate.buildNodeId })}`
+        : gate.releaseNodeId
+          ? name.node({ flowId: gate.flowId, nodeId: gate.releaseNodeId })
+          : releaseStepNotes[gate.kind],
+    );
   for (const delivery of preview.deliveries ?? []) {
+    for (const [serverId, recordId] of Object.entries(delivery.rollbackBaseline ?? {}))
+      add('policies', delivery, `rollback:${serverId}`, '回滚基线', `${serverId} · ${recordId}`);
     const choices = artifactChoices(delivery);
     for (const source of choices) {
       if (source.nodeId)
@@ -1018,28 +1153,22 @@ function reviewRows(preview: Preview, project: ProjectDetail) {
             .filter(Boolean)
             .join(' · '),
         );
-      if (delivery.requireCodeReview !== undefined)
+      if (delivery.requireCodeReview)
         add(
           'policies',
           delivery,
           'review',
           '源码审核',
           [
-            sourceReviewStatus(delivery.requireCodeReview, source),
+            sourceReviewStatus(source),
             ...(source.sourceReviews ?? []).map(
               ({ repositoryId, commitSha }) => `${name.repository(repositoryId)} · ${commitSha}`,
             ),
           ].join(' · '),
         );
     }
-    if (choices.length && delivery.requireApproval !== undefined)
-      add(
-        'policies',
-        delivery,
-        'approval',
-        '发布审批',
-        delivery.requireApproval ? '需要审批' : '无需审批',
-      );
+    if (choices.length && delivery.requireApproval)
+      add('policies', delivery, 'approval', '发布审批', '需要审批');
   }
   return rows;
 }

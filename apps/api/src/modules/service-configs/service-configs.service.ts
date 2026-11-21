@@ -78,7 +78,7 @@ class ReleasePolicyDto implements ReleasePolicy {
   @IsObject() @ValidateNested() @Type(() => HealthCheckDto) healthCheck = new HealthCheckDto();
 }
 
-class ServiceConfigDto extends DeploymentSelectionDto {
+export class ServiceConfigDto extends DeploymentSelectionDto {
   @IsOptional() @IsIn(['BUILD_ONLY', 'DEPLOY']) executionMode?: 'BUILD_ONLY' | 'DEPLOY' | null;
   @IsOptional()
   @IsIn(['TARGET', 'MANAGER'])
@@ -107,7 +107,7 @@ class VariableDto {
   @IsOptional() @IsBoolean() keepSecret?: boolean;
   @IsOptional() @IsString() @MaxLength(1000) description?: string;
 }
-class VariablesDto {
+export class VariablesDto {
   @IsString()
   @Matches(/^[a-f0-9]{64}$/)
   expectedRevision!: string;
@@ -499,7 +499,11 @@ export class ServiceConfigsService {
     const rows = await this.variableQuery(db, scope).orderBy('key').execute();
     return this.presentVariableScope(db, scope, rows);
   }
-  private async presentVariableScope(db: Kysely<Database>, scope: VariableScope, rows: VariableRow[]) {
+  private async presentVariableScope(
+    db: Kysely<Database>,
+    scope: VariableScope,
+    rows: VariableRow[],
+  ) {
     return {
       revision: variableRevision(scope, rows),
       variables: await this.presentVariables(db, rows),
@@ -768,14 +772,6 @@ class ServiceConfigsController {
   ) {
     return this.service.get(s, e);
   }
-  @Roles('ADMIN', 'OPERATOR') @Put('services/:serviceId/environments/:envId/config') save(
-    @Param('serviceId') s: string,
-    @Param('envId') e: string,
-    @Body() dto: ServiceConfigDto,
-    @Req() req: AuthRequest,
-  ) {
-    return this.service.save(s, e, dto, req.user.id, req.user.role === 'ADMIN');
-  }
   @Get('projects/:projectId/variables') projectVars(@Param('projectId') project: string) {
     return this.service.listProjectVariables(project);
   }
@@ -802,13 +798,6 @@ class ServiceConfigsController {
   @Get('environments/:envId/variables/inherited') inheritedEnvVars(@Param('envId') e: string) {
     return this.service.listInheritedVariables(e);
   }
-  @Roles('ADMIN', 'OPERATOR') @Put('environments/:envId/variables') saveEnvVars(
-    @Param('envId') e: string,
-    @Body() dto: VariablesDto,
-    @Req() req: AuthRequest,
-  ) {
-    return this.service.saveVariables(e, dto, req.user.id);
-  }
   @Roles('ADMIN')
   @Header('Cache-Control', 'no-store')
   @Post('environments/:envId/variables/:key/reveal')
@@ -820,16 +809,6 @@ class ServiceConfigsController {
     @Param('envId') e: string,
   ) {
     return this.service.listVariables(e, s);
-  }
-  @Roles('ADMIN', 'OPERATOR')
-  @Put('services/:serviceId/environments/:envId/variables')
-  saveServiceVars(
-    @Param('serviceId') s: string,
-    @Param('envId') e: string,
-    @Body() dto: VariablesDto,
-    @Req() req: AuthRequest,
-  ) {
-    return this.service.saveVariables(e, dto, req.user.id, s);
   }
   @Roles('ADMIN')
   @Header('Cache-Control', 'no-store')

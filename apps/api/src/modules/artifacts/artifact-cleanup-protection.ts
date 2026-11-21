@@ -19,15 +19,22 @@ export async function protectedArtifacts(db: Kysely<Database>) {
         'id',
         'artifact_id',
         'pipeline_run_id',
-        'service_id',
-        'environment_id',
-        'server_id',
+        'release_scope_key',
         'status',
         'health_status',
+        'activated_at',
         'previous_deployment_id',
       ])
-      .where('status', 'in', ['SUCCESS', 'RUNNING', 'NEEDS_ATTENTION'])
-      .orderBy('started_at', (order) => order.desc().nullsLast())
+      .where((eb) =>
+        eb.or([
+          eb('activated_at', 'is not', null),
+          eb('status', 'in', ['SUCCESS', 'RUNNING', 'NEEDS_ATTENTION']),
+        ]),
+      )
+      .orderBy(
+        (eb) => eb.fn.coalesce('activated_at', 'started_at'),
+        (order) => order.desc().nullsLast(),
+      )
       .orderBy('id', 'desc')
       .execute(),
     db.selectFrom('service_environment_configs').select('release_policy_json').execute(),
@@ -56,25 +63,27 @@ export async function protectedArtifacts(db: Kysely<Database>) {
       .map(({ pipeline_run_id }) => pipeline_run_id),
   );
   for (const deployment of deployments) {
-    const scope = JSON.stringify([
-      deployment.service_id,
-      deployment.environment_id,
-      deployment.server_id,
-    ]);
-    if (deployment.status === 'SUCCESS') {
-      if (
-        (!current.has(scope) || pinnedRuns.has(deployment.pipeline_run_id)) &&
-        deployment.artifact_id
-      )
-        protectedIds.add(deployment.artifact_id);
-      current.add(scope);
-      if (deployment.health_status === 'HEALTHY' && !healthy.has(scope) && deployment.artifact_id) {
-        protectedIds.add(deployment.artifact_id);
-        healthy.add(scope);
-      }
-    } else {
+    const scope = deployment.release_scope_key;
+    if (deployment.status === 'RUNNING' || deployment.status === 'NEEDS_ATTENTION') {
       if (deployment.artifact_id) protectedIds.add(deployment.artifact_id);
       if (deployment.previous_deployment_id) previousIds.add(deployment.previous_deployment_id);
+    }
+    if (deployment.activated_at === null && deployment.status !== 'SUCCESS') continue;
+    if (
+      deployment.artifact_id &&
+      (!scope || !current.has(scope) || pinnedRuns.has(deployment.pipeline_run_id))
+    )
+      protectedIds.add(deployment.artifact_id);
+    if (!scope) continue;
+    current.add(scope);
+    if (
+      deployment.status === 'SUCCESS' &&
+      deployment.health_status === 'HEALTHY' &&
+      deployment.artifact_id &&
+      !healthy.has(scope)
+    ) {
+      protectedIds.add(deployment.artifact_id);
+      healthy.add(scope);
     }
   }
   for (const deployment of deployments)

@@ -6,9 +6,16 @@ import test, { type TestContext } from 'node:test';
 import { dataDirectory } from '../core/config';
 import { DatabaseService } from '../core/database/database.service';
 import { lockAvailableArtifacts } from '../modules/artifacts/artifact-availability';
+import { protectedArtifacts } from '../modules/artifacts/artifact-cleanup-protection';
 import { ArtifactRetentionService } from '../modules/artifacts/artifact-retention.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { AuditService } from '../modules/audit/audit.service';
+import {
+  deploymentScopeKey,
+  normalizeReleasePath,
+  type ReleaseScope,
+} from '../modules/deployments/deployment-scope';
+import { DeploymentsService } from '../modules/deployments/deployments.service';
 import { createPostgresTestDatabase, postgresTestUrl } from './helpers/isolated-postgres';
 
 const now = Date.now();
@@ -310,6 +317,73 @@ async function verifyRetention(t: TestContext, database: DatabaseService) {
     .where('id', '=', delayed.id)
     .executeTakeFirstOrThrow();
   assert.ok(removed.archive_deleted_at);
+
+  const fileScope = (deployPath: string): ReleaseScope => ({
+    projectId: ids.project,
+    serviceId: ids.service,
+    environmentId: ids.env,
+    definition: { artifactType: 'FILE', deployPath },
+    graphDeployment: { method: 'FILE' },
+  });
+  async function deployed(
+    scope: ReleaseScope,
+    startedAt: number,
+    activatedAt: number,
+    health: string,
+  ) {
+    const artifact = await archive(currentRun.runId, expired);
+    const id = randomUUID();
+    await db
+      .insertInto('deployment_records')
+      .values({
+        id,
+        pipeline_run_id: currentRun.runId,
+        artifact_id: artifact.id,
+        task_target_id: targetId,
+        service_id: ids.service,
+        environment_id: ids.env,
+        server_id: ids.server,
+        status: 'SUCCESS',
+        health_status: health,
+        deploy_path: scope.definition.deployPath,
+        release_path_key: normalizeReleasePath(scope.definition.deployPath),
+        release_scope_key: deploymentScopeKey(scope, ids.server),
+        started_at: startedAt,
+        activated_at: activatedAt,
+      })
+      .execute();
+    return { id, artifactId: artifact.id };
+  }
+  const one = fileScope('/srv/veyops/location-one');
+  const two = fileScope('/srv/veyops/location-two');
+  const oldHealthy = await deployed(one, now - 40, now - 30, 'HEALTHY');
+  const currentOne = await deployed(
+    fileScope('/srv/veyops/./location-one/'),
+    now - 29,
+    now - 5,
+    'UNKNOWN',
+  );
+  const superseded = await deployed(one, now - 20, now - 10, 'NOT_CHECKED');
+  const currentTwo = await deployed(two, now - 15, now - 2, 'HEALTHY');
+  const repositories = new DeploymentsService(database);
+  assert.equal((await repositories.currentSnapshot(db, one, ids.server))?.id, currentOne.id);
+  assert.equal((await repositories.currentSnapshot(db, two, ids.server))?.id, currentTwo.id);
+  await assert.rejects(
+    repositories.assertGraphReleasePath(
+      db,
+      {
+        ...one,
+        definition: { ...one.definition, artifactType: 'DOCKER_IMAGE' },
+        graphDeployment: { method: 'COMPOSE' },
+      },
+      ids.server,
+    ),
+    /部署目录已有其他发布/,
+  );
+  const protectedIds = await protectedArtifacts(db);
+  for (const { artifactId } of [oldHealthy, currentOne, currentTwo])
+    assert.ok(protectedIds.has(artifactId));
+  assert.ok(!protectedIds.has(superseded.artifactId));
 }
 
 test('artifact retention protects current, pending and pinned archives on SQLite', async (t) => {

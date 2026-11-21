@@ -14,7 +14,10 @@ export const graphTaskKeyPrefix = 'execution-flow:';
 export const activeFlowStatuses = ['QUEUED', 'RUNNING', 'WAITING', 'CANCEL_REQUESTED'];
 export const isNodeTerminal = (status: string) =>
   status === 'SKIPPED' || (terminalTaskStatuses as readonly string[]).includes(status);
-export const isDelivery = ({ type }: GraphNode) => type === 'BUILD' || type === 'DEPLOY_ARTIFACT';
+export const isRelease = ({ type }: Pick<GraphNode, 'type'>) =>
+  type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT';
+export const isDelivery = (node: Pick<GraphNode, 'type'>) =>
+  node.type === 'BUILD' || isRelease(node);
 
 export function flowSelection(
   flow: GraphFlow,

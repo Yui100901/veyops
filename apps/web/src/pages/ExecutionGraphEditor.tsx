@@ -17,7 +17,12 @@ import {
   GraphFlowBranches,
   GraphTemplatePicker,
 } from './ExecutionGraphBindings';
-import { branchOptions, graphKey, graphNodeLabels } from './execution-graph-definition';
+import {
+  branchOptions,
+  graphKey,
+  graphNodeLabels,
+  isReleaseNode,
+} from './execution-graph-definition';
 import type {
   GraphBinding,
   GraphCanvas,
@@ -67,20 +72,15 @@ const palette: { name: string; types: NodeType[] }[] = [
   { name: '开始与结束', types: ['START', 'END'] },
   {
     name: '功能节点',
-    types: [
-      'CHECKOUT',
-      'LOAD_ENV',
-      'SHELL',
-      'CHECK',
-      'BUILD',
-      'REGISTER_ARTIFACT',
-      'DEPLOY_ARTIFACT',
-      'LOG',
-    ],
+    types: ['CHECKOUT', 'LOAD_ENV', 'SHELL', 'CHECK', 'BUILD', 'REGISTER_ARTIFACT', 'LOG'],
+  },
+  {
+    name: '发布与验证',
+    types: ['SOURCE_REVIEW', 'APPROVAL', 'DEPLOY_ARTIFACT', 'HEALTH_CHECK', 'ROLLBACK_ARTIFACT'],
   },
   {
     name: '流程控制',
-    types: ['CONDITION', 'SWITCH', 'PARALLEL', 'JOIN', 'DELAY', 'APPROVAL', 'FLOW_CALL'],
+    types: ['CONDITION', 'SWITCH', 'PARALLEL', 'JOIN', 'DELAY', 'FLOW_CALL'],
   },
 ];
 const templateTypes = palette
@@ -101,11 +101,16 @@ function makeNode(type: NodeType, project: ProjectDetail): GraphNode {
       : {}),
     ...(type === 'BUILD' ? { build: { repositoryId: repo?.id } } : {}),
     ...(type === 'LOAD_ENV' ? { loadEnvironment: { required: true } } : {}),
-    ...(type === 'DEPLOY_ARTIFACT' ? { deploy: {} } : {}),
+    ...(type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT'
+      ? { deploy: { method: 'FILE' as const } }
+      : {}),
+    ...(type === 'HEALTH_CHECK' ? { healthCheck: { command: '', timeoutSeconds: 30 } } : {}),
     ...(type === 'CONDITION' && { condition: { key: 'input', value: 'yes' } }),
     ...(type === 'SWITCH' && { switch: { key: 'input', cases: ['release'] } }),
     ...(type === 'DELAY' && { delaySeconds: 5 }),
-    ...(type === 'APPROVAL' && { approval: { timeoutSeconds: 3600 } }),
+    ...((type === 'APPROVAL' || type === 'SOURCE_REVIEW') && {
+      approval: { timeoutSeconds: 3600 },
+    }),
   };
 }
 
@@ -265,13 +270,22 @@ export function ProjectGraphEditor({
       inspected.type === 'END' && fields.outputs
         ? new Set(fields.outputs.map(({ id }) => id))
         : undefined;
-    const removedParameters = new Set(
+    const removedBindings = new Set(
       fields.shell?.params
         ? (inspected.shell?.params ?? [])
             .filter(({ id }) => !fields.shell?.params?.some((field) => field.id === id))
             .map(({ id }) => id)
         : [],
     );
+    const nextBuild = inspected.type === 'SOURCE_REVIEW' ? fields.approval?.buildNodeId : undefined;
+    const oldBuild =
+      nextBuild && nextBuild !== inspected.approval?.buildNodeId
+        ? inspected.approval?.buildNodeId
+        : undefined;
+    if (nextBuild) {
+      removedBindings.add('source');
+      removedBindings.add('artifact');
+    }
     const endpoints = canvas.endpoints.map((pair) => {
       if (nextOutputs && pair.endId === inspected.id)
         return {
@@ -280,19 +294,26 @@ export function ProjectGraphEditor({
             Object.entries(pair.outputBindings ?? {}).filter(([id]) => nextOutputs.has(id)),
           ),
         };
-      if (removedParameters.size && pair.inputBindings?.[inspected.id])
-        return {
-          ...pair,
-          inputBindings: {
-            ...pair.inputBindings,
-            [inspected.id]: Object.fromEntries(
-              Object.entries(pair.inputBindings[inspected.id]).filter(
-                ([id]) => !removedParameters.has(id),
-              ),
-            ),
-          },
-        };
-      return pair;
+      const previousBindings = pair.inputBindings?.[inspected.id];
+      const oldBuildBinding = oldBuild ? pair.inputBindings?.[oldBuild] : undefined;
+      const previousReview = oldBuildBinding?.review;
+      const unbindOldReview =
+        oldBuild &&
+        previousReview?.kind === 'OUTPUT' &&
+        previousReview.nodeId === inspected.id &&
+        previousReview.fieldId === 'review';
+      if ((!removedBindings.size || !previousBindings) && !unbindOldReview) return pair;
+      const inputBindings = { ...pair.inputBindings };
+      if (removedBindings.size && previousBindings)
+        inputBindings[inspected.id] = Object.fromEntries(
+          Object.entries(previousBindings).filter(([id]) => !removedBindings.has(id)),
+        );
+      if (unbindOldReview) {
+        const buildBindings = { ...oldBuildBinding };
+        delete buildBindings.review;
+        inputBindings[oldBuild] = buildBindings;
+      }
+      return { ...pair, inputBindings };
     });
     onChange(
       template
@@ -365,7 +386,9 @@ export function ProjectGraphEditor({
     const checkout = nodes.find(({ type }) => type === 'CHECKOUT');
     const script = nodes.find(({ type }) => type === 'SHELL');
     const build = nodes.find((node) => node.type === 'BUILD');
-    const deploy = nodes.find((node) => node.type === 'DEPLOY_ARTIFACT');
+    const review = nodes.find(({ type }) => type === 'SOURCE_REVIEW');
+    const approval = nodes.find(({ type }) => type === 'APPROVAL');
+    const deploy = nodes.find(isReleaseNode);
     const end = canvas.nodes.find((node) => node.id === presetEnd)!;
     const inputs = [...(start.inputs ?? [])];
     const outputs = [...(end.outputs ?? [])];
@@ -378,8 +401,9 @@ export function ProjectGraphEditor({
       return id;
     };
     const inputBindings = { ...pair.inputBindings };
+    const environmentBindings = { ...pair.environmentBindings };
     const outputBindings = { ...pair.outputBindings };
-    if (checkout && script) {
+    if (checkout) {
       const chosen = project.repositories.length === 1 ? project.repositories[0] : undefined;
       const repository: GraphBinding = chosen
         ? { kind: 'VALUE', value: chosen.id }
@@ -406,6 +430,8 @@ export function ProjectGraphEditor({
           onMissing: 'REPOSITORY_DEFAULT',
         },
       };
+    }
+    if (checkout && script) {
       inputBindings[script.id] = {
         source: { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'source' },
         workspace: { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'workspace' },
@@ -428,24 +454,45 @@ export function ProjectGraphEditor({
       const service = pair.serviceId
         ? undefined
         : addField(inputs, { id: 'service', name: '服务', type: 'SERVICE', required: !!deploy });
+      const releaseTargets =
+        deploy &&
+        addField(inputs, {
+          id: 'releaseTargets',
+          name: deploy.type === 'ROLLBACK_ARTIFACT' ? '回滚目标' : '发布目标',
+          type: 'TARGETS',
+          required: true,
+        });
       for (const node of [build, deploy]) {
         if (!node) continue;
-        const isBuild = node.type === 'BUILD';
-        const targets = addField(inputs, {
-          id: isBuild ? 'buildTargets' : 'releaseTargets',
-          name: isBuild ? '构建目标（目标端构建时使用）' : '发布目标',
-          type: 'TARGETS',
-          required: !isBuild,
-        });
-        const bindings: Record<string, GraphBinding> = {
-          targets: { kind: 'INPUT', fieldId: targets },
-        };
+        const bindings: Record<string, GraphBinding> = {};
+        const targets =
+          releaseTargets ||
+          addField(inputs, {
+            id: 'buildTargets',
+            name: '目标端构建服务器',
+            type: 'TARGETS',
+            required: false,
+          });
+        bindings.targets = { kind: 'INPUT', fieldId: targets };
         if (service) bindings.service = { kind: 'INPUT', fieldId: service };
         inputBindings[node.id] = bindings;
       }
     }
     if (build) {
-      if (!build.build?.repositoryId) {
+      build.build = { ...build.build, buildLocation: deploy ? 'TARGET' : 'MANAGER' };
+      if (checkout && review) {
+        review.approval = { ...review.approval, buildNodeId: build.id };
+        inputBindings[build.id].source = { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'source' };
+        inputBindings[build.id].workspace = {
+          kind: 'OUTPUT',
+          nodeId: checkout.id,
+          fieldId: 'workspace',
+        };
+        inputBindings[build.id].review = { kind: 'OUTPUT', nodeId: review.id, fieldId: 'review' };
+        environmentBindings[build.id] = {
+          GIT_SHA: { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'commitSha' },
+        };
+      } else if (!build.build.repositoryId) {
         const repo = addField(inputs, {
           id: 'repository',
           name: '仓库',
@@ -465,6 +512,7 @@ export function ProjectGraphEditor({
       outputBindings[id] = { kind: 'OUTPUT', nodeId: build.id, fieldId: 'artifacts' };
     }
     if (deploy) {
+      if (approval) approval.approval = { ...approval.approval, releaseNodeId: deploy.id };
       if (build)
         inputBindings[deploy.id].artifact = {
           kind: 'OUTPUT',
@@ -474,7 +522,7 @@ export function ProjectGraphEditor({
       else {
         const id = addField(inputs, {
           id: 'artifact',
-          name: '构建产物',
+          name: deploy.type === 'ROLLBACK_ARTIFACT' ? '历史构建产物' : '构建产物',
           type: 'ARTIFACT',
           multiple: true,
           required: true,
@@ -503,7 +551,9 @@ export function ProjectGraphEditor({
         ...nodes,
       ],
       endpoints: canvas.endpoints.map((item) =>
-        item.startId === start.id ? { ...item, inputBindings, outputBindings } : item,
+        item.startId === start.id
+          ? { ...item, inputBindings, environmentBindings, outputBindings }
+          : item,
       ),
       edges: [
         ...canvas.edges.filter(({ from, to }) => from !== activeNode.id || to !== presetEnd),
@@ -1468,6 +1518,16 @@ function LoadEnvironmentFields({
 }
 
 function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsProps) {
+  const downstream =
+    node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW'
+      ? reachable(canvas, node.id)
+      : undefined;
+  const downstreamReleases = canvas.nodes.filter(
+    (candidate) => downstream?.has(candidate.id) && isReleaseNode(candidate),
+  );
+  const downstreamBuilds = canvas.nodes.filter(
+    (candidate) => downstream?.has(candidate.id) && candidate.type === 'BUILD',
+  );
   return (
     <>
       <Field label="节点名称">
@@ -1546,12 +1606,85 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           change={(build) => patch({ build })}
         />
       )}
-      {node.type === 'DEPLOY_ARTIFACT' && (
+      {isReleaseNode(node) && (
         <DeployFields
+          project={project}
           value={node.deploy ?? {}}
           canEdit={canEdit}
           change={(deploy) => patch({ deploy })}
         />
+      )}
+      {node.type === 'SOURCE_REVIEW' && (
+        <Field
+          label="源码审核范围"
+          hint="选择构建节点后，审核覆盖其实际使用的主仓库、源码依赖和环境文件。切换到此模式会清除手动指定的源码和产物；请在构建节点的审核输入选择本节点的审核输出。"
+        >
+          <select
+            data-graph-node-field="buildNodeId"
+            disabled={!canEdit}
+            value={node.approval?.buildNodeId ?? ''}
+            onChange={(event) =>
+              patch({
+                approval: { ...node.approval, buildNodeId: event.target.value || undefined },
+              })
+            }
+          >
+            <option value="">使用绑定的源码或产物</option>
+            {node.approval?.buildNodeId &&
+              !downstreamBuilds.some(({ id }) => id === node.approval?.buildNodeId) && (
+                <option value={node.approval.buildNodeId} disabled>
+                  所选构建节点已断开或不可用
+                </option>
+              )}
+            {downstreamBuilds.map(({ id, name }) => (
+              <option key={id} value={id}>
+                构建 · {name}
+              </option>
+            ))}
+          </select>
+        </Field>
+      )}
+      {node.type === 'ROLLBACK_ARTIFACT' && (
+        <p className="field-note">
+          选择要恢复的历史产物。自动回滚须绑定明确报告应用不健康的检查结果，用它确认逐台服务器的回滚基线。
+        </p>
+      )}
+      {node.type === 'HEALTH_CHECK' && (
+        <>
+          <Field
+            label="检查命令"
+            hint="在发布版本目录执行。退出码 0 表示健康，10 表示已确认应用不健康，其余结果需要人工核查。"
+          >
+            <textarea
+              data-graph-node-field="command"
+              rows={3}
+              maxLength={65536}
+              readOnly={!canEdit}
+              value={node.healthCheck?.command ?? ''}
+              onChange={(event) =>
+                patch({ healthCheck: { ...node.healthCheck, command: event.target.value } })
+              }
+            />
+          </Field>
+          <Field label="检查超时（秒）">
+            <input
+              type="number"
+              min={1}
+              max={180}
+              data-graph-node-field="timeoutSeconds"
+              readOnly={!canEdit}
+              value={node.healthCheck?.timeoutSeconds ?? ''}
+              onChange={(event) =>
+                patch({
+                  healthCheck: {
+                    command: node.healthCheck?.command ?? '',
+                    timeoutSeconds: event.target.value ? Number(event.target.value) : undefined,
+                  },
+                })
+              }
+            />
+          </Field>
+        </>
       )}
       {node.type === 'REGISTER_ARTIFACT' && (
         <ArtifactOutputEditor
@@ -1595,16 +1728,53 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
         </Field>
       )}
       {node.type === 'APPROVAL' && (
-        <Field label="审批超时（秒）" hint="留空默认 86400 秒。">
+        <Field
+          label="审批对应的发布节点"
+          hint="选择下游部署或回滚时，审批会固定实际服务、目标和产物。"
+        >
+          <select
+            data-graph-node-field="releaseNodeId"
+            disabled={!canEdit}
+            value={node.approval?.releaseNodeId ?? ''}
+            onChange={(event) =>
+              patch({
+                approval: { ...node.approval, releaseNodeId: event.target.value || undefined },
+              })
+            }
+          >
+            <option value="">普通流程审批</option>
+            {node.approval?.releaseNodeId &&
+              !downstreamReleases.some(({ id }) => id === node.approval?.releaseNodeId) && (
+                <option value={node.approval.releaseNodeId} disabled>
+                  所选节点已断开或不可用
+                </option>
+              )}
+            {downstreamReleases.map(({ id, name }) => (
+              <option key={id} value={id}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </Field>
+      )}
+      {(node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW') && (
+        <Field
+          label={node.type === 'SOURCE_REVIEW' ? '审核超时（秒）' : '审批超时（秒）'}
+          hint="留空默认 86400 秒。"
+        >
           <input
             type="number"
             min={1}
             max={604800}
+            data-graph-node-field="timeoutSeconds"
             readOnly={!canEdit}
             value={node.approval?.timeoutSeconds ?? ''}
             onChange={(event) =>
               patch({
-                approval: event.target.value ? { timeoutSeconds: Number(event.target.value) } : {},
+                approval: {
+                  ...node.approval,
+                  timeoutSeconds: event.target.value ? Number(event.target.value) : undefined,
+                },
               })
             }
           />

@@ -18,7 +18,16 @@ import {
   type GraphSetupIssue,
 } from './ExecutionGraphRepairLinks';
 import { ExecutionGraphStartStatus } from './ExecutionGraphStartStatus';
-import { graphKey } from './execution-graph-definition';
+import {
+  ExecutionGraphReleaseInspection,
+  ExecutionGraphReleaseResults,
+  ExecutionGraphReviewScope,
+  releaseTargetHealthUnknown,
+  type ReleaseContext,
+  type ReleaseInspection,
+  type ReviewScope,
+} from './ExecutionGraphReleaseResults';
+import { graphKey, graphNodeLabels, isReleaseNode } from './execution-graph-definition';
 import type {
   GraphEnvironmentSetSummary,
   GraphBinding,
@@ -113,8 +122,7 @@ function artifactFieldScope(
   if (field.type !== 'ARTIFACT') return general;
   const consumer = flow.nodes.find(
     (node) =>
-      node.type === 'DEPLOY_ARTIFACT' &&
-      referencesInput(flow.inputBindings?.[node.id]?.artifact, field.id),
+      isReleaseNode(node) && referencesInput(flow.inputBindings?.[node.id]?.artifact, field.id),
   );
   if (!consumer) return general;
   const bindings = flow.inputBindings?.[consumer.id];
@@ -122,6 +130,7 @@ function artifactFieldScope(
   const serviceId = serviceReferenceId(staticBinding(bindings?.service, parameters));
   return {
     ...general,
+    deliveryMethod: consumer.deploy?.method,
     serviceId: serviceId ?? general.serviceId,
     targets:
       (targets && typeof targets === 'object' ? (targets as DeploymentSelection) : undefined) ??
@@ -186,17 +195,20 @@ function PlanIssueBanner({
 function Results({
   values,
   labels = {},
+  omit = [],
   title,
   artifactContext,
 }: {
   values?: Record<string, unknown>;
   labels?: Record<string, string>;
+  omit?: string[];
   title: string;
   artifactContext?: { projectId: string; scope: DeliveryScope };
 }) {
   const rows = Object.entries(values ?? {}).filter(
     ([name]) =>
       ![
+        ...omit,
         'decision',
         'wakeAt',
         'expiresAt',
@@ -511,7 +523,10 @@ export function ExecutionGraphStart({
             {preview.nodes.map((node) => (
               <li key={node.nodeId}>
                 {node.name}
-                {node.type === 'APPROVAL' && node.selected !== false && <small> · 人工审批</small>}
+                {node.selected !== false &&
+                  (node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW') && (
+                    <small> · {graphNodeLabels[node.type]}</small>
+                  )}
                 {node.selected === false && <small> · 跳过</small>}
               </li>
             ))}
@@ -622,6 +637,7 @@ interface RunNode {
     exitCode?: number | null;
     startedAt?: number | null;
     finishedAt?: number | null;
+    inspection?: ReleaseInspection;
   }[];
   variableSources?: {
     key: string;
@@ -634,10 +650,14 @@ interface RunNode {
     expiresAt?: number;
     decision?: 'APPROVE' | 'REJECT' | 'EXPIRED';
     decidedAt?: number;
+    actorId?: string;
+    scope?: ReviewScope;
+    scopeHash?: string;
   };
 }
 interface RunDetail extends GraphRun {
   nodes: RunNode[];
+  createdBy?: string;
   commitSha?: string;
   artifactIds?: string[];
   definition?: GraphFlow;
@@ -645,21 +665,36 @@ interface RunDetail extends GraphRun {
   environmentSet?: GraphEnvironmentSetSummary | null;
 }
 
+function needsReleaseInspection(node: RunNode, target: NonNullable<RunNode['targets']>[number]) {
+  return (
+    (isReleaseNode(node) || node.type === 'HEALTH_CHECK') &&
+    (Boolean(target.inspection) ||
+      (!['PENDING', 'QUEUED', 'RUNNING', 'WAITING', 'CANCEL_REQUESTED'].includes(node.status) &&
+        (['NEEDS_ATTENTION', 'FAILED', 'TIMED_OUT'].includes(target.status) ||
+          (node.type === 'HEALTH_CHECK' &&
+            releaseTargetHealthUnknown(node.output?.release, target.serverId)))))
+  );
+}
+
 export function ExecutionGraphHistory({
   path,
-  projectId,
+  project,
   canCancel,
   canApprove,
+  userId,
   selected,
+  selectedNodeId,
   onSelect,
   scope,
   delivery,
 }: {
   path: string;
-  projectId: string;
+  project: ProjectDetail;
   canCancel: boolean;
   canApprove: boolean;
+  userId: string;
   selected?: string;
+  selectedNodeId?: string;
   onSelect: (id: string) => void;
   scope: GraphWorkbenchScope;
   delivery?: GraphDeliveryReturn;
@@ -749,12 +784,14 @@ export function ExecutionGraphHistory({
         <RunDetails
           key={selected}
           path={path + '/runs/' + encodeURIComponent(selected)}
-          projectId={projectId}
+          project={project}
           canCancel={canCancel}
           canApprove={canApprove}
+          userId={userId}
           onChange={list.reload}
           scope={scope}
           delivery={delivery}
+          selectedNodeId={selectedNodeId}
         />
       )}
     </>
@@ -763,31 +800,66 @@ export function ExecutionGraphHistory({
 
 function RunDetails({
   path,
-  projectId,
+  project,
   canCancel,
   canApprove,
+  userId,
   onChange,
   scope,
   delivery,
+  selectedNodeId,
 }: {
   path: string;
-  projectId: string;
+  project: ProjectDetail;
   canCancel: boolean;
   canApprove: boolean;
+  userId: string;
   onChange: () => void;
   scope: GraphWorkbenchScope;
   delivery?: GraphDeliveryReturn;
+  selectedNodeId?: string;
 }) {
+  const projectId = project.id;
   const run = useResource<RunDetail>(path, 3000);
   const [cancelDialog, setCancelDialog] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState('');
   const item = run.data;
+  const canInspect = canApprove || (canCancel && item?.createdBy === userId);
+  const currentRunId = item?.id;
+  useEffect(() => {
+    if (currentRunId && selectedNodeId) {
+      document
+        .getElementById('graph-run-node-' + selectedNodeId)
+        ?.scrollIntoView({ block: 'center' });
+    }
+  }, [currentRunId, selectedNodeId]);
   const deliveryScope = {
     serviceId: scope.serviceId,
     environmentId: scope.environmentId,
     view: scope.view,
+    viewSearch: scope.viewSearch,
   };
+  const releaseContext = {
+    projectId,
+    deliveryScope,
+    returnPath: item ? graphRunHref(projectId, item.id, scope, delivery).slice(1) : '',
+    nodeHref: (node: string) =>
+      '#' +
+      graphWorkbenchPath(projectId, {
+        ...scope,
+        ...delivery,
+        pane: 'history',
+        run: item?.id,
+        node,
+      }),
+    nodeName: (id: string) => item?.nodes.find(({ nodeId }) => id === nodeId)?.name,
+    repositoryName: (id) => project.repositories.find((repository) => id === repository.id)?.name,
+    serviceName: (id) =>
+      [...project.services, ...(project.archivedServices ?? [])].find(
+        (service) => id === service.id,
+      )?.name,
+  } satisfies ReleaseContext;
   const returnLink =
     delivery &&
     '#' +
@@ -931,7 +1003,11 @@ function RunDetails({
               ) : null}
               <ol className="graph-logs">
                 {item.nodes.map((n) => (
-                  <li key={n.nodeId}>
+                  <li
+                    key={n.nodeId}
+                    id={'graph-run-node-' + n.nodeId}
+                    aria-current={selectedNodeId === n.nodeId ? 'location' : undefined}
+                  >
                     <div className="heading-actions">
                       <strong>{n.name}</strong>
                       <Status value={n.status} />
@@ -1000,6 +1076,10 @@ function RunDetails({
                     )}
                     <Results
                       values={n.output}
+                      omit={[
+                        ...(n.output?.scope ? ['scope', 'scopeHash', 'review', 'actorId'] : []),
+                        ...(isReleaseNode(n) || n.type === 'HEALTH_CHECK' ? ['release'] : []),
+                      ]}
                       title="节点输出"
                       artifactContext={{ projectId, scope: deliveryScope }}
                       labels={Object.fromEntries(
@@ -1055,15 +1135,26 @@ function RunDetails({
                     {n.type === 'DELAY' && n.status === 'WAITING' && n.output?.wakeAt && (
                       <p>计划恢复 · {formatTime(n.output.wakeAt)}</p>
                     )}
-                    {n.type === 'APPROVAL' && (
+                    {(n.type === 'APPROVAL' || n.type === 'SOURCE_REVIEW') && (
                       <GraphApprovalActions
                         node={n}
                         path={path}
                         canApprove={canApprove}
+                        context={releaseContext}
                         onChange={() => {
                           void run.reload();
                           onChange();
                         }}
+                      />
+                    )}
+                    {(isReleaseNode(n) || n.type === 'HEALTH_CHECK') && (
+                      <ExecutionGraphReleaseResults
+                        value={n.output?.release}
+                        type={n.type}
+                        context={releaseContext}
+                        serverName={(id) =>
+                          n.targets?.find(({ serverId }) => id === serverId)?.serverName
+                        }
                       />
                     )}
                     {n.taskId && (
@@ -1072,9 +1163,12 @@ function RunDetails({
                       </a>
                     )}
                     {!!n.targets?.length && (
-                      <details className="graph-field-card">
+                      <details
+                        className="graph-field-card"
+                        open={n.targets.some((target) => needsReleaseInspection(n, target))}
+                      >
                         <summary>逐目标执行 · {n.targets.length} 项</summary>
-                        <ul className="graph-edge-list">
+                        <ul className="graph-edge-list graph-run-targets">
                           {n.targets.map((target) => (
                             <li key={target.serverId}>
                               <div>
@@ -1102,6 +1196,25 @@ function RunDetails({
                                   <small>结束 {formatTime(target.finishedAt)}</small>
                                 )}
                               </div>
+                              {needsReleaseInspection(n, target) && (
+                                <ExecutionGraphReleaseInspection
+                                  context={releaseContext}
+                                  path={`${path}/nodes/${encodeURIComponent(n.nodeId)}/targets/${encodeURIComponent(target.serverId)}/inspect-release`}
+                                  latest={target.inspection}
+                                  canInspect={canInspect}
+                                  replanHref={
+                                    canInspect
+                                      ? '#' +
+                                        graphWorkbenchPath(projectId, {
+                                          ...scope,
+                                          start: item.flowId,
+                                          version: item.version,
+                                        })
+                                      : undefined
+                                  }
+                                  onChange={() => void run.reload()}
+                                />
+                              )}
                             </li>
                           ))}
                         </ul>
@@ -1164,23 +1277,35 @@ function GraphApprovalActions({
   path,
   canApprove,
   onChange,
+  context,
 }: {
   node: RunNode;
   path: string;
   canApprove: boolean;
   onChange: () => void;
+  context: ReleaseContext;
 }) {
-  const [decision, setDecision] = useState<'APPROVE' | 'REJECT'>();
+  const [choice, setChoice] = useState<{ decision: 'APPROVE' | 'REJECT'; scopeHash?: string }>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const waiting = node.status === 'WAITING';
+  const reviewScope = node.output?.scope;
+  const scopeHash = node.output?.scopeHash;
+  const needsScope = node.type === 'SOURCE_REVIEW' || Boolean(reviewScope || scopeHash);
+  const scopeReady = !needsScope || Boolean(reviewScope && scopeHash);
+  const current = waiting && scopeReady && choice?.scopeHash === scopeHash;
+  const isReview = node.type === 'SOURCE_REVIEW';
+  const action = isReview ? '源码审核' : '审批';
   async function decide() {
-    if (!waiting || !decision || busy) return;
+    if (!current || !choice || busy) return;
     setError('');
     setBusy(true);
     try {
-      await post(path + '/nodes/' + encodeURIComponent(node.nodeId) + '/decision', { decision });
-      setDecision(undefined);
+      await post(path + '/nodes/' + encodeURIComponent(node.nodeId) + '/decision', {
+        decision: choice.decision,
+        expectedScopeHash: choice.scopeHash,
+      });
+      setChoice(undefined);
       onChange();
     } catch (error) {
       setError(message(error));
@@ -1191,15 +1316,26 @@ function GraphApprovalActions({
   }
   return (
     <>
-      {waiting && node.output?.expiresAt && <p>审批截止 · {formatTime(node.output.expiresAt)}</p>}
+      {reviewScope && <ExecutionGraphReviewScope review={reviewScope} context={context} />}
+      {waiting && node.output?.expiresAt && (
+        <p>
+          {action}截止 · {formatTime(node.output.expiresAt)}
+        </p>
+      )}
       {node.output?.decision && (
         <p>
           {node.output.decision === 'APPROVE'
             ? '已批准'
             : node.output.decision === 'REJECT'
               ? '已拒绝'
-              : '审批已超时'}
+              : `${action}已超时`}
           {node.output.decidedAt ? ' · ' + formatTime(node.output.decidedAt) : ''}
+          {node.output.actorId && (
+            <>
+              {' '}
+              · 操作人 <code>{node.output.actorId}</code>
+            </>
+          )}
         </p>
       )}
       {canApprove && waiting && (
@@ -1207,43 +1343,53 @@ function GraphApprovalActions({
           <button
             type="button"
             className="button primary small"
-            onClick={() => setDecision('APPROVE')}
+            disabled={!scopeReady}
+            onClick={() => setChoice({ decision: 'APPROVE', scopeHash })}
           >
-            批准节点
+            {isReview ? '审核通过' : '批准节点'}
           </button>
           <button
             type="button"
             className="button secondary small"
-            onClick={() => setDecision('REJECT')}
+            disabled={!scopeReady}
+            onClick={() => setChoice({ decision: 'REJECT', scopeHash })}
           >
             拒绝节点
           </button>
         </div>
       )}
-      {decision && (
+      {choice && (
         <Confirm
-          title={decision === 'APPROVE' ? '批准审批节点' : '拒绝审批节点'}
+          title={choice.decision === 'APPROVE' ? `通过${action}` : `拒绝${action}`}
           description={
             !waiting
-              ? '审批已结束。'
-              : decision === 'APPROVE'
-                ? '批准后恢复当前执行流。'
-                : '拒绝后停止当前执行路径。'
+              ? `${action}已结束。`
+              : !current
+                ? '确认范围已更新，请关闭窗口以查看最新范围。'
+                : choice.decision === 'APPROVE'
+                  ? '通过后恢复当前执行流。'
+                  : '拒绝后停止当前执行路径。'
           }
-          detail={<p>{node.name}</p>}
-          label={waiting ? (decision === 'APPROVE' ? '确认批准' : '确认拒绝') : '关闭'}
-          destructive={waiting && decision === 'REJECT'}
+          detail={
+            current && reviewScope ? (
+              <ExecutionGraphReviewScope review={reviewScope} context={context} />
+            ) : (
+              <p>{node.name}</p>
+            )
+          }
+          label={current ? (choice.decision === 'APPROVE' ? '确认通过' : '确认拒绝') : '关闭'}
+          destructive={current && choice.decision === 'REJECT'}
           busy={busy}
           error={error}
           onClose={() => {
             if (!busy) {
-              setDecision(undefined);
+              setChoice(undefined);
               setError('');
             }
           }}
           onConfirm={() => {
-            if (waiting) void decide();
-            else setDecision(undefined);
+            if (current) void decide();
+            else setChoice(undefined);
           }}
         />
       )}

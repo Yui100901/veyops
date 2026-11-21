@@ -493,6 +493,8 @@ export interface DeploymentRecordsTable {
   rollback_of_deployment_id: Generated<string | null>;
   release_snapshot_json: Generated<string | null>;
   compose_release_json: Generated<string | null>;
+  release_scope_key: Generated<string | null>;
+  release_path_key: Generated<string | null>;
   activated_at: Generated<number | null>;
   started_at: Generated<number | null>;
   finished_at: Generated<number | null>;

@@ -4,7 +4,8 @@ import { dataDirectory } from '../../core/config';
 import type { GraphCheckoutSnapshot } from '../projects/repository-metadata.service';
 import type { Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
-import type { GraphEnvironmentPlan } from './graph-environment';
+import type { ExecutionVariables } from '../../infrastructure/execution-variables';
+import type { GraphEnvironmentPlan, GraphVariableSource } from './graph-environment';
 import { artifactSourceRef, type ArtifactSource } from '../artifacts/artifact-sources';
 
 const workspaceId = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
@@ -36,6 +37,8 @@ export interface GraphExecutionScope {
   workspace?: GraphWorkspaceRef;
   dependencies?: Record<string, GraphWorkspaceRef>;
   variables?: GraphEnvironmentRef;
+  nodeEnvironment?: ExecutionVariables;
+  nodeEnvironmentSources?: GraphVariableSource[];
   trigger?: Record<string, unknown>;
 }
 

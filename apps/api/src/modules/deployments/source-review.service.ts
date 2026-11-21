@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  Body,
   Controller,
   ForbiddenException,
   Get,
@@ -10,9 +9,7 @@ import {
   NotFoundException,
   Param,
   ParseUUIDPipe,
-  Put,
   Query,
-  Req,
 } from '@nestjs/common';
 import { IsIn, IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
 import { randomUUID } from 'node:crypto';
@@ -20,8 +17,6 @@ import type { Kysely, Selectable } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
-import { Roles } from '../auth/auth.decorators';
-import type { AuthRequest } from '../auth/auth.guard';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
 import { lockProjectGraph } from '../projects/project-relations';
 import { redactTaskLog } from '../tasks/task-log.service';
@@ -366,26 +361,6 @@ class SourceReviewController {
     @Query('repositoryId', new ParseUUIDPipe({ optional: true })) repositoryId?: string,
   ) {
     return this.reviews.list(projectId, serviceId, environmentId, commitSha, repositoryId);
-  }
-
-  @Put(':commitSha')
-  @Roles('ADMIN')
-  decide(
-    @Param('projectId', ParseUUIDPipe) projectId: string,
-    @Param('serviceId', ParseUUIDPipe) serviceId: string,
-    @Param('environmentId', ParseUUIDPipe) environmentId: string,
-    @Param('commitSha') commitSha: string,
-    @Body() input: SourceReviewDecisionDto,
-    @Req() req: AuthRequest,
-  ) {
-    return this.reviews.recordDecision(
-      projectId,
-      serviceId,
-      environmentId,
-      commitSha,
-      input,
-      req.user.id,
-    );
   }
 }
 

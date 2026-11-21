@@ -462,9 +462,13 @@ async function checkViews(databaseUrl?: string) {
   let app: NestExpressApplication | undefined;
   try {
     const { AppModule } = await import('../app.module.js');
+    const { LegacyDeliveryWriteFixtureModule } =
+      await import('./helpers/legacy-delivery-write-fixture.module.js');
     const { configureApp } = await import('../bootstrap.js');
     const { DatabaseService } = await import('../core/database/database.service.js');
-    const module = await Test.createTestingModule({ imports: [AppModule] }).compile();
+    const module = await Test.createTestingModule({
+      imports: [AppModule, LegacyDeliveryWriteFixtureModule],
+    }).compile();
     app = module.createNestApplication<NestExpressApplication>({ logger: false });
     configureApp(app);
     await app.init();

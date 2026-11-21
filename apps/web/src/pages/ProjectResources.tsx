@@ -6,13 +6,12 @@ import { Confirm, ErrorBanner, Field, Form, Loading, Section, Status } from '../
 import type {
   Credential,
   DeploymentSummary,
-  Environment,
   ProjectDetail,
   Repository,
   Service,
   User,
 } from '../models';
-import { RepositoryBinding } from './DeploymentConfig';
+import { RepositoryBinding } from './RepositoryBinding';
 import { ExecutionGraphStartList } from './ExecutionGraphStartStatus';
 import { ProjectEnvironment } from './ProjectEnvironment';
 import { ProjectEnvironmentSets } from './ProjectEnvironmentSets';
@@ -23,7 +22,7 @@ import { RepositoryDetails } from './RepositoryBrowser';
 import { repositoryBranchLabel } from './RepositoryBranches';
 import { DeploymentHistory } from './ServerResources';
 import { deliveryPath } from './delivery-route';
-import type { GraphDocument } from './execution-graph-definition';
+import type { GraphDocument, GraphRun } from './execution-graph-definition';
 import { graphResourcePanel, graphStartHref } from './graph-workbench-context';
 import {
   graphResourceReturnHref,
@@ -38,18 +37,16 @@ import {
 
 const resourceKinds = ['services', 'repositories'] as const;
 const icons = { repositories: FolderGit2, services: Box };
-const resourceLabels = { ...projectResources, environments: '环境' };
-type EditableKind = (typeof resourceKinds)[number] | 'environments';
-type Resource = Repository | Service | Environment;
+type EditableKind = (typeof resourceKinds)[number];
+type Resource = Repository | Service;
 type Props = { project: ProjectDetail; user: User; reload: () => Promise<void> };
 
 function editable(kind: ResourceKind): kind is EditableKind {
-  return kind === 'repositories' || kind === 'services' || kind === 'environments';
+  return kind === 'repositories' || kind === 'services';
 }
 
 function detail(kind: EditableKind, id: string, view?: string, viewSearch?: string): Location {
   if (kind === 'repositories') return { resource: kind, repositoryId: id, view, viewSearch };
-  if (kind === 'environments') return { resource: kind, environmentId: id, view, viewSearch };
   return { resource: kind, serviceId: id, view, viewSearch };
 }
 
@@ -111,6 +108,11 @@ export function ProjectResources({
     canEdit && resource === 'repositories' && !repositoryId && panel === 'new';
   const editor =
     editing ?? (addingRepository ? { kind: 'repositories' as const, item: undefined } : undefined);
+  const cardRuns = useResource<Record<string, GraphRun>>(
+    !selected && !editor && (!resource || resource === 'services') && project.services.length
+      ? `/projects/${id}/recent-service-graph-runs`
+      : null,
+  );
   const resourceHref = (kind?: ResourceKind) =>
     '#' + projectResourcePath(id, { ...graphBack, view, viewSearch, resource: kind });
   async function archive() {
@@ -119,9 +121,7 @@ export function ProjectResources({
     setError('');
     try {
       await remove(`/projects/${id}/${deleting.kind}/${deleting.item.id}`);
-      const archivedDetail = [service?.id, environment?.id, repository?.id].includes(
-        deleting.item.id,
-      );
+      const archivedDetail = [service?.id, repository?.id].includes(deleting.item.id);
       if (archivedDetail)
         navigate(
           projectResourcePath(id, { ...graphBack, view, viewSearch, resource: deleting.kind }),
@@ -136,7 +136,7 @@ export function ProjectResources({
   }
   function itemActions(kind: EditableKind, item: Resource) {
     if (!canEdit) return;
-    const label = resourceLabels[kind];
+    const label = projectResources[kind];
     return (
       <span className="row-actions">
         <button
@@ -207,12 +207,11 @@ export function ProjectResources({
             }}
           />
         ) : (
-          <ProjectResourceEditor
+          <ProjectRepositoryEditor
             key={editor.item?.id ?? editor.kind}
             project={project}
             user={user}
-            adding={editor.kind}
-            editingResource={editor.item}
+            repository={editor.item as Repository | undefined}
             onClose={() => {
               setEditor(undefined);
               if (addingRepository)
@@ -256,44 +255,74 @@ export function ProjectResources({
                         )
                       }
                     >
+                      {kind === 'services' && (
+                        <ErrorBanner error={cardRuns.error} retry={cardRuns.reload} />
+                      )}
                       {project[kind].length ? (
                         <div className="resource-list">
-                          {project[kind].map((item) => (
-                            <div
-                              key={item.id}
-                              className={kind === 'services' ? 'project-service-card' : undefined}
-                            >
-                              <span className="resource-avatar">
-                                <Icon size={17} />
-                              </span>
-                              <div>
-                                <a
-                                  className="text-link"
-                                  href={
-                                    '#' +
-                                    projectResourcePath(id, {
-                                      ...detail(kind, item.id, view, viewSearch),
-                                      ...graphBack,
-                                    })
-                                  }
-                                >
-                                  {item.name}
-                                </a>
-                                <small>{'cloneUrl' in item ? item.cloneUrl : item.slug}</small>
-                              </div>
-                              <span className="tag">
-                                {'cloneUrl' in item
-                                  ? repositoryBranchLabel(item)
-                                  : item.serviceType}
-                              </span>
-                              {itemActions(kind, item)}
-                              {'serviceType' in item && (
-                                <div className="project-service-card-addresses">
-                                  <ProjectAccessLinks addresses={item.addresses ?? []} showEmpty />
+                          {project[kind].map((item) => {
+                            const latest =
+                              kind === 'services' ? cardRuns.data?.[item.id] : undefined;
+                            return (
+                              <div
+                                key={item.id}
+                                className={kind === 'services' ? 'project-service-card' : undefined}
+                              >
+                                <span className="resource-avatar">
+                                  <Icon size={17} />
+                                </span>
+                                <div>
+                                  <a
+                                    className="text-link"
+                                    href={
+                                      '#' +
+                                      projectResourcePath(id, {
+                                        ...detail(kind, item.id, view, viewSearch),
+                                        ...graphBack,
+                                      })
+                                    }
+                                  >
+                                    {item.name}
+                                  </a>
+                                  <small>{'cloneUrl' in item ? item.cloneUrl : item.slug}</small>
                                 </div>
-                              )}
-                            </div>
-                          ))}
+                                <span className="tag">
+                                  {'cloneUrl' in item
+                                    ? repositoryBranchLabel(item)
+                                    : item.serviceType}
+                                </span>
+                                {itemActions(kind, item)}
+                                {'serviceType' in item && (
+                                  <div className="project-service-card-addresses">
+                                    <ProjectAccessLinks
+                                      addresses={item.addresses ?? []}
+                                      showEmpty
+                                    />
+                                    {latest && (
+                                      <div className="heading-actions">
+                                        <a
+                                          className="button secondary small"
+                                          href={
+                                            '#' +
+                                            projectGraphPath(id, {
+                                              serviceId: item.id,
+                                              view,
+                                              viewSearch,
+                                              pane: 'history',
+                                              run: latest.id,
+                                            })
+                                          }
+                                        >
+                                          最近运行 · {latest.flowName}
+                                        </a>
+                                        <Status value={latest.status} />
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
                       ) : (
                         <p className="mini-empty">尚未添加{label}</p>
@@ -322,10 +351,41 @@ export function ProjectResources({
               environment={environment}
               panel={panel}
               view={view}
+              viewSearch={viewSearch}
               graphBack={graphBack}
-              reload={reload}
-              actions={itemActions('environments', environment)}
             />
+          )}
+          {resource === 'environments' && !environment && (
+            <Section title="历史环境" subtitle="项目环境配置保留供历史记录查阅。">
+              {project.environments.length ? (
+                <ul>
+                  {project.environments.map((entry) => (
+                    <li key={entry.id}>
+                      <a
+                        className="text-link"
+                        href={
+                          '#' +
+                          projectResourcePath(id, {
+                            ...graphBack,
+                            view,
+                            viewSearch,
+                            resource,
+                            environmentId: entry.id,
+                          })
+                        }
+                      >
+                        {entry.name}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="muted">没有历史环境记录。</p>
+              )}
+              <a className="button secondary small" href={resourceHref('environment-sets')}>
+                查看变量集合
+              </a>
+            </Section>
           )}
           {repository && (
             <RepositoryDetails
@@ -368,7 +428,7 @@ export function ProjectResources({
       )}
       {deleting && (
         <Confirm
-          title={`移除${resourceLabels[deleting.kind]}`}
+          title={`移除${projectResources[deleting.kind]}`}
           description={`归档「${deleting.item.name}」。配置、可运行图版本或在途任务仍引用它时会阻止归档。`}
           label="移除"
           destructive
@@ -470,6 +530,9 @@ function ServiceDetails({
   const deployments = useResource<DeploymentSummary[]>(
     `/projects/${id}/services/${serviceId}/recent-deployments`,
   );
+  const recentRuns = useResource<GraphRun[]>(
+    `/projects/${id}/services/${serviceId}/recent-graph-runs`,
+  );
   const graphError = graph.error || published.error;
   return (
     <>
@@ -562,10 +625,44 @@ function ServiceDetails({
         </Section>
       )}
       <Section
+        title="最近执行流运行"
+        action={
+          <a className="text-link" href={'#' + projectGraphPath(id, { ...scope, pane: 'history' })}>
+            查看项目运行记录 →
+          </a>
+        }
+      >
+        <ErrorBanner error={recentRuns.error} retry={recentRuns.reload} />
+        {recentRuns.loading ? (
+          <Loading />
+        ) : recentRuns.data?.length ? (
+          <ul className="graph-edge-list">
+            {recentRuns.data.map((run) => (
+              <li key={run.id}>
+                <div className="heading-actions">
+                  <a
+                    className="text-link"
+                    href={'#' + projectGraphPath(id, { ...scope, pane: 'history', run: run.id })}
+                  >
+                    {run.flowName}
+                  </a>
+                  <Status value={run.status} />
+                  <small>
+                    v{run.version} · {formatTime(run.createdAt)}
+                  </small>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : !recentRuns.error ? (
+          <p className="mini-empty">这个服务还没有执行流运行记录。</p>
+        ) : null}
+      </Section>
+      <Section
         title="最近发布"
         action={
           <a className="text-link" href={'#' + deliveryPath(id, 'deployments', scope)}>
-            查看全部部署与回滚 →
+            查看部署历史 →
           </a>
         }
       >
@@ -587,27 +684,22 @@ function ServiceDetails({
   );
 }
 
-function ProjectResourceEditor({
+function ProjectRepositoryEditor({
   project,
   user,
-  adding,
-  editingResource,
+  repository,
   onClose,
   onSaved,
 }: {
   project: ProjectDetail;
   user: User;
-  adding: Exclude<EditableKind, 'services'>;
-  editingResource?: Resource;
+  repository?: Repository;
   onClose: () => void;
   onSaved: (item: Resource) => Promise<void>;
 }) {
-  const credentials = useResource<Credential[]>(
-    adding === 'repositories' && user.role === 'ADMIN' ? '/credentials' : null,
-  );
+  const credentials = useResource<Credential[]>(user.role === 'ADMIN' ? '/credentials' : null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const labels = resourceLabels;
   async function add(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -615,25 +707,20 @@ function ProjectResourceEditor({
     const payload: Record<string, string | null> = {
       name: text('name'),
       description: text('description'),
+      cloneUrl: text('cloneUrl'),
+      provider: text('provider'),
     };
-    if (adding === 'repositories') {
-      payload.cloneUrl = text('cloneUrl');
-      payload.provider = text('provider');
-      if (user.role === 'ADMIN') payload.credentialId = text('credentialId') || null;
-    } else {
-      payload.slug = text('slug');
-      payload.environmentType = text('environmentType');
-    }
+    if (user.role === 'ADMIN') payload.credentialId = text('credentialId') || null;
     setBusy(true);
     setError('');
-    const path = '/projects/' + project.id + '/' + adding;
+    const path = '/projects/' + project.id + '/repositories';
     try {
-      const result = editingResource
-        ? await api<Resource>(path + '/' + editingResource.id, {
+      const result = repository
+        ? await api<Repository>(path + '/' + repository.id, {
             method: 'PATCH',
             body: JSON.stringify(payload),
           })
-        : await post<Resource>(path, payload);
+        : await post<Repository>(path, payload);
       await onSaved(result);
     } catch (err) {
       setError(message(err));
@@ -643,114 +730,65 @@ function ProjectResourceEditor({
   }
   return (
     <InlineEditor
-      key={editingResource?.id ?? adding}
+      key={repository?.id ?? 'new-repository'}
       busy={busy}
-      title={`${editingResource ? '编辑' : '添加'}${labels[adding]}`}
+      title={repository ? '编辑仓库' : '添加仓库'}
       onClose={() => !busy && onClose()}
     >
       <Form
         onSubmit={add}
         error={error}
         busy={busy}
-        submit={editingResource ? '保存' : `添加${labels[adding]}`}
+        submit={repository ? '保存' : '添加仓库'}
         onCancel={() => onClose()}
       >
         <Field label="名称" required>
+          <input name="name" required autoFocus defaultValue={repository?.name} maxLength={100} />
+        </Field>
+        <Field label="Git 仓库地址" required hint="使用仓库的 HTTP(S) 克隆地址。">
           <input
-            name="name"
+            name="cloneUrl"
+            placeholder="https://github.com/team/repository.git"
+            type="url"
+            pattern="https?://.+"
+            defaultValue={repository?.cloneUrl}
             required
-            autoFocus
-            defaultValue={editingResource?.name}
-            maxLength={100}
           />
         </Field>
-        {adding === 'repositories' ? (
-          <>
-            <Field label="Git 仓库地址" required hint="使用仓库的 HTTP(S) 克隆地址。">
-              <input
-                name="cloneUrl"
-                placeholder="https://github.com/team/repository.git"
-                type="url"
-                pattern="https?://.+"
-                defaultValue={(editingResource as Repository | undefined)?.cloneUrl}
-                required
-              />
-            </Field>
-            {user.role === 'ADMIN' && (
-              <Field label="Git 认证凭据（可选）">
-                <select
-                  name="credentialId"
-                  defaultValue={(editingResource as Repository | undefined)?.credentialId ?? ''}
-                >
-                  <option value="">公开仓库，无需认证</option>
-                  {(editingResource as Repository | undefined)?.credentialId &&
-                    !(credentials.data ?? []).some(
-                      (item) =>
-                        item.id === (editingResource as Repository).credentialId &&
-                        item.status === 'ACTIVE',
-                    ) && (
-                      <option value={(editingResource as Repository).credentialId!}>
-                        保留当前凭据
-                      </option>
-                    )}
-                  {credentials.data
-                    ?.filter(
-                      (c) =>
-                        ['GIT_TOKEN', 'GIT_PASSWORD'].includes(c.type) && c.status === 'ACTIVE',
-                    )
-                    .map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name}
-                      </option>
-                    ))}
-                </select>
-              </Field>
-            )}
-            <p className="field-note">保存后会读取远端默认分支、分支列表和最新提交。</p>
-            <Field label="代码托管平台">
-              <select
-                name="provider"
-                defaultValue={(editingResource as Repository | undefined)?.provider ?? 'CUSTOM'}
-              >
-                <option value="CUSTOM">自建或其他</option>
-                <option value="GITHUB">GitHub</option>
-                <option value="GITLAB">GitLab</option>
-                <option value="GITEA">Gitea</option>
-                <option value="BITBUCKET">Bitbucket</option>
-              </select>
-            </Field>
-          </>
-        ) : (
-          <>
-            <Field label="标识" required>
-              <input
-                name="slug"
-                defaultValue={(editingResource as Environment | undefined)?.slug}
-                required
-                pattern="[a-z0-9]+(?:-[a-z0-9]+)*"
-                placeholder="production"
-              />
-            </Field>
-            <Field label="环境类型">
-              <select
-                name="environmentType"
-                defaultValue={
-                  (editingResource as Environment | undefined)?.environmentType ?? 'DEVELOPMENT'
-                }
-              >
-                <option value="DEVELOPMENT">开发环境</option>
-                <option value="TESTING">测试环境</option>
-                <option value="STAGING">预发布环境</option>
-                <option value="PRODUCTION">生产环境</option>
-                <option value="CUSTOM">自定义</option>
-              </select>
-            </Field>
-          </>
+        {user.role === 'ADMIN' && (
+          <Field label="Git 认证凭据（可选）">
+            <select name="credentialId" defaultValue={repository?.credentialId ?? ''}>
+              <option value="">公开仓库，无需认证</option>
+              {repository?.credentialId &&
+                !(credentials.data ?? []).some(
+                  (item) => item.id === repository.credentialId && item.status === 'ACTIVE',
+                ) && <option value={repository.credentialId}>保留当前凭据</option>}
+              {credentials.data
+                ?.filter(
+                  (c) => ['GIT_TOKEN', 'GIT_PASSWORD'].includes(c.type) && c.status === 'ACTIVE',
+                )
+                .map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+            </select>
+          </Field>
         )}
+        <p className="field-note">保存后会读取远端默认分支、分支列表和最新提交。</p>
+        <Field label="代码托管平台">
+          <select name="provider" defaultValue={repository?.provider ?? 'CUSTOM'}>
+            <option value="CUSTOM">自建或其他</option>
+            <option value="GITHUB">GitHub</option>
+            <option value="GITLAB">GitLab</option>
+            <option value="GITEA">Gitea</option>
+            <option value="BITBUCKET">Bitbucket</option>
+          </select>
+        </Field>
         <Field label="说明">
           <textarea
             name="description"
-            defaultValue={editingResource?.description}
+            defaultValue={repository?.description}
             maxLength={2000}
             rows={2}
           />
