@@ -164,7 +164,8 @@
 | 方法与相对路径 | 请求与结果 |
 | --- | --- |
 | `GET /` | 查询项目图、草稿修订号和当前发布版本。 |
-| `GET /catalog` | 返回内置字段、功能模块版本和端口定义。 |
+| `GET /catalog` | 返回内置字段、功能模块版本、端口定义和 `flowTemplates[]`。模板含 `id`、`name`、`steps`、`artifactTypes`。 |
+| `POST /draft/templates/expand` | 接收 `{templateId,artifactType?}`，返回 `{canvas,startId}`。产物默认 `DIRECTORY`。管理员和操作员可展开，然后通过草稿接口按修订号保存。 |
 | `POST /catalog?flow=:flowId&node=:nodeId` | 提交 `{definition}`，返回所选草稿节点的端口、候选来源、类型、可用性和分支信息。 |
 | `POST /validate` | 提交 `{definition}`。响应的 `issues` 用 `flowId`、`nodeId`、`fieldId` 和 `message` 定位发布问题。图结构检查通过后，汇总各流的绑定问题。已知问题分支可附 `branchId` 和 `edge:{from,to,when?}`。 |
 | `PUT /draft` | 提交 `{expectedRevision, definition:{flows:[],canvas:{nodes,edges,endpoints,templates}}}`。 |
@@ -179,6 +180,8 @@
 | `POST /runs/:runId/cancel` | 取消运行及尚未完成的节点和子流。 |
 | `POST /runs/:runId/nodes/:nodeId/decision` | 管理员提交 `{decision:"APPROVE"\|"REJECT",expectedScopeHash?}`。源码审核与绑定发布的审批必须传回等待节点 `output.scopeHash`。响应保留实际范围、决定、操作者及时间。 |
 | `POST /runs/:runId/nodes/:nodeId/targets/:serverId/inspect-release` | 管理员或原发起操作员核查已结束的失败或待核查目标。返回 `CURRENT`、`PREVIOUS`、`NO_ACTIVE_RELEASE` 或 `UNKNOWN`，附时间及可确认的发布和锁信息。仅执行远端读取并写审计；运行详情的逐目标 `inspection` 返回最近一次核查。 |
+
+内置模板 ID 为 `MINIMAL_CI_CD`、`CI_BUILD`、`CD_DEPLOY`。新项目保存 `MINIMAL_CI_CD` 的目录产物草稿，修订为 `1`，等待配置与发布。预览响应的 `routing` 区分已纳入、待分支决定、本次跳过和流外连线。普通出线默认纳入当前配对的结束范围，`edgeSelections` 可以固定一条或多条普通出线。条件分支 `branch.cases` 使用 `{id,value,label?}`，连线按 `CASE:<id>` 或 `DEFAULT` 识别。
 
 服务卡片通过 `GET /projects/:id/recent-service-graph-runs` 读取最近的相关图运行。可对单个服务请求 `GET /projects/:id/services/:serviceId/recent-graph-runs`。关联来自实际任务或仍在等待的已确认交付节点。
 
