@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
+const { randomUUID } = require('node:crypto');
 const { readFile, writeFile } = require('node:fs/promises');
 const { join } = require('node:path');
 
@@ -19,6 +20,13 @@ function prepareP2Repository(root, source) {
     'acceptance-next',
     source.repositoryPath,
     join(root, 'dependency.git'),
+  ]);
+  execFileSync('git', [
+    '--git-dir',
+    source.repositoryPath,
+    'tag',
+    'acceptance-next',
+    source.commitSha,
   ]);
 }
 
@@ -84,8 +92,12 @@ async function verifyP2Contract({ api, fixture, execute, source, managerArtifact
       'candidate-multi-source',
       'candidate-api-output',
       [
-        node('candidate-main', 'CHECKOUT'),
-        node('candidate-next', 'CHECKOUT'),
+        node('candidate-main', 'CHECKOUT', {
+          name: '检出源码',
+          inputs: [{ id: 'version', name: 'Git 版本', type: 'GIT_REF' }],
+        }),
+        node('candidate-next', 'CHECKOUT', { name: '检出源码' }),
+        node('candidate-tag', 'CHECKOUT'),
         node('candidate-dependency', 'CHECKOUT'),
         node(build, 'BUILD', {
           build: {
@@ -106,7 +118,8 @@ async function verifyP2Contract({ api, fixture, execute, source, managerArtifact
       [
         edge('candidate-multi-source', 'candidate-main'),
         edge('candidate-main', 'candidate-next'),
-        edge('candidate-next', 'candidate-dependency'),
+        edge('candidate-next', 'candidate-tag'),
+        edge('candidate-tag', 'candidate-dependency'),
         edge('candidate-dependency', build),
         edge(build, 'candidate-api-output'),
       ],
@@ -115,6 +128,10 @@ async function verifyP2Contract({ api, fixture, execute, source, managerArtifact
         'candidate-next': {
           repository: value(baseRepository),
           version: value({ kind: 'BRANCH', value: 'acceptance-next' }),
+        },
+        'candidate-tag': {
+          repository: value(baseRepository),
+          version: value({ kind: 'TAG', value: 'acceptance-next' }),
         },
         'candidate-dependency': { repository: value(apiRepository.id) },
         [build]: {
@@ -140,9 +157,22 @@ async function verifyP2Contract({ api, fixture, execute, source, managerArtifact
     [
       [baseRepository, source.commitSha],
       [baseRepository, source.nextCommitSha],
+      [baseRepository, source.commitSha],
       [apiRepository.id, source.nextCommitSha],
     ],
   );
+  const { draft: dependencyDraft } = await api.get(graph);
+  const missingDependency = dependencyDraft.canvas.endpoints.find(
+    ({ startId }) => startId === 'candidate-multi-source',
+  );
+  delete missingDependency.inputBindings[build].dependency_api;
+  const { issues } = await api.post(graph + '/validate', {
+    definition: { flows: [], canvas: dependencyDraft.canvas },
+  });
+  const dependencyIssue = issues.find(
+    ({ nodeId, fieldId }) => nodeId === build && fieldId === 'dependency_api',
+  );
+  assert.equal(dependencyIssue?.flowId, 'candidate-multi-source');
   const bundle = built.detail.outputs.apiBundle;
   assert.equal(bundle.name, 'API 目录');
   assert.equal(bundle.type, 'DIRECTORY');
@@ -371,8 +401,47 @@ async function verifyP2Contract({ api, fixture, execute, source, managerArtifact
     ).trim(),
     html,
   );
+  const testSetId = fixture.environmentSetIds['test-config'];
+  const setPath = project + '/environment-sets/' + testSetId;
+  const set = await api.get(setPath);
+  const oldChoice = {
+    version: fixture.version,
+    inputs: { parameters: { environmentSet: testSetId } },
+  };
+  const targetFiles = graph + '/flows/target-files';
+  const oldPlan = await api.post(targetFiles + '/preview', oldChoice);
+  const oldVariables = set.variables.map(({ key, value, description, isSecret }) => ({
+    key,
+    ...(description && { description }),
+    isSecret,
+    ...(isSecret ? { keepSecret: true } : { value }),
+  }));
+  const changedSet = await api.call('PATCH', setPath, {
+    expectedRevision: set.revision,
+    variables: [...oldVariables, { key: 'VEYOPS_ACCEPT_CONFIG_TEST', value: 'changed' }],
+  });
+  const newPlan = await api.post(targetFiles + '/preview', oldChoice);
+  assert.notEqual(oldPlan.configurationHash, newPlan.configurationHash);
+  await api.call(
+    'POST',
+    targetFiles + '/run',
+    {
+      ...oldChoice,
+      idempotencyKey: randomUUID(),
+      expectedConfigurationHash: oldPlan.configurationHash,
+      expectedPlanSections: oldPlan.planSections,
+    },
+    409,
+  );
+  await api.call('PATCH', setPath, {
+    expectedRevision: changedSet.revision,
+    variables: oldVariables,
+  });
   return {
     multiSourceRun: built.detail.id,
+    gitVersions: built.entry.checkouts,
+    dependencyIssue,
+    staleConfigurationRejected: true,
     dualReleaseRun: paired.detail.id,
     partialReleaseRun: recovered.detail.id,
     temporaryChildRun: nested.detail.id,
