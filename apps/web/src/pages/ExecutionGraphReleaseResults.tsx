@@ -25,11 +25,14 @@ type ReleaseTarget = {
   serverId: string;
   deploymentId?: string;
   rollbackOfDeploymentId?: string;
+  artifactInstanceId?: string;
+  plannedArtifactInstanceId?: string;
   status: string;
-  health: string;
+  health?: string;
   reason?: string;
+  errorSummary?: string;
   healthReason?: string;
-  consumedArtifacts: { artifactId?: string; instanceId?: string; temporaryArtifactId?: string }[];
+  consumedArtifacts?: { artifactId?: string; instanceId?: string; temporaryArtifactId?: string }[];
 };
 
 export type ReleaseContext = {
@@ -224,11 +227,7 @@ function isReleaseTarget(value: unknown): value is ReleaseTarget {
     'serverId' in value &&
     typeof value.serverId === 'string' &&
     'status' in value &&
-    typeof value.status === 'string' &&
-    'health' in value &&
-    typeof value.health === 'string' &&
-    'consumedArtifacts' in value &&
-    Array.isArray(value.consumedArtifacts),
+    typeof value.status === 'string',
   );
 }
 
@@ -402,11 +401,12 @@ export function ExecutionGraphReleaseResults({
                 {serverName(target.serverId) ?? target.serverId}
               </a>
               <Status value={target.status} />
-              {target.health === 'UNKNOWN' ? (
-                <small>{healthLabels.UNKNOWN}</small>
-              ) : (
-                <Status value={target.health} />
-              )}
+              {target.health &&
+                (target.health === 'UNKNOWN' ? (
+                  <small>{healthLabels.UNKNOWN}</small>
+                ) : (
+                  <Status value={target.health} />
+                ))}
               {target.deploymentId && (
                 <a
                   className="text-link"
@@ -423,22 +423,29 @@ export function ExecutionGraphReleaseResults({
                   被回滚的部署
                 </a>
               )}
-              {target.consumedArtifacts.map((ref, index) => {
+              {(target.consumedArtifacts?.length
+                ? target.consumedArtifacts
+                : [{ instanceId: target.artifactInstanceId }]
+              ).map((ref, index) => {
                 const id = ref.instanceId ?? ref.artifactId ?? ref.temporaryArtifactId;
-                return (
-                  id && (
-                    <ArtifactLink
-                      key={ref.instanceId ?? id + ':' + index}
-                      id={id}
-                      context={context}
-                    />
-                  )
-                );
+                return id && <ArtifactLink key={id + ':' + index} id={id} context={context} />;
               })}
+              {!target.artifactInstanceId && target.plannedArtifactInstanceId && (
+                <a
+                  className="text-link"
+                  href={recordHref(context, 'artifacts', target.plannedArtifactInstanceId)}
+                >
+                  计划产物 <code>{target.plannedArtifactInstanceId.slice(0, 12)}</code>
+                </a>
+              )}
             </div>
-            {(target.healthReason || target.reason) && (
-              <small>{target.healthReason ?? target.reason}</small>
-            )}
+            {[
+              ...new Set([target.errorSummary, target.healthReason, target.reason].filter(Boolean)),
+            ].map((reason) => (
+              <p className="field-note" key={reason}>
+                {reason}
+              </p>
+            ))}
           </li>
         ))}
       </ul>
