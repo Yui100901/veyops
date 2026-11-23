@@ -1029,7 +1029,9 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
     timeout: number,
     onData: NonNullable<ProcessOptions['onData']>,
   ) {
-    const secrets = await mkdtemp(join(tmpdir(), 'veyops-graph-shell-'));
+    const builds = join(dataDirectory, 'builds');
+    await mkdir(builds, { recursive: true, mode: 0o700 });
+    const secrets = await mkdtemp(join(builds, 'graph-shell-'));
     try {
       await writeFile(join(secrets, 'shell.env'), exportedVariables(session.variables), {
         mode: 0o600,
@@ -1040,7 +1042,7 @@ umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(
         `${enterRepositoryDirectory('/workspace', relativePath(directory))}; . /run/veyops/shell.env\n${command}`,
         secrets,
         undefined,
-        undefined,
+        helperImage(),
         timeout,
         undefined,
         onData,

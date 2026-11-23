@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { after, mock, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Test } from '@nestjs/testing';
@@ -22,6 +22,7 @@ async function checkDelivery(databaseUrl?: string) {
   const directory = await deliveryDirectory();
   const initialPassword = 'fixture-delivery-initial';
   const password = 'fixture-delivery-changed';
+  const buildHelperImage = 'fixture-shell:bookworm';
   process.env.DATA_DIR = directory;
   process.env.DATABASE_PATH = join(directory, 'test.db');
   process.env.DATABASE_CLIENT = databaseUrl ? 'postgres' : 'sqlite';
@@ -30,6 +31,7 @@ async function checkDelivery(databaseUrl?: string) {
   process.env.WORKER_ENABLED = 'false';
   process.env.ADMIN_PASSWORD = initialPassword;
   process.env.AI_PIPELINE_ANALYSIS = 'false';
+  process.env.BUILD_HELPER_IMAGE = buildHelperImage;
 
   const { LegacyDeliveryFixtureModule } =
     await import('./helpers/legacy-delivery-fixture.module.js');
@@ -77,6 +79,14 @@ async function checkDelivery(databaseUrl?: string) {
       run: async (_command: string, args: string[], options: { gzipOutput?: { path: string } }) => {
         const script = args.at(-1) ?? '';
         if (script.includes('GRAPH_SHELL_FIXTURE')) {
+          const secretsMount = args.find((arg) => arg.endsWith(',dst=/run/veyops,readonly'));
+          assert.ok(secretsMount);
+          const secrets = secretsMount.slice(
+            'type=bind,src='.length,
+            -',dst=/run/veyops,readonly'.length,
+          );
+          assert.equal(dirname(secrets), join(directory, 'builds'));
+          assert.equal(args.at(-5), buildHelperImage);
           const path = args.find((arg) => arg.endsWith(',dst=/workspace'))!;
           const workspace = path.slice('type=bind,src='.length, -',dst=/workspace'.length);
           const destination = join(workspace, 'repo', 'custom-dist');
