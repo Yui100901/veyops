@@ -93,7 +93,7 @@ async function checkUserManagement(t: TestContext, databaseUrl?: string) {
     await root.get(users).expect(401);
     const rootInitial = await login(root, 'root', initialPassword).expect(201);
     const rootId = rootInitial.body.data.id as string;
-    await root.get(users).expect(403);
+    await root.get(users).expect(200);
     await changePassword(root, initialPassword, rootPassword).expect(200);
     await login(root, 'root', rootPassword).expect(201);
     const listing = await root.get(users).expect(200);
@@ -149,6 +149,8 @@ async function checkUserManagement(t: TestContext, databaseUrl?: string) {
 
     const staffInitial = await login(staff, input.username, temporary).expect(201);
     assert.equal(staffInitial.body.data.mustChangePassword, true);
+    assert.equal(staffInitial.body.data.passwordChangeRecommended, false);
+    await staff.post(base + '/auth/dismiss-password-reminder').expect(403);
     await staff.get(base + '/projects').expect(403);
     await changePassword(staff, temporary, staffPassword).expect(200);
     await login(staff, input.username, staffPassword).expect(201);

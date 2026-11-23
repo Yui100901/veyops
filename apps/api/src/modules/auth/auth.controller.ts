@@ -52,6 +52,11 @@ export class AuthController {
     res.clearCookie('veyops_session', { path: '/' });
     return result;
   }
+  @Post('dismiss-password-reminder')
+  @HttpCode(200)
+  dismissPasswordReminder(@Req() req: AuthRequest) {
+    return this.auth.dismissPasswordReminder(req.user.id);
+  }
   private cookie(session: Awaited<ReturnType<AuthService['login']>>, res: Response) {
     res.cookie('veyops_session', session.token, {
       httpOnly: true,

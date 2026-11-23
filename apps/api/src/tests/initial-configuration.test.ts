@@ -288,7 +288,8 @@ test('failed optional provider creation does not block initial administrator log
     await auth.onApplicationBootstrap();
     const session = await auth.login('root', 'bootstrap-login-test-1234');
     assert.equal(session.user.role, 'ADMIN');
-    assert.equal(session.user.mustChangePassword, true);
+    assert.equal(session.user.mustChangePassword, false);
+    assert.equal(session.user.passwordChangeRecommended, true);
     assert.equal(session.token.length, 64);
     assert.equal(f.created, 0);
     await access(f.file);
@@ -324,16 +325,23 @@ test('concurrent fresh startups print one generated password after persistence a
     assert.ok(generated, 'startup must print a usable randomly generated password');
     const users = await f.database.db
       .selectFrom('users')
-      .select(['username', 'role', 'must_change_password'])
+      .select(['username', 'role', 'must_change_password', 'password_change_recommended'])
       .execute();
-    assert.deepEqual(users, [{ username: 'root', role: 'ADMIN', must_change_password: 1 }]);
+    assert.deepEqual(users, [
+      { username: 'root', role: 'ADMIN', must_change_password: 0, password_change_recommended: 1 },
+    ]);
     const session = await original.login('root', generated);
-    assert.equal(session.user.mustChangePassword, true);
+    assert.equal(session.user.mustChangePassword, false);
+    assert.equal(session.user.passwordChangeRecommended, true);
+    await original.dismissPasswordReminder(session.user.id);
+    assert.equal((await original.resolve(session.token)).passwordChangeRecommended, false);
     process.env.ADMIN_PASSWORD = 'fixture-restart-ignored';
     await second.onApplicationBootstrap();
     assert.equal(output.mock.callCount(), 1);
     await assert.rejects(second.login('root', 'fixture-restart-ignored'), /用户名或密码错误/);
-    assert.equal((await second.login('root', generated)).user.id, session.user.id);
+    const repeated = (await second.login('root', generated)).user;
+    assert.equal(repeated.id, session.user.id);
+    assert.equal(repeated.passwordChangeRecommended, false);
   } finally {
     delete process.env.ADMIN_PASSWORD;
     await secondDatabase.onApplicationShutdown();
@@ -358,13 +366,14 @@ test('password rotation fences sessions created concurrently with the initial pa
     await change;
     for (const result of await logins) {
       if (result.status === 'fulfilled') {
-        assert.equal(result.value.user.mustChangePassword, true);
+        assert.equal(result.value.user.passwordChangeRecommended, true);
         await assert.rejects(auth.resolve(result.value.token), /登录已过期/);
       } else assert.match(String(result.reason), /用户名或密码错误/);
     }
     await assert.rejects(auth.resolve(token), /登录已过期/);
     const next = await auth.login('root', newPassword);
     assert.equal((await auth.resolve(next.token)).mustChangePassword, false);
+    assert.equal(next.user.passwordChangeRecommended, false);
   } finally {
     delete process.env.ADMIN_PASSWORD;
     await f.close();

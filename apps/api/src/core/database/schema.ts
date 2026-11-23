@@ -6,6 +6,7 @@ export interface UsersTable {
   username: string;
   password_hash: string;
   must_change_password: Generated<number>;
+  password_change_recommended: Generated<number>;
   role: Generated<string>;
   status: Generated<string>;
   created_at: number;

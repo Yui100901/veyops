@@ -45,6 +45,7 @@ async function checkApi(databaseUrl?: string) {
     const viewer = request.agent(app.getHttpServer());
     const initialSession = request.agent(app.getHttpServer());
     await api.get('/api/v1/servers').expect(401);
+    await api.post('/api/v1/auth/dismiss-password-reminder').expect(401);
     const status = await api.get('/api/v1/auth/status').expect(200);
     assert.equal(status.body.data.initialized, true);
     assert.match(status.headers['content-security-policy'], /script-src 'self'/);
@@ -58,18 +59,25 @@ async function checkApi(databaseUrl?: string) {
       .send({ username: 'root', password: initialPassword })
       .expect(201);
     assert.equal(login.body.data.role, 'ADMIN');
-    assert.equal(login.body.data.mustChangePassword, true);
+    assert.equal(login.body.data.mustChangePassword, false);
+    assert.equal(login.body.data.passwordChangeRecommended, true);
     assert.ok(login.headers['set-cookie'][0].includes('HttpOnly'));
     assert.ok(login.headers['set-cookie'][0].includes('SameSite=Strict'));
     assert.equal(JSON.stringify(login.body).includes('token'), false);
     const current = await api.get('/api/v1/auth/me').expect(200);
-    assert.equal(current.body.data.mustChangePassword, true);
-    await api.get('/api/v1/servers').expect(403);
-    await api.post('/api/v1/credentials').send({}).expect(403);
+    assert.equal(current.body.data.passwordChangeRecommended, true);
+    await api.get('/api/v1/servers').expect(200);
     await initialSession
       .post('/api/v1/auth/login')
       .send({ username: 'root', password: initialPassword })
       .expect(201);
+    await api.post('/api/v1/auth/dismiss-password-reminder').expect(200);
+    await api.post('/api/v1/auth/dismiss-password-reminder').expect(200);
+    assert.equal(
+      (await initialSession.get('/api/v1/auth/me').expect(200)).body.data.passwordChangeRecommended,
+      false,
+    );
+    await api.get('/api/v1/servers').expect(200);
     await api
       .post('/api/v1/auth/change-password')
       .send({ currentPassword: initialPassword, newPassword: initialPassword })
@@ -99,6 +107,7 @@ async function checkApi(databaseUrl?: string) {
       .send({ username: 'root', password: newPassword })
       .expect(201);
     assert.equal(renewed.body.data.mustChangePassword, false);
+    assert.equal(renewed.body.data.passwordChangeRecommended, false);
     await api
       .post('/api/v1/credentials')
       .set('Origin', 'https://evil.example')

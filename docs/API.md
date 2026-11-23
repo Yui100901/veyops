@@ -8,12 +8,13 @@
 | ---- | --------------------- | --------------------------------------------------------------------------------------------- |
 | GET  | /health               | 匿名服务健康状态                                                                              |
 | GET  | /auth/status          | 匿名 `{initialized:boolean}`                                                                  |
-| POST | /auth/login           | `{username,password}`，返回用户信息及 `mustChangePassword`，设置 Cookie                       |
-| GET  | /auth/me              | 当前用户 `{id,username,role,mustChangePassword}`                                              |
+| POST | /auth/login           | `{username,password}`，返回当前用户，设置 Cookie                                            |
+| GET  | /auth/me              | 当前用户 `{id,username,role,mustChangePassword,passwordChangeRecommended}`                   |
+| POST | /auth/dismiss-password-reminder | 跳过当前账号的可选改密提醒，保留密码和会话                                          |
 | POST | /auth/change-password | `{currentPassword,newPassword}`；新密码 12–256 位且不同于原密码。成功后撤销账号会话，重新登录 |
 | POST | /auth/logout          | 撤销当前会话                                                                                  |
 
-角色为 ADMIN、OPERATOR、VIEWER。空库启动时创建 `root`，使用 `ADMIN_PASSWORD` 或控制台中的随机初始密码。`mustChangePassword` 为 `true` 时，会话只可读取 `/auth/me`、改密或退出。登录入口按 IP 限速。
+角色为 ADMIN、OPERATOR、VIEWER。空库启动时创建 `root`，使用 `ADMIN_PASSWORD` 或控制台中的随机初始密码。`passwordChangeRecommended` 提示空库管理员修改初始密码，可跳过并继续访问业务接口。用管理员发放或重置的临时密码登录时，`mustChangePassword` 为 `true`，会话只可读取 `/auth/me`、改密或退出。登录入口按 IP 限速。
 
 ## 用户管理
 

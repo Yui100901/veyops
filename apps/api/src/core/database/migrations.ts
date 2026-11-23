@@ -2028,6 +2028,19 @@ export const migrationProvider: MigrationProvider = {
             .execute();
         },
       } satisfies Migration,
+      '034_initial_password_reminder': {
+        async up(db) {
+          await db.schema
+            .alterTable('users')
+            .addColumn('password_change_recommended', 'integer', (column) =>
+              column.notNull().defaultTo(0).check(sql`password_change_recommended in (0, 1)`),
+            )
+            .execute();
+        },
+        async down(db) {
+          await db.schema.alterTable('users').dropColumn('password_change_recommended').execute();
+        },
+      } satisfies Migration,
     };
   },
 };

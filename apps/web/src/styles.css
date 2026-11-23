@@ -2609,6 +2609,8 @@ tbody tr:hover {
 }
 .auth-actions {
   display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
   justify-content: center;
   margin-top: 18px;
 }

@@ -3,6 +3,7 @@ export interface User {
   username: string;
   role: 'ADMIN' | 'OPERATOR' | 'VIEWER';
   mustChangePassword: boolean;
+  passwordChangeRecommended: boolean;
 }
 export const userRoleNames = {
   ADMIN: '管理员',
@@ -10,7 +11,7 @@ export const userRoleNames = {
   VIEWER: '只读用户',
 } satisfies Record<User['role'], string>;
 
-export interface ManagedUser extends User {
+export interface ManagedUser extends Omit<User, 'passwordChangeRecommended'> {
   status: 'ACTIVE' | 'DISABLED';
   createdAt: number;
   updatedAt: number;

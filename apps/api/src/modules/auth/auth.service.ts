@@ -59,7 +59,7 @@ export class AuthService implements OnApplicationBootstrap {
           password_hash: passwordHash,
           role: 'ADMIN',
           status: 'ACTIVE',
-          must_change_password: 1,
+          password_change_recommended: 1,
           created_at: now,
           updated_at: now,
         })
@@ -95,7 +95,7 @@ export class AuthService implements OnApplicationBootstrap {
         .where('id', '=', row.id)
         .where('status', '=', 'ACTIVE')
         .where('password_hash', '=', row.password_hash)
-        .returning(['id', 'username', 'role', 'must_change_password'])
+        .returning(['id', 'username', 'role', 'must_change_password', 'password_change_recommended'])
         .executeTakeFirst();
       if (!locked) throw new UnauthorizedException('用户名或密码错误');
       await tx
@@ -119,12 +119,14 @@ export class AuthService implements OnApplicationBootstrap {
     username: string;
     role: string;
     must_change_password: number;
+    password_change_recommended: number;
   }): SessionUser {
     return {
       id: row.id,
       username: row.username,
       role: row.role as Role,
       mustChangePassword: row.must_change_password === 1,
+      passwordChangeRecommended: row.password_change_recommended === 1,
     };
   }
   async resolve(token?: string): Promise<SessionUser> {
@@ -133,7 +135,13 @@ export class AuthService implements OnApplicationBootstrap {
     const row = await this.database.db
       .selectFrom('auth_sessions')
       .innerJoin('users', 'users.id', 'auth_sessions.user_id')
-      .select(['users.id', 'users.username', 'users.role', 'users.must_change_password'])
+      .select([
+        'users.id',
+        'users.username',
+        'users.role',
+        'users.must_change_password',
+        'users.password_change_recommended',
+      ])
       .where('token_hash', '=', sessionHash(token))
       .where('expires_at', '>', Date.now())
       .where('revoked_at', 'is', null)
@@ -141,6 +149,16 @@ export class AuthService implements OnApplicationBootstrap {
       .executeTakeFirst();
     if (!row) throw new UnauthorizedException('登录已过期，请重新登录');
     return this.sessionUser(row);
+  }
+  async dismissPasswordReminder(userId: string) {
+    await this.database.db
+      .updateTable('users')
+      .set({ password_change_recommended: 0, updated_at: Date.now() })
+      .where('id', '=', userId)
+      .where('status', '=', 'ACTIVE')
+      .where('password_change_recommended', '=', 1)
+      .execute();
+    return { success: true };
   }
   async changePassword(
     userId: string,
@@ -178,7 +196,12 @@ export class AuthService implements OnApplicationBootstrap {
       const now = Date.now();
       await tx
         .updateTable('users')
-        .set({ password_hash: nextHash, must_change_password: 0, updated_at: now })
+        .set({
+          password_hash: nextHash,
+          must_change_password: 0,
+          password_change_recommended: 0,
+          updated_at: now,
+        })
         .where('id', '=', userId)
         .execute();
       await revokeUserSessions(tx, userId, now);

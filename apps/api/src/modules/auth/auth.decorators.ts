@@ -11,4 +11,5 @@ export interface CurrentUser {
 }
 export interface SessionUser extends CurrentUser {
   mustChangePassword: boolean;
+  passwordChangeRecommended: boolean;
 }

@@ -240,12 +240,14 @@ function AuthPage({
 function ChangePasswordPage({
   user,
   onChanged,
+  onSkipped,
   onLogout,
   loggingOut,
   logoutError,
 }: {
   user: User;
   onChanged: () => void;
+  onSkipped: () => void;
   onLogout: () => void;
   loggingOut: boolean;
   logoutError: string;
@@ -253,6 +255,19 @@ function ChangePasswordPage({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const required = user.mustChangePassword;
+  const initial = required || user.passwordChangeRecommended;
+  async function skip() {
+    setBusy(true);
+    setError('');
+    try {
+      await post('/auth/dismiss-password-reminder');
+      onSkipped();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -282,7 +297,7 @@ function ChangePasswordPage({
     }
   }
   const form = (
-    <form onSubmit={submit} className={required ? undefined : 'form-body'}>
+    <form onSubmit={submit} className={initial ? undefined : 'form-body'}>
       <input name="username" value={user.username} autoComplete="username" type="hidden" />
       <label className="field">
         <span>当前密码</span>
@@ -319,9 +334,9 @@ function ChangePasswordPage({
           maxLength={256}
         />
       </label>
-      <ErrorBanner error={error || (required ? logoutError : '')} />
+      <ErrorBanner error={error || (initial ? logoutError : '')} />
       <button
-        className={required ? 'button primary auth-submit' : 'button primary'}
+        className={initial ? 'button primary auth-submit' : 'button primary'}
         type="submit"
         disabled={busy || loggingOut}
       >
@@ -336,7 +351,7 @@ function ChangePasswordPage({
       </button>
     </form>
   );
-  if (!required) {
+  if (!initial) {
     return (
       <>
         <PageHeader
@@ -362,9 +377,23 @@ function ChangePasswordPage({
   return (
     <AuthLayout>
       <h2>更新初始密码</h2>
-      <p>账号 {user.username} 需要设置新密码才能进入工作空间。</p>
+      <p>
+        {required
+          ? `账号 ${user.username} 需要设置新密码才能进入工作空间。`
+          : `建议为账号 ${user.username} 设置新密码。也可跳过，之后在账户设置中修改。`}
+      </p>
       {form}
       <div className="auth-actions">
+        {!required && (
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => void skip()}
+            disabled={busy || loggingOut}
+          >
+            跳过并进入工作台
+          </button>
+        )}
         <button
           type="button"
           className="text-button"
@@ -461,12 +490,16 @@ export function App() {
         setError('');
         setUser(null);
       }}
+      onSkipped={() => {
+        if (routePath === '/account/password') navigate('/');
+        setUser({ ...user, passwordChangeRecommended: false });
+      }}
       onLogout={() => void logout()}
       loggingOut={loggingOut}
       logoutError={error}
     />
   );
-  if (user.mustChangePassword) return changePassword;
+  if (user.mustChangePassword || user.passwordChangeRecommended) return changePassword;
   const operationsTab = operationsTabForPath(routePath);
   const navigationPath = operationsTab ? '/operations' : routePath;
   const current = navigation

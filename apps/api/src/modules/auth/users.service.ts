@@ -126,7 +126,12 @@ export class UsersService {
       const now = Date.now();
       const changed = await tx
         .updateTable('users')
-        .set({ password_hash: passwordHash, must_change_password: 1, updated_at: now })
+        .set({
+          password_hash: passwordHash,
+          must_change_password: 1,
+          password_change_recommended: 0,
+          updated_at: now,
+        })
         .where('id', '=', id)
         .returning(userColumns)
         .executeTakeFirst();
