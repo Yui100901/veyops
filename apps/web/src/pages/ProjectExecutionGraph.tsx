@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Play, Redo2, Save, Undo2, Upload } from 'lucide-react';
+import { ListPlus, Play, Redo2, Save, Undo2, Upload } from 'lucide-react';
 import {
   api,
   ApiError,
@@ -24,6 +24,7 @@ import {
   type GraphRunDrafts,
 } from './ExecutionGraphRun';
 import { ExecutionGraphStartList, ExecutionGraphStartStatus } from './ExecutionGraphStartStatus';
+import { ExecutionGraphTemplateDialog } from './ExecutionGraphTemplateDialog';
 import { ExecutionGraphTriggers } from './ExecutionGraphTriggers';
 import { GraphVersionTools } from './ExecutionGraphVersions';
 import { effectiveNodeType, graphNodeTypeLabel } from './execution-graph-definition';
@@ -34,9 +35,11 @@ import type {
   GraphDocument,
   GraphEdge,
   GraphFlow,
+  GraphFlowExpansion,
   GraphIssue,
   GraphNode,
 } from './execution-graph-definition';
+import { appendFlowTemplate } from './graph-presets';
 import {
   graphResourcePanel,
   graphReturnDelivery,
@@ -186,7 +189,8 @@ function Workspace({
     (scope.serviceId && !service) || (scope.environmentId && !environment),
   );
   const [graph, setGraph] = useState(initial);
-  const [canvas, setCanvas] = useState(initial.draft.canvas ?? emptyCanvas);
+  const [canvas, setCanvasState] = useState(initial.draft.canvas ?? emptyCanvas);
+  const latestCanvas = useRef(canvas);
   const [undo, setUndo] = useState<GraphCanvas[]>([]);
   const [redo, setRedo] = useState<GraphCanvas[]>([]);
   const [error, setError] = useState('');
@@ -195,6 +199,8 @@ function Workspace({
   const [conflict, setConflict] = useState(false);
   const [busy, setBusy] = useState(false);
   const [leaving, setLeaving] = useState<RouteTransition | null>(null);
+  const [templateOpen, setTemplateOpen] = useState(false);
+  const [insertedStart, setInsertedStart] = useState<string>();
   const saving = useRef(false);
   const dirty = canvas !== (graph.draft.canvas ?? emptyCanvas);
   useRouteBlocker(canEdit && dirty, setLeaving);
@@ -208,6 +214,11 @@ function Workspace({
       : null,
   );
   const publishedRun = runVersion === graph.publishedVersion ? latest : previous;
+
+  function setCanvas(next: GraphCanvas) {
+    latestCanvas.current = next;
+    setCanvasState(next);
+  }
 
   function panePath(next: GraphPane) {
     if (next === 'run' && returnStart) {
@@ -320,12 +331,19 @@ function Workspace({
   }
 
   function edit(next: GraphCanvas) {
-    if (next === canvas || saving.current) return;
-    setUndo((history) => [...history.slice(-49), canvas]);
+    const previous = latestCanvas.current;
+    if (next === previous || saving.current) return;
+    setUndo((history) => [...history.slice(-49), previous]);
     setRedo([]);
     setCanvas(next);
     setIssues([]);
     setNotice('');
+  }
+
+  function insertTemplate(expansion: GraphFlowExpansion) {
+    if (!canEdit || saving.current) throw new Error('此草稿暂时无法编辑，请稍后重试。');
+    edit(appendFlowTemplate(latestCanvas.current, expansion));
+    setInsertedStart(expansion.startId);
   }
 
   function stepDraft(direction: 'undo' | 'redo') {
@@ -503,6 +521,14 @@ function Workspace({
               <div className="heading-actions">
                 <button
                   type="button"
+                  className="button secondary"
+                  disabled={busy}
+                  onClick={() => setTemplateOpen(true)}
+                >
+                  <ListPlus size={16} /> 插入流程模板
+                </button>
+                <button
+                  type="button"
                   className="button secondary compact"
                   disabled={!undo.length || busy}
                   onClick={() => stepDraft('undo')}
@@ -545,6 +571,13 @@ function Workspace({
             )
           }
         >
+          {canEdit && templateOpen && (
+            <ExecutionGraphTemplateDialog
+              path={path}
+              insert={insertTemplate}
+              close={() => setTemplateOpen(false)}
+            />
+          )}
           {returnStart && (
             <div className="graph-fields graph-setup-return">
               <div className="heading-actions">
@@ -565,6 +598,7 @@ function Workspace({
             initialNodeId={linkedNode}
             initialFlowId={linkedFlow}
             initialFieldId={linkedField}
+            insertedStartId={insertedStart}
             renderResources={(node, pair) => (
               <ExecutionGraphResourceLinks
                 node={node}

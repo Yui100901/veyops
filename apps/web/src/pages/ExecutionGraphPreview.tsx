@@ -1,6 +1,7 @@
 import type { ProjectDetail } from '../models';
 import { graphNodeLabels } from './execution-graph-definition';
 import type {
+  GraphEdge,
   GraphEnvironmentSetSummary,
   GraphFieldEvidence,
   GraphFieldSource,
@@ -152,11 +153,13 @@ export interface Preview extends DeliveryPreview {
   environmentSet?: GraphEnvironmentSetSummary | null;
   parameters?: Record<string, unknown>;
   parameterSources?: Record<string, GraphFieldSource>;
+  routing?: (GraphEdge & { status: 'CERTAIN' | 'POSSIBLE' | 'EXCLUDED' | 'OUTSIDE_FLOW' })[];
   nodes: {
     nodeId: string;
     name: string;
     type: GraphNode['type'];
     selected?: boolean;
+    conditional?: boolean;
     inputs?: GraphFieldEvidence[];
     outputFields?: GraphFieldEvidence[];
     environment?: GraphFieldEvidence[];

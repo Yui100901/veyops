@@ -35,7 +35,7 @@ import {
   graphNodeTypeLabel,
   orderedNodes,
 } from './execution-graph-definition';
-import type { GraphEdge, GraphFlow } from './execution-graph-definition';
+import type { GraphCanvas, GraphEdge, GraphFlow, GraphNode } from './execution-graph-definition';
 
 const icons = {
   START: CirclePlay,
@@ -109,6 +109,40 @@ function layout(flow: GraphFlow, manual?: { id: string; point: Point }) {
   };
 }
 
+export function placeFlowTemplate(canvas: GraphCanvas, fragment: GraphCanvas): GraphNode[] {
+  const nodes = [...canvas.nodes, ...fragment.nodes];
+  const edges = [...canvas.edges, ...fragment.edges];
+  const { points } = layout({ id: '', name: '', nodes, edges });
+  const occupied = canvas.nodes.map(({ id }) => points.get(id)!);
+  const base = fragment.nodes.map(({ id }) => points.get(id)!);
+  const left = Math.min(...base.map(({ x }) => x));
+  const top = Math.min(...base.map(({ y }) => y));
+  const right = Math.max(...base.map(({ x }) => x)) + cardWidth;
+  const bottom = Math.max(...base.map(({ y }) => y)) + cardHeight;
+  const width = right - left;
+  const height = bottom - top;
+  for (let x = margin; x + width <= 30000; x += cardWidth + columnGap) {
+    for (let y = margin; y + height <= 30000; y += cardHeight + rowGap) {
+      // Keep each inserted chain together, with room to connect or drag its nodes.
+      if (
+        occupied.some(
+          (p) =>
+            p.x < x + width + rowGap / 2 &&
+            p.x + cardWidth + rowGap / 2 > x &&
+            p.y < y + height + rowGap / 2 &&
+            p.y + cardHeight + rowGap / 2 > y,
+        )
+      )
+        continue;
+      return fragment.nodes.map((node, i) => ({
+        ...node,
+        position: { x: Math.round(x + base[i]!.x - left), y: Math.round(y + base[i]!.y - top) },
+      }));
+    }
+  }
+  throw new Error('画布空间不足，无法放置整条执行流。');
+}
+
 interface Point {
   x: number;
   y: number;
@@ -180,6 +214,16 @@ export function NodeMap({
   const scroll = useRef<HTMLDivElement>(null);
   const moving = useRef<{ id: string; pointer: Point; position: Point } | null>(null);
   const { points, width: layoutWidth, height: layoutHeight } = layout(flow, manual);
+  const repeated = new Map<string, number[]>();
+  flow.edges.forEach(({ from, to }, index) => {
+    const key = JSON.stringify([from, to]);
+    const indices = repeated.get(key) ?? [];
+    indices.push(index);
+    repeated.set(key, indices);
+  });
+  const offsets = new Map<number, number>();
+  for (const indices of repeated.values())
+    indices.forEach((index, slot) => offsets.set(index, (slot - (indices.length - 1) / 2) * 24));
   const width = onDropNode ? Math.max(layoutWidth + 170, 640) : layoutWidth;
   const height = onDropNode ? Math.max(layoutHeight + 100, 360) : layoutHeight;
   const target = reveal && 'nodeId' in reveal ? points.get(reveal.nodeId) : undefined;
@@ -411,7 +455,12 @@ export function NodeMap({
                 const endY = to.y + cardHeight / 2;
                 const midpoint = (start + end) / 2;
                 const control = Math.max(25, (end - start) / 2);
-                const path = `M ${start} ${y} C ${start + control} ${y}, ${end - control} ${endY}, ${end} ${endY}`;
+                const offset = offsets.get(i) ?? 0;
+                const label = branchLabel(
+                  edge.when,
+                  flow.nodes.find(({ id }) => id === edge.from),
+                );
+                const path = `M ${start} ${y} C ${start + control} ${y + offset}, ${end - control} ${endY + offset}, ${end} ${endY}`;
                 return (
                   <g
                     key={JSON.stringify([edge.from, edge.to, edge.when])}
@@ -430,7 +479,7 @@ export function NodeMap({
                         d={path}
                         role="button"
                         tabIndex={0}
-                        aria-label={`连线 ${flow.nodes.find((n) => n.id === edge.from)?.name} → ${flow.nodes.find((n) => n.id === edge.to)?.name}`}
+                        aria-label={`连线 ${flow.nodes.find((n) => n.id === edge.from)?.name} → ${flow.nodes.find((n) => n.id === edge.to)?.name}${label ? ` · ${label}` : ''}`}
                         aria-pressed={selectedEdge === i}
                         aria-haspopup={onEdgeDelete ? 'menu' : undefined}
                         onContextMenu={
@@ -448,11 +497,8 @@ export function NodeMap({
                       />
                     )}
                     {edge.when && (
-                      <text x={midpoint} y={(y + endY) / 2 - 7} textAnchor="middle">
-                        {branchLabel(
-                          edge.when,
-                          flow.nodes.find(({ id }) => id === edge.from),
-                        )?.slice(0, 30)}
+                      <text x={midpoint} y={(y + endY) / 2 - 7 + 0.75 * offset} textAnchor="middle">
+                        {label?.slice(0, 30)}
                       </text>
                     )}
                   </g>
@@ -476,7 +522,10 @@ export function NodeMap({
                       title="删除连线"
                       style={{
                         left: (from.x + cardWidth + to.x) / 2,
-                        top: (from.y + to.y + cardHeight) / 2 + 9,
+                        top:
+                          (from.y + to.y + cardHeight) / 2 +
+                          9 +
+                          0.75 * (offsets.get(selectedEdge) ?? 0),
                       }}
                       onClick={() => onEdgeDelete(selectedEdge)}
                       onContextMenu={(event) =>

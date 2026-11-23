@@ -438,3 +438,32 @@ button.graph-node:focus-visible {
   white-space: normal;
   overflow-wrap: anywhere;
 }
+.graph-template-options {
+  display: grid;
+  gap: 0.6rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.graph-template-options > legend {
+  margin-block-end: 0.45rem;
+  font-weight: 600;
+}
+.graph-template-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  cursor: pointer;
+}
+.graph-template-choice > span {
+  display: grid;
+  gap: 0.25rem;
+  min-width: 0;
+}
+.graph-template-choice > span > small {
+  color: var(--muted);
+}
+.graph-template-choice:has(input:checked) {
+  border-color: var(--accent);
+}

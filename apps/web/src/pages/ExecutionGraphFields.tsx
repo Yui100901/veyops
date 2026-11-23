@@ -924,6 +924,7 @@ export function GraphBindingField({
   fallback,
   scope,
   environment,
+  allowEnvironmentKey,
   canManageProjectResources,
   allowRepositoryDefault,
   directSource,
@@ -939,6 +940,7 @@ export function GraphBindingField({
   fallback?: string;
   scope?: FieldScope;
   environment?: boolean;
+  allowEnvironmentKey?: boolean;
   canManageProjectResources?: boolean;
   allowRepositoryDefault?: boolean;
   directSource?: boolean;
@@ -998,7 +1000,7 @@ export function GraphBindingField({
         >
           <option value="">
             {referenceLookup
-              ? '同名上游，缺值时用默认值'
+              ? '使用默认值或选择明确来源'
               : nodeDefaults
                 ? '当前执行流不覆盖'
                 : fallback
@@ -1018,7 +1020,9 @@ export function GraphBindingField({
           {(value?.kind === 'VALUE' || acceptsFixedGraphValue(field)) && (
             <option value="VALUE">当前执行流固定值</option>
           )}
-          {environment && <option value="ENVIRONMENT_KEY">入口变量集合中的键</option>}
+          {(environment || allowEnvironmentKey) && (
+            <option value="ENVIRONMENT_KEY">入口变量集合中的键</option>
+          )}
           {environment && <option value="CREDENTIAL">凭据引用</option>}
           {!directSource && (choices.length > 1 || value?.kind === 'FIRST_AVAILABLE') && (
             <option value="FIRST_AVAILABLE">按分支取第一个可用来源</option>

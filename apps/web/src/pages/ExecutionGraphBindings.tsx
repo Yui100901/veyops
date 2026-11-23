@@ -20,13 +20,13 @@ import {
 import type { BindingChoice } from './ExecutionGraphFields';
 import {
   effectiveNodeType,
+  graphDynamicOutlets,
   graphKey,
   graphNodeFamily,
   graphProjectionLabels,
 } from './execution-graph-definition';
 import type {
   GraphBinding,
-  GraphArtifactType,
   GraphCanvas,
   GraphCandidate,
   GraphCatalog,
@@ -77,6 +77,10 @@ function operationFields(
     );
   }
   const standard = catalog?.modules[operation]?.[kind] ?? [];
+  if (operation === 'CONDITION' && node.branch)
+    return kind === 'inputs'
+      ? standard.map((field) => (field.id === 'value' ? { ...field, required: true } : field))
+      : [...standard, { id: 'branchId', name: '分支标识', type: 'TEXT', required: true }];
   if (kind === 'inputs' && ['DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT'].includes(operation))
     return standard.map((field) =>
       field.id === 'artifact'
@@ -102,13 +106,33 @@ function operationFields(
         required: true,
       })),
     ];
-  if (operation === 'SHELL' || operation === 'CHECK')
-    return [...standard, ...(kind === 'inputs' ? (node.shell?.params ?? []) : [])];
-  if (kind === 'outputs' && (operation === 'BUILD' || operation === 'REGISTER_ARTIFACT')) {
+  const script = operation === 'SHELL' || operation === 'CHECK';
+  if (script && kind === 'inputs') return [...standard, ...(node.shell?.params ?? [])];
+  if (
+    kind === 'outputs' &&
+    (script || operation === 'BUILD' || operation === 'REGISTER_ARTIFACT')
+  ) {
     const artifacts =
-      operation === 'BUILD' ? node.build?.artifacts : node.registerArtifacts?.artifacts;
+      operation === 'BUILD'
+        ? node.build?.artifacts
+        : script
+          ? node.shell?.artifacts
+          : node.registerArtifacts?.artifacts;
     return [
-      ...standard,
+      ...(operation === 'BUILD' && artifacts?.length
+        ? standard.filter(({ id }) => id !== 'artifact')
+        : standard),
+      ...(script && artifacts?.length
+        ? [
+            {
+              id: 'artifacts',
+              name: '产物列表',
+              type: 'ARTIFACT' as const,
+              multiple: true,
+              required: artifacts.some(({ required }) => required !== false),
+            },
+          ]
+        : []),
       ...(artifacts ?? [])
         .filter(({ id, name }) => (id ?? name) && (id ?? name) !== 'artifacts')
         .map(({ id, name, referenceName, type, required }): GraphField => ({
@@ -995,6 +1019,12 @@ export function ExecutionGraphBindings({
                   directSource={Boolean(review)}
                   nodeDefaults={fixed}
                   referenceLookup={declared || undefined}
+                  allowEnvironmentKey={Boolean(
+                    node.branch &&
+                    field.id === 'value' &&
+                    start?.environmentSet &&
+                    start.environmentSet.mode !== 'NONE',
+                  )}
                   scope={repositoryScope}
                   canManageProjectResources={canEdit}
                   allowRepositoryDefault={
@@ -1090,7 +1120,9 @@ function GraphNodeEnvironment({
         const projections: (keyof typeof graphProjectionLabels)[] =
           field.type === 'WORKSPACE' && type && ['CHECKOUT', 'SHELL', 'CHECK'].includes(type)
             ? ['WORKSPACE_PATH']
-            : field.type === 'ARTIFACT' && type && ['BUILD', 'REGISTER_ARTIFACT'].includes(type)
+            : field.type === 'ARTIFACT' &&
+                type &&
+                ['BUILD', 'REGISTER_ARTIFACT', 'SHELL', 'CHECK'].includes(type)
               ? [
                   ...(field.artifactType !== 'DOCKER_IMAGE' ? (['ARTIFACT_PATH'] as const) : []),
                   ...(field.artifactType !== 'FILE' && field.artifactType !== 'DIRECTORY'
@@ -1271,111 +1303,54 @@ function AddGraphEnvironmentKey({
 
 export function GraphFlowBranches({
   node,
-  outgoing,
   canvas,
   endpoint,
   update,
   canEdit,
 }: {
   node: GraphNode;
-  outgoing: string[];
   canvas: GraphCanvas;
   endpoint: GraphEndpoint;
   update: (endpoint: GraphEndpoint) => void;
   canEdit: boolean;
 }) {
-  if (outgoing.length < 2 || ['CONDITION', 'SWITCH', 'PARALLEL'].includes(effectiveNodeType(node)))
-    return null;
+  const edges = canvas.edges.filter(({ from }) => from === node.id);
+  if (edges.length < 2 || graphDynamicOutlets(node, edges)) return null;
+  const outgoing = edges.map(({ to }) => to);
   const current = endpoint.edgeSelections?.[node.id] ?? [];
+  function setSelection(selected: string[]) {
+    const selections = { ...endpoint.edgeSelections };
+    if (selected.length) selections[node.id] = selected;
+    else delete selections[node.id];
+    update({ ...endpoint, edgeSelections: selections });
+  }
   return (
-    <Field label="此流的下一节点" hint="有多条线路通往同一个结束节点时，须明确选择。">
-      <select
-        disabled={!canEdit}
-        value={current[0] ?? ''}
-        onChange={(event) => {
-          const selections = { ...endpoint.edgeSelections };
-          if (event.target.value) selections[node.id] = [event.target.value];
-          else delete selections[node.id];
-          update({ ...endpoint, edgeSelections: selections });
-        }}
-      >
-        <option value="">未选择分支</option>
-        {outgoing.map((id) => (
-          <option value={id} key={id}>
+    <fieldset className="graph-fields" disabled={!canEdit}>
+      <legend>此流的普通出线</legend>
+      <label className="check-inline">
+        <input
+          type="checkbox"
+          checked={!current.length}
+          onChange={(event) => setSelection(event.target.checked ? [] : outgoing)}
+        />
+        自动纳入通往当前结束的出线
+      </label>
+      {current.length > 0 &&
+        outgoing.map((id) => (
+          <label className="check-inline" key={id}>
+            <input
+              type="checkbox"
+              checked={current.includes(id)}
+              disabled={current.length === 1 && current.includes(id)}
+              onChange={(event) =>
+                setSelection(
+                  event.target.checked ? [...current, id] : current.filter((to) => to !== id),
+                )
+              }
+            />
             {canvas.nodes.find((item) => item.id === id)?.name ?? id}
-          </option>
+          </label>
         ))}
-      </select>
-    </Field>
-  );
-}
-
-export function GraphTemplatePicker({
-  templates,
-  add,
-}: {
-  templates: { name: string; nodes: GraphNode['type'][] }[];
-  add: (
-    types: GraphNode['type'][],
-    artifactType: GraphArtifactType,
-    latestCompatible: boolean,
-  ) => void;
-}) {
-  const [selected, select] = useState('');
-  const [artifactType, selectArtifactType] = useState<GraphArtifactType>('DIRECTORY');
-  const [latestCompatible, selectLatestCompatible] = useState(false);
-  const template = templates.find(({ name }) => name === selected);
-  const selectsArtifact = template?.nodes.some((type) =>
-    ['BUILD', 'DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT'].includes(type),
-  );
-  const selectsLatest =
-    template?.nodes.includes('DEPLOY_ARTIFACT') && !template.nodes.includes('BUILD');
-  return (
-    <div className="graph-field-pair">
-      <select
-        aria-label="选择快捷模板"
-        value={selected}
-        onChange={(event) => select(event.target.value)}
-      >
-        <option value="">选择快捷模板</option>
-        {templates.map(({ name }) => (
-          <option value={name} key={name}>
-            {name}
-          </option>
-        ))}
-      </select>
-      {selectsArtifact && (
-        <select
-          aria-label="模板产物类型"
-          value={artifactType}
-          onChange={(event) => selectArtifactType(event.target.value as GraphArtifactType)}
-        >
-          <option value="FILE">文件</option>
-          <option value="DIRECTORY">目录</option>
-          <option value="DOCKER_IMAGE">Docker 镜像</option>
-        </select>
-      )}
-      {selectsLatest && (
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            checked={latestCompatible}
-            onChange={(event) => selectLatestCompatible(event.target.checked)}
-          />
-          自动选择最新兼容产物
-        </label>
-      )}
-      <button
-        type="button"
-        className="button secondary small"
-        disabled={!selected}
-        onClick={() => {
-          if (template)
-            add(template.nodes, artifactType, Boolean(selectsLatest && latestCompatible));
-        }}
-      >
-        插入模板
-      </button>
-    </div>
+    </fieldset>
   );
 }

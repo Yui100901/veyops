@@ -39,6 +39,7 @@ import {
   type ReviewScope,
 } from './ExecutionGraphReleaseResults';
 import {
+  branchLabel,
   graphKey,
   graphNodeLabels,
   graphNodeTypeLabel,
@@ -560,9 +561,34 @@ export function ExecutionGraphStart({
                     <small> · {graphNodeLabels[node.type]}</small>
                   )}
                 {node.selected === false && <small> · 跳过</small>}
+                {node.conditional && <small> · 视分支结果执行</small>}
               </li>
             ))}
           </ul>
+          {Boolean(preview.routing?.length) && (
+            <details className="graph-field-card">
+              <summary>执行路线</summary>
+              <ul className="graph-edge-list">
+                {preview.routing?.map(({ from, to, when, status }) => {
+                  const source = flow.nodes.find(({ id }) => id === from);
+                  const target = flow.nodes.find(({ id }) => id === to);
+                  const labels = {
+                    CERTAIN: '纳入',
+                    POSSIBLE: '待分支决定',
+                    EXCLUDED: '本次跳过',
+                    OUTSIDE_FLOW: '流外',
+                  };
+                  return (
+                    <li key={JSON.stringify([from, to, when])}>
+                      {source?.name ?? from} → {target?.name ?? to}
+                      {when && <small> · {branchLabel(when, source)}</small>}
+                      <small> · {labels[status]}</small>
+                    </li>
+                  );
+                })}
+              </ul>
+            </details>
+          )}
           <Results
             values={Object.fromEntries(
               fields

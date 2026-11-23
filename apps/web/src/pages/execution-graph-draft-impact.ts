@@ -1,4 +1,4 @@
-import { effectiveNodeType } from './execution-graph-definition';
+import { effectiveNodeType, graphDynamicOutlets } from './execution-graph-definition';
 import type {
   GraphBinding,
   GraphCanvas,
@@ -38,37 +38,38 @@ export function reachable(
   return visited;
 }
 
-function selectedEdge(pair: GraphEndpoint, edge: GraphEdge) {
-  const selection = pair.edgeSelections?.[edge.from];
-  return !selection?.length || selection.includes(edge.to);
+function flowScope(canvas: GraphCanvas, pair: GraphEndpoint) {
+  const allowed = canvas.edges.filter(({ from, to }) => {
+    const selection = pair.edgeSelections?.[from];
+    return !selection?.length || selection.includes(to);
+  });
+  const ancestors = reachable({ ...canvas, edges: allowed }, pair.endId, true);
+  const forward = reachable({ ...canvas, edges: allowed }, pair.startId);
+  const included = new Set(
+    allowed.filter(({ from, to }) => forward.has(from) && ancestors.has(to)),
+  );
+  return { allowed, ancestors, included, forward };
 }
 
 export function pathHighlight(canvas: GraphCanvas, startId?: string) {
   const pair = canvas.endpoints.find((value) => value.startId === startId);
   if (!pair) return undefined;
-  const pathCanvas = { ...canvas, edges: canvas.edges.filter((edge) => selectedEdge(pair, edge)) };
-  const forward = reachable(pathCanvas, pair.startId);
+  const { forward, ancestors, included } = flowScope(canvas, pair);
   if (!forward.has(pair.endId)) return undefined;
-  const ancestors = reachable(pathCanvas, pair.endId, true);
-  const nodes = new Set([...forward].filter((id) => ancestors.has(id)));
-  const edges = new Set<number>();
-  canvas.edges.forEach((edge, index) => {
-    if (
-      nodes.has(edge.from) &&
-      nodes.has(edge.to) &&
-      edge.from !== pair.endId &&
-      edge.to !== pair.startId &&
-      selectedEdge(pair, edge)
-    )
-      edges.add(index);
-  });
-  return { nodes, edges };
+  return {
+    nodes: new Set([...forward].filter((id) => ancestors.has(id))),
+    edges: new Set(canvas.edges.flatMap((edge, index) => (included.has(edge) ? [index] : []))),
+  };
 }
 
 function flowRoute(canvas: GraphCanvas, pair: GraphEndpoint) {
-  const allowed = canvas.edges.filter((edge) => selectedEdge(pair, edge));
-  const ancestors = reachable({ ...canvas, edges: allowed }, pair.endId, true);
-  const types = new Map(canvas.nodes.map((node) => [node.id, effectiveNodeType(node)]));
+  const { allowed, included } = flowScope(canvas, pair);
+  const outsideOwners = new Set(
+    canvas.endpoints.flatMap((other) =>
+      other === pair ? [] : [...flowScope(canvas, other).included],
+    ),
+  );
+  const byId = new Map(canvas.nodes.map((node) => [node.id, node]));
   const outgoing = new Map<string, GraphEdge[]>();
   for (const edge of allowed) {
     const choices = outgoing.get(edge.from);
@@ -79,13 +80,13 @@ function flowRoute(canvas: GraphCanvas, pair: GraphEndpoint) {
   const edges: GraphEdge[] = [];
   const pending = new Set([pair.startId]);
   for (const from of pending) {
-    const type = types.get(from);
-    if (!type || from === pair.endId || type === 'END') continue;
+    const node = byId.get(from);
+    if (!node || from === pair.endId || node.type === 'END') continue;
     const choices = outgoing.get(from) ?? [];
-    const toEnd = choices.filter(({ to }) => ancestors.has(to));
-    // Dynamic branches must reach the paired end even when one branch is unfinished.
-    const dynamic = type === 'CONDITION' || type === 'SWITCH' || type === 'PARALLEL';
-    const active = dynamic || !toEnd.length ? choices : toEnd;
+    const dynamic = graphDynamicOutlets(node, choices);
+    const active = choices.filter(
+      (edge) => dynamic || included.has(edge) || !outsideOwners.has(edge),
+    );
     for (const edge of active) {
       edges.push(edge);
       nodes.add(edge.to);
@@ -180,6 +181,7 @@ function nodeContract(node: GraphNode) {
     node.approval?.buildNodeId,
     node.approval?.releaseNodeId,
     node.switch?.cases,
+    node.branch?.cases.map(({ id, value }) => [id, value]).sort(),
     node.flowId,
   ]);
 }

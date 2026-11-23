@@ -2,36 +2,48 @@ export const graphNodeLabels = {
   START: '开始',
   LOG: '记录日志',
   CHECKOUT: '代码拉取',
-  LOAD_ENV: '加载环境',
+  LOAD_ENV: '加载变量文件',
   SHELL: 'Shell 脚本',
-  CHECK: '代码检查',
-  BUILD: '构建并归档',
+  CHECK: '检查与测试',
+  BUILD: '构建',
   REGISTER_ARTIFACT: '登记产物',
   SOURCE_REVIEW: '源码审核',
-  DEPLOY_ARTIFACT: '部署产物',
+  DEPLOY_ARTIFACT: '部署',
   HEALTH_CHECK: '发布健康检查',
   ROLLBACK_ARTIFACT: '按产物回滚',
-  CONDITION: '条件判断',
+  CONDITION: '条件分支',
   SWITCH: '多路判断',
-  DELAY: '等待',
+  DELAY: '固定延时',
   APPROVAL: '人工审批',
   PARALLEL: '并行分支',
   JOIN: '汇合',
   FLOW_CALL: '调用执行流',
   END: '结束',
-  FUNCTION: '功能节点',
+  FUNCTION: '自定义节点',
 };
 export type GraphOperation = Exclude<
   keyof typeof graphNodeLabels,
   'FUNCTION' | 'START' | 'END' | 'CONDITION' | 'SWITCH'
 >;
 export const graphOperations = Object.keys(graphNodeLabels).filter(
-  (type) => !['FUNCTION', 'START', 'END', 'CONDITION', 'SWITCH', 'LOG'].includes(type),
+  (type) =>
+    ![
+      'FUNCTION',
+      'START',
+      'END',
+      'CONDITION',
+      'SWITCH',
+      'LOG',
+      'REGISTER_ARTIFACT',
+      'PARALLEL',
+      'JOIN',
+      'FLOW_CALL',
+    ].includes(type),
 ) as GraphOperation[];
 export interface GraphEdge {
   from: string;
   to: string;
-  when?: 'TRUE' | 'FALSE' | 'DEFAULT' | 'SUCCESS' | 'PARTIAL_SUCCESS' | `CASE:${number}`;
+  when?: 'TRUE' | 'FALSE' | 'DEFAULT' | 'SUCCESS' | 'PARTIAL_SUCCESS' | `CASE:${string}`;
 }
 export type GraphFieldType =
   | 'TEXT'
@@ -144,6 +156,17 @@ export interface GraphCatalog {
   contextFields?: GraphField[];
   modules: Partial<Record<GraphNode['type'], GraphModule>>;
   flows?: Record<string, { nodes: Record<string, GraphNodeDirectory> }>;
+  flowTemplates?: GraphFlowTemplate[];
+}
+export interface GraphFlowTemplate {
+  id: string;
+  name: string;
+  steps: string[];
+  artifactTypes: GraphArtifactType[];
+}
+export interface GraphFlowExpansion {
+  startId: string;
+  canvas: GraphCanvas;
 }
 export interface GraphIssue {
   flowId?: string;
@@ -163,6 +186,7 @@ export interface GraphArtifactOutput {
   referenceName?: string;
   type: GraphArtifactType;
   path?: string;
+  pathInput?: string;
   imageReference?: string;
   composeFilePath?: string;
   required?: boolean;
@@ -204,6 +228,7 @@ interface GraphShell {
   directory?: string;
   continueOnFailure?: boolean;
   params?: GraphField[];
+  artifacts?: GraphArtifactOutput[];
 }
 export type GraphEnvironmentSet =
   | { mode: 'NONE' }
@@ -245,10 +270,11 @@ export interface GraphNode {
   moduleId?: string;
   moduleVersion?: number;
   condition?: { key: 'input' | 'commitSha'; value: string };
+  branch?: { cases: { id: string; value: string; label?: string }[] };
   switch?: { key: 'input' | 'commitSha'; cases: string[] };
   delaySeconds?: number;
   approval?: { timeoutSeconds?: number; releaseNodeId?: string; buildNodeId?: string };
-  healthCheck?: { command: string; timeoutSeconds?: number };
+  healthCheck?: { command?: string; timeoutSeconds?: number; requireHealthy?: boolean };
   flowId?: string;
   position?: { x: number; y: number };
 }
@@ -351,6 +377,14 @@ export function isReleaseNode(node: { type: string; operation?: GraphOperation }
   return type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT';
 }
 
+export function graphDynamicOutlets(node: GraphNode, edges: readonly GraphEdge[]) {
+  return (
+    ['CONDITION', 'SWITCH', 'PARALLEL'].includes(effectiveNodeType(node)) ||
+    (isReleaseNode(node) &&
+      edges.some(({ when }) => when === 'SUCCESS' || when === 'PARTIAL_SUCCESS'))
+  );
+}
+
 export function branchOptions(
   node?: GraphNode,
 ): { value: NonNullable<GraphEdge['when']>; label: string }[] {
@@ -358,6 +392,14 @@ export function branchOptions(
     return [
       { value: 'SUCCESS', label: '全部发布成功' },
       { value: 'PARTIAL_SUCCESS', label: '部分发布成功' },
+    ];
+  if (node?.type === 'CONDITION' && node.branch)
+    return [
+      ...node.branch.cases.map(({ id, label, value }, index) => ({
+        value: `CASE:${id}` as const,
+        label: label || value || `规则 ${index + 1}`,
+      })),
+      { value: 'DEFAULT', label: '默认' },
     ];
   if (node?.type === 'CONDITION')
     return [

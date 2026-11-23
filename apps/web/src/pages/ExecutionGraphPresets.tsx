@@ -162,6 +162,7 @@ export function BuildFields({
       />
       <Text
         label="构建命令"
+        fieldId="buildCommand"
         multiline
         value={value.buildCommand}
         canEdit={canEdit}
@@ -170,6 +171,7 @@ export function BuildFields({
       {buildsImage && (
         <Text
           label="Dockerfile 路径"
+          fieldId="dockerfilePath"
           placeholder="Dockerfile"
           value={value.dockerfilePath}
           canEdit={canEdit}
@@ -317,11 +319,13 @@ export function ArtifactOutputEditor({
   value,
   canEdit,
   build = false,
+  pathInputs = [],
   onChange,
 }: {
   value: GraphArtifactOutput[];
   canEdit: boolean;
   build?: boolean;
+  pathInputs?: { id: string; name: string }[];
   onChange: (artifacts: GraphArtifactOutput[]) => void;
 }) {
   function patch(index: number, fields: Partial<GraphArtifactOutput>) {
@@ -331,7 +335,11 @@ export function ArtifactOutputEditor({
     <fieldset className="graph-fields">
       <legend>具名产物</legend>
       {value.map((output, index) => (
-        <details className="graph-field-card" key={output.id ?? output.name}>
+        <details
+          className="graph-field-card"
+          key={output.id ?? output.name}
+          data-graph-field={output.id ?? output.name}
+        >
           <summary>{output.name || '未命名产物'}</summary>
           <div className="graph-fields">
             <Field label="产物名称">
@@ -366,6 +374,7 @@ export function ArtifactOutputEditor({
                     patch(index, {
                       type,
                       path: next.path,
+                      pathInput: undefined,
                       imageReference: undefined,
                       name: output.name === previous.name ? next.name : output.name,
                       referenceName:
@@ -374,7 +383,12 @@ export function ArtifactOutputEditor({
                           : output.referenceName,
                     });
                   } else {
-                    patch(index, { type, path: undefined, imageReference: undefined });
+                    patch(index, {
+                      type,
+                      path: undefined,
+                      pathInput: undefined,
+                      imageReference: undefined,
+                    });
                   }
                 }}
               >
@@ -390,6 +404,7 @@ export function ArtifactOutputEditor({
                 {build && (
                   <Text
                     label="Dockerfile 路径"
+                    fieldId={output.id ?? output.name}
                     placeholder="Dockerfile"
                     value={output.path}
                     canEdit={canEdit}
@@ -398,6 +413,7 @@ export function ArtifactOutputEditor({
                 )}
                 <Text
                   label={build ? '构建镜像名称（可选）' : '镜像引用'}
+                  fieldId={build ? undefined : (output.id ?? output.name)}
                   value={output.imageReference}
                   canEdit={canEdit}
                   onChange={(imageReference) => patch(index, { imageReference })}
@@ -410,12 +426,40 @@ export function ArtifactOutputEditor({
                 />
               </>
             ) : (
-              <Text
-                label="工作区相对路径"
-                value={output.path}
-                canEdit={canEdit}
-                onChange={(path) => patch(index, { path })}
-              />
+              <>
+                {(pathInputs.length > 0 || output.pathInput) && (
+                  <Field label="路径来源">
+                    <select
+                      value={output.pathInput ?? ''}
+                      disabled={!canEdit}
+                      onChange={(event) =>
+                        patch(index, { pathInput: event.target.value || undefined })
+                      }
+                    >
+                      <option value="">填写相对路径</option>
+                      {output.pathInput &&
+                        !pathInputs.some(({ id }) => id === output.pathInput) && (
+                          <option value={output.pathInput} disabled>
+                            已失效的路径输入
+                          </option>
+                        )}
+                      {pathInputs.map(({ id, name }) => (
+                        <option key={id} value={id}>
+                          {name}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                )}
+                <Text
+                  label={output.pathInput ? '备用相对路径' : '工作区相对路径'}
+                  fieldId={output.id ?? output.name}
+                  placeholder={output.type === 'DIRECTORY' ? 'dist/' : 'dist/app.tar.gz'}
+                  value={output.path}
+                  canEdit={canEdit}
+                  onChange={(path) => patch(index, { path })}
+                />
+              </>
             )}
             <label className="checkbox-row">
               <input
