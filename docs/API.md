@@ -175,6 +175,7 @@
 | `POST /flows/:flowId/preview` | 提交 `{version,inputs:{parameters}}`。返回 `configurationHash`、`planSections`、参数和来源、`environmentSet`、`checkouts`、`deliveries`、图内审核及保护节点 `gates` 与节点端口证据。 |
 | `POST /flows/:flowId/run` | 提交同样的版本和输入，附 `expectedConfigurationHash` 和 `idempotencyKey`。可原样传回 `planSections` 为 `expectedPlanSections`。配置变更返回 409，`error.changes` 给出失效字段或计划段落，重新预览后方可确认。相同确认可取回原运行。 |
 | `GET /runs`、`GET /runs/:runId` | 查询运行、任务和结束节点的 `outputs`。节点详情含 `inputs`、`environment`、`output`、逐目标状态和可定位的 `issue`。 |
+| `GET /runs/:runId/nodes/:nodeId/logs?offset=0` | 从字节偏移读取该节点日志，返回来源、摘要、状态、时间和下一偏移。 |
 | `POST /runs/:runId/cancel` | 取消运行及尚未完成的节点和子流。 |
 | `POST /runs/:runId/nodes/:nodeId/decision` | 管理员提交 `{decision:"APPROVE"\|"REJECT",expectedScopeHash?}`。源码审核与绑定发布的审批必须传回等待节点 `output.scopeHash`。响应保留实际范围、决定、操作者及时间。 |
 | `POST /runs/:runId/nodes/:nodeId/targets/:serverId/inspect-release` | 管理员或原发起操作员核查已结束的失败或待核查目标。返回 `CURRENT`、`PREVIOUS`、`NO_ACTIVE_RELEASE` 或 `UNKNOWN`，附时间及可确认的发布和锁信息。仅执行远端读取并写审计；运行详情的逐目标 `inspection` 返回最近一次核查。 |
@@ -195,16 +196,19 @@
 
 Shell 和检查脚本每执行单元可返回一条 `VEYOPS_OUTPUT=` JSON 对象，通过声明的输出名转成稳定字段 ID。未知键、重复键、类型错误、超限或敏感输出会阻止节点成功。原始结果行独立解析，节点日志保存普通输出。
 
-普通路径的 `edgeSelections` 按源节点 ID 写入允许的下游节点 ID。`FLOW_CALL` 的端口取子流的开始和结束字段 ID。含外部执行资源或变量集合的子流需要在父流预览时解析其参数。运行证据中的字段状态可区分已解析、默认值、等待上游、省略或错误。来源通过稳定节点与字段 ID 回查。
+普通路径的 `edgeSelections` 按源节点 ID 写入允许的下游节点 ID。相同引用名只用于提示候选，确认后以节点和字段 ID 保存绑定。`FLOW_CALL` 的端口取子流的开始和结束字段 ID。子流预览可以固定同根构建的产物来源和目标限制，运行时再验证该根运行的实际实例。运行证据可区分已解析、默认值、等待上游、省略或错误。
 
 `BUILD.build.dependencies` 最多声明八个额外源码工作区别名。每个别名用小写字母开头，可包含小写字母、数字和连字符。流需将 Git 来源工作区绑定到主 `workspace` 和各 `dependency_<别名>` 端口。额外工作区复制到构建任务独立目录，命令可通过 `$VEYOPS_GRAPH_DEPENDENCY_ROOT/<别名>` 访问。镜像构建的 Dockerfile 需要使用依赖时，先在构建命令中将所需文件复制到主仓库的构建上下文。
 
-构建和登记配置保存在 `BUILD.build` 和 `REGISTER_ARTIFACT.registerArtifacts`。`artifacts` 条目包含 `name`、`type`、`path` 或 `imageReference`，以及可选 `required`、`composeFilePath` 和 `persist`。`persist:false` 输出 `{temporaryArtifactId}`，当前根运行及其子流可以引用。归档下载使用 `GET /artifacts/:id/download`。
+构建和登记的 `artifacts` 条目支持稳定端口 `id`、显示 `name`、`referenceName`、`type`、`path` 或 `imageReference`，以及 `required`、`composeFilePath` 和 `persist`。同一个具名端口返回一件逻辑产物。值包含 `artifactId`、`type`、`scope`、生产运行和 `instances[]`。逐实例提供 `instanceId`、`serverId` 和可查的路径、校验值或镜像身份。显式 `artifacts` 列表按逻辑 ID 汇总。`persist:false` 额外记录 `rootRunId`，仅此根运行及其子流可引用。归档下载使用 `GET /artifacts/:id/download`。
 
-- `DEPLOY_ARTIFACT` 和 `ROLLBACK_ARTIFACT` 从 `artifact` 端口取得产物。`deploy` 声明 `method`（`FILE` 或 `COMPOSE`）和 `deployPath`。Compose 来源可为 `{kind:"ARTIFACT"}` 或 `{kind:"REPOSITORY_FILE",repositoryId,commitSha,path}`。仓库模板的固定提交、路径和内容摘要随预览确认。
+Shell 和检查的环境绑定可使用 `PROJECT_VALUE`，以 `source: {kind:"OUTPUT",nodeId,fieldId}` 指定结构化来源。可取当前挂载的 `WORKSPACE_PATH`、同一 SSH 目标的 `ARTIFACT_PATH` 或镜像的 `IMAGE_NAME`、`IMAGE_ID`、`IMAGE_DIGEST`。管理端读取多实例镜像属性时通过 `serverId` 指定实例所在目标。
+
+- `DEPLOY_ARTIFACT` 和 `ROLLBACK_ARTIFACT` 从 `artifact` 端口取得一件逻辑产物。发布方式 `FILE` 接受文件或目录。`COMPOSE` 接受 Docker 镜像。Compose 来源可为 `{kind:"ARTIFACT"}` 或 `{kind:"REPOSITORY_FILE",repositoryId,commitSha,path}`，随预览确认模板。
+- `RELEASE.targets` 记录已确认的各个目标。失败目标可只有任务状态与 `errorSummary`。已确认的计划实例在 `plannedArtifactInstanceId`，实际使用的实例和发布记录分别在 `artifactInstanceId` 与 `deploymentId`。可以成对配置 `SUCCESS` 与 `PARTIAL_SUCCESS` 出边，部分成功分支只能使用有成功发布记录的目标。其他失败及待核查状态阻断后续。
 - `SOURCE_REVIEW` 可绑定单个固定 Git 来源 `source`，或含源码记录的 `artifact`。构建前审核也可设置 `approval.buildNodeId` 关联下游 `BUILD`，并将构建的 `review` 端口绑定到此审核节点的 `review` 输出。关联构建后，审核范围使用已确认计划中的主仓、依赖仓和异仓变量文件的仓库与 SHA。凭证只对所关联的本次构建有效，Worker 再核对执行快照中的完整源码列表。
 - `APPROVAL.approval.releaseNodeId` 绑定下游发布。等待时固定服务、逐目标成员、实物实例与指纹，回滚还固定被替代的发布记录。
-- `HEALTH_CHECK.healthCheck` 声明 `command` 和可选的 `timeoutSeconds`，从 `release` 端口接入同一服务成功激活的发布结果。退出码 `0` 表示健康，`10` 专用于探针明确判断应用不健康。缺少命令、权限错误、超时、连接断开或其他不明确结果进入 `NEEDS_ATTENTION`。只有明确的 `UNHEALTHY` 可经条件进入绑定 `afterRelease` 的回滚。逐目标结果保留探针判定、退出码及已知原因。
+- `HEALTH_CHECK.healthCheck` 声明 `command` 和可选的 `timeoutSeconds`，从 `release` 端口接入同一服务成功激活的发布结果。消费部分成功的发布时，通过 `targets` 显式绑定预览确认的成功目标子集。退出码 `0` 表示健康，`10` 表示明确不健康。缺少命令、权限错误、超时、连接中断或其他不明确结果进入 `NEEDS_ATTENTION`。只有明确的 `UNHEALTHY` 可经条件进入绑定 `afterRelease` 的回滚。逐目标结果保留探针判定、退出码及已知原因。
 - 不绑定 `afterRelease` 的回滚在预览固定当前发布。新运行必须选择同一服务、目标和目的地曾成功使用的历史产物。发布前再次核对活动发布身份和实物。
 - 目标核查确认发布链接及受管目录。Compose 还需核对已登记的 Docker 引擎和实际容器。当远端与平台记录一致、未发现发布锁且无待核对的自定义发布命令时，`canReplan` 提供重新预览入口。核查不会重放发布或改写历史任务结果。
 

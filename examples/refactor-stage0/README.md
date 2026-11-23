@@ -58,7 +58,9 @@
 
 ## Linux 候选验收
 
-[p1-linux.sh](../../tools/acceptance/p1-linux.sh) 从给定提交加载演示定义、初始化器和验收脚本。候选镜像须标注同一提交。下面的命令用于验收恢复后，在候选提交所在的 Linux checkout 执行。
+先执行 `npm run build -w apps/api` 和 `node tools/acceptance/check-graph-presets.cjs`，检查七条默认链在文件、目录和镜像三类产物下的编译结果。
+
+[p1-linux.sh](../../tools/acceptance/p1-linux.sh) 从给定提交加载演示定义、初始化器和验收脚本。候选镜像须标注同一提交。下面的命令在候选提交所在的 Linux checkout 执行。
 
 ```sh
 revision=$(git rev-parse HEAD)
@@ -70,7 +72,7 @@ VEYOPS_ACCEPT_RUNTIME_IMAGE="$image" sh tools/acceptance/p1-linux.sh "$revision"
 
 执行前需在本地 Linux Docker Engine 准备 `node:24-bookworm-slim`、`busybox:1.36`，使用 PostgreSQL 时还需 `postgres:17-bookworm`。宿主机需要 cgroup v2、Docker Compose 和 Buildx 插件，以及与目标基础镜像兼容的 SSH 服务端、`ssh-keygen`、OpenSSL 和 Git。脚本会验证并复制所用的本地工具。
 
-每次执行创建新目录、内部网络、四个 SSH 目标及其私有 Docker 引擎。测试组和生产模拟组使用各自服务器、发布目录和 SSH 指纹。远端发布仅发生在这些临时目标。脚本保留 `candidate.txt`、`manager.log` 和成功运行的 `evidence.json`，清理带本次标签的容器、网络和临时登录密钥。手工浏览器、断连、Worker 重启及其他 A01–A34 验收结果仍需按实施计划记载。
+每次执行创建新目录、内部网络、四个 SSH 目标及其私有 Docker 引擎。测试组和生产模拟组使用各自服务器、发布目录和 SSH 指纹。远端发布仅发生在这些临时目标。脚本覆盖多仓及分支与同名 Tag、目录和镜像、多实例与缺失目标、双服务发布、部分失败分路、同根临时产物、清理重试、Worker 租约恢复和备份还原。脚本保留 `candidate.txt`、`manager.log` 和成功运行的 `evidence.json`，清理带本次标签的容器、网络和临时登录密钥。浏览器和其他 A01–A34 结果按实施计划记录。
 
 需要在测试服务器保留供人工操作的实例时，运行 `sh tools/acceptance/p1-linux.sh "$revision" sqlite preview <测试服务器IPv4:端口>` 并设置同一个候选镜像环境变量。试用模式只对指定地址发布管理端端口。演示仓库、SSH 目标和 Docker 引擎保留在测试网络。专用目录中的 `preview-login.txt` 仅供部署者读取。首次登录可跳过改密。试用实例由部署者负责停用和清理，不随验收批次回收。
 
