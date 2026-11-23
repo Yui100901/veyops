@@ -1,10 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Play } from 'lucide-react';
 import { ApiError, formatTime, message, post, useResource, type ExecutionPlanIssue } from '../api';
-import { Confirm, ErrorBanner, Loading, RefreshButton, Section, Status } from '../components';
+import {
+  Confirm,
+  ErrorBanner,
+  Field,
+  Loading,
+  RefreshButton,
+  Section,
+  Status,
+} from '../components';
 import type { DeploymentSelection, ProjectDetail } from '../models';
+import { NodeMap } from './ExecutionGraphCanvas';
 import { GraphFieldValue, useProjectEnvironmentSets } from './ExecutionGraphFields';
 import type { FieldScope } from './ExecutionGraphFields';
+import { ConfiguredNodeExecution, showSelectedNode } from './ExecutionGraphNodeDetails';
 import {
   ExecutionPlan,
   ExecutionPlanChanges,
@@ -27,7 +37,12 @@ import {
   type ReleaseInspection,
   type ReviewScope,
 } from './ExecutionGraphReleaseResults';
-import { graphKey, graphNodeLabels, isReleaseNode } from './execution-graph-definition';
+import {
+  graphKey,
+  graphNodeLabels,
+  graphNodeTypeLabel,
+  isReleaseNode,
+} from './execution-graph-definition';
 import type {
   GraphEnvironmentSetSummary,
   GraphBinding,
@@ -197,12 +212,14 @@ function Results({
   labels = {},
   omit = [],
   title,
+  expanded,
   artifactContext,
 }: {
   values?: Record<string, unknown>;
   labels?: Record<string, string>;
   omit?: string[];
   title: string;
+  expanded?: boolean;
   artifactContext?: { projectId: string; scope: DeliveryScope };
 }) {
   const rows = Object.entries(values ?? {}).filter(
@@ -220,7 +237,7 @@ function Results({
   );
   if (!rows.length) return null;
   return (
-    <details className="graph-field-card">
+    <details className="graph-field-card" open={expanded}>
       <summary>{title}</summary>
       <dl className="graph-field-values">
         {rows.map(([name, value]) => {
@@ -618,6 +635,8 @@ interface RunNode {
   type: string;
   status: string;
   log: string;
+  startedAt?: number | null;
+  finishedAt?: number | null;
   taskId?: string;
   childRunId?: string | null;
   inputs?: GraphFieldEvidence[];
@@ -824,15 +843,26 @@ function RunDetails({
   const [cancelDialog, setCancelDialog] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState('');
+  const [nodeSelection, setNodeSelection] = useState<{ linked?: string; nodeId: string }>();
+  const overview = useRef<HTMLDivElement>(null);
+  const nodeDetail = useRef<HTMLElement>(null);
   const item = run.data;
+  const requestedNode =
+    nodeSelection?.linked === selectedNodeId
+      ? (nodeSelection?.nodeId ?? selectedNodeId)
+      : selectedNodeId;
+  const n =
+    item?.nodes.find(({ nodeId }) => nodeId === requestedNode) ??
+    item?.nodes.find(({ status }) => ['WAITING', 'RUNNING'].includes(status)) ??
+    item?.nodes.find(({ status }) => ['FAILED', 'NEEDS_ATTENTION', 'TIMED_OUT'].includes(status)) ??
+    item?.nodes[0];
+  const nodeDefinition = item?.definition?.nodes.find(({ id }) => id === n?.nodeId);
   const canInspect = canApprove || (canCancel && item?.createdBy === userId);
   const currentRunId = item?.id;
   useEffect(() => {
-    if (currentRunId && selectedNodeId) {
-      document
-        .getElementById('graph-run-node-' + selectedNodeId)
-        ?.scrollIntoView({ block: 'center' });
-    }
+    if (!currentRunId) return;
+    const linked = selectedNodeId && document.getElementById('graph-run-node-' + selectedNodeId);
+    (linked || overview.current)?.scrollIntoView({ block: 'nearest' });
   }, [currentRunId, selectedNodeId]);
   const deliveryScope = {
     serviceId: scope.serviceId,
@@ -872,6 +902,10 @@ function RunDetails({
         taskId: delivery.taskId,
       });
   const active = ['PENDING', 'QUEUED', 'WAITING', 'RUNNING'].includes(item?.status ?? '');
+  function selectNode(nodeId: string) {
+    setNodeSelection({ linked: selectedNodeId, nodeId });
+    window.requestAnimationFrame(() => showSelectedNode(nodeDetail.current));
+  }
   function closeCancel() {
     if (!cancelling) {
       setCancelDialog(false);
@@ -917,7 +951,7 @@ function RunDetails({
         ) : (
           item && (
             <>
-              <div className="heading-actions">
+              <div className="heading-actions" ref={overview}>
                 <strong>
                   {item.flowName} · 图版本 v{item.version}
                 </strong>
@@ -1001,242 +1035,316 @@ function RunDetails({
                   ))}
                 </div>
               ) : null}
-              <ol className="graph-logs">
-                {item.nodes.map((n) => (
-                  <li
-                    key={n.nodeId}
-                    id={'graph-run-node-' + n.nodeId}
-                    aria-current={selectedNodeId === n.nodeId ? 'location' : undefined}
-                  >
-                    <div className="heading-actions">
-                      <strong>{n.name}</strong>
-                      <Status value={n.status} />
-                    </div>
-                    {n.issue && (
-                      <div role="status" className="error-banner">
-                        <span>
-                          {[n.issue.fieldName ?? n.issue.fieldId, n.issue.branchId, n.issue.message]
-                            .filter(Boolean)
-                            .join(' · ')}
-                        </span>
-                        {n.issue.sourceNodeId && (
-                          <a
-                            className="text-link"
-                            href={
-                              '#' +
+              {n && (
+                <div className="graph-node-layout">
+                  <div className="graph-node-location">
+                    <Field label="定位节点">
+                      <select value={n.nodeId} onChange={(event) => selectNode(event.target.value)}>
+                        {item.nodes.map(({ nodeId, name }) => (
+                          <option key={nodeId} value={nodeId}>
+                            {name}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                  </div>
+                  <div className="graph-node-layout-inner">
+                    {item.definition ? (
+                      <NodeMap flow={item.definition} selected={[n.nodeId]} onSelect={selectNode} />
+                    ) : null}
+                    <article
+                      key={n.nodeId}
+                      id={'graph-run-node-' + n.nodeId}
+                      ref={nodeDetail}
+                      className="graph-node-detail"
+                      aria-label="运行节点详情"
+                    >
+                      <header>
+                        <div>
+                          <h3 aria-live="polite">{n.name}</h3>
+                          <small>
+                            {nodeDefinition
+                              ? graphNodeTypeLabel(nodeDefinition)
+                              : (graphNodeLabels[n.type as keyof typeof graphNodeLabels] ??
+                                n.type)}{' '}
+                            · v{item.version}
+                          </small>
+                        </div>
+                        <Status value={n.status} />
+                      </header>
+                      {(n.startedAt != null || n.finishedAt != null) && (
+                        <div className="graph-node-actions field-note">
+                          {n.startedAt != null && <span>开始 {formatTime(n.startedAt)}</span>}
+                          {n.finishedAt != null && <span>结束 {formatTime(n.finishedAt)}</span>}
+                        </div>
+                      )}
+                      <div className="graph-node-actions">
+                        <a
+                          className="button secondary small"
+                          href={
+                            '#' +
+                            graphWorkbenchPath(projectId, {
+                              ...scope,
+                              pane: 'published',
+                              version: item.version,
+                              node: n.nodeId,
+                              flow: item.flowId,
+                            })
+                          }
+                        >
+                          查看发布配置
+                        </a>
+                        {n.taskId && (
+                          <a className="button secondary small" href={'#/tasks/' + n.taskId}>
+                            查看逐目标任务日志
+                          </a>
+                        )}
+                      </div>
+                      {n.issue && (
+                        <div role="status" className="error-banner">
+                          <span>
+                            {[
+                              n.issue.fieldName ?? n.issue.fieldId,
+                              n.issue.branchId,
+                              n.issue.message,
+                            ]
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </span>
+                          {n.issue.sourceNodeId && (
+                            <a
+                              className="text-link"
+                              href={
+                                '#' +
+                                graphWorkbenchPath(projectId, {
+                                  ...scope,
+                                  pane: 'published',
+                                  version: item.version,
+                                  node: n.issue.sourceNodeId,
+                                  field: n.issue.sourceFieldId,
+                                  flow: item.flowId,
+                                })
+                              }
+                            >
+                              查看来源节点
+                            </a>
+                          )}
+                        </div>
+                      )}
+                      <FieldEvidenceList
+                        title="节点输入"
+                        fields={n.inputs}
+                        expanded
+                        repositoryName={releaseContext.repositoryName}
+                        nameSource={(id) => item.nodes.find(({ nodeId }) => id === nodeId)?.name}
+                        linkSource={(source) =>
+                          source.nodeId
+                            ? '#' +
                               graphWorkbenchPath(projectId, {
                                 ...scope,
                                 pane: 'published',
                                 version: item.version,
-                                node: n.issue.sourceNodeId,
-                                field: n.issue.sourceFieldId,
+                                node: source.nodeId,
+                                field: source.fieldId,
                                 flow: item.flowId,
                               })
-                            }
-                          >
-                            查看来源节点
-                          </a>
-                        )}
-                      </div>
-                    )}
-                    <FieldEvidenceList
-                      title="节点输入"
-                      fields={n.inputs}
-                      nameSource={(id) => item.nodes.find(({ nodeId }) => id === nodeId)?.name}
-                      linkSource={(source) =>
-                        source.nodeId
-                          ? '#' +
-                            graphWorkbenchPath(projectId, {
-                              ...scope,
-                              pane: 'published',
-                              version: item.version,
-                              node: source.nodeId,
-                              field: source.fieldId,
-                              flow: item.flowId,
-                            })
-                          : undefined
-                      }
-                    />
-                    {n.checkout && (
-                      <p className="field-note">
-                        检出版本来源 · {sourceName(n.checkout.versionSource)}
-                        {n.checkout.requestedVersion && (
-                          <>
-                            {' '}
-                            · <code>{n.checkout.requestedVersion.value}</code>
-                          </>
-                        )}
-                        {n.checkout.triggerCommitSha && (
-                          <>
-                            {' '}
-                            · 事件提交 <code>{n.checkout.triggerCommitSha}</code>
-                          </>
-                        )}
-                      </p>
-                    )}
-                    <Results
-                      values={n.output}
-                      omit={[
-                        ...(n.output?.scope ? ['scope', 'scopeHash', 'review', 'actorId'] : []),
-                        ...(isReleaseNode(n) || n.type === 'HEALTH_CHECK' ? ['release'] : []),
-                      ]}
-                      title="节点输出"
-                      artifactContext={{ projectId, scope: deliveryScope }}
-                      labels={Object.fromEntries(
-                        (
-                          item.definition?.nodes.find(({ id }) => id === n.nodeId)?.outputs ?? []
-                        ).map(({ id, name }) => [id, name]),
-                      )}
-                    />
-                    <FieldEvidenceList
-                      title="实际注入的环境绑定"
-                      fields={n.environment}
-                      nameSource={(id) => item.nodes.find(({ nodeId }) => id === nodeId)?.name}
-                    />
-                    <FieldEvidenceList
-                      title="最终输出来源"
-                      fields={n.outputFields}
-                      nameSource={(id) => item.nodes.find(({ nodeId }) => id === nodeId)?.name}
-                      linkSource={(source) =>
-                        source.nodeId
-                          ? '#' +
-                            graphWorkbenchPath(projectId, {
-                              ...scope,
-                              pane: 'published',
-                              version: item.version,
-                              node: source.nodeId,
-                              field: source.fieldId,
-                              flow: item.flowId,
-                            })
-                          : undefined
-                      }
-                    />
-                    {!!n.variableSources?.length && (
-                      <details className="graph-field-card">
-                        <summary>环境变量来源 · {n.variableSources.length} 项</summary>
-                        <dl className="graph-field-values">
-                          {n.variableSources.map(({ key, source, isSecret, overriddenSources }) => (
-                            <div key={key}>
-                              <dt>
-                                <code>{key}</code>
-                              </dt>
-                              <dd>
-                                {sourceName(source)}
-                                {isSecret && ' · 敏感引用'}
-                                {!!overriddenSources?.length && (
-                                  <small>覆盖 {overriddenSources.map(sourceName).join('、')}</small>
-                                )}
-                              </dd>
-                            </div>
-                          ))}
-                        </dl>
-                      </details>
-                    )}
-                    {n.type === 'DELAY' && n.status === 'WAITING' && n.output?.wakeAt && (
-                      <p>计划恢复 · {formatTime(n.output.wakeAt)}</p>
-                    )}
-                    {(n.type === 'APPROVAL' || n.type === 'SOURCE_REVIEW') && (
-                      <GraphApprovalActions
-                        node={n}
-                        path={path}
-                        canApprove={canApprove}
-                        context={releaseContext}
-                        onChange={() => {
-                          void run.reload();
-                          onChange();
-                        }}
-                      />
-                    )}
-                    {(isReleaseNode(n) || n.type === 'HEALTH_CHECK') && (
-                      <ExecutionGraphReleaseResults
-                        value={n.output?.release}
-                        type={n.type}
-                        context={releaseContext}
-                        serverName={(id) =>
-                          n.targets?.find(({ serverId }) => id === serverId)?.serverName
+                            : undefined
                         }
                       />
-                    )}
-                    {n.taskId && (
-                      <a className="text-link" href={'#/tasks/' + n.taskId}>
-                        查看逐目标任务日志
-                      </a>
-                    )}
-                    {!!n.targets?.length && (
-                      <details
-                        className="graph-field-card"
-                        open={n.targets.some((target) => needsReleaseInspection(n, target))}
-                      >
-                        <summary>逐目标执行 · {n.targets.length} 项</summary>
-                        <ul className="graph-edge-list graph-run-targets">
-                          {n.targets.map((target) => (
-                            <li key={target.serverId}>
-                              <div>
-                                <a
-                                  className="text-link"
-                                  href={serverResourceHref({
-                                    serverId: target.serverId,
-                                    projectId,
-                                    returnPath: graphRunHref(
+                      {n.checkout && (
+                        <p className="field-note">
+                          检出版本来源 · {sourceName(n.checkout.versionSource)}
+                          {n.checkout.requestedVersion && (
+                            <>
+                              {' '}
+                              · <code>{n.checkout.requestedVersion.value}</code>
+                            </>
+                          )}
+                          {n.checkout.triggerCommitSha && (
+                            <>
+                              {' '}
+                              · 事件提交 <code>{n.checkout.triggerCommitSha}</code>
+                            </>
+                          )}
+                        </p>
+                      )}
+                      {nodeDefinition && n.type !== 'START' && n.type !== 'END' && (
+                        <details className="graph-field-card">
+                          <summary>执行配置</summary>
+                          <ConfiguredNodeExecution node={nodeDefinition} flow={item.definition} />
+                        </details>
+                      )}
+                      <Results
+                        values={n.output}
+                        omit={[
+                          ...(n.output?.scope ? ['scope', 'scopeHash', 'review', 'actorId'] : []),
+                          ...(isReleaseNode(n) || n.type === 'HEALTH_CHECK' ? ['release'] : []),
+                        ]}
+                        title="节点输出"
+                        expanded
+                        artifactContext={{ projectId, scope: deliveryScope }}
+                        labels={Object.fromEntries(
+                          (
+                            item.definition?.nodes.find(({ id }) => id === n.nodeId)?.outputs ?? []
+                          ).map(({ id, name }) => [id, name]),
+                        )}
+                      />
+                      <FieldEvidenceList
+                        title="实际注入的环境绑定"
+                        fields={n.environment}
+                        expanded
+                        nameSource={(id) => item.nodes.find(({ nodeId }) => id === nodeId)?.name}
+                      />
+                      <FieldEvidenceList
+                        title="最终输出来源"
+                        fields={n.outputFields}
+                        expanded
+                        repositoryName={releaseContext.repositoryName}
+                        nameSource={(id) => item.nodes.find(({ nodeId }) => id === nodeId)?.name}
+                        linkSource={(source) =>
+                          source.nodeId
+                            ? '#' +
+                              graphWorkbenchPath(projectId, {
+                                ...scope,
+                                pane: 'published',
+                                version: item.version,
+                                node: source.nodeId,
+                                field: source.fieldId,
+                                flow: item.flowId,
+                              })
+                            : undefined
+                        }
+                      />
+                      {!!n.variableSources?.length && (
+                        <details className="graph-field-card">
+                          <summary>环境变量来源 · {n.variableSources.length} 项</summary>
+                          <dl className="graph-field-values">
+                            {n.variableSources.map(
+                              ({ key, source, isSecret, overriddenSources }) => (
+                                <div key={key}>
+                                  <dt>
+                                    <code>{key}</code>
+                                  </dt>
+                                  <dd>
+                                    {sourceName(source)}
+                                    {isSecret && ' · 敏感引用'}
+                                    {!!overriddenSources?.length && (
+                                      <small>
+                                        覆盖 {overriddenSources.map(sourceName).join('、')}
+                                      </small>
+                                    )}
+                                  </dd>
+                                </div>
+                              ),
+                            )}
+                          </dl>
+                        </details>
+                      )}
+                      {n.type === 'DELAY' && n.status === 'WAITING' && n.output?.wakeAt && (
+                        <p>计划恢复 · {formatTime(n.output.wakeAt)}</p>
+                      )}
+                      {(n.type === 'APPROVAL' || n.type === 'SOURCE_REVIEW') && (
+                        <GraphApprovalActions
+                          node={n}
+                          path={path}
+                          canApprove={canApprove}
+                          context={releaseContext}
+                          onChange={() => {
+                            void run.reload();
+                            onChange();
+                          }}
+                        />
+                      )}
+                      {(isReleaseNode(n) || n.type === 'HEALTH_CHECK') && (
+                        <ExecutionGraphReleaseResults
+                          value={n.output?.release}
+                          type={n.type}
+                          context={releaseContext}
+                          serverName={(id) =>
+                            n.targets?.find(({ serverId }) => id === serverId)?.serverName
+                          }
+                        />
+                      )}
+                      {!!n.targets?.length && (
+                        <details
+                          className="graph-field-card"
+                          open={n.targets.some((target) => needsReleaseInspection(n, target))}
+                        >
+                          <summary>逐目标执行 · {n.targets.length} 项</summary>
+                          <ul className="graph-edge-list graph-run-targets">
+                            {n.targets.map((target) => (
+                              <li key={target.serverId}>
+                                <div>
+                                  <a
+                                    className="text-link"
+                                    href={serverResourceHref({
+                                      serverId: target.serverId,
                                       projectId,
-                                      item.id,
-                                      scope,
-                                      delivery,
-                                    ).slice(1),
-                                  })}
-                                >
-                                  {target.serverName ?? target.serverId}
-                                </a>{' '}
-                                <Status value={target.status} />
-                                {target.exitCode != null && <small>退出码 {target.exitCode}</small>}
-                                {target.startedAt && (
-                                  <small>开始 {formatTime(target.startedAt)}</small>
+                                      returnPath: graphRunHref(
+                                        projectId,
+                                        item.id,
+                                        scope,
+                                        delivery,
+                                      ).slice(1),
+                                    })}
+                                  >
+                                    {target.serverName ?? target.serverId}
+                                  </a>{' '}
+                                  <Status value={target.status} />
+                                  {target.exitCode != null && (
+                                    <small>退出码 {target.exitCode}</small>
+                                  )}
+                                  {target.startedAt && (
+                                    <small>开始 {formatTime(target.startedAt)}</small>
+                                  )}
+                                  {target.finishedAt && (
+                                    <small>结束 {formatTime(target.finishedAt)}</small>
+                                  )}
+                                </div>
+                                {needsReleaseInspection(n, target) && (
+                                  <ExecutionGraphReleaseInspection
+                                    context={releaseContext}
+                                    path={`${path}/nodes/${encodeURIComponent(n.nodeId)}/targets/${encodeURIComponent(target.serverId)}/inspect-release`}
+                                    latest={target.inspection}
+                                    canInspect={canInspect}
+                                    replanHref={
+                                      canInspect
+                                        ? '#' +
+                                          graphWorkbenchPath(projectId, {
+                                            ...scope,
+                                            start: item.flowId,
+                                            version: item.version,
+                                          })
+                                        : undefined
+                                    }
+                                    onChange={() => void run.reload()}
+                                  />
                                 )}
-                                {target.finishedAt && (
-                                  <small>结束 {formatTime(target.finishedAt)}</small>
-                                )}
-                              </div>
-                              {needsReleaseInspection(n, target) && (
-                                <ExecutionGraphReleaseInspection
-                                  context={releaseContext}
-                                  path={`${path}/nodes/${encodeURIComponent(n.nodeId)}/targets/${encodeURIComponent(target.serverId)}/inspect-release`}
-                                  latest={target.inspection}
-                                  canInspect={canInspect}
-                                  replanHref={
-                                    canInspect
-                                      ? '#' +
-                                        graphWorkbenchPath(projectId, {
-                                          ...scope,
-                                          start: item.flowId,
-                                          version: item.version,
-                                        })
-                                      : undefined
-                                  }
-                                  onChange={() => void run.reload()}
-                                />
-                              )}
-                            </li>
-                          ))}
-                        </ul>
-                      </details>
-                    )}
-                    {n.log && (
-                      <details className="graph-field-card">
-                        <summary>节点日志</summary>
-                        <pre>{n.log}</pre>
-                      </details>
-                    )}
-                    {n.childRunId && (
-                      <a
-                        className="text-link"
-                        href={graphRunHref(projectId, n.childRunId, scope, delivery)}
-                      >
-                        查看子流运行
-                      </a>
-                    )}
-                  </li>
-                ))}
-              </ol>
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+                      )}
+                      {n.log ? (
+                        <details className="graph-field-card" open>
+                          <summary>节点日志</summary>
+                          <pre>{n.log}</pre>
+                        </details>
+                      ) : (
+                        <p className="field-note">此节点暂无日志。</p>
+                      )}
+                      {n.childRunId && (
+                        <a
+                          className="text-link"
+                          href={graphRunHref(projectId, n.childRunId, scope, delivery)}
+                        >
+                          查看子流运行
+                        </a>
+                      )}
+                    </article>
+                  </div>
+                </div>
+              )}
               <a className="text-link" href={graphRunHref(projectId, item.id, scope, delivery)}>
                 本次运行的固定链接
               </a>

@@ -1,6 +1,8 @@
 import { ConflictException } from '@nestjs/common';
 import type { Kysely, Transaction } from 'kysely';
 import type { Database } from '../../core/database/schema';
+import { graphRepositoryMatches } from './graph-repository-selectors';
+import { graphRepositoryUrl } from './http-clone-url';
 import {
   projectResourceReferences,
   type ProjectResourceReference,
@@ -97,16 +99,40 @@ async function availableIds(
   ids: string[],
 ) {
   switch (type) {
-    case 'REPOSITORY':
+    case 'REPOSITORY': {
+      const selectors = new Map(ids.map((id) => [id, graphRepositoryUrl(id)]));
+      const directIds = ids.filter((id) => !selectors.get(id));
+      const [direct, addressed] = await Promise.all([
+        directIds.length
+          ? db
+              .selectFrom('repositories')
+              .select('id')
+              .where('project_id', '=', projectId)
+              .where('archived_at', 'is', null)
+              .where('id', 'in', directIds)
+              .execute()
+          : [],
+        graphRepositoryMatches(
+          db,
+          projectId,
+          [...selectors.values()].filter((url): url is string => url !== undefined),
+        ),
+      ]);
+      return [
+        ...direct,
+        ...[...selectors].flatMap(([id, url]) =>
+          url && addressed.get(url)?.length === 1 ? [{ id }] : [],
+        ),
+      ];
+    }
     case 'SERVICE':
     case 'ENVIRONMENT':
     case 'ENVIRONMENT_SET': {
       const table = {
-        REPOSITORY: 'repositories',
         SERVICE: 'services',
         ENVIRONMENT: 'environments',
         ENVIRONMENT_SET: 'project_environment_sets',
-      }[type] as 'repositories' | 'services' | 'environments' | 'project_environment_sets';
+      }[type] as 'services' | 'environments' | 'project_environment_sets';
       return db
         .selectFrom(table)
         .select('id')

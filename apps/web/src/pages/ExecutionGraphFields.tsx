@@ -12,7 +12,7 @@ import {
   type Artifact,
   type ArtifactRef,
 } from './Delivery';
-import { useRepositoryBranches } from './RepositoryBranches';
+import { BranchSyncControls, useRepositoryBranches } from './RepositoryBranches';
 import { graphKey } from './execution-graph-definition';
 import type { EnvironmentSetSummary } from './ProjectEnvironmentSets';
 import type {
@@ -47,6 +47,7 @@ interface ValueProps {
   scope?: FieldScope;
   canRegisterRepository?: boolean;
   checkRequired?: boolean;
+  repositoryAddress?: boolean;
 }
 
 function stringValue(value: unknown) {
@@ -222,6 +223,41 @@ function RepositoryValue({
   );
 }
 
+function RepositoryAddressValue({ field, project, value, change, disabled }: ValueProps) {
+  const list = useId();
+  const selected = referenceId(value);
+  const displayed = project.repositories.find(({ id }) => id === selected)?.cloneUrl ?? selected;
+  const repository = project.repositories.find(({ cloneUrl }) => cloneUrl === displayed.trim());
+  return (
+    <Field
+      label={field.name}
+      hint={
+        repository ? '已匹配项目仓库 · ' + repository.name : '输入项目中已登记的 Git 仓库地址。'
+      }
+    >
+      <input
+        disabled={disabled}
+        inputMode="url"
+        list={list}
+        placeholder="https://example.com/project.git"
+        value={displayed}
+        onChange={(event) => change(event.target.value || undefined)}
+        onBlur={(event) => {
+          const trimmed = event.target.value.trim();
+          if (trimmed !== event.target.value) change(trimmed || undefined);
+        }}
+      />
+      <datalist id={list}>
+        {project.repositories.map(({ id, cloneUrl, name }) => (
+          <option key={id} value={cloneUrl}>
+            {name}
+          </option>
+        ))}
+      </datalist>
+    </Field>
+  );
+}
+
 function GitVersionValue({
   project,
   field,
@@ -234,9 +270,10 @@ function GitVersionValue({
   const current = value as { kind?: string; value?: string } | undefined;
   const kind = current?.kind ?? 'BRANCH';
   const list = useId();
-  const branches = useRepositoryBranches(
-    scope?.repositoryId ? '/projects/' + project.id + '/repositories/' + scope.repositoryId : null,
-  );
+  const repositoryPath = scope?.repositoryId
+    ? '/projects/' + project.id + '/repositories/' + scope.repositoryId
+    : null;
+  const branches = useRepositoryBranches(kind === 'BRANCH' ? repositoryPath : null);
   return (
     <div className="graph-fields">
       <div className="graph-field-pair">
@@ -269,6 +306,9 @@ function GitVersionValue({
           </datalist>
         </Field>
       </div>
+      {repositoryPath && kind === 'BRANCH' && !disabled && (
+        <BranchSyncControls branches={branches} />
+      )}
       {!field.required && value !== undefined && !disabled && (
         <button type="button" className="button secondary small" onClick={() => change(undefined)}>
           清除版本
@@ -530,7 +570,12 @@ export function GraphFieldValue(props: ValueProps) {
       </fieldset>
     );
   }
-  if (field.type === 'REPOSITORY') return <RepositoryValue {...props} />;
+  if (field.type === 'REPOSITORY')
+    return props.repositoryAddress ? (
+      <RepositoryAddressValue {...props} />
+    ) : (
+      <RepositoryValue {...props} />
+    );
   if (field.type === 'GIT_REF') return <GitVersionValue {...props} />;
   if (field.type === 'ARTIFACT') return <ArtifactValue {...props} />;
   if (field.type === 'TARGETS') return <TargetsValue {...props} />;
@@ -551,8 +596,9 @@ export function GraphFieldValue(props: ValueProps) {
       />
     );
   }
-  if (field.type === 'BOOLEAN' || field.options?.length) {
-    const choices = field.options?.length ? field.options : [true, false];
+  if (field.type === 'BOOLEAN' || field.type === 'GIT_FETCH_MODE' || field.options?.length) {
+    const choices =
+      field.type === 'GIT_FETCH_MODE' ? ['LATEST', 'FULL'] : (field.options ?? [true, false]);
     return (
       <Field label={field.name}>
         <select
@@ -567,7 +613,15 @@ export function GraphFieldValue(props: ValueProps) {
           <option value="">请选择</option>
           {choices.map((item) => (
             <option value={JSON.stringify(item)} key={JSON.stringify(item)}>
-              {typeof item === 'boolean' ? (item ? '是' : '否') : String(item)}
+              {field.type === 'GIT_FETCH_MODE'
+                ? item === 'FULL'
+                  ? '拉取完整历史'
+                  : '只拉取选定提交（浅拉取）'
+                : typeof item === 'boolean'
+                  ? item
+                    ? '是'
+                    : '否'
+                  : String(item)}
             </option>
           ))}
         </select>
@@ -613,7 +667,6 @@ export function GraphFieldEditor({
   disabled,
   change,
   title,
-  scriptPort,
 }: {
   type: 'input' | 'output';
   fields: GraphField[];
@@ -622,43 +675,46 @@ export function GraphFieldEditor({
   disabled?: boolean;
   change: (fields: GraphField[]) => void;
   title?: string;
-  scriptPort?: boolean;
 }) {
   const [preset, setPreset] = useState('');
-  const [portId, setPortId] = useState('');
   const isInput = type === 'input';
   const standards = (isInput ? catalog?.inputPresets : catalog?.outputPresets)?.filter(
     (field) => field.type !== 'ENVIRONMENT',
   );
   const fieldTypes = catalog?.fieldTypes;
-  const scriptTypes = isInput
-    ? ['TEXT', 'NUMBER', 'BOOLEAN', 'PATH', 'CREDENTIAL']
-    : ['TEXT', 'NUMBER', 'BOOLEAN'];
-  const validPortId =
-    /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(portId) &&
-    (!isInput || !/^VEYOPS_/i.test(portId)) &&
-    !fields.some(({ id }) => id === portId);
   function add() {
-    if (scriptPort && !validPortId) return;
     const standard = standards?.find(({ id }) => id === preset);
     if (!standard && preset !== 'custom') return;
-    const id = scriptPort
-      ? portId
-      : standard && !fields.some((field) => field.id === standard.id)
+    const id =
+      standard && !fields.some((field) => field.id === standard.id)
         ? standard.id
         : graphKey('field');
+    const base =
+      standard?.id
+        .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+        .replaceAll('-', '_')
+        .toUpperCase() ?? (isInput ? 'INPUT' : 'OUTPUT');
+    let referenceName = base;
+    for (
+      let i = 2;
+      fields.some((field) => (field.referenceName ?? field.id) === referenceName);
+      i++
+    )
+      referenceName = base + '_' + i;
     change([
       ...fields,
-      standard
-        ? { ...standard, id }
-        : {
-            id,
-            name: scriptPort ? portId : '自定义' + (isInput ? '输入' : '输出'),
-            type: 'TEXT',
-            required: false,
-          },
+      {
+        ...standard,
+        id,
+        name: standard?.name ?? '自定义' + (isInput ? '输入' : '输出'),
+        type: standard?.type ?? 'TEXT',
+        referenceName,
+        required: true,
+        multiple: undefined,
+        options: undefined,
+      },
     ]);
-    setPortId('');
+    setPreset('');
   }
   function patch(id: string, value: Partial<GraphField>) {
     change(fields.map((row) => (row.id === id ? { ...row, ...value } : row)));
@@ -677,7 +733,6 @@ export function GraphFieldEditor({
             </small>
           </summary>
           <div className="graph-fields">
-            {scriptPort && <code>{field.id}</code>}
             <Field label="显示名称">
               <input
                 disabled={disabled}
@@ -686,7 +741,7 @@ export function GraphFieldEditor({
                 onChange={(event) => patch(field.id, { name: event.target.value })}
               />
             </Field>
-            <Field label="引用名" hint="留空沿用字段 ID。改名后原有绑定仍有效。">
+            <Field label="引用名称" hint="建议使用大写英文与下划线。改名后原有绑定仍有效。">
               <input
                 disabled={disabled}
                 maxLength={64}
@@ -696,18 +751,6 @@ export function GraphFieldEditor({
                 }
               />
             </Field>
-            {scriptPort && (
-              <Field label={isInput ? '进程变量名' : '结果 JSON 键'} hint="留空沿用字段 ID。">
-                <input
-                  disabled={disabled}
-                  maxLength={64}
-                  value={field.exportName ?? ''}
-                  onChange={(event) =>
-                    patch(field.id, { exportName: event.target.value || undefined })
-                  }
-                />
-              </Field>
-            )}
             <Field label="数据类型">
               <select
                 disabled={disabled}
@@ -726,7 +769,6 @@ export function GraphFieldEditor({
               >
                 {Object.entries(fieldTypes ?? { [field.type]: field.type })
                   .filter(([id]) => id !== 'ENVIRONMENT' || field.type === 'ENVIRONMENT')
-                  .filter(([id]) => !scriptPort || scriptTypes.includes(id))
                   .map(([id, label]) => (
                     <option value={id} key={id}>
                       {label}
@@ -734,62 +776,6 @@ export function GraphFieldEditor({
                   ))}
               </select>
             </Field>
-            <div className="graph-field-pair">
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  disabled={disabled}
-                  checked={!!field.required}
-                  onChange={(event) => patch(field.id, { required: event.target.checked })}
-                />{' '}
-                必填
-              </label>
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  disabled={
-                    disabled ||
-                    field.type === 'ENVIRONMENT_SET' ||
-                    (scriptPort && field.type === 'CREDENTIAL')
-                  }
-                  checked={!!field.multiple}
-                  onChange={(event) =>
-                    patch(field.id, { multiple: event.target.checked, defaultValue: undefined })
-                  }
-                />{' '}
-                允许多值
-              </label>
-            </div>
-            {['TEXT', 'NUMBER'].includes(field.type) && (
-              <Field label="可选值" hint="每行一个，留空不限定。">
-                <textarea
-                  disabled={disabled}
-                  rows={3}
-                  key={field.type}
-                  defaultValue={field.options?.join('\n') ?? ''}
-                  onBlur={(event) => {
-                    const entries = event.target.value
-                      .split('\n')
-                      .map((item) => item.trim())
-                      .filter(Boolean);
-                    const options = entries.map((item) =>
-                      field.type === 'NUMBER' ? Number(item) : item,
-                    );
-                    if (
-                      options.some((item) => typeof item === 'number' && !Number.isFinite(item))
-                    ) {
-                      event.target.setCustomValidity('数值选项须为有限数字。');
-                      event.target.reportValidity();
-                      return;
-                    }
-                    event.target.setCustomValidity('');
-                    patch(field.id, {
-                      options: options.length ? [...new Set(options)] : undefined,
-                    });
-                  }}
-                />
-              </Field>
-            )}
             {field.type === 'ARTIFACT' && (
               <Field label="产物类型">
                 <select
@@ -835,6 +821,7 @@ export function GraphFieldEditor({
                 'IMAGE',
                 'REPOSITORY',
                 'GIT_REF',
+                'GIT_FETCH_MODE',
                 'ENVIRONMENT',
                 'ENVIRONMENT_SET',
                 'SERVICE',
@@ -864,19 +851,7 @@ export function GraphFieldEditor({
       ))}
       {!disabled && (
         <div className="graph-field-pair">
-          {scriptPort ? (
-            <Field label="稳定标识">
-              <input
-                value={portId}
-                maxLength={64}
-                placeholder={isInput ? 'PORT' : 'REPORT_CODE'}
-                onChange={(event) => {
-                  setPortId(event.target.value);
-                  setPreset('custom');
-                }}
-              />
-            </Field>
-          ) : (
+          <Field label={isInput ? '添加输入' : '添加输出'}>
             <select
               aria-label={isInput ? '选择输入字段' : '选择输出字段'}
               value={preset}
@@ -890,13 +865,8 @@ export function GraphFieldEditor({
                 </option>
               ))}
             </select>
-          )}
-          <button
-            className="button secondary small"
-            type="button"
-            disabled={scriptPort ? !validPortId : !preset}
-            onClick={add}
-          >
+          </Field>
+          <button className="button secondary small" type="button" disabled={!preset} onClick={add}>
             <Plus size={14} /> 添加{isInput ? '输入' : '输出'}
           </button>
         </div>
@@ -962,6 +932,8 @@ export function GraphBindingField({
   canRegisterRepository,
   allowRepositoryDefault,
   directSource,
+  nodeDefaults,
+  referenceLookup,
 }: {
   field: GraphField;
   choices: BindingChoice[];
@@ -975,6 +947,8 @@ export function GraphBindingField({
   canRegisterRepository?: boolean;
   allowRepositoryDefault?: boolean;
   directSource?: boolean;
+  nodeDefaults?: boolean;
+  referenceLookup?: boolean;
 }) {
   const [search, setSearch] = useState('');
   const selected = value ? bindingKey(value) : '';
@@ -1029,7 +1003,15 @@ export function GraphBindingField({
             else update(choices.find(({ binding }) => bindingKey(binding) === next)?.binding);
           }}
         >
-          <option value="">{fallback ? '采用默认来源' : '选择数据来源'}</option>
+          <option value="">
+            {referenceLookup
+              ? '同名上游，缺值时用默认值'
+              : nodeDefaults
+                ? '当前执行流不覆盖'
+                : fallback
+                  ? '采用默认来源'
+                  : '选择数据来源'}
+          </option>
           {unavailable && (
             <option value={selected} disabled>
               原有来源不可用
@@ -1040,9 +1022,9 @@ export function GraphBindingField({
               {choiceLabel(choice)}
             </option>
           ))}
-          {!['SOURCE', 'WORKSPACE', 'REPORT', 'RELEASE', 'REVIEW', 'VARIABLES'].includes(
-            field.type,
-          ) && <option value="VALUE">固定值</option>}
+          {(value?.kind === 'VALUE' || acceptsFixedGraphValue(field)) && (
+            <option value="VALUE">当前执行流固定值</option>
+          )}
           {environment && <option value="ENVIRONMENT_KEY">入口变量集合中的键</option>}
           {environment && <option value="CREDENTIAL">凭据引用</option>}
           {!directSource && (choices.length > 1 || value?.kind === 'FIRST_AVAILABLE') && (
@@ -1057,7 +1039,7 @@ export function GraphBindingField({
           value={value.value}
           change={(next) =>
             update(
-              next === undefined && field.type === 'GIT_REF'
+              next === undefined && ['GIT_REF', 'GIT_FETCH_MODE'].includes(field.type)
                 ? undefined
                 : { kind: 'VALUE', value: next ?? '' },
             )
@@ -1065,6 +1047,7 @@ export function GraphBindingField({
           disabled={disabled}
           scope={scope}
           canRegisterRepository={canRegisterRepository}
+          repositoryAddress={referenceLookup}
         />
       )}
       {value?.kind === 'ENVIRONMENT_KEY' && (
@@ -1171,5 +1154,12 @@ export function GraphBindingField({
         </Field>
       )}
     </div>
+  );
+}
+
+export function acceptsFixedGraphValue(field: GraphField) {
+  return (
+    field.source !== 'CURRENT_RUN' &&
+    !['SOURCE', 'WORKSPACE', 'REPORT', 'RELEASE', 'REVIEW', 'VARIABLES'].includes(field.type)
   );
 }

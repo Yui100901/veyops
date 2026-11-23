@@ -62,6 +62,9 @@ const nodeTypes = [
   'FLOW_CALL',
   'END',
 ] as const;
+const functionOperations = nodeTypes.filter(
+  (type) => type !== 'START' && type !== 'END' && type !== 'CONDITION' && type !== 'SWITCH',
+);
 
 class GraphCondition {
   @IsOptional() @IsIn(['input', 'commitSha']) key?: 'input' | 'commitSha';
@@ -234,7 +237,13 @@ export class GraphNode {
   @Matches(idFormat) id!: string;
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
   @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) referenceName?: string;
-  @IsIn(nodeTypes) type!: (typeof nodeTypes)[number];
+  @IsIn([...nodeTypes, 'FUNCTION']) type!: (typeof nodeTypes)[number] | 'FUNCTION';
+  @ValidateIf((node, value) => node.type === 'FUNCTION' || value !== undefined)
+  @IsIn(functionOperations)
+  operation?: (typeof functionOperations)[number];
+  @ValidateIf((_o, value) => value !== undefined) @IsBoolean() declaredPorts?: boolean;
+  @ValidateIf((_o, v) => v !== undefined) @IsObject() inputDefaults?: Record<string, unknown>;
+  @ValidateIf((_o, v) => v !== undefined) @IsObject() environmentDefaults?: Record<string, string>;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(80) moduleId?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsInt() @Min(1) moduleVersion?: number;
   @ValidateIf((_o, v) => v !== undefined)
@@ -320,6 +329,19 @@ export class GraphNode {
   @ValidateNested()
   @Type(() => GraphNodePosition)
   position?: GraphNodePosition;
+}
+
+/** The canvas keeps editable function nodes. Execution uses the existing native modules. */
+export function runtimeGraphNode(node: GraphNode): GraphNode {
+  if (node.type !== 'FUNCTION' && node.operation === undefined) return node;
+  const { operation, ...definition } = node;
+  if (node.type === 'FUNCTION' && operation && functionOperations.includes(operation))
+    return { ...definition, type: operation, declaredPorts: true };
+  throw new GraphCompileError({
+    nodeId: node.id,
+    fieldId: 'operation',
+    message: '功能节点必须选择有效的执行方式',
+  });
 }
 export class GraphEdge {
   @Matches(idFormat) from!: string;
@@ -583,6 +605,8 @@ export function validateGraphDefinition(definition: GraphDefinition) {
     for (const node of ordered) {
       try {
         if (!safeGraphId(node.id)) throw new BadRequestException('节点 ID 无效');
+        if (node.type === 'FUNCTION' || node.operation !== undefined)
+          throw new BadRequestException('功能节点须在画布中声明后编译');
         if (!definition.canvas && nodeIds.has(node.id))
           throw new BadRequestException('同一图版本中的节点 ID 必须唯一');
         nodeIds.add(node.id);

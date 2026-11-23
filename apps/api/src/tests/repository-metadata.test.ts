@@ -229,7 +229,8 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   const { DatabaseService } = await import('../core/database/database.service.js');
   const { RepositoryMetadataService } =
     await import('../modules/projects/repository-metadata.service.js');
-  const { GraphNodeTasks } = await import('../modules/execution-graphs/graph-node-tasks.js');
+  const { GraphNodeTasks, graphCheckoutOutputs } =
+    await import('../modules/execution-graphs/graph-node-tasks.js');
   const { BuildsService } = await import('../modules/builds/builds.service.js');
   const { PipelineDefinitionDto } = await import('../modules/pipelines/pipeline.dto.js');
   const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
@@ -301,10 +302,12 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     .post(repositoryPath)
     .send({ ...create, credentialId: credential })
     .expect(403);
-  await operator
-    .post(repositoryPath)
-    .send({ ...create, name: 'Public fixture' })
-    .expect(201);
+  const duplicate = (
+    await operator
+      .post(repositoryPath)
+      .send({ ...create, name: 'Public fixture' })
+      .expect(201)
+  ).body.data;
   await git('--git-dir', bare, 'symbolic-ref', 'HEAD', 'refs/heads/feature/release');
   const created = (
     await admin
@@ -352,11 +355,23 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   assert.equal(recovered.defaultBranch, 'main');
   const metadata = app.get(RepositoryMetadataService);
   const access = { clone_url: create.cloneUrl, credential_id: credential };
+  const beforeRepositoryMatch = fixture.authenticatedRequests();
+  await assert.rejects(
+    metadata.planGraphCheckout(project, { repositoryId: create.cloneUrl, mode: 'BRANCH' }),
+    /匹配多个项目仓库/,
+  );
+  await assert.rejects(
+    metadata.planGraphCheckout(other, { repositoryId: create.cloneUrl, mode: 'BRANCH' }),
+    /未匹配当前项目/,
+  );
+  assert.equal(fixture.authenticatedRequests(), beforeRepositoryMatch);
+  await admin.delete(`${repositoryPath}/${duplicate.id}`).expect(200);
   const shallow = await metadata.planGraphCheckout(project, {
-    repositoryId: id,
+    repositoryId: create.cloneUrl,
     mode: 'BRANCH',
     branch: 'feature/release',
   });
+  assert.equal(shallow.repositoryId, id);
   assert.equal(shallow.commitSha, feature);
   assert.deepEqual(await metadata.checkoutGraphSource(project, shallow), {
     commitSha: feature,
@@ -390,17 +405,102 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     (await readFile(join(persistedWorktree, 'docs', 'DEPLOY.md'), 'utf8')).trim(),
     '# Second release',
   );
-  const history = await metadata.planGraphCheckout(project, {
-    repositoryId: id,
-    mode: 'COMMIT',
-    commitSha: second,
-    fullClone: true,
+  const graphNodes = app.get(GraphNodeTasks);
+  const checkoutNode = { id: 'source', name: 'Source', type: 'CHECKOUT' } as const;
+  const values = { repository: id, version: { kind: 'COMMIT', value: second } };
+  const plan = await graphNodes.prepare(project, checkoutNode, { values, fetchModeDeferred: true });
+  assert.equal(plan.type, 'CHECKOUT');
+  assert.equal(plan.fetchModeDeferred, true);
+  assert.equal(plan.source.commitSha, second);
+  assert.equal(graphCheckoutOutputs(plan.source, undefined, undefined, true).fetchMode, undefined);
+  const task = await graphNodes.task(project, checkoutNode, plan, randomUUID(), {
+    runId: randomUUID(),
+    nodeRunId: randomUUID(),
+    values: { ...values, fetchMode: 'FULL' },
   });
+  const history = task.payload.graphModule?.source;
+  assert.ok(history);
+  assert.equal(graphCheckoutOutputs(history).fetchMode, 'FULL');
   assert.deepEqual(await metadata.checkoutGraphSource(project, history), {
     commitSha: second,
     subject: 'Second change',
     shallow: false,
   });
+  const graphPath = `/api/v1/projects/${project}/execution-graph`;
+  const repoInput = {
+    id: 'repository',
+    name: '仓库名',
+    referenceName: 'GIT_REPOSITORY_NAME',
+    type: 'REPOSITORY',
+    defaultValue: create.cloneUrl,
+  };
+  const graph = {
+    flows: [],
+    canvas: {
+      nodes: [
+        { id: 'default', name: '默认仓库', type: 'START' },
+        {
+          id: 'supplied',
+          name: '上游指定仓库',
+          type: 'START',
+          inputs: [{ ...repoInput, id: 'upstreamRepo' }],
+        },
+        {
+          id: 'checkout',
+          name: '手工配置检出节点',
+          type: 'FUNCTION',
+          operation: 'CHECKOUT',
+          inputs: [repoInput],
+        },
+        { id: 'end', name: '完成检出', type: 'END' },
+      ],
+      endpoints: [
+        { startId: 'default', endId: 'end' },
+        { startId: 'supplied', endId: 'end' },
+      ],
+      edges: [
+        { from: 'default', to: 'checkout' },
+        { from: 'supplied', to: 'checkout' },
+        { from: 'checkout', to: 'end' },
+      ],
+      templates: [],
+    },
+  };
+  const currentGraph = (await admin.get(graphPath).expect(200)).body.data;
+  const savedGraph = (
+    await admin
+      .put(graphPath + '/draft')
+      .send({ expectedRevision: currentGraph.revision, definition: graph })
+      .expect(200)
+  ).body.data;
+  const published = (
+    await admin
+      .post(graphPath + '/publish')
+      .send({ expectedRevision: savedGraph.revision })
+      .expect(201)
+  ).body.data;
+  for (const [flow, source] of [
+    ['default', 'DEFAULT'],
+    ['supplied', 'INPUT'],
+  ]) {
+    const preview = (
+      await admin
+        .post(`${graphPath}/flows/${flow}/preview`)
+        .send({
+          version: published.publishedVersion,
+          inputs: { parameters: flow === 'supplied' ? { upstreamRepo: id } : {} },
+        })
+        .expect(201)
+    ).body.data;
+    assert.equal(preview.checkouts[0].repositoryId, id);
+    assert.equal(preview.checkouts[0].commitSha, main);
+    const checkout = preview.nodes.find((node: { nodeId: string }) => node.nodeId === 'checkout');
+    const repository = checkout.inputs.find(
+      (field: { fieldId: string }) => field.fieldId === 'repository',
+    );
+    assert.equal(repository.source.kind, source);
+  }
+  await admin.delete(metadataPath).expect(409);
   await assert.rejects(metadata.checkoutGraphSource(other, shallow), /仓库不存在/);
   assert.deepEqual(
     await metadata.branchHeads(project, id, ['main', 'feature/release', 'not-found'], access),
@@ -423,7 +523,6 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     files: [{ path: 'services/web/.env', keys: ['SHOULD_NOT_SEND'] }],
   });
   assert.equal(environmentFiles.text.includes('env-file-private'), false);
-  const graphNodes = app.get(GraphNodeTasks);
   const currentSource = { repositoryId: id, commitSha: main, branch: 'main' };
   const configured = await graphNodes.prepareEnvironment(
     project,

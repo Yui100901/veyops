@@ -16,6 +16,7 @@ import type { ProjectDetail, User } from '../models';
 import { NodeMap } from './ExecutionGraphCanvas';
 import { ProjectGraphEditor } from './ExecutionGraphEditor';
 import { ExecutionGraphMigration } from './ExecutionGraphMigration';
+import { PublishedNodeDetails, showSelectedNode } from './ExecutionGraphNodeDetails';
 import { ExecutionGraphResourceLinks } from './ExecutionGraphResourceLinks';
 import {
   ExecutionGraphHistory,
@@ -25,9 +26,10 @@ import {
 import { ExecutionGraphStartList, ExecutionGraphStartStatus } from './ExecutionGraphStartStatus';
 import { ExecutionGraphTriggers } from './ExecutionGraphTriggers';
 import { GraphVersionTools } from './ExecutionGraphVersions';
-import { graphNodeLabels } from './execution-graph-definition';
+import { effectiveNodeType, graphNodeTypeLabel } from './execution-graph-definition';
 import type {
   GraphCanvas,
+  GraphCatalog,
   GraphDocument,
   GraphEdge,
   GraphFlow,
@@ -38,7 +40,6 @@ import {
   graphResourcePanel,
   graphReturnDelivery,
   graphScopeBackHref,
-  graphStartHref,
   graphStartReadiness,
   graphWorkbenchPath,
   type GraphPane,
@@ -48,7 +49,11 @@ import { readProjectWorkspace } from './project-workspace-route';
 import './execution-graph.css';
 import './graph-start.css';
 
-type PublishedGraph = { version: number; definition: GraphDocument['draft'] };
+type PublishedGraph = {
+  version: number;
+  definition: GraphDocument['draft'];
+  retiredAt?: number | null;
+};
 
 const emptyCanvas: GraphCanvas = { nodes: [], edges: [], endpoints: [], templates: [] };
 
@@ -189,6 +194,13 @@ function Workspace({
   const latest = useResource<PublishedGraph>(
     graph.publishedVersion ? path + '/versions/' + graph.publishedVersion : null,
   );
+  const runVersion = linkedVersion ?? graph.publishedVersion;
+  const previous = useResource<PublishedGraph>(
+    pane === 'run' && runVersion && runVersion !== graph.publishedVersion
+      ? path + '/versions/' + runVersion
+      : null,
+  );
+  const publishedRun = runVersion === graph.publishedVersion ? latest : previous;
 
   function panePath(next: GraphPane) {
     if (next === 'run' && returnStart) {
@@ -435,23 +447,20 @@ function Workspace({
         </p>
       )}
       {pane === 'run' && (
-        <Section
-          title="已发布执行图"
-          subtitle={graph.publishedVersion ? '版本 v' + graph.publishedVersion : undefined}
-        >
+        <Section title="已发布执行图" subtitle={runVersion ? '版本 v' + runVersion : undefined}>
           <div className="graph-fields">
-            <ErrorBanner error={latest.error} retry={() => void latest.reload()} />
+            <ErrorBanner error={publishedRun.error} retry={() => void publishedRun.reload()} />
             {invalidScope ? (
               <ErrorBanner error="所选服务或环境不在当前项目的可用资源中。" />
-            ) : graph.publishedVersion && latest.loading ? (
+            ) : runVersion && publishedRun.loading ? (
               <Loading />
-            ) : latest.data && latest.data.version === graph.publishedVersion ? (
+            ) : publishedRun.data && publishedRun.data.version === runVersion ? (
               <PublishedRun
-                key={`${latest.data.version}:${linkedStart ?? ''}:${linkedNode ?? ''}:${linkedFlow ?? ''}:${scope.serviceId ?? ''}:${scope.environmentId ?? ''}`}
-                published={latest.data}
+                key={`${publishedRun.data.version}:${linkedStart ?? ''}:${linkedNode ?? ''}:${linkedFlow ?? ''}:${scope.serviceId ?? ''}:${scope.environmentId ?? ''}`}
+                published={publishedRun.data}
                 project={project}
                 path={path}
-                canRun={canEdit}
+                canRun={canEdit && !publishedRun.data.retiredAt}
                 startId={linkedStart}
                 focusFieldId={linkedField}
                 inspectNodeId={linkedNode}
@@ -461,7 +470,7 @@ function Workspace({
                 onRun={openRun}
               />
             ) : (
-              !graph.publishedVersion && (
+              !runVersion && (
                 <>
                   <p>发布执行图后，开始节点会在这里提供运行入口。</p>
                   {canEdit && (
@@ -668,8 +677,9 @@ function PublishedRun({
   const start = selected?.nodes.find(({ type }) => type === 'START');
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
-    if (canRun && flow && !focusFieldId) heading.current?.focus();
-  }, [canRun, flow, focusFieldId]);
+    if (canRun && flow && !focusFieldId && !inspectNodeId)
+      heading.current?.focus({ preventScroll: true });
+  }, [canRun, flow, focusFieldId, inspectNodeId]);
   return (
     <>
       {scoped && (
@@ -679,7 +689,14 @@ function PublishedRun({
             flows={flows}
             project={project}
             scope={scope}
-            href={(entry) => graphStartHref(project.id, entry.id, scope)}
+            href={(entry) =>
+              '#' +
+              graphWorkbenchPath(project.id, {
+                ...scope,
+                start: entry.id,
+                version: published.version,
+              })
+            }
             selectedId={selected?.id}
             canRepair={canRun}
             version={published.version}
@@ -687,43 +704,20 @@ function PublishedRun({
         </div>
       )}
       {startId && !selected && <ErrorBanner error="当前发布版本中找不到此开始节点。" />}
-      {canRun && !scoped && <p>点击带有「手动运行」标识的开始节点，填写运行参数。</p>}
-      {canRun && flow && readiness && (
-        <div className="graph-properties graph-manual-start" key={flow.id}>
-          <div className="heading-actions">
-            <h3 ref={heading} tabIndex={-1}>
-              <Play size={17} aria-hidden="true" /> 运行 {flow.name}
-            </h3>
-          </div>
-          {start && (
-            <ExecutionGraphResourceLinks
-              node={start}
-              start={start}
-              flow={flow}
-              flowId={flow.id}
-              pane="run"
-              project={project}
-              scope={scope}
-            />
-          )}
-          <ExecutionGraphStart
-            project={project}
-            path={path}
-            flow={flow}
-            version={published.version}
-            initialInputs={initialInputs}
-            workbenchScope={scope}
-            drafts={drafts}
-            focusFieldId={focusFieldId}
-            onRun={onRun}
-          />
-        </div>
-      )}
+      {published.retiredAt && <p className="field-note">此版本已停用，可查看节点配置。</p>}
       <PublishedNodes
         definition={published.definition}
+        path={path}
+        project={project}
+        version={published.version}
         initialNodeId={inspectNodeId ?? start?.id}
+        scrollToInitialNode={Boolean(inspectNodeId && !focusFieldId)}
         initialFlowId={inspectFlowId ?? selected?.id}
         runFlowId={canRun ? flow?.id : undefined}
+        onRunSetup={() => {
+          heading.current?.scrollIntoView({ block: 'nearest' });
+          heading.current?.focus({ preventScroll: true });
+        }}
         runnableFlowIds={
           new Set(
             flows
@@ -734,7 +728,14 @@ function PublishedRun({
         onChooseFlow={
           canRun
             ? (item) =>
-                item && navigate(graphWorkbenchPath(project.id, { ...scope, start: item.id }))
+                navigate(
+                  graphWorkbenchPath(project.id, {
+                    ...scope,
+                    start: item.id,
+                    node: item.nodes.find(({ type }) => type === 'START')?.id,
+                    version: published.version,
+                  }),
+                )
             : undefined
         }
         renderResources={(node, inspectedFlow) => {
@@ -759,6 +760,7 @@ function PublishedRun({
                 start={inspectedFlow?.nodes.find(({ type }) => type === 'START')}
                 flow={inspectedFlow}
                 flowId={inspectedFlow?.id}
+                version={published.version}
                 pane="run"
                 project={project}
                 scope={scope}
@@ -767,6 +769,38 @@ function PublishedRun({
           );
         }}
       />
+      {canRun && flow && readiness && (
+        <div className="graph-properties graph-manual-start" key={flow.id}>
+          <div className="heading-actions">
+            <h3 ref={heading} tabIndex={-1}>
+              <Play size={17} aria-hidden="true" /> 运行 {flow.name}
+            </h3>
+          </div>
+          {start && (
+            <ExecutionGraphResourceLinks
+              node={start}
+              start={start}
+              flow={flow}
+              flowId={flow.id}
+              pane="run"
+              version={published.version}
+              project={project}
+              scope={scope}
+            />
+          )}
+          <ExecutionGraphStart
+            project={project}
+            path={path}
+            flow={flow}
+            version={published.version}
+            initialInputs={initialInputs}
+            workbenchScope={scope}
+            drafts={drafts}
+            focusFieldId={focusFieldId}
+            onRun={onRun}
+          />
+        </div>
+      )}
     </>
   );
 }
@@ -974,7 +1008,11 @@ function PublishedVersions({
                 <PublishedNodes
                   key={`${live.version}:${linkedNode ?? ''}:${linkedFlow ?? ''}`}
                   definition={live.definition}
+                  path={path}
+                  project={project}
+                  version={live.version}
                   initialNodeId={linkedNode}
+                  scrollToInitialNode={Boolean(linkedNode)}
                   initialFlowId={linkedFlow}
                   renderResources={(node, flow) => (
                     <ExecutionGraphResourceLinks
@@ -1015,24 +1053,40 @@ function edgeKey({ from, to, when }: GraphEdge) {
 
 function PublishedNodes({
   definition,
+  path,
+  project,
+  version,
   onChooseFlow,
   initialNodeId,
+  scrollToInitialNode,
   initialFlowId,
   runnableFlowIds,
   runFlowId,
+  onRunSetup,
   renderResources,
 }: {
   definition: GraphDocument['draft'];
-  onChooseFlow?: (flow: GraphFlow | undefined) => void;
+  path: string;
+  project: ProjectDetail;
+  version: number;
+  onChooseFlow?: (flow: GraphFlow) => void;
   initialNodeId?: string;
+  scrollToInitialNode?: boolean;
   initialFlowId?: string;
   runnableFlowIds?: ReadonlySet<string>;
   runFlowId?: string;
+  onRunSetup?: () => void;
   renderResources?: (node: GraphNode, flow?: GraphFlow) => React.ReactNode;
 }) {
+  const catalog = useResource<GraphCatalog>(path + '/catalog');
   const [selected, setSelected] = useState(initialNodeId ?? '');
   const [hovered, setHovered] = useState<string>();
   const [legacyId, setLegacyId] = useState(initialFlowId ?? '');
+  const [inspectionFlowId, setInspectionFlowId] = useState(initialFlowId);
+  const nodeDetail = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (scrollToInitialNode) showSelectedNode(nodeDetail.current);
+  }, [scrollToInitialNode]);
   const flow: GraphFlow | undefined = definition.canvas
     ? {
         id: 'canvas',
@@ -1056,9 +1110,10 @@ function PublishedNodes({
   );
   const inspectedFlow =
     flowsByStart.get(selected) ??
-    flowsWithNode.find(({ id }) => id === (definition.canvas ? initialFlowId : flow.id)) ??
-    (flowsWithNode.length === 1 ? flowsWithNode[0] : undefined);
-  const highlight = flowsByStart.get(hovered ?? selected);
+    flowsWithNode.find(({ id }) => id === (definition.canvas ? inspectionFlowId : flow.id)) ??
+    flowsWithNode[0];
+  const inspectedNode = inspectedFlow?.nodes.find(({ id }) => id === selected) ?? node;
+  const highlight = (hovered && flowsByStart.get(hovered)) || flowsByStart.get(selected);
   const highlightedEdges = new Set(highlight?.edges.map(edgeKey));
   return (
     <>
@@ -1069,7 +1124,6 @@ function PublishedNodes({
             onChange={(e) => {
               setLegacyId(e.target.value);
               setSelected('');
-              onChooseFlow?.(undefined);
             }}
           >
             {definition.flows.map(({ id, name }) => (
@@ -1080,71 +1134,81 @@ function PublishedNodes({
           </select>
         </Field>
       )}
-      <NodeMap
-        flow={flow}
-        selected={selected ? [selected] : []}
-        highlighted={new Set(highlight?.nodes.map(({ id }) => id))}
-        highlightEdges={
-          new Set(flow.edges.flatMap((edge, i) => (highlightedEdges.has(edgeKey(edge)) ? [i] : [])))
-        }
-        onHighlight={setHovered}
-        isRunnableStart={onChooseFlow ? (id) => Boolean(runnable(id)) : undefined}
-        onSelect={(id) => {
-          setSelected(id);
-          onChooseFlow?.(flowsByStart.get(id));
-        }}
-      />
-      {node && !selectedFlow && (
-        <div className="graph-properties">
-          <strong>
-            {node.name} · {graphNodeLabels[node.type]}
-          </strong>
-          {renderResources?.(node, inspectedFlow)}
-          {node.message && <p>{node.message}</p>}
-          {node.checkout && <p>{node.checkout.fullClone ? '全量历史' : '浅拉取'}</p>}
-          {node.shell?.command && <pre>{node.shell.command}</pre>}
-          {node.condition && (
-            <p>
-              {node.condition.key === 'input' ? '运行参数' : '提交 SHA'} 等于 {node.condition.value}
-            </p>
-          )}
-          {node.switch && (
-            <p>
-              {node.switch.key === 'input' ? '运行参数' : '提交 SHA'} · 匹配项{' '}
-              {node.switch.cases.join('、')}
-            </p>
-          )}
-          {node.type === 'DELAY' && <p>等待 {node.delaySeconds} 秒</p>}
-          {(node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW') && (
-            <p>管理员审批 · {node.approval?.timeoutSeconds ?? 86400} 秒后超时</p>
-          )}
-          {node.type === 'APPROVAL' && node.approval?.releaseNodeId && (
-            <p>
-              审批范围 ·{' '}
-              {definition.flows
-                .flatMap((flow) => flow.nodes)
-                .find(({ id }) => id === node.approval?.releaseNodeId)?.name ??
-                node.approval.releaseNodeId}
-            </p>
-          )}
-          {node.healthCheck?.command && <pre>{node.healthCheck.command}</pre>}
-          {node.deploy?.method && (
-            <p>{node.deploy.method === 'COMPOSE' ? 'Docker Compose 部署' : '文件部署'}</p>
-          )}
-          {node.flowId && (
-            <p>
-              子执行流 ·{' '}
-              {definition.flows.find((item) => item.id === node.flowId)?.name ?? node.flowId}
-            </p>
-          )}
-          {node.inputs?.length ? (
-            <p>声明输入 · {node.inputs.map(({ name }) => name).join('、')}</p>
-          ) : null}
-          {node.outputs?.length ? (
-            <p>声明输出 · {node.outputs.map(({ name }) => name).join('、')}</p>
-          ) : null}
+      <div className="graph-node-layout">
+        <div className="graph-node-layout-inner">
+          <NodeMap
+            flow={flow}
+            selected={selected ? [selected] : []}
+            highlighted={new Set(highlight?.nodes.map(({ id }) => id))}
+            highlightEdges={
+              new Set(
+                flow.edges.flatMap((edge, i) => (highlightedEdges.has(edgeKey(edge)) ? [i] : [])),
+              )
+            }
+            onHighlight={setHovered}
+            isRunnableStart={onChooseFlow ? (id) => Boolean(runnable(id)) : undefined}
+            onSelect={(id) => {
+              setSelected(id);
+              const start = runnable(id);
+              if (start && start.id !== runFlowId) onChooseFlow?.(start);
+              window.requestAnimationFrame(() => showSelectedNode(nodeDetail.current));
+            }}
+          />
+          <article ref={nodeDetail} className="graph-node-detail" aria-label="发布节点详情">
+            {node && inspectedNode ? (
+              <>
+                <header>
+                  <div>
+                    <h3 aria-live="polite">{node.name}</h3>
+                    <small>
+                      {graphNodeTypeLabel(node)} · v{version}
+                    </small>
+                  </div>
+                  {selectedFlow && onRunSetup && (
+                    <button type="button" className="button primary small" onClick={onRunSetup}>
+                      <Play size={15} /> 填写运行参数
+                    </button>
+                  )}
+                </header>
+                {definition.canvas &&
+                flowsWithNode.length > 1 &&
+                effectiveNodeType(node) !== 'START' ? (
+                  <Field label="执行流">
+                    <select
+                      value={inspectedFlow?.id ?? ''}
+                      onChange={(e) => setInspectionFlowId(e.target.value)}
+                    >
+                      {flowsWithNode.map(({ id, name }) => (
+                        <option key={id} value={id}>
+                          {name}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                ) : (
+                  inspectedFlow && <p className="field-note">所属执行流 · {inspectedFlow.name}</p>
+                )}
+                {renderResources?.(inspectedNode, inspectedFlow)}
+                {catalog.error && <ErrorBanner error={catalog.error} retry={catalog.reload} />}
+                <PublishedNodeDetails
+                  node={inspectedNode}
+                  flow={inspectedFlow}
+                  definition={definition}
+                  catalog={catalog.data}
+                  project={project}
+                />
+              </>
+            ) : (
+              <>
+                <h3>节点详情</h3>
+                <p className="field-note">
+                  {selected ? '此版本中找不到所选节点。' : '在画布上选择节点查看配置。'}
+                </p>
+              </>
+            )}
+          </article>
         </div>
-      )}
+      </div>
     </>
   );
 }

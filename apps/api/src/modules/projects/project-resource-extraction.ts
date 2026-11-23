@@ -142,7 +142,11 @@ function bindingReferences(
   return [];
 }
 
-function nodeReferences(source: ReferenceSource, node: GraphNode) {
+function nodeReferences(
+  source: ReferenceSource,
+  node: GraphNode,
+  ports = graphModulePorts(node)?.inputs ?? [],
+) {
   const legacy = objectValue((node as GraphNode & { delivery?: unknown }).delivery);
   const oldBuild = objectValue(legacy.build);
   return [
@@ -174,6 +178,7 @@ function nodeReferences(source: ReferenceSource, node: GraphNode) {
       ...fieldReferences(source, field, field.defaultValue),
       ...(field.type === 'ENVIRONMENT_SET' ? fieldReferences(source, field, field.options) : []),
     ]),
+    ...ports.flatMap((field) => fieldReferences(source, field, node.inputDefaults?.[field.id])),
   ];
 }
 
@@ -248,13 +253,18 @@ function flowReferences(source: ReferenceSource, flow: GraphFlow, flows: Map<str
           bindings?.environment,
           fields,
           'ENVIRONMENT',
-          defaultEnvironment,
+          idValue(node.inputDefaults?.environment) ?? defaultEnvironment,
         ),
-        serviceId: authoredScope(bindings?.service, fields, 'SERVICE', defaultService),
+        serviceId: authoredScope(
+          bindings?.service,
+          fields,
+          'SERVICE',
+          idValue(node.inputDefaults?.service) ?? defaultService,
+        ),
       };
       const ports = graphModulePorts(node, flows.get(node.flowId ?? ''))?.inputs ?? [];
       return [
-        ...nodeReferences(nodeSource, node),
+        ...nodeReferences(nodeSource, node, ports),
         ...ports.flatMap((field) => bindingReferences(nodeSource, field, bindings?.[field.id])),
         ...Object.entries(flow.environmentBindings?.[node.id] ?? {}).flatMap(([key, binding]) =>
           bindingReferences(nodeSource, { id: key, name: key, type: 'TEXT' }, binding),
@@ -287,7 +297,11 @@ export function graphResourceReferences(
   ];
   rows.push(
     ...rawNodes.flatMap((node) =>
-      nodeReferences({ ...context, nodeId: node.id, nodeName: node.name }, node),
+      nodeReferences(
+        { ...context, nodeId: node.id, nodeName: node.name },
+        node,
+        graphModulePorts(node, flows.get(node.flowId ?? ''))?.inputs ?? [],
+      ),
     ),
   );
   // Drafts may keep endpoint bindings whose control path is temporarily incomplete.

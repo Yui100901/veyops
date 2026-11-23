@@ -100,7 +100,10 @@ export function ExecutionGraphResourceLinks({
     const values = Array.isArray(field.defaultValue) ? field.defaultValue : [field.defaultValue];
     for (const value of values) add(resource, value);
   }
-  add('repositories', node.checkout?.repositoryId ?? node.build?.repositoryId);
+  add(
+    'repositories',
+    node.inputDefaults?.repository ?? node.checkout?.repositoryId ?? node.build?.repositoryId,
+  );
   add('servers', node.shell?.serverId);
   if (node.type === 'START') {
     add('services', flow?.serviceId);
@@ -110,6 +113,7 @@ export function ExecutionGraphResourceLinks({
   }
   const bindings = flow?.inputBindings?.[node.id];
   for (const [port, type] of Object.entries(ports)) {
+    add(relationFields[type], node.inputDefaults?.[port]);
     const binding = bindings?.[port];
     if (binding?.kind === 'VALUE') add(relationFields[type], binding.value);
     if (binding?.kind === 'INPUT') {

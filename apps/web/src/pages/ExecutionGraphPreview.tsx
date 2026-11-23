@@ -180,7 +180,9 @@ export interface Preview extends DeliveryPreview {
     branch?: string;
     tag?: string;
     commitSha: string;
-    fullClone: boolean;
+    fullClone?: boolean;
+    fetchMode?: 'LATEST' | 'FULL';
+    fetchModeDeferred?: boolean;
   })[];
   scripts?: (NodeScope & {
     serverId?: string;
@@ -195,6 +197,11 @@ export interface Preview extends DeliveryPreview {
     variables: PlanVariable[];
     deferred: DeferredBinding[];
   };
+}
+
+function checkoutModeLabel(checkout: NonNullable<Preview['checkouts']>[number]) {
+  if (checkout.fetchModeDeferred) return '拉取方式由上游运行结果确定';
+  return checkout.fetchMode === 'FULL' || checkout.fullClone ? '完整拉取' : '拉取最新';
 }
 
 const sourceNames: Record<string, string> = {
@@ -351,10 +358,17 @@ const policyNames = {
   REPOSITORY_DEFAULT: '缺值时采用仓库默认分支',
 };
 
-function displayEvidenceValue(field: GraphFieldEvidence) {
+function displayEvidenceValue(
+  field: GraphFieldEvidence,
+  repositoryName?: (id: string) => string | undefined,
+) {
   if (field.sensitive || field.type === 'CREDENTIAL' || field.source?.kind === 'CREDENTIAL')
     return '敏感引用';
   const value = field.value;
+  if (field.type === 'REPOSITORY' && typeof value === 'string')
+    return repositoryName?.(value) ?? value;
+  if (field.type === 'GIT_FETCH_MODE' && (value === 'FULL' || value === 'LATEST'))
+    return value === 'FULL' ? '完整拉取' : '拉取最新';
   if (typeof value === 'string') return value === '' ? '空字符串' : value;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) return value.length + ' 项';
@@ -376,17 +390,21 @@ function displayEvidenceValue(field: GraphFieldEvidence) {
 export function FieldEvidenceList({
   title,
   fields,
+  expanded,
   linkSource,
   nameSource,
+  repositoryName,
 }: {
   title: string;
   fields?: GraphFieldEvidence[];
+  expanded?: boolean;
   linkSource?: (source: GraphFieldSource) => string | undefined;
   nameSource?: (id: string) => string | undefined;
+  repositoryName?: (id: string) => string | undefined;
 }) {
   if (!fields?.length) return null;
   return (
-    <details className="graph-field-card">
+    <details className="graph-field-card" open={expanded}>
       <summary>
         {title} · {fields.length} 项
       </summary>
@@ -404,7 +422,7 @@ export function FieldEvidenceList({
             ]
               .filter(Boolean)
               .join(' · ');
-          const value = displayEvidenceValue(field);
+          const value = displayEvidenceValue(field, repositoryName);
           return (
             <div key={field.fieldId}>
               <dt>
@@ -740,7 +758,7 @@ export function ExecutionPlan({
               <span>
                 {checkout.repositoryName ?? name.repository(checkout.repositoryId)} ·{' '}
                 {checkout.branch ?? (checkout.tag ? `标签 ${checkout.tag}` : '指定提交')} ·{' '}
-                {checkout.fullClone ? '完整历史' : '浅拉取'}
+                {checkoutModeLabel(checkout)}
               </span>
               <code>{checkout.commitSha}</code>
               {(checkout.ref || checkout.versionSource) && (
@@ -1108,8 +1126,13 @@ function reviewRows(preview: Preview, project: ProjectDetail) {
       'checkouts',
       checkout,
       'commit',
-      '源码提交',
-      [name.repository(checkout.repositoryId), checkout.branch ?? checkout.tag, checkout.commitSha]
+      '源码与检出方式',
+      [
+        name.repository(checkout.repositoryId),
+        checkout.branch ?? checkout.tag,
+        checkout.commitSha,
+        checkoutModeLabel(checkout),
+      ]
         .filter(Boolean)
         .join(' · '),
     );

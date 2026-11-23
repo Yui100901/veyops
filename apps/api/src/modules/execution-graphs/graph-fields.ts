@@ -10,6 +10,7 @@ import {
   isUUID,
 } from 'class-validator';
 import { isGitBranchName } from '../projects/git-ref';
+import { graphRepositoryUrl } from '../projects/http-clone-url';
 import { relativePath } from '../pipelines/pipeline.validation';
 import { redactTaskLog } from '../tasks/task-log.service';
 import type { GraphFlow, GraphNode } from './execution-graph-definition';
@@ -18,6 +19,8 @@ export const graphIdFormat = /^[A-Za-z0-9_-]{1,64}$/;
 export const graphReferenceFormat = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 export const graphEnvironmentKeyFormat = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 export const graphArtifactTypes = ['FILE', 'DIRECTORY', 'DOCKER_IMAGE'] as const;
+export const graphGitFetchModes = ['LATEST', 'FULL'] as const;
+export type GraphGitFetchMode = (typeof graphGitFetchModes)[number];
 export const graphMissingPolicies = ['ERROR', 'OMIT', 'USE_DEFAULT', 'REPOSITORY_DEFAULT'] as const;
 export const graphFieldTypes = {
   TEXT: '文本',
@@ -25,6 +28,7 @@ export const graphFieldTypes = {
   BOOLEAN: '布尔值',
   REPOSITORY: '项目仓库',
   GIT_REF: 'Git 版本',
+  GIT_FETCH_MODE: '拉取方式',
   ENVIRONMENT: '项目环境',
   ENVIRONMENT_SET: '环境变量集合',
   SERVICE: '项目服务',
@@ -150,6 +154,7 @@ function scalar(field: GraphField, value: unknown): boolean {
     case 'BOOLEAN':
       return typeof value === 'boolean';
     case 'REPOSITORY':
+      return uuid(value) || Boolean(graphRepositoryUrl(value));
     case 'ENVIRONMENT':
     case 'ENVIRONMENT_SET':
     case 'CREDENTIAL':
@@ -167,6 +172,8 @@ function scalar(field: GraphField, value: unknown): boolean {
           ? sha(value.value)
           : (value.kind === 'BRANCH' || value.kind === 'TAG') && isGitBranchName(value.value))
       );
+    case 'GIT_FETCH_MODE':
+      return graphGitFetchModes.some((mode) => mode === value);
     case 'PATH':
       return path(value);
     case 'IMAGE':
@@ -253,7 +260,11 @@ export function validateGraphValue(field: GraphField, value: unknown): boolean {
   );
 }
 
-export function validateGraphField(field: GraphField, declaration: 'INPUT' | 'OUTPUT') {
+export function validateGraphField(
+  field: GraphField,
+  declaration: 'INPUT' | 'OUTPUT',
+  functional = false,
+) {
   if (
     !field ||
     !safeGraphId(field.id) ||
@@ -277,7 +288,7 @@ export function validateGraphField(field: GraphField, declaration: 'INPUT' | 'OU
     field.options &&
     (!Array.isArray(field.options) ||
       field.options.length > 100 ||
-      !['TEXT', 'NUMBER', 'BOOLEAN', 'ENVIRONMENT_SET'].includes(field.type) ||
+      !['TEXT', 'NUMBER', 'BOOLEAN', 'ENVIRONMENT_SET', 'GIT_FETCH_MODE'].includes(field.type) ||
       field.options.some(
         (option) =>
           !scalar(field, option) ||
@@ -292,13 +303,14 @@ export function validateGraphField(field: GraphField, declaration: 'INPUT' | 'OU
     return '字段导出名无效';
   if (
     field.defaultValue !== undefined &&
-    (declaration !== 'INPUT' ||
+    ((!functional && declaration !== 'INPUT') ||
       field.selection !== undefined ||
       !validateGraphValue({ ...field, required: true }, field.defaultValue) ||
       redactTaskLog(JSON.stringify(field.defaultValue)) !== JSON.stringify(field.defaultValue))
   )
     return '默认值不符合字段类型或与取值规则冲突';
   if (
+    !functional &&
     declaration === 'INPUT' &&
     ['WORKSPACE', 'SOURCE', 'RELEASE', 'REVIEW', 'REPORT', 'VARIABLES'].includes(field.type)
   )
@@ -418,7 +430,15 @@ const branchValue = {
 const graphModules = {
   CHECKOUT: modulePorts(
     'git.checkout',
-    [field('repository', 'REPOSITORY', true), field('version', 'GIT_REF')],
+    [
+      field('repository', 'REPOSITORY', true),
+      field('version', 'GIT_REF'),
+      {
+        ...field('fetchMode', 'GIT_FETCH_MODE', true),
+        defaultValue: 'LATEST',
+        options: [...graphGitFetchModes],
+      },
+    ],
     [
       field('source', 'SOURCE', true),
       field('workspace', 'WORKSPACE', true),
@@ -428,6 +448,8 @@ const graphModules = {
       field('branch', 'TEXT', false, '实际分支'),
       field('tag', 'TEXT', false, '实际标签'),
       field('commitSha', 'TEXT', true, '实际 Git SHA'),
+      field('version', 'GIT_REF', true, '实际提交版本'),
+      field('fetchMode', 'GIT_FETCH_MODE', true, '实际拉取方式'),
       field('subject', 'TEXT', false, '提交摘要'),
     ],
   ),
@@ -519,7 +541,10 @@ export const graphCatalog = {
   modules: graphModules,
 };
 
-export function graphModulePorts(node: GraphNode, calledFlow?: GraphFlow): ModulePorts | undefined {
+export function graphOperationPorts(
+  node: GraphNode,
+  calledFlow?: GraphFlow,
+): ModulePorts | undefined {
   const definition = (graphModules as Partial<Record<GraphNode['type'], ModulePorts>>)[node.type];
   if (!definition) return undefined;
   if (node.type === 'SOURCE_REVIEW' && node.approval?.buildNodeId)
@@ -533,15 +558,11 @@ export function graphModulePorts(node: GraphNode, calledFlow?: GraphFlow): Modul
   if (node.type === 'SHELL' || node.type === 'CHECK')
     return {
       ...definition,
-      inputs: [...definition.inputs, ...(node.shell?.params ?? [])],
-      outputs: [
-        ...definition.outputs.map((port) =>
-          port.id === 'workspace' && node.shell?.location === 'MANAGER'
-            ? { ...port, required: true }
-            : port,
-        ),
-        ...(node.outputs ?? node.shell?.outputs ?? []),
-      ],
+      outputs: definition.outputs.map((port) =>
+        port.id === 'workspace' && node.shell?.location === 'MANAGER'
+          ? { ...port, required: true }
+          : port,
+      ),
     };
   const artifacts =
     node.type === 'BUILD'
@@ -574,11 +595,105 @@ export function graphModulePorts(node: GraphNode, calledFlow?: GraphFlow): Modul
   return { ...definition, inputs };
 }
 
+function scriptDeclarations(node: GraphNode, kind: 'inputs' | 'outputs'): GraphField[] {
+  return (
+    node[kind]?.map((field) => ({
+      ...field,
+      exportName: field.referenceName ?? field.id,
+      required: true,
+    })) ?? []
+  );
+}
+
+export function graphScriptInputs(node: GraphNode): GraphField[] {
+  if (node.type !== 'SHELL' && node.type !== 'CHECK') return [];
+  if (!node.declaredPorts || node.inputs === undefined) return node.shell?.params ?? [];
+  const native = new Set(shellInputs.map(({ id }) => id));
+  return scriptDeclarations(node, 'inputs').filter(({ id }) => !native.has(id));
+}
+
+export function graphScriptOutputs(node: GraphNode): GraphField[] {
+  if (node.type !== 'SHELL' && node.type !== 'CHECK') return [];
+  if (!node.declaredPorts || node.outputs === undefined)
+    return node.outputs ?? node.shell?.outputs ?? [];
+  const native = new Set(shellOutputs.map(({ id }) => id));
+  return scriptDeclarations(node, 'outputs').filter(({ id }) => !native.has(id));
+}
+
+function exposedPorts(standard: GraphField[], declared?: GraphField[]) {
+  if (!declared) return standard;
+  const byId = new Map(declared.map((field) => [field.id, field]));
+  return standard.map((field) => {
+    const declaration = byId.get(field.id);
+    if (!declaration) return field;
+    const { name, referenceName, defaultValue } = declaration;
+    return {
+      ...field,
+      name,
+      referenceName: referenceName ?? field.referenceName,
+      defaultValue: defaultValue ?? field.defaultValue,
+      required: true,
+    };
+  });
+}
+
+export function graphModulePorts(node: GraphNode, calledFlow?: GraphFlow): ModulePorts | undefined {
+  const runtime =
+    node.type === 'FUNCTION' && node.operation
+      ? { ...node, type: node.operation, declaredPorts: true }
+      : node;
+  const ports = graphOperationPorts(runtime, calledFlow);
+  if (!ports) return undefined;
+  const inputs = [
+    ...exposedPorts(ports.inputs, runtime.declaredPorts ? node.inputs : undefined),
+    ...graphScriptInputs(runtime),
+  ];
+  return {
+    ...ports,
+    inputs: inputs.map((port) => {
+      if (
+        runtime.declaredPorts &&
+        node.inputs?.some(({ id, defaultValue }) => id === port.id && defaultValue !== undefined)
+      )
+        return port;
+      if (Object.hasOwn(node.inputDefaults ?? {}, port.id))
+        return { ...port, defaultValue: node.inputDefaults?.[port.id] };
+      if (port.id === 'fetchMode' && runtime.type === 'CHECKOUT' && node.checkout?.fullClone)
+        return { ...port, defaultValue: 'FULL' };
+      return port;
+    }),
+    outputs: [
+      ...exposedPorts(ports.outputs, runtime.declaredPorts ? node.outputs : undefined),
+      ...graphScriptOutputs(runtime),
+    ],
+  };
+}
+
+export function graphNodeEnvironmentBindings(
+  flow: GraphFlow,
+  node: GraphNode,
+): Record<string, GraphBinding> {
+  return {
+    ...Object.fromEntries(
+      Object.entries(node.environmentDefaults ?? {}).map(([key, value]) => [
+        key,
+        { kind: 'VALUE' as const, value },
+      ]),
+    ),
+    ...flow.environmentBindings?.[node.id],
+  };
+}
+
 export function graphDefaultBinding(
   flow: GraphFlow,
   node: GraphNode,
   fieldId: string,
 ): GraphBinding | undefined {
+  const declared = node.declaredPorts && node.inputs?.find(({ id }) => id === fieldId);
+  if (declared && declared.defaultValue !== undefined)
+    return { kind: 'VALUE', value: declared.defaultValue };
+  if (Object.hasOwn(node.inputDefaults ?? {}, fieldId))
+    return { kind: 'VALUE', value: node.inputDefaults?.[fieldId] };
   if (fieldId === 'repository') {
     const repository = node.checkout?.repositoryId ?? node.build?.repositoryId;
     if (repository) return { kind: 'VALUE', value: repository };

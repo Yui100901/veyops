@@ -19,7 +19,15 @@ export const graphNodeLabels = {
   JOIN: '汇合',
   FLOW_CALL: '调用执行流',
   END: '结束',
+  FUNCTION: '功能节点',
 };
+export type GraphOperation = Exclude<
+  keyof typeof graphNodeLabels,
+  'FUNCTION' | 'START' | 'END' | 'CONDITION' | 'SWITCH'
+>;
+export const graphOperations = Object.keys(graphNodeLabels).filter(
+  (type) => !['FUNCTION', 'START', 'END', 'CONDITION', 'SWITCH'].includes(type),
+) as GraphOperation[];
 export interface GraphEdge {
   from: string;
   to: string;
@@ -31,6 +39,7 @@ export type GraphFieldType =
   | 'BOOLEAN'
   | 'REPOSITORY'
   | 'GIT_REF'
+  | 'GIT_FETCH_MODE'
   | 'ENVIRONMENT'
   | 'ENVIRONMENT_SET'
   | 'SERVICE'
@@ -83,6 +92,7 @@ export interface GraphNodeDirectory {
   inputs: GraphField[];
   outputs: GraphField[];
   candidates: GraphCandidate[];
+  automaticInputBindings?: Record<string, GraphBinding>;
 }
 export interface GraphFieldSource {
   kind: string;
@@ -184,6 +194,9 @@ export type GraphEnvironmentSetSummary = { id: string; name: string; revision: n
 export interface GraphNode {
   id: string;
   type: keyof typeof graphNodeLabels;
+  operation?: GraphOperation;
+  inputDefaults?: Record<string, unknown>;
+  environmentDefaults?: Record<string, string>;
   name: string;
   referenceName?: string;
   message?: string;
@@ -217,6 +230,20 @@ export interface GraphNode {
   healthCheck?: { command: string; timeoutSeconds?: number };
   flowId?: string;
   position?: { x: number; y: number };
+}
+
+export function effectiveNodeType(node: Pick<GraphNode, 'type' | 'operation'>) {
+  return node.type === 'FUNCTION' ? (node.operation ?? 'SHELL') : node.type;
+}
+
+export function graphNodeTypeLabel(node: Pick<GraphNode, 'type' | 'operation'>) {
+  return graphNodeLabels[effectiveNodeType(node)];
+}
+
+export function graphNodeFamily(node: Pick<GraphNode, 'type'>) {
+  if (node.type === 'START' || node.type === 'END') return 'boundary';
+  if (node.type === 'CONDITION' || node.type === 'SWITCH') return 'condition';
+  return 'function';
 }
 export interface FlowBindings {
   serviceId?: string;
@@ -295,11 +322,12 @@ export function orderedNodes(flow: GraphFlow) {
 }
 
 export function isDeliveryNode(node: GraphNode) {
-  return node.type === 'BUILD' || isReleaseNode(node);
+  return effectiveNodeType(node) === 'BUILD' || isReleaseNode(node);
 }
 
-export function isReleaseNode(node: { type: string }) {
-  return node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT';
+export function isReleaseNode(node: { type: string; operation?: GraphOperation }) {
+  const type = node.type === 'FUNCTION' ? node.operation : node.type;
+  return type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT';
 }
 
 export function branchOptions(

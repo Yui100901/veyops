@@ -1,0 +1,109 @@
+.graph-node-layout {
+  container-type: inline-size;
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.graph-node-layout-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.graph-node-detail,
+.graph-node-detail-section,
+.graph-node-execution-config {
+  display: grid;
+  gap: 0.7rem;
+  min-width: 0;
+}
+
+.graph-node-detail {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  background: var(--surface, #fff);
+  overflow-wrap: anywhere;
+  scroll-margin-top: 1rem;
+}
+
+.graph-node-detail > header {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.55rem;
+}
+
+.graph-node-detail > header > div {
+  display: grid;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.graph-node-detail-section {
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--border);
+}
+
+.graph-node-detail-section h4,
+.graph-node-settings,
+.graph-node-settings dd {
+  margin: 0;
+}
+
+.graph-node-settings {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.graph-node-settings > div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.graph-node-settings dt {
+  font-weight: 600;
+}
+
+.graph-node-settings dt small {
+  font-weight: 400;
+}
+
+.graph-node-detail pre {
+  max-height: 24rem;
+  overflow: auto;
+  margin: 0;
+  padding: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: #f5f8fc;
+  white-space: pre-wrap;
+}
+
+.graph-node-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.graph-node-execution-config:empty {
+  display: none;
+}
+
+.graph-node-location {
+  width: min(100%, 24rem);
+}
+
+.graph-node-location .field {
+  margin: 0;
+}
+
+@container (min-width: 52rem) {
+  .graph-node-layout-inner:has(> .graph-canvas) {
+    grid-template-columns: minmax(0, 1fr) minmax(19rem, 35%);
+  }
+}

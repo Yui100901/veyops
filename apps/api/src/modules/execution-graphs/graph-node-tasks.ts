@@ -45,7 +45,13 @@ import { ServiceConfigsService } from '../service-configs/service-configs.servic
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import type { CreateTaskInput, TaskExecutionContext, TaskRecord } from '../tasks/tasks.types';
 import type { GraphNode } from './execution-graph-definition';
-import { validateGraphValue, type GraphField } from './graph-fields';
+import {
+  graphScriptInputs,
+  graphScriptOutputs,
+  validateGraphValue,
+  type GraphField,
+  type GraphGitFetchMode,
+} from './graph-fields';
 import { graphNodeRequiresIsolation, isGraphTriggerKind } from './graph-automatic-delivery';
 import { GraphScriptOutput } from './graph-script-output';
 import { graphReleaseResult, type GraphReleaseResult } from './graph-release-gates';
@@ -92,10 +98,11 @@ export interface GraphNodeScope {
   nodeEnvironment?: ExecutionVariables;
   nodeEnvironmentSources?: GraphVariableSource[];
   credentialNonces?: Readonly<Record<string, string>>;
+  fetchModeDeferred?: boolean;
 }
 
 export type GraphNodePlan =
-  | { type: 'CHECKOUT'; source: GraphCheckoutSnapshot }
+  | { type: 'CHECKOUT'; source: GraphCheckoutSnapshot; fetchModeDeferred?: boolean }
   | { type: 'HEALTH_CHECK' }
   | {
       type: ScriptNode;
@@ -164,13 +171,34 @@ export function graphCheckoutOutputs(
   snapshot: GraphCheckoutSnapshot,
   workspace?: GraphWorkspaceRef,
   subject?: string,
+  fetchModeDeferred = false,
 ): Record<string, unknown> {
   const { repositoryId, repositoryName, branch, tag, commitSha, fullClone } = snapshot;
   const ref =
     snapshot.ref ?? (branch ? 'refs/heads/' + branch : tag ? 'refs/tags/' + tag : commitSha);
   const metadata = { repositoryId, repositoryName, ref, branch, tag, commitSha, subject };
-  const source = { ...metadata, fullClone };
-  return { ...metadata, source, workspace: workspace ? { ...workspace, subject } : source };
+  const source = { ...metadata, ...(!fetchModeDeferred && { fullClone }) };
+  return {
+    ...metadata,
+    version: { kind: 'COMMIT', value: commitSha },
+    ...(!fetchModeDeferred && { fetchMode: graphCheckoutFetchMode(fullClone) }),
+    source,
+    workspace: workspace ? { ...workspace, subject } : source,
+  };
+}
+
+export function graphCheckoutFetchMode(fullClone: boolean): GraphGitFetchMode {
+  return fullClone ? 'FULL' : 'LATEST';
+}
+
+function checkoutFullClone(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (value === 'FULL' || value === 'LATEST') return value === 'FULL';
+  throw new ExecutionPlanIssueError({
+    code: 'REPOSITORY',
+    fieldId: 'fetchMode',
+    message: '拉取方式必须为仅拉取指定提交或完整历史',
+  });
 }
 
 function scriptInputSources(fields: readonly GraphField[], values: Record<string, unknown>) {
@@ -398,8 +426,10 @@ export class GraphNodeTasks implements OnModuleInit {
           message: 'Git 版本类型无效',
         });
       const version = text(ref?.value);
+      const fullClone = checkoutFullClone(values.fetchMode) ?? config?.fullClone;
       return {
         type: 'CHECKOUT',
+        ...(scope.fetchModeDeferred && { fetchModeDeferred: true }),
         source: await this.repositories
           .planGraphCheckout(projectId, {
             repositoryId,
@@ -407,7 +437,7 @@ export class GraphNodeTasks implements OnModuleInit {
             branch: kind === 'BRANCH' ? version : undefined,
             tag: kind === 'TAG' ? version : undefined,
             commitSha: kind === 'COMMIT' ? version : undefined,
-            fullClone: config?.fullClone,
+            fullClone,
           })
           .catch((error: unknown) =>
             withPlanIssue(error, {
@@ -471,7 +501,7 @@ export class GraphNodeTasks implements OnModuleInit {
       : serverId
         ? { serverIds: [serverId] }
         : undefined;
-    const scriptInputs = scriptInputSources(node.shell?.params ?? [], values);
+    const scriptInputs = scriptInputSources(graphScriptInputs(node), values);
     const variableSources = graphVariableSources(variableRef?.environmentFile, configured, [
       ...scriptInputs,
       ...(scope.nodeEnvironmentSources ?? []),
@@ -577,11 +607,22 @@ export class GraphNodeTasks implements OnModuleInit {
 
     if (plan.type === 'CHECKOUT') {
       if (!self) throw new BadRequestException('缺少源码工作区标识');
+      const fullClone = checkoutFullClone(values.fetchMode);
+      if (
+        plan.fetchModeDeferred
+          ? fullClone === undefined
+          : fullClone !== undefined && fullClone !== plan.source.fullClone
+      )
+        throw new ConflictException('实际拉取方式与已确认计划不一致');
+      const source =
+        plan.fetchModeDeferred && fullClone !== undefined
+          ? { ...plan.source, fullClone }
+          : plan.source;
       return {
         ...base,
         payload: {
           ...base.payload,
-          graphModule: { ...settings, workspace: self, source: plan.source },
+          graphModule: { ...settings, workspace: self, source },
         },
       };
     }
@@ -722,8 +763,9 @@ export class GraphNodeTasks implements OnModuleInit {
             environmentId,
           }
         : undefined;
+    const fields = graphScriptInputs(node);
     const parameters = scriptVariables(
-      config.params ?? [],
+      fields,
       values,
       scope.nodeEnvironment,
       scope.credentialNonces,
@@ -741,7 +783,7 @@ export class GraphNodeTasks implements OnModuleInit {
       plan.environmentFile,
       plan.configuredVariableSources ?? plan.variableSources ?? [],
       [
-        ...scriptInputSources(config.params ?? [], values),
+        ...scriptInputSources(fields, values),
         ...(scope.nodeEnvironmentSources ?? []),
         ...Object.keys(platform).map((key) => ({
           key,
@@ -770,7 +812,7 @@ export class GraphNodeTasks implements OnModuleInit {
             timeout: config.timeout ?? defaults.timeout,
             continueOnFailure: config.continueOnFailure === true,
             parameters: { ...parameters, variables: { ...parameters.variables, ...platform } },
-            outputs: node.outputs ?? node.shell?.outputs ?? [],
+            outputs: graphScriptOutputs(node),
           },
         },
       },

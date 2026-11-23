@@ -3,6 +3,7 @@ import test from 'node:test';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import {
+  canvasCatalog,
   canvasIssues,
   compileCanvas,
   withDraftCanvas,
@@ -11,8 +12,15 @@ import {
   SaveGraphDraftDto,
   type GraphCanvas,
   type GraphFlow,
+  type GraphNode,
 } from '../modules/execution-graphs/execution-graph-definition';
 import type { GraphBinding, GraphField } from '../modules/execution-graphs/graph-fields';
+import {
+  inspectDeclaredNodeOutputs,
+  inspectNodeEnvironment,
+  inspectNodeInputs,
+} from '../modules/execution-graphs/graph-run-bindings';
+import { graphResourceReferences } from '../modules/projects/project-resource-extraction';
 
 const sharedCanvas = (): GraphCanvas => ({
   nodes: [
@@ -158,6 +166,177 @@ const output = (nodeId: string, fieldId: string): GraphBinding => ({
   kind: 'OUTPUT',
   nodeId,
   fieldId,
+});
+
+test('editable function templates compile typed inputs, outputs, and environment overrides', () => {
+  const canvas = sharedCanvas();
+  const mode: GraphField = { id: 'mode', type: 'GIT_FETCH_MODE', name: '拉取方式', required: true };
+  const version = { kind: 'COMMIT', value: 'a'.repeat(40) };
+  const script: GraphNode = {
+    id: 'script',
+    name: '选择拉取方式',
+    type: 'FUNCTION',
+    operation: 'SHELL',
+    shell: { location: 'MANAGER', command: 'printf "working\\n"', params: [mode] },
+    inputDefaults: { mode: 'FULL' },
+    outputs: [mode],
+    environmentDefaults: { REGION: 'us-west', TRACE: 'off' },
+  };
+  canvas.nodes[2] = {
+    id: 'report',
+    type: 'FUNCTION',
+    operation: 'CHECKOUT',
+    name: '拉取代码',
+    inputDefaults: { repository: repositoryId, version, fetchMode: 'LATEST' },
+  };
+  canvas.nodes.push(script);
+  canvas.templates.push({
+    ...canvas.nodes[2],
+    id: 'template-checkout',
+  });
+  canvas.edges[0] = { from: 'build-start', to: 'script' };
+  canvas.edges.push({ from: 'script', to: 'report' });
+  const endpoint = canvas.endpoints[0]!;
+  endpoint.inputBindings = {
+    report: { fetchMode: { ...output('script', 'mode'), onMissing: 'USE_DEFAULT' } },
+  };
+  endpoint.environmentBindings = {
+    script: { TRACE: { kind: 'VALUE', value: 'on' } },
+  };
+  assert.deepEqual(
+    validateSync(
+      plainToInstance(SaveGraphDraftDto, {
+        expectedRevision: 1,
+        definition: { canvas },
+      }),
+      { whitelist: true, forbidNonWhitelisted: true },
+    ),
+    [],
+  );
+  const definition = compileCanvas(canvas, true);
+  assert.ok(definition.canvas);
+  assert.equal(definition.canvas.nodes[2]!.type, 'FUNCTION');
+  assert.equal(definition.canvas.templates.at(-1)!.operation, 'CHECKOUT');
+  const flow = definition.flows[0]!;
+  const checkout = flow.nodes.find(({ id }) => id === 'report')!;
+  assert.equal(checkout.type, 'CHECKOUT');
+  assert.equal(checkout.operation, undefined);
+  assert.equal(checkout.moduleId, 'git.checkout');
+  const values = (mode: string) => new Map([['script', { mode }]]);
+  const prepared = inspectNodeInputs(flow, checkout, { context: {}, outputs: values('FULL') });
+  assert.deepEqual(
+    { ...prepared.values },
+    { repository: repositoryId, version, fetchMode: 'FULL' },
+  );
+  assert.equal(
+    inspectNodeInputs(flow, checkout, { context: {}, producerStatus: () => 'SUCCESS' }).values
+      .fetchMode,
+    'LATEST',
+  );
+  assert.equal(
+    inspectNodeInputs(flow, checkout, { context: {}, outputs: values('unexpected') }).evidence.at(
+      -1,
+    )?.state,
+    'ERROR',
+  );
+  const scriptNode = flow.nodes.find(({ id }) => id === 'script')!;
+  const { variables } = inspectNodeEnvironment(flow, scriptNode, { context: {} });
+  assert.deepEqual({ ...variables.variables }, { REGION: 'us-west', TRACE: 'on' });
+  assert.ok(
+    graphResourceReferences(definition, { state: 'RUNNABLE', sourceId: 'graph' }).some(
+      (item) => item.resourceId === repositoryId && item.fieldId === 'repository',
+    ),
+  );
+  canvas.nodes[2]!.inputDefaults!.fetchMode = 'INVALID';
+  assert.equal(canvasIssues(canvas)[0]!.fieldId, 'fetchMode');
+});
+
+test('declared single inputs consume the latest upstream reference before their own defaults', () => {
+  const repository: GraphField = {
+    id: 'repository',
+    name: '仓库名称',
+    referenceName: 'GIT_REPOSITORY_NAME',
+    type: 'REPOSITORY',
+    defaultValue: 'http://git.example.test/default.git',
+  };
+  const artifactDirectory: GraphField = {
+    id: 'path',
+    name: '产物目录',
+    referenceName: 'ARTIFACT_DIR',
+    type: 'PATH',
+    defaultValue: './dist',
+  };
+  const script = (id: string, nodeOutputs: GraphField[]): GraphNode => ({
+    id,
+    type: 'FUNCTION',
+    operation: 'SHELL',
+    name: id,
+    shell: { location: 'MANAGER', command: 'printf ok' },
+    outputs: nodeOutputs,
+  });
+  const canvas: GraphCanvas = {
+    nodes: [
+      { id: 'start', name: '开始', type: 'START' },
+      script('earlier', [{ ...repository, id: 'selected', defaultValue: undefined }]),
+      script('nearer', [{ ...repository, id: 'different', defaultValue: undefined }]),
+      {
+        id: 'fetch',
+        name: '自定义拉取',
+        type: 'FUNCTION',
+        operation: 'CHECKOUT',
+        inputs: [repository],
+        outputs: [{ id: 'branch', name: '实际分支', referenceName: 'ACTUAL_BRANCH', type: 'TEXT' }],
+      },
+      { ...script('deploy', []), inputs: [artifactDirectory] },
+      { id: 'end', name: '结束', type: 'END' },
+    ],
+    edges: ['start', 'earlier', 'nearer', 'fetch', 'deploy'].map((from, index) => ({
+      from,
+      to: ['earlier', 'nearer', 'fetch', 'deploy', 'end'][index]!,
+    })),
+    endpoints: [{ startId: 'start', endId: 'end' }],
+    templates: [],
+  };
+  const flow = compileCanvas(canvas, true).flows[0]!;
+  const fetch = flow.nodes.find(({ id }) => id === 'fetch')!;
+  const expected = {
+    kind: 'FIRST_AVAILABLE',
+    sources: [output('nearer', 'different'), output('earlier', 'selected')],
+    onMissing: 'USE_DEFAULT',
+  };
+  assert.deepEqual(flow.compiled?.nodes.fetch?.inputBindings.repository, expected);
+  assert.deepEqual(
+    canvasCatalog(canvas, 'start', 'fetch').start?.nodes.fetch?.automaticInputBindings.repository,
+    expected,
+  );
+  const outputs = new Map<string, Record<string, unknown>>([
+    ['earlier', { selected: 'http://git.example.test/earlier.git' }],
+    ['nearer', { different: 'http://git.example.test/nearer.git' }],
+  ]);
+  assert.equal(
+    inspectNodeInputs(flow, fetch, { context: {}, outputs }).values.repository,
+    'http://git.example.test/nearer.git',
+  );
+  assert.equal(
+    inspectNodeInputs(flow, fetch, { context: {}, producerStatus: () => 'SKIPPED' }).values
+      .repository,
+    repository.defaultValue,
+  );
+  assert.equal(
+    inspectNodeInputs(
+      flow,
+      flow.nodes.find(({ id }) => id === 'deploy')!,
+      { context: {} },
+    ).values.path,
+    './dist',
+  );
+  assert.equal(inspectDeclaredNodeOutputs(fetch, {})[0]?.state, 'ERROR');
+  assert.equal(inspectDeclaredNodeOutputs(fetch, { branch: 'main' })[0]?.state, 'RESOLVED');
+  repository.multiple = true;
+  assert.match(canvasIssues(canvas)[0]!.message, /单值必填/);
+  repository.multiple = false;
+  repository.options = [];
+  assert.match(canvasIssues(canvas)[0]!.message, /选项约束/);
 });
 
 function deliveryCanvas(): GraphCanvas {

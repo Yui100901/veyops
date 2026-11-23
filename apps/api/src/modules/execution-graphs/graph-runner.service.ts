@@ -44,6 +44,8 @@ import {
   selectedServerIds,
 } from '../deployment-targets/deployment-selection';
 import { RepositoryMetadataService } from '../projects/repository-metadata.service';
+import { resolveGraphRepositorySelector } from '../projects/graph-repository-selectors';
+import { graphRepositoryUrl } from '../projects/http-clone-url';
 import {
   resolveEnvironmentSet,
   type EnvironmentSetSummary,
@@ -62,7 +64,12 @@ import {
 } from './execution-graph-definition';
 import type { GraphInputsDto, GraphPreviewDto, GraphRunDto } from './graph-runner.controller';
 import { graphInputIssue, withNodePlanIssue, withPlanIssue } from './graph-execution-plan-issues';
-import { GraphNodeTasks, graphCheckoutOutputs, type GraphNodePlan } from './graph-node-tasks';
+import {
+  GraphNodeTasks,
+  graphCheckoutFetchMode,
+  graphCheckoutOutputs,
+  type GraphNodePlan,
+} from './graph-node-tasks';
 import { latestReleaseInspections } from './graph-release-inspection.service';
 import {
   assertAutomaticGraphFlow,
@@ -84,7 +91,7 @@ import {
   type GraphEnvironmentRef,
   type GraphWorkspaceRef,
 } from './graph-workspace';
-import type { GraphBinding, GraphField } from './graph-fields';
+import type { GraphBinding, GraphField, GraphGitFetchMode } from './graph-fields';
 import {
   artifactBindingRefs,
   bindingContext,
@@ -96,6 +103,7 @@ import {
   flowEnd,
   flowStart,
   graphEnvironmentSetId,
+  inspectDeclaredNodeOutputs,
   inspectNodeEnvironment,
   inspectNodeInputs,
   inspectFlowOutputs,
@@ -232,6 +240,8 @@ interface CheckoutProvenance {
   requestedVersion?: GitRefValue;
   triggerRepositoryId?: string;
   triggerCommitSha?: string;
+  fetchMode?: GraphGitFetchMode;
+  fetchModeDeferred?: boolean;
 }
 
 const variableCredentialTypes = ['API_KEY', 'API_SECRET', 'CUSTOM_SECRET', 'USERNAME_PASSWORD'];
@@ -655,14 +665,28 @@ export class GraphRunnerService implements OnModuleInit {
       if (table) {
         const ids = (Array.isArray(value) ? value : [value]).map(referenceId);
         if (ids.some((id) => !id)) throw graphInputIssue(flow, '项目资源引用无效', field);
+        const selected = new Set(ids as string[]);
+        if (field.type === 'REPOSITORY') {
+          for (const id of selected) {
+            if (!graphRepositoryUrl(id)) continue;
+            try {
+              await resolveGraphRepositorySelector(this.database.db, projectId, id);
+              selected.delete(id);
+            } catch (error) {
+              if (!(error instanceof HttpException)) throw error;
+              throw graphInputIssue(flow, error.message, field);
+            }
+          }
+        }
+        if (!selected.size) continue;
         const rows = await this.database.db
           .selectFrom(table)
           .select('id')
           .where('project_id', '=', projectId)
           .where('archived_at', 'is', null)
-          .where('id', 'in', [...new Set(ids)] as string[])
+          .where('id', 'in', [...selected])
           .execute();
-        if (rows.length !== new Set(ids).size)
+        if (rows.length !== selected.size)
           throw graphInputIssue(flow, field.name + ' 不属于当前项目', field);
       }
     }
@@ -1207,7 +1231,7 @@ export class GraphRunnerService implements OnModuleInit {
       branch?: string;
       tag?: string;
       commitSha: string;
-      fullClone: boolean;
+      fullClone?: boolean;
     } & CheckoutProvenance)[] = [];
     const scripts: {
       nodeId: string;
@@ -1378,8 +1402,37 @@ export class GraphRunnerService implements OnModuleInit {
             releaseNodeId: node.approval?.releaseNodeId,
             buildNodeId: node.approval?.buildNodeId,
           });
+        const checkoutAddress =
+          (node.type === 'CHECKOUT' || node.type === 'BUILD') &&
+          graphRepositoryUrl(values.repository);
+        const selectedRepositoryId = checkoutAddress
+          ? await resolveGraphRepositorySelector(
+              this.database.db,
+              projectId,
+              checkoutAddress,
+            ).catch((error: unknown) =>
+              withPlanIssue(error, {
+                code: 'REPOSITORY',
+                flowId: current.id,
+                flowName: current.name,
+                nodeId: node.id,
+                nodeName: node.name,
+                fieldId: 'repository',
+                ...nodeScope,
+              }),
+            )
+          : undefined;
+        const nativeValues = selectedRepositoryId
+          ? { ...values, repository: selectedRepositoryId }
+          : values;
         if (node.type === 'CHECKOUT' || (node.type === 'BUILD' && values.version))
-          checkouts[node.id] = checkoutProvenance(current, node, values, input.evidence, trigger);
+          checkouts[node.id] = checkoutProvenance(
+            current,
+            node,
+            nativeValues,
+            input.evidence,
+            trigger,
+          );
         if (isDelivery(node)) {
           const delivery = await this.delivery(
             projectId,
@@ -1387,7 +1440,7 @@ export class GraphRunnerService implements OnModuleInit {
             request.version,
             node,
             args,
-            values,
+            nativeValues,
             production,
             environmentSet,
             rootId,
@@ -1451,6 +1504,9 @@ export class GraphRunnerService implements OnModuleInit {
               parameters: args.parameters,
               values,
               trigger,
+              fetchModeDeferred: input.evidence.some(
+                ({ fieldId, state }) => fieldId === 'fetchMode' && state === 'DEFERRED',
+              ),
               nodeEnvironment: environment.variables,
               nodeEnvironmentSources: environment.sources,
             })
@@ -1515,7 +1571,22 @@ export class GraphRunnerService implements OnModuleInit {
           if (plan.type === 'CHECKOUT') {
             const { repositoryId, repositoryName, ref, branch, tag, commitSha, fullClone } =
               plan.source;
-            outputs.set(node.id, graphCheckoutOutputs(plan.source));
+            if (selectedRepositoryId && selectedRepositoryId !== repositoryId)
+              throw fieldIssue(current, node, {
+                fieldId: 'repository',
+                name: '仓库',
+                type: 'REPOSITORY',
+                state: 'ERROR',
+                message: '仓库地址匹配的项目仓库已变化，请重新预览',
+              });
+            outputs.set(
+              node.id,
+              graphCheckoutOutputs(plan.source, undefined, undefined, plan.fetchModeDeferred),
+            );
+            const mode = plan.fetchModeDeferred
+              ? { fetchModeDeferred: true as const }
+              : { fetchMode: graphCheckoutFetchMode(fullClone) };
+            checkouts[node.id] = { ...checkouts[node.id]!, ...mode };
             checkoutRows.push({
               nodeId: node.id,
               flowId: current.id,
@@ -1525,7 +1596,7 @@ export class GraphRunnerService implements OnModuleInit {
               branch,
               tag,
               commitSha,
-              fullClone,
+              ...(!plan.fetchModeDeferred && { fullClone }),
               ...checkouts[node.id]!,
             });
           } else if (plan.type === 'SHELL' || plan.type === 'CHECK') {
@@ -2141,6 +2212,28 @@ export class GraphRunnerService implements OnModuleInit {
     node.output_json = output ? JSON.stringify(output) : null;
   }
 
+  private async recordDeclaredOutputs(
+    tx: Transaction<Database>,
+    row: NodeRun,
+    flow: GraphFlow,
+    node: GraphNode,
+    output?: Values,
+  ) {
+    const outputFields = inspectDeclaredNodeOutputs(node, output);
+    if (!outputFields.length) return;
+    const evidence = row.evidence_json ? (JSON.parse(row.evidence_json) as NodeEvidence) : {};
+    evidence.outputFields = outputFields;
+    const invalid = outputFields.find(({ state }) => state === 'ERROR');
+    if (invalid) evidence.issue = fieldIssue(flow, node, invalid).issue;
+    row.evidence_json = JSON.stringify(evidence);
+    await tx
+      .updateTable('execution_node_runs')
+      .set({ evidence_json: row.evidence_json })
+      .where('id', '=', row.id)
+      .execute();
+    return invalid ? evidence.issue?.message : undefined;
+  }
+
   private async taskArtifacts(taskIds: string[], db = this.database.db) {
     if (!taskIds.length) return [];
     return db
@@ -2427,11 +2520,17 @@ export class GraphRunnerService implements OnModuleInit {
                 : undefined;
             if (node.type === 'HEALTH_CHECK' && output?.status === 'UNKNOWN')
               status = 'NEEDS_ATTENTION';
+            const invalidOutput =
+              status === 'SUCCESS'
+                ? await this.recordDeclaredOutputs(tx, row, flow, node, output)
+                : undefined;
+            if (invalidOutput) status = 'FAILED';
             await this.terminalNode(
               tx,
               row,
               status,
-              task.error_summary ??
+              invalidOutput ??
+                task.error_summary ??
                 (node.type === 'HEALTH_CHECK' && status === 'NEEDS_ATTENTION'
                   ? '健康状态未知，需人工核查当前发布。'
                   : undefined) ??
@@ -2442,7 +2541,7 @@ export class GraphRunnerService implements OnModuleInit {
               task.started_at,
               task.finished_at ?? now,
             );
-            if (output) outputs.set(node.id, output);
+            if (output && !invalidOutput) outputs.set(node.id, output);
             const issue = task.result_json
               ? (JSON.parse(task.result_json) as { graphIssue?: ExecutionPlanIssue }).graphIssue
               : undefined;
@@ -2483,11 +2582,18 @@ export class GraphRunnerService implements OnModuleInit {
               .orderBy('position')
               .execute();
             const result = JSON.parse(childOutputs[0]?.output_json ?? '{}') as Values;
+            const invalidOutput =
+              child.status === 'SUCCESS'
+                ? await this.recordDeclaredOutputs(tx, row, flow, node, result)
+                : undefined;
             await this.terminalNode(
               tx,
               row,
-              child.status,
-              child.status === 'SUCCESS' ? '子执行流已完成。' : '子执行流未成功，详情见子运行。',
+              invalidOutput ? 'FAILED' : child.status,
+              invalidOutput ??
+                (child.status === 'SUCCESS'
+                  ? '子执行流已完成。'
+                  : '子执行流未成功，详情见子运行。'),
               {
                 childRunId: child.id,
                 ...result,
@@ -2495,7 +2601,7 @@ export class GraphRunnerService implements OnModuleInit {
               child.created_at,
               child.finished_at ?? now,
             );
-            if (child.status === 'SUCCESS') outputs.set(node.id, result);
+            if (child.status === 'SUCCESS' && !invalidOutput) outputs.set(node.id, result);
             selection = flowSelection(flow, snapshot.inputs, bindings);
           } else row.status = child.status;
           continue;

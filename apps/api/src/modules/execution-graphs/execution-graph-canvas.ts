@@ -5,6 +5,7 @@ import { flowCandidateCatalog } from './graph-binding-validation';
 import {
   annotateGraphIssue,
   orderedFlowNodes,
+  runtimeGraphNode,
   validateGraphDefinition,
   type GraphCanvas,
   type GraphDefinition,
@@ -106,7 +107,7 @@ export function withDraftCanvas(
 }
 
 function validateCanvas(canvas: GraphCanvas) {
-  const byId = new Map(canvas.nodes.map((node) => [node.id, node]));
+  const byId = new Map(canvas.nodes.map((node) => [node.id, runtimeGraphNode(node)]));
   const ids = new Set([...canvas.nodes, ...canvas.templates].map(({ id }) => id));
   if (ids.size !== canvas.nodes.length + canvas.templates.length)
     throw new BadRequestException('画布节点和功能节点库中的 ID 必须唯一');
@@ -141,11 +142,19 @@ function validateCanvas(canvas: GraphCanvas) {
       node.deploy?.startCommand,
       node.deploy?.stopCommand,
       node.deploy?.healthCheckCommand,
+      JSON.stringify(node.inputDefaults),
+      JSON.stringify(node.environmentDefaults),
+      ...(node.type === 'FUNCTION'
+        ? [...(node.inputs ?? []), ...(node.outputs ?? [])].map(({ defaultValue }) =>
+            JSON.stringify(defaultValue),
+          )
+        : []),
       ...(node.switch?.cases ?? []),
     ];
     if (text.some((value) => value && redactTaskLog(value) !== value))
       throw new BadRequestException('节点配置包含明文凭据，请移除敏感值');
   }
+  canvas.templates.forEach(runtimeGraphNode);
   return { byId, edges };
 }
 

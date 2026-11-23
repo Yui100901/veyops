@@ -8,6 +8,8 @@ import { graphInputIssue } from './graph-execution-plan-issues';
 import {
   graphDefaultBinding,
   graphModulePorts,
+  graphNodeEnvironmentBindings,
+  graphRecord,
   validateGraphValue,
   type GraphBinding,
   type GraphField,
@@ -265,11 +267,30 @@ export function inspectNodeInputs(
   const values: Values = Object.create(null);
   const evidence = fields.map((field) => {
     const binding = bindings[field.id] ?? graphDefaultBinding(flow, node, field.id);
-    const read = checkedBinding(field, binding, context);
+    const usesDeclaredDefault =
+      binding?.kind === 'VALUE' &&
+      node.declaredPorts &&
+      node.inputs?.some(({ id }) => id === field.id) &&
+      field.defaultValue !== undefined &&
+      !flow.inputBindings?.[node.id]?.[field.id];
+    const read = checkedBinding(field, usesDeclaredDefault ? undefined : binding, context);
     if (read.value !== undefined) values[field.id] = read.value;
     return read.evidence;
   });
   return { fields, values, evidence };
+}
+
+export function inspectDeclaredNodeOutputs(node: GraphNode, output: unknown): GraphFieldEvidence[] {
+  if (!node.declaredPorts || !node.outputs) return [];
+  const values = graphRecord(output) ? output : undefined;
+  return node.outputs.map((field) => {
+    const value = entry(values, field.id);
+    return checkedBinding(
+      { ...field, required: true, defaultValue: undefined },
+      value === undefined ? undefined : { kind: 'VALUE', value },
+      { context: {} },
+    ).evidence;
+  });
 }
 
 export function inspectNodeEnvironment(
@@ -284,7 +305,7 @@ export function inspectNodeEnvironment(
   };
   const sources: GraphVariableSource[] = [];
   const bindings =
-    flow.compiled?.nodes[node.id]?.environmentBindings ?? flow.environmentBindings?.[node.id] ?? {};
+    flow.compiled?.nodes[node.id]?.environmentBindings ?? graphNodeEnvironmentBindings(flow, node);
   const evidence = Object.entries(bindings).map(([key, binding]) => {
     const read = checkedBinding(
       { id: key, name: key, type: 'TEXT', required: false },

@@ -19,8 +19,12 @@ import {
 } from './ExecutionGraphBindings';
 import {
   branchOptions,
+  effectiveNodeType,
   graphKey,
   graphNodeLabels,
+  graphNodeFamily,
+  graphNodeTypeLabel,
+  graphOperations,
   isReleaseNode,
 } from './execution-graph-definition';
 import type {
@@ -32,6 +36,7 @@ import type {
   GraphField,
   GraphIssue,
   GraphNode,
+  GraphOperation,
 } from './execution-graph-definition';
 import './execution-graph-editor.css';
 
@@ -40,6 +45,13 @@ type Position = NonNullable<GraphNode['position']>;
 type Selection = { kind: 'node' | 'template'; id: string } | { kind: 'edge'; index: number };
 type Connector = Pick<GraphEdge, 'from' | 'to'>;
 type FieldFocus = { nodeId: string; fieldId: string };
+const functionalTabs = {
+  input: '输入',
+  execution: '执行',
+  output: '输出',
+  environment: '环境变量',
+};
+type FunctionalTab = keyof typeof functionalTabs;
 
 function focusInspectorField(inspector: HTMLElement, fieldId: string, bound: boolean) {
   const escaped = CSS.escape(fieldId);
@@ -68,38 +80,63 @@ function focusInspectorField(inspector: HTMLElement, fieldId: string, bound: boo
   (control ?? inspector.querySelector<HTMLElement>('h3'))?.focus({ preventScroll: true });
 }
 
-const palette: { name: string; types: NodeType[] }[] = [
-  { name: '开始与结束', types: ['START', 'END'] },
-  {
-    name: '功能节点',
-    types: ['CHECKOUT', 'LOAD_ENV', 'SHELL', 'CHECK', 'BUILD', 'REGISTER_ARTIFACT', 'LOG'],
-  },
-  {
-    name: '发布与验证',
-    types: ['SOURCE_REVIEW', 'APPROVAL', 'DEPLOY_ARTIFACT', 'HEALTH_CHECK', 'ROLLBACK_ARTIFACT'],
-  },
-  {
-    name: '流程控制',
-    types: ['CONDITION', 'SWITCH', 'PARALLEL', 'JOIN', 'DELAY', 'FLOW_CALL'],
-  },
-];
-const templateTypes = palette
-  .flatMap(({ types }) => types)
-  .filter((type) => !['START', 'END'].includes(type));
-
-function makeNode(type: NodeType, project: ProjectDetail): GraphNode {
+function makeNode(type: NodeType, project: ProjectDetail, preset = true): GraphNode {
   const name = graphNodeLabels[type];
+  const operation = type === 'FUNCTION' ? 'SHELL' : type;
   const repo = project.repositories.length === 1 ? project.repositories[0] : undefined;
-  return {
+  return authoredNode({
     id: graphKey('node'),
     type,
     name,
     ...(type === 'LOG' && { message: name }),
-    ...(type === 'CHECKOUT' && { checkout: { fullClone: false } }),
-    ...(type === 'SHELL' || type === 'CHECK'
-      ? { shell: { location: 'TARGET' as const, timeout: 180 } }
+    ...(operation === 'SHELL' || operation === 'CHECK'
+      ? { shell: { location: 'MANAGER' as const, timeout: 180 } }
       : {}),
-    ...(type === 'BUILD' ? { build: { repositoryId: repo?.id } } : {}),
+    ...(preset && type === 'BUILD' && repo && { inputDefaults: { repository: repo.id } }),
+    ...(preset &&
+      type === 'CHECKOUT' && {
+        inputs: [
+          {
+            id: 'repository',
+            name: '仓库地址',
+            referenceName: 'GIT_REPOSITORY_NAME',
+            type: 'REPOSITORY' as const,
+            required: true,
+            defaultValue: repo?.cloneUrl,
+          },
+          {
+            id: 'fetchMode',
+            name: '拉取方式',
+            referenceName: 'GIT_FETCH_MODE',
+            type: 'GIT_FETCH_MODE' as const,
+            required: true,
+            defaultValue: 'LATEST',
+          },
+        ],
+        outputs: [
+          {
+            id: 'commitSha',
+            name: '检出提交',
+            referenceName: 'GIT_COMMIT_SHA',
+            type: 'TEXT' as const,
+            required: true,
+          },
+        ],
+      }),
+    ...(preset &&
+      type === 'REGISTER_ARTIFACT' && {
+        inputs: [
+          {
+            id: 'path',
+            name: '产物目录',
+            referenceName: 'ARTIFACT_DIR',
+            type: 'PATH' as const,
+            required: true,
+            defaultValue: './dist',
+          },
+        ],
+      }),
+    ...(type === 'BUILD' && { build: {} }),
     ...(type === 'LOAD_ENV' ? { loadEnvironment: { required: true } } : {}),
     ...(type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT'
       ? { deploy: { method: 'FILE' as const } }
@@ -111,7 +148,12 @@ function makeNode(type: NodeType, project: ProjectDetail): GraphNode {
     ...((type === 'APPROVAL' || type === 'SOURCE_REVIEW') && {
       approval: { timeoutSeconds: 3600 },
     }),
-  };
+  });
+}
+
+function authoredNode(node: GraphNode): GraphNode {
+  if (graphNodeFamily(node) !== 'function') return node;
+  return { ...node, type: 'FUNCTION', operation: effectiveNodeType(node) as GraphOperation };
 }
 
 function reachable(canvas: GraphCanvas, origin: string, reversed = false, stopAtBoundary = true) {
@@ -193,7 +235,8 @@ export function ProjectGraphEditor({
   const [source, setSource] = useState<string>();
   const [connector, setConnector] = useState<Connector>();
   const [startId, setStartId] = useState<string | undefined>(initialFlowId);
-  const [templateType, setTemplateType] = useState<NodeType>('CHECKOUT');
+  const [templateType, setTemplateType] = useState<NodeType>('FUNCTION');
+  const [tab, setTab] = useState<FunctionalTab>('input');
   const [error, setError] = useState('');
   const [focusRequest, setFocusRequest] = useState<FieldFocus | undefined>(() =>
     initialNodeId && initialFieldId
@@ -213,6 +256,7 @@ export function ProjectGraphEditor({
       ? canvas.templates.find(({ id }) => id === selection.id)
       : undefined;
   const inspected = activeNode ?? template;
+  const isFunction = inspected && graphNodeFamily(inspected) === 'function';
   const activeEdge = selection?.kind === 'edge' ? canvas.edges[selection.index] : undefined;
   const selectedPair = canvas.endpoints.find((pair) => pair.startId === startId);
   const selectedPath = pathHighlight(canvas, selectedPair?.startId);
@@ -220,7 +264,9 @@ export function ProjectGraphEditor({
     canvas: GraphCanvas;
     flows: GraphCatalog['flows'];
   }>();
-  const hasActiveFlowNode = Boolean(activeNode && selectedPath?.nodes.has(activeNode.id));
+  const activePair =
+    activeNode && selectedPath?.nodes.has(activeNode.id) ? selectedPair : undefined;
+  const hasActiveFlowNode = Boolean(activePair);
   const catalogNodeId = activeNode?.id;
   const catalogFlowId = selectedPair?.startId;
   useEffect(() => {
@@ -255,17 +301,26 @@ export function ProjectGraphEditor({
   useEffect(() => {
     if (!focusRequest || focusRequest === handledFocus.current || pendingBindings) return;
     if (inspected?.id !== focusRequest.nodeId) return;
+    const repairTab = ['buildNodeId', 'releaseNodeId', 'command', 'timeoutSeconds'].includes(
+      focusRequest.fieldId,
+    )
+      ? 'execution'
+      : 'input';
+    if (isFunction && tab !== repairTab) {
+      setTab(repairTab);
+      return;
+    }
     const frame = window.requestAnimationFrame(() => {
       if (!inspector.current) return;
       focusInspectorField(inspector.current, focusRequest.fieldId, boundField);
       handledFocus.current = focusRequest;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [focusRequest, inspected?.id, pendingBindings, boundField]);
+  }, [focusRequest, inspected?.id, pendingBindings, boundField, isFunction, tab]);
 
   function patch(fields: Partial<GraphNode>) {
     if (!inspected || !canEdit) return;
-    const change = (item: GraphNode) => (item.id === inspected.id ? { ...item, ...fields } : item);
+    const operationChanged = fields.operation && fields.operation !== effectiveNodeType(inspected);
     const nextOutputs =
       inspected.type === 'END' && fields.outputs
         ? new Set(fields.outputs.map(({ id }) => id))
@@ -273,11 +328,29 @@ export function ProjectGraphEditor({
     const removedBindings = new Set(
       fields.shell?.params
         ? (inspected.shell?.params ?? [])
-            .filter(({ id }) => !fields.shell?.params?.some((field) => field.id === id))
+            .filter(
+              (parameter) =>
+                !fields.shell?.params?.some(
+                  (field) =>
+                    field.id === parameter.id &&
+                    field.type === parameter.type &&
+                    Boolean(field.multiple) === Boolean(parameter.multiple),
+                ),
+            )
             .map(({ id }) => id)
         : [],
     );
-    const nextBuild = inspected.type === 'SOURCE_REVIEW' ? fields.approval?.buildNodeId : undefined;
+    if (fields.inputs && graphNodeFamily(inspected) === 'function') {
+      const operation = effectiveNodeType(inspected);
+      const native = catalog.data?.modules[operation]?.inputs ?? [];
+      for (const input of inspected.inputs ?? []) {
+        if (native.some(({ id }) => id === input.id)) continue;
+        if (!fields.inputs.some(({ id, type }) => id === input.id && type === input.type))
+          removedBindings.add(input.id);
+      }
+    }
+    const nextBuild =
+      effectiveNodeType(inspected) === 'SOURCE_REVIEW' ? fields.approval?.buildNodeId : undefined;
     const oldBuild =
       nextBuild && nextBuild !== inspected.approval?.buildNodeId
         ? inspected.approval?.buildNodeId
@@ -285,6 +358,15 @@ export function ProjectGraphEditor({
     if (nextBuild) {
       removedBindings.add('source');
       removedBindings.add('artifact');
+    }
+    function change(item: GraphNode) {
+      if (item.id !== inspected?.id) return item;
+      const next = { ...item, ...fields };
+      if (removedBindings.size && next.inputDefaults)
+        next.inputDefaults = Object.fromEntries(
+          Object.entries(next.inputDefaults).filter(([id]) => !removedBindings.has(id)),
+        );
+      return authoredNode(next);
     }
     const endpoints = canvas.endpoints.map((pair) => {
       if (nextOutputs && pair.endId === inspected.id)
@@ -295,6 +377,13 @@ export function ProjectGraphEditor({
           ),
         };
       const previousBindings = pair.inputBindings?.[inspected.id];
+      if (operationChanged) {
+        const inputBindings = { ...pair.inputBindings };
+        const environmentBindings = { ...pair.environmentBindings };
+        delete inputBindings[inspected.id];
+        delete environmentBindings[inspected.id];
+        return { ...pair, inputBindings, environmentBindings };
+      }
       const oldBuildBinding = oldBuild ? pair.inputBindings?.[oldBuild] : undefined;
       const previousReview = oldBuildBinding?.review;
       const unbindOldReview =
@@ -324,13 +413,14 @@ export function ProjectGraphEditor({
   function addNode(raw: GraphNode, position?: Position) {
     if (!canEdit) return;
     const copy = {
-      ...structuredClone(raw),
+      ...authoredNode(structuredClone(raw)),
       id: graphKey('node'),
       referenceName: undefined,
       position,
     };
     onChange({ ...canvas, nodes: [...canvas.nodes, copy] });
     select({ kind: 'node', id: copy.id });
+    setTab(effectiveNodeType(copy) === 'SHELL' ? 'execution' : 'input');
     setConnector(undefined);
   }
   function drag(event: DragEvent<HTMLButtonElement>, payload: string) {
@@ -383,11 +473,11 @@ export function ProjectGraphEditor({
     if (!activeNode || !presetEnd || !canInsertPreset || !canEdit) return;
     const start = activeNode;
     const nodes = types.map((type) => makeNode(type, project));
-    const checkout = nodes.find(({ type }) => type === 'CHECKOUT');
-    const script = nodes.find(({ type }) => type === 'SHELL');
-    const build = nodes.find((node) => node.type === 'BUILD');
-    const review = nodes.find(({ type }) => type === 'SOURCE_REVIEW');
-    const approval = nodes.find(({ type }) => type === 'APPROVAL');
+    const checkout = nodes.find((node) => effectiveNodeType(node) === 'CHECKOUT');
+    const script = nodes.find((node) => effectiveNodeType(node) === 'SHELL');
+    const build = nodes.find((node) => effectiveNodeType(node) === 'BUILD');
+    const review = nodes.find((node) => effectiveNodeType(node) === 'SOURCE_REVIEW');
+    const approval = nodes.find((node) => effectiveNodeType(node) === 'APPROVAL');
     const deploy = nodes.find(isReleaseNode);
     const end = canvas.nodes.find((node) => node.id === presetEnd)!;
     const inputs = [...(start.inputs ?? [])];
@@ -439,9 +529,17 @@ export function ProjectGraphEditor({
       script.shell = {
         ...script.shell,
         location: 'MANAGER',
-        command: 'printf \'VEYOPS_OUTPUT={"commit":"%s"}\\n\' "$VEYOPS_GIT_COMMIT_SHA"',
+        command: 'printf \'VEYOPS_OUTPUT={"COMMIT_SHA":"%s"}\\n\' "$VEYOPS_GIT_COMMIT_SHA"',
       };
-      script.outputs = [{ id: 'commit', name: '实际提交 SHA', type: 'TEXT', required: true }];
+      script.outputs = [
+        {
+          id: 'commit',
+          name: '实际提交 SHA',
+          referenceName: 'COMMIT_SHA',
+          type: 'TEXT',
+          required: true,
+        },
+      ];
       const result = addField(outputs, {
         id: 'commit',
         name: '实际提交 SHA',
@@ -458,7 +556,7 @@ export function ProjectGraphEditor({
         deploy &&
         addField(inputs, {
           id: 'releaseTargets',
-          name: deploy.type === 'ROLLBACK_ARTIFACT' ? '回滚目标' : '发布目标',
+          name: effectiveNodeType(deploy) === 'ROLLBACK_ARTIFACT' ? '回滚目标' : '发布目标',
           type: 'TARGETS',
           required: true,
         });
@@ -492,7 +590,7 @@ export function ProjectGraphEditor({
         environmentBindings[build.id] = {
           GIT_SHA: { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'commitSha' },
         };
-      } else if (!build.build.repositoryId) {
+      } else if (!build.inputDefaults?.repository) {
         const repo = addField(inputs, {
           id: 'repository',
           name: '仓库',
@@ -522,7 +620,7 @@ export function ProjectGraphEditor({
       else {
         const id = addField(inputs, {
           id: 'artifact',
-          name: deploy.type === 'ROLLBACK_ARTIFACT' ? '历史构建产物' : '构建产物',
+          name: effectiveNodeType(deploy) === 'ROLLBACK_ARTIFACT' ? '历史构建产物' : '构建产物',
           type: 'ARTIFACT',
           multiple: true,
           required: true,
@@ -673,6 +771,7 @@ export function ProjectGraphEditor({
   }
   function selectNode(id: string) {
     select({ kind: 'node', id });
+    if (activeNode?.id !== id) setTab('input');
     setFocusRequest(undefined);
     if (canvas.endpoints.some((pair) => pair.startId === id)) setStartId(id);
     else if (!selectedPath?.nodes.has(id)) {
@@ -712,6 +811,52 @@ export function ProjectGraphEditor({
     copyNode(inspected.id);
   }
 
+  function renderBranches(node: GraphNode, endpoint: GraphEndpoint) {
+    return (
+      <GraphFlowBranches
+        node={node}
+        canvas={canvas}
+        outgoing={canvas.edges
+          .filter(
+            ({ from, to }) => from === node.id && reachable(canvas, to, false).has(endpoint.endId),
+          )
+          .map(({ to }) => to)}
+        endpoint={endpoint}
+        update={updatePair}
+        canEdit={canEdit}
+      />
+    );
+  }
+
+  function paletteButton(type: NodeType, label = graphNodeLabels[type]) {
+    return (
+      <button
+        type="button"
+        key={type}
+        draggable
+        className="graph-palette-node"
+        onDragStart={(event) => drag(event, 'type:' + type)}
+        onClick={() => addNode(makeNode(type, project))}
+      >
+        <Plus size={14} />
+        {label}
+      </button>
+    );
+  }
+
+  function createTemplate(node: GraphNode) {
+    const item = {
+      ...authoredNode(structuredClone(node)),
+      id: graphKey('template'),
+      position: undefined,
+    };
+    onChange({ ...canvas, templates: [...canvas.templates, item] });
+    select({ kind: 'template', id: item.id });
+    setTab(effectiveNodeType(item) === 'SHELL' ? 'execution' : 'input');
+    setConnector(undefined);
+    setSource(undefined);
+  }
+
   return (
     <div
       className="project-graph-editor"
@@ -730,75 +875,76 @@ export function ProjectGraphEditor({
       {canEdit && (
         <aside className="graph-palette" aria-label="节点库">
           <h3>节点库</h3>
-          {palette.map(({ name, types }) => (
-            <div className="graph-palette-group" key={name}>
-              <h4>{name}</h4>
-              {types.map((type) => (
+          <div className="graph-palette-group">
+            <h4>开始与结束</h4>
+            {paletteButton('START')}
+            {paletteButton('END')}
+          </div>
+          <div className="graph-palette-group">
+            <h4>功能节点</h4>
+            {paletteButton('FUNCTION', '新建自定义节点')}
+            <details className="graph-palette-templates">
+              <summary>系统模板</summary>
+              <div className="graph-palette-group">
+                {graphOperations.map((operation) => paletteButton(operation))}
+              </div>
+            </details>
+            <details className="graph-palette-templates" open={template ? true : undefined}>
+              <summary>
+                项目模板{canvas.templates.length ? ' · ' + canvas.templates.length : ''}
+              </summary>
+              <div className="graph-palette-group">
+                {canvas.templates.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    draggable
+                    aria-pressed={template?.id === item.id}
+                    className="graph-palette-node"
+                    onDragStart={(event) => drag(event, 'template:' + item.id)}
+                    onClick={() => {
+                      select({ kind: 'template', id: item.id });
+                      setTab('input');
+                      setConnector(undefined);
+                      setSource(undefined);
+                    }}
+                  >
+                    <Copy size={14} />
+                    {item.name || '未命名模板'}
+                  </button>
+                ))}
+                <Field label="起始模板">
+                  <select
+                    value={templateType}
+                    onChange={(event) => setTemplateType(event.target.value as NodeType)}
+                  >
+                    <option value="FUNCTION">空白功能节点</option>
+                    {graphOperations.map((type) => (
+                      <option key={type} value={type}>
+                        {graphNodeLabels[type]}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
                 <button
                   type="button"
-                  key={type}
-                  draggable
-                  className="graph-palette-node"
-                  onDragStart={(event) => drag(event, 'type:' + type)}
-                  onClick={() => addNode(makeNode(type, project))}
+                  className="button secondary small"
+                  onClick={() => createTemplate(makeNode(templateType, project))}
                 >
-                  <Plus size={14} />
-                  {graphNodeLabels[type]}
+                  <Plus size={15} />
+                  新建项目模板
                 </button>
-              ))}
-            </div>
-          ))}
+              </div>
+            </details>
+          </div>
           <div className="graph-palette-group">
-            <h4>预设功能节点</h4>
-            {canvas.templates.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                draggable
-                aria-pressed={template?.id === item.id}
-                className="graph-palette-node"
-                onDragStart={(event) => drag(event, 'template:' + item.id)}
-                onClick={() => {
-                  select({ kind: 'template', id: item.id });
-                  setConnector(undefined);
-                  setSource(undefined);
-                }}
-              >
-                <Copy size={14} />
-                {item.name || '未命名模板'}
-              </button>
-            ))}
-            <label className="graph-palette-input">
-              <span>模板类型</span>
-              <select
-                value={templateType}
-                onChange={(event) => setTemplateType(event.target.value as NodeType)}
-              >
-                {templateTypes.map((type) => (
-                  <option key={type} value={type}>
-                    {graphNodeLabels[type]}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              type="button"
-              className="button secondary small"
-              onClick={() => {
-                const item = { ...makeNode(templateType, project), id: graphKey('template') };
-                onChange({ ...canvas, templates: [...canvas.templates, item] });
-                select({ kind: 'template', id: item.id });
-                setConnector(undefined);
-                setSource(undefined);
-              }}
-            >
-              <Plus size={15} />
-              新建模板
-            </button>
+            <h4>条件节点</h4>
+            {paletteButton('CONDITION')}
+            {paletteButton('SWITCH')}
           </div>
         </aside>
       )}
-      <div className="graph-canvas-column">
+      <div className="graph-editor-toolbar">
         <div className="graph-canvas-help">
           {canEdit && <p>拖节点到画布，点击两端连接点连线。右键节点或连线打开操作菜单。</p>}
           {source && (
@@ -860,6 +1006,8 @@ export function ProjectGraphEditor({
         <ErrorBanner error={catalog.error} retry={catalog.reload} />
         {missingRepairNode && <ErrorBanner error="运行问题关联的节点已不在当前草稿中。" />}
         <ErrorBanner error={error} />
+      </div>
+      <div className="graph-canvas-column">
         <NodeMap
           flow={flow}
           selected={activeNode ? [activeNode.id] : []}
@@ -916,26 +1064,81 @@ export function ProjectGraphEditor({
         <aside ref={inspector} className="graph-inspector graph-properties" aria-label="选中项属性">
           {inspected && (
             <>
-              <h3 tabIndex={-1}>
-                {template ? '模板属性' : '节点属性'} · {graphNodeLabels[inspected.type]}
-              </h3>
-              <NodeFields
-                key={inspected.id}
-                project={project}
-                node={inspected}
-                canvas={canvas}
-                canEdit={canEdit}
-                patch={patch}
-                catalog={catalog.data}
-              />
-              {activeNode?.type === 'CHECKOUT' && !hasActiveFlowNode && (
-                <p className="field-note">选择包含此节点的执行流，即可绑定仓库和 Git 版本。</p>
+              <header className="graph-inspector-title">
+                <p>{template ? '项目模板' : isFunction ? '功能节点' : '节点属性'}</p>
+                <h3 tabIndex={-1}>{inspected.name || graphNodeTypeLabel(inspected)}</h3>
+              </header>
+              <NodeIdentity node={inspected} canEdit={canEdit} patch={patch} />
+              {isFunction ? (
+                <>
+                  <nav className="graph-inspector-tabs" aria-label="功能节点配置">
+                    {(Object.keys(functionalTabs) as FunctionalTab[]).map((item) => (
+                      <button
+                        type="button"
+                        key={item}
+                        aria-pressed={tab === item}
+                        onClick={() => setTab(item)}
+                      >
+                        {functionalTabs[item]}
+                      </button>
+                    ))}
+                  </nav>
+                  <div className="graph-inspector-panel" key={inspected.id + ':' + tab}>
+                    {tab === 'execution' ? (
+                      <NodeOperationFields
+                        project={project}
+                        node={inspected}
+                        canvas={canvas}
+                        canEdit={canEdit}
+                        patch={patch}
+                        selectOperation={(operation) =>
+                          patch(changeOperation(inspected, operation, project))
+                        }
+                      />
+                    ) : (
+                      <>
+                        <ExecutionGraphBindings
+                          canvas={canvas}
+                          node={inspected}
+                          endpoint={activePair}
+                          flowEdgeIndexes={selectedPath?.edges}
+                          catalog={catalog.data}
+                          directory={
+                            catalogSnapshot?.canvas === canvas ? catalogSnapshot.flows : undefined
+                          }
+                          project={project}
+                          canEdit={canEdit}
+                          update={updatePair}
+                          patchNode={patch}
+                          section={tab}
+                        />
+                        {tab === 'input' && activeNode && renderResources?.(activeNode, activePair)}
+                        <FunctionPortFields
+                          node={inspected}
+                          section={tab}
+                          canEdit={canEdit}
+                          patch={patch}
+                        />
+                      </>
+                    )}
+                    {tab === 'execution' &&
+                      activeNode &&
+                      activePair &&
+                      renderBranches(activeNode, activePair)}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <NodeOperationFields
+                    node={inspected}
+                    project={project}
+                    canvas={canvas}
+                    canEdit={canEdit}
+                    patch={patch}
+                  />
+                  {activeNode && renderResources?.(activeNode, activePair)}
+                </>
               )}
-              {activeNode &&
-                renderResources?.(
-                  activeNode,
-                  selectedPath?.nodes.has(activeNode.id) ? selectedPair : undefined,
-                )}
               {activeNode?.type === 'START' && (
                 <>
                   <StartPair
@@ -1005,28 +1208,15 @@ export function ProjectGraphEditor({
                   />
                 </>
               )}
-              {activeNode && selectedPair && (
+              {!isFunction && activeNode && activePair && (
                 <>
-                  <GraphFlowBranches
-                    node={activeNode}
-                    canvas={canvas}
-                    outgoing={canvas.edges
-                      .filter(
-                        ({ from, to }) =>
-                          from === activeNode.id &&
-                          reachable(canvas, to, false).has(selectedPair.endId),
-                      )
-                      .map(({ to }) => to)}
-                    endpoint={selectedPair}
-                    update={updatePair}
-                    canEdit={canEdit}
-                  />
-                  {selectedPath?.nodes.has(activeNode.id) && (
+                  {renderBranches(activeNode, activePair)}
+                  {activeNode.type !== 'START' && (
                     <ExecutionGraphBindings
                       canvas={canvas}
                       node={activeNode}
-                      endpoint={selectedPair}
-                      flowEdgeIndexes={selectedPath.edges}
+                      endpoint={activePair}
+                      flowEdgeIndexes={selectedPath?.edges}
                       catalog={catalog.data}
                       directory={
                         catalogSnapshot?.canvas === canvas ? catalogSnapshot.flows : undefined
@@ -1048,6 +1238,15 @@ export function ProjectGraphEditor({
                     >
                       <Plus size={15} />
                       添加到画布
+                    </button>
+                  )}
+                  {isFunction && activeNode && (
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      onClick={() => createTemplate(activeNode)}
+                    >
+                      保存为项目模板
                     </button>
                   )}
                   <button type="button" className="button secondary small" onClick={duplicate}>
@@ -1517,19 +1716,9 @@ function LoadEnvironmentFields({
   );
 }
 
-function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsProps) {
-  const downstream =
-    node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW'
-      ? reachable(canvas, node.id)
-      : undefined;
-  const downstreamReleases = canvas.nodes.filter(
-    (candidate) => downstream?.has(candidate.id) && isReleaseNode(candidate),
-  );
-  const downstreamBuilds = canvas.nodes.filter(
-    (candidate) => downstream?.has(candidate.id) && candidate.type === 'BUILD',
-  );
+function NodeIdentity({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'>) {
   return (
-    <>
+    <div className="graph-inspector-identity">
       <Field label="节点名称">
         <input
           readOnly={!canEdit}
@@ -1538,7 +1727,7 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           onChange={(event) => patch({ name: event.target.value })}
         />
       </Field>
-      <Field label="节点引用名" hint="留空时系统分配。修改引用名后仍使用原有绑定。">
+      <Field label="节点引用名" hint="留空时系统分配。">
         <input
           readOnly={!canEdit}
           maxLength={64}
@@ -1546,7 +1735,108 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           onChange={(event) => patch({ referenceName: event.target.value || undefined })}
         />
       </Field>
-      {node.type === 'LOG' && (
+    </div>
+  );
+}
+
+function changeOperation(
+  node: GraphNode,
+  operation: GraphOperation,
+  project: ProjectDetail,
+): Partial<GraphNode> {
+  const next = makeNode(operation, project, false);
+  return {
+    type: 'FUNCTION',
+    operation,
+    inputDefaults: next.inputDefaults,
+    environmentDefaults: undefined,
+    moduleId: undefined,
+    moduleVersion: undefined,
+    message: next.message,
+    checkout: next.checkout,
+    shell: next.shell,
+    loadEnvironment: next.loadEnvironment,
+    registerArtifacts: next.registerArtifacts,
+    build: next.build,
+    deploy: next.deploy,
+    inputs: next.inputs,
+    outputs: next.outputs,
+    delaySeconds: next.delaySeconds,
+    approval: next.approval,
+    healthCheck: next.healthCheck,
+    flowId: next.flowId,
+    ...(node.name === graphNodeTypeLabel(node) && { name: next.name }),
+  };
+}
+
+function FunctionPortFields({
+  node,
+  canEdit,
+  patch,
+  section,
+}: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'> & {
+  section: Exclude<FunctionalTab, 'execution'>;
+}) {
+  const operation = effectiveNodeType(node);
+  if (operation === 'BUILD' && (section === 'input' || section === 'output'))
+    return (
+      <BuildFields
+        section={section}
+        value={node.build ?? {}}
+        canEdit={canEdit}
+        change={(build) => patch({ build })}
+      />
+    );
+  if (section === 'output' && operation === 'REGISTER_ARTIFACT')
+    return (
+      <ArtifactOutputEditor
+        value={node.registerArtifacts?.artifacts ?? []}
+        canEdit={canEdit}
+        onChange={(artifacts) => patch({ registerArtifacts: { artifacts } })}
+      />
+    );
+  return null;
+}
+
+function NodeOperationFields({
+  node,
+  project,
+  canvas,
+  canEdit,
+  patch,
+  selectOperation,
+}: Omit<FieldsProps, 'catalog'> & {
+  selectOperation?: (operation: GraphOperation) => void;
+}) {
+  const operation = effectiveNodeType(node);
+  const downstream =
+    operation === 'APPROVAL' || operation === 'SOURCE_REVIEW'
+      ? reachable(canvas, node.id)
+      : undefined;
+  const downstreamReleases = canvas.nodes.filter(
+    (candidate) => downstream?.has(candidate.id) && isReleaseNode(candidate),
+  );
+  const downstreamBuilds = canvas.nodes.filter(
+    (candidate) => downstream?.has(candidate.id) && effectiveNodeType(candidate) === 'BUILD',
+  );
+  return (
+    <>
+      {selectOperation && (
+        <Field label="执行操作" hint="更换操作会重置节点输入、执行配置、输出和环境变量。">
+          <select
+            disabled={!canEdit}
+            value={operation}
+            onChange={(event) => selectOperation(event.target.value as GraphOperation)}
+          >
+            {graphOperations.map((item) => (
+              <option key={item} value={item}>
+                {graphNodeLabels[item]}
+              </option>
+            ))}
+          </select>
+        </Field>
+      )}
+      {operation === 'LOG' && (
         <Field label="日志内容">
           <textarea
             readOnly={!canEdit}
@@ -1556,51 +1846,17 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           />
         </Field>
       )}
-      {node.type === 'CHECKOUT' && (
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            disabled={!canEdit}
-            checked={Boolean(node.checkout?.fullClone)}
-            onChange={(event) =>
-              patch({ checkout: { ...node.checkout, fullClone: event.target.checked } })
-            }
-          />{' '}
-          拉取完整历史
-        </label>
+      {operation === 'CHECKOUT' && (
+        <p className="field-note">
+          仓库、Git 版本和拉取方式在「输入」中声明，实际检出的提交会写入输出。
+        </p>
       )}
-      {(node.type === 'SHELL' || node.type === 'CHECK') && (
-        <>
-          <ShellFields node={node} canEdit={canEdit} patch={patch} />
-          <p className="field-note">
-            用端口标识读取环境变量。脚本可按 <code>{'VEYOPS_OUTPUT={"REPORT_CODE":"ok"}'}</code>{' '}
-            输出结构化值。
-          </p>
-          <GraphFieldEditor
-            title="脚本输入端口"
-            scriptPort
-            project={project}
-            catalog={catalog}
-            type="input"
-            disabled={!canEdit}
-            fields={node.shell?.params ?? []}
-            change={(params) => patch({ shell: { ...node.shell, params } })}
-          />
-          <GraphFieldEditor
-            title="脚本输出端口"
-            scriptPort
-            project={project}
-            catalog={catalog}
-            type="output"
-            disabled={!canEdit}
-            fields={node.outputs ?? []}
-            change={(outputs) => patch({ outputs })}
-          />
-        </>
+      {(operation === 'SHELL' || operation === 'CHECK') && (
+        <ShellFields node={node} canEdit={canEdit} patch={patch} />
       )}
-      {node.type === 'BUILD' && (
+      {operation === 'BUILD' && (
         <BuildFields
-          project={project}
+          section="execution"
           value={node.build ?? {}}
           canEdit={canEdit}
           change={(build) => patch({ build })}
@@ -1614,7 +1870,7 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           change={(deploy) => patch({ deploy })}
         />
       )}
-      {node.type === 'SOURCE_REVIEW' && (
+      {operation === 'SOURCE_REVIEW' && (
         <Field
           label="源码审核范围"
           hint="选择构建节点后，审核覆盖其实际使用的主仓库、源码依赖和环境文件。切换到此模式会清除手动指定的源码和产物；请在构建节点的审核输入选择本节点的审核输出。"
@@ -1644,12 +1900,12 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           </select>
         </Field>
       )}
-      {node.type === 'ROLLBACK_ARTIFACT' && (
+      {operation === 'ROLLBACK_ARTIFACT' && (
         <p className="field-note">
           选择要恢复的历史产物。自动回滚须绑定明确报告应用不健康的检查结果，用它确认逐台服务器的回滚基线。
         </p>
       )}
-      {node.type === 'HEALTH_CHECK' && (
+      {operation === 'HEALTH_CHECK' && (
         <>
           <Field
             label="检查命令"
@@ -1686,17 +1942,10 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           </Field>
         </>
       )}
-      {node.type === 'REGISTER_ARTIFACT' && (
-        <ArtifactOutputEditor
-          value={node.registerArtifacts?.artifacts ?? []}
-          canEdit={canEdit}
-          onChange={(artifacts) => patch({ registerArtifacts: { artifacts } })}
-        />
-      )}
-      {node.type === 'LOAD_ENV' && (
+      {operation === 'LOAD_ENV' && (
         <LoadEnvironmentFields key={node.id} node={node} canEdit={canEdit} patch={patch} />
       )}
-      {node.type === 'CONDITION' && (
+      {operation === 'CONDITION' && (
         <div className="form-grid">
           <Field label="等于" hint="在当前流绑定比较值。">
             <input
@@ -1712,8 +1961,8 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           </Field>
         </div>
       )}
-      {node.type === 'SWITCH' && <SwitchFields node={node} canEdit={canEdit} patch={patch} />}
-      {node.type === 'DELAY' && (
+      {operation === 'SWITCH' && <SwitchFields node={node} canEdit={canEdit} patch={patch} />}
+      {operation === 'DELAY' && (
         <Field label="等待时间（秒）">
           <input
             type="number"
@@ -1727,7 +1976,7 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           />
         </Field>
       )}
-      {node.type === 'APPROVAL' && (
+      {operation === 'APPROVAL' && (
         <Field
           label="审批对应的发布节点"
           hint="选择下游部署或回滚时，审批会固定实际服务、目标和产物。"
@@ -1757,9 +2006,9 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           </select>
         </Field>
       )}
-      {(node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW') && (
+      {(operation === 'APPROVAL' || operation === 'SOURCE_REVIEW') && (
         <Field
-          label={node.type === 'SOURCE_REVIEW' ? '审核超时（秒）' : '审批超时（秒）'}
+          label={operation === 'SOURCE_REVIEW' ? '审核超时（秒）' : '审批超时（秒）'}
           hint="留空默认 86400 秒。"
         >
           <input
@@ -1780,7 +2029,7 @@ function NodeFields({ node, project, canvas, canEdit, patch, catalog }: FieldsPr
           />
         </Field>
       )}
-      {node.type === 'FLOW_CALL' && (
+      {operation === 'FLOW_CALL' && (
         <Field label="子执行流">
           <select
             disabled={!canEdit}
@@ -1923,7 +2172,7 @@ function ShellFields({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canEd
           }
         />
       </Field>
-      {node.type === 'CHECK' && (
+      {effectiveNodeType(node) === 'CHECK' && (
         <label className="checkbox-row">
           <input
             type="checkbox"
@@ -1936,7 +2185,7 @@ function ShellFields({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canEd
           检查失败时由后续节点判断
         </label>
       )}
-      <Field label="Shell 脚本">
+      <Field label="Shell 脚本" hint="脚本输入和节点环境变量会注入执行进程。">
         <textarea
           readOnly={!canEdit}
           rows={5}

@@ -2,7 +2,6 @@ import { Plus, Trash2 } from 'lucide-react';
 import { useResource } from '../api';
 import { ErrorBanner, Field } from '../components';
 import type { ProjectDetail } from '../models';
-import { useRepositoryBranches, BranchSyncControls } from './RepositoryBranches';
 import { artifactTypes } from './ExecutionGraphFields';
 import type {
   FlowBuildDefinition,
@@ -22,113 +21,24 @@ export const graphTemplates: { name: string; nodes: GraphNode['type'][] }[] = [
 ];
 
 export function BuildFields({
-  project,
+  section,
   value,
   canEdit,
   change,
 }: {
-  project: ProjectDetail;
+  section: 'input' | 'execution' | 'output';
   value: FlowBuildDefinition;
   canEdit: boolean;
   change: (value: FlowBuildDefinition) => void;
 }) {
-  const repositoryId = value.repositoryId ?? '';
-  const repo = project.repositories.find((item) => item.id === repositoryId);
-  const branches = useRepositoryBranches(
-    repo ? `/projects/${project.id}/repositories/${repo.id}` : null,
-  );
   const registries = useResource<{ id: string; name: string }[]>(
-    value.artifactType === 'DOCKER_IMAGE' ||
-      value.artifacts?.some(({ type }) => type === 'DOCKER_IMAGE')
-      ? '/registries'
-      : null,
+    section === 'output' && value.artifactType === 'DOCKER_IMAGE' ? '/registries' : null,
   );
   function patch(fields: Partial<FlowBuildDefinition>) {
     change({ ...value, ...fields });
   }
-  return (
-    <div className="form-grid graph-preset-fields">
-      <Field label="构建仓库">
-        <select
-          data-graph-node-field="repository"
-          disabled={!canEdit}
-          value={repositoryId}
-          onChange={(event) =>
-            patch({
-              repositoryId: event.target.value || undefined,
-              branch: undefined,
-              commitSha: undefined,
-            })
-          }
-        >
-          <option value="">选择仓库</option>
-          {project.repositories.map(({ id, name }) => (
-            <option key={id} value={id}>
-              {name}
-            </option>
-          ))}
-        </select>
-      </Field>
-      {repo && (
-        <Field label="构建分支" hint="留空使用远程默认分支。固定提交优先，可留空。">
-          <select
-            disabled={!canEdit || branches.loading}
-            value={value.branch ?? ''}
-            onChange={(event) =>
-              patch({ branch: event.target.value || undefined, commitSha: undefined })
-            }
-          >
-            <option value="">远程默认分支</option>
-            {value.branch && !branches.data?.branches.some(({ name }) => name === value.branch) && (
-              <option value={value.branch}>{value.branch}</option>
-            )}
-            {branches.data?.branches.map(({ name }) => (
-              <option key={name}>{name}</option>
-            ))}
-          </select>
-          {canEdit && <BranchSyncControls branches={branches} />}
-        </Field>
-      )}
-      <Text
-        label="固定提交 SHA"
-        value={value.commitSha}
-        canEdit={canEdit}
-        onChange={(commitSha) => patch({ commitSha, ...(commitSha && { branch: undefined }) })}
-      />
-      <Field label="构建位置">
-        <select
-          disabled={!canEdit}
-          value={value.buildLocation ?? ''}
-          onChange={(e) =>
-            patch({
-              buildLocation: (e.target.value || undefined) as FlowBuildDefinition['buildLocation'],
-            })
-          }
-        >
-          <option value="">项目默认设置</option>
-          <option value="TARGET">目标服务器</option>
-          <option value="MANAGER">管理端隔离构建</option>
-        </select>
-      </Field>
-      <Field label="默认产物类型">
-        <select
-          disabled={!canEdit}
-          value={value.artifactType ?? 'FILE'}
-          onChange={(e) =>
-            patch({ artifactType: e.target.value as FlowBuildDefinition['artifactType'] })
-          }
-        >
-          <option value="FILE">文件归档</option>
-          <option value="DOCKER_IMAGE">Docker 镜像</option>
-        </select>
-      </Field>
-      <Text
-        label="源码目录"
-        placeholder="."
-        value={value.repoPath}
-        canEdit={canEdit}
-        onChange={(repoPath) => patch({ repoPath })}
-      />
+  if (section === 'input')
+    return (
       <Field
         label="额外源码工作区"
         hint="用逗号分隔小写别名，保存后在所属执行流绑定输入。构建命令可访问 VEYOPS_GRAPH_DEPENDENCY_ROOT 下对应的目录。"
@@ -146,6 +56,86 @@ export function BuildFields({
           }}
         />
       </Field>
+    );
+  if (section === 'output')
+    return (
+      <div className="form-grid graph-preset-fields">
+        <Field label="默认产物类型">
+          <select
+            disabled={!canEdit}
+            value={value.artifactType ?? 'FILE'}
+            onChange={(e) =>
+              patch({ artifactType: e.target.value as FlowBuildDefinition['artifactType'] })
+            }
+          >
+            <option value="FILE">文件归档</option>
+            <option value="DOCKER_IMAGE">Docker 镜像</option>
+          </select>
+        </Field>
+        {(value.artifactType ?? 'FILE') === 'FILE' ? (
+          <Text
+            label="归档目录"
+            placeholder="dist"
+            value={value.outputPath}
+            canEdit={canEdit}
+            onChange={(outputPath) => patch({ outputPath })}
+          />
+        ) : (
+          <>
+            <Text
+              label="镜像仓库"
+              value={value.imageRepository}
+              canEdit={canEdit}
+              onChange={(imageRepository) => patch({ imageRepository })}
+            />
+            <Field label="镜像 Registry">
+              <select
+                disabled={!canEdit}
+                value={value.registryId ?? ''}
+                onChange={(e) => patch({ registryId: e.target.value || undefined })}
+              >
+                <option value="">未配置</option>
+                {registries.data?.map(({ id, name }) => (
+                  <option key={id} value={id}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <ErrorBanner error={registries.error} />
+          </>
+        )}
+        <ArtifactOutputEditor
+          value={value.artifacts ?? []}
+          canEdit={canEdit}
+          onChange={(artifacts) => patch({ artifacts })}
+        />
+      </div>
+    );
+  return (
+    <div className="form-grid graph-preset-fields">
+      <Field label="构建位置">
+        <select
+          disabled={!canEdit}
+          value={value.buildLocation ?? ''}
+          onChange={(e) =>
+            patch({
+              buildLocation: (e.target.value || undefined) as FlowBuildDefinition['buildLocation'],
+            })
+          }
+        >
+          <option value="">项目默认设置</option>
+          <option value="TARGET">目标服务器</option>
+          <option value="MANAGER">管理端隔离构建</option>
+        </select>
+      </Field>
+      <Text
+        label="源码目录"
+        placeholder="."
+        value={value.repoPath}
+        canEdit={canEdit}
+        onChange={(repoPath) => patch({ repoPath })}
+      />
       {value.buildLocation !== 'TARGET' && (
         <Text
           label="构建环境镜像"
@@ -168,51 +158,15 @@ export function BuildFields({
         canEdit={canEdit}
         onChange={(buildCommand) => patch({ buildCommand })}
       />
-      {(value.artifactType ?? 'FILE') === 'FILE' ? (
+      {value.artifactType === 'DOCKER_IMAGE' && (
         <Text
-          label="归档目录"
-          placeholder="dist"
-          value={value.outputPath}
+          label="Dockerfile 路径"
+          placeholder="Dockerfile"
+          value={value.dockerfilePath}
           canEdit={canEdit}
-          onChange={(outputPath) => patch({ outputPath })}
+          onChange={(dockerfilePath) => patch({ dockerfilePath })}
         />
-      ) : (
-        <>
-          <Text
-            label="Dockerfile 路径"
-            placeholder="Dockerfile"
-            value={value.dockerfilePath}
-            canEdit={canEdit}
-            onChange={(dockerfilePath) => patch({ dockerfilePath })}
-          />
-          <Text
-            label="镜像仓库"
-            value={value.imageRepository}
-            canEdit={canEdit}
-            onChange={(imageRepository) => patch({ imageRepository })}
-          />
-          <Field label="镜像 Registry">
-            <select
-              disabled={!canEdit}
-              value={value.registryId ?? ''}
-              onChange={(e) => patch({ registryId: e.target.value || undefined })}
-            >
-              <option value="">未配置</option>
-              {registries.data?.map(({ id, name }) => (
-                <option key={id} value={id}>
-                  {name}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <ErrorBanner error={registries.error} />
-        </>
       )}
-      <ArtifactOutputEditor
-        value={value.artifacts ?? []}
-        canEdit={canEdit}
-        onChange={(artifacts) => patch({ artifacts })}
-      />
     </div>
   );
 }

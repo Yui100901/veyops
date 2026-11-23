@@ -98,8 +98,8 @@ export class GraphScriptOutput {
     return Object.fromEntries(
       [...declarations].flatMap(([name, field]) => {
         const present = Object.hasOwn(result, name);
-        if (!present && field.required === false) return [];
-        const value = present ? result[name] : undefined;
+        const value = present ? result[name] : field.defaultValue;
+        if (value === undefined && field.required === false) return [];
         if (!validateGraphValue({ ...field, required: true }, value))
           outputIssue('脚本未提供有效的「' + field.name + '」输出', field);
         for (const scalar of Array.isArray(value) ? value : [value]) {

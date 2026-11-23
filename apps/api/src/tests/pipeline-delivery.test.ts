@@ -1346,7 +1346,13 @@ async function checkDelivery(databaseUrl?: string) {
         name: 'Shell 构建',
         inputs: [
           ...scoped,
-          { id: 'outputDir', name: '产物目录', type: 'PATH', defaultValue: 'custom-dist' },
+          {
+            id: 'outputDir',
+            name: '产物目录',
+            referenceName: 'ARTIFACT_DIR',
+            type: 'PATH',
+            defaultValue: 'custom-dist',
+          },
         ],
       },
       {
@@ -1362,9 +1368,19 @@ async function checkDelivery(databaseUrl?: string) {
       },
       {
         id: 'register',
-        type: 'REGISTER_ARTIFACT',
+        type: 'FUNCTION',
+        operation: 'REGISTER_ARTIFACT',
         name: '登记 Shell 产物',
-        registerArtifacts: { artifacts: [{ name: 'static', type: 'DIRECTORY' }] },
+        inputs: [
+          {
+            id: 'path',
+            name: '产物目录',
+            referenceName: 'ARTIFACT_DIR',
+            type: 'PATH',
+            defaultValue: './dist',
+          },
+        ],
+        registerArtifacts: { artifacts: [{ name: 'static', type: 'DIRECTORY', path: 'unused' }] },
       },
       {
         id: 'custom-end',
@@ -1485,7 +1501,7 @@ async function checkDelivery(databaseUrl?: string) {
             endId: 'custom-end',
             inputBindings: {
               script: { OUT_DIR: input('outputDir') },
-              register: { workspace: from('script', 'workspace'), path: input('outputDir') },
+              register: { workspace: from('script', 'workspace') },
             },
             outputBindings: { directory: from('register', 'static') },
           },
@@ -1537,6 +1553,20 @@ async function checkDelivery(databaseUrl?: string) {
       assert.equal((await create(path + '/run', confirmed)).id, run.id);
       return { reviewed, detail: await waitGraph(run.id) };
     };
+    const custom = await submit('custom');
+    assert.equal(custom.detail.status, 'SUCCESS', JSON.stringify(custom.detail.nodes));
+    assert.equal(custom.detail.outputs.directory[0].type, 'DIRECTORY');
+    const inspected = custom.detail.nodes.find(
+      (node: { nodeId: string }) => node.nodeId === 'register',
+    );
+    assert.equal(
+      inspected.inputs.find(({ fieldId }: { fieldId: string }) => fieldId === 'path').value,
+      'custom-dist',
+    );
+    const scriptResult = custom.detail.nodes.find(
+      (node: { nodeId: string }) => node.nodeId === 'script',
+    );
+    assert.equal(scriptResult.output.result, 'generated');
     const beforePublish = remoteCommands.length;
     const onlyBuild = await submit('build');
     assert.deepEqual(onlyBuild.reviewed.deliveries[0].serverIds, []);
@@ -1983,13 +2013,6 @@ async function checkDelivery(databaseUrl?: string) {
     });
     assert.equal(graphFailure.detail.status, 'FAILED');
     assert.equal(graphFailure.detail.nodes.at(-1).status, 'SKIPPED');
-    const custom = await submit('custom');
-    assert.equal(custom.detail.status, 'SUCCESS', JSON.stringify(custom.detail.nodes));
-    assert.equal(custom.detail.outputs.directory[0].type, 'DIRECTORY');
-    const scriptResult = custom.detail.nodes.find(
-      (node: { nodeId: string }) => node.nodeId === 'script',
-    );
-    assert.equal(scriptResult.output.result, 'generated');
     const buildTask = onlyBuild.detail.nodes.find(
       (node: { nodeId: string }) => node.nodeId === 'build-node',
     );

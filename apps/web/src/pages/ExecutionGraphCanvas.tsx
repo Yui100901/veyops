@@ -28,7 +28,13 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { branchLabel, graphNodeLabels, orderedNodes } from './execution-graph-definition';
+import {
+  branchLabel,
+  effectiveNodeType,
+  graphNodeFamily,
+  graphNodeTypeLabel,
+  orderedNodes,
+} from './execution-graph-definition';
 import type { GraphFlow } from './execution-graph-definition';
 
 const icons = {
@@ -463,7 +469,9 @@ export function NodeMap({
                 );
               })()}
             {flow.nodes.map((node) => {
-              const Icon = icons[node.type];
+              const nodeType = effectiveNodeType(node);
+              const family = graphNodeFamily(node);
+              const Icon = icons[nodeType];
               const runnable = node.type === 'START' && isRunnableStart?.(node.id);
               const hasMenu = onNodeCopy && onNodeDelete;
               const location = points.get(node.id)!;
@@ -479,7 +487,7 @@ export function NodeMap({
                   <Icon size={18} />
                   <span>
                     <strong>{node.name || '未命名节点'}</strong>
-                    <small>{runnable ? '开始 · 手动运行' : graphNodeLabels[node.type]}</small>
+                    <small>{runnable ? '开始 · 手动运行' : graphNodeTypeLabel(node)}</small>
                   </span>
                 </>
               );
@@ -488,7 +496,8 @@ export function NodeMap({
                   <button
                     type="button"
                     className={className}
-                    data-node-type={node.type}
+                    data-node-type={nodeType}
+                    data-node-family={family}
                     style={style}
                     aria-pressed={selected.includes(node.id)}
                     aria-label={runnable ? `运行 ${node.name}` : undefined}
@@ -558,7 +567,13 @@ export function NodeMap({
                     )}
                 </div>
               ) : (
-                <div key={node.id} className={className} data-node-type={node.type} style={style}>
+                <div
+                  key={node.id}
+                  className={className}
+                  data-node-type={nodeType}
+                  data-node-family={family}
+                  style={style}
+                >
                   {label}
                 </div>
               );

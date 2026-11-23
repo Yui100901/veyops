@@ -33,6 +33,10 @@ import {
 import { CredentialsService } from '../credentials/credentials.service';
 import { redactTaskLog } from '../tasks/task-log.service';
 import { isGitBranchName as isBranchName } from './git-ref';
+import { graphRepositoryUrl, httpCloneUrl } from './http-clone-url';
+import { resolveGraphRepositorySelector } from './graph-repository-selectors';
+
+export { httpCloneUrl } from './http-clone-url';
 
 const exec = promisify(execFile);
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -171,24 +175,6 @@ class RepositoryCommitsQuery {
   @IsOptional() @IsString() @Matches(/^(?:[1-9]|[1-4][0-9]|50)$/) limit?: string;
 }
 
-export function httpCloneUrl(value: string): string {
-  if (
-    !/^https?:\/\//i.test(value) ||
-    /\s|\\/.test(value) ||
-    [...value].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127)
-  )
-    throw new BadRequestException('仓库查询需要有效的 HTTP(S) 克隆地址');
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new BadRequestException('仓库查询需要有效的 HTTP(S) 克隆地址');
-  }
-  if (url.username || url.password || value.includes('?') || value.includes('#'))
-    throw new BadRequestException('仓库地址不能包含凭据、查询或片段');
-  return url.href;
-}
-
 interface GitRepository {
   url: string;
   run(args: string[]): Promise<string>;
@@ -320,8 +306,14 @@ export class RepositoryMetadataService {
       fullClone?: boolean;
     },
   ): Promise<GraphCheckoutSnapshot> {
-    const row = await this.repositoryRow(projectId, input.repositoryId);
+    const address = graphRepositoryUrl(input.repositoryId);
+    const repositoryId = address
+      ? await resolveGraphRepositorySelector(this.database.db, projectId, address)
+      : input.repositoryId;
+    const row = await this.repositoryRow(projectId, repositoryId);
     if (!row) throw new NotFoundException('仓库不存在');
+    if (address && address !== row.clone_url)
+      throw new ConflictException('仓库地址已变化，请重新预览');
     const access = { clone_url: row.clone_url, credential_id: row.credential_id };
     let branch: string | undefined;
     let tag: string | undefined;
@@ -329,7 +321,7 @@ export class RepositoryMetadataService {
     if (input.mode === 'BRANCH') {
       const remote = await this.withRepository(
         projectId,
-        input.repositoryId,
+        repositoryId,
         (git) => this.listBranches(git),
         access,
       );
@@ -342,7 +334,7 @@ export class RepositoryMetadataService {
       const ref = 'refs/tags/' + tag;
       commitSha = await this.withRepository(
         projectId,
-        input.repositoryId,
+        repositoryId,
         async (git) => {
           if (git.redact(tag!) !== tag) throw new BadRequestException('请选择有效的 Git 标签');
           const data = await git.run(['ls-remote', '--', git.url, ref, ref + '^{}']);
@@ -364,12 +356,12 @@ export class RepositoryMetadataService {
     if (input.mode === 'COMMIT')
       await this.withRepository(
         projectId,
-        input.repositoryId,
+        repositoryId,
         (git) => this.fetchPinnedCommit(git, commitSha!),
         access,
       );
     return {
-      repositoryId: input.repositoryId,
+      repositoryId,
       repositoryName: row.name,
       ref: branch ? 'refs/heads/' + branch : tag ? 'refs/tags/' + tag : commitSha,
       branch,

@@ -4,6 +4,8 @@ import type { GraphDefinition } from '../execution-graphs/execution-graph-defini
 import { activeFlowStatuses } from '../execution-graphs/graph-run-lifecycle';
 import type { TaskPayload } from '../tasks/tasks.types';
 import { terminalTaskStatuses } from '../tasks/tasks.types';
+import { graphRepositoryMatches } from './graph-repository-selectors';
+import { graphRepositoryUrl } from './http-clone-url';
 import {
   graphResourceReferences,
   graphTriggerReferences,
@@ -567,7 +569,19 @@ export async function projectResourceReferences(
       ? taskReferences(db, projectId, options)
       : [],
   ]);
-  const refs = [...configured, ...graph, ...tasks];
+  const references = [...configured, ...graph, ...tasks];
+  const addresses = new Map(
+    references.flatMap(({ resourceType, resourceId }) => {
+      const address = resourceType === 'REPOSITORY' && graphRepositoryUrl(resourceId);
+      return address ? [[resourceId, address] as const] : [];
+    }),
+  );
+  const repositories = await graphRepositoryMatches(db, projectId, addresses.values());
+  const refs = references.flatMap((reference) => {
+    const address = reference.resourceType === 'REPOSITORY' && addresses.get(reference.resourceId);
+    const ids = address ? repositories.get(address) : undefined;
+    return ids?.length ? ids.map((resourceId) => ({ ...reference, resourceId })) : [reference];
+  });
   if (!options.resourceType || options.resourceType === 'SERVER')
     refs.push(
       ...(await currentMembers(
