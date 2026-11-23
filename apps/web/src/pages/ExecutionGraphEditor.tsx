@@ -5,12 +5,7 @@ import { post, useResource } from '../api';
 import { ErrorBanner, Field } from '../components';
 import type { ProjectDetail, Server } from '../models';
 import { graphDragType, NodeMap } from './ExecutionGraphCanvas';
-import {
-  ArtifactOutputEditor,
-  BuildFields,
-  DeployFields,
-  graphTemplates,
-} from './ExecutionGraphPresets';
+import { ArtifactOutputEditor, BuildFields, DeployFields } from './ExecutionGraphPresets';
 import { GraphFieldEditor, useProjectEnvironmentSets } from './ExecutionGraphFields';
 import {
   canCreateStartParameter,
@@ -30,7 +25,7 @@ import {
   isReleaseNode,
 } from './execution-graph-definition';
 import type {
-  GraphBinding,
+  GraphArtifactType,
   GraphCanvas,
   GraphCatalog,
   GraphEdge,
@@ -47,6 +42,7 @@ import {
   pathHighlight,
   reachable,
 } from './execution-graph-draft-impact';
+import { applyGraphPreset, authoredNode, graphTemplates, makeNode } from './graph-presets';
 import './execution-graph-editor.css';
 
 type NodeType = GraphNode['type'];
@@ -94,82 +90,6 @@ function focusInspectorField(inspector: HTMLElement, fieldId: string, bound: boo
   const control = field.matches(controls) ? field : field.querySelector<HTMLElement>(controls);
   field.scrollIntoView({ block: 'nearest' });
   (control ?? inspector.querySelector<HTMLElement>('h3'))?.focus({ preventScroll: true });
-}
-
-function makeNode(type: NodeType, project: ProjectDetail, preset = true): GraphNode {
-  const name = graphNodeLabels[type];
-  const operation = type === 'FUNCTION' ? 'SHELL' : type;
-  const repo = project.repositories.length === 1 ? project.repositories[0] : undefined;
-  return authoredNode({
-    id: graphKey('node'),
-    type,
-    name,
-    ...(type === 'LOG' && { message: name }),
-    ...(operation === 'SHELL' || operation === 'CHECK'
-      ? { shell: { location: 'MANAGER' as const, timeout: 180 } }
-      : {}),
-    ...(preset && type === 'BUILD' && repo && { inputDefaults: { repository: repo.id } }),
-    ...(preset &&
-      type === 'CHECKOUT' && {
-        inputs: [
-          {
-            id: 'repository',
-            name: '仓库地址',
-            referenceName: 'GIT_REPOSITORY_NAME',
-            type: 'REPOSITORY' as const,
-            required: true,
-            defaultValue: repo?.cloneUrl,
-          },
-          {
-            id: 'fetchMode',
-            name: '拉取方式',
-            referenceName: 'GIT_FETCH_MODE',
-            type: 'GIT_FETCH_MODE' as const,
-            required: true,
-            defaultValue: 'LATEST',
-          },
-        ],
-        outputs: [
-          {
-            id: 'commitSha',
-            name: '检出提交',
-            referenceName: 'GIT_COMMIT_SHA',
-            type: 'TEXT' as const,
-            required: true,
-          },
-        ],
-      }),
-    ...(preset &&
-      type === 'REGISTER_ARTIFACT' && {
-        inputs: [
-          {
-            id: 'path',
-            name: '产物目录',
-            referenceName: 'ARTIFACT_DIR',
-            type: 'PATH' as const,
-            required: true,
-            defaultValue: './dist',
-          },
-        ],
-      }),
-    ...(type === 'BUILD' && { build: {} }),
-    ...(type === 'LOAD_ENV' ? { loadEnvironment: { required: true } } : {}),
-    ...(type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT'
-      ? { deploy: { method: 'FILE' as const } }
-      : {}),
-    ...(type === 'HEALTH_CHECK' ? { healthCheck: { command: '', timeoutSeconds: 30 } } : {}),
-    ...(type === 'CONDITION' && { condition: { key: 'input', value: 'yes' } }),
-    ...(type === 'SWITCH' && { switch: { key: 'input', cases: ['release'] } }),
-    ...(type === 'DELAY' && { delaySeconds: 5 }),
-    ...((type === 'APPROVAL' || type === 'SOURCE_REVIEW') && {
-      approval: { timeoutSeconds: 3600 },
-    }),
-  });
-}
-
-function authoredNode(node: GraphNode): GraphNode {
-  if (graphNodeFamily(node) !== 'function') return node;
-  return { ...node, type: 'FUNCTION', operation: effectiveNodeType(node) as GraphOperation };
 }
 
 export function ProjectGraphEditor({
@@ -566,195 +486,13 @@ export function ProjectGraphEditor({
     Boolean(presetEnd) &&
     canvas.edges.filter(({ from }) => from === activeNode.id).length === 1 &&
     canvas.edges.some(({ from, to }) => from === activeNode.id && to === presetEnd);
-  function insertPreset(types: NodeType[]) {
-    if (!activeNode || !presetEnd || !canInsertPreset || !canEdit) return;
-    const start = activeNode;
-    const nodes = types.map((type) => makeNode(type, project));
-    const checkout = nodes.find((node) => effectiveNodeType(node) === 'CHECKOUT');
-    const script = nodes.find((node) => effectiveNodeType(node) === 'SHELL');
-    const build = nodes.find((node) => effectiveNodeType(node) === 'BUILD');
-    const review = nodes.find((node) => effectiveNodeType(node) === 'SOURCE_REVIEW');
-    const approval = nodes.find((node) => effectiveNodeType(node) === 'APPROVAL');
-    const deploy = nodes.find(isReleaseNode);
-    const end = canvas.nodes.find((node) => node.id === presetEnd)!;
-    const inputs = [...(start.inputs ?? [])];
-    const outputs = [...(end.outputs ?? [])];
-    const pair = canvas.endpoints.find(({ startId }) => startId === start.id)!;
-    const addField = (fields: GraphField[], next: GraphField) => {
-      const existing = fields.find(({ id }) => id === next.id);
-      if (existing?.type === next.type) return existing.id;
-      const id = existing ? graphKey('field') : next.id;
-      fields.push({ ...next, id });
-      return id;
-    };
-    const inputBindings = { ...pair.inputBindings };
-    const environmentBindings = { ...pair.environmentBindings };
-    const outputBindings = { ...pair.outputBindings };
-    if (checkout) {
-      const chosen = project.repositories.length === 1 ? project.repositories[0] : undefined;
-      const repository: GraphBinding = chosen
-        ? { kind: 'VALUE', value: chosen.id }
-        : {
-            kind: 'INPUT',
-            fieldId: addField(inputs, {
-              id: 'repository',
-              name: '仓库',
-              type: 'REPOSITORY',
-              required: true,
-            }),
-          };
-      const version = addField(inputs, {
-        id: 'gitVersion',
-        name: 'Git 版本',
-        type: 'GIT_REF',
-        required: false,
-      });
-      inputBindings[checkout.id] = {
-        repository,
-        version: {
-          kind: 'INPUT',
-          fieldId: version,
-          onMissing: 'REPOSITORY_DEFAULT',
-        },
-      };
-    }
-    if (checkout && script) {
-      inputBindings[script.id] = {
-        source: { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'source' },
-        workspace: { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'workspace' },
-      };
-      script.shell = {
-        ...script.shell,
-        location: 'MANAGER',
-        command: 'printf \'VEYOPS_OUTPUT={"COMMIT_SHA":"%s"}\\n\' "$VEYOPS_GIT_COMMIT_SHA"',
-      };
-      script.outputs = [
-        {
-          id: 'commit',
-          name: '实际提交 SHA',
-          referenceName: 'COMMIT_SHA',
-          type: 'TEXT',
-          required: true,
-        },
-      ];
-      const result = addField(outputs, {
-        id: 'commit',
-        name: '实际提交 SHA',
-        type: 'TEXT',
-        required: true,
-      });
-      outputBindings[result] = { kind: 'OUTPUT', nodeId: script.id, fieldId: 'commit' };
-    }
-    if (build || deploy) {
-      const service = pair.serviceId
-        ? undefined
-        : addField(inputs, { id: 'service', name: '服务', type: 'SERVICE', required: !!deploy });
-      const releaseTargets =
-        deploy &&
-        addField(inputs, {
-          id: 'releaseTargets',
-          name: effectiveNodeType(deploy) === 'ROLLBACK_ARTIFACT' ? '回滚目标' : '发布目标',
-          type: 'TARGETS',
-          required: true,
-        });
-      for (const node of [build, deploy]) {
-        if (!node) continue;
-        const bindings: Record<string, GraphBinding> = {};
-        const targets =
-          releaseTargets ||
-          addField(inputs, {
-            id: 'buildTargets',
-            name: '目标端构建服务器',
-            type: 'TARGETS',
-            required: false,
-          });
-        bindings.targets = { kind: 'INPUT', fieldId: targets };
-        if (service) bindings.service = { kind: 'INPUT', fieldId: service };
-        inputBindings[node.id] = bindings;
-      }
-    }
-    if (build) {
-      build.build = { ...build.build, buildLocation: deploy ? 'TARGET' : 'MANAGER' };
-      if (checkout && review) {
-        review.approval = { ...review.approval, buildNodeId: build.id };
-        inputBindings[build.id].source = { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'source' };
-        inputBindings[build.id].workspace = {
-          kind: 'OUTPUT',
-          nodeId: checkout.id,
-          fieldId: 'workspace',
-        };
-        inputBindings[build.id].review = { kind: 'OUTPUT', nodeId: review.id, fieldId: 'review' };
-        environmentBindings[build.id] = {
-          GIT_SHA: { kind: 'OUTPUT', nodeId: checkout.id, fieldId: 'commitSha' },
-        };
-      } else if (!build.inputDefaults?.repository) {
-        const repo = addField(inputs, {
-          id: 'repository',
-          name: '仓库',
-          type: 'REPOSITORY',
-          required: true,
-        });
-        inputBindings[build.id].repository = { kind: 'INPUT', fieldId: repo };
-      }
-      const id = addField(outputs, {
-        id: 'buildArtifacts',
-        name: '构建产物',
-        type: 'ARTIFACT',
-        multiple: true,
-        source: 'CURRENT_RUN',
-        required: true,
-      });
-      outputBindings[id] = { kind: 'OUTPUT', nodeId: build.id, fieldId: 'artifacts' };
-    }
-    if (deploy) {
-      if (approval) approval.approval = { ...approval.approval, releaseNodeId: deploy.id };
-      if (build)
-        inputBindings[deploy.id].artifact = {
-          kind: 'OUTPUT',
-          nodeId: build.id,
-          fieldId: 'artifacts',
-        };
-      else {
-        const id = addField(inputs, {
-          id: 'artifact',
-          name: effectiveNodeType(deploy) === 'ROLLBACK_ARTIFACT' ? '历史构建产物' : '构建产物',
-          type: 'ARTIFACT',
-          multiple: true,
-          required: true,
-        });
-        inputBindings[deploy.id].artifact = { kind: 'INPUT', fieldId: id };
-      }
-      const id = addField(outputs, {
-        id: 'release',
-        name: '服务发布结果',
-        type: 'RELEASE',
-        required: true,
-      });
-      outputBindings[id] = { kind: 'OUTPUT', nodeId: deploy.id, fieldId: 'release' };
-    }
-    const path = [activeNode.id, ...nodes.map(({ id }) => id), presetEnd];
-    onChange({
-      ...canvas,
-      nodes: [
-        ...canvas.nodes.map((node) =>
-          node.id === start.id
-            ? { ...node, inputs }
-            : node.id === end.id
-              ? { ...node, outputs }
-              : node,
-        ),
-        ...nodes,
-      ],
-      endpoints: canvas.endpoints.map((item) =>
-        item.startId === start.id
-          ? { ...item, inputBindings, environmentBindings, outputBindings }
-          : item,
-      ),
-      edges: [
-        ...canvas.edges.filter(({ from, to }) => from !== activeNode.id || to !== presetEnd),
-        ...path.slice(1).map((to, i) => ({ from: path[i]!, to })),
-      ],
-    });
+  function insertPreset(
+    types: NodeType[],
+    artifactType: GraphArtifactType,
+    latestCompatible: boolean,
+  ) {
+    if (!activeNode || !canInsertPreset || !canEdit) return;
+    onChange(applyGraphPreset(canvas, activeNode, types, project, artifactType, latestCompatible));
   }
   function detachEdge(index: number) {
     if (!canEdit) return;
@@ -846,6 +584,14 @@ export function ProjectGraphEditor({
       return;
     }
     const owner = canvas.nodes.find(({ id }) => id === source);
+    if (
+      owner &&
+      isReleaseNode(owner) &&
+      canvas.edges.some(({ from, when }) => from === source && !when)
+    ) {
+      setError('请先将普通连线改为「全部发布成功」分支，再添加「部分发布成功」分支。');
+      return;
+    }
     const options = branchOptions(owner).filter(
       ({ value }) => !canvas.edges.some(({ from, when }) => from === source && when === value),
     );
@@ -1614,6 +1360,10 @@ function ConnectorFields({
   const [when, setWhen] = useState(edge.when);
   const source = canvas.nodes.find(({ id }) => id === edge.from);
   const to = canvas.nodes.find(({ id }) => id === edge.to);
+  const canUseOrdinary =
+    source &&
+    isReleaseNode(source) &&
+    !canvas.edges.some((item, i) => item.from === edge.from && index !== i);
   const options = branchOptions(source).filter(
     ({ value }) =>
       !canvas.edges.some(
@@ -1632,7 +1382,7 @@ function ConnectorFields({
             value={when ?? ''}
             onChange={(event) => setWhen(event.target.value as GraphEdge['when'])}
           >
-            <option value="">选择分支</option>
+            <option value="">{canUseOrdinary ? '普通连线 · 全部成功后继续' : '选择分支'}</option>
             {options.map(({ value, label }) => (
               <option key={value} value={value}>
                 {label}
@@ -1646,8 +1396,8 @@ function ConnectorFields({
           <button
             type="button"
             className="button primary small"
-            disabled={!options.some(({ value }) => value === when)}
-            onClick={() => commit({ ...edge, when }, index)}
+            disabled={!(!when && canUseOrdinary) && !options.some(({ value }) => value === when)}
+            onClick={() => commit({ ...edge, when: when || undefined }, index)}
           >
             {index === undefined ? '连接' : '更新分支'}
           </button>
@@ -2022,6 +1772,7 @@ function NodeOperationFields({
             value={operation}
             onChange={(event) => selectOperation(event.target.value as GraphOperation)}
           >
+            {operation === 'LOG' && <option value="LOG">{graphNodeLabels.LOG}</option>}
             {graphOperations.map((item) => (
               <option key={item} value={item}>
                 {graphNodeLabels[item]}

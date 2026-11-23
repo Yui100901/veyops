@@ -15,6 +15,7 @@ import { NodeMap } from './ExecutionGraphCanvas';
 import { GraphFieldValue, useProjectEnvironmentSets } from './ExecutionGraphFields';
 import type { FieldScope } from './ExecutionGraphFields';
 import { ConfiguredNodeExecution, showSelectedNode } from './ExecutionGraphNodeDetails';
+import { ExecutionGraphNodeLogs } from './ExecutionGraphNodeLogs';
 import {
   ExecutionPlan,
   ExecutionPlanChanges,
@@ -158,12 +159,18 @@ function artifactOutput(value: unknown) {
   if (!value || typeof value !== 'object') return undefined;
   if ('temporaryArtifactId' in value && typeof value.temporaryArtifactId === 'string')
     return { id: value.temporaryArtifactId, label: '查看临时产物', temporary: true };
-  if ('artifactId' in value && typeof value.artifactId === 'string')
+  if ('artifactId' in value && typeof value.artifactId === 'string') {
+    const instances =
+      'instances' in value && Array.isArray(value.instances) ? value.instances : undefined;
+    const temporary = 'scope' in value && value.scope === 'TEMPORARY';
+    const firstInstance = instances?.[0] as { instanceId?: string } | undefined;
     return {
-      id: value.artifactId,
+      id: temporary ? (firstInstance?.instanceId ?? value.artifactId) : value.artifactId,
       label: 'name' in value && typeof value.name === 'string' ? value.name : '查看产物',
-      temporary: false,
+      temporary,
+      instances,
     };
+  }
   return undefined;
 }
 
@@ -252,20 +259,27 @@ function Results({
                     {references.map(
                       (reference, index) =>
                         reference && (
-                          <a
-                            className="button secondary small"
-                            key={reference.id + ':' + index}
-                            href={
-                              '#' +
-                              deliveryPath(artifactContext.projectId, 'artifacts', {
-                                ...artifactContext.scope,
-                                recordId: reference.id,
-                              })
-                            }
-                          >
-                            {reference.label}
-                            {reference.temporary && <span className="tag">临时</span>}
-                          </a>
+                          <div key={reference.id + ':' + index}>
+                            <a
+                              className="button secondary small"
+                              href={
+                                '#' +
+                                deliveryPath(artifactContext.projectId, 'artifacts', {
+                                  ...artifactContext.scope,
+                                  recordId: reference.id,
+                                })
+                              }
+                            >
+                              {reference.label}
+                              {reference.temporary && <span className="tag">临时</span>}
+                            </a>
+                            {!!reference.instances?.length && (
+                              <details>
+                                <summary>逐目标实例（{reference.instances.length}）</summary>
+                                <pre>{JSON.stringify(reference.instances, null, 2)}</pre>
+                              </details>
+                            )}
+                          </div>
                         ),
                     )}
                   </div>
@@ -514,7 +528,7 @@ export function ExecutionGraphStart({
                 scope={artifactFieldScope(field, flow, parameters, scope)}
                 disabled={Boolean(initialInputs && Object.hasOwn(initialInputs, field.id))}
                 checkRequired
-                canRegisterRepository
+                canManageProjectResources
                 value={parameters[field.id]}
                 change={(value) => updateParameter(field, value)}
               />
@@ -1503,14 +1517,12 @@ function RunDetails({
                           </ul>
                         </details>
                       )}
-                      {n.log ? (
-                        <details className="graph-field-card" open>
-                          <summary>节点日志</summary>
-                          <pre>{n.log}</pre>
-                        </details>
-                      ) : (
-                        <p className="field-note">此节点暂无日志。</p>
-                      )}
+                      <ExecutionGraphNodeLogs
+                        key={`${path}/${n.nodeId}`}
+                        path={`${path}/nodes/${encodeURIComponent(n.nodeId)}/logs`}
+                        status={n.status}
+                        legacy={n.log}
+                      />
                       {n.childRunId && (
                         <a
                           className="text-link"

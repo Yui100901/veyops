@@ -27,6 +27,7 @@ import { ExecutionGraphStartList, ExecutionGraphStartStatus } from './ExecutionG
 import { ExecutionGraphTriggers } from './ExecutionGraphTriggers';
 import { GraphVersionTools } from './ExecutionGraphVersions';
 import { effectiveNodeType, graphNodeTypeLabel } from './execution-graph-definition';
+import { GraphResourceContext } from './graph-resource-context';
 import type {
   GraphCanvas,
   GraphCatalog,
@@ -65,6 +66,7 @@ export default function ProjectExecutionGraph({
   embedded,
   runDrafts,
   project: providedProject,
+  reloadProject,
 }: {
   id: string;
   user: User;
@@ -73,6 +75,7 @@ export default function ProjectExecutionGraph({
   embedded?: boolean;
   runDrafts?: GraphRunDrafts;
   project?: ProjectDetail;
+  reloadProject?: () => void | Promise<void>;
 }) {
   const base = `/projects/${encodeURIComponent(id)}`;
   const projectResource = useResource<ProjectDetail>(
@@ -109,19 +112,23 @@ export default function ProjectExecutionGraph({
       </>
     );
   return (
-    <Workspace
-      key={id}
-      project={project}
-      initial={graph.data}
-      path={base + '/execution-graph'}
-      canEdit={user.role !== 'VIEWER' && !project.archived}
-      isAdmin={user.role === 'ADMIN'}
-      userId={user.id}
-      runId={runId}
-      search={search}
-      embedded={embedded}
-      runDrafts={runDrafts}
-    />
+    <GraphResourceContext.Provider
+      value={{ role: user.role, reload: reloadProject ?? projectResource.reload }}
+    >
+      <Workspace
+        key={id}
+        project={project}
+        initial={graph.data}
+        path={base + '/execution-graph'}
+        canEdit={user.role !== 'VIEWER' && !project.archived}
+        isAdmin={user.role === 'ADMIN'}
+        userId={user.id}
+        runId={runId}
+        search={search}
+        embedded={embedded}
+        runDrafts={runDrafts}
+      />
+    </GraphResourceContext.Provider>
   );
 }
 

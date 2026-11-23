@@ -1,7 +1,7 @@
 import { useRef, useState, type FormEvent } from 'react';
 import { ArrowDown, ArrowUp, Plus, Trash2 } from 'lucide-react';
 import { ApiError, api, message, post } from '../api';
-import { Field, Form } from '../components';
+import { Field, Form, Modal } from '../components';
 import { InlineEditor } from '../InlineEditor';
 import type { Service } from '../models';
 import { ProjectAccessLinks, projectAccessUrl } from './ProjectAccessLinks';
@@ -39,13 +39,15 @@ function focusAddress(form: HTMLFormElement, errors: AddressErrors) {
 export function ProjectServiceEditor({
   projectId,
   service,
+  modal = false,
   onClose,
   onSaved,
 }: {
   projectId: string;
   service?: Service;
+  modal?: boolean;
   onClose: () => void;
-  onSaved: (service: Service) => Promise<void>;
+  onSaved: (service: Service) => void | Promise<void>;
 }) {
   const nextRow = useRef(0);
   const [rows, setRows] = useState<AddressDraft[]>(() =>
@@ -90,6 +92,7 @@ export function ProjectServiceEditor({
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (modal) event.stopPropagation();
     if (busy || conflict !== undefined) return;
     const element = event.currentTarget;
     const form = new FormData(element);
@@ -160,13 +163,22 @@ export function ProjectServiceEditor({
     }
   }
 
+  const Editor = modal ? Modal : InlineEditor;
+  const close = () => {
+    if (!busy) onClose();
+  };
   return (
-    <InlineEditor busy={busy} title={service ? '编辑服务' : '添加服务'} onClose={onClose} wide>
+    <Editor
+      title={service ? '编辑服务' : '添加服务'}
+      onClose={close}
+      wide
+      {...(!modal && { busy })}
+    >
       <Form
         onSubmit={save}
         busy={busy}
         error={error}
-        onCancel={onClose}
+        onCancel={close}
         submitDisabled={conflict !== undefined}
       >
         <div className="form-grid">
@@ -331,6 +343,6 @@ export function ProjectServiceEditor({
           </div>
         )}
       </Form>
-    </InlineEditor>
+    </Editor>
   );
 }

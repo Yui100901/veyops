@@ -1,22 +1,15 @@
-import { useState, type FormEvent } from 'react';
+import { useState } from 'react';
 import { Box, FolderGit2, Pencil, Plus, Trash2 } from 'lucide-react';
-import { InlineEditor } from '../InlineEditor';
-import { api, formatTime, message, navigate, post, remove, useResource } from '../api';
-import { Confirm, ErrorBanner, Field, Form, Loading, Section, Status } from '../components';
-import type {
-  Credential,
-  DeploymentSummary,
-  ProjectDetail,
-  Repository,
-  Service,
-  User,
-} from '../models';
+import { formatTime, message, navigate, remove, useResource } from '../api';
+import { Confirm, ErrorBanner, Loading, Section, Status } from '../components';
+import type { DeploymentSummary, ProjectDetail, Repository, Service, User } from '../models';
 import { RepositoryBinding } from './RepositoryBinding';
 import { ExecutionGraphStartList } from './ExecutionGraphStartStatus';
 import { ProjectEnvironment } from './ProjectEnvironment';
 import { ProjectEnvironmentSets } from './ProjectEnvironmentSets';
 import { ProjectAccessLinks } from './ProjectAccessLinks';
 import { ProjectRelations } from './ProjectRelations';
+import { ProjectRepositoryEditor } from './ProjectRepositoryEditor';
 import { ProjectServiceEditor } from './ProjectServiceEditor';
 import { RepositoryDetails } from './RepositoryBrowser';
 import { repositoryBranchLabel } from './RepositoryBranches';
@@ -209,8 +202,8 @@ export function ProjectResources({
         ) : (
           <ProjectRepositoryEditor
             key={editor.item?.id ?? editor.kind}
-            project={project}
-            user={user}
+            projectId={id}
+            role={user.role}
             repository={editor.item as Repository | undefined}
             onClose={() => {
               setEditor(undefined);
@@ -681,119 +674,5 @@ function ServiceDetails({
         )}
       </Section>
     </>
-  );
-}
-
-function ProjectRepositoryEditor({
-  project,
-  user,
-  repository,
-  onClose,
-  onSaved,
-}: {
-  project: ProjectDetail;
-  user: User;
-  repository?: Repository;
-  onClose: () => void;
-  onSaved: (item: Resource) => Promise<void>;
-}) {
-  const credentials = useResource<Credential[]>(user.role === 'ADMIN' ? '/credentials' : null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  async function add(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    const text = (key: string) => String(form.get(key) ?? '').trim();
-    const payload: Record<string, string | null> = {
-      name: text('name'),
-      description: text('description'),
-      cloneUrl: text('cloneUrl'),
-      provider: text('provider'),
-    };
-    if (user.role === 'ADMIN') payload.credentialId = text('credentialId') || null;
-    setBusy(true);
-    setError('');
-    const path = '/projects/' + project.id + '/repositories';
-    try {
-      const result = repository
-        ? await api<Repository>(path + '/' + repository.id, {
-            method: 'PATCH',
-            body: JSON.stringify(payload),
-          })
-        : await post<Repository>(path, payload);
-      await onSaved(result);
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <InlineEditor
-      key={repository?.id ?? 'new-repository'}
-      busy={busy}
-      title={repository ? '编辑仓库' : '添加仓库'}
-      onClose={() => !busy && onClose()}
-    >
-      <Form
-        onSubmit={add}
-        error={error}
-        busy={busy}
-        submit={repository ? '保存' : '添加仓库'}
-        onCancel={() => onClose()}
-      >
-        <Field label="名称" required>
-          <input name="name" required autoFocus defaultValue={repository?.name} maxLength={100} />
-        </Field>
-        <Field label="Git 仓库地址" required hint="使用仓库的 HTTP(S) 克隆地址。">
-          <input
-            name="cloneUrl"
-            placeholder="https://github.com/team/repository.git"
-            type="url"
-            pattern="https?://.+"
-            defaultValue={repository?.cloneUrl}
-            required
-          />
-        </Field>
-        {user.role === 'ADMIN' && (
-          <Field label="Git 认证凭据（可选）">
-            <select name="credentialId" defaultValue={repository?.credentialId ?? ''}>
-              <option value="">公开仓库，无需认证</option>
-              {repository?.credentialId &&
-                !(credentials.data ?? []).some(
-                  (item) => item.id === repository.credentialId && item.status === 'ACTIVE',
-                ) && <option value={repository.credentialId}>保留当前凭据</option>}
-              {credentials.data
-                ?.filter(
-                  (c) => ['GIT_TOKEN', 'GIT_PASSWORD'].includes(c.type) && c.status === 'ACTIVE',
-                )
-                .map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-            </select>
-          </Field>
-        )}
-        <p className="field-note">保存后会读取远端默认分支、分支列表和最新提交。</p>
-        <Field label="代码托管平台">
-          <select name="provider" defaultValue={repository?.provider ?? 'CUSTOM'}>
-            <option value="CUSTOM">自建或其他</option>
-            <option value="GITHUB">GitHub</option>
-            <option value="GITLAB">GitLab</option>
-            <option value="GITEA">Gitea</option>
-            <option value="BITBUCKET">Bitbucket</option>
-          </select>
-        </Field>
-        <Field label="说明">
-          <textarea
-            name="description"
-            defaultValue={repository?.description}
-            maxLength={2000}
-            rows={2}
-          />
-        </Field>
-      </Form>
-    </InlineEditor>
   );
 }

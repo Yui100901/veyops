@@ -1,8 +1,14 @@
-import { useId, useState } from 'react';
+import { useContext, useId, useState } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
-import { formatTime, message, post, useResource } from '../api';
+import { formatTime, useResource } from '../api';
 import { ErrorBanner, Field } from '../components';
-import type { Credential, DeploymentSelection, ProjectDetail, Repository } from '../models';
+import type {
+  Credential,
+  DeploymentSelection,
+  ProjectDetail,
+  Repository,
+  Service,
+} from '../models';
 import { DeploymentSelectionPicker, useDeploymentInventory } from './DeploymentSelection';
 import {
   artifactInstanceId,
@@ -13,6 +19,9 @@ import {
   type ArtifactRef,
 } from './Delivery';
 import { BranchSyncControls, useRepositoryBranches } from './RepositoryBranches';
+import { GraphResourceDialog } from './GraphResourceDialog';
+import { GraphResourceContext } from './graph-resource-context';
+import { graphPresetTypePatch, matchingGraphPreset, presetReference } from './graph-field-presets';
 import { graphKey } from './execution-graph-definition';
 import type { EnvironmentSetSummary } from './ProjectEnvironmentSets';
 import type {
@@ -45,7 +54,7 @@ interface ValueProps {
   change: (value: unknown) => void;
   disabled?: boolean;
   scope?: FieldScope;
-  canRegisterRepository?: boolean;
+  canManageProjectResources?: boolean;
   checkRequired?: boolean;
   repositoryAddress?: boolean;
 }
@@ -106,155 +115,110 @@ function ResourceSelect({
   );
 }
 
-function RepositoryValue({
+function ProjectResourceValue({
   project,
   field,
   value,
   change,
   disabled,
-  canRegisterRepository,
+  canManageProjectResources,
   checkRequired,
+  repositoryAddress,
 }: ValueProps) {
-  const [url, setUrl] = useState('');
-  const [added, setAdded] = useState<Repository[]>([]);
-  const [registration, setRegistration] = useState(false);
-  const [name, setName] = useState('');
-  const [credentialId, setCredentialId] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const credentials = useResource<Credential[]>(registration ? '/credentials' : null);
-  const repositories = [
-    ...project.repositories,
-    ...added.filter(({ id }) => !project.repositories.some((repo) => repo.id === id)),
-  ];
-  const normalize = (address: string) =>
-    address
+  const context = useContext(GraphResourceContext);
+  const [open, setOpen] = useState(false);
+  const [addedRepository, setAddedRepository] = useState<Repository>();
+  const [addedService, setAddedService] = useState<Service>();
+  const repositories =
+    addedRepository && !project.repositories.some(({ id }) => id === addedRepository.id)
+      ? [...project.repositories, addedRepository]
+      : project.repositories;
+  const services =
+    addedService && !project.services.some(({ id }) => id === addedService.id)
+      ? [...project.services, addedService]
+      : project.services;
+  const repository = field.type === 'REPOSITORY';
+  const options = (repository ? repositories : services).filter(
+    ({ id }) => !field.options || field.options.includes(id),
+  );
+  const selected = referenceId(value);
+  const addressKey = (url: string) =>
+    url
       .trim()
       .replace(/\/+$/, '')
       .replace(/\.git$/i, '');
-  const match = repositories.find((repo) => normalize(repo.cloneUrl) === normalize(url));
-  async function register() {
-    setError('');
-    setBusy(true);
-    try {
-      const repo = await post<Repository>('/projects/' + project.id + '/repositories', {
-        name: name.trim(),
-        cloneUrl: url.trim(),
-        ...(credentialId && { credentialId }),
-      });
-      setAdded([...added, repo]);
-      change(repo.id);
-      setUrl('');
-      setRegistration(false);
-    } catch (error) {
-      setError(message(error));
-    } finally {
-      setBusy(false);
-    }
+  const matchingAddresses = repository
+    ? repositories.filter(({ cloneUrl }) => addressKey(cloneUrl) === addressKey(selected))
+    : [];
+  const byAddress = matchingAddresses.length === 1 ? matchingAddresses[0] : undefined;
+  const canCreate =
+    canManageProjectResources &&
+    context &&
+    !disabled &&
+    context.role !== 'VIEWER' &&
+    !project.archived &&
+    !field.options?.length;
+
+  function setRepository(item: Repository) {
+    change(repositoryAddress ? item.cloneUrl : item.id);
   }
+
   return (
     <>
       <ResourceSelect
         label={field.name}
-        options={repositories}
-        value={value}
-        change={change}
-        disabled={disabled || busy}
-        required={checkRequired && field.required}
-      />
-      {!disabled && (
-        <div className="graph-variable-actions">
-          <Field label="按仓库地址匹配">
-            <input
-              inputMode="url"
-              placeholder="https://git.example.org/team/project.git"
-              value={url}
-              onChange={(event) => {
-                const entered = event.target.value;
-                setUrl(entered);
-                const hit = repositories.find(
-                  (repo) => normalize(repo.cloneUrl) === normalize(entered),
-                );
-                if (hit) change(hit.id);
-              }}
-            />
-          </Field>
-          {url.trim() &&
-            !match &&
-            canRegisterRepository &&
-            (!registration ? (
-              <button
-                type="button"
-                className="button secondary small"
-                onClick={() => setRegistration(true)}
-              >
-                <Plus size={14} /> 登记仓库并选用
-              </button>
-            ) : (
-              <>
-                <Field label="仓库名称">
-                  <input
-                    value={name}
-                    maxLength={100}
-                    onChange={(event) => setName(event.target.value)}
-                  />
-                </Field>
-                <ResourceSelect
-                  label="仓库凭据（可选）"
-                  options={credentials.data ?? []}
-                  value={credentialId}
-                  change={(id) => setCredentialId(id ?? '')}
-                  empty="公开仓库"
-                />
-                <button
-                  type="button"
-                  className="button secondary small"
-                  disabled={busy || !name.trim() || !/^https?:\/\/\S+$/i.test(url.trim())}
-                  onClick={() => void register()}
-                >
-                  保存并选用
-                </button>
-                <ErrorBanner error={error || credentials.error} />
-              </>
-            ))}
-        </div>
-      )}
-    </>
-  );
-}
-
-function RepositoryAddressValue({ field, project, value, change, disabled }: ValueProps) {
-  const list = useId();
-  const selected = referenceId(value);
-  const displayed = project.repositories.find(({ id }) => id === selected)?.cloneUrl ?? selected;
-  const repository = project.repositories.find(({ cloneUrl }) => cloneUrl === displayed.trim());
-  return (
-    <Field
-      label={field.name}
-      hint={
-        repository ? '已匹配项目仓库 · ' + repository.name : '输入项目中已登记的 Git 仓库地址。'
-      }
-    >
-      <input
-        disabled={disabled}
-        inputMode="url"
-        list={list}
-        placeholder="https://example.com/project.git"
-        value={displayed}
-        onChange={(event) => change(event.target.value || undefined)}
-        onBlur={(event) => {
-          const trimmed = event.target.value.trim();
-          if (trimmed !== event.target.value) change(trimmed || undefined);
+        options={options}
+        value={byAddress ? byAddress.id : selected}
+        change={(id) => {
+          if (repository) {
+            const item = repositories.find((repo) => repo.id === id);
+            if (item) setRepository(item);
+            else change(undefined);
+          } else change(id ? { serviceId: id } : undefined);
         }}
+        disabled={disabled}
+        required={checkRequired && field.required}
+        empty={repository ? '选择项目仓库' : '选择项目服务'}
       />
-      <datalist id={list}>
-        {project.repositories.map(({ id, cloneUrl, name }) => (
-          <option key={id} value={cloneUrl}>
-            {name}
-          </option>
+      {canCreate && (
+        <button
+          type="button"
+          className="button secondary small graph-resource-add"
+          onClick={() => setOpen(true)}
+        >
+          <Plus size={14} aria-hidden="true" /> {repository ? '添加项目仓库' : '添加项目服务'}
+        </button>
+      )}
+      {canCreate &&
+        open &&
+        (repository ? (
+          <GraphResourceDialog
+            kind="repository"
+            project={project}
+            role={context.role}
+            onClose={() => setOpen(false)}
+            onSaved={(item) => {
+              setAddedRepository(item);
+              setRepository(item);
+              setOpen(false);
+              void context.reload();
+            }}
+          />
+        ) : (
+          <GraphResourceDialog
+            kind="service"
+            project={project}
+            role={context.role}
+            onClose={() => setOpen(false)}
+            onSaved={(item) => {
+              setAddedService(item);
+              change({ serviceId: item.id });
+              setOpen(false);
+              void context.reload();
+            }}
+          />
         ))}
-      </datalist>
-    </Field>
+    </>
   );
 }
 
@@ -361,6 +325,7 @@ function ArtifactValue({
     if (
       !isDeployableArtifact(artifact) ||
       (requestedKind && requestedKind !== kind) ||
+      (field.acceptedArtifactTypes && !field.acceptedArtifactTypes.some((type) => type === kind)) ||
       (scope?.deliveryMethod === 'FILE' && kind === 'DOCKER_IMAGE') ||
       (scope?.serviceId && artifact.serviceId !== scope.serviceId) ||
       (server && servers.size > 0 && !servers.has(server))
@@ -570,19 +535,15 @@ export function GraphFieldValue(props: ValueProps) {
       </fieldset>
     );
   }
-  if (field.type === 'REPOSITORY')
-    return props.repositoryAddress ? (
-      <RepositoryAddressValue {...props} />
-    ) : (
-      <RepositoryValue {...props} />
-    );
+  if (field.type === 'REPOSITORY' || field.type === 'SERVICE')
+    return <ProjectResourceValue {...props} />;
   if (field.type === 'GIT_REF') return <GitVersionValue {...props} />;
   if (field.type === 'ARTIFACT') return <ArtifactValue {...props} />;
   if (field.type === 'TARGETS') return <TargetsValue {...props} />;
   if (field.type === 'CREDENTIAL') return <CredentialsValue {...props} />;
   if (field.type === 'ENVIRONMENT_SET') return <EnvironmentSetValue {...props} />;
-  if (field.type === 'ENVIRONMENT' || field.type === 'SERVICE') {
-    const options = (field.type === 'ENVIRONMENT' ? project.environments : project.services).filter(
+  if (field.type === 'ENVIRONMENT') {
+    const options = project.environments.filter(
       ({ id }) => !field.options || field.options.includes(id),
     );
     return (
@@ -590,7 +551,7 @@ export function GraphFieldValue(props: ValueProps) {
         label={field.name}
         options={options}
         value={value}
-        change={(id) => change(id && field.type === 'SERVICE' ? { serviceId: id } : id)}
+        change={change}
         disabled={disabled}
         required={required}
       />
@@ -678,10 +639,12 @@ export function GraphFieldEditor({
 }) {
   const [preset, setPreset] = useState('');
   const isInput = type === 'input';
-  const standards = (isInput ? catalog?.inputPresets : catalog?.outputPresets)?.filter(
-    (field) => field.type !== 'ENVIRONMENT',
-  );
+  const standards = isInput ? catalog?.inputPresets : catalog?.outputPresets;
   const fieldTypes = catalog?.fieldTypes;
+  const editorFields = fields.map((field) => ({
+    ...field,
+    ...graphPresetTypePatch(field, matchingGraphPreset(field.referenceName, catalog, isInput)),
+  }));
   function add() {
     const standard = standards?.find(({ id }) => id === preset);
     if (!standard && preset !== 'custom') return;
@@ -689,11 +652,7 @@ export function GraphFieldEditor({
       standard && !fields.some((field) => field.id === standard.id)
         ? standard.id
         : graphKey('field');
-    const base =
-      standard?.id
-        .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-        .replaceAll('-', '_')
-        .toUpperCase() ?? (isInput ? 'INPUT' : 'OUTPUT');
+    const base = standard ? presetReference(standard) : isInput ? 'INPUT' : 'OUTPUT';
     let referenceName = base;
     for (
       let i = 2;
@@ -716,12 +675,21 @@ export function GraphFieldEditor({
     setPreset('');
   }
   function patch(id: string, value: Partial<GraphField>) {
-    change(fields.map((row) => (row.id === id ? { ...row, ...value } : row)));
+    change(
+      fields.map((row) => {
+        if (row.id !== id) return row;
+        const reference = Object.hasOwn(value, 'referenceName')
+          ? value.referenceName
+          : row.referenceName;
+        const standard = matchingGraphPreset(reference, catalog, isInput);
+        return { ...row, ...graphPresetTypePatch(row, standard), ...value };
+      }),
+    );
   }
   return (
     <section className="graph-fields">
       <h4>{title ?? (isInput ? '运行输入' : '结束输出')}</h4>
-      {fields.map((field) => (
+      {editorFields.map((field) => (
         <details className="graph-field-card" data-graph-field={field.id} key={field.id}>
           <summary>
             {field.name}{' '}
@@ -754,7 +722,9 @@ export function GraphFieldEditor({
             </Field>
             <Field label="数据类型">
               <select
-                disabled={disabled}
+                disabled={
+                  disabled || Boolean(matchingGraphPreset(field.referenceName, catalog, isInput))
+                }
                 value={field.type}
                 onChange={(event) =>
                   patch(field.id, {
@@ -770,7 +740,7 @@ export function GraphFieldEditor({
                 }
               >
                 {Object.entries(fieldTypes ?? { [field.type]: field.type })
-                  .filter(([id]) => id !== 'ENVIRONMENT' || field.type === 'ENVIRONMENT')
+                  .filter(([id]) => isInput || id !== 'CREDENTIAL')
                   .map(([id, label]) => (
                     <option value={id} key={id}>
                       {label}
@@ -839,6 +809,7 @@ export function GraphFieldEditor({
                   field={{ ...field, name: '默认值', required: false }}
                   value={field.defaultValue}
                   disabled={disabled}
+                  canManageProjectResources={!disabled}
                   change={(defaultValue) => patch(field.id, { defaultValue })}
                 />
               )}
@@ -899,6 +870,8 @@ function bindingKey(binding: GraphBinding): string {
       return JSON.stringify([binding.kind, binding.nodeId, binding.fieldId]);
     case 'AS_GIT_REF':
       return JSON.stringify([binding.kind, binding.refKind, bindingKey(binding.source)]);
+    case 'PROJECT_VALUE':
+      return JSON.stringify([binding.kind, binding.projection, bindingKey(binding.source)]);
     default:
       return binding.kind;
   }
@@ -951,7 +924,7 @@ export function GraphBindingField({
   fallback,
   scope,
   environment,
-  canRegisterRepository,
+  canManageProjectResources,
   allowRepositoryDefault,
   directSource,
   nodeDefaults,
@@ -966,7 +939,7 @@ export function GraphBindingField({
   fallback?: string;
   scope?: FieldScope;
   environment?: boolean;
-  canRegisterRepository?: boolean;
+  canManageProjectResources?: boolean;
   allowRepositoryDefault?: boolean;
   directSource?: boolean;
   nodeDefaults?: boolean;
@@ -1059,14 +1032,25 @@ export function GraphBindingField({
           value={value.value}
           change={(next) =>
             update(
-              next === undefined && ['GIT_REF', 'GIT_FETCH_MODE'].includes(field.type)
+              next === undefined &&
+                [
+                  'REPOSITORY',
+                  'SERVICE',
+                  'ENVIRONMENT',
+                  'ENVIRONMENT_SET',
+                  'TARGETS',
+                  'ARTIFACT',
+                  'CREDENTIAL',
+                  'GIT_REF',
+                  'GIT_FETCH_MODE',
+                ].includes(field.type)
                 ? undefined
                 : { kind: 'VALUE', value: next ?? '' },
             )
           }
           disabled={disabled}
           scope={scope}
-          canRegisterRepository={canRegisterRepository}
+          canManageProjectResources={canManageProjectResources}
           repositoryAddress={referenceLookup}
         />
       )}

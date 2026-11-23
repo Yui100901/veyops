@@ -1,7 +1,11 @@
 import type { ProjectDetail } from '../models';
 import { moduleFields, nodeFixedInputValue } from './ExecutionGraphBindings';
 import { sourceName } from './ExecutionGraphPreview';
-import { effectiveNodeType, graphNodeTypeLabel } from './execution-graph-definition';
+import {
+  effectiveNodeType,
+  graphNodeTypeLabel,
+  graphProjectionLabels,
+} from './execution-graph-definition';
 import type {
   GraphBinding,
   GraphCanvas,
@@ -69,6 +73,8 @@ function bindingLabel(
       return '凭据引用 · 隐藏';
     case 'AS_GIT_REF':
       return `${binding.refKind === 'BRANCH' ? '转换为分支' : '转换为标签'} · ${bindingLabel(binding.source, undefined, flow, node, project)}`;
+    case 'PROJECT_VALUE':
+      return `${bindingLabel(binding.source, undefined, flow, node, project)} → ${graphProjectionLabels[binding.projection]}${binding.serverId ? ' · ' + binding.serverId : ''}`;
     case 'FIRST_AVAILABLE':
       return binding.sources
         .map((source) => bindingLabel(source, field, flow, node, project))

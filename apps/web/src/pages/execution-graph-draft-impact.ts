@@ -117,6 +117,7 @@ function refersToOutput(binding: GraphBinding, nodeId: string): boolean {
     case 'OUTPUT':
       return binding.nodeId === nodeId;
     case 'AS_GIT_REF':
+    case 'PROJECT_VALUE':
       return refersToOutput(binding.source, nodeId);
     case 'FIRST_AVAILABLE':
       return binding.sources.some((source) => refersToOutput(source, nodeId));

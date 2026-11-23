@@ -26,12 +26,12 @@ export type GraphOperation = Exclude<
   'FUNCTION' | 'START' | 'END' | 'CONDITION' | 'SWITCH'
 >;
 export const graphOperations = Object.keys(graphNodeLabels).filter(
-  (type) => !['FUNCTION', 'START', 'END', 'CONDITION', 'SWITCH'].includes(type),
+  (type) => !['FUNCTION', 'START', 'END', 'CONDITION', 'SWITCH', 'LOG'].includes(type),
 ) as GraphOperation[];
 export interface GraphEdge {
   from: string;
   to: string;
-  when?: 'TRUE' | 'FALSE' | 'DEFAULT' | `CASE:${number}`;
+  when?: 'TRUE' | 'FALSE' | 'DEFAULT' | 'SUCCESS' | 'PARTIAL_SUCCESS' | `CASE:${number}`;
 }
 export type GraphFieldType =
   | 'TEXT'
@@ -66,11 +66,21 @@ export interface GraphField {
   defaultValue?: unknown;
   selection?: 'LATEST_COMPATIBLE';
   artifactType?: GraphArtifactType;
+  acceptedArtifactTypes?: GraphArtifactType[];
   source?: 'CURRENT_RUN';
   options?: (string | number | boolean)[];
   acceptedTypes?: GraphFieldType[];
 }
 export type GraphMissingPolicy = 'ERROR' | 'OMIT' | 'USE_DEFAULT' | 'REPOSITORY_DEFAULT';
+export type GraphValueProjection =
+  'WORKSPACE_PATH' | 'ARTIFACT_PATH' | 'IMAGE_NAME' | 'IMAGE_ID' | 'IMAGE_DIGEST';
+export const graphProjectionLabels: Record<GraphValueProjection, string> = {
+  WORKSPACE_PATH: '代码目录',
+  ARTIFACT_PATH: '产物路径',
+  IMAGE_NAME: '镜像名称',
+  IMAGE_ID: '镜像 ID',
+  IMAGE_DIGEST: '镜像 Digest',
+};
 export type GraphBinding = { onMissing?: GraphMissingPolicy } & (
   | { kind: 'INPUT' | 'CONTEXT' | 'NODE_INPUT'; fieldId: string }
   | { kind: 'OUTPUT'; nodeId: string; fieldId: string }
@@ -78,6 +88,12 @@ export type GraphBinding = { onMissing?: GraphMissingPolicy } & (
   | { kind: 'ENVIRONMENT_KEY'; key: string }
   | { kind: 'CREDENTIAL'; credentialId: string }
   | { kind: 'AS_GIT_REF'; refKind: 'BRANCH' | 'TAG'; source: GraphBinding }
+  | {
+      kind: 'PROJECT_VALUE';
+      source: { kind: 'OUTPUT'; nodeId: string; fieldId: string };
+      projection: GraphValueProjection;
+      serverId?: string;
+    }
   | { kind: 'FIRST_AVAILABLE'; sources: GraphBinding[] }
 );
 export interface GraphCandidate {
@@ -123,6 +139,8 @@ export interface GraphCatalog {
   fieldTypes: Record<GraphFieldType, string>;
   inputPresets: GraphField[];
   outputPresets: GraphField[];
+  scriptInputTypes?: GraphFieldType[];
+  scriptOutputTypes?: GraphFieldType[];
   contextFields?: GraphField[];
   modules: Partial<Record<GraphNode['type'], GraphModule>>;
   flows?: Record<string, { nodes: Record<string, GraphNodeDirectory> }>;
@@ -140,7 +158,9 @@ export interface GraphIssue {
   message: string;
 }
 export interface GraphArtifactOutput {
+  id?: string;
   name: string;
+  referenceName?: string;
   type: GraphArtifactType;
   path?: string;
   imageReference?: string;
@@ -334,6 +354,11 @@ export function isReleaseNode(node: { type: string; operation?: GraphOperation }
 export function branchOptions(
   node?: GraphNode,
 ): { value: NonNullable<GraphEdge['when']>; label: string }[] {
+  if (node && isReleaseNode(node))
+    return [
+      { value: 'SUCCESS', label: '全部发布成功' },
+      { value: 'PARTIAL_SUCCESS', label: '部分发布成功' },
+    ];
   if (node?.type === 'CONDITION')
     return [
       { value: 'TRUE', label: '成立' },

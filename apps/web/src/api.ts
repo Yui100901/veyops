@@ -64,7 +64,8 @@ function readPlanIssue(value: unknown): ExecutionPlanIssue | undefined {
       typeof from === 'string' &&
       typeof to === 'string' &&
       (when === undefined ||
-        (typeof when === 'string' && /^(?:TRUE|FALSE|DEFAULT|CASE:[0-9])$/.test(when)))
+        (typeof when === 'string' &&
+          /^(?:TRUE|FALSE|DEFAULT|SUCCESS|PARTIAL_SUCCESS|CASE:[0-9])$/.test(when)))
     ) {
       issue.edge = { from, to, when: when as GraphEdge['when'] };
     }

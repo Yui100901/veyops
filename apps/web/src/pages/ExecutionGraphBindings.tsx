@@ -1,7 +1,16 @@
 import { useState } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
+import { useResource } from '../api';
 import { Field } from '../components';
-import type { ProjectDetail } from '../models';
+import type { ProjectDetail, Server } from '../models';
+import {
+  graphPresetTypePatch,
+  matchingGraphPreset,
+  presetReference,
+  scriptInputTypes,
+  scriptOutputTypes,
+} from './graph-field-presets';
+export { suggestedGraphPortReference } from './graph-field-presets';
 import {
   acceptsFixedGraphValue,
   GraphBindingField,
@@ -9,9 +18,15 @@ import {
   hasMissingGraphBindingSource,
 } from './ExecutionGraphFields';
 import type { BindingChoice } from './ExecutionGraphFields';
-import { effectiveNodeType, graphKey, graphNodeFamily } from './execution-graph-definition';
+import {
+  effectiveNodeType,
+  graphKey,
+  graphNodeFamily,
+  graphProjectionLabels,
+} from './execution-graph-definition';
 import type {
   GraphBinding,
+  GraphArtifactType,
   GraphCanvas,
   GraphCandidate,
   GraphCatalog,
@@ -34,7 +49,12 @@ export function moduleFields(
     ...standard.map((port) => {
       const custom = declared.find(({ id }) => id === port.id);
       return custom
-        ? { ...port, ...custom, defaultValue: custom.defaultValue ?? port.defaultValue }
+        ? {
+            ...port,
+            name: custom.name,
+            referenceName: custom.referenceName ?? port.referenceName,
+            defaultValue: custom.defaultValue ?? port.defaultValue,
+          }
         : port;
     }),
     ...declared.filter(({ id }) => !standard.some((port) => port.id === id)),
@@ -57,6 +77,21 @@ function operationFields(
     );
   }
   const standard = catalog?.modules[operation]?.[kind] ?? [];
+  if (kind === 'inputs' && ['DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT'].includes(operation))
+    return standard.map((field) =>
+      field.id === 'artifact'
+        ? {
+            ...field,
+            multiple: false,
+            acceptedArtifactTypes:
+              node.deploy?.method === 'COMPOSE'
+                ? ['DOCKER_IMAGE']
+                : node.deploy?.method === 'FILE'
+                  ? ['FILE', 'DIRECTORY']
+                  : undefined,
+          }
+        : field,
+    );
   if (operation === 'BUILD' && kind === 'inputs')
     return [
       ...standard,
@@ -75,12 +110,12 @@ function operationFields(
     return [
       ...standard,
       ...(artifacts ?? [])
-        .filter(({ name }) => name && name !== 'artifacts')
-        .map(({ name, type, required }): GraphField => ({
-          id: name,
+        .filter(({ id, name }) => (id ?? name) && (id ?? name) !== 'artifacts')
+        .map(({ id, name, referenceName, type, required }): GraphField => ({
+          id: id ?? name,
           name,
+          referenceName,
           type: 'ARTIFACT',
-          multiple: true,
           artifactType: type,
           required: required !== false,
         })),
@@ -89,43 +124,27 @@ function operationFields(
   return standard;
 }
 
-const suggestedPortReferences: Record<string, string> = {
-  repository: 'GIT_REPOSITORY_NAME',
-  version: 'GIT_VERSION',
-  fetchMode: 'GIT_FETCH_MODE',
-  commitSha: 'GIT_COMMIT_SHA',
-  repositoryId: 'GIT_REPOSITORY_NAME',
-  path: 'ARTIFACT_DIR',
-};
-
-export function suggestedGraphPortReference(id: string) {
-  return (
-    suggestedPortReferences[id] ??
-    id
-      .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-      .replaceAll('-', '_')
-      .toUpperCase()
-  );
-}
-
 function addFunctionField(
   fields: GraphField[],
   input: boolean,
   port?: GraphField,
   defaultValue?: unknown,
+  preset?: GraphField,
 ): GraphField {
   const id = port?.id ?? graphKey('field');
-  const prefix = port ? suggestedGraphPortReference(id) : input ? 'INPUT' : 'OUTPUT';
+  const definition = port ?? preset;
+  const prefix = definition ? presetReference(definition) : input ? 'INPUT' : 'OUTPUT';
   let referenceName = prefix;
   for (let i = 2; fields.some((field) => field.referenceName === referenceName); i++)
     referenceName = prefix + '_' + i;
   return {
     id,
-    name: port?.name ?? (input ? '自定义输入' : '自定义输出'),
+    name: definition?.name ?? (input ? '自定义输入' : '自定义输出'),
     referenceName,
-    type: port?.type ?? 'TEXT',
-    required: true,
-    ...(port?.artifactType && { artifactType: port.artifactType }),
+    type: definition?.type ?? 'TEXT',
+    required: port?.required ?? true,
+    ...(definition?.multiple && { multiple: true }),
+    ...(definition?.artifactType && { artifactType: definition.artifactType }),
     ...(input && defaultValue !== undefined && { defaultValue }),
   };
 }
@@ -135,12 +154,16 @@ function AddFunctionField({
   node,
   nativePorts,
   allowCustom,
+  catalog,
+  candidates = [],
   patch,
 }: {
   kind: 'inputs' | 'outputs';
   node: GraphNode;
   nativePorts: GraphField[];
   allowCustom: boolean;
+  catalog?: GraphCatalog;
+  candidates?: GraphCandidate[];
   patch: (fields: Partial<GraphNode>) => void;
 }) {
   const input = kind === 'inputs';
@@ -150,6 +173,35 @@ function AddFunctionField({
     (port) => !port.multiple && !declared.some(({ id }) => id === port.id),
   );
   const current = native.find(({ id }) => id === selection);
+  const standards = input ? catalog?.inputPresets : catalog?.outputPresets;
+  const allowedTypes = input
+    ? (catalog?.scriptInputTypes ?? scriptInputTypes)
+    : (catalog?.scriptOutputTypes ?? scriptOutputTypes);
+  const presets = allowCustom
+    ? (standards ?? []).filter(
+        (field) =>
+          !field.multiple &&
+          allowedTypes.includes(field.type) &&
+          !declared.some(({ referenceName }) => referenceName === presetReference(field)),
+      )
+    : [];
+  const selectedPreset = presets.find((field) => selection === 'preset:' + presetReference(field));
+  function optionLabel(field: GraphField) {
+    const reference = presetReference(field);
+    const upstream = candidates
+      .filter(
+        ({ field: source, binding }) =>
+          (binding.kind === 'OUTPUT' || binding.kind === 'INPUT') &&
+          (source.referenceName ?? source.exportName ?? source.id) === reference &&
+          compatible(source, field),
+      )
+      .map(
+        ({ label, availability }) => label + (availability === 'CONDITIONAL' ? '（按分支）' : ''),
+      );
+    return (
+      field.name + ' · ' + reference + (upstream.length ? ' · 已有来源 ' + upstream.join('、') : '')
+    );
+  }
   if (!native.length && !allowCustom) return null;
   return (
     <div className="graph-field-pair graph-port-add">
@@ -157,22 +209,38 @@ function AddFunctionField({
         <select value={selection} onChange={(event) => setSelection(event.target.value)}>
           <option value="">选择要声明的字段</option>
           {allowCustom && <option value="__custom">自定义字段</option>}
-          {native.map(({ id, name }) => (
-            <option key={id} value={id}>
-              {name}
-            </option>
-          ))}
+          {!!presets.length && (
+            <optgroup label="系统预设变量">
+              {presets.map((field) => (
+                <option key={presetReference(field)} value={'preset:' + presetReference(field)}>
+                  {optionLabel(field)}
+                </option>
+              ))}
+            </optgroup>
+          )}
+          {!!native.length && (
+            <optgroup label="执行动作端口">
+              {native.map((field) => (
+                <option key={field.id} value={field.id}>
+                  {optionLabel(field)}
+                </option>
+              ))}
+            </optgroup>
+          )}
         </select>
       </Field>
       <button
         className="button secondary small"
         type="button"
-        disabled={selection !== '__custom' && !current}
+        disabled={selection !== '__custom' && !current && !selectedPreset}
         onClick={() => {
           const defaultValue = current && input ? nodeFixedInputValue(node, current) : undefined;
           patch({
             ...(current && input && patchInputDefault(node, current.id, undefined)),
-            [kind]: [...declared, addFunctionField(declared, input, current, defaultValue)],
+            [kind]: [
+              ...declared,
+              addFunctionField(declared, input, current, defaultValue, selectedPreset),
+            ],
           });
           setSelection('');
         }}
@@ -186,6 +254,8 @@ function AddFunctionField({
 function FunctionFieldNames({
   field,
   native,
+  preset,
+  input,
   allowedTypes,
   catalog,
   canEdit,
@@ -194,6 +264,8 @@ function FunctionFieldNames({
 }: {
   field: GraphField;
   native: boolean;
+  preset?: GraphField;
+  input: boolean;
   allowedTypes?: GraphFieldType[];
   catalog?: GraphCatalog;
   canEdit: boolean;
@@ -223,12 +295,26 @@ function FunctionFieldNames({
             maxLength={64}
             placeholder="EXAMPLE_NAME"
             value={field.referenceName ?? field.id}
-            onChange={(event) => patch({ referenceName: event.target.value })}
+            onChange={(event) => {
+              const referenceName = event.target.value;
+              const typedPreset = native
+                ? undefined
+                : matchingGraphPreset(
+                    referenceName,
+                    catalog,
+                    input,
+                    ({ type, multiple }) =>
+                      !multiple && (!allowedTypes || allowedTypes.includes(type)),
+                  );
+              patch({ ...graphPresetTypePatch(field, typedPreset), referenceName });
+            }}
           />
         </Field>
       </div>
-      {native ? (
-        <p className="field-note">执行端口 · {fieldTypes[field.type]}</p>
+      {native || preset ? (
+        <p className="field-note">
+          {preset ? '系统预设 ' + presetReference(preset) : '执行端口'} · {fieldTypes[field.type]}
+        </p>
       ) : (
         <Field label="数据类型">
           <select
@@ -337,7 +423,10 @@ function compatible(source: GraphField, input: GraphField) {
     (source.type === input.type || input.acceptedTypes?.includes(source.type)) &&
     (Boolean(source.multiple) === Boolean(input.multiple) ||
       (input.type === 'ARTIFACT' && input.multiple && !source.multiple)) &&
-    (!input.artifactType || !source.artifactType || input.artifactType === source.artifactType)
+    (!source.artifactType ||
+      ((!input.artifactType || input.artifactType === source.artifactType) &&
+        (!input.acceptedArtifactTypes ||
+          input.acceptedArtifactTypes.includes(source.artifactType))))
   );
 }
 
@@ -451,6 +540,7 @@ function matchingChoices(
 function namedSources(binding: GraphBinding, candidates: GraphCandidate[]): string[] {
   if (binding.kind === 'FIRST_AVAILABLE')
     return binding.sources.flatMap((item) => namedSources(item, candidates));
+  if (binding.kind === 'PROJECT_VALUE') return namedSources(binding.source, candidates);
   if (binding.kind === 'AS_GIT_REF') return namedSources(binding.source, candidates);
   const candidate = candidates.find(
     ({ binding: source }) =>
@@ -507,11 +597,33 @@ export function ExecutionGraphBindings({
   const isEnd = operation === 'END';
   const functional = graphNodeFamily(node) === 'function';
   const compiled = endpoint && directory?.[endpoint.startId]?.nodes[node.id];
-  const availableFields = isEnd
-    ? (compiled?.outputs ?? node.outputs ?? [])
-    : operation === 'SOURCE_REVIEW' && node.approval?.buildNodeId
-      ? []
-      : (compiled?.inputs ?? moduleFields(node, 'inputs', canvas, catalog));
+  const script = operation === 'SHELL' || operation === 'CHECK';
+  const inputTypes = catalog?.scriptInputTypes ?? scriptInputTypes;
+  const outputTypes = catalog?.scriptOutputTypes ?? scriptOutputTypes;
+  const nativeInputs = functional ? operationFields(node, 'inputs', canvas, catalog) : [];
+  const nativeOutputs = functional ? operationFields(node, 'outputs', canvas, catalog) : [];
+  const functionPreset = (field: GraphField, kind: 'inputs' | 'outputs') => {
+    const input = kind === 'inputs';
+    const ports = input ? nativeInputs : nativeOutputs;
+    if (!script || ports.some(({ id }) => id === field.id)) return undefined;
+    return matchingGraphPreset(
+      field.referenceName,
+      catalog,
+      input,
+      ({ type, multiple }) => !multiple && (input ? inputTypes : outputTypes).includes(type),
+    );
+  };
+  const effectiveDeclaration = (field: GraphField, kind: 'inputs' | 'outputs') => ({
+    ...field,
+    ...graphPresetTypePatch(field, functionPreset(field, kind)),
+  });
+  const availableFields = (
+    isEnd
+      ? (compiled?.outputs ?? node.outputs ?? [])
+      : operation === 'SOURCE_REVIEW' && node.approval?.buildNodeId
+        ? []
+        : (compiled?.inputs ?? moduleFields(node, 'inputs', canvas, catalog))
+  ).map((field) => effectiveDeclaration(field, 'inputs'));
   const fields =
     node.shell?.location === 'MANAGER' && ['SHELL', 'CHECK'].includes(operation)
       ? availableFields.filter(({ id }) => id !== 'targets')
@@ -571,9 +683,6 @@ export function ExecutionGraphBindings({
     ? (compiled?.outputs ?? moduleFields(node, 'outputs', canvas, catalog))
     : [];
   const supportsEnvironment = ['BUILD', 'SHELL', 'CHECK'].includes(operation);
-  const script = operation === 'SHELL' || operation === 'CHECK';
-  const nativeInputs = functional ? operationFields(node, 'inputs', canvas, catalog) : [];
-  const nativeOutputs = functional ? operationFields(node, 'outputs', canvas, catalog) : [];
   const hasDeclaredInput = (fieldId: string) =>
     functional && node.inputs?.some(({ id }) => id === fieldId);
   const patchDeclaration = (
@@ -585,7 +694,15 @@ export function ExecutionGraphBindings({
       [kind]: (node[kind] ?? []).flatMap((field) => {
         if (field.id !== fieldId) return [field];
         return patch
-          ? [{ ...field, ...patch, required: true, multiple: undefined, options: undefined }]
+          ? [
+              {
+                ...effectiveDeclaration(field, kind),
+                ...patch,
+                required: true,
+                multiple: undefined,
+                options: undefined,
+              },
+            ]
           : [];
       }),
     });
@@ -600,10 +717,12 @@ export function ExecutionGraphBindings({
             node={node}
             nativePorts={nativeOutputs}
             allowCustom={script}
+            catalog={catalog}
             patch={patchNode}
           />
         )}
-        {declared.map((field) => {
+        {declared.map((raw) => {
+          const field = effectiveDeclaration(raw, 'outputs');
           const native = nativeOutputs.some(({ id }) => id === field.id);
           return (
             <section
@@ -614,11 +733,9 @@ export function ExecutionGraphBindings({
               <FunctionFieldNames
                 field={field}
                 native={native}
-                allowedTypes={
-                  script
-                    ? ['TEXT', 'NUMBER', 'BOOLEAN', 'GIT_FETCH_MODE', 'PATH', 'REPOSITORY']
-                    : undefined
-                }
+                preset={functionPreset(field, 'outputs')}
+                input={false}
+                allowedTypes={script ? outputTypes : undefined}
                 catalog={catalog}
                 canEdit={canEdit}
                 patch={(value) => patchDeclaration('outputs', field.id, value)}
@@ -630,6 +747,7 @@ export function ExecutionGraphBindings({
                   field={{ ...field, name: '默认值', required: false }}
                   value={field.defaultValue}
                   disabled={!canEdit}
+                  canManageProjectResources={canEdit}
                   repositoryAddress={field.type === 'REPOSITORY'}
                   change={(defaultValue) => patchDeclaration('outputs', field.id, { defaultValue })}
                 />
@@ -643,7 +761,7 @@ export function ExecutionGraphBindings({
           </p>
         )}
         {!!implicit.length && (
-          <details className="graph-field-card">
+          <details className="graph-field-card" open={operation === 'CHECKOUT' || undefined}>
             <summary>查看执行结果字段</summary>
             <dl className="graph-field-values">
               {implicit.map((field) => (
@@ -666,6 +784,7 @@ export function ExecutionGraphBindings({
       <GraphNodeEnvironment
         key={node.id}
         project={project}
+        canvas={canvas}
         node={node}
         fields={fields}
         candidates={candidates}
@@ -685,18 +804,17 @@ export function ExecutionGraphBindings({
     );
   if (!fields.length && !functional)
     return patchNode ? <p className="field-note">此操作没有待配置的输入。</p> : null;
-  const repository = bindings?.repository;
-  const repositoryValue =
-    repository?.kind === 'VALUE'
-      ? repository.value
-      : repository?.kind === 'INPUT'
-        ? start?.inputs?.find(({ id }) => id === repository.fieldId)?.defaultValue
-        : !repository
-          ? (node.inputs?.find(({ id }) => id === 'repository')?.defaultValue ??
-            node.inputDefaults?.repository ??
-            node.checkout?.repositoryId ??
-            node.build?.repositoryId)
-          : undefined;
+  const repositoryValue = fields
+    .filter(({ type }) => type === 'REPOSITORY')
+    .map((field) => {
+      const binding = bindings?.[field.id] ?? compiled?.automaticInputBindings?.[field.id];
+      return binding?.kind === 'VALUE'
+        ? binding.value
+        : binding?.kind === 'INPUT'
+          ? start?.inputs?.find(({ id }) => id === binding.fieldId)?.defaultValue
+          : nodeFixedInputValue(node, field);
+    })
+    .find((value) => value !== undefined && value !== '');
   const repositoryScope = {
     repositoryId:
       typeof repositoryValue === 'string'
@@ -712,7 +830,7 @@ export function ExecutionGraphBindings({
       {!patchNode && <h4>{isEnd ? '最终输出' : '输入'}</h4>}
       {functional && (
         <p className="field-note">
-          每个声明输入读取一个值。优先使用同名上游变量，缺值时使用默认值。
+          同名变量可作为候选来源。选择后会把来源保存到当前执行流。
           {script && (
             <>
               {' '}
@@ -727,14 +845,18 @@ export function ExecutionGraphBindings({
           node={node}
           nativePorts={nativeInputs.filter((port) => fields.some(({ id }) => id === port.id))}
           allowCustom={script}
+          catalog={catalog}
+          candidates={candidates}
           patch={patchNode}
         />
       )}
       {[...fields]
         .sort(
           (left, right) =>
+            Number(operation === 'CHECKOUT' && left.id === 'fetchMode') -
+              Number(operation === 'CHECKOUT' && right.id === 'fetchMode') ||
             Number(Boolean(hasDeclaredInput(right.id))) -
-            Number(Boolean(hasDeclaredInput(left.id))),
+              Number(Boolean(hasDeclaredInput(left.id))),
         )
         .map((field) => {
           const declared = hasDeclaredInput(field.id);
@@ -749,9 +871,19 @@ export function ExecutionGraphBindings({
           );
           const automatic = compiled?.automaticInputBindings?.[field.id];
           const sourceLabels = automatic ? namedSources(automatic, candidates) : [];
+          const bound = bindings?.[field.id];
+          const possibleSources =
+            !bound && !automatic && declared && !review
+              ? candidates.filter(
+                  ({ field: source, binding }) =>
+                    (binding.kind === 'OUTPUT' || binding.kind === 'INPUT') &&
+                    (source.referenceName ?? source.exportName ?? source.id) ===
+                      field.referenceName &&
+                    compatible(source, field),
+                )
+              : [];
           const typeLabel = catalog?.fieldTypes[field.type] ?? field.type;
           const fixed = Boolean(patchNode && !review && acceptsFixedGraphValue(field));
-          const bound = bindings?.[field.id];
           const fallback =
             isEnd || review ? undefined : configuredFallback(node, field, start, endpoint);
           const implicitHint = bound
@@ -760,12 +892,19 @@ export function ExecutionGraphBindings({
               ? '来源缺值时采用节点默认值。'
               : undefined
             : sourceLabels.length
-              ? `同名来源 · ${sourceLabels.join('、')}${automatic?.onMissing === 'USE_DEFAULT' ? ' · 缺值时采用默认值' : ''}`
-              : fallback;
-          const unbound = !bound && !automatic && !fallback;
+              ? `同名候选 · ${sourceLabels.join('、')}`
+              : possibleSources.length
+                ? '同名候选来源 · ' + possibleSources.map(({ label }) => label).join('、')
+                : fallback;
+          const unbound = !bound && !fallback;
           const unique =
-            compiled && unbound && choices.length === 1 && choices[0]?.availability === 'ALWAYS'
-              ? choices[0]
+            compiled && unbound
+              ? choices.find(
+                  ({ binding, availability }) =>
+                    availability === 'ALWAYS' &&
+                    (choices.length === 1 ||
+                      (automatic && JSON.stringify(binding) === JSON.stringify(automatic))),
+                )
               : undefined;
           const canMakeParameter =
             createStartParameter &&
@@ -798,7 +937,7 @@ export function ExecutionGraphBindings({
                 project={project}
                 scope={repositoryScope}
                 disabled={!canEdit}
-                canRegisterRepository={canEdit}
+                canManageProjectResources={canEdit}
                 repositoryAddress={declared || undefined}
                 change={(value) =>
                   declared
@@ -821,7 +960,7 @@ export function ExecutionGraphBindings({
               )}
             </div>
           );
-          return (
+          const port = (
             <section
               key={node.id + ':' + field.id}
               className="graph-inspector-port"
@@ -831,11 +970,9 @@ export function ExecutionGraphBindings({
                 <FunctionFieldNames
                   field={field}
                   native={native}
-                  allowedTypes={
-                    script
-                      ? ['TEXT', 'NUMBER', 'BOOLEAN', 'GIT_FETCH_MODE', 'PATH', 'CREDENTIAL']
-                      : undefined
-                  }
+                  preset={functionPreset(field, 'inputs')}
+                  input
+                  allowedTypes={script ? inputTypes : undefined}
                   catalog={catalog}
                   canEdit={canEdit}
                   patch={(value) => patchDeclaration('inputs', field.id, value)}
@@ -859,7 +996,7 @@ export function ExecutionGraphBindings({
                   nodeDefaults={fixed}
                   referenceLookup={declared || undefined}
                   scope={repositoryScope}
-                  canRegisterRepository={canEdit}
+                  canManageProjectResources={canEdit}
                   allowRepositoryDefault={
                     field.id === 'version' && ['CHECKOUT', 'BUILD'].includes(operation)
                   }
@@ -901,6 +1038,18 @@ export function ExecutionGraphBindings({
                 ))}
             </section>
           );
+          return operation === 'CHECKOUT' && field.id === 'fetchMode' ? (
+            <details
+              key={node.id + ':' + field.id}
+              className="graph-field-card"
+              open={repairFieldIds?.has(field.id) || undefined}
+            >
+              <summary>高级设置 · 拉取方式</summary>
+              {port}
+            </details>
+          ) : (
+            port
+          );
         })}
     </section>
   );
@@ -908,6 +1057,7 @@ export function ExecutionGraphBindings({
 
 function GraphNodeEnvironment({
   project,
+  canvas,
   node,
   fields,
   candidates,
@@ -917,6 +1067,7 @@ function GraphNodeEnvironment({
   canEdit,
 }: {
   project: ProjectDetail;
+  canvas: GraphCanvas;
   node: GraphNode;
   fields: GraphField[];
   candidates: GraphCandidate[];
@@ -926,6 +1077,34 @@ function GraphNodeEnvironment({
   canEdit: boolean;
 }) {
   const defaults = node.environmentDefaults ?? {};
+  const permitsProjection = ['SHELL', 'CHECK'].includes(effectiveNodeType(node));
+  const servers = useResource<Pick<Server, 'id' | 'name'>[]>(
+    permitsProjection && bindings ? '/servers' : null,
+  );
+  const projected = permitsProjection
+    ? candidates.flatMap((candidate): BindingChoice[] => {
+        const { binding: source, field } = candidate;
+        if (source.kind !== 'OUTPUT' || field.multiple) return [];
+        const producer = canvas.nodes.find(({ id }) => id === source.nodeId);
+        const type = producer && effectiveNodeType(producer);
+        const projections: (keyof typeof graphProjectionLabels)[] =
+          field.type === 'WORKSPACE' && type && ['CHECKOUT', 'SHELL', 'CHECK'].includes(type)
+            ? ['WORKSPACE_PATH']
+            : field.type === 'ARTIFACT' && type && ['BUILD', 'REGISTER_ARTIFACT'].includes(type)
+              ? [
+                  ...(field.artifactType !== 'DOCKER_IMAGE' ? (['ARTIFACT_PATH'] as const) : []),
+                  ...(field.artifactType !== 'FILE' && field.artifactType !== 'DIRECTORY'
+                    ? (['IMAGE_NAME', 'IMAGE_ID', 'IMAGE_DIGEST'] as const)
+                    : []),
+                ]
+              : [];
+        return projections.map((projection) => ({
+          ...candidate,
+          label: candidate.label + ' → ' + graphProjectionLabels[projection],
+          binding: { kind: 'PROJECT_VALUE', source, projection },
+        }));
+      })
+    : [];
   const sources: GraphCandidate[] = [
     ...fields.map((field): GraphCandidate => ({
       label: '本节点输入 · ' + field.name,
@@ -988,27 +1167,61 @@ function GraphNodeEnvironment({
               acceptedTypes: ['NUMBER', 'BOOLEAN', 'PATH', 'CREDENTIAL'],
             };
             return (
-              <GraphBindingField
-                key={name}
-                field={field}
-                value={value}
-                project={project}
-                choices={matchingChoices(
-                  sources.filter(
-                    ({ field: sourceField, binding }) =>
-                      sourceField.type !== 'CREDENTIAL' || binding.kind === 'NODE_INPUT',
-                  ),
-                  field,
+              <div key={name} className="graph-fields">
+                <GraphBindingField
+                  field={field}
+                  value={value}
+                  project={project}
+                  choices={[
+                    ...matchingChoices(
+                      sources.filter(
+                        ({ field: sourceField, binding }) =>
+                          sourceField.type !== 'CREDENTIAL' || binding.kind === 'NODE_INPUT',
+                      ),
+                      field,
+                    ),
+                    ...projected,
+                  ]}
+                  environment
+                  disabled={!canEdit}
+                  change={(next) => {
+                    const copied = { ...bindings };
+                    if (next) copied[name] = next;
+                    else delete copied[name];
+                    update(copied);
+                  }}
+                />
+                {value.kind === 'PROJECT_VALUE' && value.projection.startsWith('IMAGE_') && (
+                  <Field
+                    label="实例所在服务器"
+                    hint="在管理端读取多台机器的镜像时，请指定其中一台。"
+                  >
+                    <select
+                      disabled={!canEdit}
+                      value={value.serverId ?? ''}
+                      onChange={(event) =>
+                        update({
+                          ...bindings,
+                          [name]: { ...value, serverId: event.target.value || undefined },
+                        })
+                      }
+                    >
+                      <option value="">当前执行位置</option>
+                      {value.serverId && !servers.data?.some(({ id }) => id === value.serverId) && (
+                        <option value={value.serverId}>当前配置 {value.serverId}</option>
+                      )}
+                      {servers.data?.map(({ id, name: serverName }) => (
+                        <option key={id} value={id}>
+                          {serverName}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
                 )}
-                environment
-                disabled={!canEdit}
-                change={(next) => {
-                  const copied = { ...bindings };
-                  if (next) copied[name] = next;
-                  else delete copied[name];
-                  update(copied);
-                }}
-              />
+                {value.kind === 'PROJECT_VALUE' && value.projection === 'WORKSPACE_PATH' && (
+                  <p className="field-note">请将同一上游工作区绑定到本节点的工作区输入。</p>
+                )}
+              </div>
             );
           })}
           {canEdit && (
@@ -1102,9 +1315,21 @@ export function GraphTemplatePicker({
   add,
 }: {
   templates: { name: string; nodes: GraphNode['type'][] }[];
-  add: (types: GraphNode['type'][]) => void;
+  add: (
+    types: GraphNode['type'][],
+    artifactType: GraphArtifactType,
+    latestCompatible: boolean,
+  ) => void;
 }) {
   const [selected, select] = useState('');
+  const [artifactType, selectArtifactType] = useState<GraphArtifactType>('DIRECTORY');
+  const [latestCompatible, selectLatestCompatible] = useState(false);
+  const template = templates.find(({ name }) => name === selected);
+  const selectsArtifact = template?.nodes.some((type) =>
+    ['BUILD', 'DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT'].includes(type),
+  );
+  const selectsLatest =
+    template?.nodes.includes('DEPLOY_ARTIFACT') && !template.nodes.includes('BUILD');
   return (
     <div className="graph-field-pair">
       <select
@@ -1119,13 +1344,34 @@ export function GraphTemplatePicker({
           </option>
         ))}
       </select>
+      {selectsArtifact && (
+        <select
+          aria-label="模板产物类型"
+          value={artifactType}
+          onChange={(event) => selectArtifactType(event.target.value as GraphArtifactType)}
+        >
+          <option value="FILE">文件</option>
+          <option value="DIRECTORY">目录</option>
+          <option value="DOCKER_IMAGE">Docker 镜像</option>
+        </select>
+      )}
+      {selectsLatest && (
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={latestCompatible}
+            onChange={(event) => selectLatestCompatible(event.target.checked)}
+          />
+          自动选择最新兼容产物
+        </label>
+      )}
       <button
         type="button"
         className="button secondary small"
         disabled={!selected}
         onClick={() => {
-          const template = templates.find(({ name }) => name === selected);
-          if (template) add(template.nodes);
+          if (template)
+            add(template.nodes, artifactType, Boolean(selectsLatest && latestCompatible));
         }}
       >
         插入模板

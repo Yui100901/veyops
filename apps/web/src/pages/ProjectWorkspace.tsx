@@ -71,6 +71,7 @@ export function ProjectWorkspace({
             user={user}
             embedded
             project={project}
+            reloadProject={projectResource.reload}
             runDrafts={graphRunDrafts.current}
             runId={new URLSearchParams(search).get('run') ?? undefined}
             search={search}
