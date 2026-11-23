@@ -859,7 +859,11 @@ test('ordinary routes to the same end all run unless narrowed by the flow', () =
   graph.nodes.push({ id: 'approve', name: '审批', type: 'APPROVAL' });
   graph.edges.push({ from: 'combined-start', to: 'approve' }, { from: 'approve', to: 'source' });
   assert.deepEqual(canvasIssues(graph), []);
-  assert.equal(compileCanvas(graph, true).flows[1]!.edges.filter(({ from }) => from === 'combined-start').length, 2);
+  assert.equal(
+    compileCanvas(graph, true).flows[1]!.edges.filter(({ from }) => from === 'combined-start')
+      .length,
+    2,
+  );
   graph.endpoints[1]!.edgeSelections = { 'combined-start': ['approve'] };
   const flows = compileCanvas(graph, true).flows;
   assert.equal(flows[1]!.edges.find((edge) => edge.from === 'combined-start')?.to, 'approve');

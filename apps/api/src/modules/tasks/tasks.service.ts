@@ -135,7 +135,8 @@ export class TasksService {
         ];
         const pipeline = input.payload.pipeline;
         const artifactRootRunId =
-          pipeline?.mode === 'DEPLOY_ARTIFACT' && input.idempotencyKey?.startsWith(graphTaskKeyPrefix)
+          pipeline?.mode === 'DEPLOY_ARTIFACT' &&
+          input.idempotencyKey?.startsWith(graphTaskKeyPrefix)
             ? pipeline.artifactRootRunId
             : undefined;
         if (await unavailableReference(tx, input.scope.projectId, scoped, { artifactRootRunId }))
@@ -252,12 +253,13 @@ export class TasksService {
           })),
         )
         .execute();
-    if (
-      input.pipelineRun &&
-      input.scope?.projectId &&
-      input.scope.serviceId &&
-      input.scope.environmentId
-    ) {
+    // Graph artifact producers keep their authored task scope while recording
+    // delivery history against the backing service and environment.
+    const deliveryServiceId = input.registrationProfile?.serviceId ?? input.scope?.serviceId;
+    const deliveryEnvironmentId = input.registrationProfile
+      ? pipeline?.environmentId
+      : input.scope?.environmentId;
+    if (input.pipelineRun && input.scope?.projectId && deliveryServiceId && deliveryEnvironmentId) {
       const run = input.pipelineRun;
       await tx
         .insertInto('pipeline_runs')
@@ -267,8 +269,8 @@ export class TasksService {
           pipeline_id: run.pipelineId,
           pipeline_version_id: run.pipelineVersionId,
           project_id: input.scope.projectId,
-          service_id: input.scope.serviceId,
-          environment_id: input.scope.environmentId,
+          service_id: deliveryServiceId,
+          environment_id: deliveryEnvironmentId,
           target_id: input.scope.targetId ?? null,
           target_selection_json: payload.pipeline?.targetSelection
             ? JSON.stringify(payload.pipeline.targetSelection)

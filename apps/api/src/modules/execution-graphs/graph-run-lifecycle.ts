@@ -63,7 +63,10 @@ export function graphPreviewRouting(flow: GraphFlow, selection: ReturnType<typeo
   }
   return {
     certain,
-    edges: flow.edges.map((edge) => ({ ...edge, status: routes.get(edge) ?? 'EXCLUDED' as const })),
+    edges: flow.edges.map((edge) => ({
+      ...edge,
+      status: routes.get(edge) ?? ('EXCLUDED' as const),
+    })),
   };
 }
 
@@ -80,7 +83,8 @@ export function branchMatch(
   }
   const configuration = node.condition ?? node.switch;
   if (!configuration && !node.branch) return undefined;
-  const explicit = flow.compiled?.nodes[node.id]?.inputBindings.value ?? flow.inputBindings?.[node.id]?.value;
+  const explicit =
+    flow.compiled?.nodes[node.id]?.inputBindings.value ?? flow.inputBindings?.[node.id]?.value;
   const output = state?.outputs?.get(node.id);
   if (node.branch) {
     if (typeof output?.branchId === 'string') return output.branchId as GraphEdge['when'];

@@ -670,21 +670,15 @@ export function graphOperationPorts(
       inputs: calledFlow?.nodes.find((candidate) => candidate.type === 'START')?.inputs ?? [],
       outputs: calledFlow?.nodes.find((candidate) => candidate.type === 'END')?.outputs ?? [],
     };
-  if (node.type === 'SHELL' || node.type === 'CHECK')
-    return {
-      ...definition,
-      outputs: definition.outputs.map((port) =>
+  const script = node.type === 'SHELL' || node.type === 'CHECK';
+  const outputs = script
+    ? definition.outputs.map((port) =>
         port.id === 'workspace' && node.shell?.location === 'MANAGER'
           ? { ...port, required: true }
           : port,
-      ),
-    };
-  const artifacts =
-    node.type === 'BUILD'
-      ? node.build?.artifacts
-      : node.type === 'REGISTER_ARTIFACT'
-        ? node.registerArtifacts?.artifacts
-        : undefined;
+      )
+    : definition.outputs;
+  const artifacts = graphArtifactDeclarations(node);
   const inputs =
     node.type === 'BUILD' && node.build?.dependencies?.length
       ? [
@@ -699,6 +693,7 @@ export function graphOperationPorts(
       ...definition,
       inputs,
       outputs: [
+        ...(script ? outputs : []),
         { ...allArtifacts, required: artifacts.some((artifact) => artifact.required !== false) },
         ...artifacts.map(({ id, name, referenceName, type, required }) => ({
           ...field(id ?? name, 'ARTIFACT', required !== false, name),
@@ -716,7 +711,21 @@ export function graphOperationPorts(
         artifactType: node.build?.artifactType,
       })),
     };
-  return { ...definition, inputs };
+  return { ...definition, inputs, outputs };
+}
+
+export function graphArtifactDeclarations(node: GraphNode) {
+  switch (node.type === 'FUNCTION' ? node.operation : node.type) {
+    case 'BUILD':
+      return node.build?.artifacts;
+    case 'REGISTER_ARTIFACT':
+      return node.registerArtifacts?.artifacts;
+    case 'SHELL':
+    case 'CHECK':
+      return node.shell?.artifacts;
+    default:
+      return undefined;
+  }
 }
 
 function scriptDeclarations(node: GraphNode, kind: 'inputs' | 'outputs'): GraphField[] {
@@ -740,7 +749,7 @@ export function graphScriptOutputs(node: GraphNode): GraphField[] {
   if (node.type !== 'SHELL' && node.type !== 'CHECK') return [];
   if (!node.declaredPorts || node.outputs === undefined)
     return node.outputs ?? node.shell?.outputs ?? [];
-  const native = new Set(shellOutputs.map(({ id }) => id));
+  const native = new Set(graphOperationPorts(node)?.outputs.map(({ id }) => id));
   return scriptDeclarations(node, 'outputs').filter(({ id }) => !native.has(id));
 }
 

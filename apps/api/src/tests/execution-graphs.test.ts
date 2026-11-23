@@ -18,14 +18,27 @@ const choiceBinding = { kind: 'INPUT', fieldId: choice.id } as const;
 const plainBranchCanvas: GraphCanvas = {
   nodes: [
     { id: 'start-plain', type: 'START', name: '普通分叉', inputs: [choice] },
-    { id: 'rules', type: 'CONDITION', name: '条件分支', branch: {
-      cases: [{ id: 'publish', value: 'release' }, { id: 'verify', value: 'test' }],
-    } },
+    {
+      id: 'rules',
+      type: 'CONDITION',
+      name: '条件分支',
+      branch: {
+        cases: [
+          { id: 'publish', value: 'release' },
+          { id: 'verify', value: 'test' },
+        ],
+      },
+    },
     { id: 'parallel-approval', type: 'APPROVAL', name: '并行审批' },
     { id: 'selected-path', type: 'APPROVAL', name: '匹配路径审批' },
     { id: 'default-path', type: 'LOG', name: '默认路径', message: 'default' },
     { id: 'combined', type: 'LOG', name: '下游任务', message: 'merged' },
-    { id: 'end-plain', type: 'END', name: '结束', outputs: [{ id: 'chosen', type: 'TEXT', name: '选中规则' }] },
+    {
+      id: 'end-plain',
+      type: 'END',
+      name: '结束',
+      outputs: [{ id: 'chosen', type: 'TEXT', name: '选中规则' }],
+    },
   ],
   edges: [
     { from: 'start-plain', to: 'rules' },
@@ -38,11 +51,14 @@ const plainBranchCanvas: GraphCanvas = {
     { from: 'parallel-approval', to: 'combined' },
     { from: 'combined', to: 'end-plain' },
   ],
-  endpoints: [{
-    startId: 'start-plain', endId: 'end-plain',
-    inputBindings: { rules: { value: choiceBinding } },
-    outputBindings: { chosen: { kind: 'OUTPUT', nodeId: 'rules', fieldId: 'branchId' } },
-  }],
+  endpoints: [
+    {
+      startId: 'start-plain',
+      endId: 'end-plain',
+      inputBindings: { rules: { value: choiceBinding } },
+      outputBindings: { chosen: { kind: 'OUTPUT', nodeId: 'rules', fieldId: 'branchId' } },
+    },
+  ],
   templates: [],
 };
 
@@ -227,46 +243,120 @@ async function checkGraph(url?: string) {
     ) => run.nodes.find(({ nodeId }) => nodeId === id)!;
     const state = (run: Parameters<typeof findNode>[0], nodeId: string) =>
       findNode(run, nodeId)?.status;
-    const plainPath = root + '/projects/' + await project('plain-dag') + '/execution-graph';
+    const plainPath = root + '/projects/' + (await project('plain-dag')) + '/execution-graph';
     const publishPlain = async (canvas: GraphCanvas) => {
       const { revision } = (await api.get(plainPath).expect(200)).body.data;
-      const draft = (await api.put(plainPath + '/draft').send({ expectedRevision: revision, definition: { canvas } }).expect(200)).body.data;
-      const { publishedVersion } = (await api.post(plainPath + '/publish').send({ expectedRevision: draft.revision }).expect(201)).body.data;
+      const draft = (
+        await api
+          .put(plainPath + '/draft')
+          .send({ expectedRevision: revision, definition: { canvas } })
+          .expect(200)
+      ).body.data;
+      const { publishedVersion } = (
+        await api
+          .post(plainPath + '/publish')
+          .send({ expectedRevision: draft.revision })
+          .expect(201)
+      ).body.data;
       return publishedVersion as number;
     };
     const plainFlow = plainPath + '/flows/start-plain';
     const initialPlainVersion = await publishPlain(plainBranchCanvas);
     const args = { version: initialPlainVersion, inputs: { parameters: { choice: 'release' } } };
-    const before = (await api.post(plainFlow + '/preview').send(args).expect(201)).body.data;
-    assert.equal(before.routing.find(({ when }: { when: string }) => when === 'CASE:publish').status, 'CERTAIN');
-    assert.equal(before.routing.find(({ when }: { when: string }) => when === 'CASE:verify').status, 'EXCLUDED');
+    const before = (
+      await api
+        .post(plainFlow + '/preview')
+        .send(args)
+        .expect(201)
+    ).body.data;
+    assert.equal(
+      before.routing.find(({ when }: { when: string }) => when === 'CASE:publish').status,
+      'CERTAIN',
+    );
+    assert.equal(
+      before.routing.find(({ when }: { when: string }) => when === 'CASE:verify').status,
+      'EXCLUDED',
+    );
     const reordered = structuredClone(plainBranchCanvas);
     const rules = reordered.nodes.find(({ id }) => id === 'rules')!.branch!.cases;
     rules.reverse();
     rules[1]!.label = '新显示名称';
     args.version = await publishPlain(reordered);
-    await api.post(plainFlow + '/run').send({ ...args, expectedConfigurationHash: before.configurationHash, idempotencyKey: randomUUID() }).expect(409);
-    const currentRoute = (await api.post(plainFlow + '/preview').send(args).expect(201)).body.data;
-    const identity = { ...args, expectedConfigurationHash: currentRoute.configurationHash, idempotencyKey: randomUUID() };
-    const pendingJoin = (await api.post(plainFlow + '/run').send(identity).expect(201)).body.data;
+    await api
+      .post(plainFlow + '/run')
+      .send({
+        ...args,
+        expectedConfigurationHash: before.configurationHash,
+        idempotencyKey: randomUUID(),
+      })
+      .expect(409);
+    const currentRoute = (
+      await api
+        .post(plainFlow + '/preview')
+        .send(args)
+        .expect(201)
+    ).body.data;
+    const identity = {
+      ...args,
+      expectedConfigurationHash: currentRoute.configurationHash,
+      idempotencyKey: randomUUID(),
+    };
+    const pendingJoin = (
+      await api
+        .post(plainFlow + '/run')
+        .send(identity)
+        .expect(201)
+    ).body.data;
     assert.equal(pendingJoin.status, 'WAITING');
     assert.equal(state(pendingJoin, 'parallel-approval'), 'WAITING');
     assert.equal(state(pendingJoin, 'combined'), 'PENDING');
     assert.equal(state(pendingJoin, 'default-path'), 'SKIPPED');
-    await api.post(plainPath + '/runs/' + pendingJoin.id + '/nodes/selected-path/decision').send({ decision: 'APPROVE' }).expect(201);
-    await api.post(plainPath + '/runs/' + pendingJoin.id + '/nodes/parallel-approval/decision').send({ decision: 'APPROVE' }).expect(201);
-    const rerun = (await api.post(plainFlow + '/run').send(identity).expect(201)).body.data;
+    await api
+      .post(plainPath + '/runs/' + pendingJoin.id + '/nodes/selected-path/decision')
+      .send({ decision: 'APPROVE' })
+      .expect(201);
+    await api
+      .post(plainPath + '/runs/' + pendingJoin.id + '/nodes/parallel-approval/decision')
+      .send({ decision: 'APPROVE' })
+      .expect(201);
+    const rerun = (
+      await api
+        .post(plainFlow + '/run')
+        .send(identity)
+        .expect(201)
+    ).body.data;
     assert.equal(rerun.id, pendingJoin.id);
     assert.equal(rerun.status, 'SUCCESS');
     assert.deepEqual(rerun.outputs, { chosen: 'CASE:publish' });
-    assert.equal(rerun.nodes.filter(({ nodeId }: { nodeId: string }) => nodeId === 'combined').length, 1);
-    const blocked = (await api.post(plainFlow + '/run').send({ ...identity, idempotencyKey: randomUUID() }).expect(201)).body.data;
+    assert.equal(
+      rerun.nodes.filter(({ nodeId }: { nodeId: string }) => nodeId === 'combined').length,
+      1,
+    );
+    const blocked = (
+      await api
+        .post(plainFlow + '/run')
+        .send({ ...identity, idempotencyKey: randomUUID() })
+        .expect(201)
+    ).body.data;
     const blockedPath = plainPath + '/runs/' + blocked.id + '/nodes/';
-    const rejectedBranch = (await api.post(blockedPath + 'selected-path/decision').send({ decision: 'REJECT' }).expect(201)).body.data;
+    const rejectedBranch = (
+      await api
+        .post(blockedPath + 'selected-path/decision')
+        .send({ decision: 'REJECT' })
+        .expect(201)
+    ).body.data;
     assert.equal(state(rejectedBranch, 'parallel-approval'), 'WAITING');
     assert.equal(state(rejectedBranch, 'combined'), 'SKIPPED');
-    assert.match(rejectedBranch.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === 'combined').log, /匹配路径审批/);
-    const failedJoin = (await api.post(blockedPath + 'parallel-approval/decision').send({ decision: 'APPROVE' }).expect(201)).body.data;
+    assert.match(
+      rejectedBranch.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === 'combined').log,
+      /匹配路径审批/,
+    );
+    const failedJoin = (
+      await api
+        .post(blockedPath + 'parallel-approval/decision')
+        .send({ decision: 'APPROVE' })
+        .expect(201)
+    ).body.data;
     assert.equal(failedJoin.status, 'FAILED');
     assert.equal(state(dagRun, 'yes'), 'SUCCESS');
     assert.equal(state(dagRun, 'no'), 'SKIPPED');

@@ -41,13 +41,16 @@ test('execution graph validates edges, branch labels and calls independently of 
     ['start', 'check', 'first', 'second', 'join', 'end'],
   );
   flow.edges[2]!.when = 'TRUE';
-  assert.throws(() => validateGraphDefinition({ flows: [flow] }), (error: unknown) => {
-    assert.ok(error instanceof GraphCompileError);
-    assert.equal(error.issue.flowId, flow.id);
-    assert.equal(error.issue.nodeId, 'check');
-    assert.deepEqual(error.issue.edge, flow.edges[2]);
-    return true;
-  });
+  assert.throws(
+    () => validateGraphDefinition({ flows: [flow] }),
+    (error: unknown) => {
+      assert.ok(error instanceof GraphCompileError);
+      assert.equal(error.issue.flowId, flow.id);
+      assert.equal(error.issue.nodeId, 'check');
+      assert.deepEqual(error.issue.edge, flow.edges[2]);
+      return true;
+    },
+  );
 
   const cyclic = example();
   cyclic.nodes.push(

@@ -49,6 +49,8 @@ async function checkDelivery(databaseUrl?: string) {
   const { ArtifactsService } = await import('../modules/artifacts/artifacts.service.js');
   const { GraphTriggersService } =
     await import('../modules/execution-graphs/graph-triggers.service.js');
+  const { expandGraphTemplate } =
+    await import('../modules/execution-graphs/graph-flow-templates.js');
   const { RepositoryMetadataService } =
     await import('../modules/projects/repository-metadata.service.js');
 
@@ -72,6 +74,7 @@ async function checkDelivery(databaseUrl?: string) {
   let failedBuildServer: string | undefined;
   let registryPullFails = false;
   let failNextHealthCheck = false;
+  let strictGraphProbeExitCode = 0;
   let archivePlatformMismatch = false;
   let auxiliaryCommit = 'c'.repeat(40);
   const moduleRef = await Test.createTestingModule({
@@ -125,6 +128,8 @@ async function checkDelivery(databaseUrl?: string) {
             await writeFile(join(workspace, 'repo', 'Dockerfile'), 'FROM scratch\n');
             await writeFile(join(workspace, 'repo', 'compose.yaml'), compose);
           } else {
+            if (script.includes('missing-shell-output'))
+              return { exitCode: 44, stdout: '', stderr: '' };
             const filename =
               /'\/workspace\/(artifact(?:-[0-9a-f-]+)?\.tar\.gz)'/.exec(script)?.[1] ??
               'artifact.tar.gz';
@@ -168,6 +173,8 @@ async function checkDelivery(databaseUrl?: string) {
           failNextHealthCheck = false;
           return { exitCode: 1 };
         }
+        if (command.includes('GRAPH_TEMPLATE_HEALTH_CHECK'))
+          return { exitCode: strictGraphProbeExitCode };
         const switched = /ln -s '([^']+)' '[^']+'; mv -Tf -- '[^']+' '([^']+)'/.exec(command);
         if (switched) releaseLinks.set(`${target.id}:${switched[2]}`, switched[1]!);
         const reading = /^readlink -- '([^']+)'$/.exec(command);
@@ -1384,24 +1391,19 @@ async function checkDelivery(databaseUrl?: string) {
           location: 'MANAGER',
           command: 'echo GRAPH_SHELL_FIXTURE',
           params: [{ id: 'OUT_DIR', name: '输出目录', type: 'PATH' }],
+          artifacts: [
+            { id: 'static', name: '站点目录', type: 'DIRECTORY', pathInput: 'OUT_DIR' },
+            {
+              id: 'html',
+              name: '临时首页',
+              type: 'FILE',
+              path: 'custom-dist/index.html',
+              persist: false,
+            },
+            { name: 'optional', type: 'FILE', path: 'missing-shell-output', required: false },
+          ],
         },
         outputs: [{ id: 'result', name: '结果', type: 'TEXT' }],
-      },
-      {
-        id: 'register',
-        type: 'FUNCTION',
-        operation: 'REGISTER_ARTIFACT',
-        name: '登记 Shell 产物',
-        inputs: [
-          {
-            id: 'path',
-            name: '产物目录',
-            referenceName: 'ARTIFACT_DIR',
-            type: 'PATH',
-            defaultValue: './dist',
-          },
-        ],
-        registerArtifacts: { artifacts: [{ name: 'static', type: 'DIRECTORY', path: 'unused' }] },
       },
       {
         id: 'custom-end',
@@ -1518,8 +1520,7 @@ async function checkDelivery(databaseUrl?: string) {
     ];
     const edges = [
       ['custom', 'script'],
-      ['script', 'register'],
-      ['register', 'custom-end'],
+      ['script', 'custom-end'],
       ['build', 'git-actual'],
       ['composed', 'git-actual'],
       ['git-actual', 'git-schema'],
@@ -1569,9 +1570,8 @@ async function checkDelivery(databaseUrl?: string) {
             endId: 'custom-end',
             inputBindings: {
               script: { OUT_DIR: input('outputDir') },
-              register: { workspace: from('script', 'workspace'), path: input('outputDir') },
             },
-            outputBindings: { directory: from('register', 'static') },
+            outputBindings: { directory: from('script', 'static') },
           },
           {
             startId: 'build',
@@ -1630,20 +1630,28 @@ async function checkDelivery(databaseUrl?: string) {
       return { reviewed, detail: await waitGraph(run.id) };
     };
     const custom = await submit('custom');
-    assert.equal(custom.detail.status, 'SUCCESS', JSON.stringify(custom.detail.nodes));
+    const scriptTaskId = custom.detail.nodes.find(
+      ({ nodeId }: { nodeId: string }) => nodeId === 'script',
+    ).taskId;
+    const scriptLog =
+      scriptTaskId &&
+      (await api.get('/api/v1/tasks/' + scriptTaskId + '/logs').expect(200)).body.data.content;
+    assert.equal(custom.detail.status, 'SUCCESS', scriptLog ?? JSON.stringify(custom.detail.nodes));
     assert.equal(custom.detail.outputs.directory.type, 'DIRECTORY');
     assert.equal(custom.detail.outputs.directory.instances.length, 1);
-    const inspected = custom.detail.nodes.find(
-      (node: { nodeId: string }) => node.nodeId === 'register',
-    );
-    assert.equal(
-      inspected.inputs.find(({ fieldId }: { fieldId: string }) => fieldId === 'path').value,
-      'custom-dist',
-    );
     const scriptResult = custom.detail.nodes.find(
       (node: { nodeId: string }) => node.nodeId === 'script',
     );
+    assert.equal(
+      scriptResult.inputs.find(({ fieldId }: { fieldId: string }) => fieldId === 'OUT_DIR').value,
+      'custom-dist',
+    );
     assert.equal(scriptResult.output.result, 'generated');
+    assert.equal(scriptResult.output.static.name, '站点目录');
+    assert.equal(scriptResult.output.html.scope, 'TEMPORARY');
+    assert.equal(scriptResult.output.html.rootRunId, custom.detail.id);
+    assert.equal(scriptResult.output.optional, undefined);
+    assert.equal(scriptResult.output.artifacts.length, 2);
     const beforePublish = remoteCommands.length;
     const onlyBuild = await submit('build');
     assert.deepEqual(onlyBuild.reviewed.deliveries[0].serverIds, []);
@@ -1757,9 +1765,14 @@ async function checkDelivery(databaseUrl?: string) {
       JSON.stringify(historicalRelease.detail.nodes),
     );
     assert.equal(produced.physical.engineId, 'fixture-manager-engine');
-    assert.ok(remoteCommands.slice(beforePublish).some(
-      ({ serverId, command }) => serverId === serverIds[0] && command.includes('image load --input'),
-    ));
+    assert.ok(
+      remoteCommands
+        .slice(beforePublish)
+        .some(
+          ({ serverId, command }) =>
+            serverId === serverIds[0] && command.includes('image load --input'),
+        ),
+    );
     assert.deepEqual(historicalRelease.reviewed.deliveries[0].artifactIds, [savedImage]);
     assert.deepEqual(
       historicalRelease.reviewed.deliveries[0].artifactRefs[0].composeTemplate,
@@ -1836,11 +1849,7 @@ async function checkDelivery(databaseUrl?: string) {
           repositoryId: repo.id,
           commitSha: failingCommit,
         }).expect(202);
-      const releaseTaskFor = async (
-        ruleId: string,
-        kind: string,
-        guarded = true,
-      ) => {
+      const releaseTaskFor = async (ruleId: string, kind: string, guarded = true) => {
         const rows = await events(ruleId);
         assert.equal(rows.length, 1, JSON.stringify(rows));
         const [event] = rows;
@@ -1859,7 +1868,8 @@ async function checkDelivery(databaseUrl?: string) {
             expectedScopeHash: scopeHash,
           });
           assert.equal(
-            receipt.nodes.find((item: { nodeId: string }) => item.nodeId === nodeId).output.decision,
+            receipt.nodes.find((item: { nodeId: string }) => item.nodeId === nodeId).output
+              .decision,
             'APPROVE',
           );
           run = await graphRun();
@@ -2235,6 +2245,143 @@ async function checkDelivery(databaseUrl?: string) {
     assert.equal(activations().length, activationCount);
     assert.equal(composeUploads.at(-1), repositoryCompose);
     repositoryComposeRead = repositoryCompose;
+
+    const expanded = expandGraphTemplate('CD_DEPLOY', 'DOCKER_IMAGE');
+    const templateRelease = expanded.canvas.nodes.find(
+      ({ operation }) => operation === 'DEPLOY_ARTIFACT',
+    )!;
+    const templateApproval = expanded.canvas.nodes.find(
+      ({ operation }) => operation === 'APPROVAL',
+    )!;
+    const templateProbe = expanded.canvas.nodes.find(
+      ({ operation }) => operation === 'HEALTH_CHECK',
+    )!;
+    templateRelease.deploy = {
+      method: 'COMPOSE',
+      deployPath: '/srv/veyops-graph-template',
+      composeSource: {
+        kind: 'REPOSITORY_FILE',
+        repositoryId: sharedRepo.id,
+        commitSha: successfulCommit,
+        path: repositoryComposePath,
+      },
+    };
+    templateProbe.healthCheck!.command = 'echo GRAPH_TEMPLATE_HEALTH_CHECK';
+    const cdDraft = (
+      await api
+        .put('/api/v1' + graphPath + '/draft')
+        .send({
+          expectedRevision: edited.revision,
+          definition: { canvas: expanded.canvas },
+        })
+        .expect(200)
+    ).body.data;
+    const cdVersion = (await create(graphPath + '/publish', { expectedRevision: cdDraft.revision }))
+      .publishedVersion;
+    const cdFlow = `${graphPath}/flows/${expanded.startId}`;
+    const cdRequest = {
+      version: cdVersion,
+      inputs: {
+        parameters: {
+          artifact: { artifactId: savedImage },
+          service: { serviceId: service.id },
+          releaseTargets: { serverIds: [serverIds[0]!] },
+        },
+      },
+    };
+    const queueCd = async (
+      request:
+        | typeof cdRequest
+        | {
+            version: number;
+            inputs: { parameters: Omit<typeof cdRequest.inputs.parameters, 'service'> };
+          },
+    ) => {
+      const plan = await create(cdFlow + '/preview', request);
+      const run = await create(cdFlow + '/run', {
+        ...request,
+        idempotencyKey: randomUUID(),
+        expectedConfigurationHash: plan.configurationHash,
+      });
+      const approval = run.nodes.find(
+        ({ nodeId }: { nodeId: string }) => nodeId === templateApproval.id,
+      );
+      assert.equal(approval.status, 'WAITING');
+      assert.equal(approval.output.scope.serviceId, service.id);
+      assert.deepEqual(approval.output.scope.artifactIds, [savedImage]);
+      const decide = (decision: 'APPROVE' | 'REJECT') =>
+        create(`${graphPath}/runs/${run.id}/nodes/${approval.nodeId}/decision`, {
+          decision,
+          expectedScopeHash: approval.output.scopeHash,
+        });
+      return { run, decide };
+    };
+    const rejected = await queueCd(cdRequest);
+    await rejected.decide('REJECT');
+    const refused = await waitGraph(rejected.run.id);
+    assert.equal(refused.status, 'FAILED');
+    assert.equal(
+      refused.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === templateRelease.id).taskId,
+      null,
+    );
+    for (const [code, status, health] of [
+      [0, 'SUCCESS', 'HEALTHY'],
+      [10, 'FAILED', 'UNHEALTHY'],
+      [127, 'NEEDS_ATTENTION', 'UNKNOWN'],
+    ] as const) {
+      strictGraphProbeExitCode = code;
+      const { run, decide } = await queueCd(cdRequest);
+      await decide('APPROVE');
+      const result = await waitGraph(run.id);
+      assert.equal(result.status, status, JSON.stringify(result.nodes));
+      const probe = result.nodes.find(
+        ({ nodeId }: { nodeId: string }) => nodeId === templateProbe.id,
+      );
+      assert.equal(probe.status, status);
+      assert.equal(probe.output.release.targets[0].health, health);
+      assert.equal(probe.output.release.targets[0].probeExitCode, code);
+      if (status === 'SUCCESS') assert.equal(result.outputs.healthStatus, health);
+    }
+
+    // A fixed service must follow the same health verdict as a service selected at run time.
+    const fixed = structuredClone(expanded.canvas);
+    const [fixedStart] = fixed.nodes;
+    fixedStart!.inputs = fixedStart!.inputs!.filter(({ id }) => id !== 'service');
+    fixed.endpoints[0]!.serviceId = service.id;
+    fixed.endpoints[0]!.inputBindings![templateRelease.id]!.service = {
+      kind: 'VALUE',
+      value: { serviceId: service.id },
+    };
+    const fixedDraft = (
+      await api
+        .put('/api/v1' + graphPath + '/draft')
+        .send({
+          expectedRevision: cdDraft.revision,
+          definition: { canvas: fixed },
+        })
+        .expect(200)
+    ).body.data;
+    const fixedVersion = (
+      await create(graphPath + '/publish', { expectedRevision: fixedDraft.revision })
+    ).publishedVersion;
+    strictGraphProbeExitCode = 10;
+    const fixedCd = await queueCd({
+      version: fixedVersion,
+      inputs: {
+        parameters: {
+          artifact: { artifactId: savedImage },
+          releaseTargets: { serverIds: [serverIds[0]!] },
+        },
+      },
+    });
+    await fixedCd.decide('APPROVE');
+    const fixedFailure = await waitGraph(fixedCd.run.id);
+    assert.equal(fixedFailure.status, 'FAILED', JSON.stringify(fixedFailure.nodes));
+    assert.equal(
+      fixedFailure.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === templateProbe.id)
+        .output.status,
+      'UNHEALTHY',
+    );
 
     const archiveRevision = await create(managedPath, { source: 'ARCHIVE', expectedVersion: 2 });
     assert.equal(archiveRevision.version, 3);

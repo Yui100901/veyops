@@ -92,6 +92,7 @@ import {
   type GraphWorkspaceRef,
 } from './graph-workspace';
 import {
+  graphArtifactDeclarations,
   graphScriptInputs,
   type GraphBinding,
   type GraphField,
@@ -1687,26 +1688,29 @@ export class GraphRunnerService implements OnModuleInit {
               ),
             );
           }
-          if (node.type === 'REGISTER_ARTIFACT') {
-            const origin = (values.source ?? values.workspace) as Values | undefined;
+          const declarations = graphArtifactDeclarations(node);
+          if (declarations?.length) {
+            const origin = values.workspace as Values | undefined;
             const repositoryId = stringValue(origin?.repositoryId) ?? unversionedArtifactRepository;
             const commitSha = stringValue(origin?.commitSha) ?? unversionedArtifactCommit;
             const definition = Object.assign(new PipelineDefinitionDto(), { repositoryId });
-            const named = node.registerArtifacts?.artifacts ?? [];
             const source = {
               definition,
               commitSha,
               serviceId: referenceId(values.service) ?? scope.serviceId,
               environmentId: referenceId(values.environment) ?? scope.environmentId,
-              sourceSnapshot: [{ repositoryId, commitSha }],
+              ...(repositoryId !== unversionedArtifactRepository && {
+                sourceSnapshot: [{ repositoryId, commitSha }],
+              }),
+              ...('serverId' in plan && plan.serverId && { serverIds: [plan.serverId] }),
             };
-            for (const artifact of named)
+            for (const artifact of declarations)
               production.set(outputKey(node.id, graphArtifactPortId(artifact)), [
                 { ...source, kind: artifact.type },
               ]);
-            if (named.length === 1)
+            if (declarations.length === 1)
               production.set(outputKey(node.id, 'artifacts'), [
-                { ...source, kind: named[0]!.type },
+                { ...source, kind: declarations[0]!.type },
               ]);
           }
           if (plan.type === 'CHECKOUT') {
@@ -1831,7 +1835,8 @@ export class GraphRunnerService implements OnModuleInit {
           sources.push(...(parameterProduction.get(binding.fieldId) ?? []));
         if (sources.length) produced[fieldId] = sources;
       }
-      if (current.id === flowId) rootRouting = graphPreviewRouting(current, flowSelection(current, args, state));
+      if (current.id === flowId)
+        rootRouting = graphPreviewRouting(current, flowSelection(current, args, state));
       return {
         inputHash,
         ...(parameterProduction.size && {
@@ -1890,7 +1895,8 @@ export class GraphRunnerService implements OnModuleInit {
       });
     }
     const selectedNodes = new Set(prepared.selectedNodeIds);
-    const edgeKey = ({ from, to, when }: { from: string; to: string; when?: string }) => JSON.stringify([from, to, when]);
+    const edgeKey = ({ from, to, when }: { from: string; to: string; when?: string }) =>
+      JSON.stringify([from, to, when]);
     const rootNodeIds = new Set(flow.nodes.map(({ id }) => id));
     const rootEdges = new Set(flow.edges.map(edgeKey));
     const routing = [
@@ -1961,6 +1967,8 @@ export class GraphRunnerService implements OnModuleInit {
     for (const { flowId, nodeId, plan } of scriptsPrepared) {
       if (plan.type !== 'SHELL' && plan.type !== 'CHECK') continue;
       section(flowId, nodeId, '执行目标及成员', [plan.serverId, plan.serverName, plan.targetHash]);
+      if (plan.targetWorkspaceRoot)
+        section(flowId, nodeId, '目标端脚本工作目录', plan.targetWorkspaceRoot);
       section(flowId, nodeId, '变量及其来源', [
         plan.variableSources,
         createHmac('sha256', encryptionKey())
@@ -2227,13 +2235,13 @@ export class GraphRunnerService implements OnModuleInit {
       }
       if (
         confirmed.definition.flows.some(({ nodes }) =>
-          nodes.some((node) => isDelivery(node) || node.type === 'REGISTER_ARTIFACT'),
+          nodes.some((node) => isDelivery(node) || graphArtifactDeclarations(node)?.length),
         )
       )
         await ensureGraphDeliveryEnvironment(tx, projectId);
       if (
         confirmed.definition.flows.some(({ nodes }) =>
-          nodes.some(({ type }) => type === 'BUILD' || type === 'REGISTER_ARTIFACT'),
+          nodes.some((node) => node.type === 'BUILD' || graphArtifactDeclarations(node)?.length),
         )
       ) {
         await ensureGraphUnscopedArtifactService(tx, projectId);
@@ -2709,7 +2717,9 @@ export class GraphRunnerService implements OnModuleInit {
                 task.error_summary ??
                 (node.type === 'HEALTH_CHECK' && status === 'NEEDS_ATTENTION'
                   ? '健康状态未知，需人工核查当前发布。'
-                  : node.type === 'HEALTH_CHECK' && status === 'FAILED' && output?.status === 'UNHEALTHY'
+                  : node.type === 'HEALTH_CHECK' &&
+                      status === 'FAILED' &&
+                      output?.status === 'UNHEALTHY'
                     ? '发布健康检查未通过。'
                     : undefined) ??
                 (status === 'SUCCESS'
@@ -2816,11 +2826,7 @@ export class GraphRunnerService implements OnModuleInit {
           continue;
         }
         if (parents.some(({ from }) => !isNodeTerminal(byId.get(from)!.status))) continue;
-        if (
-          node.type === 'DELAY' ||
-          node.type === 'APPROVAL' ||
-          node.type === 'SOURCE_REVIEW'
-        ) {
+        if (node.type === 'DELAY' || node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW') {
           try {
             const rootId = snapshot.rootId ?? run.id;
             let scope: GraphGateScope | undefined;
@@ -3978,11 +3984,7 @@ export class GraphRunnerService implements OnModuleInit {
       };
     });
     const built = await this.taskArtifacts(
-      rows.flatMap((n) =>
-        (n.type === 'BUILD' || n.type === 'REGISTER_ARTIFACT') && n.nodeTaskId
-          ? [n.nodeTaskId]
-          : [],
-      ),
+      rows.flatMap((n) => (n.nodeTaskId ? [n.nodeTaskId] : [])),
     );
     const artifacts = [
       ...new Set([

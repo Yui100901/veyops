@@ -18,10 +18,19 @@ import {
   resolveExecutionVariables,
   type ExecutionVariables,
 } from '../../infrastructure/execution-variables';
-import { SshExecutionError, SshService } from '../../infrastructure/ssh/ssh.service';
+import {
+  SshExecutionError,
+  SshService,
+  type SshTarget,
+} from '../../infrastructure/ssh/ssh.service';
 import { TargetResolver } from '../command-center/target-resolver.service';
 import { BuildsService, type BuildSession } from '../builds/builds.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
+import {
+  ArtifactOutputMissing,
+  ArtifactPhysicalService,
+} from '../artifacts/artifact-physical.service';
+import { artifactIdentity } from '../artifacts/artifact-identities';
 import { CredentialsService } from '../credentials/credentials.service';
 import {
   directDeploymentSelection,
@@ -30,6 +39,8 @@ import {
 import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
 import { PipelineExecutor } from '../pipelines/pipeline-executor.service';
 import { relativePath, shellQuote } from '../pipelines/pipeline.validation';
+import { createTargetWorkspace, targetWorkspacePath } from '../pipelines/target-workspace';
+import { SystemSettingsService } from '../system/system-settings.service';
 import {
   deliveryExecutionProfile,
   graphDeliveryEnvironment,
@@ -51,6 +62,7 @@ import { graphArtifactDefinitions, graphArtifactOutputs } from './graph-artifact
 import {
   graphScriptInputs,
   graphScriptOutputs,
+  graphArtifactDeclarations,
   validateGraphValue,
   type GraphField,
   type GraphGitFetchMode,
@@ -117,6 +129,7 @@ export type GraphNodePlan =
       serverName?: string;
       targetHash?: string;
       targetSelection?: DeploymentSelection;
+      targetWorkspaceRoot?: string;
       serviceId?: string;
       environmentId?: string;
       environment?: ExecutionVariables;
@@ -141,6 +154,7 @@ export interface GraphModulePayload {
   source?: GraphCheckoutSnapshot;
   variables?: GraphEnvironmentRef;
   targetDirectory?: string;
+  targetWorkspaceRoot?: string;
   environmentFile?: GraphEnvironmentPlan;
   variableSources?: GraphVariableSource[];
   shell?: {
@@ -281,6 +295,8 @@ export class GraphNodeTasks implements OnModuleInit {
     private readonly artifacts: ArtifactsService,
     private readonly ssh: SshService,
     private readonly credentials: CredentialsService,
+    private readonly physical: ArtifactPhysicalService,
+    private readonly systemSettings: SystemSettingsService,
     @Optional() private readonly pipelineExecutor?: PipelineExecutor,
   ) {}
 
@@ -593,6 +609,9 @@ export class GraphNodeTasks implements OnModuleInit {
       serverName: target.targets[0]!.name,
       targetHash: target.targetHash,
       targetSelection: directDeploymentSelection(selection, defaults.maxParallel),
+      ...(graphArtifactDeclarations(node)?.length && {
+        targetWorkspaceRoot: (await this.systemSettings.get(projectId)).targetWorkspaceRoot,
+      }),
     };
   }
 
@@ -600,6 +619,72 @@ export class GraphNodeTasks implements OnModuleInit {
     const available = await ownedGraphWorkspace(this.database.db, projectId, reference);
     await openGraphWorkspace(available);
     return available;
+  }
+
+  private artifactTask(
+    task: CreateTaskInput,
+    module: GraphModulePayload,
+    scope: GraphNodeScope,
+    declarations: NamedArtifactDefinition[],
+    workspace: GraphWorkspaceRef | undefined,
+    buildLocation: 'MANAGER' | 'TARGET',
+  ): CreateTaskInput {
+    if (!scope.runId || !scope.nodeRunId)
+      throw new BadRequestException('登记产物需要已确认的执行图运行');
+    const { projectId, serviceId } = module;
+    const ownerServiceId = serviceId ?? graphUnscopedArtifactService(projectId).id;
+    const environmentId = graphDeliveryEnvironment(projectId).id;
+    const definition = Object.assign(new PipelineDefinitionDto(), {
+      repositoryId: workspace?.repositoryId ?? unversionedArtifactRepository,
+      repoPath: module.targetDirectory ?? '.',
+      buildLocation,
+      artifactType: declarations[0]!.type === 'DOCKER_IMAGE' ? 'DOCKER_IMAGE' : 'FILE',
+      artifacts: declarations,
+    });
+    const profile = deliveryExecutionProfile(
+      projectId,
+      ownerServiceId,
+      scope.nodeRunId,
+      1,
+      task.name,
+      definition,
+      [],
+    );
+    const pipeline: PipelineSnapshot = {
+      graph: {
+        runId: scope.runId,
+        rootRunId: scope.rootRunId ?? scope.runId,
+        nodeRunId: scope.nodeRunId,
+        workspace,
+      },
+      artifactSources: workspaceArtifactSource(workspace),
+      runId: randomUUID(),
+      pipelineId: profile.id,
+      pipelineVersionId: profile.versionId,
+      projectId,
+      serviceId: ownerServiceId,
+      environmentId,
+      commitSha: workspace?.commitSha ?? unversionedArtifactCommit,
+      mode: 'BUILD_ONLY',
+      definition,
+      repository: { url: '', credentialId: null },
+      variables: {},
+      secretVariables: {},
+    };
+    return {
+      ...task,
+      registrationProfile: profile,
+      pipelineRun: {
+        id: pipeline.runId,
+        pipelineId: profile.id,
+        pipelineVersionId: profile.versionId,
+        gitRef: pipeline.commitSha,
+        commitSha: pipeline.commitSha,
+        buildLocation,
+        artifactType: definition.artifactType,
+      },
+      payload: { ...task.payload, pipeline, graphModule: module },
+    };
   }
 
   async task(
@@ -719,7 +804,6 @@ export class GraphNodeTasks implements OnModuleInit {
     }
     if (plan.type === 'REGISTER_ARTIFACT') {
       if (!self || !environmentId) throw new BadRequestException('登记产物需要已确认的执行图运行');
-      const ownerServiceId = serviceId ?? graphUnscopedArtifactService(projectId).id;
       await this.configs.resolveVariables(projectId, undefined, serviceId);
       const boundPath = text(values.path);
       const boundImage = text(values.image);
@@ -743,60 +827,14 @@ export class GraphNodeTasks implements OnModuleInit {
         )
           throw new BadRequestException('产物需要明确的工作区文件、目录或镜像来源');
       }
-      const definition = Object.assign(new PipelineDefinitionDto(), {
-        repositoryId: workspace?.repositoryId ?? unversionedArtifactRepository,
-        buildLocation: 'MANAGER',
-        artifactType: declarations[0]!.type === 'DOCKER_IMAGE' ? 'DOCKER_IMAGE' : 'FILE',
-        artifacts: declarations,
-      });
-      const profile = deliveryExecutionProfile(
-        projectId,
-        ownerServiceId,
-        scope.nodeRunId!,
-        1,
-        node.name,
-        definition,
-        [],
+      return this.artifactTask(
+        base,
+        { ...settings, workspace: workspace ?? self },
+        scope,
+        declarations,
+        workspace,
+        'MANAGER',
       );
-      const pipeline: PipelineSnapshot = {
-        graph: {
-          runId: scope.runId!,
-          rootRunId: scope.rootRunId ?? scope.runId,
-          nodeRunId: scope.nodeRunId!,
-          workspace,
-        },
-        artifactSources: workspaceArtifactSource(workspace),
-        runId: randomUUID(),
-        pipelineId: profile.id,
-        pipelineVersionId: profile.versionId,
-        projectId,
-        serviceId: ownerServiceId,
-        environmentId,
-        commitSha: workspace?.commitSha ?? unversionedArtifactCommit,
-        mode: 'BUILD_ONLY',
-        definition,
-        repository: { url: '', credentialId: null },
-        variables: {},
-        secretVariables: {},
-      };
-      return {
-        ...base,
-        registrationProfile: profile,
-        pipelineRun: {
-          id: pipeline.runId,
-          pipelineId: pipeline.pipelineId,
-          pipelineVersionId: pipeline.pipelineVersionId,
-          gitRef: pipeline.commitSha,
-          commitSha: pipeline.commitSha,
-          buildLocation: definition.buildLocation,
-          artifactType: definition.artifactType,
-        },
-        payload: {
-          ...base.payload,
-          pipeline,
-          graphModule: { ...settings, workspace: workspace ?? self },
-        },
-      };
     }
 
     const config = node.shell;
@@ -866,7 +904,7 @@ export class GraphNodeTasks implements OnModuleInit {
         })),
       ],
     );
-    return {
+    const task: CreateTaskInput = {
       ...base,
       payload: {
         ...base.payload,
@@ -881,6 +919,7 @@ export class GraphNodeTasks implements OnModuleInit {
           variables,
           variableSources,
           targetDirectory: config.directory,
+          targetWorkspaceRoot: plan.targetWorkspaceRoot,
           shell: {
             command: config.command,
             timeout: config.timeout ?? defaults.timeout,
@@ -891,6 +930,24 @@ export class GraphNodeTasks implements OnModuleInit {
         },
       },
     };
+    const authored = graphArtifactDeclarations(node) ?? [];
+    if (!authored.length) return task;
+    const declarations = graphArtifactDefinitions(
+      authored.map((artifact) => {
+        if (!artifact.pathInput) return artifact;
+        const value = text(values[artifact.pathInput]);
+        if (!value && !artifact.path) throw new BadRequestException('脚本的产物路径输入缺少实际值');
+        return value ? { ...artifact, path: relativePath(value) } : artifact;
+      }),
+    );
+    return this.artifactTask(
+      task,
+      task.payload.graphModule!,
+      scope,
+      declarations,
+      workspace,
+      targets.length ? 'TARGET' : 'MANAGER',
+    );
   }
 
   private async execute(
@@ -972,33 +1029,11 @@ export class GraphNodeTasks implements OnModuleInit {
     if (module.type === 'REGISTER_ARTIFACT') {
       const workspace = module.workspace!;
       if (!task.payload.pipeline!.graph?.workspace) await createGraphWorkspace(workspace);
-      const session = this.session(task, context, task.payload.pipeline!);
-      const result = await this.builds.registerManagerArtifacts(session, workspace);
-      try {
-        for (const { declaration, output } of result.artifacts ?? []) {
-          await this.artifacts.create(session.snapshot, {
-            name: declaration.name,
-            kind: declaration.type,
-            ...(declaration.type === 'DOCKER_IMAGE' && { sources: [] }),
-            storageKey: output.localArchive ?? output.imageReference!,
-            imageReference: output.imageReference,
-            imageId: output.imageId,
-            archiveKey: output.archiveKey,
-            archiveImageId: output.archiveImageId,
-            archiveImagePlatform: output.archiveImagePlatform,
-            checksum: output.checksum,
-            sizeBytes: output.sizeBytes,
-            composeYaml: output.composeYaml,
-            storageType: output.imageId ? 'LOCAL_IMAGE' : 'LOCAL_FILE',
-            physical: output.physical,
-            persist: declaration.persist,
-          });
-          context.log('已登记产物 ' + declaration.name + '\n');
-        }
-        return {};
-      } finally {
-        await result.cleanup();
-      }
+      await this.collectManagerArtifacts(
+        this.session(task, context, task.payload.pipeline!),
+        workspace,
+      );
+      return {};
     }
 
     const shell = module.shell!;
@@ -1029,13 +1064,28 @@ export class GraphNodeTasks implements OnModuleInit {
     const output = new GraphScriptOutput((line) => context.log(line, target?.id), secrets);
     const onData = output.write.bind(output);
     const targetRunId = target && (await context.startTarget(target.id));
+    const artifactSession =
+      task.payload.pipeline && this.session(task, context, task.payload.pipeline, values, secrets);
+    let targetWorkspace: string | undefined;
     let exitCode: number | null = null;
     let declared: Record<string, unknown>;
     try {
       if (target) {
-        const directory = module.targetDirectory
+        let directory = module.targetDirectory
           ? 'cd -P -- ' + shellQuote(relativePath(module.targetDirectory)) + ' || exit $?\n'
           : '';
+        if (artifactSession) {
+          if (!module.targetWorkspaceRoot) throw new ConflictException('缺少已确认的脚本工作目录');
+          const name = 'veyops-script-' + task.id;
+          const workspaceReceipt = await this.builds.remoteCapture(
+            target,
+            createTargetWorkspace(module.targetWorkspaceRoot, name),
+            artifactSession,
+            30,
+          );
+          targetWorkspace = targetWorkspacePath(workspaceReceipt, name);
+          directory = `cd -P -- ${shellQuote(targetWorkspace)} || exit $?\n${directory}case "$(pwd -P)" in ${shellQuote(targetWorkspace)}|${shellQuote(targetWorkspace)}/*) ;; *) exit 45 ;; esac\n`;
+        }
         const result = await this.ssh.execute(target, directory + shell.command, {
           timeout: shell.timeout,
           signal: context.signal,
@@ -1085,6 +1135,12 @@ export class GraphNodeTasks implements OnModuleInit {
           fieldName: invalidService.field.name,
           message: '脚本输出的项目服务不存在、已归档或不属于当前项目',
         });
+      if (artifactSession) {
+        if (target && targetWorkspace)
+          await this.collectTargetArtifacts(artifactSession, target, targetWorkspace);
+        else if (module.workspace)
+          await this.collectManagerArtifacts(artifactSession, module.workspace);
+      }
     } catch (error) {
       output.finish();
       if (targetRunId)
@@ -1095,6 +1151,20 @@ export class GraphNodeTasks implements OnModuleInit {
           error instanceof Error ? error.message : '脚本执行失败',
         );
       throw error;
+    } finally {
+      if (target && targetWorkspace) {
+        const work = shellQuote(targetWorkspace);
+        try {
+          const cleanup = await this.ssh.execute(
+            target,
+            `test ! -L ${work} && test "$(cd -P -- ${work} && pwd -P)" = ${work} && rm -rf -- ${work}`,
+            { timeout: 30 },
+          );
+          if (cleanup.exitCode !== 0) context.log('脚本临时工作目录清理失败\n', target.id);
+        } catch {
+          context.log('脚本临时工作目录清理失败\n', target.id);
+        }
+      }
     }
     if (targetRunId)
       await context.finishTarget(
@@ -1109,6 +1179,84 @@ export class GraphNodeTasks implements OnModuleInit {
       ...(!target && module.workspace && { workspace: module.workspace }),
       ...declared,
     };
+  }
+
+  private async collectManagerArtifacts(session: BuildSession, workspace: GraphWorkspaceRef) {
+    const result = await this.builds.registerManagerArtifacts(session, workspace);
+    try {
+      for (const { declaration, output } of result.artifacts ?? []) {
+        await this.artifacts.create(session.snapshot, {
+          name: declaration.name,
+          kind: declaration.type,
+          ...(declaration.type === 'DOCKER_IMAGE' && { sources: [] }),
+          storageKey: output.localArchive ?? output.imageReference!,
+          imageReference: output.imageReference,
+          imageId: output.imageId,
+          archiveKey: output.archiveKey,
+          archiveImageId: output.archiveImageId,
+          archiveImagePlatform: output.archiveImagePlatform,
+          checksum: output.checksum,
+          sizeBytes: output.sizeBytes,
+          composeYaml: output.composeYaml,
+          storageType: output.imageId ? 'LOCAL_IMAGE' : 'LOCAL_FILE',
+          physical: output.physical,
+          persist: declaration.persist,
+        });
+        session.context.log('已登记产物 ' + declaration.name + '\n');
+      }
+    } finally {
+      await result.cleanup();
+    }
+  }
+
+  private async collectTargetArtifacts(
+    session: BuildSession,
+    target: SshTarget,
+    workspace: string,
+  ) {
+    const { snapshot, context } = session;
+    for (const declaration of snapshot.definition.artifacts ?? []) {
+      const image = declaration.type === 'DOCKER_IMAGE';
+      try {
+        const physical =
+          declaration.type === 'DOCKER_IMAGE'
+            ? await this.physical.describeImage({
+                target,
+                reference: declaration.imageReference!,
+                owner: 'EXTERNAL',
+                signal: context.signal,
+              })
+            : await this.physical.collectServerPath({
+                target,
+                workspace,
+                relativePath: posix.join(
+                  snapshot.definition.repoPath,
+                  relativePath(declaration.path!),
+                ),
+                kind: declaration.type,
+                instanceId: artifactIdentity(snapshot, declaration.name, target.id).instanceId,
+                signal: context.signal,
+              });
+        await this.artifacts.create(snapshot, {
+          name: declaration.name,
+          kind: declaration.type,
+          storageKey: physical.imageReference ?? physical.path!,
+          storageType: image ? 'REMOTE_IMAGE' : 'REMOTE_FILE',
+          serverId: target.id,
+          physical,
+          imageReference: physical.imageReference,
+          imageId: physical.imageId,
+          checksum: physical.sha256,
+          sizeBytes: physical.sizeBytes,
+          persist: declaration.persist,
+        });
+        context.log('已登记产物 ' + declaration.name + '\n', target.id);
+      } catch (error) {
+        if (declaration.required !== false || !(error instanceof ArtifactOutputMissing))
+          throw error;
+        context.log('可选产物 ' + declaration.name + ' 不存在，已略过\n', target.id);
+      }
+    }
   }
 
   private shellSnapshot(task: TaskRecord, module: GraphModulePayload): PipelineSnapshot {
@@ -1143,7 +1291,9 @@ export class GraphNodeTasks implements OnModuleInit {
     node: GraphNode,
     db: Kysely<Database> = this.database.db,
   ): Promise<Record<string, unknown>> {
-    if (node.type === 'BUILD' || node.type === 'REGISTER_ARTIFACT') {
+    const declarations = graphArtifactDeclarations(node);
+    let artifactValues = {};
+    if (node.type === 'BUILD' || node.type === 'REGISTER_ARTIFACT' || declarations?.length) {
       const rows = await db
         .selectFrom('artifacts')
         .innerJoin('pipeline_runs', 'pipeline_runs.id', 'artifacts.pipeline_run_id')
@@ -1167,13 +1317,9 @@ export class GraphNodeTasks implements OnModuleInit {
         .orderBy('artifacts.artifact_name')
         .orderBy('artifacts.id')
         .execute();
-      const { named, artifacts } = graphArtifactOutputs(
-        rows,
-        node.type === 'BUILD'
-          ? (node.build?.artifacts ?? [])
-          : (node.registerArtifacts?.artifacts ?? []),
-      );
-      return { ...Object.fromEntries(named), artifacts };
+      const { named, artifacts } = graphArtifactOutputs(rows, declarations ?? []);
+      artifactValues = { ...Object.fromEntries(named), artifacts };
+      if (node.type === 'BUILD' || node.type === 'REGISTER_ARTIFACT') return artifactValues;
     }
     if (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT')
       return readReleaseOutput(
@@ -1186,9 +1332,10 @@ export class GraphNodeTasks implements OnModuleInit {
       .select('result_json')
       .where('id', '=', taskId)
       .executeTakeFirst();
-    return task?.result_json
-      ? ((JSON.parse(task.result_json) as { graphOutputs?: Record<string, unknown> })
-          .graphOutputs ?? {})
-      : {};
+    return {
+      ...(task?.result_json &&
+        (JSON.parse(task.result_json) as { graphOutputs?: Record<string, unknown> }).graphOutputs),
+      ...artifactValues,
+    };
   }
 }

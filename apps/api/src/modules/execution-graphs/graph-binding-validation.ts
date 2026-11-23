@@ -4,6 +4,7 @@ import type { GraphEdge, GraphFlow, GraphNode } from './execution-graph-definiti
 import { environmentFilePath } from './graph-environment';
 import {
   compatibleGraphFields,
+  graphArtifactDeclarations,
   GraphCompileError,
   graphContextFields,
   graphDefaultBinding,
@@ -394,7 +395,7 @@ function assertBinding(
     const workspace = binding.projection === 'WORKSPACE_PATH';
     const producerTypes = workspace
       ? ['CHECKOUT', 'SHELL', 'CHECK']
-      : ['BUILD', 'REGISTER_ARTIFACT'];
+      : ['BUILD', 'REGISTER_ARTIFACT', 'SHELL', 'CHECK'];
     if (!producer || !producerTypes.includes(producer.type))
       fail(flow, node, '投影须使用对应模块的正式输出', field, {
         sourceNodeId: nodeId,
@@ -419,7 +420,8 @@ function assertBinding(
     return;
   }
   if (binding.kind === 'CREDENTIAL' || binding.kind === 'ENVIRONMENT_KEY') {
-    const isConditionKey = binding.kind === 'ENVIRONMENT_KEY' && node.branch && field.id === 'value';
+    const isConditionKey =
+      binding.kind === 'ENVIRONMENT_KEY' && node.branch && field.id === 'value';
     if (!environment && !isConditionKey)
       fail(flow, node, '凭据用于脚本环境注入，集合变量键也可供条件分支比较', field);
     if (
@@ -456,7 +458,8 @@ function assertBinding(
   if (
     field.source === 'CURRENT_RUN' &&
     (!producer ||
-      (!['BUILD', 'REGISTER_ARTIFACT'].includes(producer.type) && source?.source !== 'CURRENT_RUN'))
+      (!['BUILD', 'REGISTER_ARTIFACT', 'SHELL', 'CHECK'].includes(producer.type) &&
+        source?.source !== 'CURRENT_RUN'))
   )
     fail(flow, node, '仅能绑定本次运行由构建或登记模块产生的产物', field);
   if (binding.kind === 'VALUE') {
@@ -534,9 +537,19 @@ function available(
 }
 
 function validateArtifactConfig(flow: GraphFlow, node: GraphNode, ports: GraphField[]) {
-  const declaration =
-    node.type === 'BUILD' ? node.build?.artifacts : node.registerArtifacts?.artifacts;
-  const references = new Set(['artifacts']);
+  const declaration = graphArtifactDeclarations(node);
+  const script = node.type === 'SHELL' || node.type === 'CHECK';
+  const references = new Set(
+    script
+      ? [
+          'artifacts',
+          'workspace',
+          'report',
+          'exitCode',
+          ...graphScriptOutputs(node).map(({ id, referenceName }) => referenceName ?? id),
+        ]
+      : ['artifacts'],
+  );
   for (const artifact of declaration ?? []) {
     const id = artifact.id ?? artifact.name;
     const port = ports.find((candidate) => candidate.id === id);
@@ -551,6 +564,15 @@ function validateArtifactConfig(flow: GraphFlow, node: GraphNode, ports: GraphFi
     references.add(reference);
     if (artifact.type !== 'DOCKER_IMAGE' && artifact.imageReference)
       fail(flow, node, '镜像地址只适用于 Docker 镜像产物', port);
+    if (artifact.pathInput !== undefined) {
+      const input = graphScriptInputs(node).find(({ id }) => id === artifact.pathInput);
+      if (!script || artifact.type === 'DOCKER_IMAGE' || input?.type !== 'PATH' || input.multiple)
+        fail(flow, node, '路径来源必须是本节点声明的单值相对路径输入', port);
+    }
+    if (script && artifact.type === 'DOCKER_IMAGE' && !artifact.imageReference)
+      fail(flow, node, '脚本镜像产物须明确指定执行端已有的镜像引用', port);
+    if (script && artifact.type !== 'DOCKER_IMAGE' && !artifact.path && !artifact.pathInput)
+      fail(flow, node, '请填写相对产物路径或选择脚本的路径输入', port);
     for (const value of [artifact.path, artifact.composeFilePath]) {
       if (
         value !== undefined &&
@@ -767,7 +789,7 @@ export function validateFlowBindings(
       if (new Set(fields.map((field) => field.id)).size !== fields.length)
         fail(flow, node, '功能端口标识不可重复');
     }
-    if (node.type === 'BUILD' || node.type === 'REGISTER_ARTIFACT')
+    if (graphArtifactDeclarations(node)?.length)
       validateArtifactConfig(flow, node, ports?.outputs ?? []);
     const conditional = node.type === 'CONDITION' || node.type === 'SWITCH';
     const destinations =
@@ -1123,8 +1145,10 @@ export function flowCandidateCatalog(
           for (const sourceId of staticOrder.get(node.id) ?? []) {
             const producer = context.nodes.get(sourceId)!;
             const reference = producer.referenceName ?? producer.id;
-            const producerLabel = references.indexOf(reference) === references.lastIndexOf(reference)
-              ? producer.name : `${producer.name}（${producer.id}）`;
+            const producerLabel =
+              references.indexOf(reference) === references.lastIndexOf(reference)
+                ? producer.name
+                : `${producer.name}（${producer.id}）`;
             const present = eligible.filter(({ order }) => order.get(node.id)?.has(sourceId));
             if (eligible.length && !present.length) continue;
             const branches = [
@@ -1133,8 +1157,7 @@ export function flowCandidateCatalog(
             for (const field of outputs.get(sourceId) ?? [])
               candidates.push({
                 label: producerLabel + ' · ' + field.name,
-                referenceName:
-                  reference + '.' + (field.referenceName ?? field.id),
+                referenceName: reference + '.' + (field.referenceName ?? field.id),
                 field,
                 binding: { kind: 'OUTPUT', nodeId: producer.id, fieldId: field.id },
                 availability:

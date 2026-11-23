@@ -151,6 +151,12 @@ class GraphShell {
   @ValidateNested({ each: true })
   @Type(() => GraphField)
   outputs?: GraphField[];
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsArray()
+  @ArrayMaxSize(30)
+  @ValidateNested({ each: true })
+  @Type(() => GraphArtifactDeclaration)
+  artifacts?: GraphArtifactDeclaration[];
 }
 
 export class GraphArtifactDeclaration {
@@ -159,6 +165,7 @@ export class GraphArtifactDeclaration {
   @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) referenceName?: string;
   @IsIn(graphArtifactTypes) type!: GraphArtifactType;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) path?: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) pathInput?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(512) imageReference?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() required?: boolean;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() persist?: boolean;
@@ -383,9 +390,14 @@ export function graphDynamicOutlets(node: GraphNode, edges: readonly GraphEdge[]
   );
 }
 
-export function graphConditionMatch(node: GraphNode, value: unknown, caseInsensitive = false): GraphEdge['when'] {
+export function graphConditionMatch(
+  node: GraphNode,
+  value: unknown,
+  caseInsensitive = false,
+): GraphEdge['when'] {
   const matches = (candidate: string) =>
-    value !== undefined && (caseInsensitive ? candidate.toLowerCase() : candidate) === String(value);
+    value !== undefined &&
+    (caseInsensitive ? candidate.toLowerCase() : candidate) === String(value);
   if (node.branch) {
     const entry = node.branch.cases.find((choice) => matches(choice.value));
     return entry ? `CASE:${entry.id}` : 'DEFAULT';
@@ -488,7 +500,11 @@ export function orderedFlowNodes(flow: GraphFlow): GraphNode[] {
   for (const edge of flow.edges) {
     const edges = outgoing.get(edge.from);
     const count = incoming.get(edge.to);
-    if (!edges || count === undefined || edges.some(({ to, when }) => to === edge.to && when === edge.when))
+    if (
+      !edges ||
+      count === undefined ||
+      edges.some(({ to, when }) => to === edge.to && when === edge.when)
+    )
       throw new BadRequestException('连线须连接同一执行流中的节点，且相同出口不能重复连接同一节点');
     edges.push(edge);
     incoming.set(edge.to, count + 1);
@@ -501,7 +517,10 @@ export function orderedFlowNodes(flow: GraphFlow): GraphNode[] {
       throw new GraphCompileError({
         flowId: flow.id,
         nodeId: node.id,
-        edge: edges.find(({ when }, index) => edges.findIndex((edge) => edge.when === when) < index && when !== undefined),
+        edge: edges.find(
+          ({ when }, index) =>
+            edges.findIndex((edge) => edge.when === when) < index && when !== undefined,
+        ),
         message: `节点「${node.name}」的连线不完整。检查入口与出口，每个条件或发布结果出口须连接一条线`,
       });
   }
@@ -532,8 +551,12 @@ function hasValidOutputs(node: GraphNode, edges: GraphEdge[]) {
     return edges.length === 2 && labels.has('SUCCESS') && labels.has('PARTIAL_SUCCESS');
   if (node.type === 'CONDITION' && node.branch) {
     const cases = node.branch.cases;
-    return Array.isArray(cases) && edges.length === cases.length + 1 && labels.has('DEFAULT') &&
-      cases.every((entry) => entry && labels.has(`CASE:${entry.id}`));
+    return (
+      Array.isArray(cases) &&
+      edges.length === cases.length + 1 &&
+      labels.has('DEFAULT') &&
+      cases.every((entry) => entry && labels.has(`CASE:${entry.id}`))
+    );
   }
   if (node.type === 'CONDITION')
     return edges.length === 2 && labels.has('TRUE') && labels.has('FALSE');
@@ -555,13 +578,30 @@ function hasValidOutputs(node: GraphNode, edges: GraphEdge[]) {
 function validateAdvancedNode(node: GraphNode) {
   if (node.branch !== undefined) {
     const cases = node.branch?.cases;
-    if (node.type !== 'CONDITION' || node.condition || !Array.isArray(cases) || !cases.length ||
-      cases.length > maxSwitchCases || cases.some((entry) => !entry || !safeGraphId(entry.id) ||
-        typeof entry.value !== 'string' || entry.value.length > 500 || redactTaskLog(entry.value) !== entry.value ||
-        (entry.label !== undefined && (typeof entry.label !== 'string' || entry.label.length > 100 || redactTaskLog(entry.label) !== entry.label))))
+    if (
+      node.type !== 'CONDITION' ||
+      node.condition ||
+      !Array.isArray(cases) ||
+      !cases.length ||
+      cases.length > maxSwitchCases ||
+      cases.some(
+        (entry) =>
+          !entry ||
+          !safeGraphId(entry.id) ||
+          typeof entry.value !== 'string' ||
+          entry.value.length > 500 ||
+          redactTaskLog(entry.value) !== entry.value ||
+          (entry.label !== undefined &&
+            (typeof entry.label !== 'string' ||
+              entry.label.length > 100 ||
+              redactTaskLog(entry.label) !== entry.label)),
+      )
+    )
       throw new BadRequestException('条件分支须配置 1 到 10 个有效规则');
-    if (new Set(cases.map(({ id }) => id)).size !== cases.length ||
-      new Set(cases.map(({ value }) => value)).size !== cases.length)
+    if (
+      new Set(cases.map(({ id }) => id)).size !== cases.length ||
+      new Set(cases.map(({ value }) => value)).size !== cases.length
+    )
       throw new BadRequestException('条件分支的规则 ID 和匹配值须各自唯一');
   }
   const config = node.switch;

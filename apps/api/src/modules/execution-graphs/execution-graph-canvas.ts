@@ -48,7 +48,10 @@ function withNodeReferences(canvas: GraphCanvas) {
 
 function validateNodeReferences(canvas: GraphCanvas, flows: GraphFlow[]) {
   for (const node of [...canvas.nodes, ...canvas.templates]) {
-    if (!safeGraphReference(node.referenceName) || reservedReferenceNames.has(node.referenceName!.toLowerCase()))
+    if (
+      !safeGraphReference(node.referenceName) ||
+      reservedReferenceNames.has(node.referenceName!.toLowerCase())
+    )
       throw new GraphCompileError({
         flowId: flows.find((flow) => flow.nodes.some(({ id }) => id === node.id))?.id,
         nodeId: node.id,
@@ -113,7 +116,11 @@ function validateCanvas(canvas: GraphCanvas) {
       throw new BadRequestException('开始节点只允许出线，结束节点只允许入线');
     const outgoing = edges.get(from.id) ?? [];
     if (outgoing.some((existing) => existing.to === to.id && existing.when === edge.when))
-      throw new GraphCompileError({ nodeId: from.id, edge, message: '相同出口不能重复连接同一节点' });
+      throw new GraphCompileError({
+        nodeId: from.id,
+        edge,
+        message: '相同出口不能重复连接同一节点',
+      });
     outgoing.push(edge);
     edges.set(from.id, outgoing);
   }
@@ -166,8 +173,7 @@ function flowScope(endpoint: GraphEndpoint, edges: ReadonlyMap<string, GraphEdge
       reverse.set(to, predecessors);
     }
   const toEnd = new Set([endpoint.endId]);
-  for (const id of toEnd)
-    for (const source of reverse.get(id) ?? []) toEnd.add(source);
+  for (const id of toEnd) for (const source of reverse.get(id) ?? []) toEnd.add(source);
 
   const route = new Set([endpoint.startId]);
   const included = new Set<GraphEdge>();
@@ -237,10 +243,15 @@ function deriveFlow(
     const outgoing = allowed(id);
     const dynamic = graphDynamicOutlets(node, edges.get(id));
     const outside = outgoing.find(
-      (edge) => !toEnd.has(edge.to) && (dynamic || Object.hasOwn(selections, id) || !owners.has(edge)),
+      (edge) =>
+        !toEnd.has(edge.to) && (dynamic || Object.hasOwn(selections, id) || !owners.has(edge)),
     );
     if (outside)
-      issue(node, `通往「${byId.get(outside.to)!.name}」的出线无法到达已配对的结束节点。路径必须全部到达对应结束，请检查连线或配置执行流范围`, outside);
+      issue(
+        node,
+        `通往「${byId.get(outside.to)!.name}」的出线无法到达已配对的结束节点。路径必须全部到达对应结束，请检查连线或配置执行流范围`,
+        outside,
+      );
     const included = outgoing.filter((edge) => toEnd.has(edge.to));
     if (node.type === 'END' || !included.length)
       issue(node, '路径必须全部到达已配对的结束节点，请检查连线');
@@ -268,7 +279,9 @@ export function compileCanvas(input: GraphCanvas, publish: boolean): GraphDefini
   const flows: GraphFlow[] = [];
   for (const [index, endpoint] of canvas.endpoints.entries()) {
     try {
-      flows.push(deriveFlow(byId.get(endpoint.startId)!, endpoint, byId, edges, scopes[index]!, owners));
+      flows.push(
+        deriveFlow(byId.get(endpoint.startId)!, endpoint, byId, edges, scopes[index]!, owners),
+      );
     } catch (error) {
       if (publish || !(error instanceof BadRequestException)) throw error;
     }
