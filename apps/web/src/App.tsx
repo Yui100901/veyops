@@ -558,7 +558,7 @@ export function App() {
       {menu && (
         <button className="sidebar-backdrop" aria-label="关闭菜单" onClick={() => setMenu(false)} />
       )}
-      <aside className={`sidebar ${menu ? 'open' : ''}`}>
+      <aside id="workspace-sidebar" className={`sidebar ${menu ? 'open' : ''}`}>
         <a href="#/" className="brand-link" aria-label="veyops 首页">
           <Brand inverse />
         </a>
@@ -625,6 +625,8 @@ export function App() {
             <button
               className="mobile-menu icon-button bare"
               aria-label={menu ? '关闭菜单' : '打开菜单'}
+              aria-controls="workspace-sidebar"
+              aria-expanded={menu}
               onClick={() => setMenu(!menu)}
             >
               {menu ? <X size={20} /> : <Menu size={20} />}

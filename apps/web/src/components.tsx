@@ -59,7 +59,7 @@ export function PageHeader({
       <div>
         {eyebrow && <div className="eyebrow">{eyebrow}</div>}
         <h1>{title}</h1>
-        <p>{description}</p>
+        {description && <p>{description}</p>}
       </div>
       {action && <div className="heading-actions">{action}</div>}
     </div>
