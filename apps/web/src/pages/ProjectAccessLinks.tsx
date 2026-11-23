@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { ArrowUpRight, Copy } from 'lucide-react';
+import { useId, useState } from 'react';
+import { ArrowUpRight, ChevronDown, Copy } from 'lucide-react';
 import './project-cards.css';
 
 export interface ProjectAccessLink {
@@ -49,42 +49,61 @@ async function copyUrl(url: string) {
   }
 }
 
-function AccessLinkList({
-  links,
-  onCopy,
-}: {
-  links: AccessLink[];
-  onCopy: (link: AccessLink) => void;
-}) {
+function AccessLinkList({ links }: { links: AccessLink[] }) {
+  const listId = useId();
+  const [expanded, setExpanded] = useState(false);
+  const [feedback, setFeedback] = useState('');
+
+  async function copyAddress(link: AccessLink) {
+    const copied = await copyUrl(link.url);
+    if (!copied) setExpanded(true);
+    setFeedback(copied ? `已复制「${link.name}」的地址` : '复制失败，可选中完整地址手动复制。');
+  }
+
   return (
-    <ul className="project-access-links">
-      {links.map((link) => (
-        <li className="project-access-actions" key={link.id}>
-          <a
-            className="project-access-link"
-            href={link.href}
-            target="_blank"
-            rel="noopener noreferrer"
-            aria-label={`打开「${link.name}」（新标签页）`}
-          >
-            <span>
+    <>
+      <ul id={listId} className="project-access-links">
+        {links.map((link) => (
+          <li className="project-access-actions" key={link.id}>
+            <a
+              className="project-access-link"
+              href={link.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label={`打开「${link.name}」（新标签页）`}
+            >
               <strong>{link.name}</strong>
-              <code className="project-access-url">{link.url}</code>
-            </span>
-            <ArrowUpRight size={16} aria-hidden="true" />
-          </a>
-          <button
-            type="button"
-            className="project-access-copy"
-            aria-label={`复制「${link.name}」的地址`}
-            onClick={() => void onCopy(link)}
-          >
-            <Copy size={15} aria-hidden="true" />
-            复制
-          </button>
-        </li>
-      ))}
-    </ul>
+              <ArrowUpRight size={16} aria-hidden="true" />
+            </a>
+            <button
+              type="button"
+              className="project-access-copy"
+              aria-label={`复制「${link.name}」的地址`}
+              onClick={() => void copyAddress(link)}
+            >
+              <Copy size={15} aria-hidden="true" />
+              复制
+            </button>
+            {expanded && <code className="project-access-url">{link.url}</code>}
+          </li>
+        ))}
+      </ul>
+      <button
+        type="button"
+        className="project-access-toggle"
+        aria-expanded={expanded}
+        aria-controls={listId}
+        onClick={() => setExpanded((shown) => !shown)}
+      >
+        <ChevronDown size={14} aria-hidden="true" />
+        {expanded ? '收起完整地址' : '显示完整地址'}
+      </button>
+      {feedback && (
+        <p className="project-access-feedback" role="status">
+          {feedback}
+        </p>
+      )}
+    </>
   );
 }
 
@@ -97,16 +116,11 @@ export function ProjectAccessLinks({
   serviceHref?: (serviceId: string) => string;
   showEmpty?: boolean;
 }) {
-  const [feedback, setFeedback] = useState('');
   const links = addresses.flatMap((address) => {
     const href = projectAccessUrl(address.url);
     return href ? [{ ...address, href }] : [];
   });
   if (!links.length) return showEmpty ? <p className="project-access-empty">暂无访问地址</p> : null;
-  async function copyAddress(link: ProjectAccessLink) {
-    const copied = await copyUrl(link.url);
-    setFeedback(copied ? `已复制「${link.name}」的地址` : '复制失败，可选中地址手动复制。');
-  }
   const services = new Map<string | null, AccessLink[]>();
   if (serviceHref) {
     for (const link of links) {
@@ -132,17 +146,12 @@ export function ProjectAccessLinks({
                   '其他地址'
                 )}
               </h5>
-              <AccessLinkList links={group} onCopy={copyAddress} />
+              <AccessLinkList links={group} />
             </li>
           ))}
         </ul>
       ) : (
-        <AccessLinkList links={links} onCopy={copyAddress} />
-      )}
-      {feedback && (
-        <p className="project-access-feedback" role="status">
-          {feedback}
-        </p>
+        <AccessLinkList links={links} />
       )}
     </div>
   );
