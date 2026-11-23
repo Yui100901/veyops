@@ -56,6 +56,10 @@
   font-size: 0.95rem;
 }
 
+.graph-palette-toggle {
+  display: none;
+}
+
 .graph-palette-templates {
   min-width: 0;
 }
@@ -396,6 +400,35 @@
 
   .graph-palette > .graph-palette-group > :is(h4, .graph-palette-templates:not([open])) {
     grid-column: auto;
+  }
+}
+
+@container graph-editor (width < 74rem) {
+  .graph-palette {
+    padding: 0.35rem 0.6rem;
+  }
+
+  .graph-palette > h3,
+  .graph-palette[data-expanded='false'] > .graph-palette-group {
+    display: none;
+  }
+
+  .graph-palette-toggle {
+    display: flex;
+    grid-column: 1 / -1;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    min-height: 2.15rem;
+    padding: 0.25rem 0.3rem;
+    border: 0;
+    background: transparent;
+    color: var(--accent-dark);
+    font-weight: 650;
+  }
+
+  .graph-palette-toggle[aria-expanded='true'] svg {
+    transform: rotate(180deg);
   }
 }
 

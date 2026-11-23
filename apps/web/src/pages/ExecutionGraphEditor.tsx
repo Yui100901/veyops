@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { DragEvent, ReactNode } from 'react';
-import { Copy, Plus, Trash2, ArrowRight, ArrowLeft } from 'lucide-react';
+import { Copy, Plus, Trash2, ArrowRight, ArrowLeft, ChevronDown } from 'lucide-react';
 import { post, useResource } from '../api';
 import { ErrorBanner, Field } from '../components';
 import type { ProjectDetail, Server } from '../models';
@@ -203,6 +203,7 @@ export function ProjectGraphEditor({
   const [connector, setConnector] = useState<Connector>();
   const [startId, setStartId] = useState<string | undefined>(initialFlowId);
   const [templateType, setTemplateType] = useState<NodeType>('FUNCTION');
+  const [paletteExpanded, setPaletteExpanded] = useState(false);
   const [tab, setTab] = useState<FunctionalTab>('input');
   const [error, setError] = useState('');
   const [parameterRepair, setParameterRepair] = useState<ParameterRepair>();
@@ -1010,8 +1011,17 @@ export function ProjectGraphEditor({
       }}
     >
       {canEdit && (
-        <aside className="graph-palette" aria-label="节点库">
+        <aside className="graph-palette" aria-label="节点库" data-expanded={paletteExpanded}>
           <h3>节点库</h3>
+          <button
+            type="button"
+            className="graph-palette-toggle"
+            aria-expanded={paletteExpanded}
+            onClick={() => setPaletteExpanded((expanded) => !expanded)}
+          >
+            节点库
+            <ChevronDown size={16} aria-hidden="true" />
+          </button>
           <div className="graph-palette-group">
             <h4>开始与结束</h4>
             {paletteButton('START')}
