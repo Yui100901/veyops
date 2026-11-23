@@ -358,6 +358,23 @@ async function checkGraph(url?: string) {
         .expect(201)
     ).body.data;
     assert.equal(failedJoin.status, 'FAILED');
+    const cancelJoin = (
+      await api
+        .post(plainFlow + '/run')
+        .send({ ...identity, idempotencyKey: randomUUID() })
+        .expect(201)
+    ).body.data;
+    const cancelledJoin = (
+      await api
+        .post(plainPath + '/runs/' + cancelJoin.id + '/cancel')
+        .send({})
+        .expect(201)
+    ).body.data;
+    assert.equal(cancelledJoin.status, 'CANCELLED');
+    assert.equal(state(cancelledJoin, 'rules'), 'SUCCESS');
+    assert.equal(state(cancelledJoin, 'parallel-approval'), 'CANCELLED');
+    assert.equal(state(cancelledJoin, 'combined'), 'SKIPPED');
+    assert.equal(state(cancelledJoin, 'end-plain'), 'SKIPPED');
     assert.equal(state(dagRun, 'yes'), 'SUCCESS');
     assert.equal(state(dagRun, 'no'), 'SKIPPED');
     assert.equal(state(dagRun, 'parallel-log'), 'SUCCESS');
