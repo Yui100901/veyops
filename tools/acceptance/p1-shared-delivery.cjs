@@ -63,6 +63,12 @@ async function verifySharedDelivery({
     assert.ok(
       instances.every(({ graphNodeRunId }) => graphNodeRunId === instances[0].graphNodeRunId),
     );
+    const produced = run.detail.nodes.find(({ nodeId }) => nodeId === 'build-image').output
+      .artifacts;
+    assert.deepEqual(
+      produced.map(({ artifactId }) => artifactId).sort(),
+      [directory.artifactId, image.artifactId].sort(),
+    );
     await verifyArtifact(api, directory);
     await verifyArtifact(api, image);
     return { directory, image };

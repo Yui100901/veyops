@@ -191,12 +191,14 @@ function serveDemoGit(gitRoot) {
     if (typeof req.url !== 'string' || !req.url.startsWith('/') || req.url.startsWith('//'))
       return res.writeHead(404).end();
     const url = new URL(req.url, 'http://localhost');
+    const allowed = /^\/(?:storefront|dependency)\.git\/(info\/refs|git-upload-pack)$/.exec(
+      url.pathname,
+    );
     const discovery =
       req.method === 'GET' &&
-      url.pathname === '/storefront.git/info/refs' &&
+      allowed?.[1] === 'info/refs' &&
       url.search === '?service=git-upload-pack';
-    const fetch =
-      req.method === 'POST' && url.pathname === '/storefront.git/git-upload-pack' && !url.search;
+    const fetch = req.method === 'POST' && allowed?.[1] === 'git-upload-pack' && !url.search;
     if (!discovery && !fetch) return res.writeHead(404).end();
     const backend = spawn('git', ['http-backend'], {
       env: {
@@ -423,7 +425,6 @@ function compileDemoGraph(demo, references, options) {
       param({
         ...descriptor,
         required: true,
-        ...(descriptor.type === 'ARTIFACT' && { multiple: true }),
         type: descriptor.type === 'SERVICE_RESULT' ? 'RELEASE' : descriptor.type,
       }),
     );

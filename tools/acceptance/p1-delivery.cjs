@@ -6,6 +6,7 @@ const { mkdir, readFile, readlink, writeFile } = require('node:fs/promises');
 const { setTimeout: sleep } = require('node:timers/promises');
 const { verifyArtifactRecovery, verifyWorkerRecovery } = require('./p1-recovery.cjs');
 const { verifySharedDelivery } = require('./p1-shared-delivery.cjs');
+const { prepareP2Repository, verifyP2Contract } = require('./p2-contract.cjs');
 const {
   initializeDemo,
   loadDemo,
@@ -286,13 +287,21 @@ function createGraphRunner(api, fixture, evidence) {
 }
 
 function artifactFor(run, output, expected) {
-  const refs = run.detail.outputs[output];
-  assert.ok(Array.isArray(refs) && refs.length > 0, `没有收到 ${output} 产物`);
-  assert.equal(new Set(refs.map(({ artifactId }) => artifactId)).size, 1);
-  const [{ artifactId }] = refs;
+  const logical = run.detail.outputs[output];
+  assert.ok(
+    logical && !Array.isArray(logical) && logical.instances.length,
+    `没有收到 ${output} 逻辑产物`,
+  );
+  const { artifactId } = logical;
   assert.match(artifactId, /^[0-9a-f-]{36}$/i);
-  const instances = refs.map((ref) => run.artifacts.find(({ id }) => id === ref.instanceId));
+  assert.equal(logical.scope, 'PERSISTENT');
+  assert.equal(logical.type, expected.kind);
+  assert.equal(logical.commitSha, expected.sha);
+  const instances = logical.instances.map((ref) =>
+    run.artifacts.find(({ id }) => id === ref.instanceId),
+  );
   assert.ok(instances.every(Boolean), '跨运行选择的产物未登记');
+  assert.ok(instances.every((instance) => instance.artifactId === artifactId));
   if (expected.servers)
     equalIds(
       instances.map(({ serverId }) => serverId),
@@ -387,7 +396,12 @@ async function verifyComposeRelease(fixture, release, artifact, expected) {
   }
 }
 
-async function verifyBackup(api, expectedArtifact, expectedRelease, { workerRecovery, artifactRecovery }) {
+async function verifyBackup(
+  api,
+  expectedArtifact,
+  expectedRelease,
+  { workerRecovery, artifactRecovery },
+) {
   const backup = await api.post('/backups', {});
   const path = '/backups/' + backup.id;
   assert.equal((await api.post(path + '/verify', {})).id, backup.id);
@@ -467,6 +481,7 @@ async function run() {
   const demo = loadDemo('/accept/examples/refactor-stage0/project.yaml');
   const gitRoot = acceptanceRoot + '/repo';
   const source = await prepareDemoRepository(demo, gitRoot);
+  if (mode !== 'preview') prepareP2Repository(gitRoot, source);
   const git = serveDemoGit(gitRoot);
   git.listen(8088, '0.0.0.0');
   await once(git, 'listening');
@@ -582,9 +597,14 @@ async function run() {
       if (scope === 'test') recoveryArtifact = file;
       const build = nodeById(target, 'build-files');
       assert.equal(build.environment.find(({ fieldId }) => fieldId === 'GIT_SHA')?.value, sha);
-      const temporaryIds = build.output.runReport.map(
-        ({ temporaryArtifactId }) => temporaryArtifactId,
+      const report = build.output.runReport;
+      assert.equal(report.scope, 'TEMPORARY');
+      assert.equal(report.rootRunId, target.detail.id);
+      assert.equal(
+        build.output.artifacts.filter(({ artifactId }) => artifactId === report.artifactId).length,
+        1,
       );
+      const temporaryIds = report.instances.map(({ instanceId }) => instanceId);
       assert.ok(temporaryIds.every(Boolean));
       assert.equal(temporaryIds.length, allTargets[scope].length);
       assert.ok(
@@ -700,7 +720,9 @@ async function run() {
     const protectedArtifacts = [files.production, imageArtifact].map(({ artifactId }) => ({
       artifactId,
     }));
-    const cleanup = await api.post('/artifact-retention/preview', { artifacts: protectedArtifacts });
+    const cleanup = await api.post('/artifact-retention/preview', {
+      artifacts: protectedArtifacts,
+    });
     assert.equal(cleanup.instances.length, allTargets.production.length * 2);
     assert.equal(cleanup.eligibleCount, 0);
     assert.ok(cleanup.instances.every((instance) => !instance.eligible && instance.reason));
@@ -805,6 +827,64 @@ async function run() {
       verifyDirectoryRelease: (run, artifact) =>
         verifyFileRelease(fixture, run, artifact, targetGroup.production, html, 'deploy-files'),
     });
+    const scaledRuns = [];
+    let scaledRelease;
+    for (const names of [['test-a'], ['test-a', 'test-b', 'production-a']]) {
+      const serverIds = names.map((name) => fixture.serverIds[name]);
+      const targets = { serverIds };
+      const built = await execute(
+        'target-files',
+        {
+          environmentSet: fixture.environmentSetIds['test-config'],
+          buildTargets: targets,
+        },
+        { plan: { collection: 'test-config', sha, buildTargets: serverIds } },
+      );
+      const directory = artifactFor(built, 'directory', {
+        kind: 'DIRECTORY',
+        sha,
+        repositoryId: repo,
+        servers: serverIds,
+      });
+      const builtDirectory = nodeById(built, 'build-files').output.webDirectory;
+      assert.equal(builtDirectory.artifactId, directory.artifactId);
+      assert.equal(builtDirectory.instances.length, names.length);
+      await verifyArtifact(api, directory);
+      const released = await execute(
+        'deploy-existing',
+        { artifact: { artifactId: directory.artifactId }, releaseTargets: targets },
+        { plan: { releaseTargets: serverIds } },
+      );
+      await verifyFileRelease(fixture, released, directory, names, html, 'deploy-files');
+      const result = {
+        buildRunId: built.detail.id,
+        releaseRunId: released.detail.id,
+        artifactId: directory.artifactId,
+        instanceIds: directory.instances.map(({ id }) => id),
+      };
+      if (names.length === 1) {
+        const missingTarget = fixture.serverIds['test-b'];
+        const response = await api.request('POST', graph + '/flows/deploy-existing/preview', {
+          version: fixture.version,
+          inputs: {
+            parameters: {
+              artifact: { artifactId: directory.artifactId },
+              releaseTargets: { serverIds: [missingTarget] },
+            },
+          },
+        });
+        assert.equal(response.status, 400);
+        const issue = (await response.json()).error?.planIssue;
+        assert.equal(issue?.code, 'ARTIFACT');
+        assert.equal(issue?.nodeId, 'deploy-files');
+        assert.equal(issue?.fieldId, 'artifact');
+        assert.equal(issue?.serverId, missingTarget);
+        result.missingTarget = { serverId: missingTarget, issue };
+      }
+      scaledRuns.push(result);
+      scaledRelease = { released, directory, names };
+    }
+    evidence.scaledArtifact = scaledRuns;
     const { draft: definition, revision: expectedRevision } = await api.get(graph);
     const failBuild = definition.canvas.nodes.find(({ id }) => id === 'build-files');
     assert.ok(failBuild?.build);
@@ -823,7 +903,14 @@ async function run() {
     );
     assert.equal(nodeById(stopped, 'deploy-files').status, 'SKIPPED');
     assert.equal(stopped.releases.length, 0);
-    await verifyFileRelease(fixture, manual, files.test, targetGroup.test, html, 'rollback-files');
+    await verifyFileRelease(
+      fixture,
+      scaledRelease.released,
+      scaledRelease.directory,
+      scaledRelease.names,
+      html,
+      'deploy-files',
+    );
 
     evidence.artifactRecovery = await verifyArtifactRecovery(
       api,
@@ -833,12 +920,33 @@ async function run() {
       files.test,
     );
     console.log('VEYOPS_ACCEPTANCE_ARTIFACT_RECOVERY ' + JSON.stringify(evidence.artifactRecovery));
-    const { TaskWorkerService } = require('/app/apps/api/dist/modules/tasks/task-worker.service.js');
+    evidence.presetContract = await verifyP2Contract({
+      api,
+      fixture,
+      execute,
+      source,
+      managerArtifact,
+      files,
+      html,
+    });
+    console.log('VEYOPS_ACCEPTANCE_PRESET_CONTRACT ' + JSON.stringify(evidence.presetContract));
+    const {
+      TaskWorkerService,
+    } = require('/app/apps/api/dist/modules/tasks/task-worker.service.js');
     evidence.workerRecovery = await verifyWorkerRecovery(api, fixture, app.get(TaskWorkerService));
     const recoveryDeployments = await api.get(projectQuery('/deployments', fixture.projectId));
-    assert.ok(!recoveryDeployments.some(({ graphRunId }) => graphRunId === evidence.workerRecovery.runId));
+    assert.ok(
+      !recoveryDeployments.some(({ graphRunId }) => graphRunId === evidence.workerRecovery.runId),
+    );
     console.log('VEYOPS_ACCEPTANCE_WORKER_RECOVERY ' + JSON.stringify(evidence.workerRecovery));
-    await verifyFileRelease(fixture, manual, files.test, targetGroup.test, html, 'rollback-files');
+    await verifyFileRelease(
+      fixture,
+      scaledRelease.released,
+      scaledRelease.directory,
+      scaledRelease.names,
+      html,
+      'deploy-files',
+    );
 
     evidence.backup = await verifyBackup(
       api,
