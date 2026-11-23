@@ -16,7 +16,7 @@ import {
   Status,
 } from '../components';
 import type { DeploymentSummary, Project, Server, ServerGroup, Service, User } from '../models';
-import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
+import { ProjectAccessLinks, projectAccessUrl, type ProjectAccessLink } from './ProjectAccessLinks';
 import { graphWorkbenchPath } from './graph-workbench-context';
 import { projectResourcePath } from './project-workspace-route';
 import { serverResourceHref } from './server-resource-route';
@@ -75,6 +75,12 @@ function ProjectViewCard({
   const serviceHref = (serviceId: string) =>
     '#' +
     projectResourcePath(project.id, { resource: 'services', serviceId, view: viewId, viewSearch });
+  const linkedServices = new Set(
+    project.addresses.filter(({ url }) => projectAccessUrl(url)).map(({ serviceId }) => serviceId),
+  );
+  const servicesWithoutAddresses = (project.services ?? []).filter(
+    ({ id }) => !linkedServices.has(id),
+  );
   return (
     <article className="project-view-card">
       <header className="project-view-card-header">
@@ -101,16 +107,16 @@ function ProjectViewCard({
         </span>
       </header>
       {project.description && <p className="project-view-description">{project.description}</p>}
-      {project.services?.length > 0 && (
+      {servicesWithoutAddresses.length > 0 && (
         <div className="tags project-view-environments" aria-label="项目服务">
-          {project.services.map((service) => (
+          {servicesWithoutAddresses.map((service) => (
             <a key={service.id} className="tag text-link" href={serviceHref(service.id)}>
               {service.name}
             </a>
           ))}
         </div>
       )}
-      <ProjectAccessLinks addresses={project.addresses} />
+      <ProjectAccessLinks addresses={project.addresses} serviceHref={serviceHref} />
       <div className="project-view-card-section">
         <h4>最近部署</h4>
         {!project.recentDeployments.length ? (

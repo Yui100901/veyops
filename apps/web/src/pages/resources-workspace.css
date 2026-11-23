@@ -168,9 +168,13 @@
 .project-service-detail-addresses {
   padding: 12px var(--surface-inset);
 }
-.resource-list > .project-service-card {
+.project-resources .resource-list > .project-service-card {
   flex-wrap: wrap;
   align-items: center;
+  margin-block: 0.65rem;
+  padding: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
 }
 
 .project-resources .resource-list > div {
@@ -183,9 +187,8 @@
 
 .resource-list > .project-service-card > .project-service-card-addresses {
   display: grid;
-  flex-basis: calc(100% - 47px);
+  flex-basis: 100%;
   gap: 8px;
-  margin-inline-start: 47px;
 }
 
 .project-service-card-addresses .button {
@@ -285,10 +288,6 @@
   }
   .service-address-order {
     margin-top: 0;
-  }
-  .resource-list > .project-service-card > .project-service-card-addresses {
-    flex-basis: 100%;
-    margin-inline-start: 0;
   }
 }
 
