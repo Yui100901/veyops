@@ -275,6 +275,8 @@ const modules = {
   'git.checkout': 'CHECKOUT',
   'delivery.build': 'BUILD',
   'environment.load': 'LOAD_ENV',
+  'shell.run': 'SHELL',
+  'artifact.register': 'REGISTER_ARTIFACT',
   'delivery.source-review': 'SOURCE_REVIEW',
   'deploy.artifact': 'DEPLOY_ARTIFACT',
   'deploy.rollback': 'ROLLBACK_ARTIFACT',
@@ -330,33 +332,48 @@ function compileDemoGraph(demo, references, options) {
         return node;
       case 'LOAD_ENV':
         return { ...node, loadEnvironment: config };
+      case 'SHELL':
+        return { ...node, shell: { ...config, params: (config.params ?? []).map(param) } };
+      case 'REGISTER_ARTIFACT':
+        return {
+          ...node,
+          registerArtifacts: {
+            artifacts: outputs.map(({ id: name, ...declaration }) => ({ ...declaration, name })),
+          },
+        };
       case 'BUILD': {
-        assert.ok(['copy-static-site', 'docker-image'].includes(config.preset), '未知演示构建动作');
-        const image = config.preset === 'docker-image';
+        assert.ok(
+          ['copy-static-site', 'docker-image', 'copy-static-and-image'].includes(config.preset),
+          '未知演示构建动作',
+        );
+        const image = config.preset !== 'copy-static-site';
+        const files = config.preset !== 'docker-image';
         const report = outputs.some(({ id: name }) => name === 'runReport');
         return {
           ...node,
           build: {
             buildLocation: config.location,
-            artifactType: image ? 'DOCKER_IMAGE' : 'FILE',
+            artifactType: files ? 'FILE' : 'DOCKER_IMAGE',
             ...(config.location === 'MANAGER' && { buildImage: options.buildImage }),
-            ...(image
-              ? { dockerfilePath: config.dockerfilePath, imageRepository: 'veyops-demo-storefront' }
-              : {
-                  outputPath: 'dist',
-                  buildCommand: [
-                    'mkdir -p dist && cp index.html dist/index.html || exit 2',
-                    ...(report
-                      ? [
-                          'test -n "$GIT_SHA" && test "$GIT_SHA" = "$VEYOPS_GIT_COMMIT_SHA" || exit 2',
-                          'test "$FILE_PROFILE" = "$ENV" || exit 2',
-                          'case "$ENV:$LOG_LEVEL" in test:debug|production:warn) ;; *) exit 2 ;; esac',
-                          'mkdir -p reports',
-                          `printf '{"commitSha":"%s","fileProfile":"%s"}\\n' "$GIT_SHA" "$FILE_PROFILE" > reports/summary.json`,
-                        ]
-                      : []),
-                  ].join('\n'),
-                }),
+            ...(image && {
+              dockerfilePath: config.dockerfilePath,
+              imageRepository: 'veyops-demo-storefront',
+            }),
+            ...(files && {
+              outputPath: 'dist',
+              buildCommand: [
+                'mkdir -p dist && cp index.html dist/index.html || exit 2',
+                ...(report
+                  ? [
+                      'test -n "$GIT_SHA" && test "$GIT_SHA" = "$VEYOPS_GIT_COMMIT_SHA" || exit 2',
+                      'test "$FILE_PROFILE" = "$ENV" || exit 2',
+                      'case "$ENV:$LOG_LEVEL" in test:debug|production:warn) ;; *) exit 2 ;; esac',
+                      'mkdir -p reports',
+                      `printf '{"commitSha":"%s","fileProfile":"%s"}\\n' "$GIT_SHA" "$FILE_PROFILE" > reports/summary.json`,
+                    ]
+                  : []),
+              ].join('\n'),
+            }),
             artifacts: outputs.map(({ id: name, ...declaration }) => ({ ...declaration, name })),
           },
         };

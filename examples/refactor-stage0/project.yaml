@@ -126,9 +126,26 @@ graph:
     - id: build-image
       module: delivery.build
       moduleVersion: 1
-      configuration: { location: TARGET, preset: docker-image, dockerfilePath: Dockerfile }
+      configuration: { location: TARGET, preset: copy-static-and-image, dockerfilePath: Dockerfile }
       outputs:
         - { id: image, type: DOCKER_IMAGE, required: true, persist: true }
+        - { id: webDirectory, type: DIRECTORY, path: dist, required: true, persist: true }
+    - id: prepare-shell
+      module: shell.run
+      moduleVersion: 1
+      configuration:
+        location: MANAGER
+        params:
+          - { id: ARTIFACT_DIR, type: PATH, required: true }
+        command: |
+          set -eu
+          mkdir -p -- "$ARTIFACT_DIR"
+          cp -- index.html "$ARTIFACT_DIR/index.html"
+    - id: register-shell
+      module: artifact.register
+      moduleVersion: 1
+      outputs:
+        - { id: shellDirectory, type: DIRECTORY, required: true, persist: true }
     - id: deploy-files
       module: deploy.artifact
       moduleVersion: 1
@@ -137,6 +154,10 @@ graph:
       module: delivery.source-review
       moduleVersion: 1
       configuration: { buildNodeId: build-manager }
+    - id: review-image-source
+      module: delivery.source-review
+      moduleVersion: 1
+      configuration: { buildNodeId: build-image }
     - id: approve-storefront
       type: APPROVAL
       configuration: { releaseNodeId: deploy-files }
@@ -252,14 +273,14 @@ graph:
           - { id: directory, type: ARTIFACT, source: { kind: OUTPUT, nodeId: build-files, fieldId: webDirectory } }
 
     - id: target-image
-      name: 目标端构建镜像
+      name: 目标端构建目录和镜像
       start:
         id: target-image
         environmentSet: &fixed_production { mode: FIXED, environmentSetId: production-config }
         parameters:
           - *service
           - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
-          - { id: buildTargets, type: TARGETS, required: true, defaultValue: { groupIds: [web-production-group] } }
+          - &production_build_targets { id: buildTargets, type: TARGETS, required: true, defaultValue: { groupIds: [web-production-group] } }
       path: [checkout, load-files, build-image]
       bindings:
         checkout: *checkout_inputs
@@ -267,8 +288,9 @@ graph:
         build-image: *target_build_inputs
       end:
         id: end-target-image
-        outputs:
-          - { id: image, type: ARTIFACT, source: { kind: OUTPUT, nodeId: build-image, fieldId: image } }
+        outputs: &target_bundle_outputs
+          - &bundle_image { id: image, type: ARTIFACT, artifactType: DOCKER_IMAGE, source: { kind: OUTPUT, nodeId: build-image, fieldId: image } }
+          - &bundle_directory { id: directory, type: ARTIFACT, artifactType: DIRECTORY, source: { kind: OUTPUT, nodeId: build-image, fieldId: webDirectory } }
 
     - id: build-and-deploy
       name: 构建并部署本次目录
@@ -322,7 +344,7 @@ graph:
         environmentSet: *fixed_production
         parameters:
           - *service
-          - { id: releaseTargets, type: TARGETS, required: true, defaultValue: { groupIds: [web-production-group] } }
+          - &production_release_targets { id: releaseTargets, type: TARGETS, required: true, defaultValue: { groupIds: [web-production-group] } }
           - { id: artifact, type: ARTIFACT, artifactType: DOCKER_IMAGE, required: true }
       path: [deploy-image]
       bindings:
@@ -330,7 +352,7 @@ graph:
       end:
         id: end-deploy-compose
         outputs:
-          - { id: release, type: SERVICE_RESULT, source: { kind: OUTPUT, nodeId: deploy-image, fieldId: release } }
+          - &image_release { id: release, type: SERVICE_RESULT, source: { kind: OUTPUT, nodeId: deploy-image, fieldId: release } }
 
     - id: rollback-existing
       name: 按历史目录回滚
@@ -382,6 +404,86 @@ graph:
               sources:
                 - { kind: OUTPUT, nodeId: rollback-files, fieldId: release }
                 - { kind: OUTPUT, nodeId: probe-files, fieldId: release }
+
+    - id: build-and-deploy-compose
+      name: 构建目录和镜像并发布 Compose
+      start:
+        id: build-and-deploy-compose
+        environmentSet: *fixed_production
+        parameters:
+          - *service
+          - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
+          - *production_build_targets
+          - *production_release_targets
+      path: [checkout, load-files, build-image, deploy-image]
+      bindings:
+        checkout: *checkout_inputs
+        load-files: *load_inputs
+        build-image: *target_build_inputs
+        deploy-image:
+          service: { kind: INPUT, fieldId: service }
+          targets: { kind: INPUT, fieldId: releaseTargets }
+          artifact: { kind: OUTPUT, nodeId: build-image, fieldId: image }
+      end: { id: end-build-and-deploy-compose, outputs: [*image_release, *bundle_image, *bundle_directory] }
+
+    - id: reviewed-target-bundle
+      name: 审核源码并构建目录和镜像
+      start:
+        id: reviewed-target-bundle
+        environmentSet: *fixed_production
+        parameters:
+          - *service
+          - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
+          - *production_build_targets
+      path: [checkout, load-files, review-image-source, build-image]
+      bindings:
+        checkout: *checkout_inputs
+        load-files: *load_inputs
+        build-image:
+          service: { kind: INPUT, fieldId: service }
+          source: { kind: OUTPUT, nodeId: checkout, fieldId: source }
+          workspace: { kind: OUTPUT, nodeId: checkout, fieldId: workspace }
+          variables: { kind: OUTPUT, nodeId: load-files, fieldId: variables }
+          targets: { kind: INPUT, fieldId: buildTargets }
+          review: { kind: OUTPUT, nodeId: review-image-source, fieldId: review }
+      end: { id: end-reviewed-target-bundle, outputs: *target_bundle_outputs }
+
+    - id: shell-register
+      name: Shell 生成并登记目录
+      start:
+        id: shell-register
+        environmentSet: *fixed_test
+        parameters:
+          - *service
+          - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
+          - { id: artifactDir, type: PATH, referenceName: ARTIFACT_DIR, required: true, defaultValue: dist-shell }
+      path: [checkout, prepare-shell, register-shell]
+      bindings:
+        checkout: *checkout_inputs
+        prepare-shell:
+          workspace: { kind: OUTPUT, nodeId: checkout, fieldId: workspace }
+          ARTIFACT_DIR: { kind: INPUT, fieldId: artifactDir }
+        register-shell:
+          workspace: { kind: OUTPUT, nodeId: prepare-shell, fieldId: workspace }
+          path: { kind: INPUT, fieldId: artifactDir }
+      end:
+        id: end-shell-register
+        outputs:
+          - { id: directory, type: ARTIFACT, artifactType: DIRECTORY, source: { kind: OUTPUT, nodeId: register-shell, fieldId: shellDirectory } }
+
+    - id: deploy-latest-directory
+      name: 发布最新兼容目录
+      start:
+        id: deploy-latest-directory
+        environmentSet: { mode: NONE }
+        parameters:
+          - *service
+          - *production_release_targets
+          - { id: artifact, type: ARTIFACT, artifactType: DIRECTORY, required: true, selection: LATEST_COMPATIBLE }
+      path: [deploy-files]
+      bindings:
+        deploy-files: *historic_release_inputs
+      end: { id: end-deploy-latest-directory, outputs: *file_release_outputs }
 
 reuseExamples:
   - producer: { flowId: target-files, nodeId: build-files, fieldId: webDirectory }

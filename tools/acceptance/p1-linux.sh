@@ -6,9 +6,22 @@ umask 077
 # are started or removed. The existing host Docker socket is never mounted.
 revision=${1:?Pass the full candidate Git SHA}
 database=${2:-sqlite}
+mode=${3:-acceptance}
+bind=${4:-}
 case "$revision" in *[!a-f0-9]*) exit 2 ;; esac
 test "${#revision}" -eq 40 || exit 2
 case "$database" in sqlite|postgres) ;; *) printf '%s\n' 'Choose sqlite or postgres.' >&2; exit 2 ;; esac
+case "$mode" in
+  acceptance) test -z "$bind" ;;
+  preview)
+    if ! printf '%s\n' "$bind" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}:[1-9][0-9]{3,4}$' ||
+       [ "${bind%:*}" = 0.0.0.0 ] || [ "${bind##*:}" -gt 65535 ]; then
+      printf '%s\n' 'Preview requires a specific host IPv4 address and port.' >&2
+      exit 2
+    fi
+    ;;
+  *) printf '%s\n' 'Choose acceptance or preview.' >&2; exit 2 ;;
+esac
 
 repo=$(git rev-parse --show-toplevel)
 test "$(git -C "$repo" rev-parse --verify "$revision^{commit}")" = "$revision"
@@ -41,6 +54,7 @@ if [ "$database" = postgres ]; then docker image inspect "$postgres_image" >/dev
 work=$(mktemp -d /tmp/veyops-candidate-XXXXXX)
 prefix=$(basename "$work")
 network="$prefix-net"
+preview_network="$prefix-preview"
 manager="$prefix-api"
 postgres="$prefix-db"
 targets='test-a test-b production-a production-b'
@@ -52,10 +66,12 @@ cleanup() {
       docker rm -fv "$name" >/dev/null || :
     fi
   done
-  if [ "$(docker network inspect --format '{{index .Labels "veyops.acceptance"}}' "$network" 2>/dev/null || :)" = "$prefix" ]; then
-    docker network rm "$network" >/dev/null || :
-  fi
-  rm -f -- "$work/bootstrap.env" "$work/postgres.env"
+  for name in "$network" "$preview_network"; do
+    if [ "$(docker network inspect --format '{{index .Labels "veyops.acceptance"}}' "$name" 2>/dev/null || :)" = "$prefix" ]; then
+      docker network rm "$name" >/dev/null || :
+    fi
+  done
+  rm -f -- "$work/bootstrap.env" "$work/postgres.env" "$work/preview-login.txt"
   rm -f -- "$work/host-ssh/fixture-admin" "$work/host-ssh/test-a" "$work/host-ssh/test-b" \
     "$work/host-ssh/production-a" "$work/host-ssh/production-b"
   printf 'Candidate artifacts and logs: %s\n' "$work"
@@ -114,7 +130,14 @@ for helper_dir in /usr/lib/openssh /usr/libexec/openssh /usr/libexec; do
 done
 ssh-keygen -q -t ed25519 -N '' -f "$work/host-ssh/fixture-admin"
 
-docker network create --internal --label "veyops.acceptance=$prefix" "$network" >/dev/null
+create_network() {
+  subnet=$1
+  shift
+  if [ -n "$subnet" ]; then set -- --subnet "$subnet" "$@"; fi
+  docker network create --label "veyops.acceptance=$prefix" "$@" >/dev/null
+}
+
+create_network "${VEYOPS_ACCEPT_NETWORK_SUBNET:-}" --internal "$network"
 for target in $targets; do
   mkdir -p "$work/targets/$target/deploy"
   ssh-keygen -q -t ed25519 -N '' -f "$work/host-ssh/$target"
@@ -187,11 +210,36 @@ fi
   fi
 } >"$work/candidate.txt"
 
-docker run --pull=never -d --name "$manager" --user root --network "$network" --network-alias manager \
+if [ "$mode" = preview ]; then
+  create_network "${VEYOPS_ACCEPT_PREVIEW_SUBNET:-}" "$preview_network"
+  set -- --network "$preview_network" --publish "$bind:3000"
+else
+  set -- --network "$network" --network-alias manager
+fi
+docker create --pull=never --name "$manager" --user root "$@" \
   --label "veyops.acceptance=$prefix" --env-file "$work/bootstrap.env" \
   --mount "type=bind,src=$work,dst=/accept" \
   --mount "type=bind,src=$work/plugins,dst=/usr/local/lib/docker/cli-plugins,readonly" \
-  --entrypoint /bin/sh "$candidate" -eu -c 'export PATH=/accept/bin:$PATH; exec node /accept/tools/acceptance/p1-delivery.cjs "$@"' sh "$revision" "$site_image" >/dev/null
+  --entrypoint /bin/sh "$candidate" -eu -c 'export PATH=/accept/bin:$PATH; exec node /accept/tools/acceptance/p1-delivery.cjs "$@"' sh "$revision" "$site_image" "$mode" >/dev/null
+if [ "$mode" = preview ]; then
+  docker network connect --alias manager "$network" "$manager"
+fi
+docker start "$manager" >/dev/null
+if [ "$mode" = preview ]; then
+  for attempt in $(seq 1 90); do
+    if [ -s "$work/preview.json" ] && curl -fsS --max-time 3 "http://$bind/api/v1/health" >/dev/null 2>&1; then
+      rm -f -- "$work/bootstrap.env" "$work/postgres.env"
+      trap - EXIT INT TERM
+      printf 'Preview URL: http://%s\nPreview container: %s\nPreview workspace: %s\n' "$bind" "$manager" "$work"
+      cat "$work/preview.json"
+      exit 0
+    fi
+    if [ "$(docker inspect --format '{{.State.Running}}' "$manager")" != true ]; then break; fi
+    sleep 1
+  done
+  docker logs --tail 50 "$manager" >&2
+  exit 1
+fi
 exit_code=$(docker wait "$manager")
 docker logs "$manager" >"$work/manager.log" 2>&1
 cat "$work/manager.log"

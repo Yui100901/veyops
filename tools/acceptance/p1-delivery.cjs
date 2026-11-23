@@ -1,9 +1,11 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { createHash, randomBytes, randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { once } = require('node:events');
 const { mkdir, readFile, readlink, writeFile } = require('node:fs/promises');
 const { setTimeout: sleep } = require('node:timers/promises');
+const { verifyArtifactRecovery, verifyWorkerRecovery } = require('./p1-recovery.cjs');
+const { verifySharedDelivery } = require('./p1-shared-delivery.cjs');
 const {
   initializeDemo,
   loadDemo,
@@ -24,7 +26,7 @@ const checkoutFile = {
   'test-config': '.env.test',
   'production-config': '.env.prod',
 };
-const [revision, fixtureImage] = process.argv.slice(2);
+const [revision, fixtureImage, mode] = process.argv.slice(2);
 
 function command(file, args) {
   return execFileSync(file, args, { encoding: 'utf8', timeout: 60_000 }).trim();
@@ -173,7 +175,7 @@ function checkDecision(node, option) {
   assert.match(node.output?.scopeHash ?? '', /^[a-f0-9]{64}$/);
   if (node.type === 'SOURCE_REVIEW') {
     assert.equal(scope.kind, 'SOURCE_REVIEW');
-    assert.equal(scope.buildNodeId, 'build-manager');
+    assert.equal(scope.buildNodeId, option.buildNodeId ?? 'build-manager');
     assert.deepEqual(scope.sources, [{ repositoryId: option.repositoryId, commitSha: option.sha }]);
   } else {
     assert.equal(scope.kind, 'RELEASE');
@@ -385,7 +387,7 @@ async function verifyComposeRelease(fixture, release, artifact, expected) {
   }
 }
 
-async function verifyBackup(api, expectedArtifact, expectedRelease) {
+async function verifyBackup(api, expectedArtifact, expectedRelease, { workerRecovery, artifactRecovery }) {
   const backup = await api.post('/backups', {});
   const path = '/backups/' + backup.id;
   assert.equal((await api.post(path + '/verify', {})).id, backup.id);
@@ -426,6 +428,12 @@ async function verifyBackup(api, expectedArtifact, expectedRelease) {
       expectedArtifact.sourceCommit,
     ],
     ['select status as value from deployment_records where id = ?', expectedRelease.id, 'SUCCESS'],
+    ['select status as value from tasks where id = ?', workerRecovery.taskId, 'NEEDS_ATTENTION'],
+    [
+      'select lifecycle_state as value from artifacts where id = ?',
+      artifactRecovery.instanceId,
+      'DELETED',
+    ],
   ];
   if (client === 'sqlite') {
     const db = require('/app/node_modules/better-sqlite3')(sqlitePath, { readonly: true });
@@ -453,6 +461,7 @@ async function verifyBackup(api, expectedArtifact, expectedRelease) {
 async function run() {
   assert.match(revision, /^[0-9a-f]{40}$/);
   assert.equal(fixtureImage, 'busybox:1.36');
+  assert.ok(['acceptance', 'preview'].includes(mode ?? 'acceptance'));
   assert.equal(process.env.DOCKER_HOST, 'unix:///accept/targets/test-a/docker.sock');
   assert.ok(['sqlite', 'postgres'].includes(process.env.DATABASE_CLIENT));
   const demo = loadDemo('/accept/examples/refactor-stage0/project.yaml');
@@ -468,13 +477,14 @@ async function run() {
     app.useLogger(false);
     await app.listen(3000, '0.0.0.0');
     const api = createApi();
-    const password = randomBytes(25).toString('hex');
-    await api.post('/auth/login', { username: 'root', password: process.env.ADMIN_PASSWORD });
-    await api.post('/auth/change-password', {
-      currentPassword: process.env.ADMIN_PASSWORD,
-      newPassword: password,
-    });
-    await api.post('/auth/login', { username: 'root', password });
+    const initialPassword = process.env.ADMIN_PASSWORD;
+    const user = await api.post('/auth/login', { username: 'root', password: initialPassword });
+    assert.equal(user.mustChangePassword, false);
+    assert.equal(user.passwordChangeRecommended, true);
+    if (mode !== 'preview') {
+      await api.post('/auth/dismiss-password-reminder');
+      assert.equal((await api.get('/auth/me')).passwordChangeRecommended, false);
+    }
     const demoConfig = {
       call: api.call,
       repositoryBaseUrl: 'http://manager:8088',
@@ -484,6 +494,20 @@ async function run() {
     const fixture = await initializeDemo(demo, demoConfig);
     assert.deepEqual(await initializeDemo(demo, demoConfig), fixture);
     assert.equal(fixture.commitSha, source.commitSha);
+    if (mode === 'preview') {
+      await writeFile(
+        acceptanceRoot + '/preview-login.txt',
+        '用户名 root\n密码 ' + initialPassword + '\n',
+        { flag: 'wx', mode: 0o600 },
+      );
+      await writeFile(
+        acceptanceRoot + '/preview.json',
+        JSON.stringify({ revision, projectId: fixture.projectId, version: fixture.version }) + '\n',
+        { flag: 'wx', mode: 0o600 },
+      );
+      await once(process, 'SIGTERM');
+      return;
+    }
     const sha = source.commitSha;
     const nextSha = source.nextCommitSha;
     assert.match(nextSha, /^[0-9a-f]{40}$/);
@@ -539,6 +563,7 @@ async function run() {
       },
     );
     const files = {};
+    let recoveryArtifact;
     for (const scope of ['test', 'production']) {
       const collection = `${scope}-config`;
       const target = await execute(
@@ -553,7 +578,8 @@ async function run() {
       );
       const expected = { sha, repositoryId: repo, servers: allTargets[scope] };
       files[scope] = artifactFor(target, 'directory', { ...expected, kind: 'DIRECTORY' });
-      artifactFor(target, 'file', { ...expected, kind: 'FILE' });
+      const file = artifactFor(target, 'file', { ...expected, kind: 'FILE' });
+      if (scope === 'test') recoveryArtifact = file;
       const build = nodeById(target, 'build-files');
       assert.equal(build.environment.find(({ fieldId }) => fieldId === 'GIT_SHA')?.value, sha);
       const temporaryIds = build.output.runReport.map(
@@ -671,12 +697,23 @@ async function run() {
         assert.equal(current.find(({ id }) => id === entry.id)?.isCurrent, true);
       }
     }
-    const cleanup = await api.post('/artifact-retention/preview', {
-      artifacts: [files.production, imageArtifact].map(({ artifactId }) => ({ artifactId })),
-    });
+    const protectedArtifacts = [files.production, imageArtifact].map(({ artifactId }) => ({
+      artifactId,
+    }));
+    const cleanup = await api.post('/artifact-retention/preview', { artifacts: protectedArtifacts });
     assert.equal(cleanup.instances.length, allTargets.production.length * 2);
     assert.equal(cleanup.eligibleCount, 0);
     assert.ok(cleanup.instances.every((instance) => !instance.eligible && instance.reason));
+    await api.call(
+      'POST',
+      '/artifact-retention/prune',
+      {
+        artifacts: protectedArtifacts,
+        planDigest: cleanup.planDigest,
+        idempotencyKey: randomUUID(),
+      },
+      409,
+    );
     evidence.protectedReleaseInstances = cleanup.instances;
 
     const staged = await execute(
@@ -752,6 +789,22 @@ async function run() {
       );
 
     const graph = `/projects/${fixture.projectId}/execution-graph`;
+    evidence.sharedDelivery = await verifySharedDelivery({
+      api,
+      execute,
+      graph,
+      fixture,
+      buildOnly: image,
+      historical: compose,
+      incompatibleDirectory: next,
+      productionTargets: allTargets.production,
+      composeExpected: { repositoryId: repo, sha, html, templateChecksum: sha256(composeTemplate) },
+      artifactFor,
+      verifyArtifact,
+      verifyComposeRelease,
+      verifyDirectoryRelease: (run, artifact) =>
+        verifyFileRelease(fixture, run, artifact, targetGroup.production, html, 'deploy-files'),
+    });
     const { draft: definition, revision: expectedRevision } = await api.get(graph);
     const failBuild = definition.canvas.nodes.find(({ id }) => id === 'build-files');
     assert.ok(failBuild?.build);
@@ -772,10 +825,26 @@ async function run() {
     assert.equal(stopped.releases.length, 0);
     await verifyFileRelease(fixture, manual, files.test, targetGroup.test, html, 'rollback-files');
 
+    evidence.artifactRecovery = await verifyArtifactRecovery(
+      api,
+      recoveryArtifact,
+      fixture,
+      demoConfig.targets['test-a'],
+      files.test,
+    );
+    console.log('VEYOPS_ACCEPTANCE_ARTIFACT_RECOVERY ' + JSON.stringify(evidence.artifactRecovery));
+    const { TaskWorkerService } = require('/app/apps/api/dist/modules/tasks/task-worker.service.js');
+    evidence.workerRecovery = await verifyWorkerRecovery(api, fixture, app.get(TaskWorkerService));
+    const recoveryDeployments = await api.get(projectQuery('/deployments', fixture.projectId));
+    assert.ok(!recoveryDeployments.some(({ graphRunId }) => graphRunId === evidence.workerRecovery.runId));
+    console.log('VEYOPS_ACCEPTANCE_WORKER_RECOVERY ' + JSON.stringify(evidence.workerRecovery));
+    await verifyFileRelease(fixture, manual, files.test, targetGroup.test, html, 'rollback-files');
+
     evidence.backup = await verifyBackup(
       api,
       files.test.instances[0],
       deploymentOn(manual, allTargets.test[0], 'rollback-files'),
+      evidence,
     );
     await writeFile(acceptanceRoot + '/evidence.json', JSON.stringify(evidence, null, 2) + '\n', {
       flag: 'wx',
