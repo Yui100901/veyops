@@ -845,6 +845,7 @@ for (const location of ['TARGET', 'MANAGER'] as const)
         const deployments = {
           activeSnapshot: async () => undefined,
           assertApproval: async () => undefined,
+          assertGraphBuildGate: async () => undefined,
           markActivated: async () => undefined,
           start: async () => {
             assert.equal(buildOnly, false);

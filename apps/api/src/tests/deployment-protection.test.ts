@@ -157,6 +157,7 @@ function fixture(
       return true;
     },
     rollbackCandidate: async () => rollbackCandidate,
+    assertGraphBuildGate: async () => undefined,
   } as unknown as DeploymentsService;
   const builds = actualBuilds
     ? new BuildsService(

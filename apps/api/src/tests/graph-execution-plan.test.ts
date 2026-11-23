@@ -9,7 +9,6 @@ import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
-import { replaceVariables } from './helpers/variable-scope';
 
 async function checkPlan(t: TestContext, url?: string) {
   const data = await mkdtemp(join(tmpdir(), 'veyops-execution-plan-'));
@@ -25,8 +24,6 @@ async function checkPlan(t: TestContext, url?: string) {
     WORKER_ENABLED: 'false',
   });
   const { AppModule } = await import('../app.module.js');
-  const { LegacyDeliveryWriteFixtureModule } =
-    await import('./helpers/legacy-delivery-write-fixture.module.js');
   const { configureApp } = await import('../bootstrap.js');
   const { GraphRunnerService } =
     await import('../modules/execution-graphs/graph-runner.service.js');
@@ -35,7 +32,7 @@ async function checkPlan(t: TestContext, url?: string) {
   const { ServersService } = await import('../modules/servers/servers.service.js');
   const app = (
     await Test.createTestingModule({
-      imports: [AppModule, LegacyDeliveryWriteFixtureModule],
+      imports: [AppModule],
     }).compile()
   ).createNestApplication<NestExpressApplication>({ logger: false });
   try {
@@ -80,21 +77,25 @@ async function checkPlan(t: TestContext, url?: string) {
       cloneUrl: 'https://git.example.test/repository.git',
     });
     const service = await create(scope + '/services', { name: 'Web', slug: 'web' });
-    const empty = await create(scope + '/environments', { name: 'Empty', slug: 'empty' });
-    const env = await create(scope + '/environments', {
-      name: 'Test',
-      slug: 'test',
-      repositoryEnvFile: '.env.test',
-      defaultTargetSelection: { groupIds: [group.id] },
-    });
-    const vars = `/services/${service.id}/environments/${env.id}/variables`;
+    const empty = await create(scope + '/environment-sets', { name: 'Empty' });
     const plain = 'value-must-not-be-in-preview';
     const secret = 'secret-must-not-be-in-preview';
-    await replaceVariables(api, base + vars, [
-      { key: 'OVERLAP', value: plain },
-      { key: 'PASSWORD', value: secret, isSecret: true },
-    ]);
+    const env = await create(scope + '/environment-sets', {
+      name: 'Test',
+      variables: [
+        { key: 'OVERLAP', value: plain },
+        { key: 'PASSWORD', value: secret, isSecret: true },
+      ],
+    });
     const pin = 'd'.repeat(40);
+    t.mock.method(app.get(RepositoryMetadataService), 'planGraphCheckout', async () => ({
+      repositoryId: repo.id,
+      repositoryName: repo.name,
+      commitSha: pin,
+      ref: pin,
+      fullClone: false,
+      access: { clone_url: repo.cloneUrl, credential_id: null },
+    }));
     const files = t.mock.method(
       app.get(RepositoryMetadataService),
       'inspectGraphEnvironmentFile',
@@ -114,8 +115,17 @@ async function checkPlan(t: TestContext, url?: string) {
     const snapshots = t.mock.method(app.get(ServersService), 'snapshot');
     const path = scope + '/execution-graph';
     const draft = (await api.get(base + path).expect(200)).body.data;
-    const field = { id: 'environment', name: 'Environment', type: 'ENVIRONMENT', required: true };
-    const start = (id: string) => ({ id, name: id, type: 'START', inputs: [field] });
+    const start = (id: string, extra: object[] = []) => ({
+      id,
+      name: id,
+      type: 'START',
+      inputs: [
+        { id: 'environmentSet', name: '变量集合', type: 'ENVIRONMENT_SET', required: true },
+        { id: 'configuration', name: '配置', type: 'TEXT', required: true },
+        ...extra,
+      ],
+      environmentSet: { mode: 'INPUT', fieldId: 'environmentSet' },
+    });
     const end = (id: string) => ({ id, name: id, type: 'END' });
     const build = (id: string, buildLocation: string) => ({
       id,
@@ -140,10 +150,42 @@ async function checkPlan(t: TestContext, url?: string) {
             canvas: {
               nodes: [
                 start('build-only'),
+                {
+                  id: 'checkout',
+                  name: '检出固定源码',
+                  type: 'CHECKOUT',
+                  checkout: { repositoryId: repo.id, mode: 'COMMIT', commitSha: pin },
+                },
+                {
+                  id: 'load',
+                  name: '载入变量文件',
+                  type: 'LOAD_ENV',
+                  loadEnvironment: {
+                    required: false,
+                    pathRule: {
+                      key: 'configuration',
+                      paths: { empty: '.env.empty', test: '.env.test' },
+                    },
+                  },
+                },
                 build('manager', 'MANAGER'),
                 end('end-build'),
-                start('combined'),
+                start('combined', [
+                  {
+                    id: 'releaseTargets',
+                    name: '发布目标',
+                    type: 'TARGETS',
+                    required: true,
+                    defaultValue: { groupIds: [group.id] },
+                  },
+                ]),
                 build('combined-build', 'MANAGER'),
+                {
+                  id: 'approve-release',
+                  name: '确认发布',
+                  type: 'APPROVAL',
+                  approval: { releaseNodeId: 'release' },
+                },
                 {
                   id: 'release',
                   name: 'Release',
@@ -161,12 +203,28 @@ async function checkPlan(t: TestContext, url?: string) {
                 end('end-target'),
               ],
               edges: [
-                ...chain(['build-only', 'manager', 'end-build']),
-                ...chain(['combined', 'combined-build', 'release', 'end-release']),
+                ...chain(['build-only', 'checkout', 'load', 'manager', 'end-build']),
+                ...chain([
+                  'combined',
+                  'combined-build',
+                  'approve-release',
+                  'release',
+                  'end-release',
+                ]),
                 ...chain(['target-only', 'target', 'end-target']),
               ],
               endpoints: [
-                { startId: 'build-only', endId: 'end-build', serviceId: service.id },
+                {
+                  startId: 'build-only',
+                  endId: 'end-build',
+                  serviceId: service.id,
+                  inputBindings: {
+                    load: { source: { kind: 'OUTPUT', nodeId: 'checkout', fieldId: 'source' } },
+                    manager: {
+                      variables: { kind: 'OUTPUT', nodeId: 'load', fieldId: 'variables' },
+                    },
+                  },
+                },
                 {
                   startId: 'combined',
                   endId: 'end-release',
@@ -174,6 +232,7 @@ async function checkPlan(t: TestContext, url?: string) {
                   inputBindings: {
                     release: {
                       artifact: { kind: 'OUTPUT', nodeId: 'combined-build', fieldId: 'output' },
+                      targets: { kind: 'INPUT', fieldId: 'releaseTargets' },
                     },
                   },
                   outputBindings: {
@@ -191,11 +250,14 @@ async function checkPlan(t: TestContext, url?: string) {
     const version = (await create(path + '/publish', { expectedRevision: revision }))
       .publishedVersion;
     const flow = (id: string) => path + '/flows/' + id;
-    const args = (environment: string, targets?: string[]) => ({
+    const args = (environmentSet: string, targets?: string[]) => ({
       version,
       inputs: {
-        parameters: { environment },
-        ...(targets && { serverIds: targets }),
+        parameters: {
+          environmentSet,
+          configuration: environmentSet === empty.id ? 'empty' : 'test',
+          ...(targets && { releaseTargets: { serverIds: targets } }),
+        },
       },
     });
     const previewOnly = await create(flow('build-only') + '/preview', args(empty.id));
@@ -204,13 +266,14 @@ async function checkPlan(t: TestContext, url?: string) {
     assert.deepEqual(previewOnly.executionPlan.targets[0].servers, []);
     assert.deepEqual(previewOnly.executionPlan.environmentFiles[0], {
       flowId: 'build-only',
-      nodeId: 'manager',
+      nodeId: 'load',
       status: 'SKIPPED',
-      source: 'CONVENTION',
+      source: 'NODE',
       required: false,
       repositoryId: repo.id,
       commitSha: pin,
       path: '.env.empty',
+      mappingKey: 'configuration',
     });
     assert.ok(
       !previewOnly.executionPlan.variables.some(
@@ -221,15 +284,14 @@ async function checkPlan(t: TestContext, url?: string) {
     assert.equal(previewWithDefaults.executionPlan.environmentFiles[0].path, '.env.test');
     assert.equal(previewWithDefaults.executionPlan.environmentFiles[0].commitSha, pin);
     assert.ok(files.mock.callCount() >= 2);
-    assert.deepEqual(
-      previewWithDefaults.executionPlan.variables.find((v: { key: string }) => v.key === 'OVERLAP'),
-      {
-        flowId: 'build-only',
-        nodeId: 'manager',
-        key: 'OVERLAP',
-        source: 'SERVICE_ENVIRONMENT',
-        sensitive: false,
-      },
+    assert.ok(
+      previewWithDefaults.executionPlan.variables.some(
+        (v: { nodeId: string; key: string; source: string; sensitive: boolean }) =>
+          v.nodeId === 'load' &&
+          v.key === 'OVERLAP' &&
+          v.source === 'ENVIRONMENT_SET' &&
+          v.sensitive === false,
+      ),
     );
     assert.ok(!JSON.stringify(previewWithDefaults).includes(plain));
     assert.ok(!JSON.stringify(previewWithDefaults).includes(secret));
@@ -239,14 +301,30 @@ async function checkPlan(t: TestContext, url?: string) {
     const combined = flow('combined');
     const defaultPlan = await create(combined + '/preview', args(env.id));
     assert.equal(defaultPlan.deliveries[1].requireApproval, false);
-    const automaticPlan = await app
-      .get(GraphRunnerService)
-      .preview(project.id, 'combined', args(env.id), {
-        automation: { kind: 'API', ruleId: 'fixture', revision: '1' },
+    const runner = app.get(GraphRunnerService);
+    const automation = { kind: 'API' as const, ruleId: 'fixture', revision: '1' };
+    const previous = process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
+    try {
+      delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
+      await assert.rejects(
+        runner.preview(project.id, 'combined', args(env.id), { automation }),
+        /API 尚未放行/,
+      );
+      process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = 'API';
+      const automaticPlan = await runner.preview(project.id, 'combined', args(env.id), {
+        automation,
       });
-    assert.equal(automaticPlan.deliveries[0]?.requireApproval, false);
-    assert.equal(automaticPlan.deliveries[1]?.requireApproval, true);
-    assert.notEqual(automaticPlan.configurationHash, defaultPlan.configurationHash);
+      assert.ok(
+        automaticPlan.gates.some(
+          ({ nodeId, kind, releaseNodeId }) =>
+            nodeId === 'approve-release' && kind === 'APPROVAL' && releaseNodeId === 'release',
+        ),
+      );
+      assert.deepEqual(automaticPlan.executionPlan.targets, defaultPlan.executionPlan.targets);
+    } finally {
+      if (previous === undefined) delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
+      else process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = previous;
+    }
     assert.deepEqual(
       defaultPlan.executionPlan.targets.map((item: { purpose: string; source: string }) => [
         item.purpose,
@@ -254,7 +332,7 @@ async function checkPlan(t: TestContext, url?: string) {
       ]),
       [
         ['BUILD', 'MANAGER'],
-        ['RELEASE', 'PROJECT_ENVIRONMENT'],
+        ['RELEASE', 'RUN_INPUT'],
       ],
     );
     assert.deepEqual(
@@ -278,17 +356,6 @@ async function checkPlan(t: TestContext, url?: string) {
     }).expect(409);
     assert.ok(stale.body.error.changes.some((change: string) => change.includes('执行目标及成员')));
 
-    const config = `/services/${service.id}/environments/${env.id}/config`;
-    await api
-      .put(base + config)
-      .send({ serverIds: [second.id], deployPath: '/opt/veyops-override' })
-      .expect(200);
-    const overridden = await create(combined + '/preview', args(env.id));
-    assert.equal(overridden.executionPlan.targets[1].source, 'SERVICE_ENVIRONMENT');
-    assert.deepEqual(
-      overridden.executionPlan.targets[1].servers.map((s: { id: string }) => s.id),
-      [second.id],
-    );
     const explicit = await create(combined + '/preview', args(env.id, [first.id]));
     assert.equal(explicit.executionPlan.targets[1].source, 'RUN_INPUT');
     assert.deepEqual(

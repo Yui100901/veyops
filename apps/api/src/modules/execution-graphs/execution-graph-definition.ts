@@ -361,7 +361,7 @@ class GraphFlowConfiguration {
   @IsOptional() @IsObject() edgeSelections?: Record<string, string[]>;
 }
 export class GraphFlow extends GraphFlowConfiguration {
-  compiled?: GraphCompiledFlow;
+  declare compiled?: GraphCompiledFlow;
   @Matches(idFormat) id!: string;
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
   @IsArray()

@@ -82,24 +82,30 @@ async function verify(databaseUrl?: string) {
       id,
       name: id,
       nodes: [
-        { id: id + '-start', type: 'START', name: '开始' },
+        { id, type: 'START', name: '开始' },
         { id: id + '-log', type: 'LOG', name: '日志', message },
         { id: id + '-end', type: 'END', name: '结束' },
       ],
       edges: [
-        { from: id + '-start', to: id + '-log' },
+        { from: id, to: id + '-log' },
         { from: id + '-log', to: id + '-end' },
       ],
     });
     async function publish(message: string) {
       const graph = (await admin.get(path).expect(200)).body.data;
+      const flows = [makeFlow('source', message), makeFlow('target', 'after source')];
       const draft = (
         await admin
           .put(path + '/draft')
           .send({
             expectedRevision: graph.revision,
             definition: {
-              flows: [makeFlow('source', message), makeFlow('target', 'after source')],
+              canvas: {
+                nodes: flows.flatMap(({ nodes }) => nodes),
+                edges: flows.flatMap(({ edges }) => edges),
+                endpoints: flows.map(({ id }) => ({ startId: id, endId: id + '-end' })),
+                templates: [],
+              },
             },
           })
           .expect(200)

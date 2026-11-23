@@ -66,7 +66,18 @@ test('execution graph draft accepts bounded integer canvas coordinates', () => {
   const fixture = example();
   const validate = () =>
     validateSync(
-      plainToInstance(SaveGraphDraftDto, { expectedRevision: 1, definition: { flows: [fixture] } }),
+      plainToInstance(SaveGraphDraftDto, {
+        expectedRevision: 1,
+        definition: {
+          flows: [],
+          canvas: {
+            nodes: fixture.nodes,
+            edges: fixture.edges,
+            endpoints: [{ startId: 'start', endId: 'end' }],
+            templates: [],
+          },
+        },
+      }),
       { whitelist: true, forbidNonWhitelisted: true },
     );
   fixture.nodes[0]!.position = { x: 0, y: 30000 };

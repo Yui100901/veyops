@@ -406,6 +406,32 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     '# Second release',
   );
   const graphNodes = app.get(GraphNodeTasks);
+  const shellNode = {
+    id: 'shell',
+    name: '仓库参数',
+    type: 'SHELL',
+    declaredPorts: true,
+    shell: { location: 'MANAGER', command: 'printf ok' },
+    inputs: [
+      {
+        id: 'repo',
+        name: '项目仓库',
+        referenceName: 'GIT_REPOSITORY',
+        type: 'REPOSITORY',
+      },
+    ],
+  } satisfies Parameters<typeof graphNodes.task>[1];
+  const shellScope = { runId: randomUUID(), nodeRunId: randomUUID(), values: { repo: id } };
+  const shellPlan = await graphNodes.prepare(project, shellNode, shellScope);
+  const shellTask = await graphNodes.task(project, shellNode, shellPlan, randomUUID(), shellScope);
+  assert.equal(
+    shellTask.payload.graphModule?.shell?.parameters.variables.GIT_REPOSITORY,
+    create.cloneUrl,
+  );
+  await assert.rejects(
+    graphNodes.task(other, shellNode, shellPlan, randomUUID(), shellScope),
+    /项目仓库不存在/,
+  );
   const checkoutNode = { id: 'source', name: 'Source', type: 'CHECKOUT' } as const;
   const values = { repository: id, version: { kind: 'COMMIT', value: second } };
   const plan = await graphNodes.prepare(project, checkoutNode, { values, fetchModeDeferred: true });
@@ -456,7 +482,11 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
       ],
       endpoints: [
         { startId: 'default', endId: 'end' },
-        { startId: 'supplied', endId: 'end' },
+        {
+          startId: 'supplied',
+          endId: 'end',
+          inputBindings: { checkout: { repository: { kind: 'INPUT', fieldId: 'upstreamRepo' } } },
+        },
       ],
       edges: [
         { from: 'default', to: 'checkout' },
