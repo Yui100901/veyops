@@ -1425,7 +1425,9 @@ fi
         await this.builds.remoteCapture(target, `${docker} info --format '{{.ID}}'`, session, 30)
       ).trim();
       const physicalEngine =
-        artifact?.physical?.location === 'DOCKER_ENGINE' ? artifact.physical.engineId : undefined;
+        artifact?.physical?.location === 'DOCKER_ENGINE' && artifact.physical.serverId === target.id
+          ? artifact.physical.engineId
+          : undefined;
       if (
         !/^[A-Za-z0-9:_-]{1,180}$/.test(dockerEngineId) ||
         (activeDockerEngineId && dockerEngineId !== activeDockerEngineId) ||
