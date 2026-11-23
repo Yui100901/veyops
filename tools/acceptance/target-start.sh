@@ -38,6 +38,9 @@ for helper_dir in /usr/lib/openssh /usr/libexec/openssh /usr/libexec; do
   done
 done
 ln -s /accept/plugins /usr/local/lib/docker/cli-plugins
+if [ ! -x /usr/bin/docker ]; then
+  ln -s /accept/bin/docker /usr/bin/docker
+fi
 ln -s "$state/docker.sock" /var/run/docker.sock
 cat >/etc/ssh-veyops-acceptance <<'CONFIG'
 Port 22
