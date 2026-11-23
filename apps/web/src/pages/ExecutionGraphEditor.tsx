@@ -631,7 +631,8 @@ export function ProjectGraphEditor({
       if (type !== 'START' || paired.has(id)) return [];
       const available = reachable(next, id);
       const reached = ends.filter((end) => available.has(end.id));
-      return reached.length === 1 ? [{ startId: id, endId: reached[0]!.id }] : [];
+      const end = reached.length === 1 ? reached[0] : undefined;
+      return end && !reachable(canvas, id).has(end.id) ? [{ startId: id, endId: end.id }] : [];
     });
     next.endpoints = [...next.endpoints, ...endpoints];
     recordImpact(
