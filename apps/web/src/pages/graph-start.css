@@ -18,12 +18,8 @@
   margin: 0;
 }
 
-.graph-scoped-starts {
-  padding: 0;
-}
-
 .project-service-starts .execution-start-options {
-  margin: 0 23px 16px;
+  margin: 0 var(--surface-inset) var(--section-gap, 16px);
 }
 
 .execution-start-options,
@@ -31,6 +27,10 @@
   display: grid;
   gap: 0.5rem;
   min-width: 0;
+}
+
+.execution-start-options {
+  container: graph-start-options / inline-size;
 }
 
 .execution-start-list {
@@ -93,7 +93,7 @@
   scroll-margin: 1rem;
 }
 
-@media (max-width: 600px) {
+@container graph-start-options (max-width: 37.5rem) {
   .execution-start-list > li {
     grid-template-columns: minmax(0, 1fr);
   }

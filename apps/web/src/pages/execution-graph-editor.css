@@ -1,9 +1,18 @@
+.execution-graph > .panel:has(> .project-graph-editor) {
+  container: graph-editor / inline-size;
+}
+
 .project-graph-editor {
   display: grid;
   align-items: start;
-  gap: 1rem;
+  gap: 0.75rem;
   grid-template-columns: minmax(0, 1fr);
   min-width: 0;
+  padding: var(--surface-inset);
+}
+
+.graph-setup-return + .project-graph-editor {
+  padding-top: 0;
 }
 
 .graph-canvas-column,
@@ -16,7 +25,7 @@
 }
 
 .graph-palette {
-  padding: 0.8rem;
+  padding: 0.65rem;
   border: 1px solid var(--border);
   border-radius: 0.65rem;
   background: #fff;
@@ -34,12 +43,21 @@
 }
 
 .graph-palette-group {
-  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 7rem), 1fr));
 }
 
+.graph-palette > h3,
 .graph-palette-group > h4,
 .graph-palette-templates {
   grid-column: 1 / -1;
+}
+
+.graph-palette > h3 {
+  font-size: 0.95rem;
+}
+
+.graph-palette-templates {
+  min-width: 0;
 }
 
 .graph-palette-templates > summary {
@@ -89,6 +107,13 @@
   gap: 0.35rem;
   color: var(--muted);
   font-size: 0.84rem;
+  flex: 1 1 17rem;
+  min-width: 0;
+}
+
+.graph-canvas-help:empty,
+.graph-editor-toolbar:not(:has(> :not(.graph-canvas-help), .graph-canvas-help > *)) {
+  display: none;
 }
 
 .graph-editor-toolbar {
@@ -102,12 +127,32 @@
 }
 
 .graph-editor-toolbar > .field {
-  flex: 0 1 17rem;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  flex: 1 1 17rem;
+  max-width: 27rem;
+  min-width: 0;
   margin: 0;
 }
 
 .graph-editor-toolbar > :not(.field, .graph-canvas-help) {
   flex: 1 1 100%;
+}
+
+.graph-editor-toolbar > .graph-validation {
+  gap: 0.45rem;
+  padding: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+}
+
+.graph-validation > h4 {
+  margin: 0;
+}
+
+.graph-canvas-column > .button {
+  justify-self: start;
 }
 
 .graph-editor-impact,
@@ -339,28 +384,39 @@
   border-color: #c84941;
 }
 
-@media (min-width: 1000px) {
+@container graph-editor (width < 52rem) {
+  .graph-palette > .graph-palette-group {
+    grid-template-columns: minmax(0, 1fr) repeat(2, minmax(0, 1.15fr));
+    align-items: center;
+  }
+
+  .graph-palette > .graph-palette-group:has(.graph-palette-templates) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .graph-palette > .graph-palette-group > :is(h4, .graph-palette-templates:not([open])) {
+    grid-column: auto;
+  }
+}
+
+@container graph-editor (min-width: 52rem) {
   .project-graph-editor:has(.graph-inspector) {
-    grid-template-columns: minmax(0, 1fr) minmax(18rem, 23rem);
+    grid-template-columns: minmax(0, 1fr) clamp(18rem, 34cqi, 23rem);
   }
 
   .graph-palette {
     grid-column: 1 / -1;
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
-
-  .graph-palette > h3 {
-    grid-column: 1 / -1;
-  }
 }
 
-@media (min-width: 1450px) {
+@container graph-editor (min-width: 74rem) {
   .project-graph-editor:has(.graph-palette) {
     grid-template-columns: minmax(10rem, 11rem) minmax(0, 1fr);
   }
 
   .project-graph-editor:has(.graph-inspector):has(.graph-palette) {
-    grid-template-columns: minmax(10rem, 11rem) minmax(0, 1fr) minmax(21rem, 25rem);
+    grid-template-columns: 11rem minmax(0, 1fr) clamp(21rem, 23cqi, 25rem);
   }
 
   .graph-palette {

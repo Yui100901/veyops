@@ -13,6 +13,11 @@
   gap: 0.85rem;
 }
 
+.execution-plan,
+.execution-plan-changes {
+  container: graph-preview / inline-size;
+}
+
 .execution-plan h4 {
   margin: 0;
   font-size: 0.95rem;
@@ -118,7 +123,7 @@
   font-size: 0.85em;
 }
 
-@media (max-width: 540px) {
+@container graph-preview (max-width: 33.75rem) {
   .execution-plan-table > div,
   .execution-plan-before-after {
     grid-template-columns: minmax(0, 1fr);
