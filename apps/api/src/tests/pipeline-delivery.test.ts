@@ -57,6 +57,9 @@ async function checkDelivery(databaseUrl?: string) {
   const compose = 'services:\n  web:\n    image: ${VEYOPS_IMAGE}\n';
   const managedV1 = compose + '# Service environment revision 1\n';
   const managedV2 = compose + '# Service environment revision 2\n';
+  const repositoryComposePath = 'deploy/compose.yaml';
+  const repositoryCompose = compose + '# Pinned repository Compose file\n';
+  let repositoryComposeRead = repositoryCompose;
   const composeUploads: string[] = [];
   const imageDigest = `sha256:${'1'.repeat(64)}`;
   const imageId = `sha256:${'2'.repeat(64)}`;
@@ -183,6 +186,7 @@ async function checkDelivery(databaseUrl?: string) {
         }
         if (command.includes('config --images'))
           options?.onData?.(`${/^VEYOPS_IMAGE='([^']+)'/.exec(command)?.[1]}\n`);
+        if (command.includes('{{.ID}}')) options?.onData?.(`fixture-engine-${target.id}\n`);
         if (command.includes('image inspect --format')) {
           const platform = command.includes('{{.Architecture}}') ? ' linux/amd64' : '';
           options?.onData?.(`${imageId}${platform}\n`);
@@ -209,6 +213,16 @@ async function checkDelivery(databaseUrl?: string) {
     .overrideProvider(RepositoryMetadataService)
     .useValue({
       inspectGraphEnvironmentFile: async () => undefined,
+      readGraphComposeFile: async (
+        _projectId: string,
+        _repositoryId: string,
+        commitSha: string,
+        path: string,
+      ) => {
+        assert.equal(commitSha, successfulCommit);
+        assert.equal(path, repositoryComposePath);
+        return repositoryComposeRead;
+      },
       planGraphCheckout: async (
         _projectId: string,
         source: { repositoryId: string; commitSha?: string; branch?: string },
@@ -1309,10 +1323,7 @@ async function checkDelivery(databaseUrl?: string) {
       slug: 'graph-release',
       environmentType: 'TESTING',
     });
-    const scoped = [
-      { id: 'environment', name: '环境', type: 'ENVIRONMENT', defaultValue: graphEnv.id },
-      { id: 'service', name: '服务', type: 'SERVICE', defaultValue: service.id },
-    ];
+    const scoped = [{ id: 'service', name: '服务', type: 'SERVICE', defaultValue: service.id }];
     const version = {
       id: 'version',
       name: '源码版本',
@@ -1330,7 +1341,6 @@ async function checkDelivery(databaseUrl?: string) {
       name: '历史镜像',
       type: 'ARTIFACT',
       artifactType: 'DOCKER_IMAGE',
-      multiple: true,
     };
     const from = (nodeId: string, fieldId: string) => ({ kind: 'OUTPUT', nodeId, fieldId });
     const input = (fieldId: string) => ({ kind: 'INPUT', fieldId });
@@ -1340,7 +1350,6 @@ async function checkDelivery(databaseUrl?: string) {
         name: 'JAR 产物',
         type: 'ARTIFACT',
         artifactType: 'FILE',
-        multiple: true,
         source: 'CURRENT_RUN',
       },
       {
@@ -1348,7 +1357,6 @@ async function checkDelivery(databaseUrl?: string) {
         name: 'Docker 镜像',
         type: 'ARTIFACT',
         artifactType: 'DOCKER_IMAGE',
-        multiple: true,
         source: 'CURRENT_RUN',
       },
     ];
@@ -1404,7 +1412,6 @@ async function checkDelivery(databaseUrl?: string) {
             id: 'directory',
             name: '静态站点',
             type: 'ARTIFACT',
-            multiple: true,
             artifactType: 'DIRECTORY',
             source: 'CURRENT_RUN',
           },
@@ -1419,10 +1426,29 @@ async function checkDelivery(databaseUrl?: string) {
         inputs: [...scoped, targets, historical],
       },
       {
+        id: 'guarded',
+        type: 'START',
+        name: '审核后发布历史镜像',
+        inputs: [...scoped, targets, historical],
+      },
+      { id: 'review-image', type: 'SOURCE_REVIEW', name: '审核实际镜像来源' },
+      {
+        id: 'approve-image',
+        type: 'APPROVAL',
+        name: '批准具体发布范围',
+        approval: { releaseNodeId: 'deploy-node' },
+      },
+      {
         id: 'latest',
         type: 'START',
         name: '发布最新镜像',
         inputs: [...scoped, targets, { ...historical, selection: 'LATEST_COMPATIBLE' }],
+      },
+      {
+        id: 'repository-template',
+        type: 'START',
+        name: '使用仓库 Compose 模板发布',
+        inputs: [...scoped, targets, historical],
       },
       {
         id: 'git-actual',
@@ -1460,7 +1486,27 @@ async function checkDelivery(databaseUrl?: string) {
         id: 'deploy-node',
         type: 'DEPLOY_ARTIFACT',
         name: '部署共享节点',
-        deploy: { deployPath: '/opt/graph-native', healthCheckCommand: 'test -f compose.yaml' },
+        deploy: {
+          method: 'COMPOSE',
+          deployPath: '/opt/graph-native',
+          healthCheckCommand: 'test -f compose.yaml',
+        },
+      },
+      {
+        id: 'deploy-repository',
+        type: 'DEPLOY_ARTIFACT',
+        name: '使用固定版本 Compose 模板部署',
+        deploy: {
+          method: 'COMPOSE',
+          deployPath: '/opt/graph-repository-template',
+          healthCheckCommand: 'test -f compose.yaml',
+          composeSource: {
+            kind: 'REPOSITORY_FILE',
+            repositoryId: sharedRepo.id,
+            commitSha: successfulCommit,
+            path: repositoryComposePath,
+          },
+        },
       },
       { id: 'build-end', type: 'END', name: '返回 JAR 和镜像', outputs },
       {
@@ -1482,8 +1528,13 @@ async function checkDelivery(databaseUrl?: string) {
       ['build-node', 'build-end'],
       ['build-node', 'deploy-node'],
       ['release', 'deploy-node'],
+      ['guarded', 'review-image'],
+      ['review-image', 'approve-image'],
+      ['approve-image', 'deploy-node'],
       ['latest', 'deploy-node'],
       ['deploy-node', 'release-end'],
+      ['repository-template', 'deploy-repository'],
+      ['deploy-repository', 'release-end'],
     ].map(([from, to]) => ({ from, to }));
     const buildBindings = {
       'git-actual': { version: input('version') },
@@ -1498,7 +1549,11 @@ async function checkDelivery(databaseUrl?: string) {
       serviceId: service.id,
       inputBindings: {
         ...(startId === 'composed' && buildBindings),
-        'deploy-node': { artifact },
+        ...(startId === 'guarded' && { 'review-image': { artifact } }),
+        'deploy-node': {
+          artifact,
+          ...(startId === 'guarded' && { review: from('review-image', 'review') }),
+        },
       },
       outputBindings: { release: from('deploy-node', 'release') },
     });
@@ -1514,7 +1569,7 @@ async function checkDelivery(databaseUrl?: string) {
             endId: 'custom-end',
             inputBindings: {
               script: { OUT_DIR: input('outputDir') },
-              register: { workspace: from('script', 'workspace') },
+              register: { workspace: from('script', 'workspace'), path: input('outputDir') },
             },
             outputBindings: { directory: from('register', 'static') },
           },
@@ -1526,7 +1581,15 @@ async function checkDelivery(databaseUrl?: string) {
           },
           releaseEndpoint('composed', from('build-node', 'image')),
           releaseEndpoint('release', input('image')),
+          releaseEndpoint('guarded', input('image')),
           releaseEndpoint('latest', input('image')),
+          {
+            startId: 'repository-template',
+            endId: 'release-end',
+            serviceId: service.id,
+            inputBindings: { 'deploy-repository': { artifact: input('image') } },
+            outputBindings: { release: from('deploy-repository', 'release') },
+          },
         ],
       },
     };
@@ -1568,7 +1631,8 @@ async function checkDelivery(databaseUrl?: string) {
     };
     const custom = await submit('custom');
     assert.equal(custom.detail.status, 'SUCCESS', JSON.stringify(custom.detail.nodes));
-    assert.equal(custom.detail.outputs.directory[0].type, 'DIRECTORY');
+    assert.equal(custom.detail.outputs.directory.type, 'DIRECTORY');
+    assert.equal(custom.detail.outputs.directory.instances.length, 1);
     const inspected = custom.detail.nodes.find(
       (node: { nodeId: string }) => node.nodeId === 'register',
     );
@@ -1609,7 +1673,6 @@ async function checkDelivery(databaseUrl?: string) {
     const [produced] = await list('/artifacts', {
       projectId: project.id,
       serviceId: service.id,
-      environmentId: graphEnv.id,
       recordId: savedImage,
     });
     assert.equal(produced.name, 'image');
@@ -1678,19 +1741,25 @@ async function checkDelivery(databaseUrl?: string) {
       (node: { nodeId: string }) => node.nodeId === 'build-end',
     );
     assert.deepEqual(
-      buildEnd.output.jar.map((value: { id: string }) => value.id),
+      buildEnd.output.jar.instances.map(({ instanceId }: { instanceId: string }) => instanceId),
       [artifactRows[1]!.id],
     );
     assert.deepEqual(
-      buildEnd.output.image.map((value: { id: string }) => value.id),
+      buildEnd.output.image.instances.map(({ instanceId }: { instanceId: string }) => instanceId),
       [savedImage],
     );
-    const historicalRelease = await submit('release', { image: [savedImage] });
+    assert.equal(buildEnd.output.jar.artifactId, artifactRows[1]!.logical_artifact_id);
+    assert.equal(buildEnd.output.image.artifactId, artifactRows[0]!.logical_artifact_id);
+    const historicalRelease = await submit('release', { image: savedImage });
     assert.equal(
       historicalRelease.detail.status,
       'SUCCESS',
       JSON.stringify(historicalRelease.detail.nodes),
     );
+    assert.equal(produced.physical.engineId, 'fixture-manager-engine');
+    assert.ok(remoteCommands.slice(beforePublish).some(
+      ({ serverId, command }) => serverId === serverIds[0] && command.includes('image load --input'),
+    ));
     assert.deepEqual(historicalRelease.reviewed.deliveries[0].artifactIds, [savedImage]);
     assert.deepEqual(
       historicalRelease.reviewed.deliveries[0].artifactRefs[0].composeTemplate,
@@ -1715,11 +1784,13 @@ async function checkDelivery(databaseUrl?: string) {
     assert.equal(released.graphNodeName, '部署共享节点');
     assert.equal(released.graphVersion, published.publishedVersion);
     assert.equal(released.serverHost, 'host-first.test');
-    assert.deepEqual(released.composeRelease, {
-      template: produced.composeTemplate,
-      imageReference: (await list('/artifacts', { recordId: released.artifactId }))[0].storageKey,
-      imageId,
-    });
+    assert.deepEqual(released.composeRelease.template, produced.composeTemplate);
+    assert.equal(
+      released.composeRelease.imageReference,
+      (await list('/artifacts', { recordId: released.artifactId }))[0].storageKey,
+    );
+    assert.equal(released.composeRelease.imageId, imageId);
+    assert.equal(released.composeRelease.dockerEngineId, 'fixture-engine-' + serverIds[0]);
     const implicitLatest = await submit('latest');
     assert.equal(
       implicitLatest.detail.status,
@@ -1729,44 +1800,19 @@ async function checkDelivery(databaseUrl?: string) {
     assert.deepEqual(implicitLatest.reviewed.deliveries[0].artifactIds, [
       releaseNode.output.release.deployments[0].artifactId,
     ]);
-    const graphConfigPath = `/api/v1/services/${service.id}/environments/${graphEnv.id}/config`;
-    await api
-      .put(graphConfigPath)
-      .send({ ...directConfig, releasePolicy: { requireCodeReview: true } })
-      .expect(200);
-    const historicalInput = args({ image: [savedImage] });
+    const historicalInput = args({ image: savedImage });
     const reviewPreview = graphPath + '/flows/release/preview';
-    await post(reviewPreview, historicalInput).expect(409);
-    await api
-      .put(
-        '/api/v1/projects/' +
-          project.id +
-          '/services/' +
-          service.id +
-          '/environments/' +
-          graphEnv.id +
-          '/source-reviews/' +
-          successfulCommit,
-      )
-      .send({ decision: 'APPROVED', repositoryId: sharedRepo.id })
-      .expect(200);
-    await post(reviewPreview, historicalInput).expect(409);
-    await api
-      .put(
-        '/api/v1/projects/' +
-          project.id +
-          '/services/' +
-          service.id +
-          '/environments/' +
-          graphEnv.id +
-          '/source-reviews/' +
-          auxiliaryCommit,
-      )
-      .send({ decision: 'APPROVED', repositoryId: dependencyRepo.id })
-      .expect(200);
+    const guardedPlan = await create(graphPath + '/flows/guarded/preview', historicalInput);
     assert.equal(
-      (await create(reviewPreview, historicalInput)).deliveries[0].requireCodeReview,
-      true,
+      guardedPlan.gates.find(({ nodeId }: { nodeId: string }) => nodeId === 'approve-image')
+        ?.releaseNodeId,
+      'deploy-node',
+    );
+    assert.ok(
+      guardedPlan.gates.some(
+        ({ nodeId, kind }: { nodeId: string; kind: string }) =>
+          nodeId === 'review-image' && kind === 'SOURCE_REVIEW',
+      ),
     );
 
     const previousAutomaticKinds = process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
@@ -1774,21 +1820,14 @@ async function checkDelivery(databaseUrl?: string) {
     process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = 'API,WEBHOOK,CRON,UPSTREAM';
     process.env.WEBHOOK_BUILD_DOCKER_SOCKET = '/run/user/1000/fixture-docker.sock';
     try {
-      await api
-        .put(graphConfigPath)
-        .send({
-          ...directConfig,
-          releasePolicy: { requireCodeReview: true, requireApproval: true },
-        })
-        .expect(200);
       const triggerPath = graphPath + '/triggers';
       const triggers = app.get(GraphTriggersService);
       const releaseRule = {
         name: 'Automatic archive release',
         enabled: true,
         version: published.publishedVersion,
-        flowId: 'release',
-        parameterMappings: { image: { source: 'VALUE', value: [savedImage] } },
+        flowId: 'guarded',
+        parameterMappings: { image: { source: 'VALUE', value: savedImage } },
       };
       const events = (ruleId: string) => list(triggerPath + '/' + ruleId + '/events', {});
       const invoke = (ruleId: string, eventId: string) =>
@@ -1800,22 +1839,72 @@ async function checkDelivery(databaseUrl?: string) {
       const releaseTaskFor = async (
         ruleId: string,
         kind: string,
-        approval: 'PENDING' | null = 'PENDING',
+        guarded = true,
       ) => {
         const rows = await events(ruleId);
         assert.equal(rows.length, 1, JSON.stringify(rows));
         const [event] = rows;
         assert.equal(event.status, 'QUEUED', JSON.stringify(event));
-        const run = (await api.get('/api/v1' + graphPath + '/runs/' + event.runId).expect(200)).body
-          .data;
+        const runPath = graphPath + '/runs/' + event.runId;
+        const graphRun = async () => (await api.get('/api/v1' + runPath).expect(200)).body.data;
+        let run = await graphRun();
         assert.equal(run.triggerType, kind);
         if (kind === 'API' || kind === 'WEBHOOK')
           assert.equal(run.trigger.commitSha, failingCommit);
-        const node = run.nodes.find((item: { nodeId: string }) => item.nodeId === 'deploy-node');
+        const releaseNode = () =>
+          run.nodes.find((item: { nodeId: string }) => item.nodeId === 'deploy-node');
+        const decide = async (nodeId: string, scopeHash: string) => {
+          const receipt = await create(runPath + '/nodes/' + nodeId + '/decision', {
+            decision: 'APPROVE',
+            expectedScopeHash: scopeHash,
+          });
+          assert.equal(
+            receipt.nodes.find((item: { nodeId: string }) => item.nodeId === nodeId).output.decision,
+            'APPROVE',
+          );
+          run = await graphRun();
+        };
+        if (guarded) {
+          const gate = (nodeId: string) => {
+            const node = run.nodes.find((item: { nodeId: string }) => item.nodeId === nodeId);
+            assert.equal(node.status, 'WAITING', JSON.stringify(node));
+            assert.equal(releaseNode().taskId, null, 'publication never queues before its gates');
+            assert.match(node.output.scopeHash, /^[a-f0-9]{64}$/);
+            return node.output;
+          };
+          const review = gate('review-image');
+          assert.equal(review.scope.kind, 'SOURCE_REVIEW');
+          assert.deepEqual(review.scope.artifactIds, [savedImage]);
+          assert.deepEqual(
+            review.scope.sources
+              .map(
+                ({ repositoryId, commitSha }: { repositoryId: string; commitSha: string }) =>
+                  `${repositoryId}:${commitSha}`,
+              )
+              .sort(),
+            [
+              `${sharedRepo.id}:${successfulCommit}`,
+              `${dependencyRepo.id}:${auxiliaryCommit}`,
+            ].sort(),
+          );
+          await post(runPath + '/nodes/review-image/decision', {
+            decision: 'APPROVE',
+            expectedScopeHash: '0'.repeat(64),
+          }).expect(409);
+          await decide('review-image', review.scopeHash);
+          const approval = gate('approve-image');
+          assert.equal(approval.scope.kind, 'RELEASE');
+          assert.equal(approval.scope.releaseNodeId, 'deploy-node');
+          assert.equal(approval.scope.serviceId, service.id);
+          assert.deepEqual(approval.scope.serverIds, [serverIds[0]]);
+          assert.deepEqual(approval.scope.artifactIds, [savedImage]);
+          await decide('approve-image', approval.scopeHash);
+        }
+        const node = releaseNode();
         assert.ok(node.taskId, JSON.stringify(node));
         const task = await getTask(node.taskId);
         assert.equal(task.triggerType, kind);
-        assert.equal(task.approvalStatus, approval);
+        assert.equal(task.approvalStatus, null);
         const row = await db
           .selectFrom('tasks')
           .select('payload_json')
@@ -1826,6 +1915,14 @@ async function checkDelivery(databaseUrl?: string) {
           targets: { id: string }[];
         };
         assert.equal(payload.pipeline.graphAutomation?.ruleId, ruleId);
+        assert.equal(
+          payload.pipeline.graphGate?.review?.nodeId,
+          guarded ? 'review-image' : undefined,
+        );
+        assert.equal(
+          payload.pipeline.graphGate?.approval?.nodeId,
+          guarded ? 'approve-image' : undefined,
+        );
         assert.equal(payload.pipeline.commitSha, successfulCommit);
         assert.deepEqual(
           payload.pipeline.deploymentArtifacts?.map(({ id }) => id),
@@ -1939,7 +2036,6 @@ async function checkDelivery(databaseUrl?: string) {
       ] as const) {
         const taskId = await releaseTaskFor(rule.id, kind);
         const activated = activations().length;
-        await create('/deployments/approvals/' + taskId + '/approve', {});
         const release = await runTask(taskId);
         assert.equal(release.status, 'SUCCESS', release.errorSummary);
         assert.equal(activations().length, activated + 1);
@@ -1950,7 +2046,6 @@ async function checkDelivery(databaseUrl?: string) {
       await invoke(revokedRule.id, 'native-api-revoked-rule');
       await triggers.tick();
       const revokedTaskId = await releaseTaskFor(revokedRule.id, 'API');
-      await create('/deployments/approvals/' + revokedTaskId + '/approve', {});
       await api
         .patch('/api/v1' + triggerPath + '/' + revokedRule.id)
         .send({ ...releaseRule, kind: 'API', enabled: false })
@@ -1988,7 +2083,6 @@ async function checkDelivery(databaseUrl?: string) {
       await invoke(ownerRule.id, 'native-api-revoked-owner');
       await triggers.tick();
       const ownerTaskId = await releaseTaskFor(ownerRule.id, 'API');
-      await create('/deployments/approvals/' + ownerTaskId + '/approve', {});
       await api
         .patch('/api/v1/users/' + ruleOwner.id)
         .send({ role: 'VIEWER' })
@@ -1999,17 +2093,10 @@ async function checkDelivery(databaseUrl?: string) {
       assert.equal(ownerRevoked.status, 'FAILED', ownerRevoked.errorSummary);
       assert.match(ownerRevoked.errorSummary, /配置管理员已失效/);
 
-      await api
-        .put(graphConfigPath)
-        .send({
-          ...directConfig,
-          releasePolicy: { requireCodeReview: true, requireApproval: false },
-        })
-        .expect(200);
-      const direct = await create(triggerPath, { ...releaseRule, kind: 'API' });
+      const direct = await create(triggerPath, { ...releaseRule, kind: 'API', flowId: 'release' });
       await invoke(direct.id, 'native-api-direct-release');
       await triggers.tick();
-      const directTaskId = await releaseTaskFor(direct.id, 'API', null);
+      const directTaskId = await releaseTaskFor(direct.id, 'API', false);
       const activated = activations().length;
       const directRelease = await runTask(directTaskId);
       assert.equal(directRelease.status, 'SUCCESS', directRelease.errorSummary);
@@ -2086,61 +2173,72 @@ async function checkDelivery(databaseUrl?: string) {
     assert.equal(savedTemplate.body.data.content, managedV1);
     assert.equal(savedTemplate.headers['cache-control'], 'no-store');
 
-    // The image remains deployable without a Compose file when a template is managed by the service environment.
+    const revision2 = await create(managedPath, managed(managedV2, 1));
+    assert.equal(revision2.version, 2);
+
+    // Graph deployments require their declared Compose source even if a legacy template is active.
     await db
       .updateTable('artifacts')
       .set({ compose_yaml: null, compose_checksum: null })
       .where('id', '=', savedImage)
       .execute();
-    const firstManaged = await submit('release', { image: [savedImage] });
-    assert.equal(firstManaged.detail.status, 'SUCCESS', JSON.stringify(firstManaged.detail.nodes));
-    assert.equal(composeUploads.at(-1), managedV1);
-    const managedDeployTask = firstManaged.detail.nodes.find(
-      (node: { nodeId: string }) => node.nodeId === 'deploy-node',
+    await post(reviewPreview, historicalInput).expect(409);
+    const firstRepository = await submit('repository-template', { image: savedImage });
+    assert.equal(
+      firstRepository.detail.status,
+      'SUCCESS',
+      JSON.stringify(firstRepository.detail.nodes),
+    );
+    assert.equal(composeUploads.at(-1), repositoryCompose);
+    const repositoryDeployTask = firstRepository.detail.nodes.find(
+      (node: { nodeId: string }) => node.nodeId === 'deploy-repository',
     ).taskId;
-    const [managedRecord] = await list('/deployments', { taskId: managedDeployTask });
-    assert.deepEqual(managedRecord.composeRelease, {
-      template: {
-        id: revision.id,
-        source: 'SERVICE_ENVIRONMENT',
-        path: 'compose.yaml',
-        version: 1,
-        checksum: revision.checksum,
-      },
+    const [repositoryRecord] = await list('/deployments', { taskId: repositoryDeployTask });
+    const repositoryTemplate = {
+      source: 'REPOSITORY_FILE',
+      path: repositoryComposePath,
+      repositoryId: sharedRepo.id,
+      commitSha: successfulCommit,
+      checksum: createHash('sha256').update(repositoryCompose).digest('hex'),
+    };
+    assert.deepEqual(firstRepository.reviewed.deliveries[0].composeTemplate, repositoryTemplate);
+    const { composeProject, ...composeEvidence } = repositoryRecord.composeRelease;
+    assert.match(composeProject, /^veyops-[a-f0-9]{24}$/);
+    assert.deepEqual(composeEvidence, {
+      template: repositoryTemplate,
       imageReference: produced.storageKey,
       imageId,
+      dockerEngineId: 'fixture-engine-' + serverIds[0],
     });
 
-    const oldPlan = await create(reviewPreview, historicalInput);
-    const revision2 = await create(managedPath, managed(managedV2, 1));
-    assert.equal(revision2.version, 2);
-    await post(graphPath + '/flows/release/run', {
+    const repositoryFlow = graphPath + '/flows/repository-template';
+    const oldPlan = await create(repositoryFlow + '/preview', historicalInput);
+    const confirmRepository = {
       ...historicalInput,
-      idempotencyKey: randomUUID(),
       expectedConfigurationHash: oldPlan.configurationHash,
+    };
+    const changedRepository = repositoryCompose + '# Unexpected bytes for the same Git object\n';
+    repositoryComposeRead = changedRepository;
+    await post(repositoryFlow + '/run', {
+      ...confirmRepository,
+      idempotencyKey: randomUUID(),
     }).expect(409);
-    const secondManaged = await submit('release', { image: [savedImage] });
-    assert.equal(
-      secondManaged.detail.status,
-      'SUCCESS',
-      JSON.stringify(secondManaged.detail.nodes),
-    );
-    assert.equal(composeUploads.at(-1), managedV2);
+    repositoryComposeRead = repositoryCompose;
+    const queuedRepository = await create(repositoryFlow + '/run', {
+      ...confirmRepository,
+      idempotencyKey: randomUUID(),
+    });
+    const activationCount = activations().length;
+    repositoryComposeRead = changedRepository;
+    const changedRun = await waitGraph(queuedRepository.id);
+    assert.equal(changedRun.status, 'FAILED', JSON.stringify(changedRun.nodes));
+    assert.equal(activations().length, activationCount);
+    assert.equal(composeUploads.at(-1), repositoryCompose);
+    repositoryComposeRead = repositoryCompose;
 
     const archiveRevision = await create(managedPath, { source: 'ARCHIVE', expectedVersion: 2 });
     assert.equal(archiveRevision.version, 3);
     await post(reviewPreview, historicalInput).expect(409);
-    const managedRollbackPath = `/deployments/${managedRecord.id}/rollback`;
-    const managedRollbackPlan = await create(managedRollbackPath + '/preview', {});
-    assert.deepEqual(managedRollbackPlan.composeTemplate, managedRecord.composeRelease.template);
-    assert.deepEqual(managedRollbackPlan.previousCompose, managedRecord.composeRelease);
-    const managedRollback = await create(managedRollbackPath, {
-      confirmationHash: managedRollbackPlan.confirmationHash,
-    });
-    assert.equal((await runTask(managedRollback.id)).status, 'SUCCESS');
-    assert.equal(composeUploads.at(-1), managedV1);
-    const [managedRolledBack] = await list('/deployments', { taskId: managedRollback.id });
-    assert.deepEqual(managedRolledBack.composeRelease, managedRecord.composeRelease);
   } finally {
     await app.close();
   }
