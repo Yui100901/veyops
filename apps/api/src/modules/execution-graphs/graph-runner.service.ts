@@ -3622,6 +3622,7 @@ export class GraphRunnerService implements OnModuleInit {
             'server_name_snapshot as serverName',
             'status',
             'exit_code as exitCode',
+            'error_summary as errorSummary',
             'started_at as startedAt',
             'finished_at as finishedAt',
           ])
@@ -3647,7 +3648,11 @@ export class GraphRunnerService implements OnModuleInit {
     };
     const targetsByTask = new Map<string, TargetDetail[]>();
     for (const { targetRowId, ...value } of targetRows) {
-      const target: TargetDetail = { ...value, inspection: observations.get(targetRowId) };
+      const target: TargetDetail = {
+        ...value,
+        errorSummary: value.errorSummary && redactTaskLog(value.errorSummary),
+        inspection: observations.get(targetRowId),
+      };
       const saved = targetsByTask.get(target.taskId);
       if (saved) saved.push(target);
       else targetsByTask.set(target.taskId, [target]);

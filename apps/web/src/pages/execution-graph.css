@@ -349,9 +349,14 @@ button.graph-node:focus-visible {
   margin-bottom: 0.65rem;
 }
 
-.graph-run-targets > li:has(.graph-release-inspection) {
+.graph-run-targets > li:has(.graph-release-inspection, .graph-target-error) {
   flex-basis: 100%;
   min-width: 0;
+}
+
+.graph-target-error {
+  margin: 0.25rem 0 0;
+  overflow-wrap: anywhere;
 }
 
 .graph-release-inspection {

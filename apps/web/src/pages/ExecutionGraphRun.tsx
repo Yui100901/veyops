@@ -52,9 +52,10 @@ import type {
   GraphRun,
 } from './execution-graph-definition';
 import { deliveryPath, deliveryTabs, type DeliveryScope } from './delivery-route';
-import { projectGraphPath, projectResourcePath } from './project-workspace-route';
+import { projectEntryPath, projectGraphPath, projectResourcePath } from './project-workspace-route';
 import { serverResourceHref } from './server-resource-route';
 import {
+  graphDraftSetupHref,
   graphRunHref,
   graphStartReadiness,
   graphWorkbenchPath,
@@ -654,6 +655,7 @@ interface RunNode {
     serverName?: string;
     status: string;
     exitCode?: number | null;
+    errorSummary?: string | null;
     startedAt?: number | null;
     finishedAt?: number | null;
     inspection?: ReleaseInspection;
@@ -682,6 +684,177 @@ interface RunDetail extends GraphRun {
   definition?: GraphFlow;
   trigger?: Record<string, unknown>;
   environmentSet?: GraphEnvironmentSetSummary | null;
+}
+
+function failedRunStatus(status: string) {
+  return ['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION'].includes(status);
+}
+
+function RunNodeRecovery({
+  node,
+  flow,
+  project,
+  scope,
+  version,
+  nodeHref,
+  canRepair,
+  canReplan,
+}: {
+  node: RunNode;
+  flow: GraphFlow;
+  project: ProjectDetail;
+  scope: GraphWorkbenchScope;
+  version: number;
+  nodeHref: (id: string) => string;
+  canRepair: boolean;
+  canReplan: boolean;
+}) {
+  const { issue } = node;
+  if (!issue && !failedRunStatus(node.status)) return null;
+
+  const issueKind = issue && repairKind(issue.code);
+  const currentFlow = !issue?.flowId || issue.flowId === flow.id;
+  const startNode = flow.nodes.find(({ type }) => type === 'START');
+  const inputId =
+    issue?.parameterId ?? (node.nodeId === startNode?.id ? issue?.fieldId : undefined);
+  const field = currentFlow ? startNode?.inputs?.find(({ id }) => id === inputId) : undefined;
+  const start = { ...scope, start: flow.id, version, field: field?.id };
+  const source = flow.nodes.find(({ id }) => id === issue?.sourceNodeId);
+  const missingSource = currentFlow && source?.id !== node.nodeId ? source : undefined;
+  const repository = project.repositories.find(({ id }) => id === issue?.repositoryId);
+  const artifactRefs = (node.inputs ?? [])
+    .filter(({ type, sensitive }) => type === 'ARTIFACT' && !sensitive)
+    .flatMap(({ value }) => (Array.isArray(value) ? value : [value]))
+    .map(artifactOutput)
+    .filter((reference) => reference && !reference.temporary);
+  const artifactHref =
+    '#' +
+    deliveryPath(project.id, 'artifacts', {
+      view: scope.view,
+      viewSearch: scope.viewSearch,
+      ...(artifactRefs.length === 1
+        ? { recordId: artifactRefs[0]?.id }
+        : {
+            serviceId: issue?.serviceId ?? scope.serviceId,
+            environmentId: issue?.environmentId ?? scope.environmentId,
+          }),
+    });
+
+  return (
+    <div className="error-banner graph-plan-issue" role="status">
+      <AlertCircle size={17} aria-hidden="true" />
+      <div>
+        <strong>
+          {node.status === 'NEEDS_ATTENTION'
+            ? '执行结果待核查'
+            : issue
+              ? planIssueLabels[issue.code]
+              : '节点执行异常'}
+        </strong>
+        {issue && (
+          <p>
+            {[issue.fieldName ?? issue.fieldId, issue.branchId, issue.message]
+              .filter(Boolean)
+              .join(' · ')}
+          </p>
+        )}
+        {node.status === 'NEEDS_ATTENTION' && <p>请核查目标的实际状态和已记录的执行结果。</p>}
+        <div className="graph-node-actions">
+          {missingSource && (
+            <a className="button secondary small" href={nodeHref(missingSource.id)}>
+              查看来源节点运行 · {missingSource.name}
+            </a>
+          )}
+          {issue?.code === 'REPOSITORY' && (
+            <a
+              className="button secondary small"
+              href={
+                '#' +
+                projectResourcePath(project.id, {
+                  resource: 'repositories',
+                  repositoryId: repository?.id,
+                  view: scope.view,
+                  viewSearch: scope.viewSearch,
+                })
+              }
+            >
+              {repository ? `查看仓库 · ${repository.name}` : '查看项目仓库'}
+            </a>
+          )}
+          {issue?.code === 'ARTIFACT' && (
+            <a className="button secondary small" href={artifactHref}>
+              {artifactRefs.length === 1 ? '查看所选产物' : '查看项目产物'}
+            </a>
+          )}
+          {issue?.code === 'BUILD_TARGET' && (
+            <a
+              className="button secondary small"
+              href={'#' + projectEntryPath(project.id, 'configuration', scope)}
+            >
+              查看项目执行配置
+            </a>
+          )}
+          {issue?.code === 'RELEASE_TARGET' &&
+            project.environments.some(({ id }) => id === issue.environmentId) && (
+              <a
+                className="button secondary small"
+                href={
+                  '#' +
+                  projectResourcePath(project.id, {
+                    resource: 'environments',
+                    environmentId: issue.environmentId,
+                    panel: 'targets',
+                    view: scope.view,
+                    viewSearch: scope.viewSearch,
+                  })
+                }
+              >
+                查看环境发布目标
+              </a>
+            )}
+          {canRepair && currentFlow && issue && issueKind && (
+            <ExecutionGraphRepairLinks
+              project={project}
+              flow={flow}
+              start={start}
+              issue={{ ...issue, nodeId: node.nodeId, kind: issueKind, parameterId: field?.id }}
+            />
+          )}
+          {canRepair &&
+            currentFlow &&
+            issue &&
+            !issueKind &&
+            (field ? (
+              <ExecutionGraphParameterLink
+                projectId={project.id}
+                start={start}
+                fieldId={field.id}
+                label="调整运行参数"
+              />
+            ) : (
+              <a
+                className="button secondary small"
+                href={graphDraftSetupHref(project.id, start, {
+                  flow: flow.id,
+                  node: node.nodeId,
+                  field: issue.fieldId,
+                })}
+              >
+                定位草稿中的节点配置
+              </a>
+            ))}
+          {canReplan && !field && (
+            <a
+              className="button secondary small"
+              href={'#' + graphWorkbenchPath(project.id, start)}
+            >
+              打开原版本重新预览
+            </a>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function needsReleaseInspection(node: RunNode, target: NonNullable<RunNode['targets']>[number]) {
@@ -851,10 +1024,11 @@ function RunDetails({
     nodeSelection?.linked === selectedNodeId
       ? (nodeSelection?.nodeId ?? selectedNodeId)
       : selectedNodeId;
+  const failures = item?.nodes.filter(({ status }) => failedRunStatus(status)) ?? [];
   const n =
     item?.nodes.find(({ nodeId }) => nodeId === requestedNode) ??
     item?.nodes.find(({ status }) => ['WAITING', 'RUNNING'].includes(status)) ??
-    item?.nodes.find(({ status }) => ['FAILED', 'NEEDS_ATTENTION', 'TIMED_OUT'].includes(status)) ??
+    failures[0] ??
     item?.nodes[0];
   const nodeDefinition = item?.definition?.nodes.find(({ id }) => id === n?.nodeId);
   const canInspect = canApprove || (canCancel && item?.createdBy === userId);
@@ -870,19 +1044,13 @@ function RunDetails({
     view: scope.view,
     viewSearch: scope.viewSearch,
   };
+  const nodeHref = (node: string) =>
+    '#' + graphWorkbenchPath(projectId, { ...scope, ...delivery, run: item?.id, node });
   const releaseContext = {
     projectId,
     deliveryScope,
-    returnPath: item ? graphRunHref(projectId, item.id, scope, delivery).slice(1) : '',
-    nodeHref: (node: string) =>
-      '#' +
-      graphWorkbenchPath(projectId, {
-        ...scope,
-        ...delivery,
-        pane: 'history',
-        run: item?.id,
-        node,
-      }),
+    returnPath: n ? nodeHref(n.nodeId).slice(1) : '',
+    nodeHref,
     nodeName: (id: string) => item?.nodes.find(({ nodeId }) => id === nodeId)?.name,
     repositoryName: (id) => project.repositories.find((repository) => id === repository.id)?.name,
     serviceName: (id) =>
@@ -902,6 +1070,10 @@ function RunDetails({
         taskId: delivery.taskId,
       });
   const active = ['PENDING', 'QUEUED', 'WAITING', 'RUNNING'].includes(item?.status ?? '');
+  const releaseChecks =
+    item?.nodes.flatMap(
+      (node) => node.targets?.filter((target) => needsReleaseInspection(node, target)) ?? [],
+    ) ?? [];
   function selectNode(nodeId: string) {
     setNodeSelection({ linked: selectedNodeId, nodeId });
     window.requestAnimationFrame(() => showSelectedNode(nodeDetail.current));
@@ -1035,6 +1207,20 @@ function RunDetails({
                   ))}
                 </div>
               ) : null}
+              {failures.length > 1 && (
+                <nav aria-label="异常节点" className="graph-node-actions">
+                  {failures.map((failure) => (
+                    <a
+                      className="button secondary small"
+                      key={failure.nodeId}
+                      href={nodeHref(failure.nodeId)}
+                      aria-current={n?.nodeId === failure.nodeId ? 'location' : undefined}
+                    >
+                      {failure.name} <Status value={failure.status} />
+                    </a>
+                  ))}
+                </nav>
+              )}
               {n && (
                 <div className="graph-node-layout">
                   <div className="graph-node-location">
@@ -1089,6 +1275,7 @@ function RunDetails({
                               version: item.version,
                               node: n.nodeId,
                               flow: item.flowId,
+                              field: n.issue?.fieldId,
                             })
                           }
                         >
@@ -1100,36 +1287,22 @@ function RunDetails({
                           </a>
                         )}
                       </div>
-                      {n.issue && (
-                        <div role="status" className="error-banner">
-                          <span>
-                            {[
-                              n.issue.fieldName ?? n.issue.fieldId,
-                              n.issue.branchId,
-                              n.issue.message,
-                            ]
-                              .filter(Boolean)
-                              .join(' · ')}
-                          </span>
-                          {n.issue.sourceNodeId && (
-                            <a
-                              className="text-link"
-                              href={
-                                '#' +
-                                graphWorkbenchPath(projectId, {
-                                  ...scope,
-                                  pane: 'published',
-                                  version: item.version,
-                                  node: n.issue.sourceNodeId,
-                                  field: n.issue.sourceFieldId,
-                                  flow: item.flowId,
-                                })
-                              }
-                            >
-                              查看来源节点
-                            </a>
-                          )}
-                        </div>
+                      {item.definition && (
+                        <RunNodeRecovery
+                          project={project}
+                          node={n}
+                          flow={item.definition}
+                          scope={scope}
+                          version={item.version}
+                          nodeHref={nodeHref}
+                          canRepair={canCancel}
+                          canReplan={
+                            canCancel &&
+                            failedRunStatus(item.status) &&
+                            item.status !== 'NEEDS_ATTENTION' &&
+                            releaseChecks.length === 0
+                          }
+                        />
                       )}
                       <FieldEvidenceList
                         title="节点输入"
@@ -1268,7 +1441,10 @@ function RunDetails({
                       {!!n.targets?.length && (
                         <details
                           className="graph-field-card"
-                          open={n.targets.some((target) => needsReleaseInspection(n, target))}
+                          open={n.targets.some(
+                            (target) =>
+                              failedRunStatus(target.status) || needsReleaseInspection(n, target),
+                          )}
                         >
                           <summary>逐目标执行 · {n.targets.length} 项</summary>
                           <ul className="graph-edge-list graph-run-targets">
@@ -1280,12 +1456,7 @@ function RunDetails({
                                     href={serverResourceHref({
                                       serverId: target.serverId,
                                       projectId,
-                                      returnPath: graphRunHref(
-                                        projectId,
-                                        item.id,
-                                        scope,
-                                        delivery,
-                                      ).slice(1),
+                                      returnPath: releaseContext.returnPath,
                                     })}
                                   >
                                     {target.serverName ?? target.serverId}
@@ -1301,6 +1472,11 @@ function RunDetails({
                                     <small>结束 {formatTime(target.finishedAt)}</small>
                                   )}
                                 </div>
+                                {target.errorSummary && (
+                                  <p className="error-text graph-target-error">
+                                    {target.errorSummary}
+                                  </p>
+                                )}
                                 {needsReleaseInspection(n, target) && (
                                   <ExecutionGraphReleaseInspection
                                     context={releaseContext}
@@ -1308,7 +1484,9 @@ function RunDetails({
                                     latest={target.inspection}
                                     canInspect={canInspect}
                                     replanHref={
-                                      canInspect
+                                      canInspect &&
+                                      failedRunStatus(item.status) &&
+                                      releaseChecks.every(({ inspection }) => inspection?.canReplan)
                                         ? '#' +
                                           graphWorkbenchPath(projectId, {
                                             ...scope,

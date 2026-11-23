@@ -19,7 +19,7 @@ import {
 import { ArrayMaxSize, ArrayUnique, IsArray, IsOptional, IsUUID } from 'class-validator';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, open, realpath } from 'node:fs/promises';
+import { open, realpath } from 'node:fs/promises';
 import { basename, dirname, join, posix } from 'node:path';
 import type { Response } from 'express';
 import { dataDirectory } from '../../core/config';
@@ -151,7 +151,9 @@ function applicationServer(row: Pick<Instance, 'physical_json' | 'server_id'>) {
 function displayPhysical(row: Pick<Instance, 'physical_json'>) {
   const real = physicalOf(row);
   if (!real) return undefined;
-  const { ownerToken: _ownerToken, hostKeyFingerprint: _hostKeyFingerprint, ...display } = real;
+  const display = { ...real };
+  delete display.ownerToken;
+  delete display.hostKeyFingerprint;
   return display;
 }
 

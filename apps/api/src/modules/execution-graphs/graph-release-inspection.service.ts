@@ -23,8 +23,7 @@ import type { GraphReleaseResult } from './graph-release-gates';
 
 const inspectionAction = 'execution-flow.release.inspected';
 const inspectionResource = 'execution-release-target';
-const inspectionStatus = ['CURRENT', 'PREVIOUS', 'NO_ACTIVE_RELEASE', 'UNKNOWN'] as const;
-type InspectionStatus = (typeof inspectionStatus)[number];
+type InspectionStatus = 'CURRENT' | 'PREVIOUS' | 'NO_ACTIVE_RELEASE' | 'UNKNOWN';
 
 export interface GraphReleaseInspection {
   status: InspectionStatus;
