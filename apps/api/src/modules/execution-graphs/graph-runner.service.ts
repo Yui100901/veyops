@@ -1326,7 +1326,7 @@ export class GraphRunnerService implements OnModuleInit {
             const startField = (flowStart(current).inputs ?? []).find(
               ({ id }) => field.source?.fieldId === id,
             );
-            if (field.fieldId === 'artifact' && startField?.selection === 'LATEST_COMPATIBLE') {
+            if (field.type === 'ARTIFACT' && startField?.selection === 'LATEST_COMPATIBLE') {
               field.state = 'DEFERRED';
               field.message = '预览将选择最新兼容产物';
             } else {

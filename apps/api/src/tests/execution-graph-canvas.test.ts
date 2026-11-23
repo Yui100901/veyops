@@ -63,6 +63,39 @@ test('each paired start defines its own named flow and independent incoming edge
   assert.equal(canvas.templates[0]!.message, '模板日志');
 });
 
+test('the compiled start reads explicit run parameters with their original provenance', () => {
+  const canvas = sharedCanvas();
+  canvas.nodes[1]!.inputs = [
+    { id: 'savedArtifact', name: '已登记产物', type: 'ARTIFACT', required: true },
+    { id: 'profile', name: '环境', type: 'TEXT', required: true, defaultValue: 'stable' },
+  ];
+  const flow = compileCanvas(canvas, true).flows[1]!;
+  const start = flow.nodes[0]!;
+  const artifact = { artifactId: '44f3a210-87ea-4bb2-b345-956476f09ee5' };
+  const inspected = inspectNodeInputs(flow, start, {
+    context: {},
+    parameters: { savedArtifact: artifact, profile: 'staging' },
+    parameterSources: { profile: { kind: 'TRIGGER_EVENT', eventField: 'environment' } },
+  });
+  assert.deepEqual({ ...inspected.values }, { savedArtifact: artifact, profile: 'staging' });
+  assert.deepEqual(inspected.evidence[1]?.source, {
+    kind: 'TRIGGER_EVENT',
+    fieldId: 'profile',
+    eventField: 'environment',
+  });
+  assert.deepEqual(
+    inspectNodeInputs(flow, start, { context: {} }).evidence.map(({ state }) => state),
+    ['ERROR', 'DEFAULTED'],
+  );
+  assert.equal(
+    inspectNodeInputs(flow, start, {
+      context: {},
+      pendingArtifacts: new Set(['savedArtifact']),
+    }).evidence[0]?.state,
+    'DEFERRED',
+  );
+});
+
 test('draft accepts disconnected nodes and unplaced templates but cannot publish an incomplete flow', () => {
   const canvas = sharedCanvas();
   canvas.nodes.push(

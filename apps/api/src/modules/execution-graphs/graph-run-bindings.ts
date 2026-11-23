@@ -262,11 +262,21 @@ export function inspectNodeInputs(
   calledFlow?: GraphFlow,
 ) {
   const compiled = flow.compiled?.nodes[node.id];
-  const fields = compiled?.inputs ?? graphModulePorts(node, calledFlow)?.inputs ?? [];
+  const fields =
+    compiled?.inputs ??
+    (node.type === 'START' ? node.inputs : graphModulePorts(node, calledFlow)?.inputs) ??
+    [];
   const bindings = compiled?.inputBindings ?? flow.inputBindings?.[node.id] ?? {};
   const values: Values = Object.create(null);
   const evidence = fields.map((field) => {
-    const binding = bindings[field.id] ?? graphDefaultBinding(flow, node, field.id);
+    const binding: GraphBinding | undefined =
+      node.type === 'START'
+        ? {
+            kind: 'INPUT',
+            fieldId: field.id,
+            onMissing: field.defaultValue === undefined ? undefined : 'USE_DEFAULT',
+          }
+        : (bindings[field.id] ?? graphDefaultBinding(flow, node, field.id));
     const usesDeclaredDefault =
       binding?.kind === 'VALUE' &&
       node.declaredPorts &&

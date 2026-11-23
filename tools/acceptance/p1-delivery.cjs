@@ -76,7 +76,13 @@ function createApi() {
       (expected !== undefined && response.status !== expected) ||
       (expected === undefined && !response.ok)
     ) {
-      throw new Error(`${method} ${path} 返回 ${response.status} ${json.error?.message ?? ''}`);
+      const issue = json.error?.planIssue;
+      const location =
+        issue && [issue.code, issue.flowId, issue.nodeId, issue.fieldId].filter(Boolean);
+      const detail = location?.length ? ` [${location.join(' / ')}]` : '';
+      throw new Error(
+        `${method} ${path} 返回 ${response.status} ${json.error?.message ?? ''}${detail}`,
+      );
     }
     return json.data;
   };
