@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import request from 'supertest';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
+import type { GraphField } from '../modules/execution-graphs/graph-fields';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
 import { replaceVariables } from './helpers/variable-scope';
 
@@ -125,6 +126,7 @@ async function checkResources(databaseUrl?: string) {
     });
     const [editedService, editedEnvironment, editedRepo] = await Promise.all([
       patch(root + '/services/' + service.id, {
+        expectedRevision: service.revision,
         name: 'Service v2',
         slug: 'service',
         serviceType: 'API',
@@ -133,7 +135,6 @@ async function checkResources(databaseUrl?: string) {
         name: 'Test v2',
         slug: 'test',
         environmentType: 'TESTING',
-        defaultTargetSelection: { groupIds: [group.id], maxParallel: 2 },
       }),
       patch(root + '/repositories/' + repo.id, {
         name: 'Git v2',
@@ -143,30 +144,60 @@ async function checkResources(databaseUrl?: string) {
     ]);
     assert.equal(editedService.serviceType, 'API');
     assert.equal(editedEnvironment.environmentType, 'TESTING');
-    assert.deepEqual(editedEnvironment.defaultTargetSelection, {
-      serverIds: [],
-      groupIds: [group.id],
-      strategy: 'PARALLEL',
-      maxParallel: 2,
-      failurePolicy: 'CONTINUE',
-    });
-    const blockedDefault = await api.delete(base + '/server-groups/' + group.id).expect(409);
-    assert.ok(
-      blockedDefault.body.error.references.some(
-        (ref: { sourceKind: string; environmentId: string }) =>
-          ref.sourceKind === 'ENVIRONMENT_DEFAULT' && ref.environmentId === environment.id,
-      ),
-    );
-    const environmentInventory = await fetch(root + '/resource-references');
-    assert.ok(
-      environmentInventory.servers
-        .find((row: { id: string }) => row.id === server.id)
-        ?.references.some(
-          (ref: { sourceKind: string }) => ref.sourceKind === 'ENVIRONMENT_DEFAULT',
-        ),
-    );
     assert.equal(editedRepo.defaultBranch, null);
     assert.equal(editedRepo.branchSyncStatus, 'ERROR');
+    const graphPath = root + '/execution-graph';
+    const publishResourceReferences = async (inputs: GraphField[]) => {
+      const { revision } = await fetch(graphPath);
+      const draft = await api
+        .put(base + graphPath + '/draft')
+        .send({
+          expectedRevision: revision,
+          definition: {
+            flows: [],
+            canvas: {
+              nodes: [
+                {
+                  id: 'start',
+                  type: 'START',
+                  name: '目标选择',
+                  inputs,
+                },
+                { id: 'end', type: 'END', name: '完成' },
+              ],
+              edges: [{ from: 'start', to: 'end' }],
+              endpoints: [{ startId: 'start', endId: 'end' }],
+              templates: [],
+            },
+          },
+        })
+        .expect(200);
+      const published = await create(graphPath + '/publish', {
+        expectedRevision: draft.body.data.revision,
+      });
+      return published.publishedVersion as number;
+    };
+    const resourceVersion = await publishResourceReferences([
+      { id: 'targets', name: '目标', type: 'TARGETS', defaultValue: { groupIds: [group.id] } },
+      { id: 'service', name: '服务', type: 'SERVICE', defaultValue: service.id },
+      { id: 'environment', name: '环境', type: 'ENVIRONMENT', defaultValue: environment.id },
+    ]);
+    const blockedGroup = await api.delete(base + '/server-groups/' + group.id).expect(409);
+    assert.ok(
+      blockedGroup.body.error.references.some(
+        (ref: { sourceKind: string; state: string; fieldId: string }) =>
+          ref.sourceKind === 'GRAPH' && ref.state === 'RUNNABLE' && ref.fieldId === 'targets',
+      ),
+    );
+    const graphInventory = await fetch(root + '/resource-references');
+    assert.ok(
+      graphInventory.servers
+        .find((row: { id: string }) => row.id === server.id)
+        ?.references.some(
+          (ref: { sourceKind: string; state: string }) =>
+            ref.sourceKind === 'GRAPH' && ref.state === 'RUNNABLE',
+        ),
+    );
     const fixtureTarget = await create('/deployment-targets', {
       name: 'Fixture deploy',
       serverIds: [server.id],
@@ -187,50 +218,59 @@ async function checkResources(databaseUrl?: string) {
     await replaceVariables(api, base + `/environments/${environment.id}/variables`, [
       { key: 'ENVIRONMENT_MODE', value: 'fixture' },
     ]);
-    const address = await create(root + '/addresses', {
-      name: 'API',
-      url: 'https://example.invalid/api',
-      serviceId: service.id,
-      environmentId: environment.id,
-      addressType: 'API',
+    const servicePath = root + '/services/' + service.id;
+    const serviceWithAddresses = await patch(servicePath, {
+      expectedRevision: editedService.revision,
+      addresses: [
+        { name: 'API', url: 'https://example.invalid/api' },
+        { name: 'Docs', url: 'https://docs.example.invalid' },
+      ],
     });
-    const docs = await create(root + '/addresses', {
-      name: 'Docs',
-      url: 'https://docs.example.invalid',
-    });
+    const [address, docs] = serviceWithAddresses.addresses;
     const cards: {
       id: string;
       addresses: {
         id: string;
         name: string;
         url: string;
-        serviceName: string | null;
-        environmentName: string | null;
+        serviceId: string;
+        serviceName: string;
+        environmentName: null;
       }[];
     }[] = await fetch('/projects?include=addresses');
-    assert.deepEqual(cards.find((p) => p.id === project.id)?.addresses, [
-      {
-        id: address.id,
-        name: 'API',
-        url: address.url,
+    assert.deepEqual(
+      cards.find((p) => p.id === project.id)?.addresses,
+      [address, docs].map((link) => ({
+        ...link,
+        serviceId: service.id,
         serviceName: editedService.name,
-        environmentName: editedEnvironment.name,
-      },
-      { id: docs.id, name: 'Docs', url: docs.url, serviceName: null, environmentName: null },
-    ]);
+        environmentName: null,
+      })),
+    );
     assert.deepEqual(cards.find((p) => p.id === peer.id)?.addresses, []);
     assert.equal('addresses' in (await fetch('/projects'))[0], false);
-    await api.delete(base + root + '/addresses/' + docs.id).expect(200);
+    const retainedAddress = await patch(servicePath, {
+      expectedRevision: serviceWithAddresses.revision,
+      addresses: [address],
+    });
+    assert.deepEqual(retainedAddress.addresses, [address]);
     await api
       .patch(base + '/projects/' + peer.id + '/services/' + service.id)
-      .send({ name: 'Wrong project', slug: 'wrong' })
+      .send({ expectedRevision: retainedAddress.revision, name: 'Wrong project', slug: 'wrong' })
       .expect(404);
+    const otherServicePath = '/projects/' + peer.id + '/services';
+    const otherService = await create(otherServicePath, {
+      name: 'Peer service',
+      slug: 'peer-service',
+    });
     await api
-      .post(base + '/projects/' + peer.id + '/addresses')
-      .send({ name: 'Wrong project', url: 'https://example.invalid', serviceId: service.id })
+      .patch(base + otherServicePath + '/' + otherService.id)
+      .send({ expectedRevision: otherService.revision, addresses: [address] })
       .expect(400);
     await api.delete(base + root + '/services/' + service.id).expect(409);
     await api.delete(base + root + '/environments/' + environment.id).expect(409);
+    await publishResourceReferences([]);
+    await create(`${graphPath}/versions/${resourceVersion}/retire`, {});
     assert.equal((await fetch(configuredScope + '/config')).targetId, fixtureTarget.id);
     assert.equal((await fetch(configuredScope + '/variables')).variables[0].key, 'SERVICE_MODE');
     assert.equal(
@@ -367,18 +407,19 @@ async function checkResources(databaseUrl?: string) {
         variables: [{ key: secretKey, isSecret: true, keepSecret: true }],
       })
       .expect(409);
-    await api.put(base + projectVarsPath).send({ variables: [] }).expect(400);
+    await api
+      .put(base + projectVarsPath)
+      .send({ variables: [] })
+      .expect(400);
     assert.equal((await fetch(projectVarsPath)).variables.length, 3);
     assert.deepEqual((await api.post(revealUrl).expect(201)).body.data, {
       value: 'rotated-secret-value',
     });
-    const cleared = await patch(root + '/environments/' + environment.id, {
-      defaultTargetSelection: null,
+    const withoutAddresses = await patch(servicePath, {
+      expectedRevision: retainedAddress.revision,
+      addresses: [],
     });
-    assert.equal(cleared.name, editedEnvironment.name);
-    assert.equal(cleared.environmentType, 'TESTING');
-    assert.equal(cleared.defaultTargetSelection, null);
-    await api.delete(base + root + '/addresses/' + address.id).expect(200);
+    assert.deepEqual(withoutAddresses.addresses, []);
     await api.delete(base + root + '/environments/' + environment.id).expect(200);
     const staging = await create(root + '/environments', { name: 'Staging', slug: 'staging' });
     const unusedService = await create(root + '/services', {
@@ -389,13 +430,30 @@ async function checkResources(databaseUrl?: string) {
     await api.delete(base + root + '/services/' + unusedService.id).expect(200);
     await configure(service.id, staging.id);
     assert.equal((await fetch(root)).deploymentTargets[0].id, fixtureTarget.id);
-    assert.deepEqual((await fetch('/servers/' + server.id)).projects, [
-      {
-        id: project.id,
-        name: 'Fixture A',
-        slug: 'fixture-a',
-      },
-    ]);
+    const serverProjects: {
+      id: string;
+      name: string;
+      slug: string;
+      references: { environmentId?: string; viaTargetId?: string; state: string }[];
+    }[] = (await fetch('/servers/' + server.id)).projects;
+    assert.deepEqual(
+      serverProjects.map(({ id, name, slug }) => ({ id, name, slug })),
+      [
+        {
+          id: project.id,
+          name: 'Fixture A',
+          slug: 'fixture-a',
+        },
+      ],
+    );
+    assert.ok(
+      serverProjects[0]?.references.some(
+        ({ environmentId, viaTargetId, state }) =>
+          environmentId === staging.id &&
+          viaTargetId === fixtureTarget.id &&
+          state === 'CONFIGURED',
+      ),
+    );
 
     const dependency = await create(root + '/dependencies', { dependsOnProjectId: peer.id });
     assert.deepEqual((await fetch('/projects/' + peer.id)).dependents, [
