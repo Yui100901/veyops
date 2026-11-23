@@ -23,7 +23,7 @@
 | `deploy-compose` | 固定生产模拟配置 | 选用与主机相符的已登记镜像，Compose 模板读取同一固定提交的 `compose.yaml`。 |
 | `build-and-deploy-compose` | 固定生产模拟配置 | 复用 `build-image` 和 `deploy-image`，发布节点取本次构建的镜像。结束节点返回发布结果、目录和镜像。 |
 | `reviewed-target-bundle` | 固定生产模拟配置 | 核对实际源码 SHA 后复用 `build-image`，返回本次构建的目录和镜像。 |
-| `shell-register` | 固定联调配置 | Shell 读取 `ARTIFACT_DIR` 生成目录并传出工作区。登记节点读取同一目录参数，返回 `shellDirectory`。 |
+| `shell-register` | 固定联调配置 | Shell 读取 `ARTIFACT_DIR` 生成目录，并通过自己的具名产物端口返回 `shellDirectory`。 |
 | `deploy-latest-directory` | 无引用 | 省略产物参数后，按生产模拟组目标选择最新兼容目录，复用 `deploy-files`。 |
 | `rollback-existing` | 固定联调配置 | 在同一服务、目标和目的地已有两次发布后，选择较早发布使用的目录并执行图内回滚，逐目标返回回滚关系。 |
 | `health-rollback` | 固定联调配置 | 遇到演示候选页面时，探针显式返回 `10`，按条件选择历史目录回滚。在健康分支直接返回检查结果。 |
@@ -44,7 +44,7 @@
 - `approve-storefront.configuration` 对应 `APPROVAL.approval`，`review-source.configuration` 对应 `SOURCE_REVIEW.approval`，`SERVICE_RESULT` 对应实际 API 的 `RELEASE` 字段。将 `configuration.deployPath`、`method` 和 `composeSource` 放入发布节点的 `deploy`。
 - `load-files.configuration` 对应 `LOAD_ENV.loadEnvironment`。当前图 API 用 `envFile` 表示单一路径，映射直接使用 `pathRule`。
 - `copy-static-site` 将仓库中的 `index.html` 复制到工作区的 `dist/index.html`。目标构建另生成声明为临时输出的 `reports/summary.json`，内容只记录实际 Git SHA 和非敏感的 `FILE_PROFILE`。`docker-image` 以工作区中的 `Dockerfile` 构建镜像并记录实际 Image ID。`copy-static-and-image` 同时执行静态文件构建和 Docker 镜像构建，登记两个具名产物。初始化器需映射访问地址，并在专用联调目标上为文件发布目录准备静态站点入口。
-- `shell-register` 的开始参数 `artifactDir` 默认为 `dist-shell`。它绑定到 Shell 的 `ARTIFACT_DIR` 和登记节点的 `path`，可在运行前指定工作区内的其他目录。
+- `shell-register` 的开始参数 `artifactDir` 默认为 `dist-shell`。它绑定到 Shell 的 `ARTIFACT_DIR`。该输入同时作为 `shellDirectory` 的路径来源，可在运行前指定工作区内的其他目录。
 - `sourceSnapshot.files` 按 UTF-8 与 LF 写入同一个无父提交的 Git 快照，文件模式均为 `100644`。以 Git SHA-1 对象格式生成的固定提交为 `5038e89acaeb008526d112afc3d68b812e2a10ff`，各构建开始参数默认引用此提交。`nextSnapshot` 可重复生成替换版本，用于观察健康失败和回滚前后的真实页面变化。
 - `reuseExamples` 指向应从实际运行结果读取的产物 ID。构建完成后使用返回的 `artifactId`，验证具体物理实例，再提交历史部署或回滚参数。产物位置、大小、摘要和镜像 ID 由执行模块记录。
 

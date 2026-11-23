@@ -141,11 +141,8 @@ graph:
           set -eu
           mkdir -p -- "$ARTIFACT_DIR"
           cp -- index.html "$ARTIFACT_DIR/index.html"
-    - id: register-shell
-      module: artifact.register
-      moduleVersion: 1
       outputs:
-        - { id: shellDirectory, type: DIRECTORY, required: true, persist: true }
+        - { id: shellDirectory, type: DIRECTORY, pathInput: ARTIFACT_DIR, required: true, persist: true }
     - id: deploy-files
       module: deploy.artifact
       moduleVersion: 1
@@ -457,19 +454,17 @@ graph:
           - *service
           - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
           - { id: artifactDir, type: PATH, referenceName: ARTIFACT_DIR, required: true, defaultValue: dist-shell }
-      path: [checkout, prepare-shell, register-shell]
+      path: [checkout, prepare-shell]
       bindings:
         checkout: *checkout_inputs
         prepare-shell:
           workspace: { kind: OUTPUT, nodeId: checkout, fieldId: workspace }
+          service: { kind: INPUT, fieldId: service }
           ARTIFACT_DIR: { kind: INPUT, fieldId: artifactDir }
-        register-shell:
-          workspace: { kind: OUTPUT, nodeId: prepare-shell, fieldId: workspace }
-          path: { kind: INPUT, fieldId: artifactDir }
       end:
         id: end-shell-register
         outputs:
-          - { id: directory, type: ARTIFACT, artifactType: DIRECTORY, source: { kind: OUTPUT, nodeId: register-shell, fieldId: shellDirectory } }
+          - { id: directory, type: ARTIFACT, artifactType: DIRECTORY, source: { kind: OUTPUT, nodeId: prepare-shell, fieldId: shellDirectory } }
 
     - id: deploy-latest-directory
       name: 发布最新兼容目录

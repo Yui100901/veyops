@@ -130,7 +130,7 @@ async function verifySharedDelivery({
   });
   const [registered] = shellArtifact.instances;
   assert.equal(registered.name, 'shellDirectory');
-  assert.equal(registered.graphNodeId, 'register-shell');
+  assert.equal(registered.graphNodeId, 'prepare-shell');
   assert.equal(registered.physical.location, 'BUILDER_PATH');
   assert.equal((await readFile(join(registered.physical.path, 'index.html'), 'utf8')).trim(), html);
   await verifyArtifact(api, shellArtifact);

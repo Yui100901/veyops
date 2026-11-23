@@ -335,7 +335,16 @@ function compileDemoGraph(demo, references, options) {
       case 'LOAD_ENV':
         return { ...node, loadEnvironment: config };
       case 'SHELL':
-        return { ...node, shell: { ...config, params: (config.params ?? []).map(param) } };
+        return {
+          ...node,
+          shell: {
+            ...config,
+            params: (config.params ?? []).map(param),
+            ...(outputs?.length && {
+              artifacts: outputs.map(({ id, ...declaration }) => ({ ...declaration, id, name: id })),
+            }),
+          },
+        };
       case 'REGISTER_ARTIFACT':
         return {
           ...node,

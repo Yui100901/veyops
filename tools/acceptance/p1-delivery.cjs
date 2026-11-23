@@ -180,7 +180,7 @@ function checkDecision(node, option) {
     assert.deepEqual(scope.sources, [{ repositoryId: option.repositoryId, commitSha: option.sha }]);
   } else {
     assert.equal(scope.kind, 'RELEASE');
-    assert.equal(scope.releaseNodeId, 'deploy-files');
+    assert.equal(scope.releaseNodeId, option.releaseNodeId ?? 'deploy-files');
     assert.equal(scope.serviceId, option.serviceId);
     equalIds(scope.serverIds, option.serverIds, '审批目标不等于展开后的实际成员');
     assert.equal(scope.artifactIds.length, scope.serverIds.length);
@@ -191,8 +191,9 @@ function checkDecision(node, option) {
 }
 
 function createGraphRunner(api, fixture, evidence) {
-  const graph = `/projects/${fixture.projectId}/execution-graph`;
   return async (flow, parameters = {}, options = {}) => {
+    const projectId = options.projectId ?? fixture.projectId;
+    const graph = `/projects/${projectId}/execution-graph`;
     const path = graph + '/flows/' + flow;
     const version = options.version ?? fixture.version;
     const choice = { version, inputs: { parameters } };
@@ -259,8 +260,8 @@ function createGraphRunner(api, fixture, evidence) {
     }
     assert.equal(decisions.size, options.decision ? 1 : 0);
     const [projectArtifacts, releases] = await Promise.all([
-      api.get(projectQuery('/artifacts', fixture.projectId)),
-      api.get(projectQuery('/deployments', fixture.projectId)),
+      api.get(projectQuery('/artifacts', projectId)),
+      api.get(projectQuery('/deployments', projectId)),
     ]);
     const recordedIds = new Set(detail.artifactIds);
     const runArtifacts = projectArtifacts.filter(({ id }) => recordedIds.has(id));
@@ -938,7 +939,7 @@ async function run() {
       fixture,
       execute,
       source,
-      managerArtifact,
+      shellArtifactId: evidence.sharedDelivery.shell.directory,
       files,
       html,
     });

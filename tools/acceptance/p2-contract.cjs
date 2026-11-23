@@ -67,7 +67,177 @@ async function publish(api, path, extend) {
   return publishedVersion;
 }
 
-async function verifyP2Contract({ api, fixture, execute, source, managerArtifact, files, html }) {
+async function verifyV2Templates({ api, fixture, execute, source, html }) {
+  const project = await api.post('/projects', {
+    name: '流程模板实机验收',
+    slug: 'candidate-template-project',
+  });
+  const projectPath = `/projects/${project.id}`;
+  const graph = `${projectPath}/execution-graph`;
+  const seed = await api.get(graph);
+  const minimal = seed.draft.canvas;
+  assert.equal(seed.revision, 1);
+  assert.equal(seed.publishedVersion, null);
+  assert.equal(minimal.endpoints.length, 1);
+  assert.equal(minimal.edges.length, 4);
+  assert.deepEqual(
+    minimal.nodes.map(({ operation, type }) => operation ?? type),
+    ['START', 'CHECKOUT', 'BUILD', 'DEPLOY_ARTIFACT', 'END'],
+  );
+  const minimalId = minimal.endpoints[0].startId;
+  assert.deepEqual((await api.get(graph)).draft.canvas, minimal);
+
+  const templateIds = ['MINIMAL_CI_CD', 'CI_BUILD', 'CD_DEPLOY'];
+  const { flowTemplates } = await api.get(graph + '/catalog');
+  assert.deepEqual(
+    flowTemplates.map(({ id }) => id),
+    templateIds,
+  );
+  const [ci, cd] = await Promise.all(
+    templateIds
+      .slice(1)
+      .map((templateId) =>
+        api.post(graph + '/draft/templates/expand', { templateId, artifactType: 'DIRECTORY' }),
+      ),
+  );
+  assert.deepEqual((await api.get(graph)).draft.canvas, minimal);
+  assert.equal((await api.get(graph)).revision, seed.revision);
+
+  const repository = await api.post(projectPath + '/repositories', {
+    name: '模板源码',
+    cloneUrl: 'http://manager:8088/storefront.git',
+  });
+  const service = await api.post(projectPath + '/services', {
+    name: '候选模板服务',
+    slug: 'candidate-template-service',
+    serviceType: 'API',
+  });
+  const serverId = fixture.serverIds['test-a'];
+  const buildTargets = { serverIds: [serverId] };
+  const releaseTargets = { serverIds: [serverId] };
+  const configureBuild = (fragment) => {
+    const build = fragment.nodes.find(({ operation }) => operation === 'BUILD');
+    build.build.buildLocation = 'TARGET';
+    build.build.buildCommand = 'test -s index.html && mkdir -p dist && cp index.html dist/';
+    build.build.artifacts[0].path = 'dist';
+  };
+  const directory = 'contract-execution-template';
+  const configureDeploy = (fragment) => {
+    const deploy = fragment.nodes.find(({ operation }) => operation === 'DEPLOY_ARTIFACT');
+    assert.equal(deploy.deploy.method, 'FILE');
+    deploy.deploy.deployPath = '/srv/veyops-stage0/' + directory;
+    return deploy;
+  };
+  configureBuild(ci.canvas);
+  ci.canvas.nodes.find(({ operation }) => operation === 'CHECK').shell.command =
+    'test -s index.html';
+  const cdDeploy = configureDeploy(cd.canvas);
+  const health = cd.canvas.nodes.find(({ operation }) => operation === 'HEALTH_CHECK');
+  assert.equal(health.healthCheck.requireHealthy, true);
+  health.healthCheck.command = 'test -s index.html || exit 10';
+  const version = await publish(api, graph, (canvas) => {
+    configureBuild(canvas);
+    configureDeploy(canvas);
+    for (const { canvas: fragment } of [ci, cd]) {
+      canvas.nodes.push(...fragment.nodes);
+      canvas.edges.push(...fragment.edges);
+      canvas.endpoints.push(...fragment.endpoints);
+    }
+  });
+
+  const assertBuilt = (run, sha) => {
+    assert.deepEqual(
+      run.entry.checkouts.map(({ repositoryId, commitSha }) => [repositoryId, commitSha]),
+      [[repository.id, sha]],
+    );
+    const produced = run.detail.outputs.buildArtifact;
+    assert.equal(produced.type, 'DIRECTORY');
+    assert.equal(produced.commitSha, sha);
+    const [instance] = produced.instances;
+    assert.equal(instance.serverId, serverId);
+    assert.ok(
+      run.artifacts.some(
+        ({ id, artifactId }) => id === instance.instanceId && artifactId === produced.artifactId,
+      ),
+    );
+    return produced;
+  };
+  const previous = await execute(
+    ci.startId,
+    {
+      repository: repository.id,
+      service: { serviceId: service.id },
+      buildTargets,
+    },
+    { projectId: project.id, version },
+  );
+  const old = assertBuilt(previous, source.commitSha);
+  assert.equal(previous.detail.outputs.report.passed, true);
+  assert.deepEqual(previous.releases, []);
+
+  const minimalRun = await execute(
+    minimalId,
+    {
+      repository: repository.id,
+      gitVersion: { kind: 'COMMIT', value: source.nextCommitSha },
+      service: { serviceId: service.id },
+      buildTargets,
+      releaseTargets,
+    },
+    { projectId: project.id, version, checkIdempotency: true },
+  );
+  const fresh = assertBuilt(minimalRun, source.nextCommitSha);
+  assert.equal(
+    minimalRun.detail.outputs.release.targets[0].artifactInstanceId,
+    fresh.instances[0].instanceId,
+  );
+  const contentPath = `/accept/targets/test-a/deploy/${directory}/current/index.html`;
+  const nextHtml = execFileSync(
+    'git',
+    ['--git-dir', source.repositoryPath, 'show', `${source.nextCommitSha}:index.html`],
+    { encoding: 'utf8' },
+  );
+  assert.equal((await readFile(contentPath, 'utf8')).trim(), nextHtml.trim());
+
+  const cdRun = await execute(
+    cd.startId,
+    {
+      artifact: { artifactId: old.artifactId },
+      service: { serviceId: service.id },
+      releaseTargets,
+    },
+    {
+      projectId: project.id,
+      version,
+      decision: {
+        releaseNodeId: cdDeploy.id,
+        serviceId: service.id,
+        serverIds: [serverId],
+      },
+    },
+  );
+  const { release, healthStatus } = cdRun.detail.outputs;
+  const [legacyInstance] = old.instances;
+  assert.equal(healthStatus, 'HEALTHY');
+  assert.equal(release.serviceId, service.id);
+  assert.equal(release.targets[0].serverId, serverId);
+  assert.equal(release.targets[0].health, 'HEALTHY');
+  assert.equal(release.targets[0].artifactInstanceId, legacyInstance.instanceId);
+  assert.deepEqual(cdRun.entry.decisions[0].scope.artifactIds, [legacyInstance.instanceId]);
+  assert.equal(cdRun.releases[0].artifactId, legacyInstance.instanceId);
+  assert.equal(cdRun.releases[0].rollbackOfDeploymentId, null);
+  assert.equal((await readFile(contentPath, 'utf8')).trim(), html);
+
+  return {
+    catalog: templateIds,
+    seed: { projectId: project.id, startId: minimalId, revision: seed.revision },
+    ci: { flowId: ci.startId, runId: previous.detail.id, artifactId: old.artifactId },
+    minimal: { flowId: minimalId, runId: minimalRun.detail.id, artifactId: fresh.artifactId },
+    cd: { flowId: cd.startId, runId: cdRun.detail.id, artifactId: old.artifactId, healthStatus },
+  };
+}
+
+async function verifyP2Contract({ api, fixture, execute, source, shellArtifactId, files, html }) {
   const project = '/projects/' + fixture.projectId;
   const graph = project + '/execution-graph';
   const baseRepository = fixture.repositoryIds['web-repo'];
@@ -205,24 +375,17 @@ async function verifyP2Contract({ api, fixture, execute, source, managerArtifact
       canvas,
       pair,
       'candidate-pair-output',
+      [release(web, 'contract-web'), release(apiId, 'contract-api')],
       [
-        node('candidate-fork', 'PARALLEL'),
-        release(web, 'contract-web'),
-        release(apiId, 'contract-api'),
-        node('candidate-join', 'JOIN'),
-      ],
-      [
-        edge(pair, 'candidate-fork'),
-        edge('candidate-fork', web),
-        edge('candidate-fork', apiId),
-        edge(web, 'candidate-join'),
-        edge(apiId, 'candidate-join'),
-        edge('candidate-join', 'candidate-pair-output'),
+        edge(pair, web),
+        edge(pair, apiId),
+        edge(web, 'candidate-pair-output'),
+        edge(apiId, 'candidate-pair-output'),
       ],
       {
         [web]: {
           service: value({ serviceId: webService }),
-          artifact: artifact(managerArtifact.artifactId),
+          artifact: artifact(shellArtifactId),
           targets: targets(testA),
         },
         [apiId]: {
@@ -448,6 +611,7 @@ async function verifyP2Contract({ api, fixture, execute, source, managerArtifact
     temporaryChildRun: nested.detail.id,
     failedTarget: failed,
     verifiedTarget: check.targets[0],
+    templates: await verifyV2Templates({ api, fixture, execute, source, html }),
   };
 }
 
