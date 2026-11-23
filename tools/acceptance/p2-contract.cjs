@@ -418,7 +418,7 @@ async function verifyP2Contract({ api, fixture, execute, source, managerArtifact
   }));
   const changedSet = await api.call('PATCH', setPath, {
     expectedRevision: set.revision,
-    variables: [...oldVariables, { key: 'VEYOPS_ACCEPT_CONFIG_TEST', value: 'changed' }],
+    variables: [...oldVariables, { key: 'ACCEPT_CONFIG_PROBE', value: 'changed' }],
   });
   const newPlan = await api.post(targetFiles + '/preview', oldChoice);
   assert.notEqual(oldPlan.configurationHash, newPlan.configurationHash);

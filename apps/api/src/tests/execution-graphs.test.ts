@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,79 +9,82 @@ import test from 'node:test';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
-import type { GraphFlow } from '../modules/execution-graphs/execution-graph-definition';
+import type { GraphCanvas } from '../modules/execution-graphs/execution-graph-definition';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
 
-const dagDefinition = {
-  flows: [
+const choice = { id: 'choice', name: '分支选择', type: 'TEXT' } as const;
+const choiceBinding = { kind: 'INPUT', fieldId: choice.id } as const;
+
+const dagCanvas: GraphCanvas = {
+  nodes: [
+    { id: 'orchestrate', type: 'START', name: '条件与并行', inputs: [choice] },
+    { id: 'split', type: 'PARALLEL', name: '并行' },
     {
-      id: 'orchestrate',
-      name: '条件与并行',
-      nodes: [
-        { id: 'dag-start', type: 'START', name: '开始' },
-        { id: 'split', type: 'PARALLEL', name: '并行' },
-        {
-          id: 'choose',
-          type: 'CONDITION',
-          name: '判断',
-          condition: { key: 'input', value: 'release' },
-        },
-        { id: 'yes', type: 'LOG', name: '发布分支', message: 'release-path' },
-        { id: 'no', type: 'LOG', name: '常规分支', message: 'regular-path' },
-        { id: 'branch-join', type: 'JOIN', name: '分支汇合' },
-        { id: 'parallel-log', type: 'LOG', name: '并行记录', message: 'parallel-path' },
-        { id: 'all-join', type: 'JOIN', name: '等待汇合' },
-        { id: 'dag-end', type: 'END', name: '结束' },
-      ],
-      edges: [
-        { from: 'dag-start', to: 'split' },
-        { from: 'split', to: 'choose' },
-        { from: 'choose', to: 'yes', when: 'TRUE' },
-        { from: 'choose', to: 'no', when: 'FALSE' },
-        { from: 'yes', to: 'branch-join' },
-        { from: 'no', to: 'branch-join' },
-        { from: 'branch-join', to: 'all-join' },
-        { from: 'split', to: 'parallel-log' },
-        { from: 'parallel-log', to: 'all-join' },
-        { from: 'all-join', to: 'dag-end' },
-      ],
+      id: 'choose',
+      type: 'CONDITION',
+      name: '判断',
+      condition: { value: 'release' },
+    },
+    { id: 'yes', type: 'LOG', name: '发布分支', message: 'release-path' },
+    { id: 'no', type: 'LOG', name: '常规分支', message: 'regular-path' },
+    { id: 'branch-join', type: 'JOIN', name: '分支汇合' },
+    { id: 'parallel-log', type: 'LOG', name: '并行记录', message: 'parallel-path' },
+    { id: 'all-join', type: 'JOIN', name: '等待汇合' },
+    { id: 'dag-end', type: 'END', name: '结束' },
+  ],
+  edges: [
+    { from: 'orchestrate', to: 'split' },
+    { from: 'split', to: 'choose' },
+    { from: 'choose', to: 'yes', when: 'TRUE' },
+    { from: 'choose', to: 'no', when: 'FALSE' },
+    { from: 'yes', to: 'branch-join' },
+    { from: 'no', to: 'branch-join' },
+    { from: 'branch-join', to: 'all-join' },
+    { from: 'split', to: 'parallel-log' },
+    { from: 'parallel-log', to: 'all-join' },
+    { from: 'all-join', to: 'dag-end' },
+  ],
+  endpoints: [
+    {
+      startId: 'orchestrate',
+      endId: 'dag-end',
+      inputBindings: { choose: { value: choiceBinding } },
     },
   ],
+  templates: [],
 };
 
-const advancedDefinition = {
-  flows: [
+const advancedCanvas: GraphCanvas = {
+  nodes: [
+    { id: 'advanced', type: 'START', name: '可控交付', inputs: [choice] },
     {
-      id: 'advanced',
-      name: '可控交付',
-      nodes: [
-        { id: 'start', type: 'START', name: '开始' },
-        {
-          id: 'switch',
-          type: 'SWITCH',
-          name: '选择执行路径',
-          switch: { key: 'input', cases: ['approve', 'delay'] },
-        },
-        { id: 'approve', type: 'APPROVAL', name: '发布确认', approval: { timeoutSeconds: 60 } },
-        { id: 'continue', type: 'LOG', name: '继续发布', message: 'approved-path' },
-        { id: 'delay', type: 'DELAY', name: '等待', delaySeconds: 60 },
-        { id: 'default', type: 'LOG', name: '普通检查', message: 'default-path' },
-        { id: 'join', type: 'JOIN', name: '汇合' },
-        { id: 'end', type: 'END', name: '结束' },
-      ],
-      edges: [
-        { from: 'start', to: 'switch' },
-        { from: 'switch', to: 'approve', when: 'CASE:0' },
-        { from: 'switch', to: 'delay', when: 'CASE:1' },
-        { from: 'switch', to: 'default', when: 'DEFAULT' },
-        { from: 'approve', to: 'continue' },
-        { from: 'continue', to: 'join' },
-        { from: 'delay', to: 'join' },
-        { from: 'default', to: 'join' },
-        { from: 'join', to: 'end' },
-      ],
+      id: 'switch',
+      type: 'SWITCH',
+      name: '选择执行路径',
+      switch: { cases: ['approve', 'delay'] },
     },
+    { id: 'approve', type: 'APPROVAL', name: '发布确认', approval: { timeoutSeconds: 60 } },
+    { id: 'continue', type: 'LOG', name: '继续发布', message: 'approved-path' },
+    { id: 'delay', type: 'DELAY', name: '等待', delaySeconds: 60 },
+    { id: 'default', type: 'LOG', name: '普通检查', message: 'default-path' },
+    { id: 'join', type: 'JOIN', name: '汇合' },
+    { id: 'end', type: 'END', name: '结束' },
   ],
+  edges: [
+    { from: 'advanced', to: 'switch' },
+    { from: 'switch', to: 'approve', when: 'CASE:0' },
+    { from: 'switch', to: 'delay', when: 'CASE:1' },
+    { from: 'switch', to: 'default', when: 'DEFAULT' },
+    { from: 'approve', to: 'continue' },
+    { from: 'continue', to: 'join' },
+    { from: 'delay', to: 'join' },
+    { from: 'default', to: 'join' },
+    { from: 'join', to: 'end' },
+  ],
+  endpoints: [
+    { startId: 'advanced', endId: 'end', inputBindings: { switch: { value: choiceBinding } } },
+  ],
+  templates: [],
 };
 
 async function checkGraph(url?: string) {
@@ -140,7 +143,7 @@ async function checkGraph(url?: string) {
     assert.notEqual(initialGraph.id, (await api.get(otherPath).expect(200)).body.data.id);
     const runDag = async (id: string, version: number, value: string) => {
       const flowPath = otherPath + '/flows/' + id;
-      const args = { version, inputs: { value } };
+      const args = { version, inputs: { parameters: { choice: value } } };
       const preview = (
         await api
           .post(flowPath + '/preview')
@@ -176,7 +179,7 @@ async function checkGraph(url?: string) {
         .put(otherPath + '/draft')
         .send({
           expectedRevision: otherGraph.revision,
-          definition: dagDefinition,
+          definition: { canvas: dagCanvas },
         })
         .expect(200)
     ).body.data;
@@ -187,44 +190,50 @@ async function checkGraph(url?: string) {
         .expect(201)
     ).body.data.publishedVersion;
     const dagRun = await runDag('orchestrate', dagV1, 'release');
-    const state = (run: { nodes: { nodeId: string; status: string }[] }, nodeId: string) =>
-      run.nodes.find((node) => node.nodeId === nodeId)?.status;
+    const findNode = (
+      run: { nodes: { nodeId: string; status: string; output?: Record<string, unknown> }[] },
+      id: string,
+    ) => run.nodes.find(({ nodeId }) => nodeId === id)!;
+    const state = (run: Parameters<typeof findNode>[0], nodeId: string) =>
+      findNode(run, nodeId)?.status;
     assert.equal(state(dagRun, 'yes'), 'SUCCESS');
     assert.equal(state(dagRun, 'no'), 'SKIPPED');
     assert.equal(state(dagRun, 'parallel-log'), 'SUCCESS');
     assert.equal(state(dagRun, 'all-join'), 'SUCCESS');
-    const original = dagDefinition.flows[0] as GraphFlow;
+    assert.equal(findNode(dagRun, 'choose').output?.matched, true);
     const calls = new Set(['choose', 'yes', 'no', 'branch-join']);
-    const reusable: GraphFlow = {
-      id: 'reusable-check',
-      name: '可复用的判断',
+    const reusableCanvas: GraphCanvas = {
       nodes: [
-        { id: 'child-start', type: 'START', name: '开始子流' },
-        ...original.nodes.filter((node) => calls.has(node.id)),
+        ...dagCanvas.nodes,
+        { id: 'reusable-check', type: 'START', name: '可复用的判断', inputs: [choice] },
         { id: 'child-end', type: 'END', name: '子流结束' },
+        { id: 'call-branch', name: '执行子流', type: 'FLOW_CALL', flowId: 'reusable-check' },
       ],
       edges: [
-        { from: 'child-start', to: 'choose' },
-        ...original.edges.filter((edge) => calls.has(edge.from) && calls.has(edge.to)),
-        { from: 'branch-join', to: 'child-end' },
-      ],
-    };
-    const parent: GraphFlow = {
-      ...original,
-      nodes: [
-        ...original.nodes.filter((node) => !calls.has(node.id)),
-        { id: 'call-branch', name: '执行子流', type: 'FLOW_CALL', flowId: reusable.id },
-      ],
-      edges: [
-        ...original.edges.filter((edge) => !calls.has(edge.from) && !calls.has(edge.to)),
+        ...dagCanvas.edges.filter(({ from, to }) => calls.has(from) === calls.has(to)),
         { from: 'split', to: 'call-branch' },
         { from: 'call-branch', to: 'all-join' },
+        { from: 'reusable-check', to: 'choose' },
+        { from: 'branch-join', to: 'child-end' },
       ],
+      endpoints: [
+        {
+          startId: 'orchestrate',
+          endId: 'dag-end',
+          inputBindings: { 'call-branch': { choice: choiceBinding } },
+        },
+        {
+          startId: 'reusable-check',
+          endId: 'child-end',
+          inputBindings: { choose: { value: choiceBinding } },
+        },
+      ],
+      templates: [],
     };
     const replaced = (
       await api
         .put(otherPath + '/draft')
-        .send({ expectedRevision: dagDraft.revision, definition: { flows: [parent, reusable] } })
+        .send({ expectedRevision: dagDraft.revision, definition: { canvas: reusableCanvas } })
         .expect(200)
     ).body.data;
     await api
@@ -246,15 +255,15 @@ async function checkGraph(url?: string) {
     assert.equal(child.version, dagV2);
     assert.equal(state(child, 'yes'), 'SKIPPED');
     assert.equal(state(child, 'no'), 'SUCCESS');
+    assert.equal(findNode(child, 'choose').output?.matched, false);
     const direct = await runDag(child.flowId, dagV2, 'release');
     assert.equal(state(direct, 'yes'), 'SUCCESS');
     const calledAgain = await runDag('orchestrate', dagV2, 'release');
     const nextChild = calledAgain.nodes.find((n: { type: string }) => n.type === 'FLOW_CALL');
     assert.notEqual(nextChild.childRunId, call.childRunId);
     assert.equal(nextChild.status, 'SUCCESS');
-    const cycle = { flows: structuredClone(replaced.draft.flows) };
-    const recursive = cycle.flows.find((item: { id: string }) => item.id === child.flowId);
-    const outgoing = recursive.edges.find((edge: { from: string }) => edge.from === 'branch-join');
+    const recursive = structuredClone(reusableCanvas);
+    const outgoing = recursive.edges.find(({ from }) => from === 'branch-join')!;
     recursive.nodes.push({
       id: 'recursive-call',
       type: 'FLOW_CALL',
@@ -263,31 +272,36 @@ async function checkGraph(url?: string) {
     });
     recursive.edges.push({ from: 'recursive-call', to: outgoing.to });
     outgoing.to = 'recursive-call';
-    await api
-      .put(otherPath + '/draft')
-      .send({ expectedRevision: replaced.revision, definition: cycle })
+    const recursiveDraft = (
+      await api
+        .put(otherPath + '/draft')
+        .send({ expectedRevision: replaced.revision, definition: { canvas: recursive } })
+        .expect(200)
+    ).body.data;
+    const recursivePublish = await api
+      .post(otherPath + '/publish')
+      .send({ expectedRevision: recursiveDraft.revision })
       .expect(400);
+    assert.match(recursivePublish.text, /执行流调用存在循环依赖/);
     const flowId = 'check';
     const definition = (message: string) => ({
-      flows: [
-        {
-          id: flowId,
-          name: '核对项目',
-          nodes: [
-            { id: 'begin', type: 'START', name: '开始' },
-            { id: 'report', type: 'LOG', name: '记录结果', message },
-            { id: 'end', type: 'END', name: '完成' },
-          ],
-          edges: [
-            { from: 'begin', to: 'report' },
-            { from: 'report', to: 'end' },
-          ],
-        },
-      ],
+      canvas: {
+        nodes: [
+          { id: flowId, type: 'START', name: '核对项目' },
+          { id: 'report', type: 'LOG', name: '记录结果', message },
+          { id: 'end', type: 'END', name: '完成' },
+        ],
+        edges: [
+          { from: flowId, to: 'report' },
+          { from: 'report', to: 'end' },
+        ],
+        endpoints: [{ startId: flowId, endId: 'end' }],
+        templates: [],
+      },
     });
     const old = definition('first published run');
     const broken = definition('invalid');
-    broken.flows[0]!.edges.push({ from: 'end', to: 'begin' });
+    broken.canvas.edges.push({ from: 'end', to: flowId });
     await api
       .put(path + '/draft')
       .send({ expectedRevision: initialGraph.revision, definition: broken })
@@ -299,7 +313,8 @@ async function checkGraph(url?: string) {
       save(initialGraph.revision, old),
     ]);
     assert.deepEqual(writes.map((r) => r.status).sort(), [200, 409]);
-    const revision = writes.find((r) => r.status === 200)!.body.data.revision;
+    const originalDraft = writes.find((r) => r.status === 200)!.body.data;
+    const revision = originalDraft.revision;
     const publish = (expectedRevision: number) =>
       api.post(path + '/publish').send({ expectedRevision });
     await publish(initialGraph.revision).expect(409);
@@ -329,7 +344,8 @@ async function checkGraph(url?: string) {
       [runId],
     );
     const next = definition('second published run');
-    const nextRevision = (await save(revision, next).expect(200)).body.data.revision;
+    const nextDraft = (await save(revision, next).expect(200)).body.data;
+    const nextRevision = nextDraft.revision;
     const v2 = (await publish(nextRevision).expect(201)).body.data.publishedVersion;
     assert.equal(v2, 2);
     const second = (
@@ -366,7 +382,7 @@ async function checkGraph(url?: string) {
       /first published run/,
     );
     const pinned = (await api.get(path + '/versions/' + v1).expect(200)).body.data;
-    assert.deepEqual(pinned.definition, old);
+    assert.deepEqual(pinned.definition.canvas, originalDraft.draft.canvas);
     await api.get(otherPath + '/runs/' + runId).expect(404);
     const db = app.get(DatabaseService).db;
     // Timestamps may tie on both databases. The opaque run cursor must preserve UUID order.
@@ -433,22 +449,25 @@ async function checkGraph(url?: string) {
         .send({ expectedRevision: nextRevision })
         .expect(201)
     ).body.data;
-    assert.deepEqual(restored.draft.flows, old.flows);
-    assert.equal(restored.draft.canvas.endpoints[0].startId, old.flows[0]!.id);
+    assert.deepEqual(restored.draft.canvas, originalDraft.draft.canvas);
+    assert.equal(restored.draft.canvas.endpoints[0].startId, flowId);
     assert.equal(restored.revision, nextRevision + 1);
     assert.equal(restored.publishedVersion, v2);
     await api
       .post(path + '/versions/1/restore')
       .send({ expectedRevision: nextRevision })
       .expect(409);
-    assert.deepEqual((await api.get(path + '/versions/2').expect(200)).body.data.definition, next);
+    assert.deepEqual(
+      (await api.get(path + '/versions/2').expect(200)).body.data.definition.canvas,
+      nextDraft.draft.canvas,
+    );
 
     const advancedProject = await project('advanced-graph');
     const advancedPath = root + '/projects/' + advancedProject + '/execution-graph';
     const savedAdvanced = (
       await api
         .put(advancedPath + '/draft')
-        .send({ expectedRevision: 1, definition: advancedDefinition })
+        .send({ expectedRevision: 1, definition: { canvas: advancedCanvas } })
         .expect(200)
     ).body.data;
     await api
@@ -456,7 +475,7 @@ async function checkGraph(url?: string) {
       .send({ expectedRevision: savedAdvanced.revision })
       .expect(201);
     const start = async (value: string) => {
-      const args = { version: 1, inputs: { value } };
+      const args = { version: 1, inputs: { parameters: { choice: value } } };
       const endpoint = advancedPath + '/flows/advanced';
       const preview = (
         await api
@@ -477,18 +496,19 @@ async function checkGraph(url?: string) {
     };
     const details = async (id: string) =>
       (await api.get(advancedPath + '/runs/' + id).expect(200)).body.data;
-    const findNode = (
-      run: { nodes: { nodeId: string; status: string; output?: Record<string, unknown> }[] },
-      id: string,
-    ) => run.nodes.find(({ nodeId }) => nodeId === id)!;
     const decisionPath = (id: string) => advancedPath + '/runs/' + id + '/nodes/approve/decision';
     const automatic = await start('ordinary');
     assert.equal(automatic.status, 'SUCCESS');
     assert.equal(findNode(automatic, 'switch').output?.matched, 'DEFAULT');
+    assert.equal(findNode(automatic, 'switch').output?.branchId, 'DEFAULT');
     assert.equal(findNode(automatic, 'approve').status, 'SKIPPED');
     const pending = await start('approve');
     assert.equal(pending.status, 'WAITING');
     assert.equal(findNode(pending, 'switch').output?.matched, 'CASE:0');
+    assert.equal(
+      findNode(pending, 'switch').output?.branchId,
+      'CASE:' + createHash('sha256').update('approve').digest('hex'),
+    );
     assert.equal(findNode(pending, 'continue').status, 'PENDING');
     assert.ok(Number(findNode(pending, 'approve').output?.expiresAt) > Date.now());
     await db
