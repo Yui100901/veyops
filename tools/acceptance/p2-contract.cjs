@@ -92,8 +92,9 @@ async function verifyP2Contract({ api, fixture, execute, source, managerArtifact
       'candidate-multi-source',
       'candidate-api-output',
       [
-        node('candidate-main', 'CHECKOUT', {
+        node('candidate-main', 'FUNCTION', {
           name: '检出源码',
+          operation: 'CHECKOUT',
           inputs: [{ id: 'version', name: 'Git 版本', type: 'GIT_REF' }],
         }),
         node('candidate-next', 'CHECKOUT', { name: '检出源码' }),
