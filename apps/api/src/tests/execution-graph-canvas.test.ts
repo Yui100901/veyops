@@ -854,15 +854,29 @@ test('a branch that bypasses release points to the required ending result and li
   assert.deepEqual(issue?.edge, bypass);
 });
 
-test('an ordinary branch with two routes to the same end requires an entry-specific selection', () => {
+test('ordinary routes to the same end all run unless narrowed by the flow', () => {
   const graph = deliveryCanvas();
   graph.nodes.push({ id: 'approve', name: '审批', type: 'APPROVAL' });
   graph.edges.push({ from: 'combined-start', to: 'approve' }, { from: 'approve', to: 'source' });
-  assert.match(canvasIssues(graph)[0]!.message, /明确选择出线/);
+  assert.deepEqual(canvasIssues(graph), []);
+  assert.equal(compileCanvas(graph, true).flows[1]!.edges.filter(({ from }) => from === 'combined-start').length, 2);
   graph.endpoints[1]!.edgeSelections = { 'combined-start': ['approve'] };
   const flows = compileCanvas(graph, true).flows;
   assert.equal(flows[1]!.edges.find((edge) => edge.from === 'combined-start')?.to, 'approve');
   assert(!flows[0]!.nodes.some((node) => node.id === 'approve'));
+});
+
+test('an unowned ordinary edge is diagnosed while a sibling flow can own that edge', () => {
+  const graph = sharedCanvas();
+  graph.nodes.push({ id: 'different-end', type: 'END', name: '其他结果' });
+  const edge = { from: 'report', to: 'different-end' };
+  graph.edges.push(edge);
+  const [issue] = canvasIssues(graph);
+  assert.deepEqual([issue?.flowId, issue?.nodeId, issue?.edge], ['build-start', 'report', edge]);
+  graph.endpoints[1]!.endId = 'different-end';
+  const { flows } = compileCanvas(graph, true);
+  assert.equal(flows[0]!.edges.at(-1)?.to, 'end');
+  assert.equal(flows[1]!.edges.at(-1)?.to, 'different-end');
 });
 
 test('conditional consumers require the producer on every active branch and allow available alternatives', () => {
@@ -883,6 +897,7 @@ test('conditional consumers require the producer on every active branch and allo
       !(
         edge.from === 'combined-start' ||
         edge.from === 'source' ||
+        edge.to === 'artifacts-end' ||
         (edge.from === 'build' && edge.to === 'deploy')
       ),
   );

@@ -4,6 +4,7 @@ import { redactTaskLog } from '../tasks/task-log.service';
 import { flowCandidateCatalog } from './graph-binding-validation';
 import {
   annotateGraphIssue,
+  graphDynamicOutlets,
   orderedFlowNodes,
   runtimeGraphNode,
   validateGraphDefinition,
@@ -46,24 +47,15 @@ function withNodeReferences(canvas: GraphCanvas) {
 }
 
 function validateNodeReferences(canvas: GraphCanvas, flows: GraphFlow[]) {
-  const references = new Map<string, GraphNode>();
   for (const node of [...canvas.nodes, ...canvas.templates]) {
-    const reference = node.referenceName?.toLowerCase();
-    const existing = reference && references.get(reference);
-    if (
-      !safeGraphReference(node.referenceName) ||
-      reservedReferenceNames.has(reference!) ||
-      existing
-    )
+    if (!safeGraphReference(node.referenceName) || reservedReferenceNames.has(node.referenceName!.toLowerCase()))
       throw new GraphCompileError({
         flowId: flows.find((flow) => flow.nodes.some(({ id }) => id === node.id))?.id,
         nodeId: node.id,
         fieldId: 'referenceName',
-        sourceNodeId: existing ? existing.id : undefined,
         severity: 'ERROR',
-        message: existing ? '节点引用名已被其他节点使用' : '节点引用名无效或已被系统保留',
+        message: '节点引用名无效或已被系统保留',
       });
-    references.set(reference!, node);
   }
 }
 
@@ -120,8 +112,8 @@ function validateCanvas(canvas: GraphCanvas) {
     if (to.type === 'START' || from.type === 'END')
       throw new BadRequestException('开始节点只允许出线，结束节点只允许入线');
     const outgoing = edges.get(from.id) ?? [];
-    if (outgoing.some((existing) => existing.to === to.id))
-      throw new BadRequestException('两个节点之间只能连接一条线');
+    if (outgoing.some((existing) => existing.to === to.id && existing.when === edge.when))
+      throw new GraphCompileError({ nodeId: from.id, edge, message: '相同出口不能重复连接同一节点' });
     outgoing.push(edge);
     edges.set(from.id, outgoing);
   }
@@ -136,6 +128,7 @@ function validateCanvas(canvas: GraphCanvas) {
     const text = [
       node.message,
       node.condition?.value,
+      ...(node.branch?.cases ?? []).map(({ value, label }) => [value, label]).flat(),
       node.shell?.command,
       node.build?.installCommand,
       node.build?.buildCommand,
@@ -158,18 +151,42 @@ function validateCanvas(canvas: GraphCanvas) {
   return { byId, edges };
 }
 
-const dynamicBranch = (node: GraphNode, edges?: readonly GraphEdge[]) =>
-  node.type === 'CONDITION' ||
-  node.type === 'SWITCH' ||
-  node.type === 'PARALLEL' ||
-  ((node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') &&
-    edges?.some(({ when }) => when === 'SUCCESS' || when === 'PARTIAL_SUCCESS'));
+function flowScope(endpoint: GraphEndpoint, edges: ReadonlyMap<string, GraphEdge[]>) {
+  const selections = graphRecord(endpoint.edgeSelections) ? endpoint.edgeSelections : {};
+  const allowed = (id: string) => {
+    const selected = selections[id];
+    const outgoing = edges.get(id) ?? [];
+    return Array.isArray(selected) ? outgoing.filter(({ to }) => selected.includes(to)) : outgoing;
+  };
+  const reverse = new Map<string, string[]>();
+  for (const id of edges.keys())
+    for (const { to } of allowed(id)) {
+      const predecessors = reverse.get(to) ?? [];
+      predecessors.push(id);
+      reverse.set(to, predecessors);
+    }
+  const toEnd = new Set([endpoint.endId]);
+  for (const id of toEnd)
+    for (const source of reverse.get(id) ?? []) toEnd.add(source);
+
+  const route = new Set([endpoint.startId]);
+  const included = new Set<GraphEdge>();
+  for (const id of route)
+    for (const edge of allowed(id)) {
+      if (!toEnd.has(edge.to)) continue;
+      route.add(edge.to);
+      included.add(edge);
+    }
+  return { allowed, toEnd, included };
+}
 
 function deriveFlow(
   start: GraphNode,
   endpoint: GraphEndpoint,
   byId: ReadonlyMap<string, GraphNode>,
   edges: ReadonlyMap<string, GraphEdge[]>,
+  scope: ReturnType<typeof flowScope>,
+  owners: ReadonlySet<GraphEdge>,
 ) {
   const { endId, inputBindings, environmentBindings, outputBindings, edgeSelections, serviceId } =
     endpoint;
@@ -184,8 +201,6 @@ function deriveFlow(
     ...(outputBindings !== undefined && { outputBindings }),
     ...(edgeSelections !== undefined && { edgeSelections }),
   };
-  // Sibling paths can lead to other flows' END nodes. Fixed selections further
-  // constrain ordinary branches; control nodes retain all declared outcomes.
   const selections = edgeSelections ?? {};
   const issue = (node: GraphNode, message: string, edge?: GraphEdge): never => {
     throw new GraphCompileError({
@@ -201,34 +216,16 @@ function deriveFlow(
     if (
       !safeGraphId(id) ||
       !node ||
-      dynamicBranch(node, edges.get(id)) ||
+      graphDynamicOutlets(node, edges.get(id)) ||
       node.type === 'END' ||
       !Array.isArray(targets) ||
-      targets.length !== 1 ||
-      !edges.get(id)?.some((edge) => edge.to === targets[0])
+      !targets.length ||
+      targets.length !== new Set(targets).size ||
+      !targets.every((target) => edges.get(id)?.some((edge) => edge.to === target && !edge.when))
     )
-      issue(node ?? start, '固定选线必须指向已有的一条普通出线');
+      issue(node ?? start, '固定选线必须指向一条或多条已有的普通出线');
   }
-  const allowed = (id: string) =>
-    Object.hasOwn(selections, id)
-      ? (edges.get(id) ?? []).filter((edge) => edge.to === selections[id]?.[0])
-      : (edges.get(id) ?? []);
-  const reverse = new Map<string, string[]>();
-  for (const id of byId.keys())
-    for (const { to } of allowed(id)) {
-      const predecessors = reverse.get(to) ?? [];
-      predecessors.push(id);
-      reverse.set(to, predecessors);
-    }
-  const toEnd = new Set([endId]);
-  const incoming = [endId];
-  for (const id of incoming)
-    for (const source of reverse.get(id) ?? []) {
-      if (!toEnd.has(source)) {
-        toEnd.add(source);
-        incoming.push(source);
-      }
-    }
+  const { allowed, toEnd } = scope;
   const visited = new Set<string>();
   const pending = [start.id];
   for (const id of pending) {
@@ -237,16 +234,18 @@ function deriveFlow(
     const node = byId.get(id)!;
     flow.nodes.push(node);
     if (id === endId) continue;
-    const branch = dynamicBranch(node, edges.get(id));
-    const outgoing = branch ? allowed(id) : allowed(id).filter((edge) => toEnd.has(edge.to));
-    if (node.type === 'END' || !outgoing.length)
+    const outgoing = allowed(id);
+    const dynamic = graphDynamicOutlets(node, edges.get(id));
+    const outside = outgoing.find(
+      (edge) => !toEnd.has(edge.to) && (dynamic || Object.hasOwn(selections, id) || !owners.has(edge)),
+    );
+    if (outside)
+      issue(node, `通往「${byId.get(outside.to)!.name}」的出线无法到达已配对的结束节点。路径必须全部到达对应结束，请检查连线或配置执行流范围`, outside);
+    const included = outgoing.filter((edge) => toEnd.has(edge.to));
+    if (node.type === 'END' || !included.length)
       issue(node, '路径必须全部到达已配对的结束节点，请检查连线');
-    const deadBranch = outgoing.find((edge) => !toEnd.has(edge.to));
-    if (deadBranch) issue(byId.get(deadBranch.to)!, '分支无法到达已配对的结束节点', deadBranch);
-    if (!branch && outgoing.length > 1)
-      issue(node, '多条出线均可到达所选结束节点，请在此执行流明确选择出线');
-    flow.edges.push(...outgoing);
-    pending.push(...outgoing.map(({ to }) => to));
+    flow.edges.push(...included);
+    pending.push(...included.map(({ to }) => to));
   }
   if (!visited.has(endId))
     throw new BadRequestException(`「${start.name}」没有通往所选结束节点的路径`);
@@ -264,10 +263,12 @@ function deriveFlow(
 export function compileCanvas(input: GraphCanvas, publish: boolean): GraphDefinition {
   const canvas = withNodeReferences(input);
   const { byId, edges } = validateCanvas(canvas);
+  const scopes = canvas.endpoints.map((endpoint) => flowScope(endpoint, edges));
+  const owners = new Set(scopes.flatMap(({ included }) => [...included]));
   const flows: GraphFlow[] = [];
-  for (const endpoint of canvas.endpoints) {
+  for (const [index, endpoint] of canvas.endpoints.entries()) {
     try {
-      flows.push(deriveFlow(byId.get(endpoint.startId)!, endpoint, byId, edges));
+      flows.push(deriveFlow(byId.get(endpoint.startId)!, endpoint, byId, edges, scopes[index]!, owners));
     } catch (error) {
       if (publish || !(error instanceof BadRequestException)) throw error;
     }

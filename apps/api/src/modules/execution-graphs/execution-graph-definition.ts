@@ -78,6 +78,21 @@ const maxApprovalSeconds = 604_800;
 export const defaultApprovalSeconds = 86_400;
 const commitFormat = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
+class GraphBranchCase {
+  @Matches(idFormat) id!: string;
+  @IsString() @MaxLength(500) value!: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(100) label?: string;
+}
+
+class GraphBranch {
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(maxSwitchCases)
+  @ValidateNested({ each: true })
+  @Type(() => GraphBranchCase)
+  cases!: GraphBranchCase[];
+}
+
 class GraphSwitch {
   @IsOptional() @IsIn(['input', 'commitSha']) key?: 'input' | 'commitSha';
   @IsArray()
@@ -305,6 +320,11 @@ export class GraphNode {
   @ValidateIf((_o, v) => v !== undefined)
   @IsObject()
   @ValidateNested()
+  @Type(() => GraphBranch)
+  branch?: GraphBranch;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
   @Type(() => GraphSwitch)
   switch?: GraphSwitch;
   @ValidateIf((_o, v) => v !== undefined)
@@ -351,8 +371,28 @@ export class GraphEdge {
   @Matches(idFormat) from!: string;
   @Matches(idFormat) to!: string;
   @ValidateIf((_o, v) => v !== undefined)
-  @Matches(/^(?:TRUE|FALSE|DEFAULT|CASE:[0-9]|SUCCESS|PARTIAL_SUCCESS)$/)
-  when?: 'TRUE' | 'FALSE' | 'DEFAULT' | `CASE:${number}` | 'SUCCESS' | 'PARTIAL_SUCCESS';
+  @Matches(/^(?:TRUE|FALSE|DEFAULT|CASE:[A-Za-z0-9_-]{1,64}|SUCCESS|PARTIAL_SUCCESS)$/)
+  when?: 'TRUE' | 'FALSE' | 'DEFAULT' | `CASE:${string}` | 'SUCCESS' | 'PARTIAL_SUCCESS';
+}
+
+export function graphDynamicOutlets(node: GraphNode, edges: readonly GraphEdge[] = []) {
+  return (
+    ['CONDITION', 'SWITCH', 'PARALLEL'].includes(node.type) ||
+    (['DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT'].includes(node.type) &&
+      edges.some(({ when }) => when === 'SUCCESS' || when === 'PARTIAL_SUCCESS'))
+  );
+}
+
+export function graphConditionMatch(node: GraphNode, value: unknown, caseInsensitive = false): GraphEdge['when'] {
+  const matches = (candidate: string) =>
+    value !== undefined && (caseInsensitive ? candidate.toLowerCase() : candidate) === String(value);
+  if (node.branch) {
+    const entry = node.branch.cases.find((choice) => matches(choice.value));
+    return entry ? `CASE:${entry.id}` : 'DEFAULT';
+  }
+  if (node.condition) return matches(node.condition.value) ? 'TRUE' : 'FALSE';
+  const index = node.switch?.cases.findIndex(matches);
+  return index === undefined ? undefined : index < 0 ? 'DEFAULT' : `CASE:${index}`;
 }
 class GraphFlowConfiguration {
   @IsOptional() @IsUUID() serviceId?: string;
@@ -448,24 +488,22 @@ export function orderedFlowNodes(flow: GraphFlow): GraphNode[] {
   for (const edge of flow.edges) {
     const edges = outgoing.get(edge.from);
     const count = incoming.get(edge.to);
-    if (!edges || count === undefined || edges.some(({ to }) => to === edge.to))
-      throw new BadRequestException('连线须连接同一执行流中的节点，且起点与终点的组合必须唯一');
+    if (!edges || count === undefined || edges.some(({ to, when }) => to === edge.to && when === edge.when))
+      throw new BadRequestException('连线须连接同一执行流中的节点，且相同出口不能重复连接同一节点');
     edges.push(edge);
     incoming.set(edge.to, count + 1);
   }
   for (const node of flow.nodes) {
     const edges = outgoing.get(node.id)!;
     const count = incoming.get(node.id)!;
-    const validInputs =
-      node.type === 'START'
-        ? count === 0
-        : node.type === 'JOIN' || node.type === 'END'
-          ? count >= 1
-          : count === 1;
+    const validInputs = node.type === 'START' ? count === 0 : count >= 1;
     if (!validInputs || !hasValidOutputs(node, edges))
-      throw new BadRequestException(
-        `节点「${node.name}」的连线不完整。检查并行、汇合、条件或多分支节点的入口及出口，每个分支必须各有一条连线`,
-      );
+      throw new GraphCompileError({
+        flowId: flow.id,
+        nodeId: node.id,
+        edge: edges.find(({ when }, index) => edges.findIndex((edge) => edge.when === when) < index && when !== undefined),
+        message: `节点「${node.name}」的连线不完整。检查入口与出口，每个条件或发布结果出口须连接一条线`,
+      });
   }
   // A unique source and sink, plus a topological ordering of all nodes, makes
   // every node reachable from START and ensures every path can reach END.
@@ -489,9 +527,14 @@ function hasValidOutputs(node: GraphNode, edges: GraphEdge[]) {
   const labels = new Set(edges.map(({ when }) => when));
   if (
     (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') &&
-    labels.has('PARTIAL_SUCCESS')
+    edges.some(({ when }) => when !== undefined)
   )
-    return edges.length === 2 && labels.has('SUCCESS');
+    return edges.length === 2 && labels.has('SUCCESS') && labels.has('PARTIAL_SUCCESS');
+  if (node.type === 'CONDITION' && node.branch) {
+    const cases = node.branch.cases;
+    return Array.isArray(cases) && edges.length === cases.length + 1 && labels.has('DEFAULT') &&
+      cases.every((entry) => entry && labels.has(`CASE:${entry.id}`));
+  }
   if (node.type === 'CONDITION')
     return edges.length === 2 && labels.has('TRUE') && labels.has('FALSE');
   if (node.type === 'SWITCH') {
@@ -506,10 +549,21 @@ function hasValidOutputs(node: GraphNode, edges: GraphEdge[]) {
   if (edges.some(({ when }) => when !== undefined)) return false;
   if (node.type === 'END') return !edges.length;
   if (node.type === 'PARALLEL') return edges.length >= 2;
-  return edges.length === 1;
+  return edges.length >= 1;
 }
 
 function validateAdvancedNode(node: GraphNode) {
+  if (node.branch !== undefined) {
+    const cases = node.branch?.cases;
+    if (node.type !== 'CONDITION' || node.condition || !Array.isArray(cases) || !cases.length ||
+      cases.length > maxSwitchCases || cases.some((entry) => !entry || !safeGraphId(entry.id) ||
+        typeof entry.value !== 'string' || entry.value.length > 500 || redactTaskLog(entry.value) !== entry.value ||
+        (entry.label !== undefined && (typeof entry.label !== 'string' || entry.label.length > 100 || redactTaskLog(entry.label) !== entry.label))))
+      throw new BadRequestException('条件分支须配置 1 到 10 个有效规则');
+    if (new Set(cases.map(({ id }) => id)).size !== cases.length ||
+      new Set(cases.map(({ value }) => value)).size !== cases.length)
+      throw new BadRequestException('条件分支的规则 ID 和匹配值须各自唯一');
+  }
   const config = node.switch;
   if (node.type === 'SWITCH') {
     if (
@@ -701,7 +755,7 @@ export function validateGraphDefinition(definition: GraphDefinition) {
         } else if (node.flowId !== undefined) {
           throw new BadRequestException('仅调用节点可引用其他执行流');
         }
-        if (node.type === 'CONDITION') {
+        if (node.type === 'CONDITION' && !node.branch) {
           const condition = node.condition;
           if (
             !condition ||

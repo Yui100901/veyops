@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { redactTaskLog } from '../tasks/task-log.service';
 import { terminalTaskStatuses } from '../tasks/tasks.types';
 import {
+  graphConditionMatch,
   orderedFlowNodes,
   type GraphEdge,
   type GraphFlow,
@@ -49,6 +50,23 @@ export function flowSelection(
   return { ordered, selected, matches, incoming };
 }
 
+export function graphPreviewRouting(flow: GraphFlow, selection: ReturnType<typeof flowSelection>) {
+  const certain = new Set([selection.ordered[0]!.id]);
+  const routes = new Map<GraphEdge, 'CERTAIN' | 'POSSIBLE'>();
+  for (const node of selection.ordered) {
+    for (const edge of selection.incoming.get(node.id) ?? []) {
+      const resolved = !edge.when || selection.matches.has(edge.from);
+      const active = certain.has(edge.from) && resolved;
+      if (active) certain.add(edge.to);
+      routes.set(edge, active ? 'CERTAIN' : 'POSSIBLE');
+    }
+  }
+  return {
+    certain,
+    edges: flow.edges.map((edge) => ({ ...edge, status: routes.get(edge) ?? 'EXCLUDED' as const })),
+  };
+}
+
 export function branchMatch(
   flow: GraphFlow,
   node: GraphNode,
@@ -61,25 +79,26 @@ export function branchMatch(
       return release.status;
   }
   const configuration = node.condition ?? node.switch;
-  if (!configuration) return undefined;
-  const explicit = flow.inputBindings?.[node.id]?.value;
-  const settled = state?.outputs?.get(node.id)?.matched;
+  if (!configuration && !node.branch) return undefined;
+  const explicit = flow.compiled?.nodes[node.id]?.inputBindings.value ?? flow.inputBindings?.[node.id]?.value;
+  const output = state?.outputs?.get(node.id);
+  if (node.branch) {
+    if (typeof output?.branchId === 'string') return output.branchId as GraphEdge['when'];
+    const value = state && inspectNodeInputs(flow, node, state).values.value;
+    return value === undefined ? undefined : graphConditionMatch(node, value);
+  }
+  const settled = output?.matched;
   if (typeof settled === 'boolean') return settled ? 'TRUE' : 'FALSE';
   if (typeof settled === 'string') return settled as GraphEdge['when'];
   const value = explicit
     ? state && inspectNodeInputs(flow, node, state).values.value
-    : branchInput(inputs, configuration.key, stringValue(state?.context?.triggerCommitSha));
+    : branchInput(inputs, configuration?.key, stringValue(state?.context?.triggerCommitSha));
   if (explicit && value === undefined) return undefined;
-  const commit = !explicit && configuration.key === 'commitSha';
-  const matches = (candidate: string) =>
-    (commit ? candidate.toLowerCase() : candidate) ===
-    (value === undefined ? undefined : String(value));
-  if (node.condition) return matches(node.condition.value) ? 'TRUE' : 'FALSE';
-  const index = node.switch!.cases.findIndex(matches);
-  return index === -1 ? 'DEFAULT' : `CASE:${index}`;
+  return graphConditionMatch(node, value, !explicit && configuration?.key === 'commitSha');
 }
 
 export function graphConditionOutput(node: GraphNode, match: NonNullable<GraphEdge['when']>) {
+  if (node.branch) return { matched: match !== 'DEFAULT', branchId: match };
   if (node.type === 'CONDITION') return { matched: match === 'TRUE' };
   if (match === 'DEFAULT') return { matched: match, branchId: 'DEFAULT' };
   const index = Number(match.slice('CASE:'.length));
@@ -109,6 +128,8 @@ export function graphNodeOutput(node: GraphNode, match?: GraphEdge['when']) {
     case 'END':
       return '执行流已结束';
     case 'CONDITION':
+      if (node.branch)
+        return match === 'DEFAULT' ? '未命中匹配值，进入默认分支。' : '规则命中，进入对应分支。';
       return match === 'TRUE' ? '条件命中，进入成立分支。' : '条件未命中，进入不成立分支。';
     case 'SWITCH':
       return match === 'DEFAULT' ? '未命中匹配值，进入默认分支。' : '多分支匹配成功。';

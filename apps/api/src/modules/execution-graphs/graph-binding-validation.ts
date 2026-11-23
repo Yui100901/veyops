@@ -1,4 +1,5 @@
 import { redactTaskLog } from '../tasks/task-log.service';
+import { graphConditionMatch } from './execution-graph-definition';
 import type { GraphEdge, GraphFlow, GraphNode } from './execution-graph-definition';
 import { environmentFilePath } from './graph-environment';
 import {
@@ -148,16 +149,7 @@ function outgoingBranches(flow: GraphFlow, node: GraphNode, edges: readonly Grap
   if (node.type !== 'CONDITION' && node.type !== 'SWITCH') return [edges];
   const binding = bindingAt(flow, node, 'value');
   if (binding?.kind === 'VALUE') {
-    const actual = String(binding.value);
-    const index = node.switch?.cases.indexOf(actual) ?? -1;
-    const branch =
-      node.type === 'CONDITION'
-        ? node.condition?.value === actual
-          ? 'TRUE'
-          : 'FALSE'
-        : index === -1
-          ? 'DEFAULT'
-          : `CASE:${index}`;
+    const branch = graphConditionMatch(node, binding.value);
     return [edges.filter((edge) => edge.when === branch)];
   }
   return edges.map((edge) => [edge]);
@@ -180,7 +172,7 @@ function possiblePaths(flow: GraphFlow, ordered: GraphNode[]) {
               ? [
                   {
                     id: `${node.id}:${edge.when}`,
-                    label: `${node.name} ${edge.when}`,
+                    label: `${node.name} ${node.branch?.cases.find(({ id }) => edge.when === `CASE:${id}`)?.label || (edge.when === 'DEFAULT' ? '默认' : edge.when)}`,
                     edge,
                   },
                 ]
@@ -427,7 +419,9 @@ function assertBinding(
     return;
   }
   if (binding.kind === 'CREDENTIAL' || binding.kind === 'ENVIRONMENT_KEY') {
-    if (!environment) fail(flow, node, '凭据或集合变量键仅能用于脚本环境注入', field);
+    const isConditionKey = binding.kind === 'ENVIRONMENT_KEY' && node.branch && field.id === 'value';
+    if (!environment && !isConditionKey)
+      fail(flow, node, '凭据用于脚本环境注入，集合变量键也可供条件分支比较', field);
     if (
       binding.kind === 'ENVIRONMENT_KEY' &&
       !context.flow.nodes.some(
@@ -1124,8 +1118,13 @@ export function flowCandidateCatalog(
             });
           }
           const eligible = paths.filter(({ path }) => path.active.has(node.id));
+          const visibleSources = [...(staticOrder.get(node.id) ?? new Set<string>())];
+          const references = visibleSources.map((id) => context.nodes.get(id)?.referenceName ?? id);
           for (const sourceId of staticOrder.get(node.id) ?? []) {
             const producer = context.nodes.get(sourceId)!;
+            const reference = producer.referenceName ?? producer.id;
+            const producerLabel = references.indexOf(reference) === references.lastIndexOf(reference)
+              ? producer.name : `${producer.name}（${producer.id}）`;
             const present = eligible.filter(({ order }) => order.get(node.id)?.has(sourceId));
             if (eligible.length && !present.length) continue;
             const branches = [
@@ -1133,9 +1132,9 @@ export function flowCandidateCatalog(
             ];
             for (const field of outputs.get(sourceId) ?? [])
               candidates.push({
-                label: producer.name + ' · ' + field.name,
+                label: producerLabel + ' · ' + field.name,
                 referenceName:
-                  (producer.referenceName ?? producer.id) + '.' + (field.referenceName ?? field.id),
+                  reference + '.' + (field.referenceName ?? field.id),
                 field,
                 binding: { kind: 'OUTPUT', nodeId: producer.id, fieldId: field.id },
                 availability:

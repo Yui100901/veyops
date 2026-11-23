@@ -639,6 +639,12 @@ export function graphOperationPorts(
 ): ModulePorts | undefined {
   const definition = (graphModules as Partial<Record<GraphNode['type'], ModulePorts>>)[node.type];
   if (!definition) return undefined;
+  if (node.type === 'CONDITION' && node.branch)
+    return {
+      ...definition,
+      inputs: [{ ...branchValue, required: true }],
+      outputs: [...definition.outputs, field('branchId', 'TEXT', true, '分支标识')],
+    };
   if (node.type === 'SOURCE_REVIEW' && node.approval?.buildNodeId)
     return { ...definition, inputs: [] };
   if (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') {

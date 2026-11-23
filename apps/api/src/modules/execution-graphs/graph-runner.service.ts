@@ -136,6 +136,7 @@ import {
   graphConditionOutput,
   flowSelection,
   graphNodeOutput,
+  graphPreviewRouting,
   graphTaskKeyPrefix,
   isDelivery,
   isRelease,
@@ -1408,6 +1409,7 @@ export class GraphRunnerService implements OnModuleInit {
     const sets = new Map<string, Promise<FrozenEnvironmentSet>>();
     const credentials: Record<string, string> = Object.create(null);
     const evidenceByNode = new Map<string, NodeEvidence>();
+    let rootRouting: ReturnType<typeof graphPreviewRouting> | undefined;
     const prepareFlow = async (
       current: GraphFlow,
       args: GraphInputsDto,
@@ -1829,6 +1831,7 @@ export class GraphRunnerService implements OnModuleInit {
           sources.push(...(parameterProduction.get(binding.fieldId) ?? []));
         if (sources.length) produced[fieldId] = sources;
       }
+      if (current.id === flowId) rootRouting = graphPreviewRouting(current, flowSelection(current, args, state));
       return {
         inputHash,
         ...(parameterProduction.size && {
@@ -1887,6 +1890,15 @@ export class GraphRunnerService implements OnModuleInit {
       });
     }
     const selectedNodes = new Set(prepared.selectedNodeIds);
+    const edgeKey = ({ from, to, when }: { from: string; to: string; when?: string }) => JSON.stringify([from, to, when]);
+    const rootNodeIds = new Set(flow.nodes.map(({ id }) => id));
+    const rootEdges = new Set(flow.edges.map(edgeKey));
+    const routing = [
+      ...(rootRouting?.edges ?? []),
+      ...(definition.canvas?.edges ?? [])
+        .filter((edge) => rootNodeIds.has(edge.from) && !rootEdges.has(edgeKey(edge)))
+        .map((edge) => ({ ...edge, status: 'OUTSIDE_FLOW' as const })),
+    ];
     const publicDeliveries = publishedDeliveries.map((delivery) =>
       publicDelivery(delivery, definition),
     );
@@ -1945,6 +1957,7 @@ export class GraphRunnerService implements OnModuleInit {
       section(row.flowId, row.nodeId, '环境文件', row);
     for (const row of checkoutRows) section(row.flowId, row.nodeId, '检出仓库与提交', row);
     section(flowId, flowStart(flow).id, '变量集合及修订', prepared.environmentSet);
+    section(flowId, flowStart(flow).id, '执行路线', routing);
     for (const { flowId, nodeId, plan } of scriptsPrepared) {
       if (plan.type !== 'SHELL' && plan.type !== 'CHECK') continue;
       section(flowId, nodeId, '执行目标及成员', [plan.serverId, plan.serverName, plan.targetHash]);
@@ -1987,6 +2000,7 @@ export class GraphRunnerService implements OnModuleInit {
       trigger,
       prepared,
       credentials,
+      routing,
     ]);
     const preview = {
       ...publicDeliveries[0],
@@ -1999,11 +2013,13 @@ export class GraphRunnerService implements OnModuleInit {
       environmentSet: prepared.environmentSet,
       parameters: publicParameters(flow, inputs.parameters),
       parameterSources,
+      routing,
       nodes: orderedFlowNodes(flow).map(({ id, name, type }) => ({
         nodeId: id,
         name,
         type,
         selected: selectedNodes.has(id),
+        conditional: selectedNodes.has(id) && rootRouting?.certain.has(id) === false,
         ...evidenceByNode.get(planKey(flow.id, id)),
       })),
       deliveries: publicDeliveries,
@@ -2787,17 +2803,20 @@ export class GraphRunnerService implements OnModuleInit {
           continue;
         }
         const parents = selection.incoming.get(node.id) ?? [];
+        const failedParent = parents.find(({ from, when }) => {
+          const status = byId.get(from)!.status;
+          if (!isNodeTerminal(status)) return false;
+          return when === 'PARTIAL_SUCCESS'
+            ? status !== 'PARTIAL_FAILED' || selection.matches.get(from) !== 'PARTIAL_SUCCESS'
+            : status !== 'SUCCESS';
+        });
+        if (failedParent) {
+          const parent = byId.get(failedParent.from)!;
+          await this.terminalNode(tx, row, 'SKIPPED', `上游节点「${parent.name}」未成功。`);
+          continue;
+        }
         if (parents.some(({ from }) => !isNodeTerminal(byId.get(from)!.status))) continue;
         if (
-          parents.some(({ from, when }) => {
-            const status = byId.get(from)!.status;
-            return when === 'PARTIAL_SUCCESS'
-              ? status !== 'PARTIAL_FAILED' || selection.matches.get(from) !== 'PARTIAL_SUCCESS'
-              : status !== 'SUCCESS';
-          })
-        ) {
-          await this.terminalNode(tx, row, 'SKIPPED', '上游节点未成功。');
-        } else if (
           node.type === 'DELAY' ||
           node.type === 'APPROVAL' ||
           node.type === 'SOURCE_REVIEW'
