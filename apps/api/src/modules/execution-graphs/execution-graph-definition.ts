@@ -218,8 +218,9 @@ class GraphComposeSource {
 }
 
 class GraphHealthCheck {
-  @IsString() @Length(1, 65536) @Matches(/\S/) command!: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(65536) command?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsInt() @Min(1) @Max(180) timeoutSeconds?: number;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() requireHealthy?: boolean;
 }
 
 export class GraphDeploySettings {
@@ -572,8 +573,8 @@ function validateAdvancedNode(node: GraphNode) {
     throw new BadRequestException('仅源码拉取节点可配置仓库');
   }
   if (node.type === 'SHELL' || node.type === 'CHECK') {
-    if (!node.shell?.command?.trim()) throw new BadRequestException('Shell 或检查节点须填写命令');
-    if (redactTaskLog(node.shell.command) !== node.shell.command)
+    const command = node.shell?.command;
+    if (command && redactTaskLog(command) !== command)
       throw new BadRequestException('Shell 命令包含明文凭据，请移除敏感值');
   } else if (node.shell !== undefined) {
     throw new BadRequestException('仅 Shell 或检查节点可配置命令');
@@ -591,11 +592,31 @@ export function annotateGraphIssue(error: unknown, flow: GraphFlow, node?: Graph
   throw error;
 }
 
+function missingNodeConfiguration(node: GraphNode): { fieldId: string; message: string }[] {
+  if (node.type === 'BUILD')
+    return (node.build?.artifacts ?? []).flatMap(({ id, name, type, path }) =>
+      type !== 'DOCKER_IMAGE' && path !== undefined && !path.trim()
+        ? [{ fieldId: id ?? name, message: `请填写「${name}」的工作区相对路径` }]
+        : [],
+    );
+  if (
+    (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') &&
+    !node.deploy?.deployPath?.trim()
+  )
+    return [{ fieldId: 'deployPath', message: '请填写节点的发布目录' }];
+  if (node.type === 'HEALTH_CHECK' && !node.healthCheck?.command?.trim())
+    return [{ fieldId: 'command', message: '请填写健康检查命令' }];
+  if ((node.type === 'SHELL' || node.type === 'CHECK') && !node.shell?.command?.trim())
+    return [{ fieldId: 'command', message: '请填写脚本或检查命令' }];
+  return [];
+}
+
 export function validateGraphDefinition(definition: GraphDefinition) {
   if (!definition.flows.length || definition.flows.length > maxFlows)
     throw new BadRequestException(`每张图须包含 1 到 ${maxFlows} 个执行流`);
   const calls = new Map<string, { nodeCount: number; children: string[] }>();
   const nodeIds = new Set<string>();
+  const issues: GraphDiagnostic[] = [];
   for (const flow of definition.flows) {
     if (calls.has(flow.id)) throw new BadRequestException('执行流 ID 重复');
     if (flow.nodes.length > maxNodes || flow.edges.length > maxEdges)
@@ -618,6 +639,14 @@ export function validateGraphDefinition(definition: GraphDefinition) {
         if (!definition.canvas && nodeIds.has(node.id))
           throw new BadRequestException('同一图版本中的节点 ID 必须唯一');
         nodeIds.add(node.id);
+        for (const { fieldId, message } of missingNodeConfiguration(node))
+          issues.push({
+            flowId: flow.id,
+            nodeId: node.id,
+            fieldId,
+            severity: 'ERROR',
+            message: `「${flow.name}」 → 「${node.name}」 · ${message}`,
+          });
         validateAdvancedNode(node);
         if ('delivery' in node || 'pipelineId' in node || 'pipelineVersion' in node)
           throw new BadRequestException('请使用功能节点配置构建和部署');
@@ -633,10 +662,9 @@ export function validateGraphDefinition(definition: GraphDefinition) {
         )
           throw new BadRequestException('功能配置与节点模块不匹配');
         if (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') {
-          if (!node.deploy?.deployPath) throw new BadRequestException('请填写节点的发布目录');
-          safeDeployPath(node.deploy.deployPath);
-          const template = node.deploy.composeSource;
-          if (template && node.deploy.method === 'FILE')
+          if (node.deploy?.deployPath?.trim()) safeDeployPath(node.deploy.deployPath);
+          const template = node.deploy?.composeSource;
+          if (template && node.deploy?.method === 'FILE')
             throw new BadRequestException('文件发布不能声明 Compose 模板');
           if (template?.kind === 'REPOSITORY_FILE') {
             if (!template.repositoryId || !template.commitSha || !template.path)
@@ -648,8 +676,8 @@ export function validateGraphDefinition(definition: GraphDefinition) {
         }
         if (
           node.type === 'HEALTH_CHECK' &&
-          (!node.healthCheck?.command?.trim() ||
-            redactTaskLog(node.healthCheck.command) !== node.healthCheck.command)
+          node.healthCheck?.command &&
+          redactTaskLog(node.healthCheck.command) !== node.healthCheck.command
         )
           throw new BadRequestException('请填写健康检查命令并通过变量引用传入凭据');
         if (node.build?.branch && (!isGitBranchName(node.build.branch) || node.build.commitSha))
@@ -691,6 +719,7 @@ export function validateGraphDefinition(definition: GraphDefinition) {
       }
     }
   }
+  if (issues.length) throw new GraphCompileError(issues[0]!, issues);
   const seen = new Set<string>();
   const expanded = new Map<string, number>();
   const count = (flowId: string): number => {
@@ -712,7 +741,6 @@ export function validateGraphDefinition(definition: GraphDefinition) {
   };
   for (const flowId of calls.keys()) count(flowId);
   const compiled = new Map<string, GraphCompiledFlow>();
-  const issues: GraphDiagnostic[] = [];
   for (const flow of definition.flows) {
     try {
       compiled.set(flow.id, validateFlowBindings(flow, definition.flows, orderedFlowNodes(flow)));

@@ -19,6 +19,7 @@ import {
   validateGraphDefinition,
 } from './execution-graph-definition';
 import { GraphCompileError, type GraphDiagnostic } from './graph-fields';
+import { expandGraphTemplate, type ExpandGraphTemplateDto } from './graph-flow-templates';
 
 function graphResponse(row: Selectable<Database['execution_graphs']>) {
   return {
@@ -49,6 +50,12 @@ export class ExecutionGraphsService {
 
   async get(projectId: string) {
     return graphResponse(await this.graph(projectId));
+  }
+
+  async expandTemplate(projectId: string, { templateId, artifactType }: ExpandGraphTemplateDto) {
+    await requireProject(this.database.db, projectId);
+    await this.graph(projectId);
+    return expandGraphTemplate(templateId, artifactType);
   }
 
   private async lockDraft(tx: Transaction<Database>, projectId: string, expectedRevision: number) {

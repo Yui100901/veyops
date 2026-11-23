@@ -2667,8 +2667,15 @@ export class GraphRunnerService implements OnModuleInit {
               this.nodeTasks
                 ? await this.nodeTasks.output(task.id, node, tx)
                 : undefined;
-            if (node.type === 'HEALTH_CHECK' && output?.status === 'UNKNOWN')
-              status = 'NEEDS_ATTENTION';
+            if (node.type === 'HEALTH_CHECK') {
+              if (output?.status === 'UNKNOWN') status = 'NEEDS_ATTENTION';
+              else if (
+                status === 'SUCCESS' &&
+                node.healthCheck?.requireHealthy &&
+                output?.status === 'UNHEALTHY'
+              )
+                status = 'FAILED';
+            }
             if (isRelease(node) && status === 'SUCCESS') {
               const release = output?.release as { status?: string } | undefined;
               if (release?.status !== 'SUCCESS') status = 'NEEDS_ATTENTION';
@@ -2686,7 +2693,9 @@ export class GraphRunnerService implements OnModuleInit {
                 task.error_summary ??
                 (node.type === 'HEALTH_CHECK' && status === 'NEEDS_ATTENTION'
                   ? '健康状态未知，需人工核查当前发布。'
-                  : undefined) ??
+                  : node.type === 'HEALTH_CHECK' && status === 'FAILED' && output?.status === 'UNHEALTHY'
+                    ? '发布健康检查未通过。'
+                    : undefined) ??
                 (status === 'SUCCESS'
                   ? '节点任务已完成，详情见关联任务。'
                   : '节点任务已结束，详情见关联任务。'),

@@ -39,7 +39,8 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { DatabaseService } from '../../core/database/database.service';
-import { initialGraphDraft } from '../../core/database/execution-graphs-migration';
+import { compileCanvas } from '../execution-graphs/execution-graph-canvas';
+import { expandGraphTemplate } from '../execution-graphs/graph-flow-templates';
 import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { CurrentUser } from '../auth/auth.decorators';
@@ -478,7 +479,9 @@ export class ProjectsService {
             id,
             project_id: id,
             revision: 1,
-            draft_json: initialGraphDraft,
+            draft_json: JSON.stringify(
+              compileCanvas(expandGraphTemplate('MINIMAL_CI_CD').canvas, false),
+            ),
             created_at: now,
             updated_at: now,
           })
