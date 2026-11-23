@@ -241,7 +241,20 @@ function createGraphRunner(api, fixture, evidence) {
       await sleep(650);
     } while (Date.now() < deadline);
     if (detail.status !== (options.expected ?? 'SUCCESS')) {
-      const states = detail.nodes.map(({ nodeId, status, log }) => ({ nodeId, status, log }));
+      const traces = async (run, depth = 0) =>
+        Promise.all(
+          run.nodes.map(async ({ nodeId, status, log, childRunId }) => ({
+            nodeId,
+            status,
+            log,
+            ...(childRunId &&
+              depth < 3 && {
+                childRunId,
+                nodes: await traces(await api.get(graph + '/runs/' + childRunId), depth + 1),
+              }),
+          })),
+        );
+      const states = await traces(detail);
       throw new Error(`${flow} 运行 ${queued.id} 状态 ${detail.status}，${JSON.stringify(states)}`);
     }
     assert.equal(decisions.size, options.decision ? 1 : 0);

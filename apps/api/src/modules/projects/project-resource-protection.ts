@@ -97,6 +97,7 @@ async function availableIds(
   projectId: string,
   type: ProjectResourceType,
   ids: string[],
+  artifactRootRunId?: string,
 ) {
   switch (type) {
     case 'REPOSITORY': {
@@ -167,7 +168,12 @@ async function availableIds(
         .select(['id', 'logical_artifact_id as logicalId'])
         .where('project_id', '=', projectId)
         .where('lifecycle_state', '=', 'ACTIVE')
-        .where('temporary_root_id', 'is', null)
+        .where((eb) =>
+          eb.or([
+            eb('temporary_root_id', 'is', null),
+            ...(artifactRootRunId ? [eb('temporary_root_id', '=', artifactRootRunId)] : []),
+          ]),
+        )
         .where('pruned_at', 'is', null)
         .where('archive_deleted_at', 'is', null)
         .where((eb) => eb.or([eb('id', 'in', ids), eb('logical_artifact_id', 'in', ids)]))
@@ -184,6 +190,7 @@ export async function unavailableReference<T extends Resource>(
   db: Kysely<Database>,
   projectId: string,
   references: T[],
+  options: { artifactRootRunId?: string } = {},
 ) {
   const layers = new Map<ProjectResourceType, Map<string, T>>();
   for (const reference of references) {
@@ -196,7 +203,11 @@ export async function unavailableReference<T extends Resource>(
     // Keep a single query comfortably below the default SQLite bind limit.
     for (let offset = 0; offset < ids.length; offset += 500) {
       const part = ids.slice(offset, offset + 500);
-      const active = new Set((await availableIds(db, projectId, type, part)).map((row) => row.id));
+      const active = new Set(
+        (await availableIds(db, projectId, type, part, options.artifactRootRunId)).map(
+          (row) => row.id,
+        ),
+      );
       const missing = part.find((id) => !active.has(id));
       if (missing) return layer.get(missing);
     }

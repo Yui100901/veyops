@@ -133,7 +133,12 @@ export class TasksService {
             ? [{ resourceType: 'LEGACY_TARGET' as const, resourceId: input.scope.targetId }]
             : []),
         ];
-        if (await unavailableReference(tx, input.scope.projectId, scoped))
+        const pipeline = input.payload.pipeline;
+        const artifactRootRunId =
+          pipeline?.mode === 'DEPLOY_ARTIFACT' && input.idempotencyKey?.startsWith(graphTaskKeyPrefix)
+            ? pipeline.artifactRootRunId
+            : undefined;
+        if (await unavailableReference(tx, input.scope.projectId, scoped, { artifactRootRunId }))
           throw new ConflictException('任务引用的资源已变化，请重新预览');
       }
       const id = existing || (await this.createInTransaction(tx, input, userId));
