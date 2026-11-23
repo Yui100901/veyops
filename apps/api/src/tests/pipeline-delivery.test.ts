@@ -109,6 +109,7 @@ async function checkDelivery(databaseUrl?: string) {
             await readFile(join(workspace, 'dependencies', 'schema', 'origin.txt'), 'utf8'),
             auxiliaryCommit,
           );
+          await writeFile(join(workspace, 'repo', 'app.jar'), archive);
         }
         const checkout = script.includes('fetch --no-recurse-submodules --no-tags --depth=1');
         if (checkout || script.includes("printf 'VEYOPS_ARTIFACT")) {
@@ -133,6 +134,8 @@ async function checkDelivery(databaseUrl?: string) {
             stdout: `${script.split(':').at(-1)}: digest: ${imageDigest} size: 321\n`,
             stderr: '',
           };
+        if (args.includes('info') && args.includes('{{.ID}}'))
+          return { exitCode: 0, stdout: 'fixture-manager-engine', stderr: '' };
         if (args.includes('image') && args.includes('inspect'))
           return {
             exitCode: 0,
