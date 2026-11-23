@@ -6,12 +6,8 @@
   clear: both;
   min-width: 0;
   width: 100%;
-  max-width: 54rem;
-  margin-block: 1rem;
-  scroll-margin-block: 1rem;
-}
-.inline-editor-wide {
-  max-width: 75rem;
+  margin-block: var(--section-gap) 0;
+  scroll-margin-block: var(--section-gap);
 }
 .inline-editor > .panel-header {
   align-items: flex-start;

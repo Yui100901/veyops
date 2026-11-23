@@ -1,8 +1,8 @@
 .environment-variables {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
-  gap: 14px;
-  justify-items: start;
+  gap: var(--section-gap);
 }
 
 .environment-variable-header {
@@ -16,6 +16,10 @@
 
 .environment-variables p {
   margin: 0;
+}
+
+.environment-variables > .button {
+  justify-self: start;
 }
 
 .environment-variables > .table-scroll,
@@ -74,10 +78,36 @@
 
 .environment-set-fields {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  width: 100%;
+}
+
+.environment-set-fields > :not(label) {
+  grid-column: 1 / -1;
+}
+
+.environment-set-fields > :is(.tag, .button) {
+  justify-self: start;
+}
+
+.environment-set-fields > label {
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  min-width: 0;
+}
+
+.environment-set-fields > label > :is(input, textarea) {
   width: 100%;
 }
 
 .environment-set-fields h3 {
   margin: 0;
+}
+
+@media (max-width: 560px) {
+  .environment-set-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

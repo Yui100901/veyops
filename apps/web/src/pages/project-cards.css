@@ -1,12 +1,13 @@
 .project-grid.project-catalog {
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
   align-items: stretch;
+  gap: var(--section-gap);
 }
 .project-catalog .project-card {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  padding: 1.15rem;
+  padding: var(--surface-inset);
   gap: 0.8rem;
 }
 .project-catalog .project-card-top {
@@ -33,7 +34,7 @@
   align-items: center;
   flex-wrap: wrap;
   margin-top: auto;
-  padding: 0.8rem 0 0;
+  padding: 10px 0 0;
   color: #526675;
   font-size: 0.85rem;
 }
@@ -63,7 +64,12 @@
   margin-bottom: 0.45rem;
 }
 .project-view-card > .project-access {
-  margin-top: 0.9rem;
+  margin-top: 10px;
+}
+
+.project-views-layout .project-views-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr));
+  gap: var(--section-gap);
 }
 .project-access ul {
   display: flex;

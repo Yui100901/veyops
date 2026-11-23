@@ -1,8 +1,9 @@
 .server-key-action {
   display: grid;
   justify-items: start;
-  gap: 10px;
-  margin-bottom: 16px;
+  gap: 8px;
+  margin-block-end: var(--section-gap);
+  min-width: 0;
 }
 
 .server-key-review,
@@ -10,7 +11,7 @@
   width: 100%;
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 12px 14px;
+  padding: 12px var(--surface-inset);
   background: #f6f9fb;
 }
 
@@ -52,7 +53,7 @@
 }
 
 .server-key-value-saved {
-  margin-bottom: 16px;
+  margin-block-end: var(--section-gap);
 }
 
 .server-key-review p {
@@ -79,8 +80,17 @@
   accent-color: var(--accent);
 }
 
-.project-workspace .page-heading {
-  margin-bottom: 14px;
+.project-workspace {
+  min-width: 0;
+}
+
+.project-workspace > .back-link {
+  min-height: 26px;
+  margin-block-end: 4px;
+}
+
+.project-workspace > .page-heading {
+  margin-block-end: 8px;
 }
 
 .project-workspace .page-heading p:empty {
@@ -95,9 +105,9 @@
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px 16px;
+  gap: 6px 12px;
   color: #516473;
-  margin-bottom: 10px;
+  overflow-wrap: anywhere;
 }
 
 .project-workspace-summary strong {
@@ -106,44 +116,87 @@
 }
 
 .project-workspace .project-entry-nav {
-  padding: 6px;
-  gap: 6px;
-  margin-bottom: 20px;
+  width: 100%;
+  gap: 4px 12px;
+  margin-block-end: var(--section-gap);
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
 }
 
-.project-entry-nav a {
-  min-height: 42px;
-  font-size: 15px;
+.project-workspace .project-entry-nav a {
+  min-height: 36px;
+  gap: 6px;
+  padding: 4px 10px;
+  border-width: 0 0 2px;
+  border-radius: 6px 6px 0 0;
+  font-size: 14px;
   white-space: nowrap;
+}
+
+.project-workspace .project-entry-nav a[aria-current='page'] {
+  background: #e6f1ee;
+  border-color: var(--accent);
+  box-shadow: none;
+}
+
+.project-entry-nav svg {
+  flex: none;
 }
 
 .project-resources {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   align-content: start;
-  gap: 16px;
-  min-width: 0;
+  gap: var(--section-gap);
 }
 
 .project-resources > .panel,
 .project-resources > .resource-section-switcher,
-.project-resources > .project-workspace-summary {
-  margin-bottom: 0;
+.project-resources > .back-link {
+  margin-block: 0;
 }
 
-.project-service-detail > nav,
+.project-resources .resource-list {
+  padding-inline: var(--surface-inset);
+}
+
 .project-service-detail > .row-actions {
-  margin: 0 20px 14px;
+  margin: 0 var(--surface-inset) 12px;
 }
 .project-service-detail-addresses {
-  margin: 0 20px 16px;
+  padding: 12px var(--surface-inset);
 }
 .resource-list > .project-service-card {
   flex-wrap: wrap;
-  align-items: flex-start;
+  align-items: center;
 }
+
+.project-resources .resource-list > div {
+  padding-block: 10px;
+}
+
+.resource-list > div > .resource-avatar {
+  flex: none;
+}
+
 .resource-list > .project-service-card > .project-service-card-addresses {
-  flex-basis: calc(100% - 46px);
-  margin-inline-start: 46px;
+  display: grid;
+  flex-basis: calc(100% - 47px);
+  gap: 8px;
+  margin-inline-start: 47px;
+}
+
+.project-service-card-addresses .button {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: start;
+}
+
+.project-service-card-addresses .project-access-empty {
+  margin: 0;
 }
 .service-address-editor,
 .service-revision-conflict {
@@ -160,12 +213,22 @@
 }
 .service-address-editor-row {
   display: grid;
-  grid-template-columns: minmax(7rem, 1fr) minmax(10rem, 2fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto;
   align-items: start;
-  gap: 0.65rem;
+  gap: 8px;
 }
+
+.service-address-editor-row > .field,
+.service-address-editor > p {
+  margin: 0;
+}
+
 .service-address-order {
-  margin-top: 1.5rem;
+  margin-top: 26px;
+}
+
+.service-address-editor-row > .error-text {
+  grid-column: 1 / -1;
 }
 .service-address-editor-row .error-text {
   color: #b42318;
@@ -182,7 +245,7 @@
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 0 20px 16px;
+  padding: 12px var(--surface-inset);
 }
 
 .project-resource-links .button {
@@ -193,6 +256,30 @@
 }
 
 @media (max-width: 560px) {
+  .project-workspace .project-entry-nav {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0;
+  }
+
+  .project-workspace .project-entry-nav a {
+    justify-content: center;
+    padding-inline: 2px;
+    gap: 4px;
+    font-size: 13px;
+  }
+
+  .project-resources > .resource-section-switcher {
+    gap: 2px;
+    padding: 3px;
+  }
+
+  .project-resources > .resource-section-switcher a {
+    min-height: 34px;
+    padding-inline: 5px;
+    font-size: 13px;
+  }
+
   .service-address-editor-row {
     grid-template-columns: 1fr;
   }
@@ -203,20 +290,18 @@
     flex-basis: 100%;
     margin-inline-start: 0;
   }
-  .project-workspace .project-entry-nav {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    width: 100%;
-  }
-  .project-entry-nav a {
-    justify-content: center;
+}
+
+@media (max-width: 375px) {
+  .project-entry-nav svg {
+    display: none;
   }
 }
 
 .project-workspace .project-detail-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 27rem), 1fr));
+  gap: var(--section-gap);
   align-items: start;
 }
 
@@ -228,30 +313,16 @@
   padding-block: 10px;
 }
 
-.project-workspace .project-detail-grid .resource-list > div {
-  padding-block: 8px;
-}
-
 .project-workspace .project-detail-grid .mini-empty {
-  padding-block: 13px;
-}
-
-@media (min-width: 1120px) {
-  .project-workspace .project-detail-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .project-workspace .project-detail-grid > :first-child {
-    grid-column: 1 / -1;
-  }
+  padding-block: 12px;
 }
 .delivery-filters {
   display: flex;
   align-items: flex-end;
   flex-wrap: wrap;
-  gap: 12px;
-  margin: 14px 0 20px;
-  padding: 14px var(--surface-inset);
+  gap: 10px;
+  margin: var(--section-gap) 0;
+  padding: 12px var(--surface-inset);
   border: 1px solid var(--border);
   border-radius: 9px;
   background: white;
@@ -268,6 +339,7 @@
 }
 .delivery-filters :is(input, select) {
   width: 100%;
+  min-width: 0;
   font-weight: 400;
 }
 
