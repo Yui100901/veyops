@@ -8,7 +8,13 @@ import {
   type GraphNode,
 } from './execution-graph-definition';
 import { redactTaskLog } from '../tasks/task-log.service';
-import { GraphCompileError, type GraphBinding, type GraphField } from './graph-fields';
+import {
+  compatibleGraphFields,
+  GraphCompileError,
+  graphModulePorts,
+  type GraphBinding,
+  type GraphField,
+} from './graph-fields';
 
 type LegacyPreset = {
   kind?: string;
@@ -244,14 +250,35 @@ export function migrateLegacyDefinition(definition: GraphDefinition) {
       nodes.get(deploy.id)!.deploy = { ...preset.deploy };
       if (!binding[deploy.id]!.artifact) {
         if (build) {
-          binding[deploy.id]!.artifact = { kind: 'OUTPUT', nodeId: build.id, fieldId: 'artifacts' };
+          const input = graphModulePorts(nodes.get(deploy.id)!)?.inputs.find(
+            ({ id }) => id === 'artifact',
+          );
+          const outputs =
+            graphModulePorts(nodes.get(build.id)!)?.outputs.filter(
+              (port) => input && compatibleGraphFields(input, port),
+            ) ?? [];
+          if (outputs.length === 1) {
+            binding[deploy.id]!.artifact = {
+              kind: 'OUTPUT',
+              nodeId: build.id,
+              fieldId: outputs[0]!.id,
+            };
+          } else {
+            issues.push(
+              migrationIssue(
+                'ARTIFACT_BINDING_AMBIGUOUS',
+                '请为旧交付节点选择一件与发布方式兼容的具名产物。',
+                true,
+                flowId,
+              ),
+            );
+          }
         } else {
           const artifact = startField(start, {
             id: 'artifact',
             name: '发布产物',
             type: 'ARTIFACT',
             selection: 'LATEST_COMPATIBLE',
-            multiple: true,
           });
           binding[deploy.id]!.artifact = { kind: 'INPUT', fieldId: artifact.id };
         }

@@ -139,7 +139,9 @@ class GraphShell {
 }
 
 export class GraphArtifactDeclaration {
-  @Matches(idFormat) name!: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) id?: string;
+  @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) referenceName?: string;
   @IsIn(graphArtifactTypes) type!: GraphArtifactType;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) path?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(512) imageReference?: string;
@@ -348,8 +350,8 @@ export class GraphEdge {
   @Matches(idFormat) from!: string;
   @Matches(idFormat) to!: string;
   @ValidateIf((_o, v) => v !== undefined)
-  @Matches(/^(?:TRUE|FALSE|DEFAULT|CASE:[0-9])$/)
-  when?: 'TRUE' | 'FALSE' | 'DEFAULT' | `CASE:${number}`;
+  @Matches(/^(?:TRUE|FALSE|DEFAULT|CASE:[0-9]|SUCCESS|PARTIAL_SUCCESS)$/)
+  when?: 'TRUE' | 'FALSE' | 'DEFAULT' | `CASE:${number}` | 'SUCCESS' | 'PARTIAL_SUCCESS';
 }
 class GraphFlowConfiguration {
   @IsOptional() @IsUUID() serviceId?: string;
@@ -484,6 +486,11 @@ export function orderedFlowNodes(flow: GraphFlow): GraphNode[] {
 
 function hasValidOutputs(node: GraphNode, edges: GraphEdge[]) {
   const labels = new Set(edges.map(({ when }) => when));
+  if (
+    (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') &&
+    labels.has('PARTIAL_SUCCESS')
+  )
+    return edges.length === 2 && labels.has('SUCCESS');
   if (node.type === 'CONDITION')
     return edges.length === 2 && labels.has('TRUE') && labels.has('FALSE');
   if (node.type === 'SWITCH') {

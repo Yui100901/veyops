@@ -158,8 +158,12 @@ function validateCanvas(canvas: GraphCanvas) {
   return { byId, edges };
 }
 
-const dynamicBranch = (node: GraphNode) =>
-  node.type === 'CONDITION' || node.type === 'SWITCH' || node.type === 'PARALLEL';
+const dynamicBranch = (node: GraphNode, edges?: readonly GraphEdge[]) =>
+  node.type === 'CONDITION' ||
+  node.type === 'SWITCH' ||
+  node.type === 'PARALLEL' ||
+  ((node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') &&
+    edges?.some(({ when }) => when === 'SUCCESS' || when === 'PARTIAL_SUCCESS'));
 
 function deriveFlow(
   start: GraphNode,
@@ -197,7 +201,7 @@ function deriveFlow(
     if (
       !safeGraphId(id) ||
       !node ||
-      dynamicBranch(node) ||
+      dynamicBranch(node, edges.get(id)) ||
       node.type === 'END' ||
       !Array.isArray(targets) ||
       targets.length !== 1 ||
@@ -233,14 +237,13 @@ function deriveFlow(
     const node = byId.get(id)!;
     flow.nodes.push(node);
     if (id === endId) continue;
-    const outgoing = dynamicBranch(node)
-      ? allowed(id)
-      : allowed(id).filter((edge) => toEnd.has(edge.to));
+    const branch = dynamicBranch(node, edges.get(id));
+    const outgoing = branch ? allowed(id) : allowed(id).filter((edge) => toEnd.has(edge.to));
     if (node.type === 'END' || !outgoing.length)
       issue(node, '路径必须全部到达已配对的结束节点，请检查连线');
     const deadBranch = outgoing.find((edge) => !toEnd.has(edge.to));
     if (deadBranch) issue(byId.get(deadBranch.to)!, '分支无法到达已配对的结束节点', deadBranch);
-    if (!dynamicBranch(node) && outgoing.length > 1)
+    if (!branch && outgoing.length > 1)
       issue(node, '多条出线均可到达所选结束节点，请在此执行流明确选择出线');
     flow.edges.push(...outgoing);
     pending.push(...outgoing.map(({ to }) => to));

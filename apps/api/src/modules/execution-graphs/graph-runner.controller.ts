@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, Req } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Query,
+  Req,
+} from '@nestjs/common';
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
@@ -89,6 +99,19 @@ export class GraphRunnerController {
   @Get('runs/:runId')
   get(@Param('id', ParseUUIDPipe) projectId: string, @Param('runId', ParseUUIDPipe) runId: string) {
     return this.runner.get(projectId, runId);
+  }
+
+  @Get('runs/:runId/nodes/:nodeId/logs')
+  nodeLogs(
+    @Param('id', ParseUUIDPipe) projectId: string,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @Param('nodeId') nodeId: string,
+    @Query('offset') offset?: string,
+  ) {
+    const position = Number(offset ?? 0);
+    if (!Number.isSafeInteger(position) || position < 0)
+      throw new BadRequestException('日志 offset 必须为非负整数');
+    return this.runner.nodeLogs(projectId, runId, nodeId, position);
   }
 
   @Post('runs/:runId/nodes/:nodeId/decision')

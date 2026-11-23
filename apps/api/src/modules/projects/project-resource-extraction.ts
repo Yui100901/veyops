@@ -137,6 +137,8 @@ function bindingReferences(
   if (binding?.kind === 'VALUE') return fieldReferences(source, field, binding.value);
   if (binding?.kind === 'CREDENTIAL')
     return referenceRows({ ...source, fieldId: field.id }, 'CREDENTIAL', binding.credentialId);
+  if (binding?.kind === 'PROJECT_VALUE')
+    return referenceRows({ ...source, fieldId: field.id }, 'SERVER', binding.serverId);
   if (binding?.kind === 'FIRST_AVAILABLE')
     return binding.sources.flatMap((candidate) => bindingReferences(source, field, candidate));
   return [];

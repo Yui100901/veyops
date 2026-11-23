@@ -16,6 +16,7 @@ import {
 } from './graph-fields';
 import type { GraphInputsDto } from './graph-runner.controller';
 import { redactTaskLog } from '../tasks/task-log.service';
+import { graphScalarProjection } from './graph-scalar-projection';
 
 export type Values = Record<string, unknown>;
 
@@ -31,6 +32,7 @@ export interface GraphBindingContext {
   nodeInputEvidence?: readonly GraphFieldEvidence[];
   producerStatus?: (nodeId: string) => string | undefined;
   credentialNonces?: Readonly<Record<string, string>>;
+  executionServerId?: string;
 }
 
 export interface GraphFieldSource {
@@ -159,6 +161,23 @@ function readBinding(binding: GraphBinding | undefined, state: GraphBindingConte
         return { state: 'INVALID', source, message: 'Git 版本转换需要普通文本' };
       return value({ kind: binding.refKind, value: original.value }, source);
     }
+    case 'PROJECT_VALUE': {
+      const original = readBinding(binding.source, state);
+      if (original.state !== 'VALUE') return original;
+      const scalar = graphScalarProjection(
+        binding,
+        original.value,
+        state.nodeInputs?.workspace,
+        state.executionServerId,
+      );
+      return scalar === undefined
+        ? {
+            state: 'INVALID',
+            source: original.source,
+            message: '请指定当前工作区或可在执行位置访问的唯一产物实例',
+          }
+        : value(scalar, original.source ?? { kind: 'OUTPUT' });
+    }
     case 'FIRST_AVAILABLE': {
       let missing: BindingRead = { state: 'MISSING' };
       for (const candidate of binding.sources) {
@@ -172,7 +191,7 @@ function readBinding(binding: GraphBinding | undefined, state: GraphBindingConte
 }
 
 function checkedBinding(
-  field: GraphField & { acceptedTypes?: GraphField['type'][] },
+  field: GraphField,
   binding: GraphBinding | undefined,
   context: GraphBindingContext,
   environment = false,
@@ -225,7 +244,10 @@ function checkedBinding(
       nonce: result.nonce ?? context.credentialNonces?.[result.credentialId],
       evidence: { ...evidence, type: 'CREDENTIAL' as const, sensitive: true },
     };
-  const raw = result.value;
+  const raw =
+    field.type === 'ARTIFACT' && result.source?.kind === 'OUTPUT'
+      ? fitArtifactCardinality(field, result.value)
+      : result.value;
   if (
     result.credentialId ||
     raw === null ||
@@ -290,13 +312,19 @@ export function inspectNodeInputs(
   return { fields, values, evidence };
 }
 
-export function inspectDeclaredNodeOutputs(node: GraphNode, output: unknown): GraphFieldEvidence[] {
+export function inspectDeclaredNodeOutputs(
+  node: GraphNode,
+  output: unknown,
+  effective = graphModulePorts(node)?.outputs,
+): GraphFieldEvidence[] {
   if (!node.declaredPorts || !node.outputs) return [];
   const values = graphRecord(output) ? output : undefined;
-  return node.outputs.map((field) => {
-    const value = entry(values, field.id);
+  return node.outputs.map((declared) => {
+    const field = effective?.find(({ id }) => id === declared.id) ?? declared;
+    const raw = entry(values, field.id);
+    const value = field.type === 'ARTIFACT' ? fitArtifactCardinality(field, raw) : raw;
     return checkedBinding(
-      { ...field, required: true, defaultValue: undefined },
+      { ...field, defaultValue: undefined },
       value === undefined ? undefined : { kind: 'VALUE', value },
       { context: {} },
     ).evidence;
@@ -382,6 +410,7 @@ export function outputSources(binding?: GraphBinding): { nodeId: string; fieldId
   if (binding?.kind === 'OUTPUT') return [{ nodeId: binding.nodeId, fieldId: binding.fieldId }];
   if (binding?.kind === 'FIRST_AVAILABLE') return binding.sources.flatMap(outputSources);
   if (binding?.kind === 'AS_GIT_REF') return outputSources(binding.source);
+  if (binding?.kind === 'PROJECT_VALUE') return outputSources(binding.source);
   return [];
 }
 
@@ -487,7 +516,13 @@ export function graphEnvironmentSetId(flow: GraphFlow, inputs: GraphInputsDto) {
 }
 
 export type GraphArtifactRef =
-  { artifactId: string; instanceId?: string } | { temporaryArtifactId: string };
+  | { artifactId: string; instanceId?: string; instanceIds?: string[]; rootRunId?: string }
+  | { temporaryArtifactId: string };
+
+export function artifactReferenceInstances(ref: GraphArtifactRef): string[] {
+  if ('temporaryArtifactId' in ref) return [ref.temporaryArtifactId];
+  return ref.instanceId ? [ref.instanceId] : (ref.instanceIds ?? []);
+}
 
 export function artifactBindingRefs(value: unknown): GraphArtifactRef[] {
   const items = Array.isArray(value) ? value : value === undefined ? [] : [value];
@@ -503,18 +538,69 @@ export function artifactBindingRefs(value: unknown): GraphArtifactRef[] {
         : undefined;
     const id = 'artifactId' in entry ? entry.artifactId : 'id' in entry ? entry.id : undefined;
     const instanceId = 'instanceId' in entry ? entry.instanceId : undefined;
-    return validId(id) && (instanceId === undefined || validId(instanceId))
-      ? { artifactId: id, ...(instanceId && { instanceId }) }
+    const instanceIds = 'instanceIds' in entry ? entry.instanceIds : undefined;
+    const rootRunId = 'rootRunId' in entry ? entry.rootRunId : undefined;
+    const restricted = 'scope' in entry ? entry.scope === 'TEMPORARY' : rootRunId !== undefined;
+    return validId(id) &&
+      (instanceId === undefined || validId(instanceId)) &&
+      (instanceIds === undefined ||
+        (instanceId === undefined &&
+          Array.isArray(instanceIds) &&
+          instanceIds.length > 0 &&
+          instanceIds.length <= 100 &&
+          instanceIds.every(validId))) &&
+      (restricted ? validId(rootRunId) : rootRunId === undefined)
+      ? {
+          artifactId: id,
+          ...(instanceId && { instanceId }),
+          ...(instanceIds && { instanceIds }),
+          ...(rootRunId && { rootRunId }),
+        }
       : undefined;
   });
-  const keys = refs.map((entry) => JSON.stringify(entry));
-  if (refs.some((entry) => !entry) || new Set(keys).size !== refs.length)
+  if (refs.some((entry) => !entry))
     throw new ExecutionPlanIssueError({
       code: 'ARTIFACT',
       fieldId: 'artifact',
-      message: '产物输入必须包含不同的产物引用',
+      message: '产物输入含无效的逻辑产物或实例引用',
     });
-  return refs as GraphArtifactRef[];
+  const grouped = new Map<string, GraphArtifactRef>();
+  for (const ref of refs as GraphArtifactRef[]) {
+    if ('temporaryArtifactId' in ref) {
+      grouped.set(`temporary:${ref.temporaryArtifactId}`, ref);
+      continue;
+    }
+    const key = `${ref.artifactId}:${ref.rootRunId ?? ''}`;
+    const previous = grouped.get(key);
+    if (!previous) {
+      grouped.set(key, ref);
+      continue;
+    }
+    const current = artifactReferenceInstances(ref);
+    const before = artifactReferenceInstances(previous);
+    const instances = [...new Set([...before, ...current])].sort();
+    grouped.set(key, {
+      artifactId: ref.artifactId,
+      ...(ref.rootRunId && { rootRunId: ref.rootRunId }),
+      ...(before.length &&
+        current.length &&
+        (instances.length === 1 ? { instanceId: instances[0] } : { instanceIds: instances })),
+    });
+  }
+  return [...grouped.values()];
+}
+
+function fitArtifactCardinality(field: GraphField, value: unknown) {
+  if (field.multiple) return graphRecord(value) && Array.isArray(value.instances) ? [value] : value;
+  if (!Array.isArray(value) || !value.length) return value;
+  try {
+    // A frozen plan may still feed the old per-instance array into this outlet.
+    // Collapse it only when every value belongs to the same logical artifact.
+    const refs = artifactBindingRefs(value);
+    return refs.length === 1 ? (value.length === 1 ? value[0] : refs[0]) : value;
+  } catch {
+    return value;
+  }
 }
 
 export function inspectFlowOutputs(flow: GraphFlow, state: GraphBindingContext) {

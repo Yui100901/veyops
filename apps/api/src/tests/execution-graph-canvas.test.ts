@@ -15,6 +15,7 @@ import {
   type GraphNode,
 } from '../modules/execution-graphs/execution-graph-definition';
 import {
+  compatibleGraphFields,
   graphCatalog,
   GraphCompileError,
   type GraphBinding,
@@ -126,6 +127,14 @@ test('built-in start presets accept an artifact group and can omit optional vers
     ],
   );
   assert.throws(() => checkedParameters(flow, { artifacts: [] }), /输入构建产物组/);
+  assert.equal(
+    graphCatalog.inputPresets.find(({ type }) => type === 'REPOSITORY')?.referenceName,
+    'GIT_REPOSITORY',
+  );
+  assert.equal(
+    graphCatalog.outputPresets.find(({ type }) => type === 'SERVICE')?.referenceName,
+    'PROJECT_SERVICE',
+  );
 });
 
 test('draft accepts disconnected nodes and unplaced templates but cannot publish an incomplete flow', () => {
@@ -236,6 +245,58 @@ const output = (nodeId: string, fieldId: string): GraphBinding => ({
   fieldId,
 });
 
+test('exposing optional Git ports changes display metadata without requiring a version', () => {
+  const canvas = sharedCanvas();
+  canvas.nodes[2] = {
+    id: 'report',
+    name: '检出仓库',
+    type: 'FUNCTION',
+    operation: 'CHECKOUT',
+    checkout: { repositoryId },
+    inputs: [
+      {
+        id: 'version',
+        name: '可选代码版本',
+        type: 'GIT_REF',
+        referenceName: 'SOURCE_VERSION',
+        required: true,
+      },
+    ],
+    outputs: [{ id: 'branch', name: '分支（有则显示）', type: 'TEXT', required: true }],
+  };
+  const flow = compileCanvas(canvas, true).flows[0]!;
+  const ports = flow.compiled!.nodes.report!;
+  assert.deepEqual(
+    ports.inputs.find(({ id }) => id === 'version'),
+    {
+      id: 'version',
+      name: '可选代码版本',
+      type: 'GIT_REF',
+      referenceName: 'SOURCE_VERSION',
+      required: false,
+    },
+  );
+  assert.equal(ports.inputBindings.version, undefined);
+  assert.equal(ports.outputs.find(({ id }) => id === 'branch')?.required, false);
+  assert.deepEqual(
+    ports.outputs
+      .filter(({ id }) => ['workspace', 'source', 'commitSha'].includes(id))
+      .map(({ referenceName }) => referenceName),
+    ['GIT_SOURCE', 'CODE_DIR', 'GIT_COMMIT_SHA'],
+  );
+  const checkout = flow.nodes.find(({ id }) => id === 'report')!;
+  assert.equal(inspectNodeInputs(flow, checkout, { context: {} }).values.version, undefined);
+  for (const kind of ['BRANCH', 'TAG']) {
+    canvas.endpoints[0]!.inputBindings = {
+      report: { version: { kind: 'VALUE', value: { kind, value: 'same' } } },
+    };
+    assert.deepEqual(
+      compileCanvas(canvas, true).flows[0]!.compiled?.nodes.report?.inputBindings.version,
+      { kind: 'VALUE', value: { kind, value: 'same' } },
+    );
+  }
+});
+
 test('editable function templates compile typed inputs, outputs, and environment overrides', () => {
   const canvas = sharedCanvas();
   const mode: GraphField = { id: 'mode', type: 'GIT_FETCH_MODE', name: '拉取方式', required: true };
@@ -319,7 +380,7 @@ test('editable function templates compile typed inputs, outputs, and environment
   assert.equal(canvasIssues(canvas)[0]!.fieldId, 'fetchMode');
 });
 
-test('declared single inputs consume the latest upstream reference before their own defaults', () => {
+test('same-reference candidates only take effect after the flow binds a source explicitly', () => {
   const repository: GraphField = {
     id: 'repository',
     name: '仓库名称',
@@ -365,18 +426,23 @@ test('declared single inputs consume the latest upstream reference before their 
     endpoints: [{ startId: 'start', endId: 'end' }],
     templates: [],
   };
-  const flow = compileCanvas(canvas, true).flows[0]!;
-  const fetch = flow.nodes.find(({ id }) => id === 'fetch')!;
-  const expected = {
+  const expected: GraphBinding = {
     kind: 'FIRST_AVAILABLE',
     sources: [output('nearer', 'different'), output('earlier', 'selected')],
     onMissing: 'USE_DEFAULT',
   };
-  assert.deepEqual(flow.compiled?.nodes.fetch?.inputBindings.repository, expected);
+  assert.deepEqual(
+    compileCanvas(canvas, true).flows[0]!.compiled?.nodes.fetch?.inputBindings.repository,
+    { kind: 'VALUE', value: repository.defaultValue },
+  );
   assert.deepEqual(
     canvasCatalog(canvas, 'start', 'fetch').start?.nodes.fetch?.automaticInputBindings.repository,
     expected,
   );
+  canvas.endpoints[0]!.inputBindings = { fetch: { repository: expected } };
+  const flow = compileCanvas(canvas, true).flows[0]!;
+  const fetch = flow.nodes.find(({ id }) => id === 'fetch')!;
+  assert.deepEqual(flow.compiled?.nodes.fetch?.inputBindings.repository, expected);
   const outputs = new Map<string, Record<string, unknown>>([
     ['earlier', { selected: 'http://git.example.test/earlier.git' }],
     ['nearer', { different: 'http://git.example.test/nearer.git' }],
@@ -398,12 +464,12 @@ test('declared single inputs consume the latest upstream reference before their 
     ).values.path,
     './dist',
   );
-  assert.equal(inspectDeclaredNodeOutputs(fetch, {})[0]?.state, 'ERROR');
+  assert.notEqual(inspectDeclaredNodeOutputs(fetch, {})[0]?.state, 'ERROR');
   assert.equal(inspectDeclaredNodeOutputs(fetch, { branch: 'main' })[0]?.state, 'RESOLVED');
-  repository.multiple = true;
+  artifactDirectory.multiple = true;
   assert.match(canvasIssues(canvas)[0]!.message, /单值必填/);
-  repository.multiple = false;
-  repository.options = [];
+  artifactDirectory.multiple = false;
+  artifactDirectory.options = [];
   assert.match(canvasIssues(canvas)[0]!.message, /选项约束/);
 });
 
@@ -426,6 +492,13 @@ function deliveryCanvas(): GraphCanvas {
         build: {
           artifacts: [
             { name: 'jar', type: 'FILE', path: 'target/main.jar' },
+            {
+              id: 'directory',
+              name: '站点目录',
+              referenceName: 'BUILD_OUTPUT_DIR',
+              type: 'DIRECTORY',
+              path: 'dist',
+            },
             { name: 'image', type: 'DOCKER_IMAGE', imageReference: 'app/main:current' },
           ],
         },
@@ -434,7 +507,7 @@ function deliveryCanvas(): GraphCanvas {
         id: 'deploy',
         name: '部署 Web',
         type: 'DEPLOY_ARTIFACT',
-        deploy: { method: 'FILE', deployPath: '/srv/veyops/test' },
+        deploy: { method: 'COMPOSE', deployPath: '/srv/veyops/test' },
       },
       {
         id: 'artifacts-end',
@@ -532,6 +605,165 @@ test('three entries share functional nodes and retain independent typed bindings
     [undefined, output('build', 'image'), { kind: 'INPUT', fieldId: 'image' }],
   );
   assert.equal(flows[0]!.nodes.find((node) => node.id === 'build')?.moduleVersion, 1);
+});
+
+test('file and Compose publishing constrain known artifact kinds in the same catalog used by compilation', () => {
+  const canvas = deliveryCanvas();
+  const publish = canvas.nodes.find(({ id }) => id === 'deploy')!;
+  const node = canvas.nodes.find(({ id }) => id === 'build')!;
+  const directory = node.build!.artifacts!.find(({ id }) => id === 'directory')!;
+  const combined = canvas.endpoints[1]!.inputBindings!.deploy!;
+  const historical = canvas.nodes.find(({ id }) => id === 'deploy-start')!.inputs![1]!;
+  const compatibleOutputs = () => {
+    const catalog = canvasCatalog(canvas, 'combined-start', 'deploy')['combined-start']!.nodes
+      .deploy!;
+    const input = catalog.inputs.find(({ id }) => id === 'artifact')!;
+    assert.equal(Boolean(input.multiple), false);
+    return catalog.candidates
+      .filter(
+        ({ binding, field }) =>
+          binding.kind === 'OUTPUT' &&
+          binding.nodeId === 'build' &&
+          field.id !== 'artifacts' &&
+          compatibleGraphFields(input, field),
+      )
+      .map(({ field }) => field.id);
+  };
+  assert.deepEqual(compatibleOutputs(), ['image']);
+  publish.deploy!.method = 'FILE';
+  assert.deepEqual(compatibleOutputs(), ['jar', 'directory']);
+  assert.deepEqual(
+    canvasIssues(canvas).map(({ flowId, nodeId, fieldId, sourceFieldId }) => [
+      flowId,
+      nodeId,
+      fieldId,
+      sourceFieldId,
+    ]),
+    [
+      ['combined-start', 'deploy', 'artifact', 'image'],
+      ['deploy-start', 'deploy', 'artifact', 'image'],
+    ],
+  );
+  combined.artifact = output('build', 'directory');
+  delete historical.artifactType;
+  directory.name = '重新命名的站点目录';
+  const { flows } = compileCanvas(canvas, true);
+  assert.deepEqual(
+    flows[1]!.compiled?.nodes.deploy?.inputBindings.artifact,
+    output('build', 'directory'),
+  );
+  assert.deepEqual(
+    flows[1]!.compiled?.nodes.build?.outputs.find(({ id }) => id === 'directory'),
+    {
+      id: 'directory',
+      name: '重新命名的站点目录',
+      type: 'ARTIFACT',
+      artifactType: 'DIRECTORY',
+      referenceName: 'BUILD_OUTPUT_DIR',
+      required: true,
+    },
+  );
+  publish.deploy!.method = 'COMPOSE';
+  assert.deepEqual(
+    canvasIssues(canvas).map(({ flowId, nodeId, fieldId, sourceFieldId }) => [
+      flowId,
+      nodeId,
+      fieldId,
+      sourceFieldId,
+    ]),
+    [['combined-start', 'deploy', 'artifact', 'directory']],
+  );
+});
+
+test('shell resource projections keep their typed upstream dependency and selected server reference', () => {
+  const canvas = sharedCanvas();
+  const serverId = '56a34773-ba65-4c34-97de-b0ab997fa91d';
+  canvas.nodes[2] = {
+    id: 'report',
+    name: '检查目录',
+    type: 'CHECK',
+    shell: { command: 'pwd', serverId },
+  };
+  canvas.nodes.push({
+    id: 'checkout',
+    name: '检出仓库',
+    type: 'CHECKOUT',
+    checkout: { repositoryId },
+  });
+  canvas.edges = [
+    { from: 'build-start', to: 'checkout' },
+    { from: 'deploy-start', to: 'checkout' },
+    { from: 'checkout', to: 'report' },
+    { from: 'report', to: 'end' },
+  ];
+  const source = { kind: 'OUTPUT', nodeId: 'checkout', fieldId: 'workspace' } as const;
+  const binding: GraphBinding = {
+    kind: 'PROJECT_VALUE',
+    projection: 'WORKSPACE_PATH',
+    source,
+    serverId,
+  };
+  canvas.endpoints[0]!.environmentBindings = { report: { CHECKOUT_DIR: binding } };
+  const definition = compileCanvas(canvas, true);
+  assert.deepEqual(
+    definition.flows[0]!.compiled?.nodes.report?.environmentBindings.CHECKOUT_DIR,
+    binding,
+  );
+  assert.ok(
+    graphResourceReferences(definition, { sourceId: 'graph', state: 'RUNNABLE' }).some(
+      (row) =>
+        row.resourceType === 'SERVER' &&
+        row.resourceId === serverId &&
+        row.fieldId === 'CHECKOUT_DIR',
+    ),
+  );
+  canvas.endpoints[0]!.environmentBindings.report!.CHECKOUT_DIR = {
+    ...binding,
+    source: { ...source, fieldId: 'commitSha' },
+  };
+  assert.deepEqual(
+    canvasIssues(canvas).map(({ nodeId, fieldId, sourceFieldId }) => [
+      nodeId,
+      fieldId,
+      sourceFieldId,
+    ]),
+    [['report', 'CHECKOUT_DIR', 'commitSha']],
+  );
+});
+
+test('release outcome edges remain dynamic and keep health targets explicit', () => {
+  const canvas = deliveryCanvas();
+  canvas.nodes.push(
+    { id: 'probe', type: 'HEALTH_CHECK', name: '检查可用目标', healthCheck: { command: 'true' } },
+    { id: 'ready', type: 'LOG', name: '记录成功', message: '成功' },
+  );
+  canvas.edges = [
+    ...canvas.edges.filter(({ from }) => from !== 'deploy'),
+    { from: 'deploy', to: 'ready', when: 'SUCCESS' },
+    { from: 'deploy', to: 'probe', when: 'PARTIAL_SUCCESS' },
+    { from: 'ready', to: 'release-end' },
+    { from: 'probe', to: 'release-end' },
+  ];
+  for (const endpoint of [canvas.endpoints[1]!, canvas.endpoints[2]!]) {
+    endpoint.inputBindings!.probe = { release: output('deploy', 'release') };
+  }
+  const targets: GraphField = { id: 'targets', name: '发布目标', type: 'TARGETS' };
+  canvas.nodes.find(({ id }) => id === 'combined-start')!.inputs!.push(targets);
+  const flow = compileCanvas(canvas, true).flows[1]!;
+  assert.deepEqual(
+    flow.edges.filter(({ from }) => from === 'deploy').map(({ when }) => when),
+    ['SUCCESS', 'PARTIAL_SUCCESS'],
+  );
+  assert.equal(
+    flow.compiled?.nodes.probe?.inputs.find(({ id }) => id === 'targets')?.required,
+    false,
+  );
+  assert.equal(flow.compiled?.nodes.probe?.inputBindings.targets, undefined);
+
+  canvas.endpoints[1]!.edgeSelections = { deploy: ['ready'] };
+  const [issue] = canvasIssues(canvas);
+  assert.equal(issue?.nodeId, 'deploy');
+  assert.match(issue?.message ?? '', /固定选线/);
 });
 
 test('publishing identifies missing input, incorrect type and untrusted managed references', () => {

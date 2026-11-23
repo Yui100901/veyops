@@ -52,7 +52,10 @@ export interface GraphReleaseResult {
   healthStatus?: 'HEALTHY' | 'UNHEALTHY' | 'UNKNOWN';
   targets: {
     serverId: string;
-    deploymentId: string;
+    deploymentId?: string;
+    artifactInstanceId?: string;
+    plannedArtifactInstanceId?: string;
+    errorSummary?: string;
     status: string;
     health?: string;
     healthReason?: string;
@@ -70,7 +73,10 @@ export function graphReleaseResult(value: unknown): GraphReleaseResult {
     !result.status ||
     !Array.isArray(result.targets) ||
     !result.targets.length ||
-    !result.targets.every((target) => target?.serverId && target.deploymentId) ||
+    !result.targets.every(
+      (target) =>
+        target?.serverId && target.status && (target.status !== 'SUCCESS' || target.deploymentId),
+    ) ||
     new Set(result.targets.map(({ serverId }) => serverId)).size !== result.targets.length
   )
     throw new ConflictException('缺少有效的发布服务或逐服务器发布记录');

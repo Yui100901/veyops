@@ -85,9 +85,14 @@ export class GraphScriptOutput {
     const declarations = new Map(fields.map((field) => [field.exportName ?? field.id, field]));
     const provided = new Set<string>();
     // Scan complete JSON string tokens after parsing so escaped keys compare by their decoded value.
-    const tokens = this.declaration?.matchAll(/("(?:[^"\\]|\\.)*")\s*(:)?/gs) ?? [];
-    for (const [, token, colon] of tokens) {
-      if (!colon || !token) continue;
+    const tokens = this.declaration?.matchAll(/("(?:[^"\\]|\\.)*")\s*(:)?|[{}\[\]]/gs) ?? [];
+    let depth = 0;
+    for (const [raw, token, colon] of tokens) {
+      if (!token) {
+        depth += raw === '{' || raw === '[' ? 1 : -1;
+        continue;
+      }
+      if (depth !== 1 || !colon) continue;
       const key = JSON.parse(token) as string;
       const field = declarations.get(key);
       if (!field) outputIssue('脚本结构化结果包含未声明的输出');

@@ -11,9 +11,12 @@ import {
   graphOperationPorts,
   graphRecord,
   graphScriptInputs,
+  graphScriptInputTypes,
   graphScriptOutputs,
+  graphScriptOutputTypes,
   safeGraphEnvironmentKey,
   safeGraphId,
+  safeGraphReference,
   validateGraphBinding,
   validateGraphField,
   validateGraphValue,
@@ -66,7 +69,6 @@ function branchLocation(path: PathScenario): DiagnosticLocation {
 
 const maxScenarios = 256;
 const scalarTypes = ['TEXT', 'NUMBER', 'BOOLEAN', 'GIT_FETCH_MODE'];
-const scriptOutputTypes = [...scalarTypes, 'PATH', 'REPOSITORY'];
 const environmentNodes = ['BUILD', 'SHELL', 'CHECK'];
 
 function locatedIssue(
@@ -138,6 +140,11 @@ function bindingAt(flow: GraphFlow, node: GraphNode, port: string) {
 }
 
 function outgoingBranches(flow: GraphFlow, node: GraphNode, edges: readonly GraphEdge[]) {
+  if (
+    (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') &&
+    edges.some(({ when }) => when !== undefined)
+  )
+    return edges.map((edge) => [edge]);
   if (node.type !== 'CONDITION' && node.type !== 'SWITCH') return [edges];
   const binding = bindingAt(flow, node, 'value');
   if (binding?.kind === 'VALUE') {
@@ -213,13 +220,12 @@ interface BindingContext {
 
 type PathOrder = { path: PathScenario; order: Map<string, Set<string>> };
 
-function automaticInputBinding(
+function suggestedInputBinding(
   context: BindingContext,
   node: GraphNode,
   field: GraphField,
   staticOrder: ReadonlyMap<string, Set<string>>,
   paths: PathOrder[],
-  strict = true,
 ): GraphBinding | undefined {
   if (!node.declaredPorts || !node.inputs?.some(({ id }) => id === field.id)) return undefined;
   const reference = field.referenceName ?? field.id;
@@ -249,15 +255,7 @@ function automaticInputBinding(
     const latest = available.filter(
       ({ producer }) => !available.some((other) => order.get(other.producer.id)?.has(producer.id)),
     );
-    if (latest.length > 1) {
-      if (!strict) return undefined;
-      fail(
-        context.flow,
-        node,
-        `引用名称 ${reference} 有多个并行来源，请在当前执行流指定来源`,
-        field,
-      );
-    }
+    if (latest.length > 1) return undefined;
   }
   const sources: GraphBinding[] = outputs.map(({ producer, port }) => ({
     kind: 'OUTPUT',
@@ -270,7 +268,7 @@ function automaticInputBinding(
       fieldId: id,
     })),
   );
-  if (!sources.length) return undefined;
+  if (sources.length === 0 || sources.length > 16) return undefined;
   const binding =
     sources.length === 1 ? sources[0]! : { kind: 'FIRST_AVAILABLE' as const, sources };
   return field.defaultValue === undefined ? binding : { ...binding, onMissing: 'USE_DEFAULT' };
@@ -287,19 +285,29 @@ function validateFunctionalDeclarations(
     ['OUTPUT', node.outputs, standard?.outputs],
   ] as const) {
     const fields = declarations ?? [];
-    for (const field of fields)
-      if (field.required === false || field.multiple || field.options !== undefined)
-        fail(flow, node, '显式声明的字段必须为单值必填，不能配置选项约束', field);
-    checkFields(flow, node, fields, kind, true);
     for (const field of fields) {
       const port = builtIns?.find(({ id }) => id === field.id);
-      if (port && (port.type !== field.type || port.multiple))
+      if (
+        port &&
+        (port.type !== field.type ||
+          (field.artifactType !== undefined && port.artifactType !== field.artifactType))
+      )
         fail(flow, node, '显式字段必须匹配执行动作的输入或输出类型', field);
       if (port && kind === 'OUTPUT' && field.defaultValue !== undefined)
         fail(flow, node, '执行动作输出使用实际结果，不能设置默认值', field);
+      if (
+        port &&
+        kind === 'INPUT' &&
+        field.defaultValue !== undefined &&
+        !validatesLiteral(port, field.defaultValue, node)
+      )
+        fail(flow, node, '默认值不符合模块端口类型或包含明文凭据', field);
       if (!port && node.type !== 'SHELL' && node.type !== 'CHECK')
         fail(flow, node, '当前执行动作没有该字段，仅 Shell 或检查支持新增字段', field);
+      if (!port && (field.required === false || field.multiple || field.options !== undefined))
+        fail(flow, node, '自定义字段必须为单值必填，且不能配置选项约束', field);
     }
+    checkFields(flow, node, fields, kind, true);
   }
 }
 
@@ -381,6 +389,38 @@ function assertBinding(
       context,
       node,
       { ...field, type: 'TEXT', options: undefined },
+      binding.source,
+      ancestors,
+    );
+    return;
+  }
+  if (binding.kind === 'PROJECT_VALUE') {
+    if (!environment || !['SHELL', 'CHECK'].includes(node.type))
+      fail(flow, node, '仅 Shell 或检查的环境变量可投影上游执行资源', field);
+    const { nodeId, fieldId } = binding.source;
+    const producer = context.nodes.get(nodeId);
+    const workspace = binding.projection === 'WORKSPACE_PATH';
+    const producerTypes = workspace
+      ? ['CHECKOUT', 'SHELL', 'CHECK']
+      : ['BUILD', 'REGISTER_ARTIFACT'];
+    if (!producer || !producerTypes.includes(producer.type))
+      fail(flow, node, '投影须使用对应模块的正式输出', field, {
+        sourceNodeId: nodeId,
+        sourceFieldId: fieldId,
+      });
+    assertBinding(
+      context,
+      node,
+      {
+        ...field,
+        type: workspace ? 'WORKSPACE' : 'ARTIFACT',
+        ...(workspace
+          ? {}
+          : {
+              acceptedArtifactTypes:
+                binding.projection === 'ARTIFACT_PATH' ? ['FILE', 'DIRECTORY'] : ['DOCKER_IMAGE'],
+            }),
+      },
       binding.source,
       ancestors,
     );
@@ -494,6 +534,7 @@ function available(
     case 'FIRST_AVAILABLE':
       return binding.sources.some((source) => available(context, source, ancestors, inputs));
     case 'AS_GIT_REF':
+    case 'PROJECT_VALUE':
       return available(context, binding.source, ancestors, inputs);
   }
 }
@@ -501,9 +542,19 @@ function available(
 function validateArtifactConfig(flow: GraphFlow, node: GraphNode, ports: GraphField[]) {
   const declaration =
     node.type === 'BUILD' ? node.build?.artifacts : node.registerArtifacts?.artifacts;
+  const references = new Set(['artifacts']);
   for (const artifact of declaration ?? []) {
-    const port = ports.find((candidate) => candidate.id === artifact.name);
-    if (!port || artifact.name === 'artifacts') fail(flow, node, '具名产物标识不可与产物列表重名');
+    const id = artifact.id ?? artifact.name;
+    const port = ports.find((candidate) => candidate.id === id);
+    if (!port || id === 'artifacts' || !safeGraphId(id))
+      fail(flow, node, '具名产物必须使用有效且不同于产物列表的端口标识', port);
+    const reference = artifact.referenceName ?? id;
+    if (
+      (artifact.referenceName !== undefined && !safeGraphReference(reference)) ||
+      references.has(reference)
+    )
+      fail(flow, node, '具名产物引用名无效或重复', port);
+    references.add(reference);
     if (artifact.type !== 'DOCKER_IMAGE' && artifact.imageReference)
       fail(flow, node, '镜像地址只适用于 Docker 镜像产物', port);
     for (const value of [artifact.path, artifact.composeFilePath]) {
@@ -697,22 +748,18 @@ export function validateFlowBindings(
       for (const field of scriptsIn) {
         if (!safeGraphEnvironmentKey(field.exportName ?? field.id))
           fail(flow, node, '脚本输入导出名须为可用的环境变量名', field);
-        if (
-          !scalarTypes.includes(field.type) &&
-          field.type !== 'PATH' &&
-          field.type !== 'CREDENTIAL'
-        )
-          fail(flow, node, '脚本入参支持文本、数值、布尔值、拉取方式、相对路径及凭据引用', field);
+        if (!graphScriptInputTypes.includes(field.type))
+          fail(flow, node, '脚本输入只支持可作为环境变量导出的字段类型', field);
         if (field.type === 'CREDENTIAL' && field.multiple)
           fail(flow, node, '每个脚本环境变量只能关联一个凭据', field);
       }
       const builtinOutputs = new Set(['workspace', 'report', 'exitCode']);
       for (const field of scriptsOut) {
-        if (!scriptOutputTypes.includes(field.type))
+        if (!graphScriptOutputTypes.includes(field.type))
           fail(
             flow,
             node,
-            '脚本自定义输出支持文本、数值、布尔值、拉取方式、相对路径和项目仓库',
+            '脚本自定义输出支持文本、数值、布尔值、拉取方式、相对路径、项目仓库和项目服务',
             field,
           );
         if (builtinOutputs.has(field.exportName ?? field.id))
@@ -763,8 +810,7 @@ export function validateFlowBindings(
           ? declaredDefault && explicit.onMissing === undefined
             ? { ...explicit, onMissing: 'USE_DEFAULT' as const }
             : explicit
-          : (automaticInputBinding(context, node, field, staticOrder, pathOrders) ??
-            graphDefaultBinding(flow, node, field.id));
+          : graphDefaultBinding(flow, node, field.id);
         return [field.id, binding];
       }),
     );
@@ -1007,6 +1053,7 @@ function producerBindings(binding: GraphBinding): Extract<GraphBinding, { kind: 
     case 'FIRST_AVAILABLE':
       return binding.sources.flatMap(producerBindings);
     case 'AS_GIT_REF':
+    case 'PROJECT_VALUE':
       return producerBindings(binding.source);
     default:
       return [];
@@ -1107,14 +1154,7 @@ export function flowCandidateCatalog(
               candidates,
               automaticInputBindings: Object.fromEntries(
                 (ports.get(node.id)?.inputs ?? []).flatMap((field) => {
-                  const binding = automaticInputBinding(
-                    context,
-                    node,
-                    field,
-                    staticOrder,
-                    paths,
-                    false,
-                  );
+                  const binding = suggestedInputBinding(context, node, field, staticOrder, paths);
                   return binding ? [[field.id, binding]] : [];
                 }),
               ),

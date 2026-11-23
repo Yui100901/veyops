@@ -42,9 +42,12 @@ import {
   type GraphCheckoutSnapshot,
 } from '../projects/repository-metadata.service';
 import { ServiceConfigsService } from '../service-configs/service-configs.service';
+import { unavailableReference } from '../projects/project-resource-protection';
+import { resolveGraphRepositorySelector } from '../projects/graph-repository-selectors';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import type { CreateTaskInput, TaskExecutionContext, TaskRecord } from '../tasks/tasks.types';
 import type { GraphNode } from './execution-graph-definition';
+import { graphArtifactDefinitions, graphArtifactOutputs } from './graph-artifact-values';
 import {
   graphScriptInputs,
   graphScriptOutputs,
@@ -55,6 +58,7 @@ import {
 import { graphNodeRequiresIsolation, isGraphTriggerKind } from './graph-automatic-delivery';
 import { GraphScriptOutput } from './graph-script-output';
 import { graphReleaseResult, type GraphReleaseResult } from './graph-release-gates';
+import { readReleaseOutput } from './graph-release-result';
 import {
   environmentFilePath,
   graphVariableSources,
@@ -103,7 +107,10 @@ export interface GraphNodeScope {
 
 export type GraphNodePlan =
   | { type: 'CHECKOUT'; source: GraphCheckoutSnapshot; fetchModeDeferred?: boolean }
-  | { type: 'HEALTH_CHECK' }
+  | {
+      type: 'HEALTH_CHECK';
+      scope?: { selection: DeploymentSelection; serverIds: string[]; targetHash: string };
+    }
   | {
       type: ScriptNode;
       serverId?: string;
@@ -291,6 +298,46 @@ export class GraphNodeTasks implements OnModuleInit {
     });
   }
 
+  private async scriptRepositoryValues(
+    projectId: string,
+    fields: readonly GraphField[],
+    values: Record<string, unknown>,
+  ) {
+    const resolved = { ...values };
+    for (const field of fields) {
+      const value = values[field.id];
+      if (field.type !== 'REPOSITORY' || value === undefined) continue;
+      const entries = Array.isArray(value) ? value : [value];
+      const addresses: string[] = [];
+      for (const entry of entries) {
+        try {
+          const id = await resolveGraphRepositorySelector(
+            this.database.db,
+            projectId,
+            String(entry),
+          );
+          const repository = await this.database.db
+            .selectFrom('repositories')
+            .select('clone_url')
+            .where('id', '=', id)
+            .where('project_id', '=', projectId)
+            .where('archived_at', 'is', null)
+            .executeTakeFirst();
+          if (!repository) throw new NotFoundException('项目仓库不存在或已归档');
+          addresses.push(repository.clone_url);
+        } catch (error) {
+          withPlanIssue(error, {
+            code: 'REPOSITORY',
+            fieldId: field.id,
+            fieldName: field.name,
+          });
+        }
+      }
+      resolved[field.id] = Array.isArray(value) ? addresses : addresses[0];
+    }
+    return resolved;
+  }
+
   async prepareEnvironment(
     projectId: string,
     input: GraphEnvironmentSource,
@@ -389,7 +436,25 @@ export class GraphNodeTasks implements OnModuleInit {
 
   async prepare(projectId: string, node: GraphNode, scope: GraphNodeScope): Promise<GraphNodePlan> {
     const values = scope.values ?? {};
-    if (node.type === 'HEALTH_CHECK') return { type: 'HEALTH_CHECK' };
+    if (node.type === 'HEALTH_CHECK') {
+      if (!values.targets) return { type: 'HEALTH_CHECK' };
+      const selection = directDeploymentSelection(
+        typeof values.targets === 'string'
+          ? { serverIds: [values.targets] }
+          : (values.targets as DeploymentSelection),
+        defaults.maxParallel,
+      );
+      if (!selection) throw new BadRequestException('请选择健康检查目标');
+      const target = await this.targets.preview(selection);
+      return {
+        type: 'HEALTH_CHECK',
+        scope: {
+          selection,
+          serverIds: target.targets.map(({ id }) => id),
+          targetHash: target.targetHash,
+        },
+      };
+    }
     if (node.type === 'CHECKOUT') {
       const config = node.checkout;
       const repositoryId = resourceId(values.repository);
@@ -480,7 +545,10 @@ export class GraphNodeTasks implements OnModuleInit {
       };
     }
     if (node.type === 'REGISTER_ARTIFACT')
-      return { type: 'REGISTER_ARTIFACT', declarations: node.registerArtifacts?.artifacts ?? [] };
+      return {
+        type: 'REGISTER_ARTIFACT',
+        declarations: graphArtifactDefinitions(node.registerArtifacts?.artifacts ?? []),
+      };
     if (node.type !== 'SHELL' && node.type !== 'CHECK')
       throw new BadRequestException('不支持的功能节点');
 
@@ -572,18 +640,24 @@ export class GraphNodeTasks implements OnModuleInit {
 
     if (plan.type === 'HEALTH_CHECK') {
       const release = graphReleaseResult(values.release);
+      const selected = plan.scope
+        ? release.targets.filter(({ serverId }) => plan.scope!.serverIds.includes(serverId))
+        : release.targets;
       if (
         release.operation === 'CHECK' ||
-        release.status !== 'SUCCESS' ||
+        (release.status !== 'SUCCESS' && !(release.status === 'PARTIAL_SUCCESS' && plan.scope)) ||
         (serviceId && release.serviceId !== serviceId) ||
-        release.targets.some(({ status }) => status !== 'SUCCESS')
+        (plan.scope && selected.length !== plan.scope.serverIds.length) ||
+        !selected.length ||
+        selected.some(({ status, deploymentId }) => status !== 'SUCCESS' || !deploymentId)
       )
-        throw new ConflictException('健康检查只能核对当前服务已成功激活的发布');
+        throw new ConflictException('健康检查目标必须匹配已确认且成功激活的发布');
       if (!node.healthCheck?.command || !this.pipelineExecutor)
         throw new BadRequestException('健康检查命令或执行器不可用');
       const targets = await this.targets.resolveForExecution({
         ...defaults,
-        serverIds: release.targets.map(({ serverId }) => serverId),
+        ...(plan.scope?.selection ?? { serverIds: selected.map(({ serverId }) => serverId) }),
+        expectedTargetHash: plan.scope?.targetHash,
         confirmed: true,
       });
       return {
@@ -596,7 +670,7 @@ export class GraphNodeTasks implements OnModuleInit {
             ...settings,
             serviceId: release.serviceId,
             healthCheck: {
-              release,
+              release: { ...release, targets: selected },
               command: node.healthCheck.command,
               timeoutSeconds: node.healthCheck.timeoutSeconds ?? 30,
             },
@@ -766,7 +840,7 @@ export class GraphNodeTasks implements OnModuleInit {
     const fields = graphScriptInputs(node);
     const parameters = scriptVariables(
       fields,
-      values,
+      await this.scriptRepositoryValues(projectId, fields, values),
       scope.nodeEnvironment,
       scope.credentialNonces,
     );
@@ -832,6 +906,7 @@ export class GraphNodeTasks implements OnModuleInit {
       const targets: GraphReleaseResult['targets'] = [];
       for (const target of release.targets) {
         context.signal.throwIfAborted();
+        if (!target.deploymentId) throw new ConflictException('没有可验证的目标发布记录');
         const id = await context.startTarget(target.serverId);
         const result = await this.pipelineExecutor.checkGraphRelease(
           module.projectId,
@@ -989,6 +1064,27 @@ export class GraphNodeTasks implements OnModuleInit {
       }
       if (exitCode !== 0 && !shell.continueOnFailure) throw new Error('脚本退出码 ' + exitCode);
       declared = output.values(shell.outputs);
+      const serviceRefs = shell.outputs.flatMap((field) => {
+        if (field.type !== 'SERVICE' || declared[field.id] === undefined) return [];
+        const value = declared[field.id];
+        return (Array.isArray(value) ? value : [value]).map((service) => ({
+          field,
+          resourceType: 'SERVICE' as const,
+          resourceId: resourceId(service)!,
+        }));
+      });
+      const invalidService = await unavailableReference(
+        this.database.db,
+        module.projectId,
+        serviceRefs,
+      );
+      if (invalidService)
+        throw new ExecutionPlanIssueError({
+          code: 'CONFIGURATION',
+          fieldId: invalidService.field.id,
+          fieldName: invalidService.field.name,
+          message: '脚本输出的项目服务不存在、已归档或不属于当前项目',
+        });
     } catch (error) {
       output.finish();
       if (targetRunId)
@@ -1065,107 +1161,26 @@ export class GraphNodeTasks implements OnModuleInit {
           'artifacts.image_digest',
           'artifacts.graph_run_id',
           'artifacts.graph_node_run_id',
+          'artifacts.physical_json',
         ])
         .where('pipeline_runs.task_id', '=', taskId)
         .orderBy('artifacts.artifact_name')
         .orderBy('artifacts.id')
         .execute();
-      const refs = rows.map((row) => ({
-        ...(row.temporary_root_id
-          ? { temporaryArtifactId: row.id }
-          : { id: row.id, artifactId: row.logical_artifact_id ?? row.id, instanceId: row.id }),
-        name: row.artifact_name ?? 'artifact',
-        type: row.artifact_kind ?? row.artifact_type,
-        serverId: row.server_id,
-        commitSha: row.source_commit === unversionedArtifactCommit ? null : row.source_commit,
-        checksum: row.checksum,
-        digest: row.storage_type === 'REGISTRY_IMAGE' ? row.image_digest : null,
-        imageId: ['LOCAL_IMAGE', 'REMOTE_IMAGE'].includes(row.storage_type)
-          ? row.image_digest
-          : null,
-        runId: row.graph_run_id,
-        nodeRunId: row.graph_node_run_id,
-      }));
-      const named = new Map<string, typeof refs>();
-      for (const ref of refs) named.set(ref.name, [...(named.get(ref.name) ?? []), ref]);
-      return { artifacts: refs, ...Object.fromEntries(named) };
+      const { named, artifacts } = graphArtifactOutputs(
+        rows,
+        node.type === 'BUILD'
+          ? (node.build?.artifacts ?? [])
+          : (node.registerArtifacts?.artifacts ?? []),
+      );
+      return { ...Object.fromEntries(named), artifacts };
     }
-    if (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') {
-      const rows = await db
-        .selectFrom('deployment_records')
-        .innerJoin('pipeline_runs', 'pipeline_runs.id', 'deployment_records.pipeline_run_id')
-        .select([
-          'deployment_records.id',
-          'deployment_records.artifact_id',
-          'deployment_records.server_id',
-          'deployment_records.status',
-          'deployment_records.health_status',
-          'deployment_records.service_id',
-          'deployment_records.environment_id',
-          'deployment_records.rollback_of_deployment_id',
-        ])
-        .where('pipeline_runs.task_id', '=', taskId)
-        .orderBy('deployment_records.started_at', 'asc')
-        .orderBy('deployment_records.id')
-        .execute();
-      const targets = [
-        ...new Map(
-          rows.flatMap((row) =>
-            row.server_id
-              ? [
-                  [
-                    row.server_id,
-                    {
-                      serverId: row.server_id,
-                      deploymentId: row.id,
-                      rollbackOfDeploymentId: row.rollback_of_deployment_id ?? undefined,
-                      status: ['SUCCESS', 'CANCELLED', 'SKIPPED', 'NEEDS_ATTENTION'].includes(
-                        row.status,
-                      )
-                        ? row.status
-                        : 'FAILED',
-                      health:
-                        row.health_status === 'FAILED'
-                          ? 'UNHEALTHY'
-                          : row.health_status === 'HEALTHY'
-                            ? 'HEALTHY'
-                            : row.health_status === 'UNKNOWN'
-                              ? 'UNKNOWN'
-                              : 'NOT_CHECKED',
-                      consumedArtifacts: row.artifact_id ? [{ artifactId: row.artifact_id }] : [],
-                    },
-                  ] as const,
-                ]
-              : [],
-          ),
-        ).values(),
-      ];
-      const successes = targets.filter((target) => target.status === 'SUCCESS').length;
-      const status = targets.some((target) => target.status === 'NEEDS_ATTENTION')
-        ? 'NEEDS_ATTENTION'
-        : !successes
-          ? 'FAILED'
-          : successes === targets.length
-            ? 'SUCCESS'
-            : 'PARTIAL_SUCCESS';
-      return {
-        release: {
-          operation: node.type === 'ROLLBACK_ARTIFACT' ? 'ROLLBACK' : 'DEPLOY',
-          service: { serviceId: rows[0]?.service_id },
-          serviceId: rows[0]?.service_id,
-          environmentId: rows[0]?.environment_id,
-          status,
-          targets,
-          deployments: rows.map((row) => ({
-            id: row.id,
-            artifactId: row.artifact_id,
-            serverId: row.server_id,
-            status: row.status,
-            health: row.health_status,
-          })),
-        },
-      };
-    }
+    if (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT')
+      return readReleaseOutput(
+        db,
+        taskId,
+        node.type === 'ROLLBACK_ARTIFACT' ? 'ROLLBACK' : 'DEPLOY',
+      );
     const task = await db
       .selectFrom('tasks')
       .select('result_json')

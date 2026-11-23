@@ -1,4 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import { redactTaskLog } from '../tasks/task-log.service';
 import { terminalTaskStatuses } from '../tasks/tasks.types';
 import {
@@ -54,6 +55,11 @@ export function branchMatch(
   inputs: GraphInputsDto,
   state?: GraphBindingContext,
 ): GraphEdge['when'] {
+  if (isRelease(node)) {
+    const release = state?.outputs?.get(node.id)?.release as { status?: string } | undefined;
+    if (release?.status === 'SUCCESS' || release?.status === 'PARTIAL_SUCCESS')
+      return release.status;
+  }
   const configuration = node.condition ?? node.switch;
   if (!configuration) return undefined;
   const explicit = flow.inputBindings?.[node.id]?.value;
@@ -71,6 +77,15 @@ export function branchMatch(
   if (node.condition) return matches(node.condition.value) ? 'TRUE' : 'FALSE';
   const index = node.switch!.cases.findIndex(matches);
   return index === -1 ? 'DEFAULT' : `CASE:${index}`;
+}
+
+export function graphConditionOutput(node: GraphNode, match: NonNullable<GraphEdge['when']>) {
+  if (node.type === 'CONDITION') return { matched: match === 'TRUE' };
+  if (match === 'DEFAULT') return { matched: match, branchId: 'DEFAULT' };
+  const index = Number(match.slice('CASE:'.length));
+  const value = node.switch!.cases[index]!;
+  const branchId = createHash('sha256').update(value).digest('hex');
+  return { matched: match, branchId: 'CASE:' + branchId };
 }
 
 function branchInput(

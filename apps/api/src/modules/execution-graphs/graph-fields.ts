@@ -47,6 +47,39 @@ export const graphFieldTypes = {
 
 export type GraphFieldType = keyof typeof graphFieldTypes;
 export type GraphArtifactType = (typeof graphArtifactTypes)[number];
+export const graphValueProjections = [
+  'WORKSPACE_PATH',
+  'ARTIFACT_PATH',
+  'IMAGE_NAME',
+  'IMAGE_ID',
+  'IMAGE_DIGEST',
+] as const;
+export type GraphValueProjection = (typeof graphValueProjections)[number];
+export const graphScriptInputTypes: readonly GraphFieldType[] = [
+  'TEXT',
+  'NUMBER',
+  'BOOLEAN',
+  'GIT_FETCH_MODE',
+  'PATH',
+  'CREDENTIAL',
+  'REPOSITORY',
+  'GIT_REF',
+  'ENVIRONMENT',
+  'ENVIRONMENT_SET',
+  'SERVICE',
+  'TARGETS',
+  'ARTIFACT',
+  'IMAGE',
+];
+export const graphScriptOutputTypes: readonly GraphFieldType[] = [
+  'TEXT',
+  'NUMBER',
+  'BOOLEAN',
+  'GIT_FETCH_MODE',
+  'PATH',
+  'REPOSITORY',
+  'SERVICE',
+];
 
 export class GraphField {
   @Matches(graphIdFormat) id!: string;
@@ -67,6 +100,8 @@ export class GraphField {
   @ValidateIf((_o, v) => v !== undefined)
   @IsIn(['CURRENT_RUN'])
   source?: 'CURRENT_RUN';
+  declare acceptedTypes?: GraphFieldType[];
+  declare acceptedArtifactTypes?: readonly GraphArtifactType[];
 }
 
 export type GraphMissingPolicy = (typeof graphMissingPolicies)[number];
@@ -80,6 +115,12 @@ export type GraphBinding = (
   | { kind: 'CREDENTIAL'; credentialId: string }
   | { kind: 'FIRST_AVAILABLE'; sources: GraphBinding[] }
   | { kind: 'AS_GIT_REF'; refKind: 'BRANCH' | 'TAG'; source: GraphBinding }
+  | {
+      kind: 'PROJECT_VALUE';
+      projection: GraphValueProjection;
+      source: { kind: 'OUTPUT'; nodeId: string; fieldId: string };
+      serverId?: string;
+    }
 ) & { onMissing?: GraphMissingPolicy };
 
 export interface GraphDiagnostic {
@@ -346,6 +387,15 @@ export function validateGraphBinding(binding: unknown, depth = 0): binding is Gr
         validateGraphBinding(binding.source, depth + 1) &&
         keys.length === 3
       );
+    case 'PROJECT_VALUE':
+      return (
+        graphValueProjections.includes(binding.projection as GraphValueProjection) &&
+        graphRecord(binding.source) &&
+        binding.source.kind === 'OUTPUT' &&
+        validateGraphBinding(binding.source, depth + 1) &&
+        (binding.serverId === undefined || uuid(binding.serverId)) &&
+        keys.every((key) => ['kind', 'projection', 'source', 'serverId'].includes(key))
+      );
     case 'FIRST_AVAILABLE':
       return (
         Array.isArray(binding.sources) &&
@@ -359,13 +409,24 @@ export function validateGraphBinding(binding: unknown, depth = 0): binding is Gr
   }
 }
 
+export function graphFieldArtifactTypes(
+  field?: GraphField,
+): readonly GraphArtifactType[] | undefined {
+  if (field?.artifactType) return [field.artifactType];
+  return field?.acceptedArtifactTypes;
+}
+
 export function compatibleGraphFields(input: GraphField, source: GraphField) {
+  const expectedArtifacts = graphFieldArtifactTypes(input);
+  const actualArtifacts = graphFieldArtifactTypes(source);
   return (
-    input.type === source.type &&
+    (input.type === source.type || input.acceptedTypes?.includes(source.type) === true) &&
     (input.multiple === source.multiple ||
       (!input.multiple && !source.multiple) ||
       (input.type === 'ARTIFACT' && Boolean(input.multiple) && !source.multiple)) &&
-    (!input.artifactType || !source.artifactType || input.artifactType === source.artifactType)
+    (!expectedArtifacts ||
+      !actualArtifacts ||
+      actualArtifacts.every((kind) => expectedArtifacts.includes(kind)))
   );
 }
 
@@ -375,6 +436,14 @@ const field = (
   required = false,
   name: string = graphFieldTypes[type],
 ): GraphField => ({ id, name, type, required });
+
+const preset = (
+  id: string,
+  type: GraphFieldType,
+  referenceName: string,
+  required?: boolean,
+  name?: string,
+): GraphField => ({ ...field(id, type, required, name), referenceName });
 
 export const graphContextFields = [
   field('projectId', 'TEXT', true, '项目 ID'),
@@ -403,14 +472,14 @@ const shellOutputs = [
   field('workspace', 'WORKSPACE'),
 ];
 const allArtifacts = { ...field('artifacts', 'ARTIFACT', true), multiple: true };
-const artifactsInput = { ...field('artifact', 'ARTIFACT', true), multiple: true };
+const artifactInput = field('artifact', 'ARTIFACT', true);
 const reviewInput = field('review', 'REVIEW');
 const releaseOutput = field('release', 'RELEASE', true);
 
 interface ModulePorts {
   id: string;
   version: number;
-  inputs: (GraphField & { acceptedTypes?: GraphFieldType[] })[];
+  inputs: GraphField[];
   outputs: GraphField[];
 }
 
@@ -432,8 +501,8 @@ const graphModules = {
   CHECKOUT: modulePorts(
     'git.checkout',
     [
-      field('repository', 'REPOSITORY', true),
-      field('version', 'GIT_REF'),
+      preset('repository', 'REPOSITORY', 'GIT_REPOSITORY', true),
+      preset('version', 'GIT_REF', 'GIT_VERSION', false, 'Git 版本（留空使用仓库默认分支）'),
       {
         ...field('fetchMode', 'GIT_FETCH_MODE', true),
         defaultValue: 'LATEST',
@@ -441,15 +510,15 @@ const graphModules = {
       },
     ],
     [
-      field('source', 'SOURCE', true),
-      field('workspace', 'WORKSPACE', true),
+      preset('source', 'SOURCE', 'GIT_SOURCE', true),
+      preset('workspace', 'WORKSPACE', 'CODE_DIR', true, '代码目录'),
       field('repositoryId', 'REPOSITORY', true, '实际仓库 ID'),
       field('repositoryName', 'TEXT', true, '实际仓库名称'),
       field('ref', 'TEXT', true, '实际 Git 引用'),
       field('branch', 'TEXT', false, '实际分支'),
       field('tag', 'TEXT', false, '实际标签'),
-      field('commitSha', 'TEXT', true, '实际 Git SHA'),
-      field('version', 'GIT_REF', true, '实际提交版本'),
+      preset('commitSha', 'TEXT', 'GIT_COMMIT_SHA', true, '实际 Git SHA'),
+      preset('version', 'GIT_REF', 'GIT_VERSION', true, '实际提交版本'),
       field('fetchMode', 'GIT_FETCH_MODE', true, '实际拉取方式'),
       field('subject', 'TEXT', false, '提交摘要'),
     ],
@@ -476,7 +545,7 @@ const graphModules = {
       reviewInput,
       ...serviceEnvTargets,
     ],
-    [allArtifacts],
+    [field('artifact', 'ARTIFACT', true), allArtifacts],
   ),
   REGISTER_ARTIFACT: modulePorts(
     'artifact.register',
@@ -491,55 +560,75 @@ const graphModules = {
   ),
   DEPLOY_ARTIFACT: modulePorts(
     'deploy.artifact',
-    [artifactsInput, reviewInput, ...serviceEnvTargets],
+    [artifactInput, reviewInput, ...serviceEnvTargets],
     [releaseOutput],
   ),
   ROLLBACK_ARTIFACT: modulePorts(
     'deploy.rollback',
-    [artifactsInput, reviewInput, field('afterRelease', 'RELEASE'), ...serviceEnvTargets],
+    [artifactInput, reviewInput, field('afterRelease', 'RELEASE'), ...serviceEnvTargets],
     [releaseOutput],
   ),
   HEALTH_CHECK: modulePorts(
     'deploy.health',
-    [field('release', 'RELEASE', true)],
+    [field('release', 'RELEASE', true), field('targets', 'TARGETS')],
     [releaseOutput, field('status', 'TEXT', true), field('healthy', 'BOOLEAN', true)],
   ),
   SOURCE_REVIEW: modulePorts(
     'delivery.source-review',
-    [field('source', 'SOURCE'), { ...artifactsInput, required: false }],
+    [field('source', 'SOURCE'), { ...artifactInput, multiple: true, required: false }],
     [field('review', 'REVIEW', true)],
   ),
-  CONDITION: modulePorts('control.condition', [branchValue], []),
-  SWITCH: modulePorts('control.switch', [branchValue], []),
+  CONDITION: modulePorts(
+    'control.condition',
+    [branchValue],
+    [field('matched', 'BOOLEAN', true, '是否匹配')],
+  ),
+  SWITCH: modulePorts(
+    'control.switch',
+    [branchValue],
+    [field('matched', 'TEXT', true, '匹配的出口'), field('branchId', 'TEXT', true, '分支标识')],
+  ),
   FLOW_CALL: modulePorts('control.call', [], []),
 } satisfies Partial<Record<GraphNode['type'], ModulePorts>>;
 
 export const graphCatalog = {
   fieldTypes: graphFieldTypes,
+  scriptInputTypes: graphScriptInputTypes,
+  scriptOutputTypes: graphScriptOutputTypes,
   missingPolicies: graphMissingPolicies,
   contextFields: graphContextFields,
   inputPresets: [
-    field('repository', 'REPOSITORY', true),
-    field('version', 'GIT_REF'),
-    field('fetchMode', 'GIT_FETCH_MODE', false, 'Git 拉取方式'),
-    field('environmentSet', 'ENVIRONMENT_SET', true),
-    field('service', 'SERVICE', true),
-    field('targets', 'TARGETS', true),
-    field('artifact', 'ARTIFACT', true, '输入构建产物'),
-    { ...field('artifacts', 'ARTIFACT', true, '输入构建产物组'), multiple: true },
-    field('outputDir', 'PATH', false, '产物目录'),
-    field('image', 'IMAGE', true),
+    preset('repository', 'REPOSITORY', 'GIT_REPOSITORY', true),
+    preset('version', 'GIT_REF', 'GIT_VERSION', false, 'Git 版本（留空使用仓库默认分支）'),
+    preset('fetchMode', 'GIT_FETCH_MODE', 'GIT_FETCH_MODE', false, 'Git 拉取方式'),
+    preset('environment', 'ENVIRONMENT', 'PROJECT_ENVIRONMENT', true),
+    preset('environmentSet', 'ENVIRONMENT_SET', 'ENVIRONMENT_SET', true),
+    preset('service', 'SERVICE', 'PROJECT_SERVICE', true),
+    preset('targets', 'TARGETS', 'TARGETS', true),
+    preset('artifact', 'ARTIFACT', 'ARTIFACT', true, '输入构建产物'),
+    { ...preset('artifacts', 'ARTIFACT', 'ARTIFACTS', true, '输入构建产物组'), multiple: true },
+    preset('outputDir', 'PATH', 'ARTIFACT_DIR', false, '产物目录'),
+    preset('image', 'IMAGE', 'IMAGE', true),
+    preset('credential', 'CREDENTIAL', 'CREDENTIAL', true),
   ],
   outputPresets: [
     {
-      ...field('artifact', 'ARTIFACT', true, '输出构建产物'),
+      ...preset('namedArtifact', 'ARTIFACT', 'ARTIFACT', true, '输出本次运行的单项产物'),
+      source: 'CURRENT_RUN',
+    },
+    {
+      ...preset('artifact', 'ARTIFACT', 'ARTIFACTS', true, '输出构建产物'),
       source: 'CURRENT_RUN',
       multiple: true,
     },
-    { ...field('systemArtifact', 'ARTIFACT', true, '输出系统产物'), multiple: true },
-    field('release', 'RELEASE', true, '输出服务发布结果'),
-    field('source', 'SOURCE', true, '输出源码版本'),
-    field('report', 'REPORT', true, '输出检查结果或报告'),
+    {
+      ...preset('systemArtifact', 'ARTIFACT', 'SYSTEM_ARTIFACTS', true, '输出系统产物'),
+      multiple: true,
+    },
+    preset('service', 'SERVICE', 'PROJECT_SERVICE', true, '输出项目服务'),
+    preset('release', 'RELEASE', 'RELEASE', true, '输出服务发布结果'),
+    preset('source', 'SOURCE', 'SOURCE', true, '输出源码版本'),
+    preset('report', 'REPORT', 'REPORT', true, '输出检查结果或报告'),
   ],
   modules: graphModules,
 };
@@ -552,6 +641,23 @@ export function graphOperationPorts(
   if (!definition) return undefined;
   if (node.type === 'SOURCE_REVIEW' && node.approval?.buildNodeId)
     return { ...definition, inputs: [] };
+  if (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') {
+    const method = node.deploy?.method;
+    const acceptedArtifactTypes: readonly GraphArtifactType[] | undefined =
+      method === 'COMPOSE'
+        ? ['DOCKER_IMAGE']
+        : method === 'FILE'
+          ? ['FILE', 'DIRECTORY']
+          : undefined;
+    return {
+      ...definition,
+      inputs: definition.inputs.map((input) =>
+        input.id === 'artifact' && acceptedArtifactTypes
+          ? { ...input, acceptedArtifactTypes }
+          : input,
+      ),
+    };
+  }
   if (node.type === 'FLOW_CALL')
     return {
       ...definition,
@@ -588,12 +694,21 @@ export function graphOperationPorts(
       inputs,
       outputs: [
         { ...allArtifacts, required: artifacts.some((artifact) => artifact.required !== false) },
-        ...artifacts.map(({ name, type, required }) => ({
-          ...field(name, 'ARTIFACT', required !== false, name),
+        ...artifacts.map(({ id, name, referenceName, type, required }) => ({
+          ...field(id ?? name, 'ARTIFACT', required !== false, name),
+          ...(referenceName && { referenceName }),
           artifactType: type,
-          multiple: true,
         })),
       ],
+    };
+  if (node.type === 'BUILD' && node.build?.artifactType)
+    return {
+      ...definition,
+      inputs,
+      outputs: definition.outputs.map((output) => ({
+        ...output,
+        artifactType: node.build?.artifactType,
+      })),
     };
   return { ...definition, inputs };
 }
@@ -634,8 +749,7 @@ function exposedPorts(standard: GraphField[], declared?: GraphField[]) {
       ...field,
       name,
       referenceName: referenceName ?? field.referenceName,
-      defaultValue: defaultValue ?? field.defaultValue,
-      required: true,
+      ...(defaultValue !== undefined && { defaultValue }),
     };
   });
 }
@@ -726,7 +840,7 @@ export function graphDefaultBinding(
   const contextType = { service: 'SERVICE', environment: 'ENVIRONMENT', targets: 'TARGETS' }[
     fieldId
   ];
-  if (contextType) {
+  if (contextType && !(fieldId === 'targets' && node.type === 'HEALTH_CHECK')) {
     const candidates =
       flow.nodes
         .find((n) => n.type === 'START')
