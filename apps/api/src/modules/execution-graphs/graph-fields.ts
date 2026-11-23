@@ -13,7 +13,7 @@ import { isGitBranchName } from '../projects/git-ref';
 import { graphRepositoryUrl } from '../projects/http-clone-url';
 import { relativePath } from '../pipelines/pipeline.validation';
 import { redactTaskLog } from '../tasks/task-log.service';
-import type { GraphFlow, GraphNode } from './execution-graph-definition';
+import type { GraphEdge, GraphFlow, GraphNode } from './execution-graph-definition';
 
 export const graphIdFormat = /^[A-Za-z0-9_-]{1,64}$/;
 export const graphReferenceFormat = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
@@ -89,6 +89,7 @@ export interface GraphDiagnostic {
   sourceNodeId?: string;
   sourceFieldId?: string;
   branchId?: string;
+  edge?: GraphEdge;
   severity?: 'ERROR' | 'WARNING';
   message: string;
 }
@@ -520,10 +521,12 @@ export const graphCatalog = {
   inputPresets: [
     field('repository', 'REPOSITORY', true),
     field('version', 'GIT_REF'),
+    field('fetchMode', 'GIT_FETCH_MODE', false, 'Git 拉取方式'),
     field('environmentSet', 'ENVIRONMENT_SET', true),
     field('service', 'SERVICE', true),
     field('targets', 'TARGETS', true),
     field('artifact', 'ARTIFACT', true, '输入构建产物'),
+    { ...field('artifacts', 'ARTIFACT', true, '输入构建产物组'), multiple: true },
     field('outputDir', 'PATH', false, '产物目录'),
     field('image', 'IMAGE', true),
   ],

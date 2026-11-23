@@ -326,6 +326,7 @@ function Workspace({
     const next = history.at(-1);
     if (!next || saving.current) return;
     setCanvas(next);
+    setIssues([]);
     setNotice('');
     if (direction === 'undo') {
       setUndo(undo.slice(0, -1));

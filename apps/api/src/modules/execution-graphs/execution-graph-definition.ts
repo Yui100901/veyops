@@ -32,6 +32,7 @@ import {
   safeGraphId,
   type GraphArtifactType,
   type GraphBinding,
+  type GraphDiagnostic,
 } from './graph-fields';
 import { validateFlowBindings, type GraphCompiledFlow } from './graph-binding-validation';
 
@@ -703,10 +704,16 @@ export function validateGraphDefinition(definition: GraphDefinition) {
     return total;
   };
   for (const flowId of calls.keys()) count(flowId);
-  return Object.fromEntries(
-    definition.flows.map((flow) => [
-      flow.id,
-      validateFlowBindings(flow, definition.flows, orderedFlowNodes(flow)),
-    ]),
-  );
+  const compiled = new Map<string, GraphCompiledFlow>();
+  const issues: GraphDiagnostic[] = [];
+  for (const flow of definition.flows) {
+    try {
+      compiled.set(flow.id, validateFlowBindings(flow, definition.flows, orderedFlowNodes(flow)));
+    } catch (error) {
+      if (!(error instanceof GraphCompileError)) throw error;
+      issues.push(...error.issues);
+    }
+  }
+  if (issues.length) throw new GraphCompileError(issues[0]!, issues);
+  return Object.fromEntries(compiled);
 }

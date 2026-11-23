@@ -13,9 +13,11 @@ import {
 } from './ExecutionGraphPresets';
 import { GraphFieldEditor, useProjectEnvironmentSets } from './ExecutionGraphFields';
 import {
+  canCreateStartParameter,
   ExecutionGraphBindings,
   GraphFlowBranches,
   GraphTemplatePicker,
+  suggestedGraphPortReference,
 } from './ExecutionGraphBindings';
 import {
   branchOptions,
@@ -38,13 +40,27 @@ import type {
   GraphNode,
   GraphOperation,
 } from './execution-graph-definition';
+import {
+  changedNodeContract,
+  changedTopologyFlows,
+  flowsUsingNode,
+  pathHighlight,
+  reachable,
+} from './execution-graph-draft-impact';
 import './execution-graph-editor.css';
 
 type NodeType = GraphNode['type'];
 type Position = NonNullable<GraphNode['position']>;
 type Selection = { kind: 'node' | 'template'; id: string } | { kind: 'edge'; index: number };
 type Connector = Pick<GraphEdge, 'from' | 'to'>;
-type FieldFocus = { nodeId: string; fieldId: string };
+type FieldFocus = { nodeId: string; fieldId: string; preferBinding?: boolean };
+type ParameterRepair = { consumerId: string; startId: string; portId: string; field: GraphField };
+type DraftImpact = {
+  canvas: GraphCanvas;
+  message: string;
+  flows: { id: string; name: string }[];
+  nodeId?: string;
+};
 const functionalTabs = {
   input: '输入',
   execution: '执行',
@@ -156,55 +172,6 @@ function authoredNode(node: GraphNode): GraphNode {
   return { ...node, type: 'FUNCTION', operation: effectiveNodeType(node) as GraphOperation };
 }
 
-function reachable(canvas: GraphCanvas, origin: string, reversed = false, stopAtBoundary = true) {
-  const boundaries = new Set(
-    canvas.nodes.filter(({ type }) => type === 'START' || type === 'END').map(({ id }) => id),
-  );
-  const pending = [origin];
-  const visited = new Set(pending);
-  const next = new Map<string, string[]>();
-  for (const edge of canvas.edges) {
-    const from = reversed ? edge.to : edge.from;
-    const to = reversed ? edge.from : edge.to;
-    const neighbors = next.get(from);
-    if (neighbors) neighbors.push(to);
-    else next.set(from, [to]);
-  }
-  for (const from of pending) {
-    if (stopAtBoundary && from !== origin && boundaries.has(from)) continue;
-    for (const to of next.get(from) ?? []) {
-      if (visited.has(to)) continue;
-      visited.add(to);
-      pending.push(to);
-    }
-  }
-  return visited;
-}
-
-function pathHighlight(canvas: GraphCanvas, startId?: string) {
-  const pair = canvas.endpoints.find((value) => value.startId === startId);
-  if (!pair) return undefined;
-  const accepts = (edge: GraphEdge) =>
-    !pair.edgeSelections?.[edge.from]?.length || pair.edgeSelections[edge.from].includes(edge.to);
-  const pathCanvas = { ...canvas, edges: canvas.edges.filter(accepts) };
-  const forward = reachable(pathCanvas, pair.startId);
-  if (!forward.has(pair.endId)) return undefined;
-  const ancestors = reachable(pathCanvas, pair.endId, true);
-  const nodes = new Set([...forward].filter((id) => ancestors.has(id)));
-  const edges = new Set<number>();
-  canvas.edges.forEach((edge, index) => {
-    if (
-      nodes.has(edge.from) &&
-      nodes.has(edge.to) &&
-      edge.from !== pair.endId &&
-      edge.to !== pair.startId &&
-      accepts(edge)
-    )
-      edges.add(index);
-  });
-  return { nodes, edges };
-}
-
 export function ProjectGraphEditor({
   canvas,
   project,
@@ -238,6 +205,12 @@ export function ProjectGraphEditor({
   const [templateType, setTemplateType] = useState<NodeType>('FUNCTION');
   const [tab, setTab] = useState<FunctionalTab>('input');
   const [error, setError] = useState('');
+  const [parameterRepair, setParameterRepair] = useState<ParameterRepair>();
+  const [impact, setImpact] = useState<DraftImpact>();
+  const [reveal, setReveal] = useState<{ nodeId: string } | { edge: GraphEdge } | undefined>(() =>
+    initialNodeId ? { nodeId: initialNodeId } : undefined,
+  );
+  const [diagnosticEdge, setDiagnosticEdge] = useState<GraphEdge>();
   const [focusRequest, setFocusRequest] = useState<FieldFocus | undefined>(() =>
     initialNodeId && initialFieldId
       ? { nodeId: initialNodeId, fieldId: initialFieldId }
@@ -266,6 +239,25 @@ export function ProjectGraphEditor({
   }>();
   const activePair =
     activeNode && selectedPath?.nodes.has(activeNode.id) ? selectedPair : undefined;
+  const repairBinding =
+    parameterRepair && activePair?.startId === parameterRepair.startId
+      ? activePair.inputBindings?.[parameterRepair.consumerId]?.[parameterRepair.portId]
+      : undefined;
+  const repairFieldIds = new Set(
+    issues.flatMap(({ flowId, nodeId, fieldId, severity }) =>
+      activePair &&
+      activeNode &&
+      (!flowId || flowId === activePair.startId) &&
+      nodeId === activeNode.id &&
+      fieldId &&
+      severity !== 'INFO' &&
+      severity !== 'WARNING'
+        ? [fieldId]
+        : [],
+    ),
+  );
+  if (activeNode && focusRequest?.nodeId === activeNode.id)
+    repairFieldIds.add(focusRequest.fieldId);
   const hasActiveFlowNode = Boolean(activePair);
   const catalogNodeId = activeNode?.id;
   const catalogFlowId = selectedPair?.startId;
@@ -291,9 +283,21 @@ export function ProjectGraphEditor({
     };
   }, [project.id, canvas, hasActiveFlowNode, catalogFlowId, catalogNodeId]);
   const highlight = pathHighlight(canvas, hovered) ?? selectedPath;
+  const diagnosticEdgeIndex = diagnosticEdge
+    ? canvas.edges.findIndex(
+        ({ from, to, when }) =>
+          from === diagnosticEdge.from && to === diagnosticEdge.to && when === diagnosticEdge.when,
+      )
+    : -1;
+  const highlightEdges =
+    diagnosticEdgeIndex >= 0
+      ? new Set([...(highlight?.edges ?? []), diagnosticEdgeIndex])
+      : highlight?.edges;
   const flow = { id: project.id, name: project.name, nodes: canvas.nodes, edges: canvas.edges };
   const boundField = Boolean(
-    focusRequest && selectedPair?.inputBindings?.[focusRequest.nodeId]?.[focusRequest.fieldId],
+    focusRequest &&
+    (focusRequest.preferBinding ||
+      selectedPair?.inputBindings?.[focusRequest.nodeId]?.[focusRequest.fieldId]),
   );
   const pendingBindings = Boolean(
     activeNode && selectedPath?.nodes.has(activeNode.id) && catalog.loading,
@@ -301,9 +305,14 @@ export function ProjectGraphEditor({
   useEffect(() => {
     if (!focusRequest || focusRequest === handledFocus.current || pendingBindings) return;
     if (inspected?.id !== focusRequest.nodeId) return;
-    const repairTab = ['buildNodeId', 'releaseNodeId', 'command', 'timeoutSeconds'].includes(
-      focusRequest.fieldId,
-    )
+    const repairTab = [
+      'buildNodeId',
+      'releaseNodeId',
+      'command',
+      'timeoutSeconds',
+      'envFile',
+      'deployPath',
+    ].includes(focusRequest.fieldId)
       ? 'execution'
       : 'input';
     if (isFunction && tab !== repairTab) {
@@ -317,6 +326,17 @@ export function ProjectGraphEditor({
     });
     return () => window.cancelAnimationFrame(frame);
   }, [focusRequest, inspected?.id, pendingBindings, boundField, isFunction, tab]);
+
+  function recordImpact(next: GraphCanvas, message: string, startIds: string[], nodeId?: string) {
+    const flows = [...new Set(startIds)].map((id) => ({
+      id,
+      name:
+        next.nodes.find((node) => node.id === id)?.name ??
+        canvas.nodes.find((node) => node.id === id)?.name ??
+        id,
+    }));
+    setImpact(flows.length ? { canvas: next, message, flows, nodeId } : undefined);
+  }
 
   function patch(fields: Partial<GraphNode>) {
     if (!inspected || !canEdit) return;
@@ -404,11 +424,26 @@ export function ProjectGraphEditor({
       }
       return { ...pair, inputBindings };
     });
-    onChange(
-      template
-        ? { ...canvas, templates: canvas.templates.map(change) }
-        : { ...canvas, nodes: canvas.nodes.map(change), endpoints },
-    );
+    const updated = change(inspected);
+    const next = template
+      ? {
+          ...canvas,
+          templates: canvas.templates.map((item) => (item.id === updated.id ? updated : item)),
+        }
+      : {
+          ...canvas,
+          nodes: canvas.nodes.map((item) => (item.id === updated.id ? updated : item)),
+          endpoints,
+        };
+    if (!template && changedNodeContract(inspected, updated)) {
+      recordImpact(
+        next,
+        '节点的字段或执行动作已变更，请复核以下执行流的绑定。',
+        flowsUsingNode(canvas, inspected.id),
+        inspected.id,
+      );
+    }
+    onChange(next);
   }
   function addNode(raw: GraphNode, position?: Position) {
     if (!canEdit) return;
@@ -447,20 +482,81 @@ export function ProjectGraphEditor({
             outputBindings: undefined,
             edgeSelections: undefined,
           };
-    onChange({
+    const next = {
       ...canvas,
       endpoints: [
         ...canvas.endpoints.filter((pair) => pair.startId !== startId),
         ...(endId ? [{ ...retained, startId, endId }] : []),
       ],
-    });
+    };
+    recordImpact(next, '开始与结束节点的配对已更新。', changedTopologyFlows(canvas, next), startId);
+    onChange(next);
     if (endId) setStartId(startId);
   }
   function updatePair(next: GraphEndpoint) {
-    onChange({
+    const updated = {
       ...canvas,
       endpoints: canvas.endpoints.map((pair) => (pair.startId === next.startId ? next : pair)),
+    };
+    recordImpact(updated, '此流的绑定或选路已更新。', [next.startId], activeNode?.id);
+    onChange(updated);
+    setDiagnosticEdge(undefined);
+  }
+  function createStartParameter(port: GraphField) {
+    if (!canEdit || !activePair || !activeNode || !canCreateStartParameter(port)) return;
+    const start = canvas.nodes.find(
+      ({ id, type }) => id === activePair.startId && type === 'START',
+    );
+    if (!start) return;
+    const inputs = start.inputs ?? [];
+    if (inputs.length >= 30) {
+      setError('当前开始节点已声明 30 个参数，请先调整已有参数。');
+      return;
+    }
+    const baseReference = (port.referenceName?.trim() || suggestedGraphPortReference(port.id))
+      .replace(/[^A-Za-z0-9_-]/g, '_')
+      .toUpperCase()
+      .slice(0, 59);
+    let referenceName = /^[A-Za-z_]/.test(baseReference)
+      ? baseReference
+      : 'INPUT_' + baseReference.slice(0, 53);
+    const referenceStem = referenceName;
+    for (
+      let index = 2;
+      inputs.some(({ id, referenceName: ref }) => (ref ?? id) === referenceName);
+      index++
+    ) {
+      referenceName = referenceStem + '_' + index;
+    }
+    const field: GraphField = {
+      id: inputs.some(({ id }) => id === port.id) ? graphKey('param') : port.id,
+      name: port.name,
+      type: port.type,
+      referenceName,
+      required: true,
+      ...(port.type === 'ARTIFACT' && { artifactType: port.artifactType, multiple: port.multiple }),
+    };
+    const bindings = activePair.inputBindings ?? {};
+    const endpoint: GraphEndpoint = {
+      ...activePair,
+      inputBindings: {
+        ...bindings,
+        [activeNode.id]: {
+          ...bindings[activeNode.id],
+          [port.id]: { kind: 'INPUT', fieldId: field.id },
+        },
+      },
+    };
+    onChange({
+      ...canvas,
+      nodes: canvas.nodes.map((node) =>
+        node.id === start.id ? { ...node, inputs: [...inputs, field] } : node,
+      ),
+      endpoints: canvas.endpoints.map((pair) => (pair.startId === start.id ? endpoint : pair)),
     });
+    setParameterRepair({ consumerId: activeNode.id, startId: start.id, portId: port.id, field });
+    setDiagnosticEdge(undefined);
+    setError('');
   }
   const presetEnd =
     activeNode && canvas.endpoints.find(({ startId }) => startId === activeNode.id)?.endId;
@@ -663,10 +759,7 @@ export function ProjectGraphEditor({
     if (!canEdit) return;
     const edge = canvas.edges[index];
     if (!edge) return;
-    const affected = canvas.endpoints.filter((pair) =>
-      pathHighlight(canvas, pair.startId)?.edges.has(index),
-    );
-    onChange({
+    const next = {
       ...canvas,
       edges: canvas.edges.filter((_, i) => index !== i),
       endpoints: canvas.endpoints.map((pair) => {
@@ -675,17 +768,20 @@ export function ProjectGraphEditor({
         delete selected[edge.from];
         return { ...pair, edgeSelections: selected };
       }),
-    });
+    };
+    recordImpact(
+      next,
+      '连线已断开，请复核以下执行流。',
+      changedTopologyFlows(canvas, next),
+      edge.to,
+    );
+    onChange(next);
     select(undefined);
-    if (affected.length)
-      setError('连线变更影响 ' + affected.length + ' 条执行流，请重新检查数据来源。');
+    setError('');
   }
   function deleteNode(id: string) {
     if (!canEdit) return;
-    const affected = canvas.endpoints.filter((pair) =>
-      pathHighlight(canvas, pair.startId)?.nodes.has(id),
-    );
-    onChange({
+    const next = {
       ...canvas,
       nodes: canvas.nodes.filter((item) => item.id !== id),
       edges: canvas.edges.filter((edge) => edge.from !== id && edge.to !== id),
@@ -703,12 +799,16 @@ export function ProjectGraphEditor({
           );
           return { ...pair, inputBindings, environmentBindings, edgeSelections };
         }),
-    });
+    };
+    recordImpact(next, '节点已删除，请复核以下执行流。', [
+      ...flowsUsingNode(canvas, id),
+      ...changedTopologyFlows(canvas, next),
+    ]);
+    onChange(next);
     select(undefined);
     setSource(undefined);
     setConnector(undefined);
-    if (affected.length)
-      setError('节点变更影响 ' + affected.length + ' 条执行流，请重新检查数据来源。');
+    setError('');
   }
   function removeSelection() {
     if (!canEdit) return;
@@ -759,13 +859,20 @@ export function ProjectGraphEditor({
     addEdge({ from: source, to: target, ...(options[0] && { when: options[0].value }) });
   }
   function addEdge(edge: GraphEdge, index?: number) {
-    onChange({
+    const next = {
       ...canvas,
       edges:
         index === undefined
           ? [...canvas.edges, edge]
           : canvas.edges.map((item, i) => (i === index ? edge : item)),
-    });
+    };
+    recordImpact(
+      next,
+      '连线已更新，请复核以下执行流。',
+      changedTopologyFlows(canvas, next),
+      edge.to,
+    );
+    onChange(next);
     setConnector(undefined);
     setError('');
   }
@@ -773,6 +880,8 @@ export function ProjectGraphEditor({
     select({ kind: 'node', id });
     if (activeNode?.id !== id) setTab('input');
     setFocusRequest(undefined);
+    setDiagnosticEdge(undefined);
+    setReveal(undefined);
     if (canvas.endpoints.some((pair) => pair.startId === id)) setStartId(id);
     else if (!selectedPath?.nodes.has(id)) {
       const affected = canvas.endpoints.filter((pair) =>
@@ -783,6 +892,34 @@ export function ProjectGraphEditor({
     setConnector(undefined);
     setSource(undefined);
     setError('');
+  }
+  function selectEdge(index: number) {
+    select({ kind: 'edge', index });
+    setSource(undefined);
+    setConnector(undefined);
+    setFocusRequest(undefined);
+    setDiagnosticEdge(undefined);
+    setReveal(undefined);
+    setError('');
+  }
+  function openIssue(issue: GraphIssue) {
+    const nodeId = issue.nodeId ?? issue.flowId;
+    const edge = issue.edge;
+    const edgeIndex = edge
+      ? canvas.edges.findIndex(
+          ({ from, to, when }) => from === edge.from && to === edge.to && when === edge.when,
+        )
+      : -1;
+    if (edge && edgeIndex >= 0 && !issue.fieldId) {
+      selectEdge(edgeIndex);
+      setReveal({ edge });
+    } else if (nodeId && canvas.nodes.some(({ id }) => id === nodeId)) {
+      selectNode(nodeId);
+      setReveal({ nodeId });
+      if (issue.fieldId) setFocusRequest({ nodeId, fieldId: issue.fieldId, preferBinding: true });
+      if (edgeIndex >= 0) setDiagnosticEdge(edge);
+    }
+    if (issue.flowId) setStartId(issue.flowId);
   }
   function copyNode(id: string, position?: Position) {
     const node = canvas.nodes.find((item) => item.id === id);
@@ -964,7 +1101,12 @@ export function ProjectGraphEditor({
           <Field label="查看执行流">
             <select
               value={selectedPair?.startId ?? ''}
-              onChange={(event) => setStartId(event.target.value || undefined)}
+              onChange={(event) => {
+                setStartId(event.target.value || undefined);
+                setFocusRequest(undefined);
+                setDiagnosticEdge(undefined);
+                setReveal(undefined);
+              }}
             >
               <option value="">查看完整执行图</option>
               {canvas.endpoints.map((pair) => (
@@ -984,20 +1126,41 @@ export function ProjectGraphEditor({
                   <button
                     type="button"
                     className="button secondary small"
-                    onClick={() => {
-                      const nodeId = issue.nodeId ?? issue.flowId;
-                      if (nodeId && canvas.nodes.some(({ id }) => id === nodeId)) {
-                        selectNode(nodeId);
-                        if (issue.fieldId) setFocusRequest({ nodeId, fieldId: issue.fieldId });
-                      }
-                      if (issue.flowId) setStartId(issue.flowId);
-                    }}
+                    onClick={() => openIssue(issue)}
                   >
-                    {issue.flowId &&
-                      canvas.nodes.find(({ id }) => id === issue.flowId)?.name + ' · '}
                     {issue.message}
-                    {issue.branchId ? ' · ' + issue.branchId : ''}
                   </button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+        {impact?.canvas === canvas && (
+          <section className="graph-editor-impact" aria-label="受影响的执行流">
+            <p className="field-note" role="status">
+              {impact.message}
+            </p>
+            <ul className="graph-edge-list">
+              {impact.flows.map(({ id, name }) => (
+                <li key={id}>
+                  {canvas.nodes.some((node) => node.id === id) ? (
+                    <button
+                      className="button secondary small"
+                      type="button"
+                      onClick={() => {
+                        const path = pathHighlight(canvas, id);
+                        const nodeId =
+                          impact.nodeId && path?.nodes.has(impact.nodeId) ? impact.nodeId : id;
+                        selectNode(nodeId);
+                        setStartId(id);
+                        setReveal({ nodeId });
+                      }}
+                    >
+                      {name}
+                    </button>
+                  ) : (
+                    <span>{name}</span>
+                  )}
                 </li>
               ))}
             </ul>
@@ -1013,7 +1176,8 @@ export function ProjectGraphEditor({
           selected={activeNode ? [activeNode.id] : []}
           selectedEdge={activeEdge && selection?.kind === 'edge' ? selection.index : undefined}
           highlighted={highlight?.nodes}
-          highlightEdges={highlight?.edges}
+          highlightEdges={highlightEdges}
+          reveal={reveal}
           onHighlight={hover}
           onSelect={selectNode}
           onMove={
@@ -1030,16 +1194,7 @@ export function ProjectGraphEditor({
           onDropNode={canEdit ? drop : undefined}
           onNodeCopy={canEdit ? copyNode : undefined}
           onNodeDelete={canEdit ? deleteNode : undefined}
-          onEdgeSelect={
-            canEdit
-              ? (index) => {
-                  select({ kind: 'edge', index });
-                  setSource(undefined);
-                  setConnector(undefined);
-                  setError('');
-                }
-              : undefined
-          }
+          onEdgeSelect={canEdit ? selectEdge : undefined}
           onEdgeDelete={canEdit ? detachEdge : undefined}
           connecting={source}
           onConnectSource={canEdit ? beginConnection : undefined}
@@ -1069,6 +1224,29 @@ export function ProjectGraphEditor({
                 <h3 tabIndex={-1}>{inspected.name || graphNodeTypeLabel(inspected)}</h3>
               </header>
               <NodeIdentity node={inspected} canEdit={canEdit} patch={patch} />
+              {parameterRepair?.consumerId === inspected.id &&
+                repairBinding?.kind === 'INPUT' &&
+                repairBinding.fieldId === parameterRepair.field.id && (
+                  <div className="graph-editor-repair">
+                    <p className="field-note" role="status">
+                      已创建并绑定开始参数「{parameterRepair.field.name}」。
+                    </p>
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      onClick={() => {
+                        selectNode(parameterRepair.startId);
+                        setReveal({ nodeId: parameterRepair.startId });
+                        setFocusRequest({
+                          nodeId: parameterRepair.startId,
+                          fieldId: parameterRepair.field.id,
+                        });
+                      }}
+                    >
+                      查看新建参数
+                    </button>
+                  </div>
+                )}
               {isFunction ? (
                 <>
                   <nav className="graph-inspector-tabs" aria-label="功能节点配置">
@@ -1111,6 +1289,8 @@ export function ProjectGraphEditor({
                           update={updatePair}
                           patchNode={patch}
                           section={tab}
+                          createStartParameter={createStartParameter}
+                          repairFieldIds={repairFieldIds}
                         />
                         {tab === 'input' && activeNode && renderResources?.(activeNode, activePair)}
                         <FunctionPortFields
@@ -1224,6 +1404,10 @@ export function ProjectGraphEditor({
                       project={project}
                       canEdit={canEdit}
                       update={updatePair}
+                      createStartParameter={
+                        activeNode.type === 'END' ? undefined : createStartParameter
+                      }
+                      repairFieldIds={repairFieldIds}
                     />
                   )}
                 </>

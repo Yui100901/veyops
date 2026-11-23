@@ -20,6 +20,7 @@ export interface ExecutionPlanIssue {
   sourceNodeId?: string;
   sourceFieldId?: string;
   branchId?: string;
+  edge?: { from: string; to: string; when?: string };
   entityType?: string;
   entityId?: string;
   environmentSetId?: string;

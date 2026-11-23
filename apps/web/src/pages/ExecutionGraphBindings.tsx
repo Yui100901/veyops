@@ -2,7 +2,12 @@ import { useState } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
 import { Field } from '../components';
 import type { ProjectDetail } from '../models';
-import { acceptsFixedGraphValue, GraphBindingField, GraphFieldValue } from './ExecutionGraphFields';
+import {
+  acceptsFixedGraphValue,
+  GraphBindingField,
+  GraphFieldValue,
+  hasMissingGraphBindingSource,
+} from './ExecutionGraphFields';
 import type { BindingChoice } from './ExecutionGraphFields';
 import { effectiveNodeType, graphKey, graphNodeFamily } from './execution-graph-definition';
 import type {
@@ -26,7 +31,12 @@ export function moduleFields(
   const standard = operationFields(node, kind, canvas, catalog);
   if (graphNodeFamily(node) !== 'function') return standard;
   return [
-    ...standard.map((port) => declared.find(({ id }) => id === port.id) ?? port),
+    ...standard.map((port) => {
+      const custom = declared.find(({ id }) => id === port.id);
+      return custom
+        ? { ...port, ...custom, defaultValue: custom.defaultValue ?? port.defaultValue }
+        : port;
+    }),
     ...declared.filter(({ id }) => !standard.some((port) => port.id === id)),
   ];
 }
@@ -273,8 +283,12 @@ function legacyGitInput(node: GraphNode, field: GraphField) {
 export function nodeFixedInputValue(node: GraphNode, field: GraphField) {
   const explicit =
     graphNodeFamily(node) === 'function' && node.inputs?.find(({ id }) => id === field.id);
-  if (explicit) return explicit.defaultValue;
-  return node.inputDefaults?.[field.id] ?? legacyGitInput(node, field) ?? field.defaultValue;
+  return (
+    (explicit ? explicit.defaultValue : undefined) ??
+    node.inputDefaults?.[field.id] ??
+    legacyGitInput(node, field) ??
+    field.defaultValue
+  );
 }
 
 function patchInputDefault(node: GraphNode, fieldId: string, value: unknown): Partial<GraphNode> {
@@ -321,8 +335,31 @@ function patchInputDefault(node: GraphNode, fieldId: string, value: unknown): Pa
 function compatible(source: GraphField, input: GraphField) {
   return (
     (source.type === input.type || input.acceptedTypes?.includes(source.type)) &&
-    (input.type === 'ARTIFACT' || Boolean(source.multiple) === Boolean(input.multiple)) &&
+    (Boolean(source.multiple) === Boolean(input.multiple) ||
+      (input.type === 'ARTIFACT' && input.multiple && !source.multiple)) &&
     (!input.artifactType || !source.artifactType || input.artifactType === source.artifactType)
+  );
+}
+
+export function canCreateStartParameter(field: GraphField) {
+  return (
+    field.source !== 'CURRENT_RUN' &&
+    (!field.multiple || field.type === 'ARTIFACT') &&
+    [
+      'TEXT',
+      'NUMBER',
+      'BOOLEAN',
+      'REPOSITORY',
+      'GIT_REF',
+      'GIT_FETCH_MODE',
+      'ENVIRONMENT_SET',
+      'SERVICE',
+      'TARGETS',
+      'ARTIFACT',
+      'PATH',
+      'IMAGE',
+      'CREDENTIAL',
+    ].includes(field.type)
   );
 }
 
@@ -333,6 +370,7 @@ function configuredFallback(
   endpoint?: GraphEndpoint,
 ) {
   const operation = effectiveNodeType(node);
+  if (nodeFixedInputValue(node, field) !== undefined) return '采用节点默认值。';
   if (
     field.id === 'version' &&
     !nodeFixedInputValue(node, field) &&
@@ -343,20 +381,58 @@ function configuredFallback(
   if (field.id === 'targets' && node.shell?.serverId) return '节点已指定执行服务器。';
   if (
     field.id === 'path' &&
-    node.registerArtifacts?.artifacts?.every(({ path, type }) => path || type === 'DOCKER_IMAGE')
+    node.registerArtifacts?.artifacts?.length &&
+    node.registerArtifacts.artifacts.every(({ path, type }) => path || type === 'DOCKER_IMAGE')
   )
     return '使用各产物设置的工作区路径。';
-  const scope = ['service', 'environment', 'targets'];
-  const candidates = start?.inputs?.filter((input) => compatible(input, field)) ?? [];
-  if (scope.includes(field.id) && candidates.length === 1)
-    return '采用此流唯一类型匹配的开始输入。';
+  const scope: Partial<Record<string, GraphFieldType>> = {
+    service: 'SERVICE',
+    environment: 'ENVIRONMENT',
+    targets: 'TARGETS',
+  };
+  const candidates =
+    start?.inputs?.filter((input) => input.type === scope[field.id] && !input.multiple) ?? [];
+  if (candidates.length === 1) return `默认来源 · 开始参数 · ${candidates[0]!.name}`;
   return undefined;
 }
 
-function matchingChoices(candidates: GraphCandidate[], field: GraphField) {
+function matchingChoices(
+  candidates: GraphCandidate[],
+  field: GraphField,
+  canvas?: GraphCanvas,
+  catalog?: GraphCatalog,
+  endpoint?: GraphEndpoint,
+) {
   return candidates.flatMap((source): BindingChoice[] => {
-    if (field.source === 'CURRENT_RUN' && source.binding.kind !== 'OUTPUT') return [];
-    if (compatible(source.field, field)) return [source];
+    const { binding } = source;
+    const producer =
+      binding.kind === 'OUTPUT' ? canvas?.nodes.find(({ id }) => id === binding.nodeId) : undefined;
+    if (field.source === 'CURRENT_RUN') {
+      if (
+        !producer ||
+        (!['BUILD', 'REGISTER_ARTIFACT'].includes(effectiveNodeType(producer)) &&
+          source.field.source !== 'CURRENT_RUN')
+      )
+        return [];
+    }
+    if (field.type === 'RELEASE' && endpoint?.serviceId && producer) {
+      const service = endpoint.inputBindings?.[producer.id]?.service;
+      const selection =
+        effectiveNodeType(producer) === 'FLOW_CALL'
+          ? canvas?.endpoints.find(({ startId }) => startId === producer.flowId)?.serviceId
+          : service?.kind === 'VALUE'
+            ? service.value
+            : !service
+              ? nodeFixedInputValue(producer, { id: 'service', name: '项目服务', type: 'SERVICE' })
+              : undefined;
+      const serviceId =
+        typeof selection === 'object' && selection !== null && 'serviceId' in selection
+          ? selection.serviceId
+          : selection;
+      if (serviceId !== undefined && serviceId !== endpoint.serviceId) return [];
+    }
+    const choice = { ...source, typeLabel: catalog?.fieldTypes[source.field.type] };
+    if (compatible(source.field, field)) return [choice];
     if (
       field.type !== 'GIT_REF' ||
       field.multiple ||
@@ -365,7 +441,7 @@ function matchingChoices(candidates: GraphCandidate[], field: GraphField) {
     )
       return [];
     return (['BRANCH', 'TAG'] as const).map((refKind) => ({
-      ...source,
+      ...choice,
       label: source.label + (refKind === 'BRANCH' ? ' → 分支' : ' → 标签'),
       binding: { kind: 'AS_GIT_REF', refKind, source: source.binding },
     }));
@@ -399,6 +475,8 @@ export function ExecutionGraphBindings({
   update,
   section = 'input',
   patchNode,
+  createStartParameter,
+  repairFieldIds,
 }: {
   canvas: GraphCanvas;
   node: GraphNode;
@@ -411,6 +489,8 @@ export function ExecutionGraphBindings({
   update: (newEndpoint: GraphEndpoint) => void;
   section?: 'input' | 'output' | 'environment';
   patchNode?: (fields: Partial<GraphNode>) => void;
+  createStartParameter?: (field: GraphField) => void;
+  repairFieldIds?: ReadonlySet<string>;
 }) {
   const operation = effectiveNodeType(node);
   const edges = canvas.edges.filter((_, index) => flowEdgeIndexes?.has(index));
@@ -660,14 +740,55 @@ export function ExecutionGraphBindings({
           const declared = hasDeclaredInput(field.id);
           const native = nativeInputs.some(({ id }) => id === field.id);
           const review = requiredReview && field.id === 'review' ? requiredReview : undefined;
-          const choices = matchingChoices(candidates, field);
+          const choices = matchingChoices(candidates, field, canvas, catalog, endpoint).filter(
+            ({ binding }) =>
+              !review ||
+              (binding.kind === 'OUTPUT' &&
+                binding.nodeId === review.id &&
+                binding.fieldId === 'review'),
+          );
           const automatic = compiled?.automaticInputBindings?.[field.id];
           const sourceLabels = automatic ? namedSources(automatic, candidates) : [];
           const typeLabel = catalog?.fieldTypes[field.type] ?? field.type;
           const fixed = Boolean(patchNode && !review && acceptsFixedGraphValue(field));
-          const overridden = Boolean(bindings?.[field.id]);
+          const bound = bindings?.[field.id];
+          const fallback =
+            isEnd || review ? undefined : configuredFallback(node, field, start, endpoint);
+          const implicitHint = bound
+            ? bound.onMissing === 'USE_DEFAULT' ||
+              (!bound.onMissing && declared && nodeFixedInputValue(node, field) !== undefined)
+              ? '来源缺值时采用节点默认值。'
+              : undefined
+            : sourceLabels.length
+              ? `同名来源 · ${sourceLabels.join('、')}${automatic?.onMissing === 'USE_DEFAULT' ? ' · 缺值时采用默认值' : ''}`
+              : fallback;
+          const unbound = !bound && !automatic && !fallback;
+          const unique =
+            compiled && unbound && choices.length === 1 && choices[0]?.availability === 'ALWAYS'
+              ? choices[0]
+              : undefined;
+          const canMakeParameter =
+            createStartParameter &&
+            start &&
+            !isEnd &&
+            !review &&
+            canCreateStartParameter(field) &&
+            (repairFieldIds?.has(field.id) ||
+              (bound && hasMissingGraphBindingSource(bound, choices)) ||
+              (unbound && field.required !== false));
+          const changeBinding = (value?: GraphBinding) => {
+            if (!endpoint) return;
+            const next = { ...bindings };
+            if (value) next[field.id] = value;
+            else delete next[field.id];
+            update(
+              isEnd
+                ? { ...endpoint, outputBindings: next }
+                : { ...endpoint, inputBindings: { ...endpoint.inputBindings, [node.id]: next } },
+            );
+          };
           const customDefault = declared
-            ? field.defaultValue
+            ? node.inputs?.find(({ id }) => id === field.id)?.defaultValue
             : (node.inputDefaults?.[field.id] ?? legacyGitInput(node, field));
           const defaultEditor = fixed && (
             <div className="graph-fields">
@@ -730,17 +851,10 @@ export function ExecutionGraphBindings({
               {endpoint && (
                 <GraphBindingField
                   field={review ? { ...field, required: true } : field}
-                  value={bindings?.[field.id]}
+                  value={bound}
                   project={project}
                   disabled={!canEdit}
-                  choices={
-                    review
-                      ? choices.filter(
-                          ({ binding }) =>
-                            binding.kind === 'OUTPUT' && binding.nodeId === review.id,
-                        )
-                      : choices
-                  }
+                  choices={choices}
                   directSource={Boolean(review)}
                   nodeDefaults={fixed}
                   referenceLookup={declared || undefined}
@@ -749,30 +863,35 @@ export function ExecutionGraphBindings({
                   allowRepositoryDefault={
                     field.id === 'version' && ['CHECKOUT', 'BUILD'].includes(operation)
                   }
-                  fallback={
-                    sourceLabels.length && !overridden
-                      ? '同名来源 · ' + sourceLabels.join('、')
-                      : isEnd
-                        ? undefined
-                        : configuredFallback(node, field, start, endpoint)
-                  }
-                  change={(value) => {
-                    const next = { ...bindings };
-                    if (value) next[field.id] = value;
-                    else delete next[field.id];
-                    update(
-                      isEnd
-                        ? { ...endpoint, outputBindings: next }
-                        : {
-                            ...endpoint,
-                            inputBindings: { ...endpoint.inputBindings, [node.id]: next },
-                          },
-                    );
-                  }}
+                  fallback={implicitHint}
+                  change={changeBinding}
                 />
               )}
+              {endpoint && canEdit && (unique || canMakeParameter) && (
+                <div className="graph-field-pair">
+                  {unique && (
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      title={unique.label}
+                      onClick={() => changeBinding(unique.binding)}
+                    >
+                      采用唯一来源
+                    </button>
+                  )}
+                  {canMakeParameter && (
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      onClick={() => createStartParameter(field)}
+                    >
+                      <Plus size={14} /> 创建并绑定开始参数
+                    </button>
+                  )}
+                </div>
+              )}
               {fixed &&
-                (overridden ? (
+                (bound ? (
                   <details className="graph-field-card">
                     <summary>节点默认值</summary>
                     {defaultEditor}

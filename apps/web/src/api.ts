@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { GraphEdge } from './pages/execution-graph-definition';
 
 const planIssueCodes = [
   'INPUT',
@@ -22,6 +23,7 @@ export interface ExecutionPlanIssue {
   sourceNodeId?: string;
   sourceFieldId?: string;
   branchId?: string;
+  edge?: GraphEdge;
   repositoryId?: string;
   commitSha?: string;
   parameterId?: string;
@@ -55,6 +57,17 @@ function readPlanIssue(value: unknown): ExecutionPlanIssue | undefined {
   ] as const) {
     const value = row[key];
     if (typeof value === 'string') issue[key] = value;
+  }
+  if (row.edge && typeof row.edge === 'object') {
+    const { from, to, when } = row.edge as Record<string, unknown>;
+    if (
+      typeof from === 'string' &&
+      typeof to === 'string' &&
+      (when === undefined ||
+        (typeof when === 'string' && /^(?:TRUE|FALSE|DEFAULT|CASE:[0-9])$/.test(when)))
+    ) {
+      issue.edge = { from, to, when: when as GraphEdge['when'] };
+    }
   }
   const { targetSource } = row;
   if (

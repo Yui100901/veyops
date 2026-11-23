@@ -165,7 +165,7 @@
 | `GET /` | 查询项目图、草稿修订号和当前发布版本。 |
 | `GET /catalog` | 返回内置字段、功能模块版本和端口定义。 |
 | `POST /catalog?flow=:flowId&node=:nodeId` | 提交 `{definition}`，返回所选草稿节点的端口、候选来源、类型、可用性和分支信息。 |
-| `POST /validate` | 提交 `{definition}`。响应的 `issues` 用 `flowId`、`nodeId`、`fieldId` 和 `message` 定位发布问题。 |
+| `POST /validate` | 提交 `{definition}`。响应的 `issues` 用 `flowId`、`nodeId`、`fieldId` 和 `message` 定位发布问题。图结构检查通过后，汇总各流的绑定问题。已知问题分支可附 `branchId` 和 `edge:{from,to,when?}`。 |
 | `PUT /draft` | 提交 `{expectedRevision, definition:{flows:[],canvas:{nodes,edges,endpoints,templates}}}`。 |
 | `POST /publish` | 提交 `{expectedRevision}`，校验并固定已保存的图版本。 |
 | `GET /versions`、`GET /versions/:version` | 查询发布历史和具体发布版本。 |

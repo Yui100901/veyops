@@ -49,7 +49,19 @@ export interface GraphCandidate {
 interface PathScenario {
   active: Set<string>;
   edges: GraphEdge[];
-  branches: { id: string; label: string }[];
+  branches: { id: string; label: string; edge: GraphEdge }[];
+}
+
+type DiagnosticLocation = Pick<
+  GraphDiagnostic,
+  'sourceNodeId' | 'sourceFieldId' | 'branchId' | 'edge'
+>;
+
+function branchLocation(path: PathScenario): DiagnosticLocation {
+  return {
+    branchId: path.branches.map(({ id }) => id).join('/') || undefined,
+    edge: path.branches.length === 1 ? path.branches[0]?.edge : undefined,
+  };
 }
 
 const maxScenarios = 256;
@@ -62,7 +74,7 @@ function locatedIssue(
   node: GraphNode,
   message: string,
   field?: GraphField,
-  evidence: Pick<GraphDiagnostic, 'sourceNodeId' | 'sourceFieldId' | 'branchId'> = {},
+  evidence: DiagnosticLocation = {},
 ): GraphDiagnostic {
   return {
     flowId: flow.id,
@@ -79,7 +91,7 @@ function fail(
   node: GraphNode,
   message: string,
   field?: GraphField,
-  evidence?: Pick<GraphDiagnostic, 'sourceNodeId' | 'sourceFieldId' | 'branchId'>,
+  evidence?: DiagnosticLocation,
 ): never {
   throw new GraphCompileError(locatedIssue(flow, node, message, field, evidence));
 }
@@ -162,6 +174,7 @@ function possiblePaths(flow: GraphFlow, ordered: GraphNode[]) {
                   {
                     id: `${node.id}:${edge.when}`,
                     label: `${node.name} ${edge.when}`,
+                    edge,
                   },
                 ]
               : [],
@@ -799,7 +812,7 @@ export function validateFlowBindings(
       const branch = path.branches.length
         ? `（分支 ${path.branches.map(({ label }) => label).join(' / ')}）`
         : '';
-      const branchId = path.branches.map(({ id }) => id).join('/') || undefined;
+      const location = branchLocation(path);
       for (const field of destinations) {
         const binding = bindings.get(field.id);
         const needsValue = field.required !== false || binding?.onMissing === 'ERROR';
@@ -815,7 +828,7 @@ export function validateFlowBindings(
               `缺少必填来源${branch}，请绑定开始参数、固定配置或上游输出`,
               field,
               {
-                branchId,
+                ...location,
                 sourceNodeId: source?.nodeId,
                 sourceFieldId: source?.fieldId,
               },
@@ -833,9 +846,7 @@ export function validateFlowBindings(
               node,
               `环境变量缺少可用值${branch}`,
               { id: key, name: key, type: 'TEXT' },
-              {
-                branchId,
-              },
+              location,
             ),
           );
       }
@@ -845,6 +856,7 @@ export function validateFlowBindings(
           node,
           `没有可用的构建源码${branch}，请绑定工作区、实际源码版本或项目仓库`,
           destinations.find((port) => port.id === 'workspace'),
+          location,
         );
       if (
         (node.type === 'SHELL' || node.type === 'CHECK') &&
@@ -857,6 +869,7 @@ export function validateFlowBindings(
           node,
           `缺少脚本执行位置${branch}，请绑定工作区或服务器`,
           destinations.find((port) => port.id === 'targets'),
+          location,
         );
       if (node.type === 'REGISTER_ARTIFACT' && !node.registerArtifacts?.artifacts.length)
         fail(flow, node, '请配置至少一个具名产物');
@@ -870,6 +883,7 @@ export function validateFlowBindings(
           node,
           `缺少可读取产物的工作区${branch}`,
           destinations.find((port) => port.id === 'workspace'),
+          location,
         );
       if (
         node.type === 'REGISTER_ARTIFACT' &&
@@ -883,6 +897,7 @@ export function validateFlowBindings(
           node,
           `配置的产物缺少工作区相对路径${branch}`,
           destinations.find((port) => port.id === 'path'),
+          location,
         );
       if (
         node.type === 'REGISTER_ARTIFACT' &&
@@ -896,6 +911,7 @@ export function validateFlowBindings(
           node,
           `配置的镜像缺少引用${branch}`,
           destinations.find((port) => port.id === 'image'),
+          location,
         );
       if ((node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') && !has('service'))
         record(
@@ -904,7 +920,7 @@ export function validateFlowBindings(
             node,
             `缺少项目服务来源${branch}`,
             destinations.find((port) => port.id === 'service'),
-            { branchId },
+            location,
           ),
         );
       if (
@@ -948,7 +964,7 @@ export function validateFlowBindings(
             selection,
             {
               sourceNodeId: buildId,
-              branchId: path.branches.map(({ id }) => id).join('/') || undefined,
+              ...branchLocation(path),
             },
           );
       }
@@ -1064,6 +1080,7 @@ export function flowCandidateCatalog(
           for (const sourceId of staticOrder.get(node.id) ?? []) {
             const producer = context.nodes.get(sourceId)!;
             const present = eligible.filter(({ order }) => order.get(node.id)?.has(sourceId));
+            if (eligible.length && !present.length) continue;
             const branches = [
               ...new Set(present.flatMap(({ path }) => path.branches.map(({ label }) => label))),
             ];

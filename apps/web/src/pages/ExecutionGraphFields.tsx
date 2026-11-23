@@ -704,14 +704,13 @@ export function GraphFieldEditor({
     change([
       ...fields,
       {
-        ...standard,
+        ...(standard ?? {
+          name: '自定义' + (isInput ? '输入' : '输出'),
+          type: 'TEXT' as const,
+          required: true,
+        }),
         id,
-        name: standard?.name ?? '自定义' + (isInput ? '输入' : '输出'),
-        type: standard?.type ?? 'TEXT',
         referenceName,
-        required: true,
-        multiple: undefined,
-        options: undefined,
       },
     ]);
     setPreset('');
@@ -729,7 +728,9 @@ export function GraphFieldEditor({
             <small>
               {' '}
               · {fieldTypes?.[field.type] ?? field.type}
-              {field.multiple ? ' · 多值' : ''}
+              {field.required === false ? ' · 选填' : ' · 必填'}
+              {field.multiple ? ' · 多值' : ' · 单值'}
+              {field.source === 'CURRENT_RUN' && ' · 本次运行产出'}
             </small>
           </summary>
           <div className="graph-fields">
@@ -758,6 +759,7 @@ export function GraphFieldEditor({
                 onChange={(event) =>
                   patch(field.id, {
                     type: event.target.value as GraphFieldType,
+                    required: true,
                     defaultValue: undefined,
                     artifactType: undefined,
                     selection: undefined,
@@ -776,6 +778,9 @@ export function GraphFieldEditor({
                   ))}
               </select>
             </Field>
+            {!!field.options?.length && (
+              <p className="field-note">可用值 {field.options.length} 项</p>
+            )}
             {field.type === 'ARTIFACT' && (
               <Field label="产物类型">
                 <select
@@ -803,16 +808,16 @@ export function GraphFieldEditor({
                   type="checkbox"
                   disabled={disabled}
                   checked={field.selection === 'LATEST_COMPATIBLE'}
-                  onChange={(event) =>
-                    patch(field.id, {
-                      selection: event.target.checked ? 'LATEST_COMPATIBLE' : undefined,
-                    })
-                  }
+                  onChange={(event) => {
+                    const selection = event.target.checked ? 'LATEST_COMPATIBLE' : undefined;
+                    patch(field.id, { selection, ...(selection && { defaultValue: undefined }) });
+                  }}
                 />{' '}
                 自动选择最新兼容产物
               </label>
             )}
             {isInput &&
+              !field.selection &&
               [
                 'TEXT',
                 'NUMBER',
@@ -879,6 +884,7 @@ export interface BindingChoice {
   label: string;
   binding: GraphBinding;
   referenceName?: string;
+  typeLabel?: string;
   availability?: 'ALWAYS' | 'CONDITIONAL';
   branches?: string[];
 }
@@ -902,6 +908,7 @@ function choiceLabel(choice: BindingChoice) {
   return [
     choice.label,
     choice.referenceName,
+    choice.typeLabel,
     choice.availability === 'CONDITIONAL'
       ? choice.branches?.length
         ? choice.branches.join('、')
@@ -910,6 +917,21 @@ function choiceLabel(choice: BindingChoice) {
   ]
     .filter(Boolean)
     .join(' · ');
+}
+
+export function hasMissingGraphBindingSource(
+  value: GraphBinding,
+  choices: BindingChoice[],
+  directSource = false,
+): boolean {
+  if (value.kind === 'FIRST_AVAILABLE' && !directSource)
+    return (
+      !value.sources.length ||
+      value.sources.some((source) => hasMissingGraphBindingSource(source, choices))
+    );
+  if (!directSource && ['VALUE', 'ENVIRONMENT_KEY', 'CREDENTIAL'].includes(value.kind))
+    return false;
+  return !choices.some(({ binding }) => bindingKey(binding) === bindingKey(value));
 }
 
 const missingPolicies: Record<GraphMissingPolicy, string> = {
@@ -953,10 +975,8 @@ export function GraphBindingField({
   const [search, setSearch] = useState('');
   const selected = value ? bindingKey(value) : '';
   const special = ['VALUE', 'FIRST_AVAILABLE', 'ENVIRONMENT_KEY', 'CREDENTIAL'];
-  const unavailable =
-    selected &&
-    (directSource || !special.includes(selected)) &&
-    !choices.some(({ binding }) => bindingKey(binding) === selected);
+  const missingSource = value && hasMissingGraphBindingSource(value, choices, directSource);
+  const unavailable = missingSource && (directSource || !special.includes(selected));
   const query = search.trim().toLocaleLowerCase();
   const visible = choices.filter(
     (choice) =>
@@ -989,7 +1009,7 @@ export function GraphBindingField({
       )}
       <Field
         label={field.name + (field.required ? '（必需）' : '')}
-        hint={unavailable ? '源节点或字段已变化，请重新选择来源。' : fallback}
+        hint={missingSource ? '源节点或字段已变化，请重新选择来源。' : fallback}
       >
         <select
           value={selected}

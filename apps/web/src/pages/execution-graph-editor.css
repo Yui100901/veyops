@@ -110,6 +110,24 @@
   flex: 1 1 100%;
 }
 
+.graph-editor-impact,
+.graph-editor-repair {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  min-width: 0;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  background: #f6f9fc;
+}
+
+.graph-editor-impact p,
+.graph-editor-repair p {
+  margin: 0;
+}
+
 .graph-inspector {
   min-width: 0;
   border: 1px solid var(--border);

@@ -183,10 +183,11 @@ function deriveFlow(
   // Sibling paths can lead to other flows' END nodes. Fixed selections further
   // constrain ordinary branches; control nodes retain all declared outcomes.
   const selections = edgeSelections ?? {};
-  const issue = (node: GraphNode, message: string): never => {
+  const issue = (node: GraphNode, message: string, edge?: GraphEdge): never => {
     throw new GraphCompileError({
       flowId: flow.id,
       nodeId: node.id,
+      edge,
       message: `「${flow.name}」 → 「${node.name}」 · ${message}`,
     });
   };
@@ -237,6 +238,8 @@ function deriveFlow(
       : allowed(id).filter((edge) => toEnd.has(edge.to));
     if (node.type === 'END' || !outgoing.length)
       issue(node, '路径必须全部到达已配对的结束节点，请检查连线');
+    const deadBranch = outgoing.find((edge) => !toEnd.has(edge.to));
+    if (deadBranch) issue(byId.get(deadBranch.to)!, '分支无法到达已配对的结束节点', deadBranch);
     if (!dynamicBranch(node) && outgoing.length > 1)
       issue(node, '多条出线均可到达所选结束节点，请在此执行流明确选择出线');
     flow.edges.push(...outgoing);

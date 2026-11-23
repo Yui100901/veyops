@@ -35,7 +35,7 @@ import {
   graphNodeTypeLabel,
   orderedNodes,
 } from './execution-graph-definition';
-import type { GraphFlow } from './execution-graph-definition';
+import type { GraphEdge, GraphFlow } from './execution-graph-definition';
 
 const icons = {
   START: CirclePlay,
@@ -144,6 +144,7 @@ export function NodeMap({
   onHighlight,
   highlighted,
   highlightEdges,
+  reveal,
   connecting,
   onConnectSource,
   onConnectTarget,
@@ -164,6 +165,7 @@ export function NodeMap({
   onHighlight?: (id?: string) => void;
   highlighted?: Set<string>;
   highlightEdges?: Set<number>;
+  reveal?: { nodeId: string } | { edge: GraphEdge };
   connecting?: string;
   onConnectSource?: (id: string) => void;
   onConnectTarget?: (id: string) => void;
@@ -180,6 +182,25 @@ export function NodeMap({
   const { points, width: layoutWidth, height: layoutHeight } = layout(flow, manual);
   const width = onDropNode ? Math.max(layoutWidth + 170, 640) : layoutWidth;
   const height = onDropNode ? Math.max(layoutHeight + 100, 360) : layoutHeight;
+  const target = reveal && 'nodeId' in reveal ? points.get(reveal.nodeId) : undefined;
+  const edge = reveal && 'edge' in reveal ? reveal.edge : undefined;
+  const edgeFrom = edge && points.get(edge.from);
+  const edgeTo = edge && points.get(edge.to);
+  const revealX = target
+    ? target.x + cardWidth / 2
+    : edgeFrom && edgeTo && (edgeFrom.x + edgeTo.x + cardWidth) / 2;
+  const revealY = target
+    ? target.y + cardHeight / 2
+    : edgeFrom && edgeTo && (edgeFrom.y + edgeTo.y + cardHeight) / 2;
+
+  useLayoutEffect(() => {
+    const viewport = scroll.current;
+    if (!viewport || revealX === undefined || revealY === undefined) return;
+    viewport.scrollTo({
+      left: Math.max(0, revealX * scale - viewport.clientWidth / 2),
+      top: Math.max(0, revealY * scale - viewport.clientHeight / 2),
+    });
+  }, [reveal, revealX, revealY, scale]);
 
   function openMenu(
     event: MouseEvent<HTMLElement | SVGElement> | KeyboardEvent<HTMLElement | SVGElement>,

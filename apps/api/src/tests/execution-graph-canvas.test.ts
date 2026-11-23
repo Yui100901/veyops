@@ -14,8 +14,14 @@ import {
   type GraphFlow,
   type GraphNode,
 } from '../modules/execution-graphs/execution-graph-definition';
-import type { GraphBinding, GraphField } from '../modules/execution-graphs/graph-fields';
 import {
+  graphCatalog,
+  GraphCompileError,
+  type GraphBinding,
+  type GraphField,
+} from '../modules/execution-graphs/graph-fields';
+import {
+  checkedParameters,
   inspectDeclaredNodeOutputs,
   inspectNodeEnvironment,
   inspectNodeInputs,
@@ -96,6 +102,32 @@ test('the compiled start reads explicit run parameters with their original prove
   );
 });
 
+test('built-in start presets accept an artifact group and can omit optional version and directory', () => {
+  const canvas = sharedCanvas();
+  const fields = graphCatalog.inputPresets.filter(({ id }) =>
+    ['artifacts', 'version', 'outputDir'].includes(id),
+  );
+  assert.equal(fields.length, 3);
+  canvas.nodes[1]!.inputs = fields;
+  const flow = compileCanvas(canvas, true).flows[1]!;
+  const artifacts = [
+    { artifactId: '44f3a210-87ea-4bb2-b345-956476f09ee5' },
+    { artifactId: '44f3a210-87ea-4bb2-b345-956476f09ee6' },
+  ];
+  const parameters = checkedParameters(flow, { artifacts });
+  const inspected = inspectNodeInputs(flow, flow.nodes[0]!, { context: {}, parameters });
+  assert.deepEqual({ ...inspected.values }, { artifacts });
+  assert.deepEqual(
+    inspected.evidence.map(({ fieldId, state }) => [fieldId, state]),
+    [
+      ['version', 'OMITTED'],
+      ['artifacts', 'RESOLVED'],
+      ['outputDir', 'OMITTED'],
+    ],
+  );
+  assert.throws(() => checkedParameters(flow, { artifacts: [] }), /输入构建产物组/);
+});
+
 test('draft accepts disconnected nodes and unplaced templates but cannot publish an incomplete flow', () => {
   const canvas = sharedCanvas();
   canvas.nodes.push(
@@ -130,6 +162,9 @@ test('all branches of a paired start must reach its selected end', () => {
     ['deploy-start'],
   );
   assert.throws(() => compileCanvas(canvas, true), /悬空节点/);
+  const [issue] = canvasIssues(canvas);
+  assert.equal(issue?.flowId, 'build-start');
+  assert.deepEqual(issue?.edge, { from: 'condition', to: 'dead-end', when: 'FALSE' });
 });
 
 test('older flows get a deterministic canvas without altering stored execution identities', () => {
@@ -395,7 +430,12 @@ function deliveryCanvas(): GraphCanvas {
           ],
         },
       },
-      { id: 'deploy', name: '部署 Web', type: 'DEPLOY_ARTIFACT' },
+      {
+        id: 'deploy',
+        name: '部署 Web',
+        type: 'DEPLOY_ARTIFACT',
+        deploy: { method: 'FILE', deployPath: '/srv/veyops/test' },
+      },
       {
         id: 'artifacts-end',
         name: '构建产物',
@@ -513,6 +553,75 @@ test('publishing identifies missing input, incorrect type and untrusted managed 
   assert.match(canvasIssues(canvas)[0]!.message, /绑定上游模块输出/);
 });
 
+test('publishing reports missing inputs for every affected flow in canvas order', () => {
+  const canvas = deliveryCanvas();
+  delete canvas.endpoints[1]!.inputBindings!.deploy!.artifact;
+  delete canvas.endpoints[2]!.inputBindings!.deploy!.artifact;
+  const issues = canvasIssues(canvas);
+  assert.deepEqual(
+    issues.map(({ flowId, nodeId, fieldId }) => [flowId, nodeId, fieldId]),
+    [
+      ['combined-start', 'deploy', 'artifact'],
+      ['deploy-start', 'deploy', 'artifact'],
+    ],
+  );
+  assert.throws(
+    () => compileCanvas(canvas, true),
+    (error: unknown) => {
+      assert.ok(error instanceof GraphCompileError);
+      assert.deepEqual(error.issue, issues[0]);
+      assert.deepEqual(error.issues, issues);
+      return true;
+    },
+  );
+});
+
+test('a shared build reports its missing workspace only in the affected flow', () => {
+  const canvas = deliveryCanvas();
+  delete canvas.endpoints[0]!.inputBindings!.build!.workspace;
+  const [issue] = canvasIssues(canvas);
+  assert.deepEqual(
+    [issue?.flowId, issue?.nodeId, issue?.fieldId],
+    ['build-start', 'build', 'workspace'],
+  );
+  const candidates = canvasCatalog(canvas, 'build-start', 'build')['build-start']!.nodes.build!
+    .candidates;
+  assert.ok(
+    candidates.some(
+      ({ binding, availability }) =>
+        availability === 'ALWAYS' &&
+        binding.kind === 'OUTPUT' &&
+        binding.nodeId === 'source' &&
+        binding.fieldId === 'workspace',
+    ),
+  );
+  canvas.endpoints[0]!.inputBindings!.build!.workspace = output('source', 'workspace');
+  assert.deepEqual(canvasIssues(canvas), []);
+});
+
+test('a branch that bypasses release points to the required ending result and live edge', () => {
+  const canvas = deliveryCanvas();
+  canvas.nodes.push({
+    id: 'skip-release',
+    type: 'CONDITION',
+    name: '决定是否发布',
+    condition: { key: 'input', value: 'yes' },
+  });
+  const bypass = { from: 'skip-release', to: 'release-end', when: 'FALSE' as const };
+  canvas.edges = canvas.edges.filter(({ from, to }) => from !== 'build' || to !== 'deploy');
+  canvas.edges.push(
+    { from: 'build', to: 'skip-release' },
+    { from: 'skip-release', to: 'deploy', when: 'TRUE' },
+    bypass,
+  );
+  const [issue] = canvasIssues(canvas);
+  assert.equal(issue?.flowId, 'combined-start');
+  assert.equal(issue?.nodeId, 'release-end');
+  assert.equal(issue?.fieldId, 'web');
+  assert.equal(issue?.sourceNodeId, 'deploy');
+  assert.deepEqual(issue?.edge, bypass);
+});
+
 test('an ordinary branch with two routes to the same end requires an entry-specific selection', () => {
   const graph = deliveryCanvas();
   graph.nodes.push({ id: 'approve', name: '审批', type: 'APPROVAL' });
@@ -557,11 +666,22 @@ test('conditional consumers require the producer on every active branch and allo
   const bindings = graph.endpoints[0]!.inputBindings!;
   bindings['secondary-build'] = { workspace: output('source', 'workspace') };
   const issue = canvasIssues(graph)[0]!;
+  assert.equal(issue.flowId, 'combined-start');
   assert.equal(issue.nodeId, 'deploy');
+  assert.equal(issue.fieldId, 'artifact');
+  assert.deepEqual(issue.edge, { from: 'condition', to: 'secondary-build', when: 'FALSE' });
   assert.match(issue.message, /FALSE/);
   bindings.deploy!.artifact = {
     kind: 'FIRST_AVAILABLE',
     sources: [output('build', 'image'), output('secondary-build', 'image')],
   };
   assert.deepEqual(canvasIssues(graph), []);
+  bindings.condition = { value: { kind: 'VALUE', value: 'yes' } };
+  const candidates = canvasCatalog(graph, 'combined-start', 'deploy')['combined-start']!.nodes
+    .deploy!.candidates;
+  assert.ok(
+    !candidates.some(
+      ({ binding }) => binding.kind === 'OUTPUT' && binding.nodeId === 'secondary-build',
+    ),
+  );
 });

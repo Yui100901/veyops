@@ -134,6 +134,7 @@ export interface GraphIssue {
   sourceNodeId?: string;
   sourceFieldId?: string;
   branchId?: string;
+  edge?: GraphEdge;
   code?: string;
   severity?: 'ERROR' | 'WARNING' | 'INFO';
   message: string;
