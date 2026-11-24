@@ -65,22 +65,26 @@
   gap: var(--section-gap);
 }
 .project-access :is(.project-access-services, .project-access-links) {
-  display: grid;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
   gap: 0.5rem;
   padding: 0;
   margin: 0;
   list-style: none;
 }
-.project-access-services {
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
-  align-items: start;
-}
 .project-access-service {
+  flex: 1 1 18rem;
   min-width: 0;
+  max-inline-size: 24rem;
   padding: 0.65rem;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #f7f9fa;
+}
+.project-access-service:has(.project-access-actions + .project-access-actions) {
+  flex-basis: 34rem;
+  max-inline-size: 46rem;
 }
 .project-access-service > h5 {
   margin: 0 0 0.45rem;
@@ -88,13 +92,12 @@
   font-weight: 650;
   overflow-wrap: anywhere;
 }
-.project-access-links {
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
-}
 .project-access-actions {
+  flex: 1 1 16rem;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   min-width: 0;
+  max-inline-size: 22rem;
   border: 1px solid #b4d6c9;
   border-radius: 7px;
   background: #fff;
@@ -104,6 +107,7 @@
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  min-block-size: 36px;
   padding: 0.45rem 0.55rem;
   color: #10604e;
   background: transparent;
@@ -139,28 +143,10 @@
   padding: 0.35rem 0.55rem;
   border-top: 1px solid #b4d6c9;
   color: var(--muted);
-  font-size: 0.77rem;
+  font-size: 0.82rem;
   line-height: 1.4;
   overflow-wrap: anywhere;
   user-select: text;
-}
-.project-access-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
-  margin-block-start: 0.35rem;
-  padding: 0.2rem 0.3rem;
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: #10604e;
-  font-size: 0.82rem;
-}
-.project-access-toggle:is(:hover, :focus-visible) {
-  background: #e9f5f0;
-}
-.project-access-toggle[aria-expanded='true'] svg {
-  transform: rotate(180deg);
 }
 .project-access-feedback,
 .project-access-empty {

@@ -1,5 +1,5 @@
-import { useId, useState } from 'react';
-import { ArrowUpRight, ChevronDown, Copy } from 'lucide-react';
+import { useState } from 'react';
+import { ArrowUpRight, Copy } from 'lucide-react';
 import './project-cards.css';
 
 export interface ProjectAccessLink {
@@ -50,19 +50,16 @@ async function copyUrl(url: string) {
 }
 
 function AccessLinkList({ links }: { links: AccessLink[] }) {
-  const listId = useId();
-  const [expanded, setExpanded] = useState(false);
   const [feedback, setFeedback] = useState('');
 
   async function copyAddress(link: AccessLink) {
     const copied = await copyUrl(link.url);
-    if (!copied) setExpanded(true);
     setFeedback(copied ? `已复制「${link.name}」的地址` : '复制失败，可选中完整地址手动复制。');
   }
 
   return (
     <>
-      <ul id={listId} className="project-access-links">
+      <ul className="project-access-links">
         {links.map((link) => (
           <li className="project-access-actions" key={link.id}>
             <a
@@ -84,20 +81,10 @@ function AccessLinkList({ links }: { links: AccessLink[] }) {
               <Copy size={15} aria-hidden="true" />
               复制
             </button>
-            {expanded && <code className="project-access-url">{link.url}</code>}
+            <code className="project-access-url">{link.url}</code>
           </li>
         ))}
       </ul>
-      <button
-        type="button"
-        className="project-access-toggle"
-        aria-expanded={expanded}
-        aria-controls={listId}
-        onClick={() => setExpanded((shown) => !shown)}
-      >
-        <ChevronDown size={14} aria-hidden="true" />
-        {expanded ? '收起完整地址' : '显示完整地址'}
-      </button>
       {feedback && (
         <p className="project-access-feedback" role="status">
           {feedback}
