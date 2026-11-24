@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  Header,
   HttpCode,
   Param,
   ParseUUIDPipe,
@@ -13,7 +14,11 @@ import type { RawBodyRequest } from '@nestjs/common';
 import type { Request } from 'express';
 import { Public, Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
-import { GraphTriggerDto, GraphWebhookDto, InvokeGraphTriggerDto } from './graph-trigger.dto';
+import {
+  GraphTriggerDto,
+  GraphTriggerPreflightDto,
+  InvokeGraphTriggerDto,
+} from './graph-trigger.dto';
 import { GraphTriggersService } from './graph-triggers.service';
 
 @Controller('projects/:id/execution-graph/triggers')
@@ -26,6 +31,7 @@ export class GraphTriggersController {
   }
 
   @Post()
+  @Header('Cache-Control', 'no-store')
   @Roles('ADMIN')
   create(
     @Param('id', ParseUUIDPipe) projectId: string,
@@ -35,7 +41,19 @@ export class GraphTriggersController {
     return this.triggers.save(projectId, body, req.user.id);
   }
 
+  @Post('preflight')
+  @HttpCode(200)
+  @Roles('ADMIN')
+  preflight(
+    @Param('id', ParseUUIDPipe) projectId: string,
+    @Body() body: GraphTriggerPreflightDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.triggers.preflight(projectId, body, req.user.id, body.triggerId);
+  }
+
   @Patch(':triggerId')
+  @Header('Cache-Control', 'no-store')
   @Roles('ADMIN')
   update(
     @Param('id', ParseUUIDPipe) projectId: string,
@@ -52,6 +70,17 @@ export class GraphTriggersController {
     @Param('triggerId', ParseUUIDPipe) triggerId: string,
   ) {
     return this.triggers.events(projectId, triggerId);
+  }
+
+  @Post(':triggerId/rotate-secret')
+  @Header('Cache-Control', 'no-store')
+  @Roles('ADMIN')
+  rotateSecret(
+    @Param('id', ParseUUIDPipe) projectId: string,
+    @Param('triggerId', ParseUUIDPipe) triggerId: string,
+    @Req() req: AuthRequest,
+  ) {
+    return this.triggers.rotateWebhookSecret(projectId, triggerId, req.user.id);
   }
 
   @Post(':triggerId/invoke')
@@ -76,18 +105,29 @@ export class GraphTriggerHooksController {
   @Public('webhook')
   receive(
     @Param('triggerId', ParseUUIDPipe) triggerId: string,
-    @Body() body: GraphWebhookDto,
     @Req() req: RawBodyRequest<Request>,
   ) {
-    return this.triggers.webhook(triggerId, {
+    return this.triggers.webhook(triggerId, this.request(req));
+  }
+
+  @Post(':triggerId/test')
+  @HttpCode(202)
+  @Public('webhook')
+  test(@Param('triggerId', ParseUUIDPipe) triggerId: string, @Req() req: RawBodyRequest<Request>) {
+    return this.triggers.webhook(triggerId, this.request(req), true);
+  }
+
+  private request(req: RawBodyRequest<Request>) {
+    return {
+      authorization: req.get('authorization'),
       timestamp: req.get('x-veyops-timestamp'),
       eventId: req.get('x-veyops-delivery'),
       signature: req.get('x-veyops-signature'),
+      giteaEvent: req.get('x-gitea-event'),
+      giteaDelivery: req.get('x-gitea-delivery'),
+      giteaSignature: req.get('x-gitea-signature'),
       raw: req.is('application/json') ? req.rawBody : undefined,
-      inputValue: body.inputValue,
-      repositoryId: body.repositoryId,
-      ref: body.ref,
-      commitSha: body.commitSha,
-    });
+      body: req.body as unknown,
+    };
   }
 }

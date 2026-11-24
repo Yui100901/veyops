@@ -234,10 +234,7 @@ export class PipelineExecutor {
     const packageNode = nodes?.find((node) => node.type === 'PACKAGE');
     const deployNode = nodes?.find((node) => node.type === 'DEPLOY');
     if (snapshot.triggerType && snapshot.triggerType !== 'MANUAL') {
-      if (
-        (!deployArtifact || !snapshot.graphAutomation) &&
-        snapshot.definition.buildLocation !== 'MANAGER'
-      )
+      if (!snapshot.graphAutomation && snapshot.definition.buildLocation !== 'MANAGER')
         throw new Error('自动任务必须使用隔离管理端构建环境');
       if (
         Object.keys(snapshot.secretVariables).length ||
@@ -251,7 +248,7 @@ export class PipelineExecutor {
         throw new Error('自动发布必须引用已归档产物和来源构建任务');
     }
     if (buildOnly && (snapshot.graphAutomation || snapshot.graph?.trigger?.kind))
-      await this.deployments.assertAutomaticDelivery(task.id, snapshot);
+      await this.deployments.assertAutomaticDelivery(task.id, snapshot, task.payload.targets);
     if (buildOnly) await this.deployments.assertGraphBuildGate(task.id, snapshot);
     const siblingCancellation = new AbortController();
     context = { ...context, signal: AbortSignal.any([context.signal, siblingCancellation.signal]) };

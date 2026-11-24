@@ -45,6 +45,7 @@ export interface Server {
   username: string;
   credentialId: string;
   hostKeyFingerprint: string;
+  automaticExecutionEnabled?: boolean;
   tags: string[];
   status: string;
   lastCheckedAt: number | null;

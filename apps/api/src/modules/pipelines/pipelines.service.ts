@@ -10,7 +10,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { findLegacyWebhookTask } from './legacy-webhook-task';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
-import type { Transaction } from 'kysely';
+import type { Kysely, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { executionIssue, type ExecutionPlanIssue } from '../../core/execution-plan-issue';
@@ -23,7 +23,7 @@ import { artifactSourceRef, type ArtifactSource } from '../artifacts/artifact-so
 import { ServiceConfigsService } from '../service-configs/service-configs.service';
 import { lockRegistry, RegistriesService } from '../registries/registries.service';
 import { PipelineExecutor } from './pipeline-executor.service';
-import { webhookBuildSocket } from '../builds/builds.service';
+import { BuildsService, webhookBuildSocket } from '../builds/builds.service';
 import { PipelineAnalysisService } from '../ai/pipeline-analysis.service';
 import { SystemSettingsService } from '../system/system-settings.service';
 import { RepositoryMetadataService } from '../projects/repository-metadata.service';
@@ -48,6 +48,7 @@ import type {
   PipelineDefinition,
   PipelineExecutionMode,
   PipelineSnapshot,
+  PipelineTarget,
 } from './pipeline.types';
 import {
   pipelineNodeSecrets,
@@ -77,6 +78,7 @@ import { SourceReviewService } from '../deployments/source-review.service';
 import { releaseArtifactSources, SourceReviewConflict } from '../deployments/release-source-policy';
 import { assertCurrentTargets, serviceReleasePolicy } from '../deployments/release-policy';
 import {
+  assertAutomaticTargets,
   assertGraphAutomation,
   type GraphAutomation,
 } from '../execution-graphs/graph-automatic-delivery';
@@ -1043,6 +1045,28 @@ export class PipelinesService implements OnModuleInit {
       throw new BadRequestException('请先配置 Webhook 专用 rootless Docker 构建环境');
   }
 
+  async assertGraphAutomaticBuild(
+    preview: {
+      definition: PipelineDefinition;
+      hasSecretVariables: boolean;
+      targetWorkspaceRoot?: string;
+    },
+    targets: readonly (string | PipelineTarget)[],
+    db: Kysely<Database> = this.database.db,
+  ) {
+    if (preview.hasSecretVariables || pipelineNodeSecrets(preview.definition).length)
+      throw new BadRequestException('自动构建不能使用环境或节点中的敏感变量');
+    if (preview.definition.registryId && preview.definition.imageRepository)
+      throw new BadRequestException('执行图自动构建只归档镜像，暂未放行构建时推送 Registry');
+    if (preview.definition.buildLocation === 'MANAGER') {
+      await BuildsService.automaticManagerSocket();
+    } else {
+      if (!preview.targetWorkspaceRoot)
+        throw new ConflictException('目标端自动构建需要已配置的私有工作目录');
+      await assertAutomaticTargets(db, targets);
+    }
+  }
+
   private snapshot(
     p: Awaited<ReturnType<PipelinesService['prepare']>>,
     commitSha: string,
@@ -1755,7 +1779,10 @@ export class PipelinesService implements OnModuleInit {
         }
         if (graphRollback)
           await graphRollbackBaselines(tx, scope, targets, artifactIds, graphRollback);
-        if (automation) await assertGraphAutomation(tx, snapshot.projectId, userId, automation);
+        if (automation) {
+          await assertGraphAutomation(tx, snapshot.projectId, userId, automation);
+          await assertAutomaticTargets(tx, p.servers);
+        }
         if (options.profile) await storeDeliveryProfile(tx, options.profile, userId);
         if (snapshot.graphReleaseTargets) await assertCurrentTargets(tx, snapshot, p.servers);
         if (snapshot.targetSelection)
@@ -1817,13 +1844,21 @@ export class PipelinesService implements OnModuleInit {
     const effectiveEnvironment =
       nodeEnvironment && mergeGraphNodeEnvironment(p.env, nodeEnvironment);
     const automation = options.graphAutomation;
-    if (options.triggerType || automation)
+    if (options.triggerType && !automation)
       this.assertAutomaticBuild({
         definition: p.definition,
         hasSecretVariables: Object.keys((effectiveEnvironment ?? p.env).secretVariables).length > 0,
       });
-    if (automation && p.definition.registryId && p.definition.imageRepository)
-      throw new BadRequestException('执行图自动构建只归档镜像，暂未放行构建时推送 Registry');
+    if (automation)
+      await this.assertGraphAutomaticBuild(
+        {
+          definition: p.definition,
+          targetWorkspaceRoot: p.targetWorkspaceRoot,
+          hasSecretVariables:
+            Object.keys((effectiveEnvironment ?? p.env).secretVariables).length > 0,
+        },
+        p.servers,
+      );
     if (
       input.expectedServerIds &&
       JSON.stringify([...input.expectedServerIds].sort()) !==
@@ -1929,7 +1964,10 @@ export class PipelinesService implements OnModuleInit {
       userId,
       async (tx) => {
         if (options.profile) await storeDeliveryProfile(tx, options.profile, userId);
-        if (automation) await assertGraphAutomation(tx, snapshot.projectId, userId, automation);
+        if (automation) {
+          await assertGraphAutomation(tx, snapshot.projectId, userId, automation);
+          if (p.definition.buildLocation === 'TARGET') await assertAutomaticTargets(tx, p.servers);
+        }
         await options.beforeInsert?.(tx);
         if (snapshot.targetSelection)
           await confirmDeploymentMembers(tx, snapshot.targetSelection, snapshot.targetMemberIds!);

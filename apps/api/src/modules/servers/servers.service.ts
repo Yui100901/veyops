@@ -19,6 +19,7 @@ import { randomUUID } from 'node:crypto';
 import {
   ArrayMaxSize,
   IsArray,
+  IsBoolean,
   IsInt,
   IsOptional,
   IsString,
@@ -65,6 +66,10 @@ class AcceptHostKeyDto {
   @IsString() @Matches(hostKeyAcceptanceToken) hostKeyAcceptanceToken!: string;
 }
 
+class AutomaticExecutionDto {
+  @IsBoolean() enabled!: boolean;
+}
+
 class CompareConfigurationDto {
   @IsUUID() baselineId!: string;
   @IsUUID() comparisonId!: string;
@@ -84,7 +89,7 @@ class ServerDto extends SshEndpointDto {
   tags?: string[];
   @IsOptional() @IsString() @MaxLength(2000) description?: string;
 }
-function present(row: Selectable<Database['servers']>) {
+function present(row: Selectable<Database['servers']> & { active_ssh_nonce: string | null }) {
   return {
     id: row.id,
     name: row.name,
@@ -93,6 +98,10 @@ function present(row: Selectable<Database['servers']>) {
     username: row.username,
     credentialId: row.credential_id,
     hostKeyFingerprint: row.host_key_fingerprint || '',
+    automaticExecutionEnabled: Boolean(
+      row.automatic_execution_credential_nonce &&
+      row.automatic_execution_credential_nonce === row.active_ssh_nonce,
+    ),
     osType: row.os_type,
     status: row.status,
     active: row.is_active === 1,
@@ -114,23 +123,74 @@ export class ServersService {
   ) {}
   async list() {
     return (
-      await this.database.db
-        .selectFrom('servers')
-        .selectAll()
-        .where('is_active', '=', 1)
-        .orderBy('created_at', 'desc')
+      await this.withAuthorization()
+        .where('servers.is_active', '=', 1)
+        .orderBy('servers.created_at', 'desc')
         .execute()
     ).map(present);
   }
-  async get(id: string, includeInactive = false) {
-    const row = await this.database.db
+  private withAuthorization() {
+    return this.database.db
       .selectFrom('servers')
-      .selectAll()
-      .where('id', '=', id)
-      .$if(!includeInactive, (query) => query.where('is_active', '=', 1))
+      .leftJoin('credentials as ssh', (join) =>
+        join
+          .onRef('ssh.id', '=', 'servers.credential_id')
+          .on('ssh.status', '=', 'ACTIVE')
+          .on('ssh.type', 'in', ['SSH_PASSWORD', 'SSH_KEY']),
+      )
+      .selectAll('servers')
+      .select('ssh.nonce as active_ssh_nonce');
+  }
+  async get(id: string, includeInactive = false) {
+    const row = await this.withAuthorization()
+      .where('servers.id', '=', id)
+      .$if(!includeInactive, (query) => query.where('servers.is_active', '=', 1))
       .executeTakeFirst();
     if (!row) throw new NotFoundException('服务器不存在');
     return present(row);
+  }
+  async setAutomaticExecution(id: string, enabled: boolean, userId: string) {
+    await this.database.db.transaction().execute(async (tx) => {
+      const server = await tx
+        .selectFrom('servers')
+        .select(['id', 'credential_id', 'host_key_fingerprint', 'updated_at'])
+        .where('id', '=', id)
+        .where('is_active', '=', 1)
+        .executeTakeFirst();
+      if (!server) throw new NotFoundException('服务器不存在');
+      const ssh =
+        enabled && server.credential_id && server.host_key_fingerprint
+          ? await tx
+              .selectFrom('credentials')
+              .select('nonce')
+              .where('id', '=', server.credential_id)
+              .where('status', '=', 'ACTIVE')
+              .where('type', 'in', ['SSH_PASSWORD', 'SSH_KEY'])
+              .executeTakeFirst()
+          : undefined;
+      if (enabled && !ssh) throw new BadRequestException('请先配置有效的 SSH 凭据和主机指纹');
+      const saved = await tx
+        .updateTable('servers')
+        .set({
+          automatic_execution_credential_nonce: ssh?.nonce ?? null,
+          updated_at: Math.max(Date.now(), server.updated_at + 1),
+        })
+        .where('id', '=', id)
+        .where('is_active', '=', 1)
+        .where('updated_at', '=', server.updated_at)
+        .returning('id')
+        .executeTakeFirst();
+      if (!saved) throw new ConflictException('服务器配置已变化，请刷新后重试');
+      await this.audit.record(
+        userId,
+        'server.automatic-execution.update',
+        'server',
+        id,
+        { enabled },
+        tx,
+      );
+    });
+    return this.get(id);
   }
   async snapshot(ids: string[]) {
     const unique = [...new Set(ids)];
@@ -331,7 +391,14 @@ export class ServersService {
           ...(fingerprint && { host_key_fingerprint: fingerprint }),
           tags_json: JSON.stringify(dto.tags || []),
           description: dto.description ?? previous.description,
-          ...(connectionChanged ? { status: 'UNKNOWN', last_checked_at: null, os_type: null } : {}),
+          ...(connectionChanged
+            ? {
+                status: 'UNKNOWN',
+                last_checked_at: null,
+                os_type: null,
+                automatic_execution_credential_nonce: null,
+              }
+            : {}),
           updated_at: Math.max(Date.now(), previous.updatedAt + 1),
         })
         .where('id', '=', id)
@@ -370,6 +437,7 @@ export class ServersService {
         .updateTable('servers')
         .set({
           host_key_fingerprint: accepted,
+          automatic_execution_credential_nonce: null,
           status: 'UNKNOWN',
           last_checked_at: null,
           os_type: null,
@@ -496,16 +564,20 @@ class ServersController {
   ) {
     return this.service.update(id, dto, req.user.id);
   }
+  @Roles('ADMIN') @Patch(':id/automatic-execution') automaticExecution(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: AutomaticExecutionDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.service.setAutomaticExecution(id, dto.enabled, req.user.id);
+  }
   @Roles('ADMIN', 'OPERATOR') @Post(':id/test') test(
     @Param('id') id: string,
     @Req() req: AuthRequest,
   ) {
     return this.service.test(id, req.user.id);
   }
-  @Roles('ADMIN') @Delete(':id') remove(
-    @Param('id') id: string,
-    @Req() req: AuthRequest,
-  ) {
+  @Roles('ADMIN') @Delete(':id') remove(@Param('id') id: string, @Req() req: AuthRequest) {
     return this.service.remove(id, req.user.id);
   }
 }

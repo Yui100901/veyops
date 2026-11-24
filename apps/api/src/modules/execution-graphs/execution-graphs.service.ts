@@ -20,6 +20,7 @@ import {
 } from './execution-graph-definition';
 import { GraphCompileError, type GraphDiagnostic } from './graph-fields';
 import { expandGraphTemplate, type ExpandGraphTemplateDto } from './graph-flow-templates';
+import { GraphTriggersService } from './graph-triggers.service';
 
 function graphResponse(row: Selectable<Database['execution_graphs']>) {
   return {
@@ -36,6 +37,7 @@ export class ExecutionGraphsService {
   constructor(
     private readonly database: DatabaseService,
     private readonly audit: AuditService,
+    private readonly triggers: GraphTriggersService,
   ) {}
 
   private async graph(projectId: string, db = this.database.db) {
@@ -112,10 +114,14 @@ export class ExecutionGraphsService {
     const issues = canvasIssues(definition.canvas);
     if (issues.length) return { issues };
     try {
-      await this.validateReferences(
-        this.database.db,
+      const compiled = compileCanvas(definition.canvas, true);
+      await this.validateReferences(this.database.db, projectId, compiled);
+      const graph = await this.graph(projectId);
+      await this.triggers.validatePublication(
         projectId,
-        compileCanvas(definition.canvas, true),
+        graph.id,
+        (graph.published_version ?? 0) + 1,
+        compiled,
       );
       return { issues: [] };
     } catch (error) {
@@ -175,6 +181,25 @@ export class ExecutionGraphsService {
   }
 
   async publish(projectId: string, expectedRevision: number, userId: string) {
+    await requireProject(this.database.db, projectId);
+    const candidate = await this.graph(projectId);
+    this.checkRevision(candidate.revision, expectedRevision);
+    const priorPublication = await this.database.db
+      .selectFrom('execution_graph_versions')
+      .select('version')
+      .where('graph_id', '=', candidate.id)
+      .where('source_revision', '=', expectedRevision)
+      .executeTakeFirst();
+    const draft = JSON.parse(candidate.draft_json) as GraphDefinition;
+    const definition = draft.canvas ? compileCanvas(draft.canvas, true) : draft;
+    if (!definition.canvas) {
+      const compiled = validateGraphDefinition(definition);
+      for (const flow of definition.flows) flow.compiled = compiled[flow.id];
+    }
+    const version = (candidate.published_version ?? 0) + 1;
+    const triggerChecks = priorPublication
+      ? []
+      : await this.triggers.validatePublication(projectId, candidate.id, version, definition);
     return this.database.db.transaction().execute(async (tx) => {
       await lockProjectGraph(tx);
       const graph = await this.lockDraft(tx, projectId, expectedRevision);
@@ -185,15 +210,11 @@ export class ExecutionGraphsService {
         .where('source_revision', '=', expectedRevision)
         .executeTakeFirst();
       if (existing) return graphResponse(graph);
-      const version = (graph.published_version ?? 0) + 1;
+      if (candidate.published_version !== graph.published_version)
+        throw new ConflictException('已发布版本已变化，请重新校验后发布');
       const now = Date.now();
-      const draft = JSON.parse(graph.draft_json) as GraphDefinition;
-      const definition = draft.canvas ? compileCanvas(draft.canvas, true) : draft;
-      if (!definition.canvas) {
-        const compiled = validateGraphDefinition(definition);
-        for (const flow of definition.flows) flow.compiled = compiled[flow.id];
-      }
       await this.validateReferences(tx, projectId, definition);
+      await this.triggers.followPublication(tx, projectId, version, definition, triggerChecks);
       await tx
         .insertInto('execution_graph_versions')
         .values({
@@ -212,19 +233,6 @@ export class ExecutionGraphsService {
         .where('id', '=', graph.id)
         .returningAll()
         .executeTakeFirstOrThrow();
-      if (definition.canvas) {
-        await tx
-          .updateTable('execution_graph_triggers')
-          .set({ enabled: 0, next_at: null, updated_at: now })
-          .where('project_id', '=', projectId)
-          .where('enabled', '=', 1)
-          .where(
-            'flow_id',
-            'not in',
-            definition.flows.map(({ id }) => id),
-          )
-          .execute();
-      }
       await this.audit.record(
         userId,
         'execution_graph.publish',
@@ -303,6 +311,15 @@ export class ExecutionGraphsService {
         .where('enabled', '=', 1)
         .executeTakeFirst();
       if (trigger) throw new ConflictException(`请先停用该版本的触发器「${trigger.name}」`);
+      const pending = await tx
+        .selectFrom('execution_graph_trigger_events as event')
+        .innerJoin('execution_graph_triggers as rule', 'rule.id', 'event.trigger_id')
+        .select('event.id')
+        .where('rule.project_id', '=', projectId)
+        .where('event.graph_version', '=', version)
+        .where('event.status', '=', 'PENDING')
+        .executeTakeFirst();
+      if (pending) throw new ConflictException('该版本仍有已接收的触发事件，请等待派发完成');
       const retiredAt = Date.now();
       await tx
         .updateTable('execution_graph_versions')

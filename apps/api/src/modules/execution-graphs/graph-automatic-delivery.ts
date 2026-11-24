@@ -1,8 +1,10 @@
 import { ConflictException, ForbiddenException } from '@nestjs/common';
 import type { Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
+import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import type { GraphDefinition } from './execution-graph-definition';
 import { graphTriggerKinds, type GraphTriggerKind } from './graph-trigger.dto';
+import type { GraphCheckoutEvent } from '../projects/repository-metadata.service';
 
 export interface GraphAutomation {
   kind: GraphTriggerKind;
@@ -15,10 +17,85 @@ export function isGraphTriggerKind(value: unknown): value is GraphTriggerKind {
   return graphTriggerKinds.some((kind) => kind === value);
 }
 
+export function graphCheckoutEvent(
+  trigger?: Record<string, unknown>,
+  nodeId?: string,
+): GraphCheckoutEvent | undefined {
+  if (
+    !trigger ||
+    !['POLL', 'GITEA', 'BEARER'].includes(String(trigger.eventSource)) ||
+    (nodeId && trigger.checkoutNodeId && trigger.checkoutNodeId !== nodeId) ||
+    typeof trigger.repositoryId !== 'string' ||
+    typeof trigger.ref !== 'string' ||
+    !trigger.ref.startsWith('refs/heads/') ||
+    typeof trigger.commitSha !== 'string' ||
+    !/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(trigger.commitSha)
+  )
+    return undefined;
+  return {
+    repositoryId: trigger.repositoryId,
+    ref: trigger.ref,
+    commitSha: trigger.commitSha.toLowerCase(),
+  };
+}
+
 export function graphNodeRequiresIsolation(type: string): boolean {
   return (
     type === 'SHELL' || type === 'CHECK' || type === 'REGISTER_ARTIFACT' || type === 'HEALTH_CHECK'
   );
+}
+
+export async function assertAutomaticTargets(
+  db: Kysely<Database>,
+  targets: readonly (string | SshTarget)[],
+) {
+  if (!targets.length) throw new ForbiddenException('自动执行需要已授权的服务器');
+  const ids = targets.map((target) => (typeof target === 'string' ? target : target.id));
+  const rows = await db
+    .selectFrom('servers as server')
+    .leftJoin('credentials as credential', 'credential.id', 'server.credential_id')
+    .select([
+      'server.id',
+      'server.name',
+      'server.host',
+      'server.port',
+      'server.username',
+      'server.host_key_fingerprint',
+      'server.credential_id',
+      'server.is_active',
+      'server.automatic_execution_credential_nonce',
+      'credential.nonce',
+      'credential.status',
+      'credential.type',
+    ])
+    .where('server.id', 'in', ids)
+    .execute();
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  for (const target of targets) {
+    const row = byId.get(typeof target === 'string' ? target : target.id);
+    if (
+      !row ||
+      row.is_active !== 1 ||
+      !row.host_key_fingerprint ||
+      !row.automatic_execution_credential_nonce ||
+      row.automatic_execution_credential_nonce !== row.nonce ||
+      row.status !== 'ACTIVE' ||
+      !['SSH_PASSWORD', 'SSH_KEY'].includes(row.type ?? '')
+    )
+      throw new ForbiddenException(
+        `服务器「${row?.name ?? (typeof target === 'string' ? target : target.name)}」缺少有效的自动执行授权，请管理员复核 SSH 身份后授权`,
+      );
+    if (
+      typeof target !== 'string' &&
+      (row.host !== target.host ||
+        row.port !== target.port ||
+        row.username !== target.username ||
+        row.host_key_fingerprint !== target.hostKeyFingerprint ||
+        row.credential_id !== target.credentialId ||
+        (target.credentialNonce && row.nonce !== target.credentialNonce))
+    )
+      throw new ConflictException(`服务器「${row.name}」的 SSH 身份与已确认计划不一致`);
+  }
 }
 
 function requireEnabled(kind: GraphTriggerKind) {
@@ -36,9 +113,8 @@ export function assertAutomaticGraphFlow(
   for (const id of flows) {
     for (const node of definition.flows.find((entry) => entry.id === id)?.nodes ?? []) {
       if (node.type === 'FLOW_CALL' && node.flowId) flows.add(node.flowId);
-      if (graphNodeRequiresIsolation(node.type))
-        throw new ForbiddenException(`节点「${node.name}」的自动执行尚未通过隔离验收`);
       if (
+        graphNodeRequiresIsolation(node.type) ||
         node.type === 'BUILD' ||
         node.type === 'DEPLOY_ARTIFACT' ||
         node.type === 'ROLLBACK_ARTIFACT'
@@ -46,8 +122,6 @@ export function assertAutomaticGraphFlow(
         requireEnabled(kind);
         hasDelivery = true;
       }
-      if (node.type === 'BUILD' && node.build?.buildLocation === 'TARGET')
-        throw new ForbiddenException(`节点「${node.name}」的自动构建需要管理端隔离运行器`);
     }
   }
   return hasDelivery;

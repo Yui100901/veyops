@@ -30,7 +30,7 @@ export function withPlanIssue(error: unknown, fallback: IssueLocation): never {
   const status = error.getStatus();
   if (
     !(error instanceof ExecutionPlanIssueError) &&
-    ![400, 404, 409, 502, 503, 504].includes(status)
+    ![400, 403, 404, 409, 502, 503, 504].includes(status)
   )
     throw error;
   const source = error instanceof ExecutionPlanIssueError ? error.issue : undefined;

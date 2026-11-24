@@ -194,6 +194,14 @@ async function checkDelivery(databaseUrl?: string) {
           return { exitCode: 77 };
         if (command.includes("printf 'VEYOPS_ARTIFACT"))
           options?.onData?.(`VEYOPS_ARTIFACT:${checksum}:${archive.length}\n`);
+        if (command.includes('measured=$(artifact_digest') && command.includes('workspace=')) {
+          const instance = /instance=[^a-f0-9]*([a-f0-9-]{36})/.exec(command)?.[1];
+          assert.ok(instance);
+          options?.onData?.(
+            `/home/fixture/.veyops/artifacts/${instance}/payload\n${checksum}:${archive.length}\n`,
+            'stdout',
+          );
+        }
         if (command.includes(' push ')) {
           const tag = /:([^:']+)'$/.exec(command)?.[1];
           options?.onData?.(`${tag}: digest: ${imageDigest} size: 321\n`);
@@ -1498,6 +1506,26 @@ async function checkDelivery(databaseUrl?: string) {
           ],
         },
       },
+      { id: 'auto-target-start', type: 'START', name: '目标端定时构建', inputs: [targets] },
+      {
+        id: 'auto-target-check',
+        type: 'CHECK',
+        name: '目标端检查',
+        shell: { location: 'TARGET', command: 'echo GRAPH_AUTOMATIC_TARGET_CHECK' },
+      },
+      {
+        id: 'auto-target-build',
+        type: 'BUILD',
+        name: '目标端构建文件',
+        build: {
+          repositoryId: repo.id,
+          branch: 'main',
+          buildLocation: 'TARGET',
+          buildCommand: 'echo GRAPH_AUTOMATIC_TARGET_BUILD',
+          artifacts: [{ name: 'jar', type: 'FILE', path: 'app.jar' }],
+        },
+      },
+      { id: 'auto-target-end', type: 'END', name: '目标端构建结束' },
       {
         id: 'deploy-node',
         type: 'DEPLOY_ARTIFACT',
@@ -1540,6 +1568,9 @@ async function checkDelivery(databaseUrl?: string) {
       ['git-actual', 'git-schema'],
       ['git-schema', 'git-unused'],
       ['git-unused', 'build-node'],
+      ['auto-target-start', 'auto-target-check'],
+      ['auto-target-check', 'auto-target-build'],
+      ['auto-target-build', 'auto-target-end'],
       ['build-node', 'build-end'],
       ['build-node', 'deploy-node'],
       ['release', 'deploy-node'],
@@ -1592,6 +1623,15 @@ async function checkDelivery(databaseUrl?: string) {
             endId: 'build-end',
             inputBindings: buildBindings,
             outputBindings: { jar: from('build-node', 'jar'), image: from('build-node', 'image') },
+          },
+          {
+            startId: 'auto-target-start',
+            endId: 'auto-target-end',
+            serviceId: service.id,
+            inputBindings: {
+              'auto-target-check': { targets: input('targets') },
+              'auto-target-build': { targets: input('targets') },
+            },
           },
           releaseEndpoint('composed', from('build-node', 'image')),
           releaseEndpoint('release', input('image')),
@@ -1846,9 +1886,56 @@ async function checkDelivery(databaseUrl?: string) {
     const previousBuildSocket = process.env.WEBHOOK_BUILD_DOCKER_SOCKET;
     process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = 'API,WEBHOOK,CRON,UPSTREAM';
     process.env.WEBHOOK_BUILD_DOCKER_SOCKET = '/run/user/1000/fixture-docker.sock';
+    const managerSocket = mock.method(
+      BuildsService,
+      'automaticManagerSocket',
+      async () => '/run/user/1000/fixture-docker.sock',
+    );
+    const grant = async (enabled: boolean) =>
+      (
+        await api
+          .patch('/api/v1/servers/' + serverIds[0] + '/automatic-execution')
+          .send({ enabled })
+          .expect(200)
+      ).body.data;
     try {
+      assert.equal((await grant(true)).automaticExecutionEnabled, true);
       const triggerPath = graphPath + '/triggers';
       const triggers = app.get(GraphTriggersService);
+      const targetCron = await create(triggerPath, {
+        name: '目标端定时构建',
+        kind: 'CRON',
+        flowId: 'auto-target-start',
+        version: published.publishedVersion,
+        enabled: true,
+        cron: '0 2 * * *',
+        timeZone: 'Asia/Shanghai',
+      });
+      const beforeTarget = remoteCommands.length;
+      await triggers.tick(targetCron.nextAt);
+      const scheduled = await list(triggerPath + '/' + targetCron.id + '/events', {});
+      assert.equal(scheduled.length, 1);
+      const builtByCron = await waitGraph(scheduled[0].runId);
+      assert.equal(builtByCron.status, 'SUCCESS', JSON.stringify(builtByCron.nodes));
+      const automaticCommands = remoteCommands.slice(beforeTarget);
+      for (const marker of ['GRAPH_AUTOMATIC_TARGET_CHECK', 'GRAPH_AUTOMATIC_TARGET_BUILD']) {
+        const commands = automaticCommands.filter(({ command }) => command.includes(marker));
+        assert.equal(commands.length, 1);
+        assert.equal(commands[0].serverId, serverIds[0]);
+        assert.match(commands[0].command, /\/\.veyops\/workspace\/veyops-/);
+      }
+      await api
+        .patch('/api/v1' + triggerPath + '/' + targetCron.id)
+        .send({
+          name: '目标端定时构建',
+          kind: 'CRON',
+          flowId: 'auto-target-start',
+          version: published.publishedVersion,
+          enabled: false,
+          cron: '0 2 * * *',
+          timeZone: 'Asia/Shanghai',
+        })
+        .expect(200);
       const releaseRule = {
         name: 'Automatic archive release',
         enabled: true,
@@ -2125,7 +2212,28 @@ async function checkDelivery(databaseUrl?: string) {
       const directRelease = await runTask(directTaskId);
       assert.equal(directRelease.status, 'SUCCESS', directRelease.errorSummary);
       assert.equal(activations().length, activated + 1);
+
+      const targetEventId = (await invoke(direct.id, 'native-api-revoked-target')).body.data.id;
+      await triggers.tick();
+      const targetEvent = (await events(direct.id)).find(
+        (item: { id: string }) => item.id === targetEventId,
+      );
+      const targetRun = (
+        await api.get('/api/v1' + graphPath + '/runs/' + targetEvent.runId).expect(200)
+      ).body.data;
+      const affectedTask = targetRun.nodes.find(
+        ({ nodeId }: { nodeId: string }) => nodeId === 'deploy-node',
+      ).taskId;
+      assert.ok(affectedTask);
+      assert.notEqual(affectedTask, directTaskId);
+      const commandsBeforeRevoke = remoteCommands.length;
+      assert.equal((await grant(false)).automaticExecutionEnabled, false);
+      const targetRevoked = await runTask(affectedTask);
+      assert.equal(targetRevoked.status, 'FAILED', targetRevoked.errorSummary);
+      assert.equal(remoteCommands.length, commandsBeforeRevoke);
+      assert.match(targetRevoked.errorSummary, /缺少有效的自动执行授权/);
     } finally {
+      managerSocket.mock.restore();
       if (previousAutomaticKinds === undefined) delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
       else process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = previousAutomaticKinds;
       if (previousBuildSocket === undefined) delete process.env.WEBHOOK_BUILD_DOCKER_SOCKET;
@@ -2337,6 +2445,47 @@ async function checkDelivery(databaseUrl?: string) {
         })
         .expect(200)
     ).body.data;
+    const publishReplacement = () =>
+      api.post('/api/v1' + graphPath + '/publish').send({ expectedRevision: cdDraft.revision });
+    const blockedReplacement = await publishReplacement().expect(400);
+    assert.ok(
+      ['build', 'guarded', 'release'].includes(blockedReplacement.body.error.planIssue.nodeId),
+    );
+    for (const rule of await list(graphPath + '/triggers', {})) {
+      if (!rule.enabled) continue;
+      const {
+        name,
+        kind,
+        flowId,
+        version,
+        cron,
+        timeZone,
+        credentialId,
+        upstreamFlowId,
+        upstreamStatus,
+        parameterMappings,
+        repositoryId,
+        refPrefix,
+      } = rule;
+      await api
+        .patch('/api/v1' + graphPath + '/triggers/' + rule.id)
+        .send({
+          enabled: false,
+          name,
+          kind,
+          flowId,
+          version,
+          cron,
+          timeZone,
+          credentialId,
+          upstreamFlowId,
+          upstreamStatus,
+          parameterMappings,
+          repositoryId,
+          refPrefix,
+        })
+        .expect(200);
+    }
     const cdVersion = (await create(graphPath + '/publish', { expectedRevision: cdDraft.revision }))
       .publishedVersion;
     const cdFlow = `${graphPath}/flows/${expanded.startId}`;

@@ -478,6 +478,10 @@ export function ServersPage({ user, search: routeSearch }: { user: User; search?
               initialMetrics={view.panel === 'metrics'}
               canEdit={canEdit && detail.data.active !== false}
               onMonitorChange={metrics.reload}
+              onAuthorizationChange={() => {
+                void detail.reload();
+                void resource.reload();
+              }}
               onClose={() => navigate(view.returnPath ?? '/servers')}
             />
           )}

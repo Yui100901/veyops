@@ -72,6 +72,13 @@ export interface GraphCheckoutSnapshot {
   commitSha: string;
   fullClone: boolean;
   access: RepositoryAccess;
+  eventPinned?: true;
+}
+
+export interface GraphCheckoutEvent {
+  repositoryId: string;
+  ref: string;
+  commitSha: string;
 }
 type BranchCacheRow = Pick<
   Selectable<RepositoriesTable>,
@@ -304,6 +311,7 @@ export class RepositoryMetadataService {
       tag?: string;
       commitSha?: string;
       fullClone?: boolean;
+      event?: GraphCheckoutEvent;
     },
   ): Promise<GraphCheckoutSnapshot> {
     const address = graphRepositoryUrl(input.repositoryId);
@@ -318,6 +326,7 @@ export class RepositoryMetadataService {
     let branch: string | undefined;
     let tag: string | undefined;
     let commitSha = input.commitSha?.toLowerCase();
+    let eventPinned = false;
     if (input.mode === 'BRANCH') {
       const remote = await this.withRepository(
         projectId,
@@ -327,6 +336,15 @@ export class RepositoryMetadataService {
       );
       branch = input.branch ?? remote.defaultBranch ?? undefined;
       commitSha = remote.branches.find((item) => item.name === branch)?.sha;
+      if (
+        branch &&
+        commitSha &&
+        input.event?.repositoryId === repositoryId &&
+        input.event.ref === 'refs/heads/' + branch
+      ) {
+        commitSha = input.event.commitSha.toLowerCase();
+        eventPinned = true;
+      }
     }
     if (input.mode === 'TAG') {
       tag = input.tag;
@@ -351,9 +369,21 @@ export class RepositoryMetadataService {
         access,
       );
     }
+    if (
+      input.mode === 'COMMIT' &&
+      input.event?.repositoryId === repositoryId &&
+      input.event.commitSha.toLowerCase() === commitSha &&
+      input.event.ref.startsWith('refs/heads/')
+    ) {
+      const triggeredBranch = input.event.ref.slice('refs/heads/'.length);
+      if (isBranchName(triggeredBranch)) {
+        branch = triggeredBranch;
+        eventPinned = true;
+      }
+    }
     if (!commitSha || !shaPattern.test(commitSha))
       throw new BadRequestException('请选择存在的仓库分支、标签或完整 Git 提交 SHA');
-    if (input.mode === 'COMMIT')
+    if (input.mode === 'COMMIT' || eventPinned)
       await this.withRepository(
         projectId,
         repositoryId,
@@ -369,6 +399,7 @@ export class RepositoryMetadataService {
       commitSha,
       fullClone: input.fullClone === true,
       access,
+      ...(eventPinned && { eventPinned: true as const }),
     };
   }
 

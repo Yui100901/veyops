@@ -8,6 +8,7 @@ import type { TaskPayload } from '../tasks/tasks.types';
 import { lockTaskLease, TaskLeaseUnavailableError } from '../tasks/task-lease';
 import { assertCurrentTargets, serviceReleasePolicy } from './release-policy';
 import {
+  assertAutomaticTargets,
   assertGraphAutomation,
   isGraphTriggerKind,
 } from '../execution-graphs/graph-automatic-delivery';
@@ -64,7 +65,11 @@ export class DeploymentsService {
       throw new ConflictException('部署目录已有其他发布，请先核查当前部署方式及归属');
   }
 
-  async assertAutomaticDelivery(taskId: string, snapshot: PipelineSnapshot) {
+  async assertAutomaticDelivery(
+    taskId: string,
+    snapshot: PipelineSnapshot,
+    targets?: PipelineTarget[],
+  ) {
     const db = this.database.db;
     if (!snapshot.graphAutomation) {
       const linked = await db
@@ -88,10 +93,12 @@ export class DeploymentsService {
       .where('id', '=', taskId)
       .executeTakeFirstOrThrow();
     await assertGraphAutomation(db, snapshot.projectId, task.created_by, snapshot.graphAutomation);
+    if (snapshot.mode === 'DEPLOY_ARTIFACT' || snapshot.definition.buildLocation === 'TARGET')
+      await assertAutomaticTargets(db, targets ?? []);
   }
 
   async assertApproval(taskId: string, snapshot: PipelineSnapshot, targets?: PipelineTarget[]) {
-    await this.assertAutomaticDelivery(taskId, snapshot);
+    await this.assertAutomaticDelivery(taskId, snapshot, targets);
     const db = this.database.db;
     const { policy } = snapshot.graphDeployment
       ? { policy: { requireApproval: false, requireCodeReview: false } }

@@ -144,6 +144,43 @@ export class CredentialsService {
     await this.audit.record(userId, 'credential.create', 'credential', id);
     return (await this.list()).find((c) => c.id === id)!;
   }
+  async storeWebhookSecret(
+    tx: Transaction<Database>,
+    userId: string,
+    name: string,
+    secret: string,
+    managedId?: string,
+  ) {
+    const encrypted = this.encrypt({ value: secret });
+    const now = Date.now();
+    const existing = managedId
+      ? await tx
+          .updateTable('credentials')
+          .set({ ...encrypted, updated_at: now })
+          .where('id', '=', managedId)
+          .where('type', '=', 'CUSTOM_SECRET')
+          .where('status', '=', 'ACTIVE')
+          .returning('id')
+          .executeTakeFirst()
+      : undefined;
+    const id = existing?.id ?? randomUUID();
+    if (!existing)
+      await tx
+        .insertInto('credentials')
+        .values({
+          id,
+          name,
+          type: 'CUSTOM_SECRET',
+          ...encrypted,
+          status: 'ACTIVE',
+          created_by: userId,
+          created_at: now,
+          updated_at: now,
+        })
+        .execute();
+    return { id, nonce: encrypted.nonce };
+  }
+
   async storeVariableValue(
     tx: Transaction<Database>,
     userId: string,
@@ -167,8 +204,12 @@ export class CredentialsService {
       .execute();
     return id;
   }
-  async decrypt(id: string, expectedNonce?: string): Promise<Record<string, string>> {
-    let query = this.database.db.selectFrom('credentials').selectAll().where('id', '=', id);
+  async decrypt(
+    id: string,
+    expectedNonce?: string,
+    db = this.database.db,
+  ): Promise<Record<string, string>> {
+    let query = db.selectFrom('credentials').selectAll().where('id', '=', id);
     if (expectedNonce) query = query.where('nonce', '=', expectedNonce);
     const row = await query.executeTakeFirst();
     if (!row || row.status !== 'ACTIVE') throw new BadRequestException('凭据不存在或已禁用');

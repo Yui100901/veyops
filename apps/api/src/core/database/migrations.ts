@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { executionGraphsMigration } from './execution-graphs-migration';
 import { executionGraphTriggersMigration } from './execution-graph-triggers-migration';
+import { executionGraphSourceTriggersMigration } from './execution-graph-source-triggers-migration';
 import { recordedDeploymentLocation } from '../../modules/deployments/deployment-scope';
 import type { Database } from './schema';
 import {
@@ -2033,7 +2034,10 @@ export const migrationProvider: MigrationProvider = {
           await db.schema
             .alterTable('users')
             .addColumn('password_change_recommended', 'integer', (column) =>
-              column.notNull().defaultTo(0).check(sql`password_change_recommended in (0, 1)`),
+              column
+                .notNull()
+                .defaultTo(0)
+                .check(sql`password_change_recommended in (0, 1)`),
             )
             .execute();
         },
@@ -2048,6 +2052,48 @@ export const migrationProvider: MigrationProvider = {
         async down(db) {
           const legacy = tables.find((table) => table.name === 'project_dependencies')!;
           await createTables(db, [legacy], []);
+        },
+      } satisfies Migration,
+      '037_execution_graph_source_triggers': executionGraphSourceTriggersMigration,
+      '038_server_automatic_execution': {
+        async up(db) {
+          await db.schema
+            .alterTable('servers')
+            .addColumn('automatic_execution_credential_nonce', 'text')
+            .execute();
+        },
+        async down(db) {
+          await db.schema
+            .alterTable('servers')
+            .dropColumn('automatic_execution_credential_nonce')
+            .execute();
+        },
+      } satisfies Migration,
+      '036_graph_trigger_event_snapshots': {
+        async up(db) {
+          await db.schema
+            .alterTable('execution_graph_trigger_events')
+            .addColumn('graph_version', 'integer')
+            .execute();
+          await db.schema
+            .alterTable('execution_graph_trigger_events')
+            .addColumn('flow_id', 'text')
+            .execute();
+          await db.schema
+            .alterTable('execution_graph_trigger_events')
+            .addColumn('rule_revision', 'text')
+            .execute();
+          await db.schema
+            .alterTable('execution_graph_trigger_events')
+            .addColumn('resolved_inputs', 'text')
+            .execute();
+        },
+        async down(db) {
+          for (const column of ['graph_version', 'flow_id', 'rule_revision', 'resolved_inputs'])
+            await db.schema
+              .alterTable('execution_graph_trigger_events')
+              .dropColumn(column)
+              .execute();
         },
       } satisfies Migration,
     };

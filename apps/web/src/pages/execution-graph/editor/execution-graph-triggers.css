@@ -1,0 +1,85 @@
+.graph-start-rules,
+.graph-start-rule-list {
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.graph-start-rule-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.graph-start-rules,
+.graph-start-rules .graph-properties {
+  gap: 0.65rem;
+  padding: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.graph-start-rules :is(h4, p, dl) {
+  margin: 0;
+}
+
+.graph-trigger-manual,
+.graph-trigger-copy .input-action-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.graph-trigger-manual {
+  justify-content: space-between;
+  padding-block-end: 0.55rem;
+  border-block-end: 1px solid var(--border);
+}
+
+.graph-trigger-editor fieldset {
+  display: grid;
+  gap: 0.75rem;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.graph-trigger-editor .form-grid,
+.graph-trigger-details .form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
+  align-items: start;
+}
+
+.graph-trigger-editor .form-grid :is(input, select) {
+  max-inline-size: 100%;
+}
+
+.graph-trigger-copy .input-action-row input {
+  flex: 1 1 min(100%, 16rem);
+}
+
+.graph-trigger-copy > [role='status']:empty {
+  display: none;
+}
+
+.graph-trigger-evidence {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
+  gap: 0.45rem 0.65rem;
+}
+
+.graph-trigger-evidence dt,
+.graph-trigger-preflight ol {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.graph-trigger-evidence dd {
+  margin: 0;
+}
+
+.graph-trigger-preflight ol {
+  margin: 0.35rem 0 0;
+  padding-inline-start: 1.3rem;
+}

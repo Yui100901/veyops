@@ -74,7 +74,9 @@ import { latestReleaseInspections } from './graph-release-inspection.service';
 import { ScriptWorkspacePreview } from './graph-script-workspaces';
 import {
   assertAutomaticGraphFlow,
+  assertAutomaticTargets,
   assertGraphAutomation,
+  graphCheckoutEvent,
   graphNodeRequiresIsolation,
   isGraphTriggerKind,
   type GraphAutomation,
@@ -332,6 +334,7 @@ interface PreparedProduction {
   environmentId?: string;
   kind?: GraphField['artifactType'];
   sourceSnapshot?: Delivery['sourceSnapshot'];
+  externalPreflight?: boolean;
 }
 
 const outputKey = (nodeId: string, fieldId: string) => `${nodeId}:${fieldId}`;
@@ -406,6 +409,8 @@ interface PlanContext {
   allowRetired?: boolean;
   rootId?: string;
   authorizePlan?: GraphPlanAuthorizer;
+  definitionOverride?: { graphId: string; definition: GraphDefinition };
+  pendingArtifactParameters?: ReadonlySet<string>;
 }
 
 function digest(value: unknown) {
@@ -878,6 +883,7 @@ export class GraphRunnerService implements OnModuleInit {
     environmentSet: FrozenEnvironmentSet | undefined,
     rootId?: string,
     parameterProduction: ReadonlyMap<string, PreparedProduction[]> = new Map(),
+    automation?: GraphAutomation,
   ): Promise<Delivery> {
     const scope = declaredScope(flow, inputs);
     const serviceId =
@@ -1051,6 +1057,15 @@ export class GraphRunnerService implements OnModuleInit {
         undefined,
         profile,
       );
+      if (automation)
+        await this.pipelines
+          .assertGraphAutomaticBuild(preview, preview.serverIds)
+          .catch((error: unknown) =>
+            withPlanIssue(error, {
+              code: 'BUILD_TARGET',
+              fieldId: preview.definition.buildLocation === 'MANAGER' ? 'buildLocation' : 'targets',
+            }),
+          );
       const environmentFile = variableBinding?.environmentFile;
       const reviewed = wrap(preview, profile, {
         branch: 'branch' in fixed ? fixed.branch : undefined,
@@ -1225,13 +1240,21 @@ export class GraphRunnerService implements OnModuleInit {
       })),
     ]) {
       const { producer } = source;
-      if (producer.serviceId !== serviceId)
+      if (!producer.externalPreflight && producer.serviceId !== serviceId)
         throw new ExecutionPlanIssueError({
           code: 'ARTIFACT',
           fieldId: 'artifact',
           message: '上游产物须属于本次部署的项目服务',
         });
-      const profile = fromBuild(producer.definition, producer.kind);
+      const profile = fromBuild(
+        producer.definition,
+        producer.kind ??
+          (producer.externalPreflight
+            ? configuredMethod === 'COMPOSE'
+              ? 'DOCKER_IMAGE'
+              : 'FILE'
+            : undefined),
+      );
       const plan = await this.pipelines.previewArtifactDeployPlan(
         profile.id,
         {
@@ -1348,18 +1371,29 @@ export class GraphRunnerService implements OnModuleInit {
     projectId: string,
     flowId: string,
     request: GraphPreviewDto,
-    { trigger, automation, allowRetired = false, rootId, authorizePlan }: PlanContext = {},
+    {
+      trigger,
+      automation,
+      allowRetired = false,
+      rootId,
+      authorizePlan,
+      definitionOverride,
+      pendingArtifactParameters,
+    }: PlanContext = {},
   ) {
     await requireProject(this.database.db, projectId);
-    const { graphId, definition } = await this.published(
-      projectId,
-      request.version,
-      this.database.db,
-      !allowRetired,
-    );
+    const { graphId, definition } =
+      definitionOverride ??
+      (await this.published(projectId, request.version, this.database.db, !allowRetired));
     const flow = this.flow(definition, flowId);
     if (automation) assertAutomaticGraphFlow(definition, flowId, automation.kind);
-    const inputs = await this.resolveParameters(projectId, flow, request.inputs ?? {}, rootId);
+    const inputs = await this.resolveParameters(
+      projectId,
+      flow,
+      request.inputs ?? {},
+      rootId,
+      pendingArtifactParameters,
+    );
     const parameterSources = startParameterSources(
       flow,
       request.inputs?.parameters,
@@ -1594,8 +1628,32 @@ export class GraphRunnerService implements OnModuleInit {
             environmentSet,
             rootId,
             parameterProduction,
+            automation,
           ).catch((error: unknown) => withNodePlanIssue(error, current, node, nodeScope));
+          if (automation && node.type !== 'BUILD') {
+            const targetIds = [
+              ...new Set(
+                [delivery, ...(delivery.alternatives ?? [])].flatMap((item) => item.serverIds),
+              ),
+            ];
+            await assertAutomaticTargets(this.database.db, targetIds).catch((error: unknown) =>
+              withPlanIssue(error, {
+                ...nodeScope,
+                code: 'RELEASE_TARGET',
+                fieldId: 'targets',
+                flowId: current.id,
+                flowName: current.name,
+                nodeId: node.id,
+                nodeName: node.name,
+              }),
+            );
+          }
           if (node.type === 'BUILD' && environment.evidence.length) {
+            if (automation && environment.evidence.some(({ sensitive }) => sensitive))
+              throw fieldIssue(current, node, {
+                ...environment.evidence.find(({ sensitive }) => sensitive)!,
+                message: '自动构建不能使用节点环境中的敏感变量',
+              });
             for (const field of environment.evidence.filter(({ state }) => state === 'DEFERRED')) {
               deferred.push({
                 flowId: current.id,
@@ -1687,6 +1745,7 @@ export class GraphRunnerService implements OnModuleInit {
               inputEvidence: input.evidence,
               scriptWorkspace,
               trigger,
+              automation,
               fetchModeDeferred: input.evidence.some(
                 ({ fieldId, state }) => fieldId === 'fetchMode' && state === 'DEFERRED',
               ),
@@ -1694,6 +1753,38 @@ export class GraphRunnerService implements OnModuleInit {
               nodeEnvironmentSources: environment.sources,
             })
             .catch((error: unknown) => withNodePlanIssue(error, current, node, nodeScope));
+          if (automation && plan.type === 'HEALTH_CHECK' && !plan.scope) {
+            const predecessors = outputSources(nodeInputBinding(current, node, 'release'));
+            const targetIds = [
+              ...new Set(
+                predecessors.flatMap(({ nodeId }) => {
+                  const source = plans.get(planKey(current.id, nodeId));
+                  return source && 'serverIds' in source
+                    ? [source, ...(source.alternatives ?? [])].flatMap((item) => item.serverIds)
+                    : [];
+                }),
+              ),
+            ];
+            if (!targetIds.length)
+              throw new ExecutionPlanIssueError({
+                code: 'RELEASE_TARGET',
+                flowId: current.id,
+                nodeId: node.id,
+                fieldId: 'targets',
+                message: '自动健康检查需要明确指定目标或绑定本流程已预检的发布结果',
+              });
+            await assertAutomaticTargets(this.database.db, targetIds).catch((error: unknown) =>
+              withPlanIssue(error, {
+                ...nodeScope,
+                code: 'RELEASE_TARGET',
+                fieldId: 'targets',
+                flowId: current.id,
+                flowName: current.name,
+                nodeId: node.id,
+                nodeName: node.name,
+              }),
+            );
+          }
           plans.set(key, plan);
           if (plan.type === 'LOAD_ENV') {
             outputs.set(node.id, {
@@ -1782,7 +1873,14 @@ export class GraphRunnerService implements OnModuleInit {
             const mode = plan.fetchModeDeferred
               ? { fetchModeDeferred: true as const }
               : { fetchMode: graphCheckoutFetchMode(fullClone) };
-            checkouts[node.id] = { ...checkouts[node.id]!, ...mode };
+            checkouts[node.id] = {
+              ...checkouts[node.id]!,
+              ...mode,
+              ...(plan.source.eventPinned && {
+                versionSource: 'TRIGGER_COMMIT',
+                requestedVersion: { kind: 'COMMIT', value: commitSha },
+              }),
+            };
             checkoutRows.push({
               nodeId: node.id,
               flowId: current.id,
@@ -1912,7 +2010,34 @@ export class GraphRunnerService implements OnModuleInit {
         confirmedOutputs,
       };
     };
-    const prepared = await prepareFlow(flow, inputs, '', parameterSources);
+    const pendingProduction = new Map<string, PreparedProduction[]>();
+    for (const field of flowStart(flow).inputs ?? []) {
+      if (!pendingArtifactParameters?.has(field.id)) continue;
+      pendingProduction.set(field.id, [
+        {
+          definition: Object.assign(new PipelineDefinitionDto(), {
+            repositoryId: unversionedArtifactRepository,
+          }),
+          commitSha: unversionedArtifactCommit,
+          kind: field.artifactType,
+          externalPreflight: true,
+        },
+      ]);
+    }
+    const prepared = await prepareFlow(flow, inputs, '', parameterSources, pendingProduction);
+    const sourceEvent = graphCheckoutEvent(trigger);
+    if (
+      sourceEvent &&
+      !checkoutRows.some(
+        (row) =>
+          graphCheckoutEvent(trigger, row.nodeId) &&
+          row.versionSource === 'TRIGGER_COMMIT' &&
+          row.repositoryId === sourceEvent.repositoryId &&
+          row.ref === sourceEvent.ref &&
+          row.commitSha === sourceEvent.commitSha,
+      )
+    )
+      throw graphInputIssue(flow, '源码事件未匹配已发布配置中的检出仓库和分支');
     if (authorizePlan) {
       const deliveries = publishedDeliveries.flatMap((plan) => [
         plan,
@@ -3293,10 +3418,26 @@ export class GraphRunnerService implements OnModuleInit {
         nodeEnvironment: environment.variables,
         nodeEnvironmentSources: environment.sources,
         trigger: snapshot.trigger ?? { triggeredAt: run.created_at },
+        automation: snapshot.automation,
       },
     );
-    await this.tasks.create(task, run.created_by, undefined, (tx, id) =>
-      this.linkTask(tx, run, row, id),
+    const automation = snapshot.automation;
+    await this.tasks.create(
+      task,
+      run.created_by,
+      automation
+        ? async (tx) => {
+            await assertGraphAutomation(
+              tx,
+              run.project_id,
+              run.created_by,
+              automation,
+              graphNodeRequiresIsolation(action.type),
+            );
+            if (task.payload.targets.length) await assertAutomaticTargets(tx, task.payload.targets);
+          }
+        : undefined,
+      (tx, id) => this.linkTask(tx, run, row, id),
     );
   }
 
@@ -3595,14 +3736,16 @@ export class GraphRunnerService implements OnModuleInit {
         const automatic =
           isGraphTriggerKind(state.run.trigger_type) ||
           isGraphTriggerKind(state.snapshot.trigger?.kind);
-        if (automatic && (isDelivery(action) || graphNodeRequiresIsolation(action.type))) {
-          if (!state.snapshot.automation || !isDelivery(action))
+        const needsAuthorization = isDelivery(action) || graphNodeRequiresIsolation(action.type);
+        if (automatic && (needsAuthorization || state.snapshot.automation)) {
+          if (!state.snapshot.automation)
             throw new ConflictException('当前节点缺少有效的自动交付授权或隔离策略');
           await assertGraphAutomation(
             this.database.db,
             state.run.project_id,
             state.run.created_by,
             state.snapshot.automation,
+            needsAuthorization,
           );
         }
         if (node.node_type === 'FLOW_CALL') {

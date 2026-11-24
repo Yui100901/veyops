@@ -231,16 +231,26 @@ Shell 和检查的环境绑定可使用 `PROJECT_VALUE`，以 `source: {kind:"OU
 
 ### 执行图触发器
 
-通过 `GET /triggers` 查询附加规则，管理员经 `POST /triggers` 创建，用 `PATCH /triggers/:id` 更新。规则绑定发布版本和开始节点。`parameterMappings` 按开始字段 ID 指定 `{source:"VALUE",value}` 或 `{source:"EVENT",field}`。事件字段包括 `repository`、`commit`、`ref`、`eventId`、`scheduledAt`、`upstreamRunId` 和 `upstreamStatus`，由触发类型决定可用项。
+路径前缀为 `/projects/:id/execution-graph`。管理员可在草稿的开始节点保存停用的规则。启用时可带可选的 `version` 来确认当前发布版。兼容发布更新启用规则关联的版本，规则 ID 和 Webhook 地址继续有效。
 
-- `CRON` 使用 `cron` 和 IANA `timeZone`。
-- `API` 经 `POST /triggers/:triggerId/invoke` 提交 `{eventId,inputValue?,repositoryId?,ref?,commitSha?}`。
-- `UPSTREAM` 指定同一发布版本的 `upstreamFlowId` 和 `upstreamStatus`。成功规则可用 `{source:"UPSTREAM_OUTPUT",fieldId}` 传递可独立验证的同类型结束字段。
-- `WEBHOOK` 使用签名凭据，可设置 `repositoryId` 和 `refPrefix` 过滤。向 `/api/v1/graph-webhooks/:triggerId` 提交 JSON，携带 `X-Veyops-Timestamp`、`X-Veyops-Delivery`、`X-Veyops-Signature`，签名对 `timestamp + "." + eventId + "." + 原始请求体` 计算 HMAC-SHA256，以 `sha256=` 加十六进制值发送。
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/triggers` | 查看规则的启用状态、下次时间、轮询观察以及已解析的仓库和分支 |
+| POST | `/triggers` | 创建规则，停用草稿可提交 `draftRevision` 检查草稿冲突 |
+| PATCH | `/triggers/:triggerId` | 保存并启用、修改或暂停规则 |
+| POST | `/triggers/preflight` | 按同样的规则字段预检，编辑时可提交 `triggerId`。返回发版号、可用状态、定位诊断和三次计划时间 |
+| GET | `/triggers/:triggerId/events` | 查看事件、接受时的版本和规则修订、当前运行结果。重复的源码观察可追到同一运行 |
+| POST | `/triggers/:triggerId/rotate-secret` | 轮换专用 Webhook 密钥，响应只返回一次新密钥 |
+| POST | `/triggers/:triggerId/invoke` | 已认证的 API 调用，提交 `{eventId,inputValue?,repositoryId?,ref?,commitSha?}` |
 
-`GET /triggers/:triggerId/events` 返回事件状态与元数据。同一规则的事件 ID 去重。
+- `CRON` 接受五段 `cron` 和可选 IANA `timeZone`。默认 `cronMode:"RUN"` 每次到期运行。使用 `cronMode:"POLL"` 检查指定或继承的仓库分支，可设置 `buildOnFirstObservation`。启用轮询与推送时，同一执行流、仓库、分支的同一次观察共用构建。回退到历史 SHA 仍可构成新变化。
+- `UPSTREAM` 按稳定 `upstreamFlowId` 关联同项目的执行流，`upstreamStatus` 默认为 `SUCCESS`。上游结束输出从该次运行实际使用的版本读取。成功规则可用 `{source:"UPSTREAM_OUTPUT",fieldId}` 映射兼容结束字段，跨运行产物使用已登记实例。
+- `WEBHOOK` 的 `webhookProtocol:"GITEA"` 核验原始 JSON 的 `X-Gitea-Signature`，使用 `X-Gitea-Event: push` 和 `X-Gitea-Delivery`。`"BEARER"` 使用 `Authorization: Bearer <token>` 提交 `{eventId,ref,commitSha}`。创建时响应给出接收路径和一次性密钥。当前分支变化只固定选中的检出节点，仓库及其凭据由维序配置决定。
+- `/api/v1/graph-webhooks/:triggerId/test` 使用与接收端相同的认证和事件校验，记录验证结果。正式投递为 `/api/v1/graph-webhooks/:triggerId`。现有签名模式继续使用 `X-Veyops-Timestamp`、`X-Veyops-Delivery`、`X-Veyops-Signature`。
 
-执行构建或部署的触发入口默认关闭。对应入口通过验收后，在 API 和执行器进程设置 `VEYOPS_AUTO_DELIVERY_TRIGGERS`，以逗号列出获准的类型，例如 `API,WEBHOOK`。自动构建使用 `WEBHOOK_BUILD_DOCKER_SOCKET` 指定的隔离管理端运行器，镜像仅做归档。自动发布消费已归档产物，遵循已发布图中的审批节点和目标绑定。变量集合参数可在规则中绑定明确的集合 ID，也可用开始字段默认值。事件提交用于保存触发来源、参数映射及提交条件判断。需要按事件提交检出时，将 `commit` 映射为开始字段并绑定到检出或构建节点的 Git 版本端口。
+`parameterMappings` 按开始字段 ID 指定固定值、事件字段或上游输出。事件字段按规则类型开放，包括 `repository`、`commit`、`ref`、`eventId`、`scheduledAt`、`upstreamRunId` 和 `upstreamStatus`。自动运行用已发布默认值填充未映射字段。
+
+自动执行有外部影响的节点时，入口类型须在 API 和执行器进程的 `VEYOPS_AUTO_DELIVERY_TRIGGERS` 中放行。通过 `PATCH /servers/:id/automatic-execution` 提交 `{enabled:true}` 为已验证 SSH 身份的目标授权。目标端使用私有工作目录，管理端运行器使用 `WEBHOOK_BUILD_DOCKER_SOCKET`。发布继续执行已配置的审批、资源权限和产物校验。
 
 ## 项目视图
 

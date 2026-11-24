@@ -1,4 +1,4 @@
-import { Injectable, Optional } from '@nestjs/common';
+import { ConflictException, Injectable, Optional } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import {
@@ -161,6 +161,7 @@ export function webhookBuildSocket() {
     return undefined;
   return socket;
 }
+
 export { gitCredentialHelper } from '../projects/git-credential';
 function gitCommand(credentialResponse?: string) {
   const options = [
@@ -294,6 +295,54 @@ async function readComposeSnapshot(path: string) {
 
 @Injectable()
 export class BuildsService {
+  static async automaticManagerSocket(probe = true) {
+    const socket = webhookBuildSocket();
+    if (!socket) throw new ConflictException('请先配置自动执行专用 rootless Docker Socket');
+    const owner = await lstat(socket).catch(() => null);
+    if (!owner?.isSocket() || process.getuid?.() !== owner.uid || owner.uid === 0)
+      throw new ConflictException('自动执行 Docker Socket 必须是构建用户拥有的非 root Unix Socket');
+    if (probe) {
+      const result = await new ProcessRunnerService()
+        .run('docker', ['--host', `unix://${socket}`, 'info', '--format', '{{json .}}'], {
+          timeout: 10,
+          isolatedDocker: true,
+        })
+        .catch(() => undefined);
+      if (result?.exitCode !== 0) throw new ConflictException('自动执行专用 Docker 无法连接');
+      BuildsService.assertAutomaticDockerInfo(result.stdout);
+    }
+    return socket;
+  }
+
+  private static assertAutomaticDockerInfo(stdout: string) {
+    let info:
+      | {
+          SecurityOptions?: string[];
+          CgroupVersion?: string;
+          CgroupDriver?: string;
+          MemoryLimit?: boolean;
+          CpuCfsQuota?: boolean;
+          PidsLimit?: boolean;
+        }
+      | undefined;
+    try {
+      info = JSON.parse(stdout) ?? undefined;
+    } catch {
+      throw new ConflictException('无法读取自动执行专用 Docker 的隔离能力');
+    }
+    if (
+      !Array.isArray(info?.SecurityOptions) ||
+      !info.SecurityOptions.includes('name=rootless') ||
+      info.CgroupVersion !== '2' ||
+      info.CgroupDriver !== 'systemd' ||
+      !info.MemoryLimit ||
+      !info.CpuCfsQuota ||
+      !info.PidsLimit
+    )
+      throw new ConflictException(
+        '自动执行专用 Docker 必须启用 rootless、cgroup v2 和 CPU/内存/PID 限制',
+      );
+  }
   constructor(
     private readonly ssh: SshService,
     private readonly runner: ProcessRunnerService,
@@ -1042,6 +1091,7 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     await mkdir(root, { recursive: true, mode: 0o700 });
     const cleanup = () => rm(root, { recursive: true, force: true });
     try {
+      if (session.snapshot.graphAutomation) await this.configureWebhookDocker(session, root);
       return await this.managerNamedArtifacts(
         session,
         root,
@@ -1066,6 +1116,7 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     await mkdir(builds, { recursive: true, mode: 0o700 });
     const secrets = await mkdtemp(join(builds, 'graph-shell-'));
     try {
+      if (session.snapshot.graphAutomation) await this.configureWebhookDocker(session, secrets);
       await writeFile(join(secrets, 'shell.env'), exportedVariables(session.variables), {
         mode: 0o600,
       });
@@ -1391,35 +1442,15 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     return { path, checksum, sizeBytes: details.size };
   }
   private async configureWebhookDocker(session: BuildSession, root: string) {
-    const socket = webhookBuildSocket();
-    if (!socket) throw new Error('未配置 Webhook 专用 rootless Docker Socket');
-    const owner = await lstat(socket).catch(() => null);
-    if (!owner?.isSocket() || process.getuid?.() !== owner.uid || owner.uid === 0)
-      throw new Error('Webhook Docker Socket 必须是构建用户拥有的非 root Unix Socket');
+    const socket = await BuildsService.automaticManagerSocket(false);
     const config = join(root, 'docker-config');
     await mkdir(config, { mode: 0o700 });
     session.webhookDocker = { socket, config };
     const result = await this.runDocker(session, ['info', '--format', '{{json .}}'], 15, {
       signal: session.context.signal,
     });
-    if (result.exitCode !== 0) throw new Error('Webhook 专用 Docker 无法连接');
-    const info = JSON.parse(result.stdout) as {
-      SecurityOptions?: string[];
-      CgroupVersion?: string;
-      CgroupDriver?: string;
-      MemoryLimit?: boolean;
-      CpuCfsQuota?: boolean;
-      PidsLimit?: boolean;
-    };
-    if (
-      !info.SecurityOptions?.includes('name=rootless') ||
-      info.CgroupVersion !== '2' ||
-      info.CgroupDriver !== 'systemd' ||
-      !info.MemoryLimit ||
-      !info.CpuCfsQuota ||
-      !info.PidsLimit
-    )
-      throw new Error('Webhook 专用 Docker 必须启用 rootless、cgroup v2 和 CPU/内存/PID 限制');
+    if (result.exitCode !== 0) throw new ConflictException('自动执行专用 Docker 无法连接');
+    BuildsService.assertAutomaticDockerInfo(result.stdout);
   }
   private async container(
     session: BuildSession,

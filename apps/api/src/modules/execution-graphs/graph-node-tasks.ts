@@ -69,7 +69,14 @@ import {
   type GraphField,
   type GraphGitFetchMode,
 } from './graph-fields';
-import { graphNodeRequiresIsolation, isGraphTriggerKind } from './graph-automatic-delivery';
+import {
+  assertAutomaticTargets,
+  assertGraphAutomation,
+  graphCheckoutEvent,
+  graphNodeRequiresIsolation,
+  isGraphTriggerKind,
+  type GraphAutomation,
+} from './graph-automatic-delivery';
 import { GraphScriptOutput } from './graph-script-output';
 import { graphReleaseResult, type GraphReleaseResult } from './graph-release-gates';
 import { readReleaseOutput } from './graph-release-result';
@@ -104,6 +111,7 @@ type ScriptNode = 'SHELL' | 'CHECK';
 type NativeModule = 'CHECKOUT' | ScriptNode | 'LOAD_ENV' | 'REGISTER_ARTIFACT' | 'HEALTH_CHECK';
 
 export interface GraphNodeScope {
+  automation?: GraphAutomation;
   environmentId?: string;
   environmentSet?: FrozenEnvironmentSet | null;
   parameters?: Record<string, unknown>;
@@ -165,6 +173,7 @@ export type GraphNodePlan =
   | { type: 'REGISTER_ARTIFACT'; declarations: NamedArtifactDefinition[] };
 
 export interface GraphModulePayload {
+  automation?: GraphAutomation;
   type: NativeModule;
   projectId: string;
   serviceId?: string;
@@ -494,6 +503,13 @@ export class GraphNodeTasks implements OnModuleInit {
       );
       if (!selection) throw new BadRequestException('请选择健康检查目标');
       const target = await this.targets.preview(selection);
+      if (scope.automation)
+        await assertAutomaticTargets(
+          this.database.db,
+          target.targets.map(({ id }) => id),
+        ).catch((error: unknown) =>
+          withPlanIssue(error, { code: 'RELEASE_TARGET', fieldId: 'targets' }),
+        );
       return {
         type: 'HEALTH_CHECK',
         scope: {
@@ -540,6 +556,7 @@ export class GraphNodeTasks implements OnModuleInit {
         });
       const version = text(ref?.value);
       const fullClone = checkoutFullClone(values.fetchMode) ?? config?.fullClone;
+      const event = graphCheckoutEvent(scope.trigger, node.id);
       return {
         type: 'CHECKOUT',
         ...(scope.fetchModeDeferred && { fetchModeDeferred: true }),
@@ -551,12 +568,14 @@ export class GraphNodeTasks implements OnModuleInit {
             tag: kind === 'TAG' ? version : undefined,
             commitSha: kind === 'COMMIT' ? version : undefined,
             fullClone,
+            event,
           })
           .catch((error: unknown) =>
             withPlanIssue(error, {
               code: 'REPOSITORY',
               fieldId: error instanceof NotFoundException ? 'repository' : 'version',
               repositoryId,
+              ...(event?.repositoryId === repositoryId && { commitSha: event.commitSha }),
             }),
           ),
       };
@@ -592,11 +611,13 @@ export class GraphNodeTasks implements OnModuleInit {
         variables: graphVariableSources(environmentFile, configured.variableSources),
       };
     }
-    if (node.type === 'REGISTER_ARTIFACT')
+    if (node.type === 'REGISTER_ARTIFACT') {
+      if (scope.automation) await BuildsService.automaticManagerSocket();
       return {
         type: 'REGISTER_ARTIFACT',
         declarations: graphArtifactDefinitions(node.registerArtifacts?.artifacts ?? []),
       };
+    }
     if (node.type !== 'SHELL' && node.type !== 'CHECK')
       throw new BadRequestException('不支持的功能节点');
 
@@ -622,6 +643,8 @@ export class GraphNodeTasks implements OnModuleInit {
       ...scriptInputs,
       ...(scope.nodeEnvironmentSources ?? []),
     ]);
+    if (scope.automation && variableSources.some(({ isSecret }) => isSecret))
+      throw new BadRequestException('自动脚本不能使用环境或节点中的敏感变量');
     const input = scope.inputEvidence?.find(({ fieldId }) => fieldId === 'workspace');
     const workspace = sourceOf(values.workspace);
     const source = sourceOf(values.source);
@@ -654,7 +677,11 @@ export class GraphNodeTasks implements OnModuleInit {
       directory: relativePath(node.shell?.directory || '.'),
       workspace: plannedWorkspace,
     };
-    if (node.shell?.location === 'MANAGER') return base;
+    const manager = async () => {
+      if (scope.automation) await BuildsService.automaticManagerSocket();
+      return base;
+    };
+    if (node.shell?.location === 'MANAGER') return manager();
     const targetIssue = {
       code: 'BUILD_TARGET',
       fieldId: 'targets',
@@ -668,7 +695,7 @@ export class GraphNodeTasks implements OnModuleInit {
           ...targetIssue,
           message: '目标端脚本或检查需要选择一台可用的服务器',
         });
-      return base;
+      return manager();
     }
     const target = await this.targets
       .preview(targetSelection)
@@ -681,13 +708,18 @@ export class GraphNodeTasks implements OnModuleInit {
         },
         409,
       );
+    if (scope.automation)
+      await assertAutomaticTargets(
+        this.database.db,
+        target.targets.map(({ id }) => id),
+      ).catch((error: unknown) => withPlanIssue(error, targetIssue));
     return {
       ...base,
       serverId: target.targets[0]!.id,
       serverName: target.targets[0]!.name,
       targetHash: target.targetHash,
       targetSelection,
-      ...((plannedWorkspace || graphArtifactDeclarations(node)?.length) && {
+      ...((scope.automation || plannedWorkspace || graphArtifactDeclarations(node)?.length) && {
         targetWorkspaceRoot: (await this.systemSettings.get(projectId)).targetWorkspaceRoot,
       }),
     };
@@ -777,6 +809,7 @@ export class GraphNodeTasks implements OnModuleInit {
         workspace,
       },
       artifactSources: workspaceArtifactSource(workspace),
+      graphAutomation: scope.automation,
       runId: randomUUID(),
       pipelineId: profile.id,
       pipelineVersionId: profile.versionId,
@@ -839,7 +872,12 @@ export class GraphNodeTasks implements OnModuleInit {
           throw error;
         })
       : undefined;
-    const settings = { type: plan.type, ...identity, trigger: scope.trigger };
+    const settings = {
+      type: plan.type,
+      ...identity,
+      trigger: scope.trigger,
+      automation: scope.automation,
+    };
     const base: CreateTaskInput = {
       name: node.name,
       type: 'GRAPH_MODULE',
@@ -1078,7 +1116,22 @@ export class GraphNodeTasks implements OnModuleInit {
     context: TaskExecutionContext,
   ): Promise<Record<string, unknown>> {
     const module = task.payload.graphModule!;
-    if (isGraphTriggerKind(module.trigger?.kind) && graphNodeRequiresIsolation(module.type))
+    if (module.automation) {
+      const { created_by: ownerId } = await this.database.db
+        .selectFrom('tasks')
+        .select('created_by')
+        .where('id', '=', task.id)
+        .executeTakeFirstOrThrow();
+      await assertGraphAutomation(
+        this.database.db,
+        module.projectId,
+        ownerId,
+        module.automation,
+        graphNodeRequiresIsolation(module.type),
+      );
+      if (task.payload.targets.length)
+        await assertAutomaticTargets(this.database.db, task.payload.targets);
+    } else if (isGraphTriggerKind(module.trigger?.kind) && graphNodeRequiresIsolation(module.type))
       throw new ConflictException('该执行图节点尚未启用隔离自动执行');
     if (module.type === 'HEALTH_CHECK') {
       const { release, command, timeoutSeconds } = module.healthCheck!;
@@ -1160,6 +1213,13 @@ export class GraphNodeTasks implements OnModuleInit {
     }
 
     const shell = module.shell!;
+    if (
+      module.automation &&
+      (Object.keys(shell.parameters.secretVariables).length ||
+        Object.keys(task.payload.environment?.secretVariables ?? {}).length ||
+        module.variables)
+    )
+      throw new ConflictException('自动脚本不能使用环境或节点中的敏感变量');
     const parameters = await resolveExecutionVariables(this.credentials, shell.parameters);
     const scoped = this.shellSnapshot(task, module);
     const inherited = (variables: Record<string, string>) =>
@@ -1201,7 +1261,7 @@ export class GraphNodeTasks implements OnModuleInit {
         let directory = module.targetDirectory
           ? 'cd -P -- ' + shellQuote(relativePath(module.targetDirectory)) + ' || exit $?\n'
           : '';
-        if (module.workspace || artifactSession) {
+        if (module.automation || module.workspace || artifactSession) {
           if (!module.targetWorkspaceRoot) throw new ConflictException('缺少已确认的脚本工作目录');
           const name = 'veyops-script-' + task.id;
           const workspaceReceipt = await this.builds.remoteCapture(
@@ -1437,6 +1497,7 @@ export class GraphNodeTasks implements OnModuleInit {
       commitSha: module.workspace?.commitSha ?? unversionedArtifactCommit,
       repository: { url: '', credentialId: null },
       definition: Object.assign(new PipelineDefinitionDto(), { buildLocation: 'MANAGER' }),
+      graphAutomation: module.automation,
       variables: task.payload.environment?.variables ?? {},
       secretVariables: task.payload.environment?.secretVariables ?? {},
       secretCredentialNonces: task.payload.environment?.secretCredentialNonces,

@@ -1,10 +1,11 @@
 import 'reflect-metadata';
 import './core/config';
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
+import { ValidationPipe, type RawBodyRequest } from '@nestjs/common';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import cookieParser from 'cookie-parser';
+import { json, type NextFunction, type Request, type Response } from 'express';
 import helmet from 'helmet';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -26,6 +27,17 @@ export function configureApp(app: NestExpressApplication) {
     }),
   );
   app.use(cookieParser());
+  const graphWebhookJson = json({
+    limit: '1mb',
+    inflate: false,
+    verify: (request, _response, body) => {
+      (request as RawBodyRequest<Request>).rawBody = body;
+    },
+  });
+  // Nest still installs its default parser for all other routes.
+  app.use('/api/v1/graph-webhooks', (request: Request, response: Response, next: NextFunction) =>
+    graphWebhookJson(request, response, next),
+  );
   app.setGlobalPrefix('api/v1');
   app.useGlobalPipes(
     new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),

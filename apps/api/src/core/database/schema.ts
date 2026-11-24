@@ -52,6 +52,7 @@ export interface ServersTable {
   credential_id: Generated<string | null>;
   os_type: Generated<string | null>;
   host_key_fingerprint: Generated<string | null>;
+  automatic_execution_credential_nonce: Generated<string | null>;
   status: Generated<string>;
   last_checked_at: Generated<number | null>;
   tags_json: Generated<string>;
@@ -770,6 +771,8 @@ export interface Database {
     config_json: string;
     enabled: number;
     next_at: Generated<number | null>;
+    source_checked_at: Generated<number | null>;
+    source_error: Generated<string | null>;
     created_by: string;
     created_at: number;
     updated_at: number;
@@ -780,11 +783,26 @@ export interface Database {
     event_key: string;
     request_hash: string;
     input_value: Generated<string | null>;
+    graph_version: Generated<number | null>;
+    flow_id: Generated<string | null>;
+    rule_revision: Generated<string | null>;
+    resolved_inputs: Generated<string | null>;
     status: string;
     run_id: Generated<string | null>;
+    duplicate_of: Generated<string | null>;
     error: Generated<string | null>;
     created_at: number;
     finished_at: Generated<number | null>;
+  };
+  execution_graph_source_observations: {
+    project_id: string;
+    flow_id: string;
+    repository_id: string;
+    ref: string;
+    commit_sha: string;
+    sequence: number;
+    event_id: Generated<string | null>;
+    last_checked_at: number;
   };
   execution_graphs: {
     id: string;

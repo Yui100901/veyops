@@ -1163,22 +1163,25 @@ export function ProjectGraphEditor({
             )}
             {activeNode?.type === 'START' && (
               <>
-                <GraphFieldEditor
-                  project={project}
-                  catalog={catalog.data}
-                  type="input"
-                  disabled={!canEdit}
-                  title="触发器与手动运行参数"
-                  fields={activeNode.inputs ?? []}
-                  change={(inputs) => patch({ inputs })}
-                />
+                {renderStart?.(activeNode.id)}
                 <StartEnvironmentFields
                   projectId={project.id}
                   node={activeNode}
                   canEdit={canEdit}
                   patch={patch}
                 />
-                {renderStart?.(activeNode.id)}
+                <details className="graph-field-card" data-field-section="input">
+                  <summary>运行与触发参数</summary>
+                  <GraphFieldEditor
+                    project={project}
+                    catalog={catalog.data}
+                    type="input"
+                    disabled={!canEdit}
+                    title="运行参数"
+                    fields={activeNode.inputs ?? []}
+                    change={(inputs) => patch({ inputs })}
+                  />
+                </details>
                 <details className="graph-field-card">
                   <summary>画布结构设置</summary>
                   <StartPair

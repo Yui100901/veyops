@@ -378,6 +378,39 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     subject: 'Branch change with [REDACTED]',
     shallow: true,
   });
+  const sourceEvent = { repositoryId: id, ref: 'refs/heads/main', commitSha: second };
+  const pinnedByEvent = await metadata.planGraphCheckout(project, {
+    repositoryId: id,
+    mode: 'BRANCH',
+    event: sourceEvent,
+  });
+  assert.equal(pinnedByEvent.branch, 'main');
+  assert.equal(pinnedByEvent.commitSha, second);
+  assert.equal(pinnedByEvent.eventPinned, true);
+  const explicitlyMapped = await metadata.planGraphCheckout(project, {
+    repositoryId: id,
+    mode: 'COMMIT',
+    commitSha: second,
+    event: sourceEvent,
+  });
+  assert.equal(explicitlyMapped.branch, 'main');
+  assert.equal(explicitlyMapped.ref, sourceEvent.ref);
+  assert.equal(explicitlyMapped.eventPinned, true);
+  const unchangedBranch = await metadata.planGraphCheckout(project, {
+    repositoryId: id,
+    mode: 'BRANCH',
+    branch: 'feature/release',
+    event: sourceEvent,
+  });
+  assert.equal(unchangedBranch.commitSha, feature);
+  assert.equal(unchangedBranch.eventPinned, undefined);
+  const unchangedRepo = await metadata.planGraphCheckout(project, {
+    repositoryId: id,
+    mode: 'BRANCH',
+    event: { ...sourceEvent, repositoryId: randomUUID() },
+  });
+  assert.equal(unchangedRepo.commitSha, main);
+  assert.equal(unchangedRepo.eventPinned, undefined);
   const tag = await metadata.planGraphCheckout(project, {
     repositoryId: id,
     mode: 'TAG',

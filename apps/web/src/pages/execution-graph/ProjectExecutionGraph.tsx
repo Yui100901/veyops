@@ -34,6 +34,7 @@ import {
 } from './run/ExecutionGraphStickyCanvas';
 import { ExecutionGraphTemplateDialog } from './editor/ExecutionGraphTemplateDialog';
 import { ExecutionGraphTriggers } from './editor/ExecutionGraphTriggers';
+import { triggerFlows, type TriggerPreflightIssue } from './editor/graph-trigger-model';
 import { GraphVersionTools } from './ExecutionGraphVersions';
 import { effectiveNodeType, graphNodeTypeLabel } from './execution-graph-definition';
 import { GraphResourceContext } from './graph-resource-context';
@@ -305,7 +306,7 @@ function Workspace({
             ? '草稿已保存'
             : '已载入服务器草稿',
       );
-      return true;
+      return saved;
     } catch (err) {
       setError(message(err));
       setConflict(err instanceof ApiError && err.status === 409);
@@ -319,6 +320,28 @@ function Workspace({
       saving.current = false;
       setBusy(false);
     }
+  }
+
+  async function prepareTriggerDraft() {
+    if (!dirty) return graph.revision;
+    const saved = await persist('save');
+    if (!saved) throw new Error('请先解决画布草稿的保存问题。');
+    return saved.revision;
+  }
+
+  function triggerIssueHref(issue: TriggerPreflightIssue) {
+    return (
+      '#' +
+      graphWorkbenchPath(project.id, {
+        ...scope,
+        pane: 'draft',
+        flow: issue.flowId,
+        node: issue.nodeId,
+        field: issue.fieldId,
+        fieldSection: issue.fieldSection,
+        artifactField: issue.artifactField,
+      })
+    );
   }
 
   function stayInDraft() {
@@ -504,6 +527,11 @@ function Workspace({
                 project={project}
                 path={path}
                 canRun={canEdit && !publishedRun.data.retiredAt}
+                showTriggers={
+                  publishedRun.data.version === graph.publishedVersion && !project.archived
+                }
+                canManageTriggers={canEdit && isAdmin}
+                triggerIssueHref={triggerIssueHref}
                 startId={linkedStart}
                 focusFieldId={linkedField}
                 inspectNodeId={linkedNode}
@@ -630,19 +658,23 @@ function Workspace({
             )}
             renderStart={(startId) =>
               !project.archived && (
-                <StartTriggers
-                  key={startId + '-' + graph.publishedVersion}
+                <ExecutionGraphTriggers
+                  key={startId}
                   startId={startId}
                   path={path}
                   project={project}
-                  published={
-                    latest.data?.version === graph.publishedVersion ? latest.data : undefined
+                  latestVersion={
+                    latest.data?.version === graph.publishedVersion &&
+                    latest.data.definition.flows.some(({ id }) => id === startId)
+                      ? graph.publishedVersion
+                      : null
                   }
-                  publishedVersion={graph.publishedVersion}
-                  loading={Boolean(graph.publishedVersion && latest.loading)}
-                  error={latest.error}
-                  canRun={canEdit && !busy}
-                  canManage={canEdit && isAdmin && !busy}
+                  flows={triggerFlows({ flows: [], canvas })}
+                  canInvoke={canEdit}
+                  canManage={canEdit && isAdmin}
+                  onPrepareDraft={prepareTriggerDraft}
+                  issueHref={triggerIssueHref}
+                  manualHref={'#' + graphWorkbenchPath(project.id, { ...scope, start: startId })}
                   onRun={openRun}
                 />
               )
@@ -701,6 +733,9 @@ function PublishedRun({
   project,
   path,
   canRun,
+  showTriggers,
+  canManageTriggers,
+  triggerIssueHref,
   startId,
   focusFieldId,
   inspectNodeId,
@@ -713,6 +748,9 @@ function PublishedRun({
   project: ProjectDetail;
   path: string;
   canRun: boolean;
+  showTriggers: boolean;
+  canManageTriggers: boolean;
+  triggerIssueHref: (issue: TriggerPreflightIssue) => string;
   startId?: string;
   focusFieldId?: string;
   inspectNodeId?: string;
@@ -831,6 +869,25 @@ function PublishedRun({
                 project={project}
                 scope={scope}
               />
+              {showTriggers && node.type === 'START' && inspectedFlow && (
+                <ExecutionGraphTriggers
+                  key={inspectedFlow.id}
+                  startId={inspectedFlow.id}
+                  path={path}
+                  project={project}
+                  latestVersion={published.version}
+                  flows={triggerFlows(published.definition)}
+                  canInvoke={canRun}
+                  canManage={canManageTriggers}
+                  issueHref={triggerIssueHref}
+                  manualHref={
+                    flow?.id !== inspectedFlow.id
+                      ? '#' + graphWorkbenchPath(project.id, { ...scope, start: inspectedFlow.id })
+                      : undefined
+                  }
+                  onRun={onRun}
+                />
+              )}
             </>
           );
         }}
@@ -869,71 +926,6 @@ function PublishedRun({
         )}
       </PublishedNodes>
     </>
-  );
-}
-
-function StartTriggers({
-  startId,
-  path,
-  project,
-  published,
-  publishedVersion,
-  loading,
-  error,
-  canRun,
-  canManage,
-  onRun,
-}: {
-  startId: string;
-  path: string;
-  project: ProjectDetail;
-  published?: PublishedGraph;
-  publishedVersion: number | null;
-  loading: boolean;
-  error: string;
-  canRun: boolean;
-  canManage: boolean;
-  onRun: (id: string) => void;
-}) {
-  const flow = published?.definition.flows.find(({ id }) => id === startId);
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="graph-properties graph-start-actions">
-      <h4>触发器</h4>
-      <ErrorBanner error={error} />
-      {loading ? (
-        <Loading />
-      ) : (
-        <p className="field-note">
-          {flow && published
-            ? '触发器运行已发布的 v' + published.version + '。'
-            : '绑定可达的结束节点并发布后，即可添加触发器。'}
-        </p>
-      )}
-      <div className="heading-actions">
-        {publishedVersion && (
-          <button
-            type="button"
-            className="button secondary small"
-            aria-expanded={open}
-            onClick={() => setOpen(!open)}
-          >
-            附加触发器
-          </button>
-        )}
-      </div>
-      {open && (
-        <ExecutionGraphTriggers
-          path={path}
-          project={project}
-          startId={startId}
-          latestVersion={flow ? publishedVersion : null}
-          canManage={canManage}
-          canInvoke={canRun}
-          onRun={onRun}
-        />
-      )}
-    </div>
   );
 }
 

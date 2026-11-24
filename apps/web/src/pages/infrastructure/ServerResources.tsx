@@ -365,6 +365,7 @@ export function ServerOverview({
   monitorRow,
   canEdit,
   onMonitorChange,
+  onAuthorizationChange,
 }: {
   server: ServerDetail;
   onClose: () => void;
@@ -372,9 +373,27 @@ export function ServerOverview({
   monitorRow?: MonitorRow;
   canEdit: boolean;
   onMonitorChange: () => void;
+  onAuthorizationChange: () => void;
 }) {
   const entry = server;
   const [metrics, setMetrics] = useState(initialMetrics);
+  const [authorizationBusy, setAuthorizationBusy] = useState(false);
+  const [authorizationError, setAuthorizationError] = useState('');
+  async function changeAuthorization() {
+    setAuthorizationBusy(true);
+    setAuthorizationError('');
+    try {
+      await api(`/servers/${encodeURIComponent(server.id)}/automatic-execution`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: !server.automaticExecutionEnabled }),
+      });
+      onAuthorizationChange();
+    } catch (error) {
+      setAuthorizationError(message(error));
+    } finally {
+      setAuthorizationBusy(false);
+    }
+  }
   return (
     <InlineEditor
       title={server.name}
@@ -407,6 +426,19 @@ export function ServerOverview({
               <span>最近检测 {formatTime(entry.lastCheckedAt)}</span>
             </div>
             {entry.description && <p>{entry.description}</p>}
+            <section>
+              <h3 className="field-title">执行流自动执行</h3>
+              <p className="field-note">
+                {entry.automaticExecutionEnabled ? '已授权' : '未授权'} · 使用当前 SSH
+                身份运行自动构建、脚本与发布。
+              </p>
+              {canEdit && (
+                <button type="button" disabled={authorizationBusy} onClick={changeAuthorization}>
+                  {entry.automaticExecutionEnabled ? '撤销自动执行授权' : '授权自动执行'}
+                </button>
+              )}
+              <ErrorBanner error={authorizationError} />
+            </section>
             <div className="tags">
               {(entry.groups ?? []).map((group) => (
                 <a

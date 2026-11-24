@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -29,6 +29,8 @@ async function verify(databaseUrl?: string) {
   const { DatabaseService } = await import('../core/database/database.service.js');
   const { AuditService } = await import('../modules/audit/audit.service.js');
   const { CredentialsService } = await import('../modules/credentials/credentials.service.js');
+  const { RepositoryMetadataService } =
+    await import('../modules/projects/repository-metadata.service.js');
   const { GraphTriggersService } =
     await import('../modules/execution-graphs/graph-triggers.service.js');
   const { GraphRunnerService } =
@@ -91,7 +93,7 @@ async function verify(databaseUrl?: string) {
         { from: id + '-log', to: id + '-end' },
       ],
     });
-    async function publish(message: string) {
+    async function saveFlows(message: string) {
       const graph = (await admin.get(path).expect(200)).body.data;
       const flows = [makeFlow('source', message), makeFlow('target', 'after source')];
       const draft = (
@@ -110,6 +112,10 @@ async function verify(databaseUrl?: string) {
           })
           .expect(200)
       ).body.data;
+      return draft;
+    }
+    async function publish(message: string) {
+      const draft = await saveFlows(message);
       return (
         await admin
           .post(path + '/publish')
@@ -117,7 +123,41 @@ async function verify(databaseUrl?: string) {
           .expect(201)
       ).body.data.publishedVersion as number;
     }
-    const version = await publish('pinned old rule version');
+    const unpublished = await saveFlows('accepted old event version');
+    const draftRule = {
+      name: 'Unpublished rule',
+      flowId: 'source',
+      kind: 'CRON',
+      cron: '0 2 * * *',
+      timeZone: 'Asia/Shanghai',
+      draftRevision: unpublished.revision,
+      enabled: false,
+    };
+    const draftTrigger = (await admin.post(triggers).send(draftRule).expect(201)).body.data;
+    assert.equal(draftTrigger.version, null);
+    assert.equal(draftTrigger.enabled, false);
+    const blocked = (
+      await admin
+        .post(triggers + '/preflight')
+        .send(draftRule)
+        .expect(200)
+    ).body.data;
+    assert.equal(blocked.eligible, false);
+    assert.equal(blocked.issue.nodeId, 'source');
+    assert.equal(blocked.nextTimes.length, 3);
+    const version = (
+      await admin
+        .post(path + '/publish')
+        .send({ expectedRevision: unpublished.revision })
+        .expect(201)
+    ).body.data.publishedVersion as number;
+    const ready = (
+      await admin
+        .post(triggers + '/preflight')
+        .send({ ...draftRule, version })
+        .expect(200)
+    ).body.data;
+    assert.equal(ready.eligible, true);
     const makeRule = async (fields: Record<string, unknown>) =>
       (
         await admin
@@ -205,8 +245,6 @@ async function verify(databaseUrl?: string) {
     assert.equal(new Date(scheduled.nextAt).getUTCHours(), 1);
     assert.equal(new Date(scheduled.nextAt).getUTCMinutes(), 15);
     assert.equal(signed.credentialNonce, undefined);
-    await publish('new visual version');
-
     await publicApi
       .post(triggers + '/' + manual.id + '/invoke')
       .send({ eventId: 'api-once' })
@@ -217,6 +255,9 @@ async function verify(databaseUrl?: string) {
         .send({ eventId: 'api-once', inputValue: 'event override' })
         .expect(202)
     ).body.data;
+    assert.equal(entered.version, version);
+    assert.equal(entered.ruleRevision, apiOrigin.revision);
+    const latestVersion = await publish('new visual version');
     const replay = (
       await admin
         .post(triggers + '/' + manual.id + '/invoke')
@@ -224,21 +265,8 @@ async function verify(databaseUrl?: string) {
         .expect(202)
     ).body.data;
     assert.equal(entered.id, replay.id);
-    const legacyValue = JSON.stringify({ value: 'event override' });
-    const legacyHash = createHash('sha256')
-      .update(JSON.stringify([apiRule.config_json, 'api-once', legacyValue]))
-      .digest('hex');
-    await database.db
-      .updateTable('execution_graph_trigger_events')
-      .set({ input_value: legacyValue, request_hash: legacyHash })
-      .where('id', '=', entered.id)
-      .execute();
-    const legacyReplay = await admin
-      .post(triggers + '/' + manual.id + '/invoke')
-      .send({ eventId: 'api-once', inputValue: 'event override' })
-      .expect(202);
-    assert.equal(legacyReplay.body.data.id, entered.id);
-    assert.equal(legacyReplay.body.data.metadata.invokedBy, undefined);
+    assert.equal(replay.version, version);
+    assert.equal(replay.ruleRevision, entered.ruleRevision);
     await admin
       .post(triggers + '/' + manual.id + '/invoke')
       .send({ eventId: 'api-once', inputValue: 'other event' })
@@ -268,6 +296,7 @@ async function verify(databaseUrl?: string) {
     const expired = String(Number(timestamp) - 601);
     await deliver('too-old', signing('too-old', expired), expired).expect(401);
     const hook = (await deliver('signed-once', signing('signed-once')).expect(202)).body.data;
+    assert.equal(hook.version, latestVersion);
     assert.equal(
       (await deliver('signed-once', signing('signed-once')).expect(202)).body.data.id,
       hook.id,
@@ -278,6 +307,7 @@ async function verify(databaseUrl?: string) {
       app.get(CredentialsService),
       app.get(AuditService),
       app.get(TaskHandlerRegistry),
+      app.get(RepositoryMetadataService),
     );
     const worker = app.get(TaskWorkerService);
     await Promise.all([worker.tick(), shadow.tick()]);
@@ -293,10 +323,13 @@ async function verify(databaseUrl?: string) {
       assert.equal(rows[0].status, 'QUEUED');
       const run = (await admin.get(path + '/runs/' + rows[0].runId).expect(200)).body.data;
       assert.equal(run.triggerType, kind);
-      assert.equal(run.version, version);
+      assert.equal(run.version, kind === 'API' ? version : latestVersion);
       assert.equal(run.status, 'SUCCESS');
       assert.equal(run.inputs.value, expectedValue);
-      assert.equal(run.nodes[1].log, 'pinned old rule version');
+      assert.equal(
+        run.nodes[1].log,
+        kind === 'API' ? 'accepted old event version' : 'new visual version',
+      );
     }
     const store = app.get(GraphTriggersService);
     await Promise.all([store.tick(scheduled.nextAt), shadow.tick(scheduled.nextAt)]);
@@ -305,6 +338,7 @@ async function verify(databaseUrl?: string) {
     assert.equal(cron[0].eventId, String(scheduled.nextAt));
     const cronRun = (await admin.get(path + '/runs/' + cron[0].runId).expect(200)).body.data;
     assert.equal(cronRun.triggerType, 'CRON');
+    assert.equal(cronRun.version, latestVersion);
     await store.tick();
     const follow = await events(upstream.id);
     assert.equal(follow.length, 3);
@@ -312,7 +346,14 @@ async function verify(databaseUrl?: string) {
       const run = (await admin.get(path + '/runs/' + event.runId).expect(200)).body.data;
       assert.equal(run.triggerType, 'UPSTREAM');
       assert.equal(run.flowId, 'target');
+      assert.equal(run.version, latestVersion);
     }
+    assert.ok(
+      follow.some(
+        (event: { metadata: { upstreamVersion: number } }) =>
+          event.metadata.upstreamVersion === version,
+      ),
+    );
     await Promise.all([store.tick(), shadow.tick()]);
     assert.equal((await events(upstream.id)).length, 3);
 
@@ -357,7 +398,7 @@ async function verify(databaseUrl?: string) {
     assert.equal(projectRuns, 6);
     assert.equal(JSON.stringify(await events(signed.id)).includes(credentialValue), false);
 
-    // A deleted START no longer owns an active trigger. Rules for retained STARTs stay pinned.
+    // Publication requires active rules that use the removed start to be paused.
     const adapted = (await admin.get(path).expect(200)).body.data;
     const canvas = adapted.draft.canvas;
     const withoutSource = {
@@ -384,12 +425,30 @@ async function verify(databaseUrl?: string) {
     await admin
       .post(path + '/publish')
       .send({ expectedRevision: saved.revision })
+      .expect(400);
+    for (const rule of [scheduled, signed, upstream])
+      await admin
+        .patch(triggers + '/' + rule.id)
+        .send({
+          name: rule.name,
+          kind: rule.kind,
+          flowId: rule.flowId,
+          enabled: false,
+          cron: rule.cron,
+          timeZone: rule.timeZone,
+          credentialId: rule.credentialId,
+          upstreamFlowId: rule.upstreamFlowId,
+          upstreamStatus: rule.upstreamStatus,
+        })
+        .expect(200);
+    await admin
+      .post(path + '/publish')
+      .send({ expectedRevision: saved.revision })
       .expect(201);
     const rules = (await admin.get(triggers).expect(200)).body.data;
     assert.equal(rules.find(({ id }: { id: string }) => id === scheduled.id).enabled, false);
     const retained = rules.find(({ id }: { id: string }) => id === upstream.id);
-    assert.equal(retained.enabled, true);
-    assert.equal(retained.version, version);
+    assert.equal(retained.enabled, false);
     await admin
       .patch(triggers + '/' + manual.id)
       .send({ name: 'Enable orphan', kind: 'API', flowId: 'source', version, enabled: true })
@@ -397,8 +456,8 @@ async function verify(databaseUrl?: string) {
     const keptHistory = (
       await admin.get(path + '/runs/' + (await events(signed.id))[0].runId).expect(200)
     ).body.data;
-    assert.equal(keptHistory.version, version);
-    assert.equal(keptHistory.nodes[1].log, 'pinned old rule version');
+    assert.equal(keptHistory.version, latestVersion);
+    assert.equal(keptHistory.nodes[1].log, 'new visual version');
   } finally {
     await app.close();
     await rm(dir, { recursive: true, force: true });
