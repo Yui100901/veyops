@@ -48,6 +48,17 @@ export class CommandCenterService implements OnModuleInit {
         failurePolicy: input.failurePolicy,
         timeout: input.timeout,
         commandTemplate: template,
+        commandSelection: {
+          targets: {
+            serverIds: input.serverIds,
+            groupIds: input.groupIds,
+            deploymentTargetIds: input.deploymentTargetIds,
+            tags: input.tags,
+            projectIds: input.projectIds,
+            environmentIds: input.environmentIds,
+          },
+          confirmedTargetHash: input.expectedTargetHash,
+        },
       },
     };
   }

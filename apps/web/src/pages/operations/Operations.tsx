@@ -256,6 +256,13 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
             ) : (
               <Status value={value.status} />
             )}
+            {value.canReuseCommand &&
+              (user.role === 'ADMIN' ||
+                (user.role === 'OPERATOR' && value.createdBy === user.id)) && (
+                <a className="button secondary" href={`#/operations/commands?reuse=${id}`}>
+                  沿用目标和命令
+                </a>
+              )}
             {failed && canInspectFailure && (
               <ContextAIButton
                 user={user}

@@ -233,6 +233,7 @@ export interface DeliveryStepNode {
 }
 export interface Task {
   id: string;
+  canReuseCommand?: boolean;
   createdBy?: string | null;
   projectId?: string | null;
   serviceId?: string | null;

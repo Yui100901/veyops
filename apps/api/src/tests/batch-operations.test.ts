@@ -249,6 +249,26 @@ test('versioned batch operations validate parameters, preserve snapshots and sto
       planPayload.steps.map(({ name }) => name),
       ['前置检查 · Ready', 'Maintenance', '执行后验证 · Verified'],
     );
+    const temporaryCommand = await api
+      .post('/api/v1/commands/execute')
+      .send({
+        ...selection,
+        confirmed: true,
+        expectedTargetHash: refreshed.body.data.targetHash,
+        command: 'hostname',
+      })
+      .expect(201);
+    const reuse = '/api/v1/tasks/' + temporaryCommand.body.data.id + '/command-reuse';
+    const draft = (await api.get(reuse).expect(200)).body.data;
+    assert.equal(draft.command, 'hostname');
+    assert.deepEqual(draft.selection, selection);
+    assert.equal(draft.previousTargetHash, refreshed.body.data.targetHash);
+    assert.deepEqual(
+      draft.previousTargets.map(({ id }: { id: string }) => id),
+      [replacement.body.data.id],
+    );
+    await operator.get(reuse).expect(403);
+    assert.equal(JSON.stringify(draft).includes(credential.body.data.id), false);
   } finally {
     await app.close();
     await rm(directory, { recursive: true, force: true });

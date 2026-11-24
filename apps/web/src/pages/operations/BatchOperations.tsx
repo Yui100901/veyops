@@ -4,7 +4,17 @@ import { useState } from 'react';
 import { ContextAIButton } from '../ai/AI';
 import type { FormEvent, ReactNode } from 'react';
 import { FileCode2, Pencil, Play, Plus, Terminal, Trash2 } from 'lucide-react';
-import { ApiError, api, formatTime, message, navigate, post, remove, useResource } from '../../api';
+import {
+  ApiError,
+  api,
+  formatTime,
+  message,
+  navigate,
+  post,
+  remove,
+  useResource,
+  useRoute,
+} from '../../api';
 import {
   Confirm,
   Empty,
@@ -42,6 +52,15 @@ interface CommandTemplate {
   currentVersion: number;
   parameters?: OperationParameter[];
   enabled?: boolean;
+}
+
+interface CommandReuse extends ExecutionOptions {
+  name: string;
+  command: string;
+  timeout: number;
+  selection: TargetSelection;
+  previousTargetHash?: string;
+  previousTargets: TargetPreview['targets'];
 }
 
 interface PlanVersion {
@@ -136,7 +155,7 @@ export function OperationsCenterPage({ tab, user }: { tab: OperationsTab; user: 
         ))}
       </nav>
       {tab === 'commands' ? (
-        <CommandsPage user={user} />
+        <CommandWorkspace user={user} />
       ) : tab === 'schedules' ? (
         <OperationSchedulesPage user={user} />
       ) : (
@@ -146,19 +165,91 @@ export function OperationsCenterPage({ tab, user }: { tab: OperationsTab; user: 
   );
 }
 
-function CommandsPage({ user }: { user: User }) {
-  const { selection, setSelection, projectId, environmentProjects } = useBatchSelection();
-  const [command, setCommand] = useState('');
-  const [name, setName] = useState('');
-  const [timeout, setTimeoutValue] = useState(300);
-  const [options, setOptions] = useState(defaultExecutionOptions);
+function CommandWorkspace({ user }: { user: User }) {
+  const reuseId = new URLSearchParams(useRoute().split('?')[1]).get('reuse');
+  const reusable = useResource<CommandReuse>(
+    reuseId && user.role !== 'VIEWER'
+      ? `/tasks/${encodeURIComponent(reuseId)}/command-reuse`
+      : null,
+  );
+  if (reuseId && reusable.loading) return <Loading />;
+  return (
+    <>
+      <ErrorBanner error={reusable.error} retry={reusable.reload} />
+      <CommandsPage key={reuseId ?? 'new'} user={user} reuse={reusable.data ?? undefined} />
+    </>
+  );
+}
+
+function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
+  const { selection, setSelection, projectId, environmentProjects } = useBatchSelection(
+    reuse?.selection,
+  );
+  const [command, setCommand] = useState(reuse?.command ?? '');
+  const [name, setName] = useState(reuse?.name ?? '');
+  const [timeout, setTimeoutValue] = useState(reuse?.timeout ?? 300);
+  const [options, setOptions] = useState<ExecutionOptions>(() =>
+    reuse
+      ? {
+          strategy: reuse.strategy,
+          maxParallel: reuse.maxParallel,
+          failurePolicy: reuse.failurePolicy,
+        }
+      : defaultExecutionOptions,
+  );
   const [preview, setPreview] = useState<TargetPreview>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [lastPreview, setLastPreview] = useState<Pick<TargetPreview, 'targets' | 'targetHash'>>();
+  const [templateName, setTemplateName] = useState('');
+  const [templateSaved, setTemplateSaved] = useState(false);
+  const [savingTemplate, setSavingTemplate] = useState(false);
   const canEdit = user.role !== 'VIEWER';
   const plans = useResource<Plan[]>(canEdit ? '/operation-plans' : null);
+  const templates = useResource<CommandTemplate[]>(canEdit ? '/command-templates' : null);
   const availablePlans = (plans.data ?? []).filter((plan) => plan.enabled !== false);
-  const [reference, setReference] = useInlineEditor<Plan>();
+  const reusableTemplates = (templates.data ?? []).filter((item) => item.enabled !== false);
+  const [reference, setReference] = useInlineEditor<Plan | CommandTemplate>();
+  const editing = canEdit && !busy && !preview;
+  const comparison =
+    lastPreview ??
+    (reuse && { targets: reuse.previousTargets, targetHash: reuse.previousTargetHash });
+  const added =
+    preview?.targets.filter(
+      (target) => comparison && !comparison.targets.some(({ id }) => target.id === id),
+    ) ?? [];
+  const removed =
+    comparison?.targets.filter(
+      (target) => preview && !preview.targets.some(({ id }) => target.id === id),
+    ) ?? [];
+  const changed =
+    preview?.targets.filter((target) =>
+      comparison?.targets.some(
+        ({ id, host, name }) => id === target.id && (host !== target.host || name !== target.name),
+      ),
+    ) ?? [];
+
+  async function saveTemplate() {
+    if (!editing || !templateName.trim() || !command.trim() || savingTemplate) return;
+    setSavingTemplate(true);
+    setTemplateSaved(false);
+    setError('');
+    try {
+      await post('/command-templates', {
+        name: templateName.trim(),
+        command,
+        timeout,
+        parameters: [],
+      });
+      setTemplateName('');
+      await templates.reload();
+      setTemplateSaved(true);
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setSavingTemplate(false);
+    }
+  }
 
   async function prepare(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -190,7 +281,10 @@ function CommandsPage({ user }: { user: User }) {
       });
       navigate(`/tasks/${task.id}`);
     } catch (err) {
-      if (err instanceof ApiError && [400, 409].includes(err.status)) setPreview(undefined);
+      if (err instanceof ApiError && [400, 409].includes(err.status)) {
+        setLastPreview(preview);
+        setPreview(undefined);
+      }
       setError(message(err));
     } finally {
       setBusy(false);
@@ -199,6 +293,7 @@ function CommandsPage({ user }: { user: User }) {
   return (
     <>
       <ErrorBanner error={plans.error} retry={plans.reload} />
+      <ErrorBanner error={templates.error} retry={templates.reload} />
       <div hidden={Boolean(reference)}>
         <form className="command-layout" onSubmit={prepare}>
           <div>
@@ -206,16 +301,17 @@ function CommandsPage({ user }: { user: User }) {
               <BatchTargetPicker
                 selection={selection}
                 onChange={setSelection}
-                disabled={!canEdit || busy}
+                disabled={!editing}
               />
             </Section>
-            <Section title="执行策略">
+            <details className="command-advanced panel">
+              <summary>并发、失败策略和超时</summary>
               <div className="form-body">
                 <BatchStrategy
                   projectId={projectId}
                   options={options}
                   onChange={setOptions}
-                  disabled={!canEdit || busy}
+                  disabled={!editing}
                 />
                 <Field label="单目标超时（秒）">
                   <input
@@ -224,12 +320,12 @@ function CommandsPage({ user }: { user: User }) {
                     max={3600}
                     value={timeout}
                     required
-                    disabled={!canEdit || busy}
+                    disabled={!editing}
                     onChange={(event) => setTimeoutValue(Number(event.target.value))}
                   />
                 </Field>
               </div>
-            </Section>
+            </details>
           </div>
           <Section
             title="临时命令"
@@ -238,21 +334,36 @@ function CommandsPage({ user }: { user: User }) {
               canEdit && (
                 <select
                   className="button secondary"
-                  aria-label="引用运维方案"
+                  aria-label="引用常用命令或运维方案"
                   value=""
-                  disabled={busy || !availablePlans.length}
+                  disabled={!editing || (!availablePlans.length && !reusableTemplates.length)}
                   onChange={(event) =>
-                    setReference(availablePlans.find((plan) => plan.id === event.target.value))
+                    setReference(
+                      [...reusableTemplates, ...availablePlans].find(
+                        (item) => item.id === event.target.value,
+                      ),
+                    )
                   }
                 >
-                  <option value="">
-                    {plans.loading || availablePlans.length ? '引用运维方案…' : '暂无可引用的方案'}
-                  </option>
-                  {availablePlans.map((plan) => (
-                    <option key={plan.id} value={plan.id}>
-                      {plan.name}
-                    </option>
-                  ))}
+                  <option value="">引用常用命令或方案</option>
+                  {!!reusableTemplates.length && (
+                    <optgroup label="命令模板">
+                      {reusableTemplates.map(({ id, name: label }) => (
+                        <option key={id} value={id}>
+                          {label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {!!availablePlans.length && (
+                    <optgroup label="运维方案">
+                      {availablePlans.map(({ id, name: label }) => (
+                        <option key={id} value={id}>
+                          {label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
                 </select>
               )
             }
@@ -262,7 +373,7 @@ function CommandsPage({ user }: { user: User }) {
                 aria-label="Shell 命令"
                 value={command}
                 onChange={(event) => setCommand(event.target.value)}
-                disabled={!canEdit || busy}
+                disabled={!editing}
                 maxLength={65536}
                 spellCheck={false}
                 required
@@ -275,14 +386,41 @@ function CommandsPage({ user }: { user: User }) {
                   value={name}
                   onChange={(event) => setName(event.target.value)}
                   maxLength={100}
-                  disabled={!canEdit || busy}
+                  disabled={!editing}
                 />
               </Field>
               <ErrorBanner error={preview ? '' : error} />
+              {templateSaved && (
+                <p className="field-note" role="status">
+                  命令模板已保存
+                </p>
+              )}
+              {canEdit && !preview && command.trim() && (
+                <details>
+                  <summary>保存为命令模板</summary>
+                  <div className="row-actions">
+                    <Field label="模板名称">
+                      <input
+                        value={templateName}
+                        maxLength={120}
+                        onChange={(e) => setTemplateName(e.target.value)}
+                      />
+                    </Field>
+                    <button
+                      type="button"
+                      className="button secondary"
+                      onClick={() => void saveTemplate()}
+                      disabled={!templateName.trim() || savingTemplate || !editing}
+                    >
+                      保存模板
+                    </button>
+                  </div>
+                </details>
+              )}
               <div className="row-actions">
                 <button
                   className="button primary"
-                  disabled={!canEdit || busy || !hasTargets(selection) || !command.trim()}
+                  disabled={!editing || !hasTargets(selection) || !command.trim()}
                 >
                   <Play size={16} />
                   预览并执行
@@ -291,39 +429,64 @@ function CommandsPage({ user }: { user: User }) {
             </div>
           </Section>
         </form>
+        {preview && (
+          <Section title="确认执行目标" subtitle={`将在 ${preview.count} 台服务器上运行上方命令`}>
+            <div className="form-body">
+              <ResolvedTargets preview={preview} />
+              {(added.length > 0 ||
+                removed.length > 0 ||
+                changed.length > 0 ||
+                (comparison?.targetHash && comparison.targetHash !== preview.targetHash)) && (
+                <div role="status" className="command-target-changes">
+                  <strong>执行目标与上次确认的范围有变化</strong>
+                  {!!added.length && <p>新增 {added.map(({ name: label }) => label).join('、')}</p>}
+                  {!!removed.length && (
+                    <p>移除 {removed.map(({ name: label }) => label).join('、')}</p>
+                  )}
+                  {!!changed.length && (
+                    <p>地址或名称变化 {changed.map(({ name: label }) => label).join('、')}</p>
+                  )}
+                  {!added.length && !removed.length && !changed.length && (
+                    <p>请复核目标的 SSH 配置。</p>
+                  )}
+                </div>
+              )}
+              <ErrorBanner error={error} />
+              <div className="row-actions">
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={busy}
+                  onClick={() => {
+                    setPreview(undefined);
+                    setError('');
+                  }}
+                >
+                  返回编辑
+                </button>
+                <button
+                  type="button"
+                  className="button primary"
+                  disabled={busy}
+                  onClick={() => void execute()}
+                >
+                  确认执行
+                </button>
+              </div>
+            </div>
+          </Section>
+        )}
       </div>
       {reference && (
         <OperationRun
           user={user}
-          endpoint="/operation-plans"
+          endpoint={'steps' in reference ? '/operation-plans' : '/command-templates'}
           entry={reference}
           canRun={canEdit}
           initialSelection={selection}
           initialEnvironmentProjects={environmentProjects}
           initialOptions={options}
           onClose={() => setReference(undefined)}
-        />
-      )}
-      {preview && (
-        <Confirm
-          title="确认执行远程命令"
-          description={`将在 ${preview.count} 台服务器上执行以下命令。`}
-          detail={
-            <>
-              <ResolvedTargets preview={preview} />
-              <pre className="code-preview">{command}</pre>
-            </>
-          }
-          label="确认执行"
-          busy={busy}
-          error={error}
-          onClose={() => {
-            if (!busy) {
-              setPreview(undefined);
-              setError('');
-            }
-          }}
-          onConfirm={execute}
         />
       )}
     </>

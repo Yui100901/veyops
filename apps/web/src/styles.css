@@ -1877,6 +1877,19 @@ tbody tr:hover {
   gap: var(--section-gap);
   min-width: 0;
 }
+.command-advanced > summary {
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+.command-target-changes {
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+.command-target-changes p {
+  margin: 0.35rem 0 0;
+}
 .selected-count {
   font-size: 10px;
   color: #74a08d;

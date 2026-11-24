@@ -33,6 +33,12 @@ export class TasksController {
   @Get(':id') get(@Param('id') id: string) {
     return this.tasks.get(id);
   }
+  @Get(':id/command-reuse') @Roles('ADMIN', 'OPERATOR') reuseCommand(
+    @Param('id') id: string,
+    @Req() req: { user: CurrentUser },
+  ) {
+    return this.tasks.commandReuse(id, req.user);
+  }
   @Get(':id/targets') targets(@Param('id') id: string, @Req() req: { user: CurrentUser }) {
     return this.tasks.targets(id, req.user);
   }

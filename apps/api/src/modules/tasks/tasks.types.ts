@@ -5,6 +5,7 @@ import type { Database } from '../../core/database/schema';
 import type { ExecutionVariables } from '../../infrastructure/execution-variables';
 import type { GraphModulePayload } from '../execution-graphs/graph-node-tasks';
 import type { DeliveryExecutionProfile } from '../pipelines/delivery-execution-profile';
+import type { TargetSelectionDto } from '../command-center/command.dto';
 
 export type TaskStatus =
   | 'PENDING'
@@ -55,6 +56,7 @@ export interface TaskPayload {
   timeout: number;
   pipeline?: PipelineSnapshot;
   commandTemplate?: { id: string; version: number };
+  commandSelection?: { targets: TargetSelectionDto; confirmedTargetHash?: string };
   retryOf?: { taskId: string; targetId: string };
 }
 export interface TaskRecord {

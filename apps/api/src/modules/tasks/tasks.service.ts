@@ -18,12 +18,15 @@ import {
   TaskPayload,
   terminalTaskStatuses,
 } from './tasks.types';
-import { TaskLogService } from './task-log.service';
+import { TaskLogService, redactTaskLog } from './task-log.service';
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
 import type { CurrentUser } from '../auth/auth.decorators';
 import { pendingReleaseApprovalTime, serviceReleasePolicy } from '../deployments/release-policy';
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
-import { storeDeliveryProfile } from '../pipelines/delivery-execution-profile';
+import {
+  graphUnscopedArtifactService,
+  storeDeliveryProfile,
+} from '../pipelines/delivery-execution-profile';
 import { isStandaloneGraphBuild } from '../pipelines/pipeline.types';
 import { lockProjectGraph } from '../projects/project-guards';
 import { taskPayloadResourceReferences } from '../projects/project-resource-references';
@@ -134,12 +137,24 @@ export class TasksService {
             : []),
         ];
         const pipeline = input.payload.pipeline;
+        const internalService =
+          pipeline?.graph && pipeline.mode === 'BUILD_ONLY'
+            ? graphUnscopedArtifactService(input.scope.projectId).id
+            : undefined;
         const artifactRootRunId =
           pipeline?.mode === 'DEPLOY_ARTIFACT' &&
           input.idempotencyKey?.startsWith(graphTaskKeyPrefix)
             ? pipeline.artifactRootRunId
             : undefined;
-        if (await unavailableReference(tx, input.scope.projectId, scoped, { artifactRootRunId }))
+        const projectResources = scoped.filter(
+          ({ resourceId, resourceType }) =>
+            resourceType !== 'SERVICE' || resourceId !== internalService,
+        );
+        if (
+          await unavailableReference(tx, input.scope.projectId, projectResources, {
+            artifactRootRunId,
+          })
+        )
           throw new ConflictException('任务引用的资源已变化，请重新预览');
       }
       const id = existing || (await this.createInTransaction(tx, input, userId));
@@ -306,12 +321,49 @@ export class TasksService {
     const definition = task.task_type === 'PIPELINE' ? payload.pipeline?.definition : undefined;
     return {
       ...presentTask(task, payload),
+      ...(this.reusableCommand(task.task_type, payload) && { canReuseCommand: true as const }),
       ...(definition?.nodes?.length && {
         pipelineGraph: {
           buildLocation: definition.buildLocation,
           nodes: definition.nodes.map(({ id, type, name }) => ({ id, type, name })),
         },
       }),
+    };
+  }
+
+  private reusableCommand(type: string, payload: TaskPayload) {
+    const command = payload.steps?.[0]?.command;
+    return type === 'COMMAND' &&
+      payload.steps?.length === 1 &&
+      command &&
+      !payload.commandTemplate &&
+      !payload.graphModule &&
+      !payload.aiRepair &&
+      !payload.environment &&
+      redactTaskLog(command) === command
+      ? command
+      : undefined;
+  }
+
+  async commandReuse(id: string, user: CurrentUser) {
+    const task = await this.row(id);
+    if (user.role !== 'ADMIN' && task.created_by !== user.id)
+      throw new ForbiddenException('仅执行者和管理员可以沿用该命令');
+    const payload = JSON.parse(task.payload_json) as TaskPayload;
+    const command = this.reusableCommand(task.task_type, payload);
+    if (!command) throw new BadRequestException('该任务没有可沿用的临时命令');
+    return {
+      name: task.name,
+      command,
+      timeout: payload.timeout,
+      strategy: payload.strategy,
+      maxParallel: payload.maxParallel,
+      failurePolicy: payload.failurePolicy,
+      selection: payload.commandSelection?.targets ?? {
+        serverIds: payload.targets.map(({ id }) => id),
+      },
+      previousTargetHash: payload.commandSelection?.confirmedTargetHash,
+      previousTargets: payload.targets.map(({ id, name, host }) => ({ id, name, host })),
     };
   }
   async targets(id: string, user?: CurrentUser) {
