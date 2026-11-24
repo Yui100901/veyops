@@ -625,6 +625,14 @@ export function ProjectGraphEditor({
           ? [...canvas.edges, edge]
           : canvas.edges.map((item, i) => (i === index ? edge : item)),
     };
+    if (edge.when === 'SUCCESS' || edge.when === 'PARTIAL_SUCCESS') {
+      next.endpoints = next.endpoints.map((pair) => {
+        if (!pair.edgeSelections?.[edge.from]) return pair;
+        const edgeSelections = { ...pair.edgeSelections };
+        delete edgeSelections[edge.from];
+        return { ...pair, edgeSelections };
+      });
+    }
     const paired = new Set(next.endpoints.map(({ startId }) => startId));
     const ends = next.nodes.filter(({ type }) => type === 'END');
     const endpoints = next.nodes.flatMap(({ id, type }) => {
