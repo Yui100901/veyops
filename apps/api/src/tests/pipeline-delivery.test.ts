@@ -2182,6 +2182,44 @@ async function checkDelivery(databaseUrl?: string) {
       [],
       'an imported image cannot inherit the build checkout provenance',
     );
+    const externalServerId = serverIds[0]!;
+    const externalServer = await db
+      .selectFrom('servers')
+      .select('host_key_fingerprint')
+      .where('id', '=', externalServerId)
+      .executeTakeFirstOrThrow();
+    const externalReference = 'fixture/script-image:1';
+    const external = await artifactsService.create(importedSnapshot, {
+      ...imageArtifact,
+      name: 'external-script-image',
+      storageType: 'REMOTE_IMAGE',
+      storageKey: externalReference,
+      imageReference: externalReference,
+      serverId: externalServerId,
+      physical: {
+        kind: 'DOCKER_IMAGE',
+        location: 'DOCKER_ENGINE',
+        owner: 'EXTERNAL',
+        serverId: externalServerId,
+        engineId: `fixture-engine-${externalServerId}`,
+        hostKeyFingerprint: externalServer.host_key_fingerprint ?? undefined,
+        platform: 'linux/amd64',
+        imageId,
+        imageReference: externalReference,
+      },
+    });
+    const eligibleExternal = () =>
+      artifactsService.deployableIn(db, snapshot.runId, true, false, undefined, [external.id]);
+    assert.deepEqual(
+      (await eligibleExternal()).map(({ id }) => id),
+      [external.id],
+    );
+    await db
+      .updateTable('artifacts')
+      .set({ storage_key: externalReference + '-unconfirmed' })
+      .where('id', '=', external.id)
+      .execute();
+    assert.deepEqual(await eligibleExternal(), []);
     assert.ok(composeUploads.length > 0 && composeUploads.every((value) => value === compose));
     const managedPath = `/services/${service.id}/environments/${graphEnv.id}/compose-templates`;
     const managed = (content: string, expectedVersion = 0) => ({

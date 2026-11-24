@@ -39,6 +39,7 @@ import type { AuthRequest } from '../auth/auth.guard';
 import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import {
   ArtifactPhysicalService,
+  isDockerImageReference,
   physicalKey,
   type ArtifactPhysical,
 } from './artifact-physical.service';
@@ -187,6 +188,21 @@ function hasDeployableMetadata(row: Selectable<ArtifactsTable>, managedCompose: 
   if (row.storage_type === 'REGISTRY_IMAGE')
     return (
       registryReference.test(row.storage_key) && row.storage_key.endsWith(`@${row.image_digest}`)
+    );
+  if (
+    row.storage_type === 'REMOTE_IMAGE' &&
+    physical?.kind === 'DOCKER_IMAGE' &&
+    physical.location === 'DOCKER_ENGINE' &&
+    physical.owner === 'EXTERNAL'
+  )
+    return (
+      row.graph_run_id !== null &&
+      row.server_id !== null &&
+      physical.serverId === row.server_id &&
+      Boolean(physical.engineId && physical.hostKeyFingerprint && physical.platform) &&
+      physical.imageId === row.image_digest &&
+      physical.imageReference === row.storage_key &&
+      isDockerImageReference(row.storage_key)
     );
   return (
     (hasArchive || (physical?.location === 'DOCKER_ENGINE' && !!row.server_id)) &&

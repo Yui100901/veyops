@@ -67,6 +67,9 @@ const imageDigest = /^sha256:[a-f0-9]{64}$/;
 const imagePlatform = /^[a-z0-9]+\/[a-z0-9]+$/;
 const engineIdentity = /^[A-Za-z0-9:_-]{1,180}$/;
 const imageReference = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,511}$/;
+export function isDockerImageReference(value: string) {
+  return imageReference.test(value);
+}
 const managedTag =
   /^veyops-build\/[a-f0-9-]{36}(?:\/[a-f0-9-]{36})?:[a-f0-9]{40,64}-[a-f0-9-]{36}$/;
 const fingerprintChanged = '服务器 SSH 指纹与登记时不同';
