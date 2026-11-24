@@ -149,6 +149,22 @@ async function verifyV2Templates({ api, fixture, execute, source, html }) {
     }
   });
 
+  const previewCheck = graph + '/flows/' + ci.startId + '/preview';
+  for (const [buildTargets, status] of [
+    [undefined, 400],
+    [{ serverIds: [serverId, fixture.serverIds['test-b']] }, 409],
+  ]) {
+    const response = await api.request('POST', previewCheck, {
+      version,
+      inputs: { parameters: { repository: repository.id, buildTargets } },
+    });
+    const { error } = await response.json();
+    assert.equal(response.status, status, error?.message);
+    assert.equal(error.planIssue.nodeId, check.id);
+    assert.equal(error.planIssue.fieldId, 'targets');
+    assert.equal(error.planIssue.fieldSection, 'input');
+  }
+
   const assertBuilt = (run, sha) => {
     assert.deepEqual(
       run.entry.checkouts.map(({ repositoryId, commitSha }) => [repositoryId, commitSha]),

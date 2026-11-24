@@ -951,7 +951,7 @@ export function validateFlowBindings(
       if (
         (node.type === 'SHELL' || node.type === 'CHECK') &&
         (node.shell?.location === 'TARGET'
-          ? !has('targets')
+          ? !has('targets') && bindings.get('targets')?.kind !== 'INPUT'
           : node.shell?.location !== 'MANAGER' && !has('workspace') && !has('targets'))
       )
         fail(

@@ -143,6 +143,30 @@ async function checkTemplates(databaseUrl?: string) {
     assert.equal(published.publishedVersion, 1);
     await api.post(`${path}/flows/${seed.nodes[0]!.id}/preview`).send({ version: 1 }).expect(400);
 
+    const ci: GraphCanvas = (
+      await api.post(expand).send({ templateId: 'CI_BUILD', artifactType: 'DIRECTORY' }).expect(201)
+    ).body.data.canvas;
+    const check = ci.nodes.find(({ operation }) => operation === 'CHECK')!;
+    const build = ci.nodes.find(({ operation }) => operation === 'BUILD')!;
+    const targetParameter = ci.nodes
+      .find(({ type }) => type === 'START')!
+      .inputs!.find(({ id }) => id === 'buildTargets')!;
+    assert.equal(targetParameter.required, false);
+    check.shell = { ...check.shell, location: 'TARGET', command: 'test -d .' };
+    ci.endpoints[0]!.inputBindings![check.id]!.targets = {
+      kind: 'INPUT',
+      fieldId: targetParameter.id,
+    };
+    build.build!.artifacts![0]!.path = 'dist';
+    build.build!.buildCommand = 'mkdir -p dist';
+    const ciValidated = await api
+      .post(`${path}/validate`)
+      .send({ definition: { canvas: ci } })
+      .expect(201);
+    assert.deepEqual(ciValidated.body.data.issues, []);
+    const ciDraft = (await save(ci, published.revision).expect(200)).body.data;
+    await api.post(`${path}/publish`).send({ expectedRevision: ciDraft.revision }).expect(201);
+
     const db = app.get(DatabaseService).db;
     const audit = app.get(AuditService);
     const record = audit.record;
