@@ -8,7 +8,6 @@ import { ExecutionGraphStartList } from '../execution-graph/run/ExecutionGraphSt
 import { ProjectEnvironment } from './environments/ProjectEnvironment';
 import { ProjectEnvironmentSets } from './environments/ProjectEnvironmentSets';
 import { ProjectAccessLinks } from './ProjectAccessLinks';
-import { ProjectRelations } from './ProjectRelations';
 import { ProjectRepositoryEditor } from './repositories/ProjectRepositoryEditor';
 import { ProjectServiceEditor } from './ProjectServiceEditor';
 import { RepositoryDetails } from './repositories/RepositoryBrowser';
@@ -413,9 +412,6 @@ export function ProjectResources({
               view={view}
               viewSearch={viewSearch}
             />
-          )}
-          {(!resource || resource === 'relations') && (
-            <ProjectRelations project={project} user={user} reload={reload} />
           )}
         </>
       )}

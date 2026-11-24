@@ -76,7 +76,7 @@
 
 仓库可通过 `PATCH /projects/:id/repositories/:resourceId` 更新，或通过同路径的 `DELETE` 归档。仓库凭据传 `null` 可解除关联。有效配置、可运行版本或在途任务仍引用资源时返回 409。只有已完成历史引用的资源可归档，历史继续使用原 ID 和快照。
 
-项目详情在 `services` 中返回服务及地址，并包含 `dependencies`、`dependents`、`deploymentTargets` 和 `recentDeployments`。`dependents` 中的 `projectId` 指向依赖本项目的项目，修改依赖需从其所属项目发起。通过 `POST /projects/:id/dependencies` 新增依赖，带记录 ID 的路径支持 `PATCH` 和 `DELETE`。提交依赖时会检查循环引用。
+项目详情在 `services` 中返回服务及地址，并包含仓库、环境、`deploymentTargets` 和 `recentDeployments`。管理员可以通过 `DELETE /projects/:id` 软删除项目。
 
 ### 服务与访问地址
 
@@ -150,7 +150,7 @@
 
 | 入口 | 页面地址 |
 | --- | --- |
-| 项目资源 | `#/projects/:id` 默认入口。`resource` 选择 `repositories`、`services`、`environment-sets` 或 `relations`，可用 `repositoryId`、`serviceId`、`environmentSetId` 定位。 |
+| 项目资源 | `#/projects/:id` 默认入口。`resource` 选择 `repositories`、`services` 或 `environment-sets`，可用 `repositoryId`、`serviceId`、`environmentSetId` 定位。 |
 | 执行图 | `#/projects/:id/execution-graph`。使用 `start`、`run`、`pane`、`version`、`node` 和 `flow` 定位。服务详情打开开始节点时带入 `serviceId`。 |
 | 产物 | `#/projects/:id/artifacts`。`artifactId` 定位产物，可按服务及源码筛选，验证、固定保留、提交清理或跳转到生产节点。部署、回滚和待审批事项从执行图运行详情查看。 |
 | 项目配置 | `#/projects/:id/configuration`。同页维护基本信息、执行默认值、项目公共变量和 AI 策略。 |

@@ -17,7 +17,6 @@ export const projectResources = {
   repositories: '仓库',
   services: '服务',
   'environment-sets': '变量集合',
-  relations: '项目依赖',
 } as const;
 
 type Entry = keyof typeof projectEntries;

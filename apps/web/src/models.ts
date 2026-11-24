@@ -220,22 +220,9 @@ export interface ProjectDetail extends Project {
   archivedServices?: Pick<Service, 'id' | 'name'>[];
   archivedEnvironments?: Pick<Environment, 'id' | 'name'>[];
   archivedRepositories?: string[];
-  dependencies?: ProjectDependency[];
-  dependents?: ProjectDependent[];
   deploymentTargets?: ServerGroup[];
   recentDeployments?: DeploymentSummary[];
 }
-export interface ProjectDependency {
-  id: string;
-  dependsOnProjectId: string;
-  projectName: string;
-  projectSlug: string;
-  dependencyType: 'RUNTIME' | 'DEPLOYMENT';
-  description: string;
-}
-export type ProjectDependent = Omit<ProjectDependency, 'dependsOnProjectId' | 'projectSlug'> & {
-  projectId: string;
-};
 export type DeliveryStepType =
   'CHECKOUT' | 'ENVIRONMENT' | 'INSTALL' | 'BUILD' | 'TEST' | 'SHELL' | 'PACKAGE' | 'DEPLOY';
 export interface DeliveryStepNode {
