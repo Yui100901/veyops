@@ -115,6 +115,7 @@ import {
   inspectNodeEnvironment,
   inspectNodeInputs,
   inspectFlowOutputs,
+  nodeInputBinding,
   outputSources,
   publicParameters,
   referenceId,
@@ -1648,6 +1649,25 @@ export class GraphRunnerService implements OnModuleInit {
                   selection.ordered,
                 )).prepare(node, state, selection.matches)
               : undefined;
+          const workspacePlan = scriptWorkspace?.plan;
+          if (workspacePlan?.candidates || workspacePlan?.optional) {
+            const sourceVaries =
+              nodeInputBinding(current, node, 'source')?.kind === 'FIRST_AVAILABLE';
+            evidenceByNode.set(key, {
+              inputs: input.evidence.map((field) =>
+                field.fieldId === 'workspace' || (field.fieldId === 'source' && sourceVaries)
+                  ? {
+                      ...field,
+                      state: 'DEFERRED',
+                      value: undefined,
+                      source: undefined,
+                      message: '由实际执行路径确定，候选来源见脚本位置',
+                    }
+                  : field,
+              ),
+              environment: environment.evidence,
+            });
+          }
           if (['SHELL', 'CHECK', 'HEALTH_CHECK', 'REGISTER_ARTIFACT'].includes(node.type))
             unbounded = true;
           if (!this.nodeTasks)
@@ -1711,11 +1731,10 @@ export class GraphRunnerService implements OnModuleInit {
           }
           const declarations = graphArtifactDeclarations(node);
           if (declarations?.length) {
-            const workspace = scriptWorkspace?.plan;
-            const origins = workspace
+            const origins = workspacePlan
               ? [
-                  ...(workspace.candidates ?? [workspace]),
-                  ...(workspace.optional ? [undefined] : []),
+                  ...(workspacePlan.candidates ?? [workspacePlan]),
+                  ...(workspacePlan.optional ? [undefined] : []),
                 ]
               : [values.workspace as Values | undefined];
             const sources = new Map<string, PreparedProduction>();

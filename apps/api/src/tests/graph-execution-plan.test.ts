@@ -471,6 +471,15 @@ async function checkPlan(t: TestContext, url?: string) {
     const branchPreview = await create(branchFlow + '/preview', branchArgs);
     const script = (preview: typeof branchPreview, nodeId: string) =>
       preview.scripts.find((item: { nodeId: string }) => item.nodeId === nodeId);
+    const inputs = branchPreview.nodes.find(
+      (item: { nodeId: string }) => item.nodeId === 'merge-check',
+    ).inputs;
+    for (const fieldId of ['workspace', 'source']) {
+      const field = inputs.find((item: { fieldId: string }) => item.fieldId === fieldId);
+      assert.equal(field.state, 'DEFERRED');
+      assert.equal(field.source, undefined);
+      assert.equal(field.value, undefined);
+    }
     assert.deepEqual(script(branchPreview, 'merge-check').workspace.candidates, [
       {
         producerNodeId: 'checkout-a',
