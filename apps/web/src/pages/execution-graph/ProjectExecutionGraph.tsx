@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { ListPlus, Play, Redo2, Save, Undo2, Upload } from 'lucide-react';
 import {
   api,
@@ -24,7 +24,14 @@ import {
   ExecutionGraphStart,
   type GraphRunDrafts,
 } from './run/ExecutionGraphRun';
-import { ExecutionGraphStartList, ExecutionGraphStartStatus } from './run/ExecutionGraphStartStatus';
+import {
+  ExecutionGraphStartList,
+  ExecutionGraphStartStatus,
+} from './run/ExecutionGraphStartStatus';
+import {
+  ExecutionGraphStickyCanvas,
+  scrollBelowGraphCanvas,
+} from './run/ExecutionGraphStickyCanvas';
 import { ExecutionGraphTemplateDialog } from './editor/ExecutionGraphTemplateDialog';
 import { ExecutionGraphTriggers } from './editor/ExecutionGraphTriggers';
 import { GraphVersionTools } from './ExecutionGraphVersions';
@@ -479,7 +486,11 @@ function Workspace({
         </p>
       )}
       {pane === 'run' && (
-        <Section title="已发布执行图" subtitle={runVersion ? '版本 v' + runVersion : undefined}>
+        <Section
+          className="graph-run-section"
+          title="已发布执行图"
+          subtitle={runVersion ? '版本 v' + runVersion : undefined}
+        >
           <div className="graph-fields">
             <ErrorBanner error={publishedRun.error} retry={() => void publishedRun.reload()} />
             {invalidScope ? (
@@ -725,6 +736,7 @@ function PublishedRun({
   const initialInputs = readiness && 'parameters' in readiness ? readiness.parameters : undefined;
   const start = selected?.nodes.find(({ type }) => type === 'START');
   const heading = useRef<HTMLHeadingElement>(null);
+  const stickyCanvas = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (canRun && flow && !focusFieldId && !inspectNodeId)
       heading.current?.focus({ preventScroll: true });
@@ -763,10 +775,15 @@ function PublishedRun({
         scrollToInitialNode={Boolean(inspectNodeId && !focusFieldId)}
         initialFlowId={inspectFlowId ?? selected?.id}
         runFlowId={canRun ? flow?.id : undefined}
-        onRunSetup={() => {
-          heading.current?.scrollIntoView({ block: 'nearest' });
-          heading.current?.focus({ preventScroll: true });
-        }}
+        stickyCanvas={stickyCanvas}
+        onRunSetup={
+          canRun && flow
+            ? () => {
+                scrollBelowGraphCanvas(heading.current, stickyCanvas.current);
+                heading.current?.focus({ preventScroll: true });
+              }
+            : undefined
+        }
         runnableFlowIds={
           new Set(
             flows
@@ -817,39 +834,40 @@ function PublishedRun({
             </>
           );
         }}
-      />
-      {canRun && flow && readiness && (
-        <div className="graph-properties graph-manual-start" key={flow.id}>
-          <div className="heading-actions">
-            <h3 ref={heading} tabIndex={-1}>
-              <Play size={17} aria-hidden="true" /> 运行 {flow.name}
-            </h3>
-          </div>
-          {start && (
-            <ExecutionGraphResourceLinks
-              node={start}
-              start={start}
-              flow={flow}
-              flowId={flow.id}
-              pane="run"
-              version={published.version}
+      >
+        {canRun && flow && readiness && (
+          <div className="graph-properties graph-manual-start" key={flow.id}>
+            <div className="heading-actions">
+              <h3 ref={heading} tabIndex={-1}>
+                <Play size={17} aria-hidden="true" /> 运行 {flow.name}
+              </h3>
+            </div>
+            {start && (
+              <ExecutionGraphResourceLinks
+                node={start}
+                start={start}
+                flow={flow}
+                flowId={flow.id}
+                pane="run"
+                version={published.version}
+                project={project}
+                scope={scope}
+              />
+            )}
+            <ExecutionGraphStart
               project={project}
-              scope={scope}
+              path={path}
+              flow={flow}
+              version={published.version}
+              initialInputs={initialInputs}
+              workbenchScope={scope}
+              drafts={drafts}
+              focusFieldId={focusFieldId}
+              onRun={onRun}
             />
-          )}
-          <ExecutionGraphStart
-            project={project}
-            path={path}
-            flow={flow}
-            version={published.version}
-            initialInputs={initialInputs}
-            workbenchScope={scope}
-            drafts={drafts}
-            focusFieldId={focusFieldId}
-            onRun={onRun}
-          />
-        </div>
-      )}
+          </div>
+        )}
+      </PublishedNodes>
     </>
   );
 }
@@ -1111,8 +1129,10 @@ function PublishedNodes({
   initialFlowId,
   runnableFlowIds,
   runFlowId,
+  stickyCanvas,
   onRunSetup,
   renderResources,
+  children,
 }: {
   definition: GraphDocument['draft'];
   path: string;
@@ -1124,8 +1144,10 @@ function PublishedNodes({
   initialFlowId?: string;
   runnableFlowIds?: ReadonlySet<string>;
   runFlowId?: string;
+  stickyCanvas?: RefObject<HTMLDivElement | null>;
   onRunSetup?: () => void;
   renderResources?: (node: GraphNode, flow?: GraphFlow) => React.ReactNode;
+  children?: React.ReactNode;
 }) {
   const catalog = useResource<GraphCatalog>(path + '/catalog');
   const [selected, setSelected] = useState(initialNodeId ?? '');
@@ -1133,9 +1155,15 @@ function PublishedNodes({
   const [legacyId, setLegacyId] = useState(initialFlowId ?? '');
   const [inspectionFlowId, setInspectionFlowId] = useState(initialFlowId);
   const nodeDetail = useRef<HTMLElement>(null);
+  const reveal = useMemo(() => (selected ? { nodeId: selected } : undefined), [selected]);
   useEffect(() => {
-    if (scrollToInitialNode) showSelectedNode(nodeDetail.current);
-  }, [scrollToInitialNode]);
+    if (!scrollToInitialNode) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (stickyCanvas) scrollBelowGraphCanvas(nodeDetail.current, stickyCanvas.current);
+      else showSelectedNode(nodeDetail.current);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [scrollToInitialNode, stickyCanvas]);
   const flow: GraphFlow | undefined = definition.canvas
     ? {
         id: 'canvas',
@@ -1153,7 +1181,6 @@ function PublishedNodes({
     const found = flowsByStart.get(id);
     return found && (!runnableFlowIds || runnableFlowIds.has(found.id)) ? found : undefined;
   }
-  const selectedFlow = runFlowId && runnable(selected)?.id === runFlowId;
   const flowsWithNode = definition.flows.filter(({ nodes }) =>
     nodes.some(({ id }) => id === selected),
   );
@@ -1164,6 +1191,32 @@ function PublishedNodes({
   const inspectedNode = inspectedFlow?.nodes.find(({ id }) => id === selected) ?? node;
   const highlight = (hovered && flowsByStart.get(hovered)) || flowsByStart.get(selected);
   const highlightedEdges = new Set(highlight?.edges.map(edgeKey));
+  function selectNode(id: string) {
+    setSelected(id);
+    const start = runnable(id);
+    if (onChooseFlow && start && start.id !== runFlowId) {
+      onChooseFlow(start);
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      if (stickyCanvas) scrollBelowGraphCanvas(nodeDetail.current, stickyCanvas.current);
+      else showSelectedNode(nodeDetail.current);
+    });
+  }
+  const renderCanvas = (expanded: boolean) => (
+    <NodeMap
+      flow={flow}
+      selected={selected ? [selected] : []}
+      highlighted={new Set(highlight?.nodes.map(({ id }) => id))}
+      highlightEdges={
+        new Set(flow.edges.flatMap((edge, i) => (highlightedEdges.has(edgeKey(edge)) ? [i] : [])))
+      }
+      onHighlight={setHovered}
+      isRunnableStart={onChooseFlow ? (id) => Boolean(runnable(id)) : undefined}
+      onSelect={selectNode}
+      reveal={stickyCanvas && expanded ? reveal : undefined}
+    />
+  );
   return (
     <>
       {!definition.canvas && definition.flows.length > 1 && (
@@ -1183,26 +1236,40 @@ function PublishedNodes({
           </select>
         </Field>
       )}
-      <div className="graph-node-layout">
+      <div className={stickyCanvas ? 'graph-node-layout graph-run-layout' : 'graph-node-layout'}>
         <div className="graph-node-layout-inner">
-          <NodeMap
-            flow={flow}
-            selected={selected ? [selected] : []}
-            highlighted={new Set(highlight?.nodes.map(({ id }) => id))}
-            highlightEdges={
-              new Set(
-                flow.edges.flatMap((edge, i) => (highlightedEdges.has(edgeKey(edge)) ? [i] : [])),
-              )
-            }
-            onHighlight={setHovered}
-            isRunnableStart={onChooseFlow ? (id) => Boolean(runnable(id)) : undefined}
-            onSelect={(id) => {
-              setSelected(id);
-              const start = runnable(id);
-              if (start && start.id !== runFlowId) onChooseFlow?.(start);
-              window.requestAnimationFrame(() => showSelectedNode(nodeDetail.current));
-            }}
-          />
+          {stickyCanvas ? (
+            <ExecutionGraphStickyCanvas
+              containerRef={stickyCanvas}
+              controls={
+                <>
+                  <Field label="定位节点">
+                    <select
+                      value={node ? selected : ''}
+                      onChange={(e) => selectNode(e.target.value)}
+                    >
+                      <option value="" disabled>
+                        选择节点
+                      </option>
+                      {flow.nodes.map(({ id, name }) => (
+                        <option key={id} value={id}>
+                          {name}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  {onRunSetup && (
+                    <button type="button" className="button primary small" onClick={onRunSetup}>
+                      <Play size={15} aria-hidden="true" /> 填写运行参数
+                    </button>
+                  )}
+                </>
+              }
+              renderCanvas={renderCanvas}
+            />
+          ) : (
+            renderCanvas(true)
+          )}
           <article ref={nodeDetail} className="graph-node-detail" aria-label="发布节点详情">
             {node && inspectedNode ? (
               <>
@@ -1213,11 +1280,6 @@ function PublishedNodes({
                       {graphNodeTypeLabel(node)} · v{version}
                     </small>
                   </div>
-                  {selectedFlow && onRunSetup && (
-                    <button type="button" className="button primary small" onClick={onRunSetup}>
-                      <Play size={15} /> 填写运行参数
-                    </button>
-                  )}
                 </header>
                 {definition.canvas &&
                 flowsWithNode.length > 1 &&
@@ -1256,6 +1318,7 @@ function PublishedNodes({
               </>
             )}
           </article>
+          {children}
         </div>
       </div>
     </>

@@ -1,11 +1,6 @@
-.panel.graph-history-detail {
-  overflow: visible;
-}
-
 .graph-history-overview,
 .graph-history-context-content,
 .graph-history-node-workspace,
-.graph-history-sticky,
 .graph-history-node-logs {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -22,16 +17,6 @@
   overflow-wrap: anywhere;
 }
 
-.graph-history-sticky {
-  position: sticky;
-  inset-block-start: 0;
-  z-index: 2;
-  padding-block: 0.5rem;
-  background: var(--surface, #fff);
-  border-bottom: 1px solid var(--border);
-}
-
-.graph-history-node-toolbar,
 .graph-history-logs-header {
   display: flex;
   flex-wrap: wrap;
@@ -41,31 +26,8 @@
   gap: 0.5rem;
 }
 
-.graph-history-node-toolbar > .field {
-  flex: 1 1 12rem;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 0.5rem;
-  max-width: 30rem;
-  min-width: 0;
-  margin: 0;
-}
-
-.graph-history-node-toolbar select {
-  min-width: 0;
-}
-
 .graph-history-logs-header h4 {
   margin: 0;
-}
-
-.graph-history-sticky .graph-canvas-scroll {
-  max-height: min(13rem, 26dvh);
-}
-
-.graph-history-sticky .graph-canvas-controls {
-  padding-block: 0.35rem;
 }
 
 .graph-history-node-logs > .task-logs {
@@ -83,10 +45,4 @@
   border: 1px solid var(--border);
   border-radius: 0.4rem;
   background: var(--surface, #fff);
-}
-
-@media (max-height: 32rem) {
-  .graph-history-sticky {
-    position: static;
-  }
 }

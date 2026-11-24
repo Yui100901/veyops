@@ -93,6 +93,15 @@
   scroll-margin: 1rem;
 }
 
+.graph-run-layout .graph-node-detail > .field {
+  max-inline-size: 30rem;
+}
+
+.graph-run-layout .graph-node-settings {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
+  align-items: start;
+}
+
 @container graph-start-options (max-width: 37.5rem) {
   .execution-start-list > li {
     grid-template-columns: minmax(0, 1fr);

@@ -1,5 +1,5 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { AlertCircle, ArrowLeft, ChevronDown, ChevronUp } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { AlertCircle, ArrowLeft } from 'lucide-react';
 import { formatTime, message, post, useResource, type ExecutionPlanIssue } from '../../../api';
 import {
   Confirm,
@@ -14,6 +14,7 @@ import type { ProjectDetail } from '../../../models';
 import { NodeMap } from '../editor/ExecutionGraphCanvas';
 import { ConfiguredNodeExecution } from '../editor/ExecutionGraphNodeDetails';
 import { ExecutionGraphNodeLogs } from './ExecutionGraphNodeLogs';
+import { ExecutionGraphStickyCanvas, scrollBelowGraphCanvas } from './ExecutionGraphStickyCanvas';
 import { FieldEvidenceList, sourceName } from './ExecutionGraphPreview';
 import {
   ExecutionGraphParameterLink,
@@ -295,17 +296,6 @@ function needsReleaseInspection(node: RunNode, target: NonNullable<RunNode['targ
   );
 }
 
-function scrollToNode(panel: HTMLElement | null, sticky: HTMLElement | null) {
-  if (!panel) return;
-  const obstruction =
-    sticky && window.getComputedStyle(sticky).position === 'sticky'
-      ? sticky.getBoundingClientRect().height
-      : 0;
-  window.scrollTo({
-    top: window.scrollY + panel.getBoundingClientRect().top - obstruction - 12,
-  });
-}
-
 export function ExecutionGraphHistory({
   path,
   project,
@@ -452,13 +442,12 @@ function RunDetails({
   const [cancelDialog, setCancelDialog] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState('');
-  const [showMap, setShowMap] = useState(true);
-  const canvasId = useId();
   const [nodeSelection, setNodeSelection] = useState<{ linked?: string; nodeId: string }>();
   const overview = useRef<HTMLDivElement>(null);
   const sticky = useRef<HTMLDivElement>(null);
   const nodeDetail = useRef<HTMLElement>(null);
   const item = run.data;
+  const definition = item?.definition;
   const requestedNode =
     nodeSelection?.linked === selectedNodeId
       ? (nodeSelection?.nodeId ?? selectedNodeId)
@@ -479,7 +468,7 @@ function RunDetails({
     if (!currentRunId) return;
     const frame = window.requestAnimationFrame(() => {
       if (selectedNodeId && nodeDetail.current?.id === 'graph-run-node-' + selectedNodeId)
-        scrollToNode(nodeDetail.current, sticky.current);
+        scrollBelowGraphCanvas(nodeDetail.current, sticky.current);
       else overview.current?.scrollIntoView({ block: 'nearest' });
     });
     return () => window.cancelAnimationFrame(frame);
@@ -522,7 +511,7 @@ function RunDetails({
     ) ?? [];
   function selectNode(nodeId: string) {
     setNodeSelection({ linked: selectedNodeId, nodeId });
-    window.requestAnimationFrame(() => scrollToNode(nodeDetail.current, sticky.current));
+    window.requestAnimationFrame(() => scrollBelowGraphCanvas(nodeDetail.current, sticky.current));
   }
   function closeCancel() {
     if (!cancelling) {
@@ -688,8 +677,9 @@ function RunDetails({
               )}
               {n && (
                 <div className="graph-history-node-workspace">
-                  <div className="graph-history-sticky" ref={sticky}>
-                    <div className="graph-history-node-toolbar">
+                  <ExecutionGraphStickyCanvas
+                    containerRef={sticky}
+                    controls={
                       <Field label="定位节点">
                         <select
                           value={n.nodeId}
@@ -702,34 +692,20 @@ function RunDetails({
                           ))}
                         </select>
                       </Field>
-                      {item.definition && (
-                        <button
-                          type="button"
-                          className="button secondary small"
-                          aria-controls={canvasId}
-                          aria-expanded={showMap}
-                          onClick={() => setShowMap((open) => !open)}
-                        >
-                          {showMap ? (
-                            <ChevronUp size={15} aria-hidden="true" />
-                          ) : (
-                            <ChevronDown size={15} aria-hidden="true" />
-                          )}
-                          {showMap ? '收起画布' : '展开画布'}
-                        </button>
-                      )}
-                    </div>
-                    {item.definition && (
-                      <div id={canvasId} hidden={!showMap}>
-                        <NodeMap
-                          flow={item.definition}
-                          selected={[n.nodeId]}
-                          onSelect={selectNode}
-                          reveal={showMap ? reveal : undefined}
-                        />
-                      </div>
-                    )}
-                  </div>
+                    }
+                    renderCanvas={
+                      definition
+                        ? (expanded) => (
+                            <NodeMap
+                              flow={definition}
+                              selected={[n.nodeId]}
+                              onSelect={selectNode}
+                              reveal={expanded ? reveal : undefined}
+                            />
+                          )
+                        : undefined
+                    }
+                  />
                   <article
                     key={n.nodeId}
                     id={'graph-run-node-' + n.nodeId}

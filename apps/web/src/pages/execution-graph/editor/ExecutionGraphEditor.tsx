@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type { DragEvent, ReactNode } from 'react';
 import { Copy, Plus, Trash2, ArrowRight, ArrowLeft, ChevronDown } from 'lucide-react';
 import { post, useResource, type GraphIssueLocation } from '../../../api';
@@ -149,6 +149,7 @@ export function ProjectGraphEditor({
   );
   const handledFocus = useRef<FieldFocus>(undefined);
   const inspector = useRef<HTMLElement>(null);
+  const inspectorId = useId();
   useEffect(() => {
     if (!insertedStartId) return;
     select({ kind: 'node', id: insertedStartId });
@@ -598,6 +599,11 @@ export function ProjectGraphEditor({
     setConnector(undefined);
     setError('');
   }
+  function revealInspector() {
+    inspector.current?.scrollIntoView({ block: 'start' });
+    inspector.current?.focus({ preventScroll: true });
+  }
+
   function beginConnection(id: string) {
     setSource((current) => (current === id ? undefined : id));
     setConnector(undefined);
@@ -628,6 +634,7 @@ export function ProjectGraphEditor({
     }
     if (options.length > 1) {
       setConnector({ from: source, to: target });
+      window.requestAnimationFrame(revealInspector);
       return;
     }
     addEdge({ from: source, to: target, ...(options[0] && { when: options[0].value }) });
@@ -805,479 +812,501 @@ export function ProjectGraphEditor({
         removeSelection();
       }}
     >
-      {canEdit && (
-        <aside className="graph-palette" aria-label="节点库" data-expanded={paletteExpanded}>
-          <h3>节点库</h3>
-          <button
-            type="button"
-            className="graph-palette-toggle"
-            aria-expanded={paletteExpanded}
-            onClick={() => setPaletteExpanded((expanded) => !expanded)}
-          >
-            节点库
-            <ChevronDown size={16} aria-hidden="true" />
-          </button>
-          <div className="graph-palette-group">
-            <h4>开始与结束</h4>
-            {paletteButton('START')}
-            {paletteButton('END')}
-          </div>
-          <div className="graph-palette-group">
-            <h4>功能节点</h4>
-            {paletteButton('FUNCTION', '新建自定义节点')}
-            <details className="graph-palette-templates">
-              <summary>系统模板</summary>
-              <div className="graph-palette-group">
-                {systemNodePresets.map((operation) => paletteButton(operation))}
-              </div>
-            </details>
-            <details className="graph-palette-templates">
-              <summary>高级节点</summary>
-              <div className="graph-palette-group">{paletteButton('DELAY')}</div>
-            </details>
-            <details className="graph-palette-templates" open={template ? true : undefined}>
-              <summary>
-                项目模板{canvas.templates.length ? ' · ' + canvas.templates.length : ''}
-              </summary>
-              <div className="graph-palette-group">
-                {canvas.templates.map((item) => (
+      <section className="graph-editing-area" aria-label="图编辑区">
+        {canEdit && (
+          <aside className="graph-palette" aria-label="节点库" data-expanded={paletteExpanded}>
+            <h3>节点库</h3>
+            <button
+              type="button"
+              className="graph-palette-toggle"
+              aria-expanded={paletteExpanded}
+              onClick={() => setPaletteExpanded((expanded) => !expanded)}
+            >
+              节点库
+              <ChevronDown size={16} aria-hidden="true" />
+            </button>
+            <div className="graph-palette-group">
+              <h4>开始与结束</h4>
+              {paletteButton('START')}
+              {paletteButton('END')}
+            </div>
+            <div className="graph-palette-group">
+              <h4>功能节点</h4>
+              {paletteButton('FUNCTION', '新建自定义节点')}
+              <details className="graph-palette-templates">
+                <summary>系统模板</summary>
+                <div className="graph-palette-group">
+                  {systemNodePresets.map((operation) => paletteButton(operation))}
+                </div>
+              </details>
+              <details className="graph-palette-templates">
+                <summary>高级节点</summary>
+                <div className="graph-palette-group">{paletteButton('DELAY')}</div>
+              </details>
+              <details className="graph-palette-templates" open={template ? true : undefined}>
+                <summary>
+                  项目模板{canvas.templates.length ? ' · ' + canvas.templates.length : ''}
+                </summary>
+                <div className="graph-palette-group">
+                  {canvas.templates.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      draggable
+                      aria-pressed={template?.id === item.id}
+                      className="graph-palette-node"
+                      onDragStart={(event) => drag(event, 'template:' + item.id)}
+                      onClick={() => {
+                        select({ kind: 'template', id: item.id });
+                        setTab('input');
+                        setConnector(undefined);
+                        setSource(undefined);
+                      }}
+                    >
+                      <Copy size={14} />
+                      {item.name || '未命名模板'}
+                    </button>
+                  ))}
+                  <Field label="起始模板">
+                    <select
+                      value={templateType}
+                      onChange={(event) => setTemplateType(event.target.value as NodeType)}
+                    >
+                      <option value="FUNCTION">空白功能节点</option>
+                      {graphOperations.map((type) => (
+                        <option key={type} value={type}>
+                          {graphNodeLabels[type]}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
                   <button
-                    key={item.id}
                     type="button"
-                    draggable
-                    aria-pressed={template?.id === item.id}
-                    className="graph-palette-node"
-                    onDragStart={(event) => drag(event, 'template:' + item.id)}
-                    onClick={() => {
-                      select({ kind: 'template', id: item.id });
-                      setTab('input');
-                      setConnector(undefined);
-                      setSource(undefined);
-                    }}
+                    className="button secondary small"
+                    onClick={() => createTemplate(makeNode(templateType, project))}
                   >
-                    <Copy size={14} />
-                    {item.name || '未命名模板'}
+                    <Plus size={15} />
+                    新建项目模板
                   </button>
-                ))}
-                <Field label="起始模板">
-                  <select
-                    value={templateType}
-                    onChange={(event) => setTemplateType(event.target.value as NodeType)}
+                </div>
+              </details>
+            </div>
+            <div className="graph-palette-group">
+              <h4>条件节点</h4>
+              {paletteButton('CONDITION')}
+            </div>
+          </aside>
+        )}
+        <div className="graph-canvas-column">
+          <div className="graph-editor-toolbar">
+            <div className="graph-canvas-help">
+              {canEdit && <p>拖节点到画布，点击两端连接点连线。右键节点或连线打开操作菜单。</p>}
+              {source && (
+                <p role="status">
+                  从「{canvas.nodes.find(({ id }) => id === source)?.name}
+                  」连线，选择一个下游连接点。{' '}
+                  <button
+                    className="button secondary small"
+                    type="button"
+                    onClick={() => setSource(undefined)}
                   >
-                    <option value="FUNCTION">空白功能节点</option>
-                    {graphOperations.map((type) => (
-                      <option key={type} value={type}>
-                        {graphNodeLabels[type]}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-                <button
-                  type="button"
-                  className="button secondary small"
-                  onClick={() => createTemplate(makeNode(templateType, project))}
+                    取消连线
+                  </button>
+                </p>
+              )}
+            </div>
+            {!!canvas.endpoints.length && (
+              <Field label="查看执行流">
+                <select
+                  value={selectedPair?.startId ?? ''}
+                  onChange={(event) => {
+                    setStartId(event.target.value || undefined);
+                    setFocusRequest(undefined);
+                    setDiagnosticEdge(undefined);
+                    setReveal(undefined);
+                  }}
                 >
-                  <Plus size={15} />
-                  新建项目模板
-                </button>
-              </div>
-            </details>
+                  <option value="">查看完整执行图</option>
+                  {canvas.endpoints.map((pair) => (
+                    <option value={pair.startId} key={pair.startId}>
+                      {canvas.nodes.find(({ id }) => id === pair.startId)?.name ?? pair.startId}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            )}
+            {!!issues.length && (
+              <section className="graph-fields graph-validation" aria-label="发布检查问题">
+                <h4>发布检查</h4>
+                <ul className="graph-edge-list">
+                  {issues.map((issue, index) => (
+                    <li key={index}>
+                      <button
+                        type="button"
+                        className="button secondary small"
+                        onClick={() => openIssue(issue)}
+                      >
+                        {issue.message}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+            {impact?.canvas === canvas && (
+              <section className="graph-editor-impact" aria-label="受影响的执行流">
+                <p className="field-note" role="status">
+                  {impact.message}
+                </p>
+                <ul className="graph-edge-list">
+                  {impact.flows.map(({ id, name }) => (
+                    <li key={id}>
+                      {canvas.nodes.some((node) => node.id === id) ? (
+                        <button
+                          className="button secondary small"
+                          type="button"
+                          onClick={() => {
+                            const path = pathHighlight(canvas, id);
+                            const nodeId =
+                              impact.nodeId && path?.nodes.has(impact.nodeId) ? impact.nodeId : id;
+                            selectNode(nodeId);
+                            setStartId(id);
+                            setReveal({ nodeId });
+                          }}
+                        >
+                          {name}
+                        </button>
+                      ) : (
+                        <span>{name}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+            <ErrorBanner error={catalog.error} retry={catalog.reload} />
+            {missingRepairNode && <ErrorBanner error="运行问题关联的节点已不在当前草稿中。" />}
+            <ErrorBanner error={error} />
           </div>
-          <div className="graph-palette-group">
-            <h4>条件节点</h4>
-            {paletteButton('CONDITION')}
-          </div>
-        </aside>
-      )}
-      <div className="graph-editor-toolbar">
-        <div className="graph-canvas-help">
-          {canEdit && <p>拖节点到画布，点击两端连接点连线。右键节点或连线打开操作菜单。</p>}
-          {source && (
-            <p role="status">
-              从「{canvas.nodes.find(({ id }) => id === source)?.name}」连线，选择一个下游连接点。{' '}
+          <NodeMap
+            flow={flow}
+            selected={activeNode ? [activeNode.id] : []}
+            selectedEdge={activeEdge && selection?.kind === 'edge' ? selection.index : undefined}
+            highlighted={highlight?.nodes}
+            highlightEdges={highlightEdges}
+            reveal={reveal}
+            onHighlight={hover}
+            onSelect={selectNode}
+            onMove={
+              canEdit
+                ? (id, position) =>
+                    onChange({
+                      ...canvas,
+                      nodes: canvas.nodes.map((item) =>
+                        item.id === id ? { ...item, position } : item,
+                      ),
+                    })
+                : undefined
+            }
+            onDropNode={canEdit ? drop : undefined}
+            onNodeCopy={canEdit ? copyNode : undefined}
+            onNodeDelete={canEdit ? deleteNode : undefined}
+            onEdgeSelect={canEdit ? selectEdge : undefined}
+            onEdgeDelete={canEdit ? detachEdge : undefined}
+            connecting={source}
+            onConnectSource={canEdit ? beginConnection : undefined}
+            onConnectTarget={canEdit ? connect : undefined}
+          />
+          <div className="graph-canvas-actions heading-actions">
+            {canEdit && canvas.nodes.some(({ position }) => position) && (
               <button
                 className="button secondary small"
                 type="button"
-                onClick={() => setSource(undefined)}
-              >
-                取消连线
-              </button>
-            </p>
-          )}
-        </div>
-        {!!canvas.endpoints.length && (
-          <Field label="查看执行流">
-            <select
-              value={selectedPair?.startId ?? ''}
-              onChange={(event) => {
-                setStartId(event.target.value || undefined);
-                setFocusRequest(undefined);
-                setDiagnosticEdge(undefined);
-                setReveal(undefined);
-              }}
-            >
-              <option value="">查看完整执行图</option>
-              {canvas.endpoints.map((pair) => (
-                <option value={pair.startId} key={pair.startId}>
-                  {canvas.nodes.find(({ id }) => id === pair.startId)?.name ?? pair.startId}
-                </option>
-              ))}
-            </select>
-          </Field>
-        )}
-        {!!issues.length && (
-          <section className="graph-fields graph-validation" aria-label="发布检查问题">
-            <h4>发布检查</h4>
-            <ul className="graph-edge-list">
-              {issues.map((issue, index) => (
-                <li key={index}>
-                  <button
-                    type="button"
-                    className="button secondary small"
-                    onClick={() => openIssue(issue)}
-                  >
-                    {issue.message}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-        {impact?.canvas === canvas && (
-          <section className="graph-editor-impact" aria-label="受影响的执行流">
-            <p className="field-note" role="status">
-              {impact.message}
-            </p>
-            <ul className="graph-edge-list">
-              {impact.flows.map(({ id, name }) => (
-                <li key={id}>
-                  {canvas.nodes.some((node) => node.id === id) ? (
-                    <button
-                      className="button secondary small"
-                      type="button"
-                      onClick={() => {
-                        const path = pathHighlight(canvas, id);
-                        const nodeId =
-                          impact.nodeId && path?.nodes.has(impact.nodeId) ? impact.nodeId : id;
-                        selectNode(nodeId);
-                        setStartId(id);
-                        setReveal({ nodeId });
-                      }}
-                    >
-                      {name}
-                    </button>
-                  ) : (
-                    <span>{name}</span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-        <ErrorBanner error={catalog.error} retry={catalog.reload} />
-        {missingRepairNode && <ErrorBanner error="运行问题关联的节点已不在当前草稿中。" />}
-        <ErrorBanner error={error} />
-      </div>
-      <div className="graph-canvas-column">
-        <NodeMap
-          flow={flow}
-          selected={activeNode ? [activeNode.id] : []}
-          selectedEdge={activeEdge && selection?.kind === 'edge' ? selection.index : undefined}
-          highlighted={highlight?.nodes}
-          highlightEdges={highlightEdges}
-          reveal={reveal}
-          onHighlight={hover}
-          onSelect={selectNode}
-          onMove={
-            canEdit
-              ? (id, position) =>
+                onClick={() =>
                   onChange({
                     ...canvas,
-                    nodes: canvas.nodes.map((item) =>
-                      item.id === id ? { ...item, position } : item,
-                    ),
+                    nodes: canvas.nodes.map((item) => ({ ...item, position: undefined })),
                   })
-              : undefined
-          }
-          onDropNode={canEdit ? drop : undefined}
-          onNodeCopy={canEdit ? copyNode : undefined}
-          onNodeDelete={canEdit ? deleteNode : undefined}
-          onEdgeSelect={canEdit ? selectEdge : undefined}
-          onEdgeDelete={canEdit ? detachEdge : undefined}
-          connecting={source}
-          onConnectSource={canEdit ? beginConnection : undefined}
-          onConnectTarget={canEdit ? connect : undefined}
-        />
-        {canEdit && canvas.nodes.some(({ position }) => position) && (
-          <button
-            className="button secondary small"
-            type="button"
-            onClick={() =>
-              onChange({
-                ...canvas,
-                nodes: canvas.nodes.map((item) => ({ ...item, position: undefined })),
-              })
-            }
-          >
-            恢复自动布局
-          </button>
+                }
+              >
+                恢复自动布局
+              </button>
+            )}
+            {(inspected || activeEdge || connector) && (
+              <button
+                className="button secondary small"
+                type="button"
+                aria-controls={inspectorId}
+                onClick={revealInspector}
+              >
+                <ChevronDown size={15} aria-hidden="true" />
+                查看详情
+              </button>
+            )}
+          </div>
+        </div>
+      </section>
+      <section
+        id={inspectorId}
+        ref={inspector}
+        className="graph-inspector graph-properties"
+        aria-label="节点与连线详情"
+        tabIndex={-1}
+      >
+        {!inspected && !activeEdge && !connector && (
+          <header className="graph-inspector-title">
+            <h3>节点详情</h3>
+            <p>选择画布中的节点查看详情。</p>
+          </header>
         )}
-      </div>
-      {(inspected || activeEdge || connector) && (
-        <aside ref={inspector} className="graph-inspector graph-properties" aria-label="选中项属性">
-          {inspected && (
-            <>
-              <header className="graph-inspector-title">
-                <p>{template ? '项目模板' : isFunction ? '功能节点' : '节点属性'}</p>
-                <h3 tabIndex={-1}>{inspected.name || graphNodeTypeLabel(inspected)}</h3>
-              </header>
-              <NodeIdentity node={inspected} canEdit={canEdit} patch={patch} />
-              {parameterRepair?.consumerId === inspected.id &&
-                repairBinding?.kind === 'INPUT' &&
-                repairBinding.fieldId === parameterRepair.field.id && (
-                  <div className="graph-editor-repair">
-                    <p className="field-note" role="status">
-                      已创建并绑定开始参数「{parameterRepair.field.name}」。
-                    </p>
-                    <button
-                      type="button"
-                      className="button secondary small"
-                      onClick={() => {
-                        selectNode(parameterRepair.startId);
-                        setReveal({ nodeId: parameterRepair.startId });
-                        setFocusRequest({
-                          nodeId: parameterRepair.startId,
-                          fieldId: parameterRepair.field.id,
-                        });
-                      }}
-                    >
-                      查看新建参数
-                    </button>
-                  </div>
-                )}
-              {isFunction ? (
-                <>
-                  <nav className="graph-inspector-tabs" aria-label="功能节点配置">
-                    {(Object.keys(functionalTabs) as FunctionalTab[]).map((item) => (
-                      <button
-                        type="button"
-                        key={item}
-                        aria-pressed={tab === item}
-                        onClick={() => setTab(item)}
-                      >
-                        {functionalTabs[item]}
-                      </button>
-                    ))}
-                  </nav>
-                  <div className="graph-inspector-panel" key={inspected.id + ':' + tab}>
-                    {tab === 'execution' ? (
-                      <NodeOperationFields
-                        project={project}
-                        node={inspected}
-                        canvas={canvas}
-                        canEdit={canEdit}
-                        patch={patch}
-                        selectOperation={(operation) =>
-                          patch(changeOperation(inspected, operation, project))
-                        }
-                      />
-                    ) : (
-                      <>
-                        <ExecutionGraphBindings
-                          canvas={canvas}
-                          node={inspected}
-                          endpoint={activePair}
-                          flowEdgeIndexes={selectedPath?.edges}
-                          catalog={catalog.data}
-                          directory={
-                            catalogSnapshot?.canvas === canvas ? catalogSnapshot.flows : undefined
-                          }
-                          project={project}
-                          canEdit={canEdit}
-                          update={updatePair}
-                          patchNode={patch}
-                          section={tab}
-                          createStartParameter={createStartParameter}
-                          repairFieldIds={repairFieldIds}
-                        />
-                        {tab === 'input' && activeNode && renderResources?.(activeNode, activePair)}
-                        <FunctionPortFields
-                          node={inspected}
-                          section={tab}
-                          canEdit={canEdit}
-                          patch={patch}
-                        />
-                      </>
-                    )}
-                    {tab === 'execution' &&
-                      activeNode &&
-                      activePair &&
-                      renderBranches(activeNode, activePair)}
-                  </div>
-                </>
-              ) : (
-                <>
-                  <NodeOperationFields
-                    node={inspected}
-                    project={project}
-                    canvas={canvas}
-                    canEdit={canEdit}
-                    patch={patch}
-                  />
-                  {activeNode && renderResources?.(activeNode, activePair)}
-                </>
-              )}
-              {activeNode?.type === 'START' && (
-                <>
-                  <GraphFieldEditor
-                    project={project}
-                    catalog={catalog.data}
-                    type="input"
-                    disabled={!canEdit}
-                    title="触发器与手动运行参数"
-                    fields={activeNode.inputs ?? []}
-                    change={(inputs) => patch({ inputs })}
-                  />
-                  <StartEnvironmentFields
-                    projectId={project.id}
-                    node={activeNode}
-                    canEdit={canEdit}
-                    patch={patch}
-                  />
-                  {renderStart?.(activeNode.id)}
-                  <details className="graph-field-card">
-                    <summary>画布结构设置</summary>
-                    <StartPair
-                      node={activeNode}
-                      canvas={canvas}
-                      canEdit={canEdit}
-                      assign={assignEnd}
-                    />
-                    {selectedPair?.startId === activeNode.id && (
-                      <Field label="此流关联发布的服务（可选）">
-                        <select
-                          value={selectedPair.serviceId ?? ''}
-                          disabled={!canEdit}
-                          onChange={(event) =>
-                            updatePair({
-                              ...selectedPair,
-                              serviceId: event.target.value || undefined,
-                            })
-                          }
-                        >
-                          <option value="">无固定关联</option>
-                          {project.services.map(({ id, name }) => (
-                            <option value={id} key={id}>
-                              {name}
-                            </option>
-                          ))}
-                        </select>
-                      </Field>
-                    )}
-                  </details>
-                </>
-              )}
-              {activeNode?.type === 'END' && (
-                <>
-                  <EndPairs
-                    key={activeNode.id}
-                    canvas={canvas}
-                    node={activeNode}
-                    canEdit={canEdit}
-                    assign={assignEnd}
-                  />
-                  <GraphFieldEditor
-                    project={project}
-                    catalog={catalog.data}
-                    type="output"
-                    disabled={!canEdit}
-                    fields={activeNode.outputs ?? []}
-                    change={(outputs) => patch({ outputs })}
-                  />
-                </>
-              )}
-              {!isFunction && activeNode && activePair && (
-                <>
-                  {renderBranches(activeNode, activePair)}
-                  {activeNode.type !== 'START' && (
-                    <ExecutionGraphBindings
-                      canvas={canvas}
-                      node={activeNode}
-                      endpoint={activePair}
-                      flowEdgeIndexes={selectedPath?.edges}
-                      catalog={catalog.data}
-                      directory={
-                        catalogSnapshot?.canvas === canvas ? catalogSnapshot.flows : undefined
-                      }
-                      project={project}
-                      canEdit={canEdit}
-                      update={updatePair}
-                      createStartParameter={
-                        activeNode.type === 'END' ? undefined : createStartParameter
-                      }
-                      repairFieldIds={repairFieldIds}
-                    />
-                  )}
-                </>
-              )}
-              {canEdit && (
-                <div className="heading-actions">
-                  {template && (
-                    <button
-                      type="button"
-                      className="button primary small"
-                      onClick={() => addNode(template)}
-                    >
-                      <Plus size={15} />
-                      添加到画布
-                    </button>
-                  )}
-                  {isFunction && activeNode && (
-                    <button
-                      type="button"
-                      className="button secondary small"
-                      onClick={() => createTemplate(activeNode)}
-                    >
-                      保存为项目模板
-                    </button>
-                  )}
-                  <button type="button" className="button secondary small" onClick={duplicate}>
-                    <Copy size={15} />
-                    {template ? '复制模板' : '复制节点'}
-                  </button>
+        {inspected && (
+          <>
+            <header className="graph-inspector-title">
+              <p>{template ? '项目模板' : isFunction ? '功能节点' : '节点属性'}</p>
+              <h3 tabIndex={-1}>{inspected.name || graphNodeTypeLabel(inspected)}</h3>
+            </header>
+            <NodeIdentity node={inspected} canEdit={canEdit} patch={patch} />
+            {parameterRepair?.consumerId === inspected.id &&
+              repairBinding?.kind === 'INPUT' &&
+              repairBinding.fieldId === parameterRepair.field.id && (
+                <div className="graph-editor-repair">
+                  <p className="field-note" role="status">
+                    已创建并绑定开始参数「{parameterRepair.field.name}」。
+                  </p>
                   <button
                     type="button"
                     className="button secondary small"
-                    onClick={removeSelection}
+                    onClick={() => {
+                      selectNode(parameterRepair.startId);
+                      setReveal({ nodeId: parameterRepair.startId });
+                      setFocusRequest({
+                        nodeId: parameterRepair.startId,
+                        fieldId: parameterRepair.field.id,
+                      });
+                    }}
                   >
-                    <Trash2 size={15} />
-                    {template ? '删除模板' : '删除节点'}
+                    查看新建参数
                   </button>
                 </div>
               )}
-            </>
-          )}
-          {connector && (
-            <ConnectorFields
-              key={connector.from + '/' + connector.to}
-              canvas={canvas}
-              edge={connector}
-              commit={addEdge}
-              onClose={() => setConnector(undefined)}
-            />
-          )}
-          {activeEdge && selection?.kind === 'edge' && (
-            <ConnectorFields
-              key={selection.index + ':' + activeEdge.from + '/' + activeEdge.to}
-              canvas={canvas}
-              edge={activeEdge}
-              index={selection.index}
-              commit={addEdge}
-              onClose={() => detachEdge(selection.index)}
-            />
-          )}
-        </aside>
-      )}
+            {isFunction ? (
+              <>
+                <nav className="graph-inspector-tabs" aria-label="功能节点配置">
+                  {(Object.keys(functionalTabs) as FunctionalTab[]).map((item) => (
+                    <button
+                      type="button"
+                      key={item}
+                      aria-pressed={tab === item}
+                      onClick={() => setTab(item)}
+                    >
+                      {functionalTabs[item]}
+                    </button>
+                  ))}
+                </nav>
+                <div className="graph-inspector-panel" key={inspected.id + ':' + tab}>
+                  {tab === 'execution' ? (
+                    <NodeOperationFields
+                      project={project}
+                      node={inspected}
+                      canvas={canvas}
+                      canEdit={canEdit}
+                      patch={patch}
+                      selectOperation={(operation) =>
+                        patch(changeOperation(inspected, operation, project))
+                      }
+                    />
+                  ) : (
+                    <>
+                      <ExecutionGraphBindings
+                        canvas={canvas}
+                        node={inspected}
+                        endpoint={activePair}
+                        flowEdgeIndexes={selectedPath?.edges}
+                        catalog={catalog.data}
+                        directory={
+                          catalogSnapshot?.canvas === canvas ? catalogSnapshot.flows : undefined
+                        }
+                        project={project}
+                        canEdit={canEdit}
+                        update={updatePair}
+                        patchNode={patch}
+                        section={tab}
+                        createStartParameter={createStartParameter}
+                        repairFieldIds={repairFieldIds}
+                      />
+                      {tab === 'input' && activeNode && renderResources?.(activeNode, activePair)}
+                      <FunctionPortFields
+                        node={inspected}
+                        section={tab}
+                        canEdit={canEdit}
+                        patch={patch}
+                      />
+                    </>
+                  )}
+                  {tab === 'execution' &&
+                    activeNode &&
+                    activePair &&
+                    renderBranches(activeNode, activePair)}
+                </div>
+              </>
+            ) : (
+              <>
+                <NodeOperationFields
+                  node={inspected}
+                  project={project}
+                  canvas={canvas}
+                  canEdit={canEdit}
+                  patch={patch}
+                />
+                {activeNode && renderResources?.(activeNode, activePair)}
+              </>
+            )}
+            {activeNode?.type === 'START' && (
+              <>
+                <GraphFieldEditor
+                  project={project}
+                  catalog={catalog.data}
+                  type="input"
+                  disabled={!canEdit}
+                  title="触发器与手动运行参数"
+                  fields={activeNode.inputs ?? []}
+                  change={(inputs) => patch({ inputs })}
+                />
+                <StartEnvironmentFields
+                  projectId={project.id}
+                  node={activeNode}
+                  canEdit={canEdit}
+                  patch={patch}
+                />
+                {renderStart?.(activeNode.id)}
+                <details className="graph-field-card">
+                  <summary>画布结构设置</summary>
+                  <StartPair
+                    node={activeNode}
+                    canvas={canvas}
+                    canEdit={canEdit}
+                    assign={assignEnd}
+                  />
+                  {selectedPair?.startId === activeNode.id && (
+                    <Field label="此流关联发布的服务（可选）">
+                      <select
+                        value={selectedPair.serviceId ?? ''}
+                        disabled={!canEdit}
+                        onChange={(event) =>
+                          updatePair({
+                            ...selectedPair,
+                            serviceId: event.target.value || undefined,
+                          })
+                        }
+                      >
+                        <option value="">无固定关联</option>
+                        {project.services.map(({ id, name }) => (
+                          <option value={id} key={id}>
+                            {name}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                  )}
+                </details>
+              </>
+            )}
+            {activeNode?.type === 'END' && (
+              <>
+                <EndPairs
+                  key={activeNode.id}
+                  canvas={canvas}
+                  node={activeNode}
+                  canEdit={canEdit}
+                  assign={assignEnd}
+                />
+                <GraphFieldEditor
+                  project={project}
+                  catalog={catalog.data}
+                  type="output"
+                  disabled={!canEdit}
+                  fields={activeNode.outputs ?? []}
+                  change={(outputs) => patch({ outputs })}
+                />
+              </>
+            )}
+            {!isFunction && activeNode && activePair && (
+              <>
+                {renderBranches(activeNode, activePair)}
+                {activeNode.type !== 'START' && (
+                  <ExecutionGraphBindings
+                    canvas={canvas}
+                    node={activeNode}
+                    endpoint={activePair}
+                    flowEdgeIndexes={selectedPath?.edges}
+                    catalog={catalog.data}
+                    directory={
+                      catalogSnapshot?.canvas === canvas ? catalogSnapshot.flows : undefined
+                    }
+                    project={project}
+                    canEdit={canEdit}
+                    update={updatePair}
+                    createStartParameter={
+                      activeNode.type === 'END' ? undefined : createStartParameter
+                    }
+                    repairFieldIds={repairFieldIds}
+                  />
+                )}
+              </>
+            )}
+            {canEdit && (
+              <div className="heading-actions">
+                {template && (
+                  <button
+                    type="button"
+                    className="button primary small"
+                    onClick={() => addNode(template)}
+                  >
+                    <Plus size={15} />
+                    添加到画布
+                  </button>
+                )}
+                {isFunction && activeNode && (
+                  <button
+                    type="button"
+                    className="button secondary small"
+                    onClick={() => createTemplate(activeNode)}
+                  >
+                    保存为项目模板
+                  </button>
+                )}
+                <button type="button" className="button secondary small" onClick={duplicate}>
+                  <Copy size={15} />
+                  {template ? '复制模板' : '复制节点'}
+                </button>
+                <button type="button" className="button secondary small" onClick={removeSelection}>
+                  <Trash2 size={15} />
+                  {template ? '删除模板' : '删除节点'}
+                </button>
+              </div>
+            )}
+          </>
+        )}
+        {connector && (
+          <ConnectorFields
+            key={connector.from + '/' + connector.to}
+            canvas={canvas}
+            edge={connector}
+            commit={addEdge}
+            onClose={() => setConnector(undefined)}
+          />
+        )}
+        {activeEdge && selection?.kind === 'edge' && (
+          <ConnectorFields
+            key={selection.index + ':' + activeEdge.from + '/' + activeEdge.to}
+            canvas={canvas}
+            edge={activeEdge}
+            index={selection.index}
+            commit={addEdge}
+            onClose={() => detachEdge(selection.index)}
+          />
+        )}
+      </section>
     </div>
   );
 }
