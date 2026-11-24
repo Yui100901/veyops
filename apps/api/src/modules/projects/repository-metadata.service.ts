@@ -576,6 +576,8 @@ export class RepositoryMetadataService {
       const output = await repository.run([
         `--git-dir=${bare}`,
         'log',
+        // In a bare repository Git otherwise reads HEAD:.mailmap from the filtered tree.
+        '--no-use-mailmap',
         '-z',
         `--max-count=${limit}`,
         '--format=%H%x00%s%x00%aI%x00%an',
