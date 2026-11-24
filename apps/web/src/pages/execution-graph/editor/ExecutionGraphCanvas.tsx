@@ -59,11 +59,15 @@ const icons = {
   SHELL: Code2,
   END: CheckCircle2,
 };
-const columnGap = 85;
-const rowGap = 42;
-const cardWidth = 168;
-const cardHeight = 66;
-const margin = 20;
+const columnGap = 76;
+const rowGap = 38;
+const cardWidth = 154;
+const cardHeight = 60;
+const margin = 18;
+const minZoom = 50;
+const maxZoom = 100;
+
+const clampZoom = (value: number) => Math.max(minZoom, Math.min(maxZoom, value));
 
 function layout(flow: GraphFlow, manual?: { id: string; point: Point }) {
   const nodes = orderedNodes(flow);
@@ -208,7 +212,7 @@ export function NodeMap({
   nodeSummary?: (node: GraphNode) => string | undefined;
 }) {
   const marker = useId();
-  const [zoom, setZoom] = useState(100);
+  const [zoom, setZoom] = useState(maxZoom);
   const scale = zoom / 100;
   const [drag, setDrag] = useState<{ start: Point; end: Point }>();
   const [manual, setManual] = useState<{ id: string; point: Point }>();
@@ -326,19 +330,28 @@ export function NodeMap({
     <div className="graph-canvas">
       <div className="graph-canvas-controls">
         <span>{onDropNode ? '项目画布' : '执行流画布'}</span>
-        <label>
-          缩放{' '}
-          <select
+        <div className="graph-canvas-zoom">
+          <label htmlFor={`${marker}-zoom`}>缩放</label>
+          <input
+            id={`${marker}-zoom`}
             aria-label="画布缩放"
+            aria-valuetext={`${zoom}%`}
+            type="range"
+            min={minZoom}
+            max={maxZoom}
+            step={1}
             value={zoom}
-            onChange={(e) => setZoom(Number(e.target.value))}
+            onChange={(event) => setZoom(clampZoom(event.currentTarget.valueAsNumber))}
+          />
+          <button
+            type="button"
+            aria-label="恢复 100% 缩放"
+            title="恢复 100% 缩放"
+            onClick={() => setZoom(maxZoom)}
           >
-            <option value={60}>60%</option>
-            <option value={80}>80%</option>
-            <option value={100}>100%</option>
-            <option value={120}>120%</option>
-          </select>
-        </label>
+            {zoom}%
+          </button>
+        </div>
       </div>
       <div
         className="graph-canvas-scroll"
@@ -557,7 +570,7 @@ export function NodeMap({
               const summary = nodeSummary?.(node);
               const label = (
                 <>
-                  <Icon size={18} />
+                  <Icon size={16} />
                   <span>
                     <strong>{node.name || '未命名节点'}</strong>
                     <small title={summary ?? undefined}>

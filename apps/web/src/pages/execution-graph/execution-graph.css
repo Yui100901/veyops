@@ -73,11 +73,11 @@
 .graph-node {
   position: absolute;
   display: grid;
-  grid-template-columns: 1.125rem minmax(0, 1fr);
+  grid-template-columns: 16px minmax(0, 1fr);
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.4rem;
   box-sizing: border-box;
-  padding: 0.35rem 0.65rem;
+  padding: 0.3rem 0.55rem;
   text-align: left;
   border: 1px solid var(--border);
   border-radius: 0.5rem;
@@ -112,7 +112,7 @@ button.graph-node:focus-visible {
 }
 .graph-node small {
   color: var(--muted);
-  font-size: 0.75rem;
+  font-size: 0.73rem;
   line-height: 1.2;
   overflow: hidden;
   white-space: nowrap;
@@ -221,7 +221,7 @@ button.graph-node:focus-visible {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0.55rem 0.8rem;
+  padding: 0.4rem 0.7rem;
   background: #fff;
   border-bottom: 1px solid var(--border);
   gap: 0.6rem;
@@ -230,16 +230,33 @@ button.graph-node:focus-visible {
 .graph-canvas-controls > span {
   font-weight: 650;
 }
-.graph-canvas-controls label {
+.graph-canvas-zoom {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.45rem;
   font-size: 0.85rem;
   color: var(--muted);
 }
-.graph-canvas-controls select {
-  min-width: 4.75rem;
-  padding: 0.25rem 0.4rem;
+.graph-canvas-zoom input {
+  width: clamp(4.75rem, 13vw, 9rem);
+  margin: 0;
+  accent-color: var(--accent);
+}
+.graph-canvas-zoom input:focus-visible {
+  outline: 2px solid var(--accent);
+  box-shadow: none;
+}
+.graph-canvas-zoom button {
+  min-width: 3.15rem;
+  padding: 0.15rem 0.3rem;
+  border: 1px solid var(--border);
+  border-radius: var(--control-radius);
+  color: var(--accent-dark);
+  background: #fff;
+  font-variant-numeric: tabular-nums;
+}
+.graph-canvas-zoom button:hover {
+  border-color: var(--accent);
 }
 .graph-canvas-scroll {
   max-height: clamp(14rem, 62dvh, 46rem);
@@ -294,7 +311,7 @@ button.graph-node:focus-visible {
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   overflow: hidden;
-  font-size: 0.875rem;
+  font-size: 0.85rem;
   line-height: 1.23;
 }
 .graph-selection {
