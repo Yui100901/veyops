@@ -37,7 +37,6 @@ async function checkManagedBackups(t: TestContext, databaseUrl?: string) {
   const client = databaseUrl ? 'postgres' : 'sqlite';
   const key = randomBytes(32);
   const initial = randomBytes(24).toString('hex');
-  const password = randomBytes(24).toString('hex');
   const logPath = 'logs/backup-fixture.log';
   const artifactPath = 'artifacts/inspection.txt';
   const log = 'fixture log\n';
@@ -110,22 +109,15 @@ async function checkManagedBackups(t: TestContext, databaseUrl?: string) {
   const admin = session();
   const viewer = session();
   assert.equal((await admin('/backups')).status, 401);
-  assert.equal(
-    (await admin('/auth/login', 'POST', { username: 'root', password: initial })).status,
-    201,
-  );
-  assert.equal((await admin('/backups')).status, 403);
-  assert.equal(
-    (
-      await admin('/auth/change-password', 'POST', {
-        currentPassword: initial,
-        newPassword: password,
-      })
-    ).status,
-    200,
-  );
-  assert.equal((await admin('/auth/login', 'POST', { username: 'root', password })).status, 201);
-  assert.deepEqual(await (await admin('/backups')).json(), { data: [] });
+  const login = await admin('/auth/login', 'POST', { username: 'root', password: initial });
+  assert.equal(login.status, 201);
+  const { data: administrator } = await login.json();
+  assert.equal(administrator.mustChangePassword, false);
+  assert.equal(administrator.passwordChangeRecommended, true);
+  const empty = await admin('/backups');
+  assert.equal(empty.status, 200);
+  assert.deepEqual(await empty.json(), { data: [] });
+  assert.equal((await admin('/auth/dismiss-password-reminder', 'POST')).status, 200);
 
   const viewerName = 'backup-viewer';
   const viewerInitial = randomBytes(24).toString('hex');
@@ -140,15 +132,13 @@ async function checkManagedBackups(t: TestContext, databaseUrl?: string) {
     ).status,
     201,
   );
-  assert.equal(
-    (
-      await viewer('/auth/login', 'POST', {
-        username: viewerName,
-        password: viewerInitial,
-      })
-    ).status,
-    201,
-  );
+  const viewerLogin = await viewer('/auth/login', 'POST', {
+    username: viewerName,
+    password: viewerInitial,
+  });
+  assert.equal(viewerLogin.status, 201);
+  assert.equal((await viewerLogin.json()).data.mustChangePassword, true);
+  assert.equal((await viewer('/auth/dismiss-password-reminder', 'POST')).status, 403);
   assert.equal(
     (
       await viewer('/auth/change-password', 'POST', {
@@ -214,7 +204,7 @@ async function checkManagedBackups(t: TestContext, databaseUrl?: string) {
 
   const audit = await (await admin('/audit')).text();
   assert.ok(audit.includes(backup.id));
-  for (const value of [password, initial, key.toString('hex'), dataDir]) {
+  for (const value of [initial, viewerInitial, viewerPassword, key.toString('hex'), dataDir]) {
     assert.ok(!audit.includes(value));
   }
   await writeFile(join(dataDir, 'backups', backup.id, artifactPath), 'changed after backup');

@@ -268,7 +268,6 @@ async function seedWorkspace(db: Kysely<Database>, userId: string) {
 
 async function checkDashboard(url?: string) {
   const initial = randomBytes(24).toString('hex');
-  const password = randomBytes(24).toString('hex');
   const settings = {
     DATABASE_CLIENT: url ? 'postgres' : 'sqlite',
     DATABASE_URL: url,
@@ -299,25 +298,23 @@ async function checkDashboard(url?: string) {
     await request(server)
       .get(base + '/dashboard')
       .expect(401);
-    await api
-      .post(base + '/auth/login')
-      .send({ username: 'root', password: initial })
-      .expect(201);
-    await api.get(base + '/dashboard').expect(403);
-    await api
-      .post(base + '/auth/change-password')
-      .send({ currentPassword: initial, newPassword: password })
-      .expect(200);
-    const { id: userId } = (
+    const {
+      id: userId,
+      mustChangePassword,
+      passwordChangeRecommended,
+    } = (
       await api
         .post(base + '/auth/login')
-        .send({ username: 'root', password })
+        .send({ username: 'root', password: initial })
         .expect(201)
     ).body.data;
+    assert.equal(mustChangePassword, false);
+    assert.equal(passwordChangeRecommended, true);
     const empty = await dashboard();
     assert.deepEqual(empty.services, { total: 0, running: 0, abnormal: 0 });
     assert.deepEqual(empty.recentDeployments, []);
     assert.deepEqual(empty.recentFailedTasks, []);
+    await api.post(base + '/auth/dismiss-password-reminder').expect(200);
 
     const { expectedRecent, taskCount } = await seedWorkspace(db, userId);
     const failures = [
