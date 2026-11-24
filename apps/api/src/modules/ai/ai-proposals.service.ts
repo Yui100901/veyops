@@ -136,19 +136,20 @@ export class AiProposalsService {
     const repair = stored.failureTaskId
       ? { taskId: stored.failureTaskId, proposalId: id, automatic }
       : undefined;
-    if (repair) {
-      const context = await this.failureGuard?.repair(repair.taskId, repair);
-      if (
-        !context ||
-        context.actor.id !== user.id ||
+    const repairContext = repair
+      ? await this.failureGuard?.repair(repair.taskId, repair)
+      : undefined;
+    if (
+      repair &&
+      (!repairContext ||
+        repairContext.actor.id !== user.id ||
         stored.action !== 'initialize_component' ||
-        stored.payload.component !== context.component ||
-        stored.projectId !== context.projectId ||
+        stored.payload.component !== repairContext.component ||
+        stored.projectId !== repairContext.projectId ||
         stored.serverIds.length !== 1 ||
-        stored.serverIds[0] !== context.current.id
-      )
-        throw new ConflictException('故障修复绑定已失效');
-    }
+        stored.serverIds[0] !== repairContext.current.id)
+    )
+      throw new ConflictException('故障修复绑定已失效');
     const inputContext = stored.conversationId
       ? await this.repository.conversationContext(stored.conversationId)
       : undefined;
@@ -162,7 +163,8 @@ export class AiProposalsService {
       context,
     );
     if (prepared.action === 'run_pipeline') assertAiPipelineScope(context, prepared.preview);
-    prepared.projectId ??= stored.projectId;
+    prepared.projectId ??= repairContext?.projectId ?? stored.projectId;
+    if (repairContext) prepared.sourceRepositoryIds = repairContext.repositoryIds;
     if (
       prepared.bindingsHash !== stored.bindingsHash ||
       prepared.projectId !== stored.projectId ||

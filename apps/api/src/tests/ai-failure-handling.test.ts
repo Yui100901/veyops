@@ -399,6 +399,8 @@ async function verifyFailures(liveKey?: string, databaseUrl?: string) {
         .send({ mode: 'CONFIRM', ...restriction })
         .expect(200);
       assert.deepEqual((await api.get(path).query({ taskId: revoked })).body.data.incidents, []);
+      await api.post('/api/v1/ai/proposals/' + revokedProposal + '/confirm').expect(403);
+      assert.equal((await incident(revoked)).repair_task_id, null);
     }
     await policy('READ_ONLY');
     assert.equal(
