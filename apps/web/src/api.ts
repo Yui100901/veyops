@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { GraphEdge } from './pages/execution-graph-definition';
+import type { GraphEdge } from './pages/execution-graph/execution-graph-definition';
 
 const planIssueCodes = [
   'INPUT',
@@ -11,7 +11,31 @@ const planIssueCodes = [
   'CONFIGURATION',
 ] as const;
 
-export interface ExecutionPlanIssue {
+const graphIssueSections = ['input', 'execution', 'output'] as const;
+const graphIssueArtifactFields = [
+  'path',
+  'pathInput',
+  'imageReference',
+  'composeFilePath',
+  'referenceName',
+] as const;
+
+export type GraphIssueLocation = {
+  fieldSection?: (typeof graphIssueSections)[number];
+  artifactField?: (typeof graphIssueArtifactFields)[number];
+};
+
+export function readGraphIssueLocation(
+  fieldSection: unknown,
+  artifactField: unknown,
+): GraphIssueLocation {
+  return {
+    fieldSection: graphIssueSections.find((section) => section === fieldSection),
+    artifactField: graphIssueArtifactFields.find((field) => field === artifactField),
+  };
+}
+
+export interface ExecutionPlanIssue extends GraphIssueLocation {
   code: (typeof planIssueCodes)[number];
   message: string;
   flowId?: string;
@@ -38,7 +62,11 @@ function readPlanIssue(value: unknown): ExecutionPlanIssue | undefined {
   const row = value as Record<string, unknown>;
   const code = planIssueCodes.find((candidate) => candidate === row.code);
   if (!code || typeof row.message !== 'string') return;
-  const issue: ExecutionPlanIssue = { code, message: row.message };
+  const issue: ExecutionPlanIssue = {
+    code,
+    message: row.message,
+    ...readGraphIssueLocation(row.fieldSection, row.artifactField),
+  };
   for (const key of [
     'flowId',
     'flowName',

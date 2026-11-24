@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { version as appVersion } from '../../../package.json';
 import type { FormEvent, ReactNode } from 'react';
 import {
@@ -22,27 +22,53 @@ import {
 } from 'lucide-react';
 import { ApiError, api, message, navigate, post, useRoute } from './api';
 import { ErrorBanner, Loading, PageHeader, Section } from './components';
-import { DashboardPage } from './pages/Dashboard';
-import { CredentialsPage, ProjectsPage, ServersPage } from './pages/Resources';
-import { TaskPage, TasksPage } from './pages/Operations';
-import { OperationsCenterPage, operationsTabForPath } from './pages/BatchOperations';
-import { AuditPage, SystemPage } from './pages/System';
-import { BackupsPage } from './pages/Backups';
-import { AIPage } from './pages/AI';
-import { DeliveryRecordsPage, RegistriesPage } from './pages/Delivery';
-import { LegacyDeliveryLink } from './pages/ProjectDelivery';
-import { ProjectWorkspace } from './pages/ProjectWorkspace';
-import { readProjectWorkspace } from './pages/project-workspace-route';
-import { ProjectViewsPage } from './pages/ProjectViews';
-import { UsersPage } from './pages/Users';
+import { AIPage } from './pages/ai/AI';
+import { DashboardPage } from './pages/dashboard/Dashboard';
+import { CredentialsPage } from './pages/infrastructure/Credentials';
+import { ProjectsPage } from './pages/projects/Projects';
+import { TaskPage, TasksPage } from './pages/operations/Operations';
+import { operationsTabForPath } from './pages/operations/operation-routes';
+import { AuditPage } from './pages/settings/Audit';
+import { DeliveryRecordsPage } from './pages/delivery/Delivery';
+import { RegistriesPage } from './pages/delivery/Registries';
+import { LegacyDeliveryLink } from './pages/projects/delivery/ProjectDelivery';
+import { readProjectWorkspace } from './pages/projects/project-workspace-route';
 import {
   NotificationBell,
   NotificationPage,
   NotificationPreferencesPage,
   NotificationSmtpPage,
-} from './pages/Notifications';
+} from './pages/notifications/Notifications';
 import { userRoleNames } from './models';
 import type { User } from './models';
+
+const ServersPage = lazy(() =>
+  import('./pages/infrastructure/Servers').then(({ ServersPage }) => ({ default: ServersPage })),
+);
+const ProjectWorkspace = lazy(() =>
+  import('./pages/projects/ProjectWorkspace').then(({ ProjectWorkspace }) => ({
+    default: ProjectWorkspace,
+  })),
+);
+const ProjectViewsPage = lazy(() =>
+  import('./pages/projects/ProjectViews').then(({ ProjectViewsPage }) => ({
+    default: ProjectViewsPage,
+  })),
+);
+const SystemPage = lazy(() =>
+  import('./pages/settings/System').then(({ SystemPage }) => ({ default: SystemPage })),
+);
+const BackupsPage = lazy(() =>
+  import('./pages/settings/Backups').then(({ BackupsPage }) => ({ default: BackupsPage })),
+);
+const UsersPage = lazy(() =>
+  import('./pages/settings/Users').then(({ UsersPage }) => ({ default: UsersPage })),
+);
+const OperationsCenterPage = lazy(() =>
+  import('./pages/operations/BatchOperations').then(({ OperationsCenterPage }) => ({
+    default: OperationsCenterPage,
+  })),
+);
 
 const navigation = [
   {
@@ -652,7 +678,7 @@ export function App() {
         </header>
         <main className="main-content">
           <ErrorBanner error={error} />
-          {page}
+          <Suspense fallback={<Loading />}>{page}</Suspense>
         </main>
       </div>
     </div>
