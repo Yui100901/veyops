@@ -138,6 +138,7 @@ interface DeliveryPreview extends NodeScope {
   serviceId?: string;
   sourceSnapshot?: PreviewSource[];
   method?: 'FILE' | 'COMPOSE';
+  artifactPath?: string;
   composeSource?: { kind: 'ARTIFACT' | 'REPOSITORY_FILE' };
   composeTemplate?:
     | { source: 'ARCHIVE'; checksum: string }
@@ -205,6 +206,11 @@ export interface Preview extends DeliveryPreview {
       candidates?: WorkspaceCandidate[];
       optional?: boolean;
     };
+    artifact?: {
+      path: string;
+      instances?: string[];
+      producers?: { nodeId: string; fieldId: string }[];
+    };
   })[];
   executionPlan?: {
     targets: PlanTarget[];
@@ -267,6 +273,7 @@ const fieldNames: Record<string, string> = {
   buildWorkspaceRoot: '构建工作区根目录',
   workspaceRoot: '工作区根目录',
   workingDirectory: '工作目录',
+  artifactPath: '产物子路径',
   workDirectory: '工作目录',
   workspace: '工作区',
   directory: '工作目录',
@@ -958,6 +965,23 @@ export function ExecutionPlan({
               {script.directory && (
                 <small>
                   工作目录 · <code>{script.directory}</code>
+                </small>
+              )}
+              {script.artifact && (
+                <small>
+                  读取产物 · <code>{script.artifact.path}</code>
+                  {script.artifact.instances?.map((id) => (
+                    <span key={id}>
+                      {' '}
+                      · <code>{id}</code>
+                    </span>
+                  ))}
+                  {script.artifact.producers?.map(({ nodeId, fieldId }) => (
+                    <span key={nodeId + ':' + fieldId}>
+                      {' '}
+                      · {name.node({ flowId: script.flowId, nodeId })} / {fieldId}
+                    </span>
+                  ))}
                 </small>
               )}
               {script.workspace && (script.workspace.candidates || script.workspace.optional) ? (

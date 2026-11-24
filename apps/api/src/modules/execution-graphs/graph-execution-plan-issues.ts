@@ -66,7 +66,9 @@ export function withNodePlanIssue(
   };
   if (!typed || !issue) return withPlanIssue(error, location);
   const binding = field
-    ? (flow.inputBindings?.[node.id]?.[field] ?? graphDefaultBinding(flow, node, field))
+    ? (flow.compiled?.nodes[node.id]?.inputBindings[field] ??
+      flow.inputBindings?.[node.id]?.[field] ??
+      graphDefaultBinding(flow, node, field))
     : undefined;
   const targetSource =
     issue.targetSource === 'RUN_INPUT' && binding && binding.kind !== 'INPUT'

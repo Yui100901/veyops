@@ -120,11 +120,19 @@ export interface GraphCandidate {
   availability: 'ALWAYS' | 'CONDITIONAL';
   branches: string[];
 }
+export interface GraphStartGroup {
+  id: string;
+  label: string;
+  primary: GraphField;
+  companion?: GraphField;
+}
 export interface GraphNodeDirectory {
   inputs: GraphField[];
   outputs: GraphField[];
   candidates: GraphCandidate[];
   automaticInputBindings?: Record<string, GraphBinding>;
+  sourceGroups?: GraphStartGroup[];
+  releaseGroups?: GraphStartGroup[];
 }
 export interface GraphFieldSource {
   kind: string;
@@ -190,6 +198,8 @@ export interface GraphArtifactOutput {
   referenceName?: string;
   type: GraphArtifactType;
   path?: string;
+  collection?: 'WORK_DIRECTORY' | 'PATH';
+  excludePaths?: string[];
   pathInput?: string;
   imageReference?: string;
   composeFilePath?: string;
@@ -215,6 +225,7 @@ export interface FlowBuildDefinition {
 }
 export interface FlowDeployDefinition {
   method?: 'FILE' | 'COMPOSE';
+  artifactPath?: string;
   composeSource?:
     | { kind: 'ARTIFACT' }
     | { kind: 'REPOSITORY_FILE'; repositoryId: string; commitSha: string; path: string };
@@ -230,6 +241,7 @@ interface GraphShell {
   timeout?: number;
   location?: 'MANAGER' | 'TARGET';
   directory?: string;
+  artifactPath?: string;
   continueOnFailure?: boolean;
   params?: GraphField[];
   artifacts?: GraphArtifactOutput[];
@@ -245,6 +257,7 @@ export interface GraphNode {
   id: string;
   type: keyof typeof graphNodeLabels;
   contract?: 'PRESET';
+  sameHostRelease?: boolean;
   operation?: GraphOperation;
   inputDefaults?: Record<string, unknown>;
   environmentDefaults?: Record<string, string>;
@@ -309,7 +322,10 @@ export interface GraphFlow extends FlowBindings {
   name: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
-  compiled?: { nodes: Record<string, { inputBindings?: Record<string, GraphBinding> }> };
+  compiled?: {
+    presetResourceGroups?: true;
+    nodes: Record<string, { inputBindings?: Record<string, GraphBinding> }>;
+  };
 }
 export interface GraphEndpoint extends FlowBindings {
   startId: string;

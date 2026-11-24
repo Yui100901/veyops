@@ -26,6 +26,7 @@ function configureFixture(canvas, variant) {
     if (node.operation === 'BUILD' && variant !== 'DOCKER_IMAGE') {
       node.build.buildCommand = 'printf "build fixture\n"';
       node.build.artifacts[0].path = variant === 'FILE' ? 'dist/fixture.tar.gz' : 'dist';
+      if (variant === 'DIRECTORY') node.build.artifacts[0].collection = 'PATH';
     }
     if (node.operation === 'DEPLOY_ARTIFACT') node.deploy.deployPath = '/tmp/veyops-preset-fixture';
     if (node.operation === 'HEALTH_CHECK') node.healthCheck.command = 'test -e current';
@@ -68,9 +69,12 @@ for (const { id, steps, artifactTypes } of graphFlowTemplates) {
     const health = actions.find(({ operation }) => operation === 'HEALTH_CHECK');
     const from = (node, fieldId) => ({ kind: 'OUTPUT', nodeId: node.id, fieldId });
     const input = (fieldId) => ({ kind: 'INPUT', fieldId });
+    configureFixture(fragment, variant);
+    const { nodes: compiled } = compileCanvas(fragment, true).flows[0].compiled;
     if (checkout) {
       assert.equal(start.inputs.find(({ id }) => id === 'gitVersion').required, false);
-      assert.deepEqual(endpoint.inputBindings[checkout.id].version, {
+      assert.equal(endpoint.inputBindings[checkout.id], undefined);
+      assert.deepEqual(compiled[checkout.id].inputBindings.version, {
         ...input('gitVersion'),
         onMissing: 'REPOSITORY_DEFAULT',
       });
@@ -90,8 +94,8 @@ for (const { id, steps, artifactTypes } of graphFlowTemplates) {
     }
     if (deploy) {
       assert.equal(deploy.deploy.method, variant === 'DOCKER_IMAGE' ? 'COMPOSE' : 'FILE');
-      assert.deepEqual(endpoint.inputBindings[deploy.id].targets, input('releaseTargets'));
-      assert.deepEqual(endpoint.inputBindings[deploy.id].service, input('service'));
+      assert.deepEqual(compiled[deploy.id].inputBindings.targets, input('releaseTargets'));
+      assert.deepEqual(compiled[deploy.id].inputBindings.service, input('service'));
       assert.deepEqual(
         endpoint.inputBindings[deploy.id].artifact,
         build ? from(build, 'primaryArtifact') : input('artifact'),
@@ -105,7 +109,6 @@ for (const { id, steps, artifactTypes } of graphFlowTemplates) {
       assert.deepEqual(endpoint.outputBindings.healthStatus, from(health, 'status'));
     }
 
-    configureFixture(fragment, variant);
     if (deploy && variant === 'DOCKER_IMAGE') {
       const wrongDelivery = structuredClone(fragment);
       const wrong = wrongDelivery.nodes.find(({ id }) => id === deploy.id);

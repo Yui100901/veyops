@@ -41,7 +41,7 @@ export async function protectedArtifacts(db: Kysely<Database>) {
     db
       .selectFrom('tasks')
       .select('payload_json')
-      .where('task_type', '=', 'PIPELINE')
+      .where('task_type', 'in', ['PIPELINE', 'GRAPH_MODULE'])
       .where('status', 'in', activeArtifactTaskStatuses)
       .execute(),
   ]);
@@ -92,9 +92,12 @@ export async function protectedArtifacts(db: Kysely<Database>) {
   for (const task of tasks) {
     const payload = JSON.parse(task.payload_json) as {
       pipeline?: { deploymentArtifacts?: { id: string }[] };
+      graphModule?: { shell?: { artifact?: { instanceId: string } } };
     };
     for (const artifact of payload.pipeline?.deploymentArtifacts ?? [])
       protectedIds.add(artifact.id);
+    const scriptArtifact = payload.graphModule?.shell?.artifact;
+    if (scriptArtifact) protectedIds.add(scriptArtifact.instanceId);
   }
   return protectedIds;
 }

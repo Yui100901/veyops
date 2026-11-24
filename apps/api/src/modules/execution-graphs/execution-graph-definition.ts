@@ -138,6 +138,7 @@ class GraphShell {
   location?: 'MANAGER' | 'TARGET';
   @ValidateIf((_o, v) => v !== undefined) @IsInt() @Min(1) @Max(7200) timeout?: number;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) directory?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) artifactPath?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() continueOnFailure?: boolean;
   @ValidateIf((_o, v) => v !== undefined)
   @IsArray()
@@ -164,6 +165,15 @@ export class GraphArtifactDeclaration {
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(64) referenceName?: string;
   @IsIn(graphArtifactTypes) type!: GraphArtifactType;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsIn(['WORK_DIRECTORY', 'PATH'])
+  collection?: 'WORK_DIRECTORY' | 'PATH';
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsString({ each: true })
+  @MaxLength(1024, { each: true })
+  excludePaths?: string[];
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) path?: string;
   @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) pathInput?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(512) imageReference?: string;
@@ -247,6 +257,7 @@ class GraphHealthCheck {
 
 export class GraphDeploySettings {
   @ValidateIf((_o, v) => v !== undefined) @IsIn(['FILE', 'COMPOSE']) method?: 'FILE' | 'COMPOSE';
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) artifactPath?: string;
   @ValidateIf((_o, v) => v !== undefined)
   @IsObject()
   @ValidateNested()
@@ -265,6 +276,7 @@ export class GraphNode {
   @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) referenceName?: string;
   @IsIn([...nodeTypes, 'FUNCTION']) type!: (typeof nodeTypes)[number] | 'FUNCTION';
   @ValidateIf((_o, v) => v !== undefined) @IsIn(['PRESET']) contract?: 'PRESET';
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() sameHostRelease?: boolean;
   @ValidateIf((node, value) => node.type === 'FUNCTION' || value !== undefined)
   @IsIn(functionOperations)
   operation?: (typeof functionOperations)[number];
@@ -690,14 +702,14 @@ export function annotateGraphIssue(error: unknown, flow: GraphFlow, node?: Graph
 
 function missingNodeConfiguration(node: GraphNode): GraphDiagnostic[] {
   if (node.type === 'BUILD')
-    return (node.build?.artifacts ?? []).flatMap(({ id, name, type, path }) =>
-      type !== 'DOCKER_IMAGE' && !path?.trim()
+    return (node.build?.artifacts ?? []).flatMap(({ id, name, type, path, collection }) =>
+      type !== 'DOCKER_IMAGE' && collection !== 'WORK_DIRECTORY' && !path?.trim()
         ? [
             {
               fieldId: id ?? name,
               fieldSection: 'output',
               artifactField: 'path',
-              message: `请填写「${name}」的工作区相对路径`,
+              message: `请填写「${name}」相对构建工作目录的路径`,
             },
           ]
         : [],
@@ -739,6 +751,25 @@ export function validateGraphDefinition(definition: GraphDefinition) {
         if (!safeGraphId(node.id)) throw new BadRequestException('节点 ID 无效');
         if (node.type === 'FUNCTION' || node.operation !== undefined)
           throw new BadRequestException('功能节点须在画布中声明后编译');
+        for (const [fieldId, directory] of [
+          ['repoPath', node.build?.repoPath],
+          ['directory', node.shell?.directory],
+          ['artifactPath', node.shell?.artifactPath ?? node.deploy?.artifactPath],
+        ] as const) {
+          if (!directory?.trim()) continue;
+          try {
+            relativePath(directory.trim());
+          } catch {
+            issues.push({
+              flowId: flow.id,
+              nodeId: node.id,
+              fieldId,
+              fieldSection: 'execution',
+              severity: 'ERROR',
+              message: `「${flow.name}」 → 「${node.name}」 · ${fieldId === 'artifactPath' ? '产物子路径' : '工作目录'}必须为不含 .. 的相对路径`,
+            });
+          }
+        }
         if (!definition.canvas && nodeIds.has(node.id))
           throw new BadRequestException('同一图版本中的节点 ID 必须唯一');
         nodeIds.add(node.id);
@@ -766,6 +797,8 @@ export function validateGraphDefinition(definition: GraphDefinition) {
           throw new BadRequestException('功能配置与节点模块不匹配');
         if (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') {
           if (node.deploy?.deployPath?.trim()) safeDeployPath(node.deploy.deployPath);
+          if (node.deploy?.method === 'COMPOSE' && node.deploy.artifactPath)
+            throw new BadRequestException('Compose 部署使用镜像，不能选择目录产物子路径');
           const template = node.deploy?.composeSource;
           if (template && node.deploy?.method === 'FILE')
             throw new BadRequestException('文件发布不能声明 Compose 模板');

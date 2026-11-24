@@ -119,10 +119,6 @@ export function expandGraphTemplate(
       { id: 'repository', name: '项目仓库', type: 'REPOSITORY', required: true },
       { id: 'gitVersion', name: 'Git 版本', type: 'GIT_REF', required: false },
     );
-    inputBindings[checkout.id] = {
-      repository: input('repository'),
-      version: { ...input('gitVersion'), onMissing: 'REPOSITORY_DEFAULT' },
-    };
   }
 
   const workspace = checkout && {
@@ -152,13 +148,14 @@ export function expandGraphTemplate(
           type: artifactType,
           required: true,
           persist: true,
-          path: artifactType === 'DOCKER_IMAGE' ? 'Dockerfile' : '',
+          ...(artifactType === 'DIRECTORY'
+            ? { collection: 'WORK_DIRECTORY' as const }
+            : { path: artifactType === 'DOCKER_IMAGE' ? 'Dockerfile' : '' }),
         },
       ],
     };
     inputBindings[build.id] = {
       ...workspace,
-      service: input('service'),
       targets: input('buildTargets'),
     };
     finish(
@@ -196,8 +193,6 @@ export function expandGraphTemplate(
     };
     inputBindings[deploy.id] = {
       artifact: build ? output(build, primaryArtifactId) : input('artifact'),
-      service: input('service'),
-      targets: input('releaseTargets'),
     };
     if (approve) approve.approval = { releaseNodeId: deploy.id };
     if (health) {

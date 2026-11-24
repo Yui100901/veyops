@@ -30,6 +30,7 @@ import {
 
 export interface ArtifactPhysical {
   kind: PathArtifactKind | 'DOCKER_IMAGE';
+  collection?: 'WORK_DIRECTORY';
   location: 'SERVER_PATH' | 'BUILDER_PATH' | 'DOCKER_ENGINE' | 'REGISTRY';
   owner: 'MANAGED' | 'EXTERNAL';
   serverId?: string;
@@ -55,7 +56,10 @@ export type ArtifactRemoval = { status: 'DELETED' | 'RETAINED' | 'RETRY'; reason
 
 interface CollectPathInput {
   workspace: string;
+  workingDirectory?: string;
   relativePath: string;
+  collection?: 'WORK_DIRECTORY' | 'PATH';
+  excludePaths?: readonly string[];
   kind: PathArtifactKind;
   instanceId: string;
   signal?: AbortSignal;
@@ -130,7 +134,37 @@ function hasErrno(error: unknown, ...codes: string[]) {
 function ensureCollection(input: CollectPathInput) {
   if (!uuid.test(input.instanceId) || !['FILE', 'DIRECTORY'].includes(input.kind))
     throw new BadRequestException('登记实例或实物类型无效');
-  return relativePath(input.relativePath);
+  const snapshot = input.collection === 'WORK_DIRECTORY';
+  if (snapshot && input.kind !== 'DIRECTORY')
+    throw new BadRequestException('工作目录须登记为目录产物');
+  const directory = posix.normalize(relativePath(input.workingDirectory || '.')).replace(/\/$/, '');
+  const path = snapshot
+    ? '.'
+    : posix.normalize(relativePath(input.relativePath)).replace(/\/$/, '');
+  if (!snapshot && path === '.') throw new BadRequestException('请指定要收集的文件或子目录');
+  const excluded = (input.excludePaths ?? []).map((value) =>
+    posix.normalize(relativePath(value)).replace(/\/$/, ''),
+  );
+  if (excluded.includes('.')) throw new BadRequestException('排除项须在工作目录内');
+  return { directory, path, snapshot, excluded };
+}
+
+function snapshotEntry(name: string) {
+  return !['.git', '.veyops', '.env'].includes(name) && !name.startsWith('.env.');
+}
+
+export function artifactSelection(physical: ArtifactPhysical | undefined, configured?: string) {
+  if (!configured && physical?.collection === 'WORK_DIRECTORY')
+    throw new ConflictException('请选择工作目录快照中的子路径，或填写 . 使用整个目录');
+  if (!configured) return '.';
+  const path = posix.normalize(relativePath(configured)).replace(/\/$/, '');
+  if (
+    !physical ||
+    physical.kind === 'DOCKER_IMAGE' ||
+    (path !== '.' && physical.kind !== 'DIRECTORY')
+  )
+    throw new ConflictException('所选子路径要求可验证的文件或目录产物');
+  return path;
 }
 
 const remoteArtifactRoot = String.raw`
@@ -149,6 +183,21 @@ if [[ ! -e "$slot" ]]; then exit 44; fi
 [[ -f "$slot/.owner" ]] || exit 45
 [[ "$(cat -- "$slot/.owner")" == "$owner" ]] || exit 45
 if [[ ! -e "$slot/payload" ]]; then exit 44; fi
+`;
+
+const remoteSelectPath = String.raw`
+source="$slot/payload"
+if [[ "$selected" != . ]]; then
+  source="$source/$selected"
+  [[ "$(realpath -e -- "$source")" == "$source" ]] || exit 45
+  if [[ -f "$source" ]]; then
+    kind=FILE
+    name=$(basename -- "$source")
+  else
+    [[ -d "$source" ]] || exit 45
+  fi
+  expected=$(artifact_digest "$kind" "$source")
+fi
 `;
 
 @Injectable()
@@ -182,7 +231,7 @@ export class ArtifactPhysicalService {
   async collectServerPath(
     input: CollectPathInput & { target: SshTarget },
   ): Promise<ArtifactPhysical> {
-    const declared = ensureCollection(input);
+    const { directory, path: declared, snapshot, excluded } = ensureCollection(input);
     if (!remotePath(input.workspace) || !input.target.hostKeyFingerprint)
       throw new BadRequestException('目标端登记需要规范工作区和已确认 SSH 指纹');
     const ownerToken = token(input.target.id, input.instanceId);
@@ -196,7 +245,12 @@ export class ArtifactPhysicalService {
         'owner=' + q(ownerToken),
         'kind=' + q(input.kind),
         'workspace=' + q(input.workspace),
+        'directory=' + q(directory),
         'declared=' + q(declared),
+        'snapshot=' + q(snapshot ? 'yes' : 'no'),
+        'excludes=(' +
+          excluded.map((path) => q('./' + path.replace(/[\\*?\[\]]/g, '\\$&'))).join(' ') +
+          ')',
         String.raw`
 mkdir -p -- "$root"
 [[ "$(realpath -e -- "$root")" == "$root" ]]
@@ -212,12 +266,16 @@ if [[ -e "$slot" || -L "$slot" ]]; then
   [[ "$(cat -- "$slot/.digest")" == "$measured" ]] || exit 45
 else
   [[ -d "$workspace" && "$(realpath -e -- "$workspace")" == "$workspace" ]]
-  requested="$workspace/$declared"
+  workdir="$workspace"
+  if [[ "$directory" != . ]]; then workdir="$workspace/$directory"; fi
+  if [[ ! -d "$workdir" ]]; then exit 44; fi
+  [[ "$(realpath -e -- "$workdir")" == "$workdir" ]] || exit 45
+  requested="$workdir"
+  if [[ "$declared" != . ]]; then requested="$workdir/$declared"; fi
   if [[ ! -e "$requested" && ! -L "$requested" ]]; then exit 44; fi
   source=$(realpath -e -- "$requested")
-  case "$source" in "$workspace"/*) ;; *) exit 45 ;; esac
-  [[ ! -L "$requested" ]]
-  original=$(artifact_digest "$kind" "$source")
+  [[ "$source" == "$requested" && ! -L "$requested" ]] || exit 45
+  if [[ "$snapshot" == no ]]; then original=$(artifact_digest "$kind" "$source"); fi
   stage="$root/.staging-$instance"
   [[ ! -L "$stage" ]]
   if [[ -e "$stage" ]]; then
@@ -230,9 +288,20 @@ else
   fi
   mkdir -- "$stage"
   printf '%s' "$owner" > "$stage/.owner"
-  cp -a -- "$source" "$stage/payload"
+  if [[ "$snapshot" == yes ]]; then
+    mkdir -- "$stage/payload"
+    selector=( -name .git -o -name .veyops -o -name .env -o -name '.env.*' )
+    for exclusion in "${'${excludes[@]}'}"; do selector+=( -o -path "$exclusion" ); done
+    (
+      cd -- "$source"
+      find . \( "${'${selector[@]}'}" \) -prune -o \( -type f -o -type d \) -print0 |
+        tar --null --no-recursion --hard-dereference -T - -cf -
+    ) | tar --no-same-owner -xf - -C "$stage/payload"
+  else
+    cp -a -- "$source" "$stage/payload"
+  fi
   measured=$(artifact_digest "$kind" "$stage/payload")
-  [[ "$measured" == "$original" ]] || exit 45
+  [[ "$snapshot" == yes || "$measured" == "$original" ]] || exit 45
   printf '%s' "$measured" > "$stage/.digest"
   mv -T -- "$stage" "$slot"
 fi
@@ -260,6 +329,7 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
       ownerToken,
       serverId: input.target.id,
       hostKeyFingerprint: input.target.hostKeyFingerprint,
+      ...(snapshot && { collection: 'WORK_DIRECTORY' }),
       ...(input.kind === 'FILE' && { fileName: posix.basename(declared) }),
       ...parseDigest(measured),
     };
@@ -309,7 +379,7 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
   }
 
   async collectBuilderPath(input: CollectPathInput): Promise<ArtifactPhysical> {
-    const declared = ensureCollection(input);
+    const { directory, path: declared, snapshot, excluded } = ensureCollection(input);
     const root = await this.builderRoot(true);
     const slot = join(root, input.instanceId);
     const ownerToken = token('manager', input.instanceId);
@@ -323,15 +393,22 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
       digest = await this.readyBuilderSlot(slot, ownerToken, input.kind, input.signal);
     } else {
       const workspace = await realpath(input.workspace);
-      const requested = resolve(workspace, declared);
-      if (!containedPath(workspace, requested)) throw new InvalidArtifactObject();
+      const workdir = resolve(workspace, directory);
+      const requested = resolve(workdir, declared);
+      if (
+        (!snapshot && !containedPath(workdir, requested)) ||
+        workspace !== resolve(input.workspace)
+      )
+        throw new InvalidArtifactObject();
       const source = await realpath(requested).catch((error: unknown) => {
         if (hasErrno(error, 'ENOENT')) throw new ArtifactOutputMissing();
         throw error;
       });
-      if (!containedPath(workspace, source) || (await lstat(requested)).isSymbolicLink())
+      if (source !== requested || (await lstat(requested)).isSymbolicLink())
         throw new InvalidArtifactObject();
-      const expected = await artifactPathDigest(source, input.kind, input.signal);
+      const expected = snapshot
+        ? undefined
+        : await artifactPathDigest(source, input.kind, input.signal);
       const stage = await mkdtemp(join(root, '.staging-' + input.instanceId + '-'));
       try {
         await writeFile(join(stage, '.owner'), ownerToken, { mode: 0o600, flag: 'wx' });
@@ -339,9 +416,25 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
           recursive: true,
           force: false,
           errorOnExist: true,
+          ...(snapshot && {
+            async filter(entry: string) {
+              input.signal?.throwIfAborted();
+              if (entry === source) return true;
+              if (
+                !snapshotEntry(basename(entry)) ||
+                excluded.includes(relative(source, entry).split(sep).join('/'))
+              )
+                return false;
+              const details = await lstat(entry);
+              return details.isFile() || details.isDirectory();
+            },
+          }),
         });
         const copied = await artifactPathDigest(join(stage, 'payload'), input.kind, input.signal);
-        if (expected.sha256 !== copied.sha256 || expected.sizeBytes !== copied.sizeBytes)
+        if (
+          expected &&
+          (expected.sha256 !== copied.sha256 || expected.sizeBytes !== copied.sizeBytes)
+        )
           throw new InvalidArtifactObject();
         await writeFile(join(stage, '.digest'), copied.sha256 + ':' + copied.sizeBytes, {
           mode: 0o600,
@@ -364,6 +457,7 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
       path,
       ownerToken,
       builderId: 'manager',
+      ...(snapshot && { collection: 'WORK_DIRECTORY' }),
       ...(input.kind === 'FILE' && { fileName: basename(declared) }),
       ...digest,
     };
@@ -616,6 +710,7 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
     target: SshTarget,
     archive: string,
     signal?: AbortSignal,
+    configuredPath?: string,
   ) {
     const name = physical.kind === 'FILE' ? (physical.fileName ?? 'artifact') : 'payload';
     if (
@@ -631,6 +726,7 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
       /[\x00-\x1f\x7f]/.test(name)
     )
       throw new ConflictException('无法将该产物应用到当前服务器');
+    const selected = artifactSelection(physical, configuredPath);
     const receipt = await this.server(
       target,
       [
@@ -641,14 +737,16 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
         'archive=' + q(archive),
         'name=' + q(name),
         'kind=' + q(physical.kind),
+        'selected=' + q(selected),
         String.raw`
 [[ "$(artifact_digest "$kind" "$slot/payload")" == "$expected" ]] || exit 45
+${remoteSelectPath}
 parent=$(dirname -- "$archive")
 [[ "$(realpath -e -- "$parent")" == "$parent" && ! -e "$archive" && ! -L "$archive" ]]
 stage=$(mktemp -d "$parent/.pickup-XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 mkdir -- "$stage/files"
-cp -a -- "$slot/payload" "$stage/files/$name"
+cp -a -- "$source" "$stage/files/$name"
 [[ "$(artifact_digest "$kind" "$stage/files/$name")" == "$expected" ]] || exit 45
 if [[ "$kind" == DIRECTORY ]]; then
   tar -czf "$stage/.payload.tar.gz" -C "$stage/files/$name" .
@@ -662,9 +760,146 @@ printf '%s:%s\n' "$(checksum "$archive")" "$(stat -c '%s' -- "$archive")"
       signal,
     );
     if (receipt.exitCode !== 0)
-      throw new ConflictException('同机产物缺失、已变化或无法生成发布归档');
+      throw new ConflictException('目标端产物或所选子路径缺失、已变化或无法归档');
     const { sha256: checksum, sizeBytes } = parseDigest(receipt.stdout);
     return { checksum, sizeBytes };
+  }
+
+  async stageBuilderArchive(
+    physical: ArtifactPhysical,
+    archive: string,
+    configuredPath: string | undefined,
+    signal?: AbortSignal,
+  ) {
+    const path = artifactSelection(physical, configuredPath);
+    if (physical.location !== 'BUILDER_PATH' || physical.kind === 'DOCKER_IMAGE')
+      throw new ConflictException('无法读取管理端文件产物');
+    try {
+      const slot = await this.builderSlot(physical);
+      const measured = await this.readyBuilderSlot(
+        slot,
+        physical.ownerToken!,
+        physical.kind,
+        signal,
+      );
+      if (measured.sha256 !== physical.sha256 || measured.sizeBytes !== physical.sizeBytes)
+        throw new InvalidArtifactObject();
+      const source = await this.builderSelection(slot, path);
+      const details = await lstat(source);
+      if (!details.isFile() && !details.isDirectory()) throw new InvalidArtifactObject();
+      const archiveDirectory = details.isDirectory() ? source : dirname(source);
+      const entry = details.isDirectory() ? '.' : './' + basename(source);
+      const name = path === '.' && details.isFile() ? physical.fileName : undefined;
+      const staging = name && (await mkdtemp(join(dirname(archive), '.pickup-')));
+      try {
+        if (staging && name) {
+          if (basename(name) !== name || ['.', '..'].includes(name))
+            throw new InvalidArtifactObject();
+          await cp(source, join(staging, name), { errorOnExist: true, force: false });
+        }
+        const packaged = await this.process.run(
+          'tar',
+          ['-czf', archive, '-C', staging || archiveDirectory, staging ? './' + name : entry],
+          { timeout: 180, signal },
+        );
+        if (packaged.exitCode !== 0) throw new InvalidArtifactObject();
+        const after = await this.readyBuilderSlot(
+          slot,
+          physical.ownerToken!,
+          physical.kind,
+          signal,
+        );
+        if (after.sha256 !== measured.sha256 || after.sizeBytes !== measured.sizeBytes)
+          throw new InvalidArtifactObject();
+        const { sha256: checksum, sizeBytes } = await artifactPathDigest(archive, 'FILE', signal);
+        return { checksum, sizeBytes };
+      } finally {
+        if (staging) await rm(staging, { recursive: true, force: true });
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (error instanceof InvalidArtifactObject || hasErrno(error, 'ENOENT'))
+        throw new ConflictException('管理端产物或所选子路径缺失、已变化或无法归档');
+      throw error;
+    }
+  }
+
+  async stageLocalPathArchive(
+    physical: ArtifactPhysical,
+    archive: string,
+    path: string | undefined,
+    signal: AbortSignal,
+  ) {
+    if (physical.location === 'BUILDER_PATH')
+      return this.stageBuilderArchive(physical, archive, path, signal);
+    if (physical.location !== 'SERVER_PATH' || !physical.serverId)
+      throw new ConflictException('产物没有可分发的文件实物');
+    const target = await this.servers.get(physical.serverId);
+    const stage = await this.server(
+      target,
+      ['umask 077', this.serverSlot(physical, target), 'mktemp -d "$root/.pickup-XXXXXXXX"'].join(
+        '\n',
+      ),
+      signal,
+    );
+    const directory = stage.stdout.trim();
+    if (
+      stage.exitCode !== 0 ||
+      !remotePath(directory) ||
+      !/\/\.veyops\/artifacts\/\.pickup-[a-zA-Z0-9]{8}$/.test(directory)
+    )
+      throw new ConflictException('无法在产物所在服务器准备分发目录');
+    try {
+      const remote = directory + '/artifact.tar.gz';
+      const receipt = await this.stageServerArchive(physical, target, remote, signal, path);
+      await this.ssh.download(target, remote, archive, { timeout: 300, signal });
+      const measured = await artifactPathDigest(archive, 'FILE', signal);
+      if (measured.sha256 !== receipt.checksum || measured.sizeBytes !== receipt.sizeBytes)
+        throw new ConflictException('分发产物归档校验失败');
+      return receipt;
+    } finally {
+      await this.server(
+        target,
+        'rm -f -- ' + q(directory + '/artifact.tar.gz') + '\nrmdir -- ' + q(directory),
+      ).catch(() => undefined);
+    }
+  }
+
+  private async builderSelection(slot: string, path: string) {
+    const root = join(slot, 'payload');
+    const source = resolve(root, path);
+    if ((path !== '.' && !containedPath(root, source)) || (await realpath(source)) !== source)
+      throw new InvalidArtifactObject();
+    return source;
+  }
+
+  async verifyPathSelection(physical: ArtifactPhysical | undefined, configuredPath?: string) {
+    const path = artifactSelection(physical, configuredPath);
+    if (path === '.' || !physical) return;
+    try {
+      if (physical.location === 'BUILDER_PATH') {
+        await this.builderSelection(await this.builderSlot(physical), path);
+      } else if (physical.location === 'SERVER_PATH' && physical.serverId) {
+        const target = await this.servers.get(physical.serverId);
+        const result = await this.server(
+          target,
+          [
+            this.serverSlot(physical, target),
+            linuxArtifactDigest,
+            'kind=' + q(physical.kind),
+            'selected=' + q(path),
+            remoteSelectPath,
+          ].join('\n'),
+        );
+        if (result.exitCode !== 0) throw new InvalidArtifactObject();
+      } else {
+        throw new InvalidArtifactObject();
+      }
+    } catch (error) {
+      if (error instanceof InvalidArtifactObject || hasErrno(error, 'ENOENT'))
+        throw new ConflictException('产物中找不到已选子路径，或该路径已变化');
+      throw error;
+    }
   }
 
   async remove(

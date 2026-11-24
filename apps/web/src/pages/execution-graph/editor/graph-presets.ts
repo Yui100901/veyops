@@ -50,7 +50,14 @@ export function primaryBuildArtifact(type: GraphArtifactType): GraphArtifactOutp
     DIRECTORY: ['构建目录', 'BUILD_OUTPUT_DIR'],
     DOCKER_IMAGE: ['构建镜像', 'DOCKER_IMAGE'],
   }[type]!;
-  return { id: 'primaryArtifact', name: name!, type, referenceName, required: true };
+  return {
+    id: 'primaryArtifact',
+    name: name!,
+    type,
+    referenceName,
+    required: true,
+    ...(type === 'DIRECTORY' && { collection: 'WORK_DIRECTORY' }),
+  };
 }
 
 export function appendFlowTemplate(

@@ -16,9 +16,12 @@ export function ExecutionGraphInputSummary({
   if (!entries.length) return null;
   return (
     <dl className="graph-action-sources" aria-label="实际数据来源">
-      {entries.map(({ label, sources }) => (
+      {entries.map(({ label, sources, grouped }) => (
         <div key={label}>
-          <dt>{label}来自</dt>
+          <dt>
+            {label}
+            {!grouped && '来自'}
+          </dt>
           <dd>
             {sources.map(({ name, nodeId, fieldId, section }, index) => {
               const target = nodeId ? { nodeId, fieldId, section } : undefined;

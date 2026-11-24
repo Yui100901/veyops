@@ -15,6 +15,8 @@ export function graphArtifactDefinitions(
     name: graphArtifactPortId(declaration),
     type: declaration.type,
     path: declaration.path,
+    collection: declaration.collection,
+    excludePaths: declaration.excludePaths,
     imageReference: declaration.imageReference,
     required: declaration.required,
     persist: declaration.persist,
@@ -55,6 +57,7 @@ export function graphArtifactInstance(row: GraphArtifactRow) {
     imageReference: physical?.imageReference,
     path: physical?.path,
     location: physical?.location,
+    collection: physical?.collection,
   };
 }
 

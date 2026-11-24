@@ -11,6 +11,7 @@ import {
   graphModulePorts,
   graphNodeEnvironmentBindings,
   graphOperationPorts,
+  graphPresetStartPort,
   graphRecord,
   graphScriptInputs,
   graphScriptInputTypes,
@@ -28,6 +29,7 @@ import {
 } from './graph-fields';
 
 export interface GraphCompiledFlow {
+  presetResourceGroups?: true;
   order: string[];
   nodes: Record<
     string,
@@ -212,6 +214,7 @@ function predecessors(edges: readonly GraphEdge[], ordered: GraphNode[]) {
 
 interface BindingContext {
   flow: GraphFlow;
+  start: GraphNode;
   inputs: Map<string, GraphField>;
   nodes: Map<string, GraphNode>;
   outputs: Map<string, GraphField[]>;
@@ -222,6 +225,230 @@ interface BindingContext {
 type PathOrder = { path: PathScenario; order: Map<string, Set<string>> };
 
 type InferredBinding = { binding?: GraphBinding; issue?: string };
+
+type ResourceGroup = {
+  id: string;
+  label: string;
+  primary: GraphField;
+  companion?: GraphField;
+};
+
+type ResolvedResourceGroup = {
+  candidates: ResourceGroup[];
+  bindings: Record<string, GraphBinding>;
+  issue?: { message: string; fieldId: string; sourceFieldId?: string };
+};
+
+const groupSpecs = {
+  source: {
+    primaryId: 'repository',
+    primaryType: 'REPOSITORY',
+    primaryPort: 'repository',
+    companionId: 'gitVersion',
+    companionType: 'GIT_REF',
+    companionPort: 'version',
+    label: '源码',
+  },
+  release: {
+    primaryId: 'service',
+    primaryType: 'SERVICE',
+    primaryPort: 'service',
+    companionId: 'releaseTargets',
+    companionType: 'TARGETS',
+    companionPort: 'targets',
+    label: '发布组合',
+  },
+} as const;
+
+type GroupKind = keyof typeof groupSpecs;
+
+function matchesStartField(field: GraphField | undefined, type: GraphField['type']) {
+  return field?.type === type && !field.multiple;
+}
+
+function resourceGroups(context: BindingContext, kind: GroupKind) {
+  const { inputs } = context;
+  const spec = groupSpecs[kind];
+  const fields = [...inputs.values()];
+  const primaries = fields.filter((field) => matchesStartField(field, spec.primaryType));
+  return primaries.flatMap((primary) => {
+    const named = primary.id === spec.primaryId || primary.id.startsWith(spec.primaryId + '-');
+    if (!named && primaries.length > 1) return [];
+    const suffix = named ? primary.id.slice(spec.primaryId.length) : '';
+    const key = spec.companionId + suffix;
+    const expected = inputs.get(key);
+    const legacy =
+      !expected && !suffix && (primary.id === spec.primaryId || primaries.length === 1)
+        ? fields.filter(
+            (field) =>
+              matchesStartField(field, spec.companionType) &&
+              (kind === 'release'
+                ? field.purpose === 'RELEASE_TARGETS' && !field.id.startsWith(key + '-')
+                : !field.id.startsWith(key + '-')),
+          )
+        : [];
+    const validPurpose = kind !== 'release' || expected?.purpose !== 'BUILD_TARGETS';
+    const companion =
+      validPurpose && matchesStartField(expected, spec.companionType)
+        ? expected
+        : legacy.length === 1
+          ? legacy[0]
+          : undefined;
+    return [{ id: primary.id, label: primary.name, primary, companion, expectedId: key }];
+  });
+}
+
+function resourceGroupBinding(
+  context: BindingContext,
+  node: GraphNode,
+  kind: GroupKind,
+  allowAbsent: boolean,
+): ResolvedResourceGroup {
+  const spec = groupSpecs[kind];
+  const primary = authoredBinding(context.flow, node, spec.primaryPort);
+  const secondary = authoredBinding(context.flow, node, spec.companionPort);
+  const groups = resourceGroups(context, kind);
+  const sameHost =
+    kind === 'release' &&
+    (context.start.sameHostRelease ||
+      (secondary?.kind === 'INPUT' && secondary.fieldId === 'buildTargets'));
+  const builder = sameHost && groups.length === 1 ? context.inputs.get('buildTargets') : undefined;
+  const buildTargets =
+    matchesStartField(builder, 'TARGETS') && builder?.purpose !== 'RELEASE_TARGETS'
+      ? builder
+      : undefined;
+  const candidates: ResourceGroup[] = groups.map(({ id, label, primary, companion }) => ({
+    id,
+    label,
+    primary,
+    companion: buildTargets ?? companion,
+  }));
+  const invalid = (message: string, fieldId: string, sourceFieldId?: string) => ({
+    candidates,
+    bindings: {},
+    issue: { message, fieldId, sourceFieldId },
+  });
+  const selected =
+    primary?.kind === 'INPUT'
+      ? groups.find(({ id }) => id === primary.fieldId)
+      : !primary && groups.length === 1
+        ? groups[0]
+        : undefined;
+  if (!selected) {
+    if (allowAbsent && !groups.length && !primary && !secondary)
+      return { candidates, bindings: {} };
+    const detail =
+      primary?.kind === 'INPUT'
+        ? '所选来源缺失或类型无效'
+        : primary
+          ? '请选择开始节点配置，不可在此固定外部资源'
+          : '请选择完整的一组配置';
+    return invalid(
+      `开始节点${spec.label}：${detail}`,
+      spec.primaryPort,
+      primary?.kind === 'INPUT' ? primary.fieldId : undefined,
+    );
+  }
+  if (sameHost && !buildTargets)
+    return invalid(
+      '构建与发布同机需要唯一发布组合及开始节点的构建目标',
+      spec.companionPort,
+      'buildTargets',
+    );
+  const companion = buildTargets ?? selected.companion;
+  if (!companion)
+    return invalid(
+      `所选${spec.label}缺少有效的${kind === 'source' ? '版本' : '发布目标'}字段，请在开始节点补齐`,
+      spec.companionPort,
+      selected.expectedId,
+    );
+  if (
+    secondary &&
+    (secondary.kind !== 'INPUT' ||
+      secondary.fieldId !== companion.id ||
+      (secondary.onMissing !== undefined &&
+        secondary.onMissing !== 'ERROR' &&
+        !(kind === 'source' && secondary.onMissing === 'REPOSITORY_DEFAULT')))
+  )
+    return invalid(
+      `输入跨越不同的${spec.label}或使用固定值，请为此节点重新选择完整组合`,
+      spec.companionPort,
+      companion.id,
+    );
+  if (primary?.onMissing !== undefined && primary.onMissing !== 'ERROR')
+    return invalid(
+      '预设资源不能使用固定兜底，请在开始节点设置默认值',
+      spec.primaryPort,
+      selected.id,
+    );
+  const bindings: Record<string, GraphBinding> = {
+    [spec.primaryPort]: { kind: 'INPUT', fieldId: selected.primary.id },
+    [spec.companionPort]: {
+      kind: 'INPUT',
+      fieldId: companion.id,
+      ...(kind === 'source' && { onMissing: 'REPOSITORY_DEFAULT' as const }),
+    },
+  };
+  return { candidates, bindings };
+}
+
+function usesStartSource(context: BindingContext, node: GraphNode, paths: PathOrder[]) {
+  return (
+    node.type === 'CHECKOUT' ||
+    (node.type === 'BUILD' &&
+      !bindingAt(context.flow, node, 'workspace') &&
+      !bindingAt(context.flow, node, 'source') &&
+      !paths.some(
+        ({ path, order }) =>
+          path.active.has(node.id) &&
+          [...(order.get(node.id) ?? [])].some((id) => context.nodes.get(id)?.type === 'CHECKOUT'),
+      ))
+  );
+}
+
+const usesReleaseGroup = (node: GraphNode) =>
+  node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT';
+
+function selectedResourceGroups(context: BindingContext, node: GraphNode, paths: PathOrder[]) {
+  return {
+    source: usesStartSource(context, node, paths)
+      ? resourceGroupBinding(context, node, 'source', node.type === 'BUILD')
+      : undefined,
+    release: usesReleaseGroup(node)
+      ? resourceGroupBinding(context, node, 'release', false)
+      : undefined,
+  };
+}
+
+function fixedPresetResource(binding: GraphBinding): boolean {
+  if (binding.onMissing === 'USE_DEFAULT') return true;
+  switch (binding.kind) {
+    case 'VALUE':
+      return true;
+    case 'FIRST_AVAILABLE':
+      return binding.sources.some(fixedPresetResource);
+    case 'AS_GIT_REF':
+    case 'PROJECT_VALUE':
+      return fixedPresetResource(binding.source);
+    default:
+      return false;
+  }
+}
+
+const legacyResourceDefaults = [
+  { section: 'checkout', key: 'repositoryId', port: 'repository' },
+  { section: 'checkout', key: 'mode', port: 'version' },
+  { section: 'checkout', key: 'branch', port: 'version' },
+  { section: 'checkout', key: 'tag', port: 'version' },
+  { section: 'checkout', key: 'commitSha', port: 'version' },
+  { section: 'build', key: 'repositoryId', port: 'repository' },
+  { section: 'build', key: 'branch', port: 'version' },
+  { section: 'build', key: 'commitSha', port: 'version' },
+  { section: 'build', key: 'buildLocation', port: 'targets' },
+  { section: 'shell', key: 'serverId', port: 'targets' },
+] as const;
+
+const startConfigIssue = '预设节点的固定资源必须移到开始节点的对应配置';
 
 function presetBinding(
   context: BindingContext,
@@ -235,7 +462,7 @@ function presetBinding(
     .map(({ order }) => order.get(node.id)!);
   const isBuild = node.type === 'BUILD';
   const isScript = node.type === 'SHELL' || node.type === 'CHECK';
-  const isRelease = node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT';
+  const isRelease = usesReleaseGroup(node);
   const useStart = (choices: GraphField[]): InferredBinding => {
     if (choices.length > 1) return { issue: '开始节点有多个可用来源，请为此字段选择一项' };
     const choice = choices[0];
@@ -247,18 +474,34 @@ function presetBinding(
         (candidate) => candidate.type === type && compatibleGraphFields(field, candidate),
       ),
     );
-  if (field.id === 'service' && (isBuild || isScript || isRelease)) {
-    if (flow.serviceId) return {};
-    return useType('SERVICE');
+  if (field.id === 'service' && (isBuild || isScript || node.type === 'REGISTER_ARTIFACT')) {
+    const consumerIds = new Set<string>();
+    for (const release of nodes.values()) {
+      if (!usesReleaseGroup(release)) continue;
+      const artifact = context.nodeInputs.get(release.id)?.find(({ id }) => id === 'artifact');
+      const artifactSource =
+        authoredBinding(flow, release, 'artifact') ??
+        (artifact && presetBinding(context, release, artifact, paths).binding);
+      if (
+        !artifactSource ||
+        !producerBindings(artifactSource).some(({ nodeId }) => nodeId === node.id)
+      )
+        continue;
+      const selected = resourceGroupBinding(context, release, 'release', false).bindings.service;
+      if (selected?.kind === 'INPUT') consumerIds.add(selected.fieldId);
+    }
+    if (consumerIds.size === 1)
+      return { binding: { kind: 'INPUT', fieldId: [...consumerIds][0]! } };
+    if (consumerIds.size > 1) return {};
+    const services = [...inputs.values()].filter(
+      (candidate) => candidate.type === 'SERVICE' && compatibleGraphFields(field, candidate),
+    );
+    return services.length === 1 ? useStart(services) : {};
   }
   if (field.id === 'environment' && (isBuild || isScript || isRelease))
     return useType('ENVIRONMENT');
   if (field.id === 'targets' && (isBuild || isScript || isRelease)) {
-    if (
-      (isBuild && node.build?.buildLocation === 'MANAGER') ||
-      (isScript && node.shell?.location === 'MANAGER')
-    )
-      return {};
+    if (isScript && node.shell?.location === 'MANAGER') return {};
     const purpose = isRelease ? 'RELEASE_TARGETS' : 'BUILD_TARGETS';
     const standardId = isRelease ? 'releaseTargets' : 'buildTargets';
     return useStart(
@@ -272,23 +515,6 @@ function presetBinding(
   }
 
   const checkout = (producer: GraphNode) => producer.type === 'CHECKOUT';
-  const reachableCheckouts = [...nodes.values()].some(
-    (producer) => checkout(producer) && ancestors.some((ancestors) => ancestors.has(producer.id)),
-  );
-  if (
-    (node.type === 'CHECKOUT' ||
-      (isBuild &&
-        !reachableCheckouts &&
-        !bindingAt(flow, node, 'workspace') &&
-        !bindingAt(flow, node, 'source'))) &&
-    (field.id === 'repository' || field.id === 'version')
-  ) {
-    const selected = useType(field.id === 'repository' ? 'REPOSITORY' : 'GIT_REF');
-    if (selected.binding && field.id === 'version')
-      return { binding: { ...selected.binding, onMissing: 'REPOSITORY_DEFAULT' } };
-    return selected;
-  }
-
   let producerMatches: ((producer: GraphNode, port: GraphField) => boolean) | undefined;
   if (
     (field.id === 'workspace' || field.id === 'source') &&
@@ -431,7 +657,8 @@ function guarantee(input: GraphField) {
 function contextSource(context: BindingContext, id: string) {
   const definition = graphContextFields.find((field) => field.id === id);
   if (!definition) return undefined;
-  if (id === 'serviceId' && context.flow.serviceId) return { ...definition, required: true };
+  if (id === 'serviceId' && context.start.contract !== 'PRESET' && context.flow.serviceId)
+    return { ...definition, required: true };
   if (id === 'environmentSetId') {
     const start = context.flow.nodes.find(({ type }) => type === 'START');
     const set = start?.environmentSet;
@@ -613,7 +840,12 @@ function assertBinding(
       (binding.kind === 'NODE_INPUT' && source.type === 'CREDENTIAL'));
   if (!source || (!scalarCondition && !environmentScalar && !compatibleGraphFields(field, source)))
     fail(flow, node, '来源不存在，或数据类型、数量、产物类型不匹配', field, evidence);
-  if (field.type === 'RELEASE' && flow.serviceId && producer) {
+  if (
+    field.type === 'RELEASE' &&
+    context.start.contract !== 'PRESET' &&
+    flow.serviceId &&
+    producer
+  ) {
     const service =
       producer.type === 'FLOW_CALL'
         ? context.flows.get(producer.flowId!)?.serviceId
@@ -716,6 +948,20 @@ function validateArtifactConfig(flow: GraphFlow, node: GraphNode, ports: GraphFi
     )
       invalid('具名产物引用名无效或重复', 'referenceName');
     references.add(reference);
+    if (
+      artifact.collection === 'WORK_DIRECTORY' &&
+      (node.type !== 'BUILD' || artifact.type !== 'DIRECTORY' || artifact.pathInput)
+    )
+      invalid('保存工作目录只能用于构建节点的目录产物', 'path');
+    if (
+      artifact.excludePaths?.some(
+        (path) =>
+          !validateGraphValue({ id: 'path', name: '排除路径', type: 'PATH' }, path) ||
+          !path.split('/').some((part) => part && part !== '.'),
+      ) ||
+      (artifact.excludePaths?.length && artifact.collection !== 'WORK_DIRECTORY')
+    )
+      invalid('排除项须为构建工作目录内的文件或目录', 'path');
     if (artifact.type !== 'DOCKER_IMAGE' && artifact.imageReference)
       invalid('镜像地址只适用于 Docker 镜像产物', 'imageReference');
     if (artifact.pathInput !== undefined) {
@@ -794,7 +1040,7 @@ export function validateFlowBindings(
   const nodeInputs = new Map(
     ordered.map((node) => [node.id, nodePorts.get(node.id)?.inputs ?? []]),
   );
-  const context: BindingContext = { flow, inputs, nodes, outputs, nodeInputs, flows };
+  const context: BindingContext = { flow, start, inputs, nodes, outputs, nodeInputs, flows };
   if (
     !graphRecord(flow.inputBindings ?? {}) ||
     !graphRecord(flow.outputBindings ?? {}) ||
@@ -861,6 +1107,7 @@ export function validateFlowBindings(
     coverage.set(key, issue);
   };
   const compiled: GraphCompiledFlow = {
+    ...(preset && { presetResourceGroups: true as const }),
     order: ordered.map(({ id }) => id),
     nodes: {},
     outputBindings: {},
@@ -869,6 +1116,8 @@ export function validateFlowBindings(
     const ports = nodePorts.get(node.id);
     if (node.type !== 'START' && node.contract !== undefined)
       fail(flow, node, '固定契约只能在开始节点声明');
+    if (node.sameHostRelease !== undefined && (node.type !== 'START' || !preset))
+      fail(flow, node, '同机发布只能在预设流的开始节点配置');
     if (preset && node.type !== 'START' && node.type !== 'END') {
       const declarations = [
         ...(node.inputs ?? []),
@@ -888,6 +1137,15 @@ export function validateFlowBindings(
           '预设动作使用系统定义的固定端口，自定义命令可声明自己的脚本字段',
           forbidden,
         );
+      for (const { section, key, port } of legacyResourceDefaults) {
+        const settings = node[section];
+        if (!settings || Reflect.get(settings, key) === undefined) continue;
+        const field = ports?.inputs.find(({ id }) => id === port);
+        fail(flow, node, `${startConfigIssue}（${section}.${key}）`, field, {
+          fieldSection: 'execution',
+          sourceNodeId: start.id,
+        });
+      }
     }
     if (node.declaredPorts)
       validateFunctionalDeclarations(flow, node, flows.get(node.flowId ?? ''));
@@ -896,6 +1154,11 @@ export function validateFlowBindings(
         fail(flow, node, '仅功能节点可以配置固定输入');
       for (const [id, value] of Object.entries(node.inputDefaults)) {
         const field = ports.inputs.find((port) => port.id === id);
+        if (preset && graphPresetStartPort(node, id))
+          fail(flow, node, `${startConfigIssue}（inputDefaults.${id}）`, field, {
+            fieldSection: 'input',
+            sourceNodeId: start.id,
+          });
         if (!field || !validatesLiteral(field, value, node))
           fail(
             flow,
@@ -1004,6 +1267,7 @@ export function validateFlowBindings(
           );
     if (
       node.type === 'END' &&
+      !preset &&
       flow.serviceId &&
       ordered.some(
         (candidate) =>
@@ -1016,10 +1280,40 @@ export function validateFlowBindings(
     )
       fail(flow, node, '关联服务的发布流需声明必填的服务发布结果');
 
+    const groups = preset ? selectedResourceGroups(context, node, pathOrders) : undefined;
+    for (const group of [groups?.source, groups?.release]) {
+      const issue = group?.issue;
+      if (issue)
+        fail(
+          flow,
+          node,
+          issue.message,
+          destinations.find(({ id }) => id === issue.fieldId),
+          {
+            fieldSection: 'input',
+            sourceNodeId: start.id,
+            sourceFieldId: issue.sourceFieldId,
+          },
+        );
+    }
     const bindings = new Map(
       destinations.map((field) => {
         if (node.type === 'END') return [field.id, flow.outputBindings?.[field.id]];
+        if (groups?.source && ['repository', 'version'].includes(field.id))
+          return [field.id, groups.source.bindings[field.id]];
+        if (groups?.release && ['service', 'targets'].includes(field.id))
+          return [field.id, groups.release.bindings[field.id]];
         const explicit = authoredBinding(flow, node, field.id);
+        if (
+          preset &&
+          explicit &&
+          graphPresetStartPort(node, field.id) &&
+          fixedPresetResource(explicit)
+        )
+          fail(flow, node, startConfigIssue, field, {
+            fieldSection: 'input',
+            sourceNodeId: start.id,
+          });
         const declaredDefault =
           node.declaredPorts &&
           node.inputs?.some(({ id }) => id === field.id) &&
@@ -1203,6 +1497,23 @@ export function validateFlowBindings(
             location,
           ),
         );
+      if (preset && usesReleaseGroup(node) && !has('targets')) {
+        const target = bindings.get('targets');
+        record(
+          locatedIssue(
+            flow,
+            node,
+            `开始节点的发布组合缺少目标${branch}`,
+            destinations.find((port) => port.id === 'targets'),
+            {
+              ...location,
+              fieldSection: 'input',
+              sourceNodeId: start.id,
+              sourceFieldId: target?.kind === 'INPUT' ? target.fieldId : undefined,
+            },
+          ),
+        );
+      }
       if (
         node.type === 'SOURCE_REVIEW' &&
         !node.approval?.buildNodeId &&
@@ -1275,6 +1586,30 @@ export function validateFlowBindings(
         fail(flow, gate, '每条发布路径都须经过对应审批，审批时必须已经取得产物和关联发布结果');
     }
   }
+  for (const node of ordered) {
+    if (
+      !['DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT'].includes(node.type) ||
+      node.deploy?.artifactPath?.trim()
+    )
+      continue;
+    const binding = compiled.nodes[node.id]?.inputBindings.artifact;
+    if (
+      binding &&
+      producerBindings(binding).some(({ nodeId, fieldId }) =>
+        nodes
+          .get(nodeId)
+          ?.build?.artifacts?.some(
+            (artifact) =>
+              artifact.collection === 'WORK_DIRECTORY' &&
+              ((artifact.id ?? artifact.name) === fieldId || fieldId === 'artifacts'),
+          ),
+      )
+    )
+      fail(flow, node, '请选择工作目录快照的子路径，或填写 . 使用整个目录', undefined, {
+        fieldId: 'artifactPath',
+        fieldSection: 'execution',
+      });
+  }
   const missing = [...coverage.values()];
   if (missing.length) throw new GraphCompileError(missing[0]!, missing);
   return compiled;
@@ -1325,6 +1660,7 @@ export function flowCandidateCatalog(
   const outputs = new Map(ordered.map((node) => [node.id, ports.get(node.id)?.outputs ?? []]));
   const context: BindingContext = {
     flow,
+    start,
     inputs,
     outputs,
     flows: called,
@@ -1336,6 +1672,8 @@ export function flowCandidateCatalog(
       ordered
         .filter(({ id }) => !nodeId || id === nodeId)
         .map((node) => {
+          const groups =
+            start.contract === 'PRESET' ? selectedResourceGroups(context, node, paths) : undefined;
           const candidates: GraphCandidate[] = [];
           for (const field of inputs.values())
             candidates.push({
@@ -1392,12 +1730,18 @@ export function flowCandidateCatalog(
                 node.type === 'START' ? (node.inputs ?? []) : (ports.get(node.id)?.inputs ?? []),
               outputs: node.type === 'END' ? (node.outputs ?? []) : (outputs.get(node.id) ?? []),
               candidates,
+              ...(groups?.source && { sourceGroups: groups.source.candidates }),
+              ...(groups?.release && { releaseGroups: groups.release.candidates }),
               automaticInputBindings: Object.fromEntries(
                 (ports.get(node.id)?.inputs ?? []).flatMap((field) => {
                   const binding =
-                    start.contract === 'PRESET'
-                      ? presetBinding(context, node, field, paths).binding
-                      : suggestedInputBinding(context, node, field, staticOrder, paths);
+                    groups?.source && ['repository', 'version'].includes(field.id)
+                      ? groups.source.bindings[field.id]
+                      : groups?.release && ['service', 'targets'].includes(field.id)
+                        ? groups.release.bindings[field.id]
+                        : start.contract === 'PRESET'
+                          ? presetBinding(context, node, field, paths).binding
+                          : suggestedInputBinding(context, node, field, staticOrder, paths);
                   return binding ? [[field.id, binding]] : [];
                 }),
               ),

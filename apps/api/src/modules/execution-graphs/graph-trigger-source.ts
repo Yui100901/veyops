@@ -95,9 +95,9 @@ export async function resolveTriggerSource(
     ({ type, operation }) => type === 'CHECKOUT' || operation === 'CHECKOUT',
   )) {
     const checkoutBinding = (fieldId: string) =>
-      flow.inputBindings?.[node.id]?.[fieldId] ??
-      inferred?.[node.id]?.automaticInputBindings[fieldId] ??
-      nodeInputBinding(flow, node, fieldId);
+      inferred
+        ? inferred[node.id]?.automaticInputBindings[fieldId]
+        : nodeInputBinding(flow, node, fieldId);
     const input = checkoutBinding('repository');
     const repository = staticBinding(flow, input, settings.parameterMappings);
     const mapping = input?.kind === 'INPUT' && settings.parameterMappings?.[input.fieldId];

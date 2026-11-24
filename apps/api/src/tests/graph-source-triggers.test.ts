@@ -13,7 +13,7 @@ import { withIsolatedPostgres } from './helpers/isolated-postgres';
 
 const a = 'a'.repeat(40);
 const b = 'b'.repeat(40);
-const ref = 'refs/heads/main';
+const ref = 'refs/heads/review-alt';
 const cloneUrl = 'https://git.example.test/team/demo.git';
 
 async function verify(t: TestContext, databaseUrl?: string) {
@@ -69,7 +69,10 @@ async function verify(t: TestContext, databaseUrl?: string) {
     const scope = prefix + '/projects/' + project.id;
     t.mock.method(metadata, 'refreshBranches', async () => ({
       defaultBranch: 'main',
-      branches: [{ name: 'main', sha: a }],
+      branches: [
+        { name: 'main', sha: a },
+        { name: 'review-alt', sha: b },
+      ],
     }));
     const repository = await make(scope + '/repositories', { name: 'Demo source', cloneUrl });
     const secondary = await make(scope + '/repositories', {
@@ -80,9 +83,10 @@ async function verify(t: TestContext, databaseUrl?: string) {
     let unavailable = false;
     t.mock.method(metadata, 'branchHeads', async () => {
       if (unavailable) return new Map();
-      return new Map([['main', head]]);
+      return new Map([['review-alt', head]]);
     });
-    const seen: { repositoryId: string; mode: string; requestedSha?: string }[] = [];
+    const seen: { repositoryId: string; mode: string; branch?: string; requestedSha?: string }[] =
+      [];
     t.mock.method(
       metadata,
       'planGraphCheckout',
@@ -106,6 +110,7 @@ async function verify(t: TestContext, databaseUrl?: string) {
         seen.push({
           repositoryId: input.repositoryId,
           mode: input.mode,
+          branch,
           requestedSha: event?.commitSha ?? input.commitSha,
         });
         return {
@@ -154,6 +159,33 @@ async function verify(t: TestContext, databaseUrl?: string) {
                       defaultValue: { kind: 'BRANCH', value: 'main' },
                       runtimeOverride: false,
                     },
+                    {
+                      id: 'repository-2',
+                      type: 'REPOSITORY',
+                      name: '同仓联调分支',
+                      defaultValue: repository.id,
+                      runtimeOverride: false,
+                    },
+                    {
+                      id: 'gitVersion-2',
+                      type: 'GIT_REF',
+                      name: '联调版本',
+                      defaultValue: { kind: 'BRANCH', value: 'review-alt' },
+                      runtimeOverride: false,
+                    },
+                    {
+                      id: 'repository-3',
+                      type: 'REPOSITORY',
+                      name: '其他仓库',
+                      defaultValue: secondary.id,
+                      runtimeOverride: false,
+                    },
+                    {
+                      id: 'gitVersion-3',
+                      type: 'GIT_REF',
+                      name: '其他版本',
+                      required: false,
+                    },
                   ],
                 },
                 {
@@ -178,10 +210,8 @@ async function verify(t: TestContext, databaseUrl?: string) {
                   startId: 'flow',
                   endId: 'end',
                   inputBindings: {
-                    other: {
-                      repository: { kind: 'VALUE', value: secondary.id },
-                      version: { kind: 'VALUE', value: { kind: 'BRANCH', value: 'main' } },
-                    },
+                    code: { repository: { kind: 'INPUT', fieldId: 'repository-2' } },
+                    other: { repository: { kind: 'INPUT', fieldId: 'repository-3' } },
                   },
                 },
               ],
@@ -270,7 +300,14 @@ async function verify(t: TestContext, databaseUrl?: string) {
     assert.equal(changes.length, 1, JSON.stringify(pollEvents));
     assert.equal(changes[0].metadata.commitSha, b);
     assert.equal(changes[0].metadata.previousCommitSha, a);
-    assert.ok(seen.some((item) => item.repositoryId === repository.id && item.requestedSha === b));
+    assert.ok(
+      seen.some(
+        (item) =>
+          item.repositoryId === repository.id &&
+          item.branch === 'review-alt' &&
+          item.requestedSha === b,
+      ),
+    );
     assert.ok(!seen.some((item) => item.repositoryId === secondary.id && item.requestedSha === b));
     const delivered = (
       eventId: string,

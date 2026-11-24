@@ -56,7 +56,13 @@ import {
   resolvePipelineSources,
   validatePipelineNodes,
 } from './pipeline-node-config';
-import { safeDeployPath, validateDefinition, validateGitUrl } from './pipeline.validation';
+import {
+  relativePath,
+  safeDeployPath,
+  validateDefinition,
+  validateGitUrl,
+} from './pipeline.validation';
+import type { ArtifactPhysical } from '../artifacts/artifact-physical.service';
 import {
   graphDeliveryEnvironment,
   graphUnscopedArtifactService,
@@ -481,7 +487,7 @@ export class PipelinesService implements OnModuleInit {
     ) as PipelineDefinition;
     let graphDeployment: PipelineSnapshot['graphDeployment'];
     if (profile?.delivery && fromArtifact) {
-      const { method, composeSource } = profile.delivery;
+      const { method, composeSource, artifactPath } = profile.delivery;
       definition.deployPath = normalizeReleasePath(definition.deployPath);
       if (
         definition.deployPath
@@ -493,7 +499,12 @@ export class PipelinesService implements OnModuleInit {
         throw new BadRequestException('部署方式与所选产物类型不兼容');
       if ((method === 'FILE' && composeSource) || (method === 'COMPOSE' && !composeSource))
         throw new BadRequestException('Compose 部署须明确选择模板来源');
-      graphDeployment = { method };
+      if (artifactPath && method === 'COMPOSE')
+        throw new BadRequestException('Compose 部署使用镜像，不能选择目录产物子路径');
+      graphDeployment = {
+        method,
+        ...(artifactPath && { artifactPath: relativePath(artifactPath) }),
+      };
       if (method === 'COMPOSE')
         graphDeployment.composeProject = graphComposeProject({ ...pipeline, definition });
       if (composeSource?.kind === 'REPOSITORY_FILE') {
@@ -819,6 +830,9 @@ export class PipelinesService implements OnModuleInit {
           ),
           ...(p.graphDeployment
             ? [{ field: 'method', value: p.graphDeployment.method, source: 'NODE' }]
+            : []),
+          ...(p.graphDeployment?.artifactPath
+            ? [{ field: 'artifactPath', value: p.graphDeployment.artifactPath, source: 'NODE' }]
             : []),
           ...(p.graphDeployment?.composeProject
             ? [{ field: 'composeProject', value: p.graphDeployment.composeProject, source: 'NODE' }]
@@ -1428,6 +1442,7 @@ export class PipelinesService implements OnModuleInit {
         'artifacts.storage_key',
         'artifacts.server_id',
         'artifacts.storage_type',
+        'artifacts.physical_json',
         'artifacts.registry_id',
         'artifacts.source_commit as artifact_commit',
         'pipeline_runs.commit_sha',
@@ -1505,7 +1520,9 @@ export class PipelinesService implements OnModuleInit {
       profile?.artifactRootRunId,
       artifactIds,
     );
-    const references = candidates.filter((candidate) => artifactIds.includes(candidate.id));
+    let references: NonNullable<PipelineSnapshot['deploymentArtifacts']> = candidates.filter(
+      (candidate) => artifactIds.includes(candidate.id),
+    );
     if (references.length !== rows.length)
       throw artifactIssue(
         new ConflictException(
@@ -1516,6 +1533,19 @@ export class PipelinesService implements OnModuleInit {
             : '文件或目录实物不可验证，或该产物正在清理',
         ),
       );
+    if (p.graphDeployment?.method === 'FILE') {
+      try {
+        await Promise.all(
+          rows.map((row) =>
+            this.artifacts.verifyFileSelection(row.physical_json, p.graphDeployment!.artifactPath),
+          ),
+        );
+      } catch (error) {
+        if (error instanceof BadRequestException || error instanceof ConflictException)
+          throw artifactIssue(error);
+        throw error;
+      }
+    }
     if (p.graphDeployment?.method === 'COMPOSE' && !p.graphDeployment.template) {
       const templates = await db
         .selectFrom('artifacts')
@@ -1546,6 +1576,16 @@ export class PipelinesService implements OnModuleInit {
     )
       throw artifactIssue(new BadRequestException('产物类型或 Registry 与有效部署配置不一致'));
     const targets = p.servers.map((server) => server.id);
+    if (
+      p.graphDeployment?.method === 'FILE' &&
+      references.length === 1 &&
+      references[0]?.serverId &&
+      !this.artifactsMatchTargets(references, targets) &&
+      rows[0]?.physical_json &&
+      (JSON.parse(rows[0].physical_json) as ArtifactPhysical).location === 'SERVER_PATH'
+    ) {
+      references = [{ ...references[0], serverId: null, sourceServerId: references[0].serverId }];
+    }
     if (!this.artifactsMatchTargets(references, targets))
       throw artifactIssue(new BadRequestException('目标端构建产物须与所选部署目标逐一匹配'));
     if (profile?.delivery?.rollback)

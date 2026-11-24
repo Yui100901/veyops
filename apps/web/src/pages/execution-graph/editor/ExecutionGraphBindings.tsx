@@ -18,11 +18,20 @@ import {
   hasMissingGraphBindingSource,
 } from './ExecutionGraphFields';
 import type { BindingChoice } from './ExecutionGraphFields';
+import { ExecutionGraphGroupSelection } from './ExecutionGraphGroupSelection';
+import {
+  graphStartGroupFields,
+  isGraphSharedReleaseTarget,
+  getGraphStartGroups,
+  type GraphStartGroupKind,
+  type GraphTargetNames,
+} from './graph-start-groups';
 import {
   effectiveNodeType,
   graphDynamicOutlets,
   graphKey,
   graphNodeFamily,
+  isReleaseNode,
   graphProjectionLabels,
 } from '../execution-graph-definition';
 import type {
@@ -107,7 +116,14 @@ function operationFields(
       })),
     ];
   const script = operation === 'SHELL' || operation === 'CHECK';
-  if (script && kind === 'inputs') return [...standard, ...(node.shell?.params ?? [])];
+  if (script && kind === 'inputs')
+    return [
+      ...standard,
+      ...(node.shell?.artifactPath?.trim() && !standard.some(({ id }) => id === 'artifact')
+        ? [{ id: 'artifact', name: '读取产物', type: 'ARTIFACT' as const, required: true }]
+        : []),
+      ...(node.shell?.params ?? []),
+    ];
   if (
     kind === 'outputs' &&
     (script || operation === 'BUILD' || operation === 'REGISTER_ARTIFACT')
@@ -442,6 +458,58 @@ function patchInputDefault(node: GraphNode, fieldId: string, value: unknown): Pa
   };
 }
 
+export function ExecutionGraphLegacyResources({
+  node,
+  canEdit,
+  patch,
+}: {
+  node: GraphNode;
+  canEdit: boolean;
+  patch: (changes: Partial<GraphNode>) => void;
+}) {
+  const checkout = node.checkout;
+  const build = node.build;
+  const shell = node.shell;
+  const corrections = [
+    (checkout?.repositoryId !== undefined || build?.repositoryId !== undefined) && {
+      id: 'repository',
+      label: '仓库',
+      remove: () => patch(patchInputDefault(node, 'repository', undefined)),
+    },
+    (checkout?.mode !== undefined ||
+      checkout?.branch !== undefined ||
+      checkout?.tag !== undefined ||
+      checkout?.commitSha !== undefined ||
+      build?.branch !== undefined ||
+      build?.commitSha !== undefined) && {
+      id: 'version',
+      label: 'Git 版本',
+      remove: () => patch(patchInputDefault(node, 'version', undefined)),
+    },
+    (build?.buildLocation !== undefined || shell?.serverId !== undefined) && {
+      id: 'targets',
+      label: '执行位置',
+      remove: () =>
+        patch({
+          ...(build && { build: { ...build, buildLocation: undefined } }),
+          ...(shell && { shell: { ...shell, serverId: undefined } }),
+        }),
+    },
+  ];
+  return corrections.map((entry) =>
+    entry ? (
+      <div key={entry.id} className="graph-repair" data-graph-node-field={entry.id}>
+        <p className="field-note">「{entry.label}」仍有旧的节点配置。请在当前开始节点设置。</p>
+        {canEdit && (
+          <button type="button" className="button secondary small" onClick={entry.remove}>
+            清除旧的{entry.label}配置
+          </button>
+        )}
+      </div>
+    ) : null,
+  );
+}
+
 function compatible(source: GraphField, input: GraphField) {
   return (
     (source.type === input.type || input.acceptedTypes?.includes(source.type)) &&
@@ -481,9 +549,10 @@ function configuredFallback(
   field: GraphField,
   start: GraphNode | undefined,
   endpoint?: GraphEndpoint,
+  startResource = false,
 ) {
   const operation = effectiveNodeType(node);
-  if (nodeFixedInputValue(node, field) !== undefined) return '采用节点默认值。';
+  if (!startResource && nodeFixedInputValue(node, field) !== undefined) return '采用节点默认值。';
   if (
     field.id === 'version' &&
     !nodeFixedInputValue(node, field) &&
@@ -491,7 +560,8 @@ function configuredFallback(
   )
     return '未指定版本时，预览解析仓库默认分支并固定实际提交。';
   if (field.id === 'service' && endpoint?.serviceId) return '使用执行流关联的服务。';
-  if (field.id === 'targets' && node.shell?.serverId) return '节点已指定执行服务器。';
+  if (!startResource && field.id === 'targets' && node.shell?.serverId)
+    return '节点已指定执行服务器。';
   if (
     field.id === 'path' &&
     node.registerArtifacts?.artifacts?.length &&
@@ -507,6 +577,16 @@ function configuredFallback(
     start?.inputs?.filter((input) => input.type === scope[field.id] && !input.multiple) ?? [];
   if (candidates.length === 1) return `默认来源 · 开始参数 · ${candidates[0]!.name}`;
   return undefined;
+}
+
+function hasFixedResourceBinding(binding: GraphBinding | undefined): boolean {
+  if (!binding) return false;
+  if (binding.kind === 'VALUE' || binding.onMissing === 'USE_DEFAULT') return true;
+  if (binding.kind === 'FIRST_AVAILABLE') return binding.sources.some(hasFixedResourceBinding);
+  return (
+    (binding.kind === 'AS_GIT_REF' || binding.kind === 'PROJECT_VALUE') &&
+    hasFixedResourceBinding(binding.source)
+  );
 }
 
 function matchingChoices(
@@ -591,6 +671,8 @@ export function ExecutionGraphBindings({
   patchNode,
   createStartParameter,
   repairFieldIds,
+  openStart,
+  targetNames,
 }: {
   canvas: GraphCanvas;
   node: GraphNode;
@@ -605,6 +687,8 @@ export function ExecutionGraphBindings({
   patchNode?: (fields: Partial<GraphNode>) => void;
   createStartParameter?: (field: GraphField) => void;
   repairFieldIds?: ReadonlySet<string>;
+  openStart?: (nodeId: string, fieldId: string) => void;
+  targetNames?: GraphTargetNames;
 }) {
   const operation = effectiveNodeType(node);
   const edges = canvas.edges.filter((_, index) => flowEdgeIndexes?.has(index));
@@ -623,7 +707,8 @@ export function ExecutionGraphBindings({
   const compiled = endpoint && directory?.[endpoint.startId]?.nodes[node.id];
   const script = operation === 'SHELL' || operation === 'CHECK';
   const custom = operation === 'SHELL';
-  const fixedContract = functional && !custom && start?.contract === 'PRESET';
+  const preset = start?.contract === 'PRESET';
+  const fixedContract = functional && !custom && preset;
   const inputTypes = catalog?.scriptInputTypes ?? scriptInputTypes;
   const outputTypes = catalog?.scriptOutputTypes ?? scriptOutputTypes;
   const nativeInputs = functional ? operationFields(node, 'inputs', canvas, catalog) : [];
@@ -655,6 +740,49 @@ export function ExecutionGraphBindings({
       ? availableFields.filter(({ id }) => id !== 'targets')
       : availableFields;
   const bindings = isEnd ? endpoint?.outputBindings : endpoint?.inputBindings?.[node.id];
+  const buildUsesStart =
+    operation === 'BUILD' &&
+    (compiled?.sourceGroups !== undefined ||
+      (!bindings?.workspace &&
+        !bindings?.source &&
+        !Array.from(ancestors).some((id) => {
+          const parent = canvas.nodes.find((item) => item.id === id);
+          return parent && effectiveNodeType(parent) === 'CHECKOUT';
+        })));
+  const groupKind: GraphStartGroupKind | undefined = !preset
+    ? undefined
+    : isReleaseNode(node)
+      ? 'release'
+      : operation === 'CHECKOUT' || buildUsesStart
+        ? 'source'
+        : undefined;
+  const groupConfig = groupKind && graphStartGroupFields[groupKind];
+  const catalogGroups = groupKind === 'source' ? compiled?.sourceGroups : compiled?.releaseGroups;
+  const externalInput = (field: GraphField) =>
+    preset &&
+    operation !== 'FLOW_CALL' &&
+    ['repository', 'version', 'service', 'targets', 'environment', 'artifact'].includes(field.id) &&
+    nativeInputs.some(({ id }) => id === field.id);
+  const groupBindings = (fieldId?: string) => {
+    if (!endpoint || !groupConfig || !groupKind) return;
+    const next = { ...bindings };
+    if (fieldId) next[groupConfig.input] = { kind: 'INPUT', fieldId };
+    else delete next[groupConfig.input];
+    if (
+      start?.sameHostRelease ||
+      !isGraphSharedReleaseTarget(
+        groupKind,
+        getGraphStartGroups(start, groupKind, catalogGroups),
+        next[groupConfig.pairedInput],
+      )
+    )
+      delete next[groupConfig.pairedInput];
+    update({
+      ...endpoint,
+      ...(groupKind === 'release' && { serviceId: undefined }),
+      inputBindings: { ...endpoint.inputBindings, [node.id]: next },
+    });
+  };
   const context = catalog?.contextFields ?? [];
   const fallbackCandidates: GraphCandidate[] = [
     ...(start?.inputs ?? []).map((field) => ({
@@ -732,6 +860,16 @@ export function ExecutionGraphBindings({
           : [];
       }),
     });
+  const repairDeclaration = (field: GraphField, remove: () => void) => (
+    <div key={field.id} className="graph-repair" data-graph-node-field={field.id}>
+      <p className="field-note">「{field.name}」是旧的自定义声明。此预设动作使用系统端口。</p>
+      {canEdit && patchNode && (
+        <button type="button" className="button secondary small" onClick={remove}>
+          移除旧的{field.name}声明
+        </button>
+      )}
+    </div>
+  );
   if (section === 'output') {
     const declared = custom
       ? (node.outputs ?? []).filter((field) => !nativeOutputs.some(({ id }) => id === field.id))
@@ -739,6 +877,11 @@ export function ExecutionGraphBindings({
     const implicit = outputs.filter((port) => !declared.some(({ id }) => id === port.id));
     return (
       <>
+        {preset &&
+          functional &&
+          (node.outputs ?? [])
+            .filter((field) => !custom || nativeOutputs.some(({ id }) => id === field.id))
+            .map((field) => repairDeclaration(field, () => patchDeclaration('outputs', field.id)))}
         {canEdit && patchNode && custom && (
           <AddFunctionField
             kind="outputs"
@@ -880,7 +1023,69 @@ export function ExecutionGraphBindings({
           patch={patchNode}
         />
       )}
+      {groupKind && start && (
+        <ExecutionGraphGroupSelection
+          kind={groupKind}
+          start={start}
+          catalogGroups={catalogGroups}
+          bindings={bindings}
+          project={project}
+          targetNames={targetNames}
+          canEdit={canEdit}
+          change={groupBindings}
+          openStart={openStart}
+        />
+      )}
+      {preset &&
+        functional &&
+        (node.inputs ?? [])
+          .filter((field) => !custom || nativeInputs.some(({ id }) => id === field.id))
+          .map((field) => repairDeclaration(field, () => patchDeclaration('inputs', field.id)))}
+      {preset &&
+        functional &&
+        !custom &&
+        (node.shell?.params ?? []).map((field) =>
+          repairDeclaration(field, () =>
+            patchNode?.({
+              shell: {
+                ...node.shell,
+                params: node.shell?.params?.filter(({ id }) => id !== field.id),
+              },
+            }),
+          ),
+        )}
+      {patchNode &&
+        fields.filter(externalInput).map((field) =>
+          node.inputDefaults?.[field.id] !== undefined ? (
+            <div className="graph-repair" data-graph-node-field={field.id} key={field.id}>
+              <p className="field-note">
+                「{field.name}」仍有旧的节点默认值。请在开始配置中设置默认值。
+              </p>
+              {canEdit && (
+                <button
+                  type="button"
+                  className="button secondary small"
+                  onClick={() => patchNode(patchInputDefault(node, field.id, undefined))}
+                >
+                  清除旧的{field.name}默认值
+                </button>
+              )}
+            </div>
+          ) : null,
+        )}
       {[...fields]
+        .filter(
+          ({ id }) =>
+            (!groupConfig || (id !== groupConfig.input && id !== groupConfig.pairedInput)) &&
+            !(preset && operation === 'CHECKOUT' && id === 'fetchMode') &&
+            !(
+              preset &&
+              operation === 'BUILD' &&
+              !buildUsesStart &&
+              (id === 'repository' || id === 'version') &&
+              !bindings?.[id]
+            ),
+        )
         .sort(
           (left, right) =>
             Number(operation === 'CHECKOUT' && left.id === 'fetchMode') -
@@ -913,14 +1118,15 @@ export function ExecutionGraphBindings({
                 )
               : [];
           const typeLabel = catalog?.fieldTypes[field.type] ?? field.type;
-          const startResource =
-            fixedContract &&
-            ['REPOSITORY', 'TARGETS', 'SERVICE', 'GIT_REF', 'ARTIFACT'].includes(field.type);
+          const startResource = externalInput(field);
           const fixed = Boolean(
             patchNode && !review && !startResource && acceptsFixedGraphValue(field),
           );
           const fallback =
-            isEnd || review ? undefined : configuredFallback(node, field, start, endpoint);
+            isEnd || review
+              ? undefined
+              : configuredFallback(node, field, start, endpoint, startResource);
+          const legacyFixedBinding = startResource && hasFixedResourceBinding(bound);
           const implicitHint = bound
             ? bound.onMissing === 'USE_DEFAULT' ||
               (!bound.onMissing && declared && nodeFixedInputValue(node, field) !== undefined)
@@ -1024,7 +1230,7 @@ export function ExecutionGraphBindings({
               {endpoint && (
                 <GraphBindingField
                   field={review ? { ...field, required: true } : field}
-                  value={bound}
+                  value={legacyFixedBinding ? undefined : bound}
                   project={project}
                   disabled={!canEdit}
                   choices={choices}
@@ -1046,6 +1252,20 @@ export function ExecutionGraphBindings({
                   fallback={implicitHint}
                   change={changeBinding}
                 />
+              )}
+              {legacyFixedBinding && (
+                <div className="row-actions">
+                  <p className="field-note">此端口仍引用旧的固定值。请选择开始配置或上游来源。</p>
+                  {canEdit && (
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      onClick={() => changeBinding()}
+                    >
+                      清除原有固定来源
+                    </button>
+                  )}
+                </div>
               )}
               {endpoint && canEdit && (unique || canMakeParameter) && (
                 <div className="graph-field-pair">

@@ -6,6 +6,7 @@ import type { GraphVariableSnapshot } from '../execution-graphs/graph-environmen
 
 export type GraphDeliveryConfiguration = {
   method: 'FILE' | 'COMPOSE';
+  artifactPath?: string;
   composeSource?:
     | { kind: 'ARTIFACT' }
     | { kind: 'REPOSITORY_FILE'; repositoryId: string; commitSha: string; path: string };

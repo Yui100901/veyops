@@ -78,19 +78,30 @@ function staticBinding(
   return undefined;
 }
 
-function artifactFieldScope(
+function parameterFieldScope(
   field: GraphField,
   flow: GraphFlow,
   parameters: Record<string, unknown>,
   general: FieldScope,
 ): FieldScope {
+  const bindingsAt = (id: string) =>
+    flow.compiled?.nodes[id]?.inputBindings ?? flow.inputBindings?.[id];
+  if (field.type === 'GIT_REF' && flow.compiled?.presetResourceGroups) {
+    const source = flow.nodes
+      .map(({ id }) => bindingsAt(id))
+      .find((bindings) => referencesInput(bindings?.version, field.id));
+    const repository = staticBinding(source?.repository, parameters);
+    return {
+      ...general,
+      repositoryId: typeof repository === 'string' ? repository : general.repositoryId,
+    };
+  }
   if (field.type !== 'ARTIFACT') return general;
   const consumer = flow.nodes.find(
-    (node) =>
-      isReleaseNode(node) && referencesInput(flow.inputBindings?.[node.id]?.artifact, field.id),
+    (node) => isReleaseNode(node) && referencesInput(bindingsAt(node.id)?.artifact, field.id),
   );
   if (!consumer) return general;
-  const bindings = flow.inputBindings?.[consumer.id];
+  const bindings = bindingsAt(consumer.id);
   const targets = staticBinding(bindings?.targets, parameters);
   const serviceId = serviceReferenceId(staticBinding(bindings?.service, parameters));
   return {
@@ -211,7 +222,9 @@ export function ExecutionGraphStart({
   const scope: FieldScope = {
     repositoryId: scopedValue('REPOSITORY') as string | undefined,
     environmentId: scopedValue('ENVIRONMENT') as string | undefined,
-    serviceId: flow.serviceId ?? serviceReferenceId(scopedValue('SERVICE')),
+    serviceId:
+      (flow.compiled?.presetResourceGroups ? undefined : flow.serviceId) ??
+      serviceReferenceId(scopedValue('SERVICE')),
     targets: scopedValue('TARGETS') as DeploymentSelection | undefined,
   };
   const [preview, setPreview] = useState<Preview>();
@@ -425,7 +438,7 @@ export function ExecutionGraphStart({
               <GraphFieldValue
                 field={field}
                 project={project}
-                scope={artifactFieldScope(field, flow, parameters, scope)}
+                scope={parameterFieldScope(field, flow, parameters, scope)}
                 disabled={Object.hasOwn(runtimePresets, field.id)}
                 checkRequired
                 canManageProjectResources

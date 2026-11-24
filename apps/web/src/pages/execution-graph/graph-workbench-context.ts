@@ -224,10 +224,13 @@ function scopeBinding(flow: GraphFlow, port: ScopeType) {
   const fixed = new Set<string>();
   const directInputs = new Set<string>();
   let dynamic = false;
-  if (port === 'service' && flow.serviceId) fixed.add(flow.serviceId);
+  const groupedService = port === 'service' && flow.compiled?.presetResourceGroups;
+  if (port === 'service' && !groupedService && flow.serviceId) fixed.add(flow.serviceId);
+  const hasReleases = groupedService && flow.nodes.some(isReleaseNode);
   for (const node of flow.nodes) {
-    if (node.type === 'FLOW_CALL') continue;
-    const binding = flow.inputBindings?.[node.id]?.[port];
+    if (node.type === 'FLOW_CALL' || (hasReleases && !isReleaseNode(node))) continue;
+    const binding =
+      flow.compiled?.nodes[node.id]?.inputBindings?.[port] ?? flow.inputBindings?.[node.id]?.[port];
     if (!binding) continue;
     const reference = knownReference(binding);
     if (typeof reference === 'string') fixed.add(reference);
@@ -235,6 +238,13 @@ function scopeBinding(flow: GraphFlow, port: ScopeType) {
     if (binding.kind === 'INPUT') directInputs.add(binding.fieldId);
   }
   const bound = fields.filter(({ id }) => directInputs.has(id));
+  if (groupedService && (bound.length > 1 || bound[0]?.runtimeOverride === false)) {
+    for (const item of bound) {
+      const reference = knownReference({ kind: 'VALUE', value: item.defaultValue });
+      if (typeof reference === 'string') fixed.add(reference);
+    }
+    return { field: undefined, fixed, ambiguous: !fixed.size };
+  }
   const field = bound.length === 1 ? bound[0] : fields.length === 1 ? fields[0] : undefined;
   return { field, fixed, ambiguous: !field && (fields.length > 1 || dynamic) };
 }
@@ -252,7 +262,11 @@ function inspectGraphScope(
     if (!id) continue;
     const { fixed, field, ambiguous } = scopeBinding(flow, port);
     const context = { status: 'CONTEXT_MISMATCH' as const, scopeType: port, contextId: id };
-    if ([...fixed].some((value) => value !== id))
+    if (
+      port === 'service' && flow.compiled?.presetResourceGroups
+        ? fixed.size > 0 && !fixed.has(id)
+        : [...fixed].some((value) => value !== id)
+    )
       return { ...context, reason: 'FIXED_SCOPE', fixedIds: [...fixed] };
     if (field?.options && !field.options.includes(id))
       return { ...context, reason: 'OPTION_NOT_ALLOWED', fieldId: field.id };
@@ -360,11 +374,12 @@ export function graphStartReadiness(
       if (resourceId && !project[resourceKinds[resourceType]].some(({ id }) => id === resourceId))
         issues.push({ reason: 'RESOURCE_UNAVAILABLE', nodeId, fieldId, resourceType, resourceId });
     };
-    checkFixed('SERVICE', flow.serviceId, start?.id);
+    if (!flow.compiled?.presetResourceGroups) checkFixed('SERVICE', flow.serviceId, start?.id);
     // Conditional branches and upstream outputs are resolved by preview.
     if (!flow.edges.some(({ when }) => when)) {
       for (const node of flow.nodes) {
-        const bindings = flow.inputBindings?.[node.id];
+        const bindings =
+          flow.compiled?.nodes[node.id]?.inputBindings ?? flow.inputBindings?.[node.id];
         if (node.type === 'CHECKOUT' || node.type === 'BUILD') {
           const repositoryId = knownRepository(node, bindings);
           if (typeof repositoryId === 'string')

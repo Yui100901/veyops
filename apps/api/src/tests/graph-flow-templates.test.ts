@@ -50,6 +50,7 @@ async function checkTemplates(databaseUrl?: string) {
     );
     assert.equal(seed.edges.length, 4);
     assert.equal(seed.nodes[2]?.build?.artifacts?.[0]?.type, 'DIRECTORY');
+    assert.equal(seed.nodes[2]?.build?.artifacts?.[0]?.collection, 'WORK_DIRECTORY');
     assert.deepEqual((await api.get(path).expect(200)).body.data, draft);
     assert.deepEqual((await api.get(`${path}/runs`).expect(200)).body.data, []);
     const { flowTemplates } = (await api.get(`${path}/catalog`).expect(200)).body.data;
@@ -125,17 +126,19 @@ async function checkTemplates(databaseUrl?: string) {
           fieldId,
         }),
       ),
-      [
-        { flowId: seed.nodes[0]!.id, nodeId: seed.nodes[2]!.id, fieldId: 'primaryArtifact' },
-        { flowId: seed.nodes[0]!.id, nodeId: seed.nodes[3]!.id, fieldId: 'deployPath' },
-      ],
+      [{ flowId: seed.nodes[0]!.id, nodeId: seed.nodes[3]!.id, fieldId: 'deployPath' }],
     );
     await api.post(`${path}/publish`).send({ expectedRevision: saved.revision }).expect(400);
 
     const ready = structuredClone(seed);
-    ready.nodes[2]!.build!.artifacts![0]!.path = 'dist';
     ready.nodes[2]!.build!.buildCommand = 'mkdir -p dist';
     ready.nodes[3]!.deploy!.deployPath = '/tmp/veyops-flow-template-fixture';
+    const missingSelection = await api
+      .post(`${path}/validate`)
+      .send({ definition: { canvas: ready } })
+      .expect(201);
+    assert.equal(missingSelection.body.data.issues[0].fieldId, 'artifactPath');
+    ready.nodes[3]!.deploy!.artifactPath = 'dist/';
     const readyDraft = (await save(ready, saved.revision).expect(200)).body.data;
     const published = (
       await api.post(`${path}/publish`).send({ expectedRevision: readyDraft.revision }).expect(201)
@@ -157,7 +160,6 @@ async function checkTemplates(databaseUrl?: string) {
       kind: 'INPUT',
       fieldId: targetParameter.id,
     };
-    build.build!.artifacts![0]!.path = 'dist';
     build.build!.buildCommand = 'mkdir -p dist';
     const ciValidated = await api
       .post(`${path}/validate`)

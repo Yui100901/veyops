@@ -2668,14 +2668,36 @@ async function checkDelivery(databaseUrl?: string) {
       if (status === 'SUCCESS') assert.equal(result.outputs.healthStatus, health);
     }
 
-    // A fixed service must follow the same health verdict as a service selected at run time.
+    // The selected start group pins both the service and target for this release.
     const fixed = structuredClone(expanded.canvas);
     const [fixedStart] = fixed.nodes;
-    fixedStart!.inputs = fixedStart!.inputs!.filter(({ id }) => id !== 'service');
-    fixed.endpoints[0]!.serviceId = service.id;
+    fixedStart!.inputs = fixedStart!.inputs!.map((field) => {
+      if (field.id === 'service')
+        return { ...field, defaultValue: { serviceId: service.id }, runtimeOverride: false };
+      if (field.id === 'releaseTargets')
+        return { ...field, defaultValue: { serverIds: [serverIds[1]!] } };
+      return field;
+    });
+    fixedStart!.inputs.push(
+      {
+        id: 'service-2',
+        name: '联调发布',
+        type: 'SERVICE',
+        defaultValue: { serviceId: service.id },
+        runtimeOverride: false,
+      },
+      {
+        id: 'releaseTargets-2',
+        name: '联调服务器',
+        type: 'TARGETS',
+        purpose: 'RELEASE_TARGETS',
+        defaultValue: { serverIds: [serverIds[0]!] },
+        runtimeOverride: false,
+      },
+    );
     fixed.endpoints[0]!.inputBindings![templateRelease.id]!.service = {
-      kind: 'VALUE',
-      value: { serviceId: service.id },
+      kind: 'INPUT',
+      fieldId: 'service-2',
     };
     const fixedDraft = (
       await api
@@ -2695,7 +2717,7 @@ async function checkDelivery(databaseUrl?: string) {
       inputs: {
         parameters: {
           artifact: { artifactId: savedImage },
-          releaseTargets: { serverIds: [serverIds[0]!] },
+          releaseTargets: { serverIds: [serverIds[1]!] },
         },
       },
     });
@@ -2707,12 +2729,16 @@ async function checkDelivery(databaseUrl?: string) {
         .output.status,
       'UNHEALTHY',
     );
+    assert.equal(
+      fixedFailure.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === templateRelease.id)
+        .targets[0].serverId,
+      serverIds[0],
+    );
 
     const ci = expandGraphTemplate('CI_BUILD', 'FILE');
     const ciCheck = ci.canvas.nodes.find(({ operation }) => operation === 'CHECK')!;
     const ciBuild = ci.canvas.nodes.find(({ operation }) => operation === 'BUILD')!;
     ciCheck.shell!.command = 'echo GRAPH_TEMPLATE_CI_FAIL; exit 23';
-    ciBuild.build!.buildLocation = 'MANAGER';
     ciBuild.build!.buildCommand = 'echo GRAPH_TEMPLATE_BUILD_BLOCKED';
     ciBuild.build!.artifacts![0]!.path = 'app.jar';
     const ciDraft = (

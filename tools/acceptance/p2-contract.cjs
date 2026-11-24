@@ -254,15 +254,14 @@ async function verifyV2Templates({ api, fixture, execute, source, html }) {
   const releaseTargets = { serverIds: [serverId] };
   const configureBuild = (fragment) => {
     const build = fragment.nodes.find(({ operation }) => operation === 'BUILD');
-    build.build.buildLocation = 'TARGET';
     build.build.buildCommand = 'test -s index.html && mkdir -p dist && cp index.html dist/';
-    build.build.artifacts[0].path = 'dist';
   };
   const directory = 'contract-execution-template';
   const configureDeploy = (fragment) => {
     const deploy = fragment.nodes.find(({ operation }) => operation === 'DEPLOY_ARTIFACT');
     assert.equal(deploy.deploy.method, 'FILE');
     deploy.deploy.deployPath = '/srv/veyops-stage0/' + directory;
+    deploy.deploy.artifactPath = 'dist';
     return deploy;
   };
   configureBuild(ci.canvas);

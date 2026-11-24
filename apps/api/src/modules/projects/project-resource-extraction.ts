@@ -233,20 +233,23 @@ function authoredScope(
 }
 
 function flowReferences(source: ReferenceSource, flow: GraphFlow, flows: Map<string, GraphFlow>) {
-  const context = { ...source, flowId: flow.id, flowName: flow.name, serviceId: flow.serviceId };
+  const grouped = flow.compiled?.presetResourceGroups;
+  const serviceId = grouped ? undefined : flow.serviceId;
+  const context = { ...source, flowId: flow.id, flowName: flow.name, serviceId };
   const start = flow.nodes.find((node) => node.type === 'START');
   const fields = start?.inputs ?? [];
   const defaultEnvironment = idValue(singleScopedField(fields, 'ENVIRONMENT')?.defaultValue);
-  const defaultService =
-    flow.serviceId ?? idValue(singleScopedField(fields, 'SERVICE')?.defaultValue);
+  const defaultService = serviceId ?? idValue(singleScopedField(fields, 'SERVICE')?.defaultValue);
   return [
     ...referenceRows(
       { ...context, nodeId: start?.id, nodeName: start?.name, fieldId: 'service' },
       'SERVICE',
-      flow.serviceId,
+      serviceId,
     ),
     ...flow.nodes.flatMap((node) => {
-      const bindings = flow.inputBindings?.[node.id];
+      const bindings = grouped
+        ? flow.compiled?.nodes[node.id]?.inputBindings
+        : flow.inputBindings?.[node.id];
       const nodeSource = {
         ...context,
         nodeId: node.id,
@@ -434,6 +437,7 @@ function preparedNodeReferences(
       objectValue(objectValue(profile.delivery).composeSource).repositoryId,
     ),
     ...referenceRows(context, 'ARTIFACT', plan.artifactIds),
+    ...referenceRows(context, 'ARTIFACT', objectValue(plan.artifact).instances),
     ...referenceRows(context, 'REGISTRY', definition.registryId),
     ...(readsRepository
       ? [

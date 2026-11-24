@@ -254,6 +254,7 @@ async function checkGraph(url?: string) {
     ).body.error;
     verifyPath(failed.planIssue);
     canvas.nodes[1]!.build!.artifacts![0]!.path = 'dist';
+    canvas.nodes[1]!.build!.artifacts![0]!.collection = 'PATH';
     const repaired = (
       await api
         .put(repairPath + '/draft')

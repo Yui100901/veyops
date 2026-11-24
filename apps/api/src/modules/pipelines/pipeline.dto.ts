@@ -38,6 +38,10 @@ export class PipelineStepDto {
 export class NamedArtifactDefinitionDto implements NamedArtifactDefinition {
   @IsString() @Matches(/^[A-Za-z0-9_-]{1,64}$/) name!: string;
   @IsIn(['FILE', 'DIRECTORY', 'DOCKER_IMAGE']) type!: NamedArtifactDefinition['type'];
+  @IsOptional()
+  @IsIn(['WORK_DIRECTORY', 'PATH'])
+  collection?: NamedArtifactDefinition['collection'];
+  @IsOptional() @IsArray() @ArrayMaxSize(100) @IsString({ each: true }) excludePaths?: string[];
   @IsOptional() @IsString() @Length(1, 1024) path?: string;
   @IsOptional() @IsString() @Length(1, 512) imageReference?: string;
   @IsOptional() @IsBoolean() required?: boolean;

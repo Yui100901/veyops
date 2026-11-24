@@ -705,7 +705,9 @@ export function graphOperationPorts(
             field('dependency_' + alias, 'WORKSPACE', true, '源码依赖 · ' + alias),
           ),
         ]
-      : definition.inputs;
+      : script && node.shell?.artifactPath?.trim()
+        ? [...definition.inputs, { ...artifactInput, name: '读取产物' }]
+        : definition.inputs;
   if (artifacts?.length)
     return {
       ...definition,
@@ -759,7 +761,7 @@ function scriptDeclarations(node: GraphNode, kind: 'inputs' | 'outputs'): GraphF
 export function graphScriptInputs(node: GraphNode): GraphField[] {
   if (node.type !== 'SHELL' && node.type !== 'CHECK') return [];
   if (!node.declaredPorts || node.inputs === undefined) return node.shell?.params ?? [];
-  const native = new Set(shellInputs.map(({ id }) => id));
+  const native = new Set(graphOperationPorts(node)?.inputs.map(({ id }) => id));
   return scriptDeclarations(node, 'inputs').filter(({ id }) => !native.has(id));
 }
 
@@ -839,6 +841,12 @@ export function graphDefaultBinding(
   node: GraphNode,
   fieldId: string,
 ): GraphBinding | undefined {
+  if (
+    flow.nodes.some((candidate) => candidate.type === 'START' && candidate.contract === 'PRESET') &&
+    (!flow.compiled || flow.compiled.presetResourceGroups) &&
+    graphPresetStartPort(node, fieldId)
+  )
+    return undefined;
   const declared = node.declaredPorts && node.inputs?.find(({ id }) => id === fieldId);
   if (declared && declared.defaultValue !== undefined)
     return { kind: 'VALUE', value: declared.defaultValue };
@@ -883,4 +891,15 @@ export function graphDefaultBinding(
   const port = graphModulePorts(node)?.inputs.find((item) => item.id === fieldId);
   if (port?.defaultValue !== undefined) return { kind: 'VALUE', value: port.defaultValue };
   return undefined;
+}
+
+export function graphPresetStartPort(node: GraphNode, fieldId: string) {
+  // A called flow and custom command may declare their own inputs with these names.
+  if (node.type === 'FLOW_CALL') return false;
+  const type = node.type === 'FUNCTION' ? node.operation : node.type;
+  const runtime = type && { ...node, type };
+  return (
+    ['repository', 'version', 'service', 'targets', 'environment', 'artifact'].includes(fieldId) &&
+    Boolean(runtime && graphOperationPorts(runtime)?.inputs.some(({ id }) => id === fieldId))
+  );
 }

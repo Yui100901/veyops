@@ -1,12 +1,33 @@
 import { Controller, Get } from '@nestjs/common';
 import { sql } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
-import type { GraphDefinition, GraphFlow } from './execution-graph-definition';
-import { flowStart, referenceId } from './graph-run-bindings';
+import {
+  orderedFlowNodes,
+  type GraphDefinition,
+  type GraphFlow,
+} from './execution-graph-definition';
+import { flowCandidateCatalog } from './graph-binding-validation';
+import { flowStart, presetReleaseServiceIds, referenceId } from './graph-run-bindings';
 
-const belongsToService = (flow: GraphFlow) =>
-  flow.serviceId ??
-  referenceId(flowStart(flow).inputs?.find(({ type }) => type === 'SERVICE')?.defaultValue);
+function belongsToServices(flow: GraphFlow, definition: GraphDefinition) {
+  const start = flowStart(flow);
+  if (
+    start.contract === 'PRESET' &&
+    flow.nodes.some(({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT')
+  ) {
+    if (flow.compiled) return presetReleaseServiceIds(flow);
+    const candidates = flowCandidateCatalog(flow, definition.flows, orderedFlowNodes(flow)).nodes;
+    return presetReleaseServiceIds(
+      flow,
+      undefined,
+      (node) => candidates[node.id]?.automaticInputBindings.service,
+    );
+  }
+  const service =
+    flow.serviceId ??
+    referenceId(start.inputs?.find(({ type }) => type === 'SERVICE')?.defaultValue);
+  return service ? [service] : [];
+}
 
 @Controller('delivery-flows')
 export class GraphFlowCatalogController {
@@ -99,37 +120,50 @@ export class GraphFlowCatalogController {
           : undefined;
       const notes = new Map<
         string,
-        { id: string; name: string; serviceId?: string; version?: number }
+        { id: string; name: string; serviceIds: string[]; version?: number }
       >();
       for (const node of draft.canvas?.nodes ?? []) {
-        if (node.type === 'START')
+        if (node.type === 'START') {
+          const serviceId = referenceId(
+            node.inputs?.find(({ type }) => type === 'SERVICE')?.defaultValue,
+          );
           notes.set(node.id, {
             id: node.id,
             name: node.name,
-            serviceId: referenceId(
-              node.inputs?.find(({ type }) => type === 'SERVICE')?.defaultValue,
-            ),
+            serviceIds: serviceId ? [serviceId] : [],
           });
+        }
       }
       for (const flow of draft.flows)
-        notes.set(flow.id, { id: flow.id, name: flow.name, serviceId: belongsToService(flow) });
+        notes.set(flow.id, {
+          id: flow.id,
+          name: flow.name,
+          serviceIds: belongsToServices(flow, draft),
+        });
       for (const flow of current?.flows ?? [])
         notes.set(flow.id, {
           id: flow.id,
           name: flow.name,
-          serviceId: belongsToService(flow),
+          serviceIds: belongsToServices(flow, current!),
           version: project.published_version!,
         });
       return {
         projectId: project.id,
         projectName: project.name,
-        flows: [...notes.values()].map((flow) => ({
-          ...flow,
-          serviceName: flow.serviceId ? names.get(flow.serviceId) : undefined,
-          hasDraftChanges: !flow.version || project.source_revision !== project.revision,
-          triggerKinds: [...new Set(events.get(key(project.id, flow.id)) ?? [])],
-          latestRun: history.get(key(project.id, flow.id)),
-        })),
+        flows: [...notes.values()].map((flow) => {
+          const serviceIds = flow.serviceIds.filter((id) => names.has(id));
+          const serviceId = serviceIds.length === 1 ? serviceIds[0] : undefined;
+          return {
+            ...flow,
+            serviceIds,
+            serviceId,
+            serviceName: serviceId ? names.get(serviceId) : undefined,
+            serviceNames: serviceIds.map((id) => names.get(id)!),
+            hasDraftChanges: !flow.version || project.source_revision !== project.revision,
+            triggerKinds: [...new Set(events.get(key(project.id, flow.id)) ?? [])],
+            latestRun: history.get(key(project.id, flow.id)),
+          };
+        }),
       };
     });
   }

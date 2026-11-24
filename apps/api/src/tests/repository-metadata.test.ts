@@ -8,6 +8,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
@@ -231,6 +232,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     await import('../modules/projects/repository-metadata.service.js');
   const { GraphNodeTasks, graphCheckoutOutputs } =
     await import('../modules/execution-graphs/graph-node-tasks.js');
+  const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
   const { BuildsService } = await import('../modules/builds/builds.service.js');
   const { PipelineDefinitionDto } = await import('../modules/pipelines/pipeline.dto.js');
   const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
@@ -511,6 +513,42 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
           operation: 'CHECKOUT',
           inputs: [repoInput],
         },
+        {
+          id: 'named',
+          name: '具名源码',
+          type: 'START',
+          contract: 'PRESET',
+          inputs: [
+            {
+              id: 'repository',
+              name: '主干源码',
+              type: 'REPOSITORY',
+              defaultValue: id,
+              runtimeOverride: false,
+            },
+            {
+              id: 'gitVersion',
+              name: '主干版本',
+              type: 'GIT_REF',
+              defaultValue: { kind: 'BRANCH', value: 'main' },
+              runtimeOverride: false,
+            },
+            {
+              id: 'repository-2',
+              name: '联调源码',
+              type: 'REPOSITORY',
+              defaultValue: id,
+              runtimeOverride: false,
+            },
+            {
+              id: 'gitVersion-2',
+              name: '联调版本',
+              type: 'GIT_REF',
+              defaultValue: { kind: 'BRANCH', value: 'feature/release' },
+            },
+          ],
+        },
+        { id: 'named-checkout', name: '具名检出', type: 'FUNCTION', operation: 'CHECKOUT' },
         { id: 'end', name: '完成检出', type: 'END' },
       ],
       endpoints: [
@@ -520,11 +558,20 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
           endId: 'end',
           inputBindings: { checkout: { repository: { kind: 'INPUT', fieldId: 'upstreamRepo' } } },
         },
+        {
+          startId: 'named',
+          endId: 'end',
+          inputBindings: {
+            'named-checkout': { repository: { kind: 'INPUT', fieldId: 'repository-2' } },
+          },
+        },
       ],
       edges: [
         { from: 'default', to: 'checkout' },
         { from: 'supplied', to: 'checkout' },
         { from: 'checkout', to: 'end' },
+        { from: 'named', to: 'named-checkout' },
+        { from: 'named-checkout', to: 'end' },
       ],
       templates: [],
     },
@@ -563,6 +610,68 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     );
     assert.equal(repository.source.kind, source);
   }
+  const namedPath = graphPath + '/flows/named';
+  const args = { version: published.publishedVersion };
+  const preview = (
+    await admin
+      .post(namedPath + '/preview')
+      .send(args)
+      .expect(201)
+  ).body.data;
+  assert.equal(preview.checkouts[0].repositoryId, id);
+  assert.equal(preview.checkouts[0].branch, 'feature/release');
+  assert.equal(preview.checkouts[0].commitSha, feature);
+  const run = (
+    await admin
+      .post(namedPath + '/run')
+      .send({
+        ...args,
+        expectedConfigurationHash: preview.configurationHash,
+        idempotencyKey: randomUUID(),
+      })
+      .expect(201)
+  ).body.data;
+  const worker = app.get(TaskWorkerService);
+  let detail;
+  for (let attempt = 0; attempt < 16; attempt++) {
+    await worker.tick();
+    detail = (await admin.get(graphPath + '/runs/' + run.id).expect(200)).body.data;
+    if (['SUCCESS', 'FAILED'].includes(detail.status)) break;
+    await delay(20);
+  }
+  assert.equal(detail.status, 'SUCCESS', JSON.stringify(detail.nodes));
+  assert.equal(
+    detail.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === 'named-checkout').output
+      .commitSha,
+    feature,
+  );
+  const changedRef = (
+    await admin
+      .post(namedPath + '/preview')
+      .send({
+        ...args,
+        inputs: { parameters: { 'gitVersion-2': { kind: 'TAG', value: 'release/v1' } } },
+      })
+      .expect(201)
+  ).body.data;
+  assert.equal(changedRef.checkouts[0].commitSha, second);
+  const missingRef = await admin
+    .post(namedPath + '/preview')
+    .send({
+      ...args,
+      inputs: {
+        parameters: { 'gitVersion-2': { kind: 'BRANCH', value: 'missing-fixture-branch' } },
+      },
+    })
+    .expect(400);
+  assert.equal(missingRef.body.error.planIssue.parameterId, 'gitVersion-2');
+  const defaults = (
+    await admin
+      .post(namedPath + '/preview')
+      .send(args)
+      .expect(201)
+  ).body.data;
+  assert.equal(defaults.checkouts[0].commitSha, feature);
   await admin.delete(metadataPath).expect(409);
   await assert.rejects(metadata.checkoutGraphSource(other, shallow), /仓库不存在/);
   assert.deepEqual(

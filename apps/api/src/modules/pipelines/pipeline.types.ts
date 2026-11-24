@@ -7,6 +7,8 @@ export interface NamedArtifactDefinition {
   name: string;
   type: 'FILE' | 'DIRECTORY' | 'DOCKER_IMAGE';
   path?: string;
+  collection?: 'WORK_DIRECTORY' | 'PATH';
+  excludePaths?: string[];
   imageReference?: string;
   required?: boolean;
   persist?: boolean;
@@ -98,6 +100,7 @@ export interface PipelineSnapshot {
   managedCompose?: import('../service-configs/compose-template-reference').ManagedComposeReference;
   graphDeployment?: {
     method: 'FILE' | 'COMPOSE';
+    artifactPath?: string;
     composeProject?: string;
     template?: Extract<
       import('../service-configs/compose-template-reference').ComposeTemplateReference,
@@ -122,7 +125,12 @@ export interface PipelineSnapshot {
   mode?: PipelineExecutionMode | 'DEPLOY_ARTIFACT';
   deployAfterBuild?: boolean;
   allowPartialDeploy?: boolean;
-  deploymentArtifacts?: { id: string; serverId: string | null; fingerprint?: string }[];
+  deploymentArtifacts?: {
+    id: string;
+    serverId: string | null;
+    sourceServerId?: string;
+    fingerprint?: string;
+  }[];
   sourceBuildTaskId?: string;
   artifactServiceScope?: boolean;
   triggerType?: 'MANUAL' | AutomaticPipelineTrigger | GraphAutomation['kind'];

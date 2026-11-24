@@ -205,11 +205,12 @@ Shell 和检查脚本每执行单元可返回一条 `VEYOPS_OUTPUT=` JSON 对象
 
 `BUILD.build.dependencies` 最多声明八个额外源码工作区别名。每个别名用小写字母开头，可包含小写字母、数字和连字符。流需将 Git 来源工作区绑定到主 `workspace` 和各 `dependency_<别名>` 端口。额外工作区复制到构建任务独立目录，命令可通过 `$VEYOPS_GRAPH_DEPENDENCY_ROOT/<别名>` 访问。镜像构建的 Dockerfile 需要使用依赖时，先在构建命令中将所需文件复制到主仓库的构建上下文。
 
-构建和登记的 `artifacts` 条目支持稳定端口 `id`、显示 `name`、`referenceName`、`type`、`path` 或 `imageReference`，以及 `required`、`composeFilePath` 和 `persist`。同一个具名端口返回一件逻辑产物。值包含 `artifactId`、`type`、`scope`、生产运行和 `instances[]`。逐实例提供 `instanceId`、`serverId` 和可查的路径、校验值或镜像身份。显式 `artifacts` 列表按逻辑 ID 汇总。`persist:false` 额外记录 `rootRunId`，仅此根运行及其子流可引用。归档下载使用 `GET /artifacts/:id/download`。
+构建和登记的 `artifacts` 条目支持稳定端口 `id`、显示 `name`、`referenceName`、`type`、`path` 或 `imageReference`，以及 `required`、`composeFilePath` 和 `persist`。构建的目录产物还支持 `collection:"WORK_DIRECTORY"`，从 `build.repoPath` 对应的工作目录收集，可选 `excludePaths` 使用同一相对路径起点。`collection:"PATH"` 收集 `path` 指定的文件或目录。同一个具名端口返回一件逻辑产物。值包含 `artifactId`、`type`、`scope`、生产运行和 `instances[]`。逐实例提供 `instanceId`、`serverId` 和可查的路径、校验值或镜像身份。`persist:false` 额外记录 `rootRunId`，仅此根运行及其子流可引用。归档下载使用 `GET /artifacts/:id/download`。
 
 Shell 和检查的环境绑定可使用 `PROJECT_VALUE`，以 `source: {kind:"OUTPUT",nodeId,fieldId}` 指定结构化来源。可取当前挂载的 `WORKSPACE_PATH`、同一 SSH 目标的 `ARTIFACT_PATH` 或镜像的 `IMAGE_NAME`、`IMAGE_ID`、`IMAGE_DIGEST`。管理端读取多实例镜像属性时通过 `serverId` 指定实例所在目标。
 
-- `DEPLOY_ARTIFACT` 和 `ROLLBACK_ARTIFACT` 从 `artifact` 端口取得一件逻辑产物。发布方式 `FILE` 接受文件或目录。`COMPOSE` 接受 Docker 镜像。Compose 来源可为 `{kind:"ARTIFACT"}` 或 `{kind:"REPOSITORY_FILE",repositoryId,commitSha,path}`，随预览确认模板。
+- `DEPLOY_ARTIFACT` 和 `ROLLBACK_ARTIFACT` 从 `artifact` 端口取得一件逻辑产物。发布方式 `FILE` 接受文件或目录，`deploy.artifactPath` 固定相对产物根的路径，工作目录快照须提供子路径或显式填 `.`。`COMPOSE` 接受 Docker 镜像。Compose 来源可为 `{kind:"ARTIFACT"}` 或 `{kind:"REPOSITORY_FILE",repositoryId,commitSha,path}`，随预览确认模板。
+- `CHECK` 和 `SHELL` 设置 `shell.artifactPath` 后，可从 `artifact` 端口取得一件文件或目录产物。预览返回所选子路径和已固定实例或上游输出，实际内容展开到 `VEYOPS_ARTIFACT_DIR`。节点的 `shell.directory` 仍相对该节点本身的工作区根。
 - `RELEASE.targets` 记录已确认的各个目标。失败目标可只有任务状态与 `errorSummary`。已确认的计划实例在 `plannedArtifactInstanceId`，实际使用的实例和发布记录分别在 `artifactInstanceId` 与 `deploymentId`。可以成对配置 `SUCCESS` 与 `PARTIAL_SUCCESS` 出边，部分成功分支只能使用有成功发布记录的目标。其他失败及待核查状态阻断后续。
 - `SOURCE_REVIEW` 可绑定单个固定 Git 来源 `source`，或含源码记录的 `artifact`。构建前审核也可设置 `approval.buildNodeId` 关联下游 `BUILD`，并将构建的 `review` 端口绑定到此审核节点的 `review` 输出。关联构建后，审核范围使用已确认计划中的主仓、依赖仓和异仓变量文件的仓库与 SHA。凭证只对所关联的本次构建有效，Worker 再核对执行快照中的完整源码列表。
 - `APPROVAL.approval.releaseNodeId` 绑定下游发布。等待时固定服务、逐目标成员、实物实例与指纹，回滚还固定被替代的发布记录。
@@ -404,6 +405,7 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 | `POST /artifacts/:id/verify` | 管理员、操作员可提交 `{instanceIds?}`，重新核对实物并记录结果和操作者。 |
 | `GET /artifacts/:id/download` | 登录后下载文件或镜像归档，响应头 `X-Artifact-SHA256` 提供校验值。 |
 | `GET /deployments` | 查询逐服务器发布记录。 |
+| `GET /projects/:projectId/services/:serviceId/delivery-status` | 按环境、服务器和发布位置返回 `current` 与 `latestAttempt`。最近尝试可独立于激活记录，包含 `taskTargetId`、`releaseTaskId`、`phase`、开始与结束时间、脱敏错误及可选的 `deploymentRecordId`。 |
 | `GET /registries`、`POST /registries` | 查询、登记镜像仓库，创建限管理员。 |
 | `PATCH /registries/:id`、`POST /registries/:id/test` | 管理员编辑、测试 HTTPS Registry V2 连通和认证，`credentialId:null` 解除凭据绑定。 |
 | `DELETE /registries/:id` | 管理员删除未被有效配置或镜像产物引用的镜像仓库，仍有引用时返回 409。 |

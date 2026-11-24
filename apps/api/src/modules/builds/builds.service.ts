@@ -81,9 +81,13 @@ export function namedArtifactSession(
   artifact: NamedArtifactDefinition,
 ): BuildSession {
   const definition = session.snapshot.definition;
-  // Graph build nodes always declare the path of each named file output.
-  if (session.snapshot.graph && artifact.type !== 'DOCKER_IMAGE' && !artifact.path?.trim())
-    throw new Error(`请填写「${artifact.name}」的工作区相对路径`);
+  if (
+    session.snapshot.graph &&
+    artifact.collection !== 'WORK_DIRECTORY' &&
+    artifact.type !== 'DOCKER_IMAGE' &&
+    !artifact.path?.trim()
+  )
+    throw new Error(`请填写「${artifact.name}」的构建工作目录相对路径`);
   return {
     ...session,
     taskId: session.snapshot.graph
@@ -213,16 +217,25 @@ export const packScript = (
   `set -eu\n${enterRepositoryDirectory(work, repoPath)}\nrequested=${q('./' + relativePath(outputPath))}\nif ! test -e "$requested" && ! test -L "$requested"; then exit 44; fi\ntest ! -L "$requested"\noutput=$(realpath -- "$requested")\ncase "$output" in "$veyops_repo"/*) ;; *) echo '产物路径超出工作目录' >&2; exit 1;; esac\n${type === 'FILE' ? 'test -f "$output"' : type === 'DIRECTORY' ? 'test -d "$output"' : ':'}\ntest -z "$(find "$output" ! -type f ! -type d -print -quit)"\nif test -d "$output"; then tar -czf ${q(archive)} -C "$output" .; elif test -f "$output"; then tar -czf ${q(archive)} -C "$(dirname "$output")" "$(basename "$output")"; else echo '产物不是普通文件/目录' >&2; exit 1; fi\nprintf 'VEYOPS_ARTIFACT:%s:%s\\n' "$(sha256sum ${q(archive)} | cut -d' ' -f1)" "$(wc -c < ${q(archive)})"\n`;
 
 export function enterRepositoryDirectory(work: string, repoPath: string) {
-  return `cd -P ${q(work)}; veyops_repo=$PWD/repo; test ! -L "$veyops_repo"; cd -P "$veyops_repo"/${q(repoPath)}; case "$PWD" in "$veyops_repo"|"$veyops_repo"/*) ;; *) echo '构建工作目录超出仓库' >&2; exit 1 ;; esac`;
+  const directory = posix.normalize(relativePath(repoPath || '.')).replace(/\/$/, '');
+  return [
+    `cd -P -- ${q(work)} || exit 45`,
+    'veyops_repo=$PWD/repo',
+    `veyops_directory="$veyops_repo"${directory === '.' ? '' : '/' + q(directory)}`,
+    'if ! cd -P -- "$veyops_directory" || ! test "$PWD" = "$veyops_directory"; then',
+    '  echo "工作目录不存在、不可访问或包含符号链接" >&2; exit 45',
+    'fi',
+  ].join('\n');
 }
 
-export function enterSourceDirectory(root: string, directory: string, initialize = false) {
+export function enterSourceDirectory(root: string, directory: string) {
+  const normalized = posix.normalize(relativePath(directory || '.')).replace(/\/$/, '');
   const source = q(root);
   return [
     `cd -P -- ${source} && test "$PWD" = ${source} || exit 45`,
-    ...(initialize ? [`mkdir -p -- ${q('./' + directory)} || exit $?`] : []),
-    `cd -P -- ${q('./' + directory)} || exit $?`,
-    `case "$PWD" in ${source}|${source}/*) ;; *) exit 45 ;; esac`,
+    `if ! cd -P -- ${q('./' + normalized)} || ! test "$PWD" = ${q(posix.join(root, normalized))}; then`,
+    '  echo "工作目录不存在、不可访问或包含符号链接" >&2; exit 45',
+    'fi',
   ].join('\n');
 }
 
@@ -1111,11 +1124,21 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     directory: string,
     timeout: number,
     onData: NonNullable<ProcessOptions['onData']>,
+    artifactArchive?: string,
   ) {
     const builds = join(dataDirectory, 'builds');
     await mkdir(builds, { recursive: true, mode: 0o700 });
     const secrets = await mkdtemp(join(builds, 'graph-shell-'));
     try {
+      if (artifactArchive) {
+        const input = join(secrets, 'artifact');
+        await mkdir(input, { mode: 0o700 });
+        const result = await this.runner.run('tar', ['-xf', artifactArchive, '-C', input], {
+          timeout: 180,
+          signal: session.context.signal,
+        });
+        if (result.exitCode !== 0) throw new ConflictException('无法解包已选脚本产物');
+      }
       if (session.snapshot.graphAutomation) await this.configureWebhookDocker(session, secrets);
       await writeFile(join(secrets, 'shell.env'), exportedVariables(session.variables), {
         mode: 0o600,
@@ -1174,6 +1197,37 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     if (d.artifactType === 'FILE') {
       const archiveName = declaration ? `artifact-${session.taskId}.tar.gz` : 'artifact.tar.gz';
       const archive = join(workspace, archiveName);
+      if (declaration?.collection === 'WORK_DIRECTORY') {
+        if (!this.physical) throw new ConflictException('构建工作目录产物适配器不可用');
+        const physical = await this.physical.collectBuilderPath({
+          workspace: resolve(workspace, 'repo'),
+          workingDirectory: d.repoPath,
+          relativePath: '.',
+          kind: 'DIRECTORY',
+          collection: declaration.collection,
+          excludePaths: declaration.excludePaths,
+          instanceId: artifactIdentity(session.snapshot, declaration.name).instanceId,
+          signal: session.context.signal,
+        });
+        await writeFile(archive, '', { flag: 'wx', mode: 0o600 });
+        try {
+          await this.physical.stageBuilderArchive(physical, archive, '.', session.context.signal);
+          const stored = await this.retainManagerArchive(
+            archive,
+            `${session.taskId}.tar.gz`,
+            session,
+          );
+          return {
+            localArchive: stored.path,
+            checksum: stored.checksum,
+            sizeBytes: stored.sizeBytes,
+            physical,
+            cleanup,
+          };
+        } finally {
+          await rm(archive, { force: true });
+        }
+      }
       // Reserve the output after repository containers have finished writing the workspace.
       await writeFile(archive, '', { flag: 'wx', mode: 0o600 });
       let stored;
@@ -1204,7 +1258,8 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
           session.snapshot.graph && this.physical
             ? await this.physical.collectBuilderPath({
                 workspace: resolve(workspace, 'repo'),
-                relativePath: posix.join(d.repoPath, d.outputPath),
+                workingDirectory: d.repoPath,
+                relativePath: d.outputPath,
                 kind:
                   declaration?.type === 'FILE' || declaration?.type === 'DIRECTORY'
                     ? declaration.type

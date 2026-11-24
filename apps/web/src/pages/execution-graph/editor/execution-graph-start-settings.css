@@ -28,6 +28,11 @@
   max-inline-size: 100%;
 }
 
+.graph-start-group-users {
+  display: grid;
+  gap: 0.35rem;
+}
+
 .graph-action-sources {
   display: grid;
   gap: 0.4rem;

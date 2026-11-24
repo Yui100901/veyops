@@ -746,6 +746,12 @@ export class ArtifactsService {
     );
   }
 
+  async verifyFileSelection(physicalJson: string | null, path?: string) {
+    if (this.physical)
+      await this.physical.verifyPathSelection(physicalOf({ physical_json: physicalJson }), path);
+    else if (path) throw new ConflictException('文件产物校验适配器不可用');
+  }
+
   async forDeployment(
     snapshot: PipelineSnapshot,
     serverId: string,
@@ -781,7 +787,7 @@ export class ArtifactsService {
     ).executeTakeFirst();
     if (
       !row ||
-      applicationServer(row) !== candidate.serverId ||
+      applicationServer(row) !== (candidate.sourceServerId ?? candidate.serverId) ||
       (row.temporary_root_id && row.temporary_root_id !== snapshot.artifactRootRunId) ||
       !hasDeployableMetadata(
         row,
@@ -792,8 +798,10 @@ export class ArtifactsService {
     if (candidate.fingerprint && candidate.fingerprint !== deploymentFingerprint(row))
       throw new ConflictException('已确认的构建产物校验信息发生变化');
     const physical = physicalOf(row);
+    if (snapshot.graphDeployment?.method === 'FILE')
+      await this.verifyFileSelection(row.physical_json, snapshot.graphDeployment.artifactPath);
     if (physical) {
-      const check = await this.check(row, physical.serverId ? target : undefined);
+      const check = await this.check(row, physical.serverId === target?.id ? target : undefined);
       await this.recordCheck(row, check);
       if (check.status !== 'AVAILABLE')
         throw new ConflictException(check.reason ?? '已确认的产物实物不可用');

@@ -74,6 +74,7 @@ import {
   graphCheckoutFetchMode,
   graphCheckoutOutputs,
   type GraphNodePlan,
+  type GraphNodeScope,
 } from './graph-node-tasks';
 import { latestReleaseInspections } from './graph-release-inspection.service';
 import { ScriptWorkspacePreview } from './graph-script-workspaces';
@@ -124,6 +125,7 @@ import {
   inspectNodeInputs,
   inspectFlowOutputs,
   nodeInputBinding,
+  presetReleaseServiceIds,
   outputSources,
   publicParameters,
   referenceId,
@@ -140,6 +142,7 @@ import {
   graphArtifactInstance,
   graphArtifactPortId,
 } from './graph-artifact-values';
+import { normalizeRelativePath } from '../pipelines/pipeline.validation';
 import {
   activeFlowStatuses,
   branchMatch,
@@ -339,6 +342,7 @@ interface PreparedProduction {
   serviceId?: string;
   environmentId?: string;
   kind?: GraphField['artifactType'];
+  collection?: 'WORK_DIRECTORY' | 'PATH';
   sourceSnapshot?: Delivery['sourceSnapshot'];
   externalPreflight?: boolean;
 }
@@ -359,6 +363,7 @@ function publicDelivery(delivery: Delivery, definition: GraphDefinition) {
     pipelineHash: undefined,
     profile: undefined,
     method: delivery.profile?.delivery?.method,
+    artifactPath: delivery.profile?.delivery?.artifactPath,
     composeSource: delivery.profile?.delivery?.composeSource,
     alternatives: undefined,
     artifactBinding: undefined,
@@ -522,6 +527,7 @@ export class GraphRunnerService implements OnModuleInit {
       rootId?: string;
       db?: Kysely<Database>;
       single?: boolean;
+      distributeFile?: boolean;
     } = {},
   ) {
     if (!refs.length) return [];
@@ -638,6 +644,13 @@ export class GraphRunnerService implements OnModuleInit {
       if (sameHost.every((group) => group.length === 1)) instances = sameHost.flat();
       else if (sameHost.every((group) => group.length <= 1) && transferable.length === 1)
         instances = transferable;
+      else if (
+        options.distributeFile &&
+        matching.length === 1 &&
+        matching[0]?.physical_json &&
+        (matching[0].artifact_kind === 'FILE' || matching[0].artifact_kind === 'DIRECTORY')
+      )
+        instances = matching;
       else {
         const index = sameHost.findIndex((group) => group.length !== 1);
         throw new ExecutionPlanIssueError({
@@ -686,6 +699,32 @@ export class GraphRunnerService implements OnModuleInit {
         nodeRunId: row.graph_node_run_id,
       };
     });
+  }
+
+  private async scriptArtifactInstance(
+    projectId: string,
+    value: unknown,
+    rootId: string | undefined,
+    serverId: string | undefined,
+    path: string,
+  ) {
+    const candidates = (
+      await this.artifactReferences(projectId, artifactBindingRefs(value), undefined, {
+        rootId,
+        single: true,
+      })
+    ).filter(({ type }) => type === 'FILE' || type === 'DIRECTORY');
+    const local = candidates.filter((candidate) => candidate.serverId === (serverId ?? null));
+    const selected =
+      local.length === 1 ? local[0] : candidates.length === 1 ? candidates[0] : undefined;
+    if (!selected || (selected.type === 'FILE' && path !== '.'))
+      throw new ExecutionPlanIssueError({
+        code: 'ARTIFACT',
+        fieldId: 'artifact',
+        message: '请选择唯一可读取的文件或目录产物实例',
+      });
+    await this.nodeTasks!.assertScriptArtifactPath(projectId, selected.id, path);
+    return selected.id;
   }
 
   private async artifactParameter(
@@ -904,7 +943,7 @@ export class GraphRunnerService implements OnModuleInit {
         fieldId: 'service',
         message: '请选择项目服务',
       });
-    if (flow.serviceId && serviceId !== flow.serviceId)
+    if (!flow.compiled?.presetResourceGroups && flow.serviceId && serviceId !== flow.serviceId)
       throw new ExecutionPlanIssueError({
         code: 'CONFIGURATION',
         fieldId: 'service',
@@ -914,7 +953,7 @@ export class GraphRunnerService implements OnModuleInit {
       environmentId,
       ...(values.targets as GraphInputsDto | undefined),
     };
-    const targetBinding = flow.inputBindings?.[node.id]?.targets;
+    const targetBinding = nodeInputBinding(flow, node, 'targets');
     const describe = (
       configuration?: ResolvedDeliveryConfiguration,
     ): DeliveryConfiguration | undefined =>
@@ -1106,6 +1145,9 @@ export class GraphRunnerService implements OnModuleInit {
     }
 
     const { method: configuredMethod, composeSource, ...deploySettings } = node.deploy ?? {};
+    const artifactPath = deploySettings.artifactPath?.trim()
+      ? normalizeRelativePath(deploySettings.artifactPath.trim())
+      : undefined;
     const afterRelease =
       flow.compiled?.nodes[node.id]?.inputBindings.afterRelease ??
       flow.inputBindings?.[node.id]?.afterRelease;
@@ -1143,6 +1185,7 @@ export class GraphRunnerService implements OnModuleInit {
         ...profile,
         delivery: {
           method,
+          ...(artifactPath && { artifactPath }),
           ...(method === 'COMPOSE' && {
             composeSource:
               composeSource?.kind === 'REPOSITORY_FILE'
@@ -1177,6 +1220,7 @@ export class GraphRunnerService implements OnModuleInit {
         targets,
         rootId,
         single: true,
+        distributeFile: configuredMethod !== 'COMPOSE',
       });
       const ids = refs.map(({ id }) => id);
       if (refs.some((ref) => ref.serviceId !== serviceId))
@@ -1252,6 +1296,12 @@ export class GraphRunnerService implements OnModuleInit {
       })),
     ]) {
       const { producer } = source;
+      if (producer.collection === 'WORK_DIRECTORY' && !artifactPath)
+        throw new ExecutionPlanIssueError({
+          code: 'ARTIFACT',
+          fieldId: 'artifactPath',
+          message: '请选择本次工作目录快照中的子路径，或填写 . 使用整个目录',
+        });
       if (!producer.externalPreflight && producer.serviceId !== serviceId)
         throw new ExecutionPlanIssueError({
           code: 'ARTIFACT',
@@ -1278,7 +1328,11 @@ export class GraphRunnerService implements OnModuleInit {
       );
       const missingTarget =
         producer.serverIds?.length &&
-        !(producer.kind === 'DOCKER_IMAGE' && producer.definition.registryId)
+        !(producer.kind === 'DOCKER_IMAGE' && producer.definition.registryId) &&
+        !(
+          producer.serverIds.length === 1 &&
+          (producer.kind === 'FILE' || producer.kind === 'DIRECTORY')
+        )
           ? plan.serverIds.find((id) => !producer.serverIds!.includes(id))
           : undefined;
       if (missingTarget)
@@ -1444,6 +1498,7 @@ export class GraphRunnerService implements OnModuleInit {
       environmentId?: string;
       directory: string;
       workspace?: Extract<GraphNodePlan, { type: 'SHELL' | 'CHECK' }>['workspace'];
+      artifact?: Extract<GraphNodePlan, { type: 'SHELL' | 'CHECK' }>['artifact'];
     }[] = [];
     const publishedDeliveries: Delivery[] = [];
     const plannedServices = new Set<string>();
@@ -1715,7 +1770,7 @@ export class GraphRunnerService implements OnModuleInit {
             };
             for (const artifact of named)
               production.set(outputKey(node.id, graphArtifactPortId(artifact)), [
-                { ...source, kind: artifact.type },
+                { ...source, kind: artifact.type, collection: artifact.collection },
               ]);
             if (named.length === 1)
               production.set(outputKey(node.id, 'artifacts'), [
@@ -1776,6 +1831,26 @@ export class GraphRunnerService implements OnModuleInit {
               nodeEnvironmentSources: environment.sources,
             })
             .catch((error: unknown) => withNodePlanIssue(error, current, node, nodeScope));
+          if (
+            (plan.type === 'SHELL' || plan.type === 'CHECK') &&
+            node.shell?.artifactPath?.trim()
+          ) {
+            const path = normalizeRelativePath(node.shell.artifactPath.trim());
+            const binding = nodeInputBinding(current, node, 'artifact');
+            const evidence = input.evidence.find(({ fieldId }) => fieldId === 'artifact');
+            if (evidence?.state === 'DEFERRED') {
+              plan.artifact = { path, producers: outputSources(binding) };
+            } else {
+              const instance = await this.scriptArtifactInstance(
+                projectId,
+                values.artifact,
+                rootId,
+                plan.serverId,
+                path,
+              ).catch((error: unknown) => withNodePlanIssue(error, current, node, nodeScope));
+              plan.artifact = { path, instances: [instance] };
+            }
+          }
           if (automation && plan.type === 'HEALTH_CHECK' && !plan.scope) {
             const predecessors = outputSources(nodeInputBinding(current, node, 'release'));
             const targetIds = [
@@ -1930,6 +2005,7 @@ export class GraphRunnerService implements OnModuleInit {
               environmentId: plan.environmentId,
               directory: plan.directory,
               workspace: plan.workspace,
+              artifact: plan.artifact,
             });
           }
         } else if (child) {
@@ -2100,7 +2176,7 @@ export class GraphRunnerService implements OnModuleInit {
             .filter(({ serviceUnscoped }) => !serviceUnscoped)
             .map(({ serviceId }) => serviceId),
           ...plannedServices,
-          flow.serviceId,
+          flow.compiled?.presetResourceGroups ? undefined : flow.serviceId,
         ]),
         unbounded,
       });
@@ -2533,12 +2609,12 @@ export class GraphRunnerService implements OnModuleInit {
       }
       const validateTargets = async (plan: Delivery | GraphNodePlan) => {
         if (!('pipelineId' in plan)) {
-          if (
-            (plan.type === 'SHELL' || plan.type === 'CHECK') &&
-            plan.serverId &&
-            plan.targetSelection
-          )
-            await confirmDeploymentMembers(tx, plan.targetSelection, [plan.serverId]);
+          if (plan.type === 'SHELL' || plan.type === 'CHECK') {
+            if (plan.serverId && plan.targetSelection)
+              await confirmDeploymentMembers(tx, plan.targetSelection, [plan.serverId]);
+            if (plan.artifact?.instances?.length)
+              await lockAvailableArtifacts(tx, plan.artifact.instances);
+          }
           return;
         }
         if (plan.configuration?.targetSelection)
@@ -3204,8 +3280,13 @@ export class GraphRunnerService implements OnModuleInit {
               tx,
             );
             const scope = declaredScope(flow, snapshot.inputs);
+            const releaseServices = flow.compiled?.presetResourceGroups
+              ? presetReleaseServiceIds(flow, snapshot.inputs.parameters)
+              : flow.serviceId
+                ? [flow.serviceId]
+                : [];
             if (
-              flow.serviceId &&
+              releaseServices.length &&
               (node.outputs ?? []).some((field) => field.type === 'RELEASE') &&
               !Object.entries(result).some(
                 ([id, value]) =>
@@ -3218,7 +3299,8 @@ export class GraphRunnerService implements OnModuleInit {
                     value.operation !== 'CHECK' ||
                     ('healthStatus' in value && value.healthStatus === 'HEALTHY')) &&
                   'serviceId' in value &&
-                  value.serviceId === flow.serviceId &&
+                  typeof value.serviceId === 'string' &&
+                  releaseServices.includes(value.serviceId) &&
                   (!scope.environmentId ||
                     ('environmentId' in value && value.environmentId === scope.environmentId)),
               )
@@ -3481,6 +3563,30 @@ export class GraphRunnerService implements OnModuleInit {
     if (!this.nodeTasks || !this.tasks || !row.dispatch_json)
       throw new BadRequestException('执行节点服务不可用');
     const plan = JSON.parse(row.dispatch_json) as GraphNodePlan;
+    const evidence = row.evidence_json
+      ? (JSON.parse(row.evidence_json) as NodeEvidence).inputs
+      : undefined;
+    let scriptArtifact: GraphNodeScope['scriptArtifact'];
+    if ((plan.type === 'SHELL' || plan.type === 'CHECK') && plan.artifact) {
+      const { path, instances, producers } = plan.artifact;
+      const instance = await this.scriptArtifactInstance(
+        run.project_id,
+        values.artifact,
+        snapshot.rootId ?? run.id,
+        plan.serverId,
+        path,
+      );
+      const realized = evidence?.find(({ fieldId }) => fieldId === 'artifact')?.source;
+      if (
+        (instances && !instances.includes(instance)) ||
+        (producers?.length &&
+          !producers.some(
+            ({ nodeId, fieldId }) => realized?.nodeId === nodeId && realized.fieldId === fieldId,
+          ))
+      )
+        throw new ConflictException('脚本实际读取的产物与已确认计划不一致');
+      scriptArtifact = { path, instances: [instance] };
+    }
     const scope = declaredScope(flow, snapshot.inputs);
     await this.validateNodeResources(
       run.project_id,
@@ -3500,9 +3606,8 @@ export class GraphRunnerService implements OnModuleInit {
         serviceId: referenceId(values.service) ?? scope.serviceId,
         environmentId: referenceId(values.environment) ?? scope.environmentId,
         values,
-        inputEvidence: row.evidence_json
-          ? (JSON.parse(row.evidence_json) as NodeEvidence).inputs
-          : undefined,
+        inputEvidence: evidence,
+        scriptArtifact,
         credentialNonces: snapshot.credentials,
         nodeEnvironment: environment.variables,
         nodeEnvironmentSources: environment.sources,
@@ -3511,19 +3616,27 @@ export class GraphRunnerService implements OnModuleInit {
       },
     );
     const automation = snapshot.automation;
+    const artifactInstances = scriptArtifact?.instances;
     await this.tasks.create(
       task,
       run.created_by,
-      automation
+      automation || artifactInstances?.length
         ? async (tx) => {
-            await assertGraphAutomation(
-              tx,
-              run.project_id,
-              run.created_by,
-              automation,
-              graphNodeRequiresIsolation(action.type),
-            );
-            if (task.payload.targets.length) await assertAutomaticTargets(tx, task.payload.targets);
+            if (artifactInstances?.length) {
+              await lockProjectGraph(tx);
+              await lockAvailableArtifacts(tx, artifactInstances);
+            }
+            if (automation) {
+              await assertGraphAutomation(
+                tx,
+                run.project_id,
+                run.created_by,
+                automation,
+                graphNodeRequiresIsolation(action.type),
+              );
+              if (task.payload.targets.length)
+                await assertAutomaticTargets(tx, task.payload.targets);
+            }
           }
         : undefined,
       (tx, id) => this.linkTask(tx, run, row, id),
@@ -3546,7 +3659,12 @@ export class GraphRunnerService implements OnModuleInit {
           run.project_id,
           artifactBindingRefs(bindings.artifact ?? stored.artifactIds),
           undefined,
-          { rootId, targets: stored.serverIds, single: true },
+          {
+            rootId,
+            targets: stored.serverIds,
+            single: true,
+            distributeFile: stored.profile?.delivery?.method === 'FILE',
+          },
         )
       : [];
     const artifacts = revisions.map(({ id }) => id);

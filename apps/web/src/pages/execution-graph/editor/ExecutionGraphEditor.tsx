@@ -10,9 +10,11 @@ import { ExecutionGraphStartSettings, isStartBusinessField } from './ExecutionGr
 import { ArtifactOutputEditor, BuildFields, DeployFields } from './ExecutionGraphPresets';
 import { GraphFieldEditor, GraphFieldValue } from './ExecutionGraphFields';
 import { actionCardText, graphActionSources, startCardText } from './graph-action-sources';
+import { useGraphTargetNames } from './graph-start-groups';
 import {
   canCreateStartParameter,
   ExecutionGraphBindings,
+  ExecutionGraphLegacyResources,
   GraphFlowBranches,
   suggestedGraphPortReference,
 } from './ExecutionGraphBindings';
@@ -96,7 +98,10 @@ function focusInspectorField(inspector: HTMLElement, focus: FieldFocus, bound: b
   )
     details.open = true;
   const controls = 'select:enabled, input:enabled, textarea:enabled';
-  const control = field.matches(controls) ? field : field.querySelector<HTMLElement>(controls);
+  const control = field.matches(controls)
+    ? field
+    : (field.querySelector<HTMLElement>(controls) ??
+      field.querySelector<HTMLElement>('button:enabled'));
   field.scrollIntoView({ block: 'nearest' });
   (control ?? inspector.querySelector<HTMLElement>('h3'))?.focus({ preventScroll: true });
 }
@@ -187,6 +192,7 @@ export function ProjectGraphEditor({
   }>();
   const activePair =
     activeNode && selectedPath?.nodes.has(activeNode.id) ? selectedPair : undefined;
+  const targetNames = useGraphTargetNames(canvas.nodes.some(isReleaseNode));
   const inspectedStartScope =
     activeNode?.type === 'START'
       ? (selectedPath?.nodes ?? reachable(canvas, activeNode.id))
@@ -713,10 +719,19 @@ export function ProjectGraphEditor({
       catalogSnapshot?.canvas === canvas
         ? catalogSnapshot.flows?.[pair.startId]?.nodes[node.id]?.automaticInputBindings
         : undefined;
-    return graphActionSources(start, canvas.nodes, {
-      ...automatic,
-      ...pair.inputBindings?.[node.id],
-    });
+    return graphActionSources(
+      start,
+      canvas.nodes,
+      { ...automatic, ...pair.inputBindings?.[node.id] },
+      node,
+      project,
+      targetNames,
+    );
+  }
+  function openNodeField(nodeId: string, fieldId: string) {
+    selectNode(nodeId);
+    setReveal({ nodeId });
+    setFocusRequest({ nodeId, fieldId, fieldSection: 'input' });
   }
   function summarizeNode(node: GraphNode) {
     if (node.type === 'START')
@@ -1158,15 +1173,26 @@ export function ProjectGraphEditor({
                 </nav>
                 <div className="graph-inspector-panel" key={inspected.id + ':' + tab}>
                   {tab === 'execution' ? (
-                    <NodeOperationFields
-                      project={project}
-                      node={inspected}
-                      canvas={canvas}
-                      canEdit={canEdit}
-                      patch={patch}
-                      useStartDefaults={useStartDefaults}
-                      selectOperation={(operation) => patch(changeOperation(inspected, operation))}
-                    />
+                    <>
+                      {useStartDefaults && (
+                        <ExecutionGraphLegacyResources
+                          node={inspected}
+                          canEdit={canEdit}
+                          patch={patch}
+                        />
+                      )}
+                      <NodeOperationFields
+                        project={project}
+                        node={inspected}
+                        canvas={canvas}
+                        canEdit={canEdit}
+                        patch={patch}
+                        useStartDefaults={useStartDefaults}
+                        selectOperation={(operation) =>
+                          patch(changeOperation(inspected, operation))
+                        }
+                      />
+                    </>
                   ) : (
                     <>
                       <ExecutionGraphBindings
@@ -1185,6 +1211,8 @@ export function ProjectGraphEditor({
                         section={tab}
                         createStartParameter={createStartParameter}
                         repairFieldIds={repairFieldIds}
+                        openStart={openNodeField}
+                        targetNames={targetNames}
                       />
                       {tab === 'input' && activeNode && renderResources?.(activeNode, activePair)}
                       <FunctionPortFields
@@ -1221,13 +1249,18 @@ export function ProjectGraphEditor({
                   endpoint={activePair}
                   project={project}
                   canEdit={canEdit}
-                  change={(inputs, endpoint) => {
-                    if (!endpoint) patch({ inputs });
+                  selectStep={(nodeId) => {
+                    selectNode(nodeId);
+                    setTab('input');
+                    setReveal({ nodeId });
+                  }}
+                  change={(inputs, endpoint, settings) => {
+                    if (!endpoint) patch({ inputs, ...settings });
                     else
                       onChange({
                         ...canvas,
                         nodes: canvas.nodes.map((item) =>
-                          item.id === activeNode.id ? { ...item, inputs } : item,
+                          item.id === activeNode.id ? { ...item, inputs, ...settings } : item,
                         ),
                         endpoints: canvas.endpoints.map((item) =>
                           item.startId === endpoint.startId ? endpoint : item,
@@ -1889,6 +1922,7 @@ function NodeOperationFields({
           </p>
           <Field label="拉取深度">
             <select
+              data-graph-node-field="fetchMode"
               disabled={!canEdit}
               value={
                 node.checkout?.fullClone || node.inputDefaults?.fetchMode === 'FULL'
@@ -2319,13 +2353,28 @@ function ShellFields({
           </select>
         </Field>
       )}
-      <Field label="工作区相对目录">
+      <Field label="工作目录" hint="相对本节点工作区根目录，留空使用根目录。">
         <input
+          data-graph-node-field="directory"
           disabled={!canEdit}
           placeholder="."
           value={shell.directory ?? ''}
           onChange={(event) =>
             patch({ shell: { ...shell, directory: event.target.value || undefined } })
+          }
+        />
+      </Field>
+      <Field
+        label="读取产物子路径"
+        hint="填写后在输入中选择产物。脚本通过 $VEYOPS_ARTIFACT_DIR 读取所选内容。"
+      >
+        <input
+          data-graph-node-field="artifactPath"
+          disabled={!canEdit}
+          placeholder="reports/ 或 ."
+          value={shell.artifactPath ?? ''}
+          onChange={(event) =>
+            patch({ shell: { ...shell, artifactPath: event.target.value || undefined } })
           }
         />
       </Field>

@@ -7,8 +7,10 @@ import {
   Optional,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
 import type { Kysely } from 'kysely';
-import { posix } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, posix } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { Database } from '../../core/database/schema';
 import { DatabaseService } from '../../core/database/database.service';
@@ -29,6 +31,7 @@ import { ArtifactsService } from '../artifacts/artifacts.service';
 import {
   ArtifactOutputMissing,
   ArtifactPhysicalService,
+  type ArtifactPhysical,
 } from '../artifacts/artifact-physical.service';
 import { artifactIdentity } from '../artifacts/artifact-identities';
 import { CredentialsService } from '../credentials/credentials.service';
@@ -38,7 +41,7 @@ import {
 } from '../deployment-targets/deployment-selection';
 import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
 import { PipelineExecutor } from '../pipelines/pipeline-executor.service';
-import { relativePath, shellQuote } from '../pipelines/pipeline.validation';
+import { normalizeRelativePath, relativePath, shellQuote } from '../pipelines/pipeline.validation';
 import { assertGraphCompose } from '../pipelines/graph-compose';
 import { createTargetWorkspace, targetWorkspacePath } from '../pipelines/target-workspace';
 import { SystemSettingsService } from '../system/system-settings.service';
@@ -127,7 +130,14 @@ export interface GraphNodeScope {
   fetchModeDeferred?: boolean;
   inputEvidence?: readonly GraphFieldEvidence[];
   scriptWorkspace?: { plan?: ScriptWorkspacePlan };
+  scriptArtifact?: ScriptArtifactPlan;
 }
+
+type ScriptArtifactPlan = {
+  path: string;
+  instances?: string[];
+  producers?: { nodeId: string; fieldId: string }[];
+};
 
 export type ScriptWorkspaceCandidate = {
   producerNodeId?: string;
@@ -157,6 +167,7 @@ export type GraphNodePlan =
       targetWorkspaceRoot?: string;
       directory: string;
       workspace?: ScriptWorkspacePlan;
+      artifact?: ScriptArtifactPlan;
       serviceId?: string;
       environmentId?: string;
       environment?: ExecutionVariables;
@@ -191,6 +202,7 @@ export interface GraphModulePayload {
     continueOnFailure: boolean;
     parameters: ExecutionVariables;
     outputs: NonNullable<GraphNode['outputs']>;
+    artifact?: { instanceId: string; rootId: string; path: string };
   };
   trigger?: Record<string, unknown>;
   healthCheck?: { command: string; timeoutSeconds: number; release: GraphReleaseResult };
@@ -676,6 +688,7 @@ export class GraphNodeTasks implements OnModuleInit {
       environmentFile: variableRef?.environmentFile,
       directory: relativePath(node.shell?.directory || '.'),
       workspace: plannedWorkspace,
+      artifact: scope.scriptArtifact,
     };
     const manager = async () => {
       if (scope.automation) await BuildsService.automaticManagerSocket();
@@ -719,9 +732,7 @@ export class GraphNodeTasks implements OnModuleInit {
       serverName: target.targets[0]!.name,
       targetHash: target.targetHash,
       targetSelection,
-      ...((scope.automation || plannedWorkspace || graphArtifactDeclarations(node)?.length) && {
-        targetWorkspaceRoot: (await this.systemSettings.get(projectId)).targetWorkspaceRoot,
-      }),
+      targetWorkspaceRoot: (await this.systemSettings.get(projectId)).targetWorkspaceRoot,
     };
   }
 
@@ -729,6 +740,36 @@ export class GraphNodeTasks implements OnModuleInit {
     const available = await ownedGraphWorkspace(this.database.db, projectId, reference);
     await openGraphWorkspace(available);
     return available;
+  }
+
+  async assertScriptArtifactPath(projectId: string, instanceId: string, path: string) {
+    const row = await this.database.db
+      .selectFrom('artifacts')
+      .select('physical_json')
+      .where('project_id', '=', projectId)
+      .where('id', '=', instanceId)
+      .where('lifecycle_state', '=', 'ACTIVE')
+      .where('pruned_at', 'is', null)
+      .executeTakeFirst();
+    if (!row?.physical_json) throw new ConflictException('所选产物没有可验证的文件或目录实物');
+    await this.artifacts.verifyFileSelection(row.physical_json, normalizeRelativePath(path));
+  }
+
+  private async scriptArtifactPhysical(
+    projectId: string,
+    input: NonNullable<NonNullable<GraphModulePayload['shell']>['artifact']>,
+  ) {
+    const row = await this.database.db
+      .selectFrom('artifacts')
+      .select(['physical_json', 'temporary_root_id'])
+      .where('project_id', '=', projectId)
+      .where('id', '=', input.instanceId)
+      .where('lifecycle_state', '=', 'ACTIVE')
+      .where('pruned_at', 'is', null)
+      .executeTakeFirst();
+    if (!row?.physical_json || (row.temporary_root_id && row.temporary_root_id !== input.rootId))
+      throw new ConflictException('所选脚本产物已不可用');
+    return JSON.parse(row.physical_json) as ArtifactPhysical;
   }
 
   private async confirmedScriptWorkspace(
@@ -1087,6 +1128,15 @@ export class GraphNodeTasks implements OnModuleInit {
             continueOnFailure: config.continueOnFailure === true,
             parameters: { ...parameters, variables: { ...parameters.variables, ...platform } },
             outputs: graphScriptOutputs(node),
+            ...(scope.scriptArtifact?.instances?.length === 1 &&
+              plan.artifact &&
+              plan.artifact.path === scope.scriptArtifact.path && {
+                artifact: {
+                  instanceId: scope.scriptArtifact.instances[0]!,
+                  rootId: scope.rootRunId!,
+                  path: plan.artifact.path,
+                },
+              }),
           },
         },
       },
@@ -1251,6 +1301,7 @@ export class GraphNodeTasks implements OnModuleInit {
       task.payload.pipeline && this.session(task, context, task.payload.pipeline, values, secrets);
     const shellSession = this.session(task, context, snapshot, values, secrets);
     let targetWorkspace: string | undefined;
+    let artifactScratch: string | undefined;
     let sourceRoot: string | undefined;
     let uncertainExecution = false;
     let exitCode: number | null = null;
@@ -1261,7 +1312,12 @@ export class GraphNodeTasks implements OnModuleInit {
         let directory = module.targetDirectory
           ? 'cd -P -- ' + shellQuote(relativePath(module.targetDirectory)) + ' || exit $?\n'
           : '';
-        if (module.automation || module.workspace || artifactSession) {
+        if (
+          module.targetWorkspaceRoot ||
+          module.automation ||
+          module.workspace ||
+          artifactSession
+        ) {
           if (!module.targetWorkspaceRoot) throw new ConflictException('缺少已确认的脚本工作目录');
           const name = 'veyops-script-' + task.id;
           const workspaceReceipt = await this.builds.remoteCapture(
@@ -1279,7 +1335,57 @@ export class GraphNodeTasks implements OnModuleInit {
               module.workspace,
             );
           sourceRoot = module.workspace ? targetWorkspace + '/repo' : targetWorkspace;
-          directory = enterSourceDirectory(sourceRoot, relativeDirectory, !module.workspace) + '\n';
+          directory = enterSourceDirectory(sourceRoot, relativeDirectory) + '\n';
+        }
+        if (shell.artifact) {
+          if (!targetWorkspace) throw new ConflictException('缺少脚本产物工作区');
+          const physical = await this.scriptArtifactPhysical(module.projectId, shell.artifact);
+          const archive = targetWorkspace + '/input.tar.gz';
+          const input = targetWorkspace + '/input';
+          let checksum: string;
+          if (physical.location === 'SERVER_PATH' && physical.serverId === target.id) {
+            ({ checksum } = await this.physical.stageServerArchive(
+              physical,
+              target,
+              archive,
+              context.signal,
+              shell.artifact.path,
+            ));
+          } else {
+            artifactScratch = await mkdtemp(join(tmpdir(), 'veyops-script-artifact-'));
+            const local = join(artifactScratch, 'input.tar.gz');
+            ({ checksum } = await this.physical.stageLocalPathArchive(
+              physical,
+              local,
+              shell.artifact.path,
+              context.signal,
+            ));
+            await this.ssh.upload(target, local, archive, { timeout: 300, signal: context.signal });
+          }
+          await this.builds.remote(
+            target,
+            [
+              'set -eu',
+              'test "$(sha256sum < ' +
+                shellQuote(archive) +
+                ' | cut -d " " -f1)" = ' +
+                shellQuote(checksum),
+              'umask 077',
+              'mkdir -- ' + shellQuote(input),
+              'tar --no-same-owner --no-same-permissions -xf ' +
+                shellQuote(archive) +
+                ' -C ' +
+                shellQuote(input),
+            ].join('\n'),
+            shellSession,
+            180,
+            '脚本产物归档校验或展开失败',
+          );
+          values.VEYOPS_ARTIFACT_DIR = input;
+          await context.log(
+            '读取产物 ' + shell.artifact.instanceId + ' · ' + shell.artifact.path + '\n',
+            target.id,
+          );
         }
         const result = await this.ssh.execute(target, directory + shell.command, {
           timeout: shell.timeout,
@@ -1294,6 +1400,22 @@ export class GraphNodeTasks implements OnModuleInit {
         const workspace = await openGraphWorkspace(module.workspace).catch(() =>
           createGraphWorkspace(module.workspace!),
         );
+        let archive: string | undefined;
+        if (shell.artifact) {
+          const physical = await this.scriptArtifactPhysical(module.projectId, shell.artifact);
+          artifactScratch = await mkdtemp(join(tmpdir(), 'veyops-script-artifact-'));
+          archive = join(artifactScratch, 'input.tar.gz');
+          await this.physical.stageLocalPathArchive(
+            physical,
+            archive,
+            shell.artifact.path,
+            context.signal,
+          );
+          values.VEYOPS_ARTIFACT_DIR = '/run/veyops/artifact';
+          await context.log(
+            '读取产物 ' + shell.artifact.instanceId + ' · ' + shell.artifact.path + '\n',
+          );
+        }
         const result = await this.builds.managerGraphShell(
           shellSession,
           workspace,
@@ -1301,6 +1423,7 @@ export class GraphNodeTasks implements OnModuleInit {
           module.targetDirectory ?? '.',
           shell.timeout,
           onData,
+          archive,
         );
         exitCode = result.exitCode;
         output.finish(result);
@@ -1348,6 +1471,7 @@ export class GraphNodeTasks implements OnModuleInit {
         );
       throw error;
     } finally {
+      if (artifactScratch) await rm(artifactScratch, { recursive: true, force: true });
       if (target && targetWorkspace && !uncertainExecution) {
         const work = shellQuote(targetWorkspace);
         try {

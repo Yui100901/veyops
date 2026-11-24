@@ -366,7 +366,9 @@ export function inspectNodeInputs(
 }
 
 export function nodeInputBinding(flow: GraphFlow, node: GraphNode, fieldId: string) {
-  const bindings = flow.compiled?.nodes[node.id]?.inputBindings ?? flow.inputBindings?.[node.id];
+  const compiled = flow.compiled?.nodes[node.id];
+  if (compiled && flow.compiled?.presetResourceGroups) return compiled.inputBindings[fieldId];
+  const bindings = compiled?.inputBindings ?? flow.inputBindings?.[node.id];
   return bindings?.[fieldId] ?? graphDefaultBinding(flow, node, fieldId);
 }
 
@@ -516,16 +518,51 @@ export function assertRuntimeParameterOverrides(flow: GraphFlow, supplied?: Valu
       );
 }
 
+export function presetReleaseServiceIds(
+  flow: GraphFlow,
+  parameters?: Values,
+  serviceBinding = (node: GraphNode) => nodeInputBinding(flow, node, 'service'),
+) {
+  const defaults = new Map(
+    (flowStart(flow).inputs ?? []).map(({ id, defaultValue }) => [id, defaultValue]),
+  );
+  return [
+    ...new Set(
+      flow.nodes.flatMap((node) => {
+        if (node.type !== 'DEPLOY_ARTIFACT' && node.type !== 'ROLLBACK_ARTIFACT') return [];
+        const binding = serviceBinding(node);
+        const id =
+          binding?.kind === 'INPUT' &&
+          referenceId(
+            parameters ? entry(parameters, binding.fieldId) : defaults.get(binding.fieldId),
+          );
+        return id ? [id] : [];
+      }),
+    ),
+  ];
+}
+
 export function declaredScope(flow: GraphFlow, inputs: GraphInputsDto) {
   const fields = flowStart(flow).inputs ?? [];
   const find = (type: GraphField['type']) => {
     const candidates = fields.filter((field) => field.type === type && !field.multiple);
     return candidates.length === 1 ? entry(inputs.parameters, candidates[0]!.id) : undefined;
   };
+  const usesNewReleaseScope =
+    flow.compiled?.presetResourceGroups &&
+    flow.nodes.some(({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT');
+  const releaseServices = usesNewReleaseScope
+    ? presetReleaseServiceIds(flow, inputs.parameters)
+    : [];
   return {
-    serviceId: flow.serviceId ?? referenceId(find('SERVICE')),
+    serviceId: usesNewReleaseScope
+      ? releaseServices.length === 1
+        ? releaseServices[0]
+        : undefined
+      : ((flow.compiled?.presetResourceGroups ? undefined : flow.serviceId) ??
+        referenceId(find('SERVICE'))),
     environmentId: stringValue(find('ENVIRONMENT')) ?? inputs.environmentId,
-    targets: (find('TARGETS') ?? {}) as Pick<
+    targets: ((flow.compiled?.presetResourceGroups ? undefined : find('TARGETS')) ?? {}) as Pick<
       GraphInputsDto,
       'serverIds' | 'groupIds' | 'strategy' | 'maxParallel' | 'failurePolicy'
     >,

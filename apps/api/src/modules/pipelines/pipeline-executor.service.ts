@@ -6,7 +6,9 @@ import {
   Optional,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { posix } from 'node:path';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, posix } from 'node:path';
 import { redactText } from '../../infrastructure/ssh/secret-redactor';
 import { SshExecutionError, SshService, SshTarget } from '../../infrastructure/ssh/ssh.service';
 import {
@@ -684,14 +686,19 @@ export class PipelineExecutor {
                 let checksum = deploymentInput?.checksum ?? manager?.checksum,
                   sizeBytes = manager?.sizeBytes;
                 const localArchive = deploymentInput?.localArchive ?? manager?.localArchive;
-                if (deploymentInput?.physical?.location === 'SERVER_PATH') {
-                  const source = deploymentInput.physical;
-                  if (!this.physical) throw new ConflictException('目标端产物适配器不可用');
-                  ({ checksum, sizeBytes } = await step(
-                    'TRANSFER',
-                    '在目标端校验并准备登记产物',
-                    () =>
-                      this.physical!.stageServerArchive(source, target, archive, context.signal),
+                if (
+                  deploymentInput?.physical?.location === 'SERVER_PATH' ||
+                  (deploymentInput?.physical?.location === 'BUILDER_PATH' &&
+                    snapshot.graphDeployment?.artifactPath)
+                ) {
+                  ({ checksum, sizeBytes } = await step('TRANSFER', '校验并准备所选文件产物', () =>
+                    this.transferGraphFileArtifact(
+                      deploymentInput,
+                      target,
+                      archive,
+                      snapshot.graphDeployment?.artifactPath,
+                      context.signal,
+                    ),
                   ));
                 } else if (localArchive) {
                   await step('TRANSFER', 'SFTP分发已归档的构建产物', () =>
@@ -989,7 +996,10 @@ export class PipelineExecutor {
           this.physical!.collectServerPath({
             target,
             workspace: posix.join(work, 'repo'),
-            relativePath: posix.join(repoPath, outputPath),
+            workingDirectory: repoPath,
+            relativePath: outputPath,
+            collection: declaration?.collection,
+            excludePaths: declaration?.excludePaths,
             kind,
             instanceId: artifactIdentity(snapshot, declaration?.name, target.id).instanceId,
             signal: session.context.signal,
@@ -1208,11 +1218,15 @@ export class PipelineExecutor {
       if (snapshot.definition.artifactType === 'FILE') {
         const archive = `${rollbackWork}/artifact.tar.gz`;
         let checksum = artifact.checksum;
-        if (artifact.physical?.location === 'SERVER_PATH' && this.physical) {
-          ({ checksum } = await this.physical.stageServerArchive(
-            artifact.physical,
+        if (
+          artifact.physical?.location === 'SERVER_PATH' ||
+          (artifact.physical?.location === 'BUILDER_PATH' && snapshot.graphDeployment?.artifactPath)
+        ) {
+          ({ checksum } = await this.transferGraphFileArtifact(
+            artifact,
             target,
             archive,
+            snapshot.graphDeployment?.artifactPath,
             session.context.signal,
           ));
         } else {
@@ -1601,6 +1615,32 @@ test "$(${docker} image inspect --format ${q(inspect)} ${q(imageReference)})" = 
       '从归档加载镜像失败或镜像 ID 不一致',
     );
   }
+  private async transferGraphFileArtifact(
+    artifact: DeploymentArtifact,
+    target: SshTarget,
+    archive: string,
+    path: string | undefined,
+    signal: AbortSignal,
+  ) {
+    if (!artifact.physical || !this.physical) throw new ConflictException('文件产物适配器不可用');
+    if (artifact.physical.location === 'SERVER_PATH' && artifact.physical.serverId === target.id)
+      return this.physical.stageServerArchive(artifact.physical, target, archive, signal, path);
+    const directory = await mkdtemp(join(tmpdir(), 'veyops-artifact-'));
+    try {
+      const local = join(directory, 'artifact.tar.gz');
+      const receipt = await this.physical.stageLocalPathArchive(
+        artifact.physical,
+        local,
+        path,
+        signal,
+      );
+      await this.ssh.upload(target, local, archive, { timeout: 300, signal });
+      return receipt;
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
   private async inRelease(
     target: SshTarget,
     work: string,

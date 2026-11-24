@@ -220,6 +220,7 @@ export function DeployFields({
               change({
                 ...value,
                 method: method || undefined,
+                artifactPath: method === 'COMPOSE' ? undefined : value.artifactPath,
                 composeSource:
                   method === 'COMPOSE' ? (template ?? { kind: 'ARTIFACT' }) : undefined,
               });
@@ -238,6 +239,17 @@ export function DeployFields({
           canEdit={canEdit}
           onChange={(deployPath) => change({ ...value, deployPath })}
         />
+        {value.method !== 'COMPOSE' && (
+          <Text
+            label="产物子路径"
+            fieldId="artifactPath"
+            placeholder="dist/ 或 ."
+            hint="相对所选产物根目录。使用工作目录快照时请填写子路径，或填写 . 使用整个目录。"
+            value={value.artifactPath}
+            canEdit={canEdit}
+            onChange={(artifactPath) => change({ ...value, artifactPath })}
+          />
+        )}
         {value.method !== 'FILE' && (
           <Field label="Compose 模板来源" hint="Compose 发布会锁定模板摘要。">
             <select
@@ -383,6 +395,8 @@ export function ArtifactOutputEditor({
                     patch(index, {
                       type,
                       path: next.path,
+                      collection: next.collection,
+                      excludePaths: undefined,
                       pathInput: undefined,
                       imageReference: undefined,
                       name: output.name === previous.name ? next.name : output.name,
@@ -395,6 +409,8 @@ export function ArtifactOutputEditor({
                     patch(index, {
                       type,
                       path: undefined,
+                      collection: build && type === 'DIRECTORY' ? 'WORK_DIRECTORY' : undefined,
+                      excludePaths: undefined,
                       pathInput: undefined,
                       imageReference: undefined,
                     });
@@ -435,8 +451,53 @@ export function ArtifactOutputEditor({
                   onChange={(composeFilePath) => patch(index, { composeFilePath })}
                 />
               </>
+            ) : build && output.type === 'DIRECTORY' && output.collection === 'WORK_DIRECTORY' ? (
+              <>
+                <Field label="收集范围">
+                  <select
+                    value="WORK_DIRECTORY"
+                    disabled={!canEdit}
+                    onChange={() => patch(index, { collection: 'PATH', excludePaths: undefined })}
+                  >
+                    <option value="WORK_DIRECTORY">保存工作目录</option>
+                    <option value="PATH">仅保存指定路径</option>
+                  </select>
+                </Field>
+                <Field
+                  label="排除路径"
+                  hint="每行一条相对工作目录的路径。Git 元数据和 .env 文件自动排除。"
+                >
+                  <textarea
+                    defaultValue={output.excludePaths?.join('\n') ?? ''}
+                    readOnly={!canEdit}
+                    rows={3}
+                    onChange={(event) =>
+                      patch(index, {
+                        excludePaths: event.target.value
+                          .split(/\r?\n/)
+                          .map((path) => path.trim())
+                          .filter(Boolean),
+                      })
+                    }
+                  />
+                </Field>
+              </>
             ) : (
               <>
+                {build && output.type === 'DIRECTORY' && (
+                  <Field label="收集范围">
+                    <select
+                      value="PATH"
+                      disabled={!canEdit}
+                      onChange={() =>
+                        patch(index, { collection: 'WORK_DIRECTORY', path: undefined })
+                      }
+                    >
+                      <option value="WORK_DIRECTORY">保存工作目录</option>
+                      <option value="PATH">仅保存指定路径</option>
+                    </select>
+                  </Field>
+                )}
                 {(pathInputs.length > 0 || output.pathInput) && (
                   <Field label="路径来源">
                     <select
@@ -463,7 +524,9 @@ export function ArtifactOutputEditor({
                   </Field>
                 )}
                 <Text
-                  label={output.pathInput ? '备用相对路径' : '工作区相对路径'}
+                  label={
+                    output.pathInput ? '备用相对路径' : build ? '工作目录相对路径' : '相对路径'
+                  }
                   artifactField="path"
                   hint={build ? '相对构建工作目录。发布执行图时必填。' : undefined}
                   required={build}

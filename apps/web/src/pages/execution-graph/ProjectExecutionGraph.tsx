@@ -17,6 +17,7 @@ import type { ProjectDetail, User } from '../../models';
 import { NodeMap } from './editor/ExecutionGraphCanvas';
 import { ExecutionGraphInputSummary } from './editor/ExecutionGraphInputSummary';
 import { actionCardText, graphActionSources, startCardText } from './editor/graph-action-sources';
+import { useGraphTargetNames } from './editor/graph-start-groups';
 import { ProjectGraphEditor } from './editor/ExecutionGraphEditor';
 import { ExecutionGraphMigration } from './ExecutionGraphMigration';
 import { PublishedNodeDetails, showSelectedNode } from './editor/ExecutionGraphNodeDetails';
@@ -38,7 +39,7 @@ import { ExecutionGraphTemplateDialog } from './editor/ExecutionGraphTemplateDia
 import { ExecutionGraphTriggers } from './editor/ExecutionGraphTriggers';
 import { triggerFlows, type TriggerPreflightIssue } from './editor/graph-trigger-model';
 import { GraphVersionTools } from './ExecutionGraphVersions';
-import { effectiveNodeType, graphNodeTypeLabel } from './execution-graph-definition';
+import { effectiveNodeType, graphNodeTypeLabel, isReleaseNode } from './execution-graph-definition';
 import { GraphResourceContext } from './graph-resource-context';
 import type {
   GraphCanvas,
@@ -289,9 +290,31 @@ function Workspace({
     setError('');
     setNotice('');
     try {
-      if (action === 'publish' || action === 'validate') {
+      let draft = graph;
+      if (action === 'save' || (action === 'publish' && !confirmed && dirty)) {
+        draft = await api(path + '/draft', {
+          method: 'PUT',
+          body: JSON.stringify({
+            expectedRevision: graph.revision,
+            definition: { flows: [], canvas: latestCanvas.current },
+          }),
+        });
+        setGraph(draft);
+        setCanvas(draft.draft.canvas ?? emptyCanvas);
+        setPublication(undefined);
+        setIssues([]);
+        setConflict(false);
+        setNotice('草稿已保存');
+        if (action === 'save') return draft;
+      }
+      if (action === 'validate' || (action === 'publish' && !confirmed)) {
+        setPublication(undefined);
         const result = await post<{ issues: GraphIssue[] }>(path + '/validate', {
-          definition: { flows: [], canvas },
+          definition: {
+            flows: [],
+            canvas:
+              action === 'validate' ? latestCanvas.current : (draft.draft.canvas ?? emptyCanvas),
+          },
         });
         setIssues(result.issues);
         if (result.issues.some(({ severity }) => severity !== 'WARNING' && severity !== 'INFO'))
@@ -300,25 +323,16 @@ function Workspace({
           setNotice('发布检查通过');
           return;
         }
-        if (!confirmed) {
-          setPublication(
-            await post(path + '/publication-impact', { expectedRevision: graph.revision }),
-          );
-          return;
-        }
+        setPublication(
+          await post(path + '/publication-impact', { expectedRevision: draft.revision }),
+        );
+        return;
       }
       let saved: GraphDocument;
-      if (action === 'save')
-        saved = await api(path + '/draft', {
-          method: 'PUT',
-          body: JSON.stringify({
-            expectedRevision: graph.revision,
-            definition: { flows: [], canvas },
-          }),
-        });
-      else if (action === 'publish')
-        saved = await post(path + '/publish', { expectedRevision: graph.revision });
-      else saved = await api(path);
+      if (action === 'publish') {
+        if (dirty || publication?.revision !== graph.revision) return;
+        saved = await post(path + '/publish', { expectedRevision: publication.revision });
+      } else saved = await api(path);
       setGraph(saved);
       setPublication(undefined);
       setCanvas(saved.draft.canvas ?? emptyCanvas);
@@ -328,13 +342,7 @@ function Workspace({
         setRedo([]);
       }
       setConflict(false);
-      setNotice(
-        action === 'publish'
-          ? '已发布 v' + saved.publishedVersion
-          : action === 'save'
-            ? '草稿已保存'
-            : '已载入服务器草稿',
-      );
+      setNotice(action === 'publish' ? '已发布 v' + saved.publishedVersion : '已载入服务器草稿');
       return saved;
     } catch (err) {
       setError(message(err));
@@ -401,6 +409,7 @@ function Workspace({
     setUndo((history) => [...history.slice(-49), previous]);
     setRedo([]);
     setCanvas(next);
+    setPublication(undefined);
     setIssues([]);
     setNotice('');
   }
@@ -416,6 +425,7 @@ function Workspace({
     const next = history.at(-1);
     if (!next || saving.current) return;
     setCanvas(next);
+    setPublication(undefined);
     setIssues([]);
     setNotice('');
     if (direction === 'undo') {
@@ -570,7 +580,7 @@ function Workspace({
               <button
                 type="button"
                 className="button primary"
-                disabled={busy}
+                disabled={busy || conflict}
                 onClick={() => void persist('publish', true)}
               >
                 确认发布
@@ -680,10 +690,10 @@ function Workspace({
                 <button
                   type="button"
                   className="button primary"
-                  disabled={dirty || busy || conflict}
+                  disabled={busy || conflict}
                   onClick={() => void persist('publish')}
                 >
-                  <Upload size={16} /> 发布版本
+                  <Upload size={16} /> 保存并检查发布
                 </button>
               </div>
             )
@@ -1237,6 +1247,9 @@ function PublishedNodes({
   children?: React.ReactNode;
 }) {
   const catalog = useResource<GraphCatalog>(path + '/catalog');
+  const targetNames = useGraphTargetNames(
+    definition.flows.some(({ nodes }) => nodes.some(isReleaseNode)),
+  );
   const [selected, setSelected] = useState(initialNodeId ?? '');
   const [hovered, setHovered] = useState<string>();
   const [legacyId, setLegacyId] = useState(initialFlowId ?? '');
@@ -1284,6 +1297,9 @@ function PublishedNodes({
       selectedFlow.nodes.find(({ type }) => type === 'START'),
       selectedFlow.nodes,
       selectedFlow.compiled?.nodes[item.id]?.inputBindings ?? selectedFlow.inputBindings?.[item.id],
+      item,
+      project,
+      targetNames,
     );
   }
   function selectNode(id: string) {

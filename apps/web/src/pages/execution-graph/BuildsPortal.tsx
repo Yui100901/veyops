@@ -10,8 +10,8 @@ import './builds-portal.css';
 interface Flow {
   id: string;
   name: string;
-  serviceId?: string;
-  serviceName?: string;
+  serviceIds: string[];
+  serviceNames: string[];
   version?: number;
   hasDraftChanges: boolean;
   triggerKinds: string[];
@@ -47,7 +47,7 @@ export function BuildsPortal({ user }: { user: User }) {
   const services = new Map(
     narrowed.flatMap(({ flows }) =>
       flows.flatMap((flow) =>
-        flow.serviceId && flow.serviceName ? [[flow.serviceId, flow.serviceName] as const] : [],
+        flow.serviceIds.map((id, index) => [id, flow.serviceNames[index] ?? id] as const),
       ),
     ),
   );
@@ -56,9 +56,9 @@ export function BuildsPortal({ user }: { user: User }) {
       ...project,
       flows: project.flows.filter(
         (flow) =>
-          (!serviceId || serviceId === flow.serviceId) &&
-          [flow.name, flow.serviceName, project.projectName].some((value) =>
-            value?.toLowerCase().includes(query.trim().toLowerCase()),
+          (!serviceId || flow.serviceIds.includes(serviceId)) &&
+          [flow.name, ...flow.serviceNames, project.projectName].some((value) =>
+            value.toLowerCase().includes(query.trim().toLowerCase()),
           ),
       ),
     }))
@@ -159,7 +159,7 @@ export function BuildsPortal({ user }: { user: User }) {
                 <div>
                   <strong>{flow.name}</strong>
                   <div className="builds-flow-meta">
-                    {flow.serviceName && <span>{flow.serviceName}</span>}
+                    {flow.serviceNames.length > 0 && <span>{flow.serviceNames.join('、')}</span>}
                     <span>{flow.version ? `已发布 v${flow.version}` : '草稿'}</span>
                     {flow.version && flow.hasDraftChanges && <span>有草稿修改</span>}
                     {flow.triggerKinds.length > 0 && (

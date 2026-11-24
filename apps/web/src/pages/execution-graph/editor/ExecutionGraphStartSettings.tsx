@@ -1,4 +1,4 @@
-import { Plus, Trash2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, Plus, Trash2 } from 'lucide-react';
 import { Field } from '../../../components';
 import type { DeploymentSelection, ProjectDetail } from '../../../models';
 import { effectiveNodeType, graphKey, isReleaseNode } from '../execution-graph-definition';
@@ -7,8 +7,16 @@ import type {
   GraphEndpoint,
   GraphField,
   GraphNode,
+  GraphStartGroup,
 } from '../execution-graph-definition';
 import { GraphFieldValue } from './ExecutionGraphFields';
+import {
+  getGraphStartGroups,
+  graphResourceId,
+  graphStartGroupFields,
+  selectedGraphStartGroup,
+  type GraphStartGroupKind,
+} from './graph-start-groups';
 import './execution-graph-start-settings.css';
 
 const standardFields = {
@@ -49,30 +57,11 @@ export function isStartBusinessField(field: GraphField) {
   );
 }
 
-function referenceId(value: unknown) {
-  if (typeof value === 'string') return value;
-  if (value && typeof value === 'object') {
-    if ('repositoryId' in value && typeof value.repositoryId === 'string')
-      return value.repositoryId;
-    if ('serviceId' in value && typeof value.serviceId === 'string') return value.serviceId;
-  }
-}
-
 function bindingUsesInput(binding: GraphBinding, id: string): boolean {
   if (binding.kind === 'INPUT') return binding.fieldId === id;
   if (binding.kind === 'FIRST_AVAILABLE')
     return binding.sources.some((item) => bindingUsesInput(item, id));
   return binding.kind === 'AS_GIT_REF' && bindingUsesInput(binding.source, id);
-}
-
-function endpointUsesInput(endpoint: GraphEndpoint, id: string) {
-  return [
-    ...Object.values(endpoint.inputBindings ?? {}).flatMap((ports) => Object.values(ports)),
-    ...Object.values(endpoint.environmentBindings ?? {}).flatMap((bindings) =>
-      Object.values(bindings),
-    ),
-    ...Object.values(endpoint.outputBindings ?? {}),
-  ].some((binding) => bindingUsesInput(binding, id));
 }
 
 export function ExecutionGraphStartSettings({
@@ -82,13 +71,19 @@ export function ExecutionGraphStartSettings({
   project,
   canEdit,
   change,
+  selectStep,
 }: {
   node: GraphNode;
   flowNodes: GraphNode[];
   endpoint?: GraphEndpoint;
   project: ProjectDetail;
   canEdit: boolean;
-  change: (fields: GraphField[], endpoint?: GraphEndpoint) => void;
+  change: (
+    fields: GraphField[],
+    endpoint?: GraphEndpoint,
+    patch?: Pick<GraphNode, 'sameHostRelease'>,
+  ) => void;
+  selectStep?: (nodeId: string) => void;
 }) {
   const fields = node.inputs ?? [];
   const current = (key: keyof typeof standardFields): GraphField => {
@@ -103,8 +98,6 @@ export function ExecutionGraphStartSettings({
     ['BUILD', 'SHELL', 'CHECK'].includes(effectiveNodeType(step)),
   );
   const hasBuild = flowNodes.some((step) => effectiveNodeType(step) === 'BUILD');
-  const primarySource = current('repository');
-  const primaryVersion = current('gitVersion');
   const buildTargets = current('buildTargets');
   const primaryService = current('service');
   const primaryRelease = current('releaseTargets');
@@ -112,15 +105,14 @@ export function ExecutionGraphStartSettings({
   const fixedArtifact =
     !typedArtifact.selection &&
     (typedArtifact.runtimeOverride === false || typedArtifact.defaultValue !== undefined);
-  const namedSources = fields.filter(
-    (field) => isRepositoryField(field) && field.id !== primarySource.id,
-  );
-  const namedReleases = fields.filter(
-    ({ id, type }) => id.startsWith('service-') && type === 'SERVICE',
-  );
-  const targetBinding = release ? endpoint?.inputBindings?.[release.id]?.targets : undefined;
+  const sources = groups('source', current('repository'), current('gitVersion'));
+  const releases = groups('release', primaryService, primaryRelease);
+  const usesLegacySharedTarget = releaseNodes.some(({ id }) => {
+    const binding = endpoint?.inputBindings?.[id]?.targets;
+    return binding?.kind === 'INPUT' && binding.fieldId === 'buildTargets';
+  });
   const commonTargetBinding =
-    targetBinding?.kind === 'INPUT' && targetBinding.fieldId === 'buildTargets';
+    releases.length === 1 && (node.sameHostRelease || usesLegacySharedTarget);
   const targetSelection = buildTargets.defaultValue as DeploymentSelection | undefined;
   const singleHost = targetSelection?.serverIds?.length === 1 && !targetSelection.groupIds?.length;
   const artifactBinding = release ? endpoint?.inputBindings?.[release.id]?.artifact : undefined;
@@ -131,92 +123,229 @@ export function ExecutionGraphStartSettings({
       (!artifactBinding ||
         (artifactBinding.kind === 'INPUT' && artifactBinding.fieldId === 'artifact')));
 
-  function replace(field: GraphField, patch: Partial<GraphField>) {
-    const next = { ...field, ...patch };
+  function groups(kind: GraphStartGroupKind, primary: GraphField, companion: GraphField) {
+    const found = getGraphStartGroups(node, kind);
+    return found.length ? found : [{ id: primary.id, label: primary.name, primary, companion }];
+  }
+
+  function replace(field: GraphField, patch: Partial<GraphField>, pair?: GraphField) {
+    const next = {
+      ...field,
+      name: fields.find(({ id }) => id === field.id)?.name ?? field.name,
+      ...patch,
+    };
     const nextEndpoint =
-      field.id === 'service' && endpoint && releaseNodes.length === 1
-        ? {
-            ...endpoint,
-            serviceId: next.runtimeOverride === false ? referenceId(next.defaultValue) : undefined,
-          }
+      field.type === 'SERVICE' && endpoint?.serviceId
+        ? { ...endpoint, serviceId: undefined }
         : undefined;
-    change(
-      fields.some(({ id }) => id === field.id)
-        ? fields.map((item) => (item.id === field.id ? next : item))
-        : [...fields, next],
-      nextEndpoint,
+    const nextFields = fields.some(({ id }) => id === field.id)
+      ? fields.map((item) => (item.id === field.id ? next : item))
+      : [...fields, next];
+    if (pair && !nextFields.some(({ id }) => id === pair.id)) nextFields.push(pair);
+    change(nextFields, nextEndpoint);
+  }
+
+  function setDefault(field: GraphField, value: unknown, pair?: GraphField) {
+    replace(
+      field,
+      {
+        defaultValue: value,
+        runtimeOverride: field.runtimeOverride ?? value === undefined,
+      },
+      pair,
     );
   }
 
-  function setDefault(field: GraphField, value: unknown) {
-    replace(field, {
-      defaultValue: value,
-      runtimeOverride: field.runtimeOverride ?? value === undefined,
-    });
+  function sharedTargetTransition(share: boolean) {
+    if (!endpoint) return { inputs: fields, endpoint };
+    const inputBindings = { ...endpoint.inputBindings };
+    for (const { id } of releaseNodes) {
+      const bindings = inputBindings[id];
+      if (!bindings?.targets) continue;
+      const { targets } = bindings;
+      if (share || (targets.kind === 'INPUT' && targets.fieldId === 'buildTargets')) {
+        inputBindings[id] = { ...bindings };
+        delete inputBindings[id].targets;
+      }
+    }
+    const group = releases[0];
+    const targets = group.companion ?? groupCompanion(group, 'release');
+    const usedElsewhere = [
+      ...Object.values(inputBindings).flatMap(Object.values),
+      ...Object.values(endpoint.environmentBindings ?? {}).flatMap(Object.values),
+      ...Object.values(endpoint.outputBindings ?? {}),
+    ].some((binding) => bindingUsesInput(binding, targets.id));
+    const inputs =
+      share && !usedElsewhere ? fields.filter(({ id }) => id !== targets.id) : [...fields];
+    if (!inputs.some(({ id }) => id === group.primary.id)) inputs.push(group.primary);
+    if (!share && releases.length === 1) {
+      const index = inputs.findIndex(({ id }) => id === targets.id);
+      const separate = { ...targets, defaultValue: buildTargets.defaultValue };
+      if (index < 0) inputs.push(separate);
+      else inputs[index] = separate;
+    }
+    return { inputs, endpoint: { ...endpoint, inputBindings, serviceId: undefined } };
   }
 
   function setSharedTarget(share: boolean) {
-    if (!endpoint || !release) return;
-    const inputBindings = {
-      ...endpoint.inputBindings,
-      [release.id]: {
-        ...endpoint.inputBindings?.[release.id],
-        targets: { kind: 'INPUT' as const, fieldId: share ? 'buildTargets' : 'releaseTargets' },
-      },
+    const next = sharedTargetTransition(share);
+    change(next.inputs, next.endpoint, { sameHostRelease: share || undefined });
+  }
+
+  function groupCompanion(group: GraphStartGroup, kind: GraphStartGroupKind): GraphField {
+    const { primary, companion } = graphStartGroupFields[kind];
+    const suffix = group.id.startsWith(primary + '-') ? group.id.slice(primary.length) : '';
+    return {
+      ...standardFields[companion],
+      id: companion + suffix,
     };
-    const next = { ...endpoint, inputBindings };
-    const inputs = fields.filter(
-      ({ id }) => !share || id !== 'releaseTargets' || endpointUsesInput(next, id),
-    );
-    if (!share && !inputs.some(({ id }) => id === 'releaseTargets'))
-      inputs.push(standardFields.releaseTargets);
-    change(inputs, next);
   }
 
   function addNamed(kind: 'source' | 'release') {
     const key = graphKey('resource');
-    if (kind === 'source') {
-      change([
-        ...fields,
+    const config = graphStartGroupFields[kind];
+    const currentGroups = kind === 'source' ? sources : releases;
+    const first = currentGroups[0];
+    const separate = kind === 'release' && commonTargetBinding;
+    const next = separate ? sharedTargetTransition(false) : { inputs: [...fields], endpoint };
+    const firstCompanion = first.companion ?? groupCompanion(first, kind);
+    for (const field of [first.primary, firstCompanion])
+      if (!next.inputs.some(({ id }) => id === field.id)) next.inputs.push(field);
+    change(
+      [
+        ...next.inputs,
         {
-          ...standardFields.repository,
-          id: 'repository-' + key,
-          name: '源码 ' + (namedSources.length + 2),
+          ...standardFields[config.primary],
+          id: config.primary + '-' + key,
+          name: config.label + ' ' + (currentGroups.length + 1),
         },
-        { ...standardFields.gitVersion, id: 'gitVersion-' + key },
-      ]);
-    } else {
-      change([
-        ...fields,
-        {
-          ...standardFields.service,
-          id: 'service-' + key,
-          name: '发布 ' + (namedReleases.length + 2),
-        },
-        { ...standardFields.releaseTargets, id: 'releaseTargets-' + key },
-      ]);
-    }
+        { ...standardFields[config.companion], id: config.companion + '-' + key },
+      ],
+      kind === 'release' && next.endpoint ? { ...next.endpoint, serviceId: undefined } : undefined,
+      separate ? { sameHostRelease: undefined } : undefined,
+    );
   }
 
-  function removeNamed(primary: GraphField, secondary: GraphField) {
-    change(fields.filter(({ id }) => id !== primary.id && id !== secondary.id));
+  function groupUsers(group: GraphStartGroup, kind: GraphStartGroupKind) {
+    if (!endpoint) return [];
+    const ids = [group.primary.id, group.companion?.id];
+    const usesGroup = (bindings?: Record<string, GraphBinding>) =>
+      Object.values(bindings ?? {}).some((binding) =>
+        ids.some((id) => id !== undefined && bindingUsesInput(binding, id)),
+      );
+    const selected = (step: GraphNode) => {
+      const bindings = endpoint.inputBindings?.[step.id];
+      const operation = effectiveNodeType(step);
+      const typeMatches =
+        kind === 'source'
+          ? operation === 'CHECKOUT' ||
+            (operation === 'BUILD' && !bindings?.workspace && !checkoutNodes.length)
+          : isReleaseNode(step);
+      return (
+        typeMatches &&
+        selectedGraphStartGroup(kind, kind === 'source' ? sources : releases, bindings)?.id ===
+          group.id
+      );
+    };
+    return flowNodes.filter(
+      (step) =>
+        selected(step) ||
+        usesGroup(endpoint.inputBindings?.[step.id]) ||
+        usesGroup(endpoint.environmentBindings?.[step.id]) ||
+        (step.id === endpoint.endId && usesGroup(endpoint.outputBindings)),
+    );
   }
 
-  function runtimeToggle(field: GraphField) {
+  function moveGroup(group: GraphStartGroup, before: GraphStartGroup) {
+    const from = fields.findIndex(({ id }) => id === group.id);
+    const to = fields.findIndex(({ id }) => id === before.id);
+    if (from === -1 || to === -1) return;
+    const reordered = [...fields];
+    const [field] = reordered.splice(from, 1);
+    reordered.splice(to, 0, field);
+    change(reordered);
+  }
+
+  function groupActions(
+    group: GraphStartGroup,
+    kind: GraphStartGroupKind,
+    list: GraphStartGroup[],
+  ) {
+    if (!canEdit || list.length < 2) return null;
+    const index = list.findIndex(({ id }) => id === group.id);
+    const previous = list[index - 1];
+    const next = list[index + 1];
+    const users = groupUsers(group, kind);
+    return (
+      <>
+        {users.length > 0 && (
+          <div className="graph-start-group-users">
+            <p className="field-note">移除前，请先在执行流「{node.name}」中更新以下节点的来源。</p>
+            <div className="row-actions">
+              {users.map((step) =>
+                selectStep ? (
+                  <button
+                    type="button"
+                    className="button secondary small"
+                    key={step.id}
+                    onClick={() => selectStep(step.id)}
+                  >
+                    {step.name}
+                  </button>
+                ) : (
+                  <span key={step.id}>{step.name}</span>
+                ),
+              )}
+            </div>
+          </div>
+        )}
+        <div className="row-actions">
+          <button
+            className="button secondary small"
+            type="button"
+            disabled={!previous}
+            onClick={() => previous && moveGroup(group, previous)}
+          >
+            <ArrowUp size={14} /> 上移
+          </button>
+          <button
+            className="button secondary small"
+            type="button"
+            disabled={!next}
+            onClick={() => next && moveGroup(group, next)}
+          >
+            <ArrowDown size={14} /> 下移
+          </button>
+          <button
+            className="button secondary small"
+            type="button"
+            disabled={users.length > 0}
+            onClick={() =>
+              change(fields.filter(({ id }) => id !== group.id && id !== group.companion?.id))
+            }
+          >
+            <Trash2 size={14} /> 移除 {group.label}
+          </button>
+        </div>
+      </>
+    );
+  }
+
+  function runtimeToggle(field: GraphField, companion?: GraphField) {
     return (
       <label className="checkbox-row">
         <input
           type="checkbox"
           disabled={!canEdit}
           checked={field.runtimeOverride !== false}
-          onChange={(event) => replace(field, { runtimeOverride: event.target.checked })}
+          onChange={(event) => replace(field, { runtimeOverride: event.target.checked }, companion)}
         />
         允许运行时修改{field.name}
       </label>
     );
   }
 
-  function input(field: GraphField, repositoryId?: string) {
+  function input(field: GraphField, repositoryId?: string, companion?: GraphField) {
     return (
       <div className="graph-start-resource" data-graph-node-field={field.id}>
         <GraphFieldValue
@@ -225,15 +354,17 @@ export function ExecutionGraphStartSettings({
           value={field.defaultValue}
           scope={{ repositoryId }}
           disabled={!canEdit}
-          change={(value) => setDefault(field, value)}
+          change={(value) => setDefault(field, value, companion)}
         />
-        {runtimeToggle(field)}
+        {runtimeToggle(field, companion)}
       </div>
     );
   }
 
-  function source(repository: GraphField, version: GraphField, named = false) {
-    const reference = referenceId(repository.defaultValue);
+  function source(group: GraphStartGroup) {
+    const repository = group.primary;
+    const version = group.companion ?? groupCompanion(group, 'source');
+    const reference = graphResourceId(repository.defaultValue);
     const registered = project.repositories.find(
       ({ id, cloneUrl }) => id === reference || cloneUrl === reference,
     );
@@ -244,51 +375,47 @@ export function ExecutionGraphStartSettings({
         aria-label={repository.name}
         key={repository.id}
       >
-        {named && (
+        {(sources.length > 1 || repository.id !== 'repository') && (
           <Field label="源码名称">
             <input
               maxLength={100}
               readOnly={!canEdit}
               value={repository.name}
-              onChange={(event) => replace(repository, { name: event.target.value })}
+              onChange={(event) => replace(repository, { name: event.target.value }, version)}
             />
           </Field>
         )}
-        {input(repository)}
-        {input(version, registered?.id)}
+        {input({ ...repository, name: '项目仓库' }, undefined, version)}
+        {input(version, registered?.id, repository)}
         <p className="field-note">
           {currentBranch ? '仓库默认分支 · ' + currentBranch : '留空使用仓库默认分支。'}
         </p>
-        {canEdit && named && (
-          <div>
-            <button
-              className="button secondary small"
-              type="button"
-              onClick={() => removeNamed(repository, version)}
-            >
-              <Trash2 size={14} /> 移除 {repository.name}
-            </button>
-          </div>
-        )}
+        {groupActions(group, 'source', sources)}
       </section>
     );
   }
 
-  function releaseSettings(service: GraphField, targets: GraphField, named = false) {
+  function releaseSettings(group: GraphStartGroup) {
+    const service = group.primary;
+    const targets = group.companion ?? groupCompanion(group, 'release');
     return (
       <section className="graph-start-resource-group" aria-label={service.name} key={service.id}>
-        {named && (
+        {(releases.length > 1 || service.id !== 'service') && (
           <Field label="发布组合名称">
             <input
               maxLength={100}
               readOnly={!canEdit}
               value={service.name}
-              onChange={(event) => replace(service, { name: event.target.value })}
+              onChange={(event) => replace(service, { name: event.target.value }, targets)}
             />
           </Field>
         )}
-        {input(service)}
-        {!named && releaseNodes.length === 1 && hasBuild && endpoint && (
+        {input(
+          { ...service, name: '项目服务' },
+          undefined,
+          commonTargetBinding ? undefined : targets,
+        )}
+        {releases.length === 1 && hasBuild && endpoint && node.contract === 'PRESET' && (
           <label className="checkbox-row">
             <input
               type="checkbox"
@@ -299,28 +426,20 @@ export function ExecutionGraphStartSettings({
             构建与发布同一台服务器
           </label>
         )}
-        {!named && commonTargetBinding ? (
+        {commonTargetBinding ? (
           <p className="field-note">发布使用开始节点的构建位置。</p>
         ) : (
-          input(targets)
+          input(targets, undefined, service)
         )}
-        {canEdit && named && (
-          <div>
-            <button
-              className="button secondary small"
-              type="button"
-              onClick={() => removeNamed(service, targets)}
-            >
-              <Trash2 size={14} /> 移除 {service.name}
-            </button>
-          </div>
-        )}
+        {groupActions(group, 'release', releases)}
       </section>
     );
   }
 
   const showsSource = Boolean(
-    checkoutNodes.length || namedSources.length || primarySource.defaultValue,
+    checkoutNodes.length ||
+    (hasBuild && !checkoutNodes.length) ||
+    fields.some((field) => isRepositoryField(field)),
   );
   const showsBuild = needsLocation || buildTargets.defaultValue !== undefined;
   if (!showsSource && !showsBuild && !releaseNodes.length && !externalArtifact) return null;
@@ -329,16 +448,8 @@ export function ExecutionGraphStartSettings({
       <h4>任务默认配置</h4>
       {showsSource && (
         <>
-          {source(primarySource, primaryVersion)}
-          {namedSources.map((repository) => {
-            const id = repository.id.replace(/^repository-/, 'gitVersion-');
-            return source(
-              repository,
-              fields.find((field) => field.id === id) ?? { ...standardFields.gitVersion, id },
-              true,
-            );
-          })}
-          {canEdit && (checkoutNodes.length > 1 || namedSources.length > 0) && (
+          {sources.map(source)}
+          {canEdit && (
             <div>
               <button
                 className="button secondary small"
@@ -364,16 +475,22 @@ export function ExecutionGraphStartSettings({
       )}
       {releaseNodes.length > 0 && (
         <>
-          {releaseSettings(primaryService, primaryRelease)}
-          {namedReleases.map((service) => {
-            const id = service.id.replace(/^service-/, 'releaseTargets-');
-            return releaseSettings(
-              service,
-              fields.find((field) => field.id === id) ?? { ...standardFields.releaseTargets, id },
-              true,
-            );
-          })}
-          {canEdit && (releaseNodes.length > 1 || namedReleases.length > 0) && (
+          {releases.length > 1 && (node.sameHostRelease || usesLegacySharedTarget) && (
+            <div className="graph-repair">
+              <p className="field-note">同机发布要求唯一的发布组合。请为每组单独设置目标。</p>
+              {canEdit && (
+                <button
+                  className="button secondary small"
+                  type="button"
+                  onClick={() => setSharedTarget(false)}
+                >
+                  清除旧的同机配置
+                </button>
+              )}
+            </div>
+          )}
+          {releases.map(releaseSettings)}
+          {canEdit && (
             <div>
               <button
                 className="button secondary small"
@@ -391,13 +508,7 @@ export function ExecutionGraphStartSettings({
           <Field label="外部产物来源">
             <select
               disabled={!canEdit}
-              value={
-                typedArtifact.selection
-                  ? 'latest'
-                  : fixedArtifact
-                    ? 'fixed'
-                    : 'provided'
-              }
+              value={typedArtifact.selection ? 'latest' : fixedArtifact ? 'fixed' : 'provided'}
               onChange={(event) => {
                 const value = event.target.value;
                 replace(typedArtifact, {
@@ -419,10 +530,15 @@ export function ExecutionGraphStartSettings({
                 field={typedArtifact}
                 value={typedArtifact.defaultValue}
                 scope={{
-                  serviceId: referenceId(primaryService.defaultValue),
+                  serviceId:
+                    releases.length === 1
+                      ? graphResourceId(releases[0].primary.defaultValue)
+                      : undefined,
                   targets: commonTargetBinding
                     ? targetSelection
-                    : (primaryRelease.defaultValue as DeploymentSelection | undefined),
+                    : releases.length === 1
+                      ? (releases[0].companion?.defaultValue as DeploymentSelection | undefined)
+                      : undefined,
                 }}
                 disabled={!canEdit}
                 change={(value) => setDefault(typedArtifact, value)}

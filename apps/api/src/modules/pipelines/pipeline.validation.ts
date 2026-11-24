@@ -1,4 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
+import { posix } from 'node:path';
 import type { PipelineDefinition } from './pipeline.types';
 
 export const shellQuote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -13,6 +14,9 @@ export function relativePath(value: string): string {
   )
     throw new BadRequestException('仓库和产物路径必须为不含..的相对路径');
   return value;
+}
+export function normalizeRelativePath(value: string): string {
+  return posix.normalize(relativePath(value)).replace(/\/$/, '');
 }
 export function safeDeployPath(value: string): string {
   if (

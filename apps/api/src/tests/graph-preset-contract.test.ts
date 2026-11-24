@@ -1,16 +1,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { compileCanvas } from '../modules/execution-graphs/execution-graph-canvas';
+import { canvasCatalog, compileCanvas } from '../modules/execution-graphs/execution-graph-canvas';
 import type {
   GraphCanvas,
   GraphNode,
 } from '../modules/execution-graphs/execution-graph-definition';
-import type { GraphField } from '../modules/execution-graphs/graph-fields';
+import { GraphCompileError, type GraphField } from '../modules/execution-graphs/graph-fields';
 import { expandGraphTemplate } from '../modules/execution-graphs/graph-flow-templates';
 import {
   assertRuntimeParameterOverrides,
   checkedParameters,
+  declaredScope,
   graphEnvironmentSetId,
+  inspectNodeInputs,
 } from '../modules/execution-graphs/graph-run-bindings';
 
 const repositoryId = 'a3d7b94a-2862-499e-b47f-7e2af06d8d72';
@@ -18,7 +20,9 @@ const firstServer = 'a3d7b94a-2862-499e-b47f-7e2af06d8d73';
 const otherServer = 'a3d7b94a-2862-499e-b47f-7e2af06d8d74';
 const serviceId = 'a3d7b94a-2862-499e-b47f-7e2af06d8d75';
 const environmentSetId = 'a3d7b94a-2862-499e-b47f-7e2af06d8d76';
+const alternateService = 'a3d7b94a-2862-499e-b47f-7e2af06d8d77';
 const main = { kind: 'BRANCH', value: 'main' };
+const alternate = { kind: 'BRANCH', value: 'review-alt' };
 const input = (fieldId: string) => ({ kind: 'INPUT' as const, fieldId });
 const output = (nodeId: string, fieldId: string) => ({ kind: 'OUTPUT' as const, nodeId, fieldId });
 const file = { id: 'dist', name: '文件', type: 'FILE' as const, path: 'build.tar' };
@@ -256,4 +260,156 @@ test('minimal default template uses the start contract and retains five stable a
     canvas.nodes.map(({ type, operation }) => operation ?? type),
     ['START', 'CHECKOUT', 'BUILD', 'DEPLOY_ARTIFACT', 'END'],
   );
+});
+
+function withNamedGroups() {
+  const canvas = fixture();
+  canvas.nodes[0]!.inputs!.push(
+    { id: 'repository-2', name: '联调', type: 'REPOSITORY', defaultValue: repositoryId },
+    { id: 'gitVersion-2', name: '联调版本', type: 'GIT_REF', defaultValue: alternate },
+    { id: 'service-2', name: '联调目标', type: 'SERVICE', defaultValue: alternateService },
+    {
+      id: 'releaseTargets-2',
+      name: '联调服务器',
+      type: 'TARGETS',
+      purpose: 'RELEASE_TARGETS',
+      defaultValue: { serverIds: [firstServer] },
+    },
+  );
+  canvas.endpoints[0]!.inputBindings = {
+    code: { repository: input('repository-2') },
+    release: { service: input('service-2') },
+  };
+  return canvas;
+}
+
+test('preset catalog, publication and runtime use the selected named source and release group', () => {
+  const canvas = withNamedGroups();
+  canvas.endpoints[0]!.serviceId = serviceId;
+  const code = canvasCatalog(canvas, 'start', 'code').start?.nodes.code;
+  const release = canvasCatalog(canvas, 'start', 'release').start?.nodes.release;
+  assert.deepEqual(code?.automaticInputBindings.version, {
+    ...input('gitVersion-2'),
+    onMissing: 'REPOSITORY_DEFAULT',
+  });
+  assert.ok(
+    code?.sourceGroups?.some(
+      ({ id, companion }) => id === 'repository-2' && companion?.id === 'gitVersion-2',
+    ),
+  );
+  assert.deepEqual(release?.automaticInputBindings.targets, input('releaseTargets-2'));
+  const flow = compileCanvas(canvas, true).flows[0]!;
+  const nodes = flow.compiled!.nodes;
+  assert.deepEqual(nodes.build?.inputBindings.service, input('service-2'));
+  assert.deepEqual(nodes.release?.inputBindings.service, input('service-2'));
+  assert.deepEqual(nodes.release?.inputBindings.targets, input('releaseTargets-2'));
+  assert.deepEqual(
+    declaredScope(flow, { parameters: checkedParameters(flow) }).serviceId,
+    alternateService,
+  );
+  const parameters = checkedParameters(flow, { gitVersion: { kind: 'TAG', value: 'v1.2.3' } });
+  const checkout = flow.nodes.find(({ id }) => id === 'code')!;
+  assert.deepEqual(
+    inspectNodeInputs(flow, checkout, { parameters, context: {} }).values.version,
+    alternate,
+  );
+  const pinned = { kind: 'COMMIT', value: 'a'.repeat(40) };
+  const override = checkedParameters(flow, { gitVersion: main, 'gitVersion-2': pinned });
+  assert.deepEqual(
+    inspectNodeInputs(flow, checkout, { parameters: override, context: {} }).values.version,
+    pinned,
+  );
+});
+
+test('preset group diagnostics identify the consumer and the missing or mismatched start member', () => {
+  const canvas = withNamedGroups();
+  const bindings = canvas.endpoints[0]!.inputBindings!;
+  const hasIssue = (nodeId: string, port: string, fieldId: string) => (error: unknown) =>
+    error instanceof GraphCompileError &&
+    error.issues.some(
+      (issue) =>
+        issue.nodeId === nodeId &&
+        issue.fieldId === port &&
+        issue.sourceNodeId === 'start' &&
+        issue.sourceFieldId === fieldId,
+    );
+  bindings.code!.version = input('gitVersion');
+  assert.throws(() => compileCanvas(canvas, true), hasIssue('code', 'version', 'gitVersion-2'));
+  delete bindings.code!.version;
+  bindings.release!.targets = input('releaser');
+  assert.throws(
+    () => compileCanvas(canvas, true),
+    hasIssue('release', 'targets', 'releaseTargets-2'),
+  );
+  delete bindings.release!.targets;
+  canvas.nodes[0]!.inputs = canvas.nodes[0]!.inputs!.filter(({ id }) => id !== 'repository-2');
+  assert.doesNotThrow(() => compileCanvas(canvas, false));
+  assert.throws(() => compileCanvas(canvas, true), hasIssue('code', 'repository', 'repository-2'));
+});
+
+test('single preset group can use same-host start configuration and an empty Git version', () => {
+  const canvas = fixture();
+  const startNode = canvas.nodes[0]!;
+  startNode.sameHostRelease = true;
+  startNode.inputs = startNode.inputs!.flatMap((field) =>
+    field.id === 'builder'
+      ? [{ ...field, id: 'buildTargets' }]
+      : field.id === 'gitVersion'
+        ? [{ ...field, required: false, defaultValue: undefined }]
+        : field.id === 'releaser'
+          ? []
+          : [field],
+  );
+  const flow = compileCanvas(canvas, true).flows[0]!;
+  assert.deepEqual(flow.compiled?.nodes.release?.inputBindings.targets, input('buildTargets'));
+  const values = inspectNodeInputs(
+    flow,
+    flow.nodes.find(({ id }) => id === 'code')!,
+    {
+      context: {},
+      parameters: checkedParameters(flow),
+    },
+  ).values;
+  assert.equal(values.repository, repositoryId);
+  assert.equal(values.version, undefined);
+});
+
+test('preset BUILD directly consuming a named source selects its Git version', () => {
+  const canvas = withNamedGroups();
+  canvas.nodes = canvas.nodes.filter(({ id }) => id !== 'code' && id !== 'env' && id !== 'check');
+  canvas.edges = canvas.nodes
+    .slice(1)
+    .map(({ id }, index) => ({ from: canvas.nodes[index]!.id, to: id }));
+  const bindings = canvas.endpoints[0]!.inputBindings!;
+  delete bindings.code;
+  bindings.build = { repository: input('repository-2') };
+  const nodes = compileCanvas(canvas, true).flows[0]!.compiled!.nodes;
+  assert.deepEqual(nodes.build?.inputBindings.repository, input('repository-2'));
+  assert.deepEqual(nodes.build?.inputBindings.version, {
+    ...input('gitVersion-2'),
+    onMissing: 'REPOSITORY_DEFAULT',
+  });
+});
+
+test('preset publication rejects node-level direct and legacy fixed resources', () => {
+  const canvas = fixture();
+  canvas.nodes[0]!.inputs = canvas.nodes[0]!.inputs!.filter(({ id }) => id !== 'repository');
+  const checkout = canvas.nodes.find(({ id }) => id === 'code')!;
+  checkout.inputDefaults = { repository: repositoryId };
+  assert.doesNotThrow(() => compileCanvas(canvas, false));
+  assert.throws(() => compileCanvas(canvas, true), /inputDefaults\.repository/);
+  delete checkout.inputDefaults;
+  checkout.checkout = { repositoryId, fullClone: true };
+  assert.throws(() => compileCanvas(canvas, true), /checkout\.repositoryId/);
+  checkout.checkout = { fullClone: true };
+  canvas.nodes[0]!.inputs!.push({
+    id: 'repository',
+    name: '仓库',
+    type: 'REPOSITORY',
+    defaultValue: repositoryId,
+  });
+  assert.doesNotThrow(() => compileCanvas(canvas, true));
+  const build = canvas.nodes.find(({ id }) => id === 'build')!;
+  build.build!.buildLocation = 'MANAGER';
+  assert.throws(() => compileCanvas(canvas, true), /build\.buildLocation/);
 });
