@@ -27,13 +27,13 @@ type ViewIndex = { views: Summary[]; defaultViewId: string };
 type ViewProject = {
   id: string;
   deploymentStatus: string;
-  environments: { id: string; environmentType: string }[];
-  addresses: { id: string; url: string }[];
+  addresses: { id: string; url: string; serviceId: string }[];
   recentDeployments: {
     id: string;
     taskId: string;
     environmentId: string;
     serverId: string;
+    serviceId: string;
     status: string;
     healthStatus: string;
   }[];
@@ -87,7 +87,7 @@ async function checkCustomViews(
   assert.equal(index.views.find(({ id }) => id === 'all')?.isDefault, false);
   assert.deepEqual(
     index.views.filter(({ kind }) => kind !== 'CUSTOM').map(({ id }) => id),
-    ['all', 'production', 'testing', 'abnormal'],
+    ['all', 'abnormal'],
   );
   assert.deepEqual(
     (await get<ViewDetail>(admin, '/views/' + privateView.id)).projects.map(({ id }) => id),
@@ -107,7 +107,10 @@ async function checkCustomViews(
     isDefault: true,
   });
   await admin.get(apiBase + '/views/' + operatorView.id).expect(404);
-  assert.equal((await get<ViewIndex>(viewer, '/views')).views.length, 4);
+  assert.deepEqual(
+    (await get<ViewIndex>(viewer, '/views')).views.map(({ id }) => id),
+    ['all', 'abnormal'],
+  );
   await viewer.get(apiBase + '/views/all').expect(200);
   await viewer.get(apiBase + '/views/' + privateView.id).expect(404);
   await viewer
@@ -120,7 +123,7 @@ async function checkCustomViews(
     .expect(403);
   await viewer.delete(apiBase + '/views/' + privateView.id).expect(403);
   await admin
-    .patch(apiBase + '/views/production')
+    .patch(apiBase + '/views/abnormal')
     .send(initial)
     .expect(403);
   await admin.delete(apiBase + '/views/all').expect(403);
@@ -215,25 +218,42 @@ async function checkCustomViews(
 }
 
 async function checkPresets(api: Api, db: Kysely<Database>, userId: string) {
-  const [mixed, unchecked, running, empty] = await Promise.all([
-    project(api, 'Mixed environments', 'mixed'),
+  const [mixed, unchecked, running, empty, inactive] = await Promise.all([
+    project(api, 'Mixed targets', 'mixed'),
     project(api, 'Unchecked', 'unchecked'),
     project(api, 'Running', 'running'),
     project(api, 'Empty', 'empty'),
+    project(api, 'Inactive target', 'inactive'),
   ]);
   const now = Date.now();
   const timestamps = { created_at: now, updated_at: now };
-  const serverIds = [randomUUID(), randomUUID()];
+  const [firstServer, secondServer, inactiveServer] = [randomUUID(), randomUUID(), randomUUID()];
+  const groupId = randomUUID();
   const targetId = randomUUID();
   await db
     .insertInto('servers')
     .values(
-      serverIds.map((id, index) => ({
+      [firstServer, secondServer, inactiveServer].map((id, index) => ({
         id,
         name: `View fixture server ${index + 1}`,
         host: '127.0.0.1',
         username: 'fixture',
+        is_active: id === inactiveServer ? 0 : 1,
         ...timestamps,
+      })),
+    )
+    .execute();
+  await db
+    .insertInto('server_groups')
+    .values({ id: groupId, name: 'View fixture group', created_at: now })
+    .execute();
+  await db
+    .insertInto('server_group_members')
+    .values(
+      [firstServer, inactiveServer].map((id) => ({
+        group_id: groupId,
+        server_id: id,
+        created_at: now,
       })),
     )
     .execute();
@@ -252,28 +272,18 @@ async function checkPresets(api: Api, db: Kysely<Database>, userId: string) {
   const testing = await environment(mixed.id, 'Testing', 'TESTING');
   const uncheckedEnv = await environment(unchecked.id, 'Testing', 'TESTING');
   const runningEnv = await environment(running.id, 'Testing', 'TESTING');
-  const address = (name: string, environmentId?: string) =>
-    create<{ id: string }>(api, `/projects/${mixed.id}/addresses`, {
-      name,
-      url: `https://example.invalid/${name}`,
-      environmentId,
+  const inactiveEnv = await environment(inactive.id, 'Testing', 'TESTING');
+  const service = (projectId: string, slug: string, links: string[] = []) =>
+    create<{ id: string; addresses: { id: string }[] }>(api, `/projects/${projectId}/services`, {
+      name: slug,
+      slug,
+      addresses: links.map((name) => ({ name, url: `https://example.invalid/${name}` })),
     });
-  const sharedAddress = await address('shared');
-  const prodAddress = await address('prod', production.id);
-  const testAddress = await address('test', testing.id);
+  const web = await service(mixed.id, 'web', ['home', 'docs']);
+  const backend = await service(mixed.id, 'backend', ['api']);
 
-  async function deploymentHistory(projectId: string) {
-    const [serviceId, pipelineId, versionId] = [randomUUID(), randomUUID(), randomUUID()];
-    await db
-      .insertInto('services')
-      .values({
-        id: serviceId,
-        project_id: projectId,
-        name: 'Service',
-        slug: 'service',
-        ...timestamps,
-      })
-      .execute();
+  async function deploymentHistory(projectId: string, serviceId: string) {
+    const [pipelineId, versionId] = [randomUUID(), randomUUID()];
     await db
       .insertInto('pipelines')
       .values({
@@ -368,16 +378,33 @@ async function checkPresets(api: Api, db: Kysely<Database>, userId: string) {
     };
   }
 
-  const mixedDeploy = await deploymentHistory(mixed.id);
-  await mixedDeploy(production.id, serverIds[0]!, now + 10, 'FAILED', 'FAILED');
+  const mixedDeploy = await deploymentHistory(mixed.id, web.id);
+  const superseded = await mixedDeploy(production.id, firstServer, now + 10, 'FAILED', 'FAILED');
   for (const offset of [20, 30, 40, 50]) {
-    await mixedDeploy(production.id, serverIds[1]!, now + offset, 'SUCCESS', 'HEALTHY');
+    await mixedDeploy(production.id, secondServer, now + offset, 'SUCCESS', 'HEALTHY');
   }
-  const tested = await mixedDeploy(testing.id, serverIds[0]!, now + 60, 'SUCCESS', 'HEALTHY');
-  const uncheckedDeploy = await deploymentHistory(unchecked.id);
-  await uncheckedDeploy(uncheckedEnv.id, serverIds[0]!, now + 20, 'SUCCESS', 'NOT_CHECKED');
-  const runningDeploy = await deploymentHistory(running.id);
-  await runningDeploy(runningEnv.id, serverIds[0]!, now + 20, 'RUNNING', 'PENDING');
+  const failed = await mixedDeploy(production.id, secondServer, now + 55, 'FAILED', 'FAILED');
+  const tested = await mixedDeploy(testing.id, firstServer, now + 60, 'SUCCESS', 'HEALTHY');
+  const backendDeploy = await deploymentHistory(mixed.id, backend.id);
+  const backendRelease = await backendDeploy(
+    production.id,
+    secondServer,
+    now + 65,
+    'SUCCESS',
+    'HEALTHY',
+  );
+  const uncheckedDeploy = await deploymentHistory(
+    unchecked.id,
+    (await service(unchecked.id, 'web')).id,
+  );
+  await uncheckedDeploy(uncheckedEnv.id, firstServer, now + 20, 'SUCCESS', 'NOT_CHECKED');
+  const runningDeploy = await deploymentHistory(running.id, (await service(running.id, 'web')).id);
+  await runningDeploy(runningEnv.id, firstServer, now + 20, 'RUNNING', 'PENDING');
+  const inactiveDeploy = await deploymentHistory(
+    inactive.id,
+    (await service(inactive.id, 'web')).id,
+  );
+  await inactiveDeploy(inactiveEnv.id, inactiveServer, now + 20, 'SUCCESS', 'HEALTHY');
 
   const all = await get<ViewDetail>(api, '/views/all');
   assert.equal(all.projects.find(({ id }) => id === empty.id)?.deploymentStatus, 'NOT_DEPLOYED');
@@ -386,39 +413,58 @@ async function checkPresets(api: Api, db: Kysely<Database>, userId: string) {
   assert.equal(all.projects.find(({ id }) => id === running.id)?.deploymentStatus, 'RUNNING');
   assert.deepEqual((await get<ViewDetail>(api, '/views/abnormal')).projectIds, [mixed.id]);
 
-  const prod = await get<ViewDetail>(api, '/views/production');
-  assert.deepEqual(prod.projectIds, [mixed.id]);
-  const prodProject = prod.projects[0]!;
-  assert.equal(prodProject.deploymentStatus, 'ABNORMAL');
+  const mixedProject = all.projects.find(({ id }) => id === mixed.id)!;
   assert.deepEqual(
-    prodProject.environments.map(({ id }) => id),
-    [production.id],
+    mixedProject.recentDeployments.map(({ id }) => id),
+    [backendRelease.recordId, tested.recordId, failed.recordId],
+  );
+  const healthyTarget = await get<ViewDetail>(
+    api,
+    `/views/all?serviceId=${web.id}&serverId=${firstServer}`,
+  );
+  assert.deepEqual(healthyTarget.projectIds, [mixed.id]);
+  const [healthyProject] = healthyTarget.projects;
+  assert.equal(healthyProject?.deploymentStatus, 'HEALTHY');
+  assert.deepEqual(
+    healthyProject?.addresses.map(({ id, serviceId }) => ({ id, serviceId })),
+    web.addresses.map(({ id }) => ({ id, serviceId: web.id })),
   );
   assert.deepEqual(
-    new Set(prodProject.addresses.map(({ id }) => id)),
-    new Set([sharedAddress.id, prodAddress.id]),
-  );
-  assert.equal(prodProject.recentDeployments.length, 3);
-  assert.ok(
-    prodProject.recentDeployments.every(
-      ({ status, environmentId }) => status === 'SUCCESS' && environmentId === production.id,
-    ),
+    healthyProject?.recentDeployments.map(({ id, serverId, serviceId }) => ({
+      id,
+      serverId,
+      serviceId,
+    })),
+    [tested, superseded].map(({ recordId }) => ({
+      id: recordId,
+      serverId: firstServer,
+      serviceId: web.id,
+    })),
   );
 
-  const testView = await get<ViewDetail>(api, '/views/testing');
-  assert.deepEqual(new Set(testView.projectIds), new Set([mixed.id, unchecked.id, running.id]));
-  const testProject = testView.projects.find(({ id }) => id === mixed.id)!;
-  assert.equal(testProject.deploymentStatus, 'HEALTHY');
+  const failingTarget = await get<ViewDetail>(api, `/views/all?serverId=${secondServer}`);
+  assert.deepEqual(failingTarget.projectIds, [mixed.id]);
+  assert.equal(failingTarget.projects[0]?.deploymentStatus, 'ABNORMAL');
+  const backendView = await get<ViewDetail>(api, `/views/all?serviceId=${backend.id}`);
+  assert.deepEqual(backendView.projectIds, [mixed.id]);
+  assert.equal(backendView.projects[0]?.deploymentStatus, 'HEALTHY');
   assert.deepEqual(
-    testProject.environments.map(({ id }) => id),
-    [testing.id],
+    backendView.projects[0]?.recentDeployments.map(({ id }) => id),
+    [backendRelease.recordId],
   );
-  assert.deepEqual(
-    new Set(testProject.addresses.map(({ id }) => id)),
-    new Set([sharedAddress.id, testAddress.id]),
+
+  const group = await get<ViewDetail>(api, `/views/all?groupId=${groupId}`);
+  assert.deepEqual(new Set(group.projectIds), new Set([mixed.id, unchecked.id, running.id]));
+  assert.ok(
+    group.projects.every(({ recentDeployments }) =>
+      recentDeployments.every(({ serverId }) => serverId === firstServer),
+    ),
   );
-  assert.equal(testProject.recentDeployments[0]?.taskId, tested.taskId);
-  assert.equal(testProject.recentDeployments[0]?.id, tested.recordId);
+  await api.get(`${apiBase}/views/all?serverId=${firstServer}&groupId=${groupId}`).expect(400);
+  await api.get(`${apiBase}/views/all?groupId=${randomUUID()}`).expect(404);
+  await api.get(`${apiBase}/views/all?serverId=${randomUUID()}`).expect(404);
+  await api.get(apiBase + '/views/production').expect(404);
+  await api.get(apiBase + '/views/testing').expect(404);
 
   const recent = `/projects/${mixed.id}/services/${tested.serviceId}/recent-deployments`;
   const rows = await get<{ id: string; serviceId: string }[]>(api, recent);
@@ -433,9 +479,9 @@ async function checkPresets(api: Api, db: Kysely<Database>, userId: string) {
   await api.get(`${apiBase}${recent}?environmentId=${uncheckedEnv.id}`).expect(404);
   await api.get(apiBase + recent.replace(mixed.id, unchecked.id)).expect(404);
 
-  const fix = await mixedDeploy(production.id, serverIds[0]!, now + 70, 'SUCCESS', 'HEALTHY');
+  const fix = await mixedDeploy(production.id, secondServer, now + 70, 'SUCCESS', 'HEALTHY');
   assert.deepEqual((await get<ViewDetail>(api, '/views/abnormal')).projectIds, []);
-  const repaired = (await get<ViewDetail>(api, '/views/production')).projects[0]!;
+  const repaired = (await get<ViewDetail>(api, `/views/all?serviceId=${web.id}`)).projects[0]!;
   assert.equal(repaired.deploymentStatus, 'HEALTHY');
   assert.equal(repaired.recentDeployments[0]?.taskId, fix.taskId);
 }
