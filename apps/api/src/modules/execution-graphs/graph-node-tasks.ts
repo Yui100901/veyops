@@ -118,14 +118,20 @@ export interface GraphNodeScope {
   credentialNonces?: Readonly<Record<string, string>>;
   fetchModeDeferred?: boolean;
   inputEvidence?: readonly GraphFieldEvidence[];
+  scriptWorkspace?: { plan?: ScriptWorkspacePlan };
 }
 
-type ScriptWorkspacePlan = {
+export type ScriptWorkspaceCandidate = {
   producerNodeId?: string;
   producerField?: string;
   repositoryId?: string;
   commitSha?: string;
   deferred: boolean;
+};
+
+export type ScriptWorkspacePlan = ScriptWorkspaceCandidate & {
+  candidates?: ScriptWorkspaceCandidate[];
+  optional?: boolean;
 };
 
 export type GraphNodePlan =
@@ -619,10 +625,16 @@ export class GraphNodeTasks implements OnModuleInit {
     const input = scope.inputEvidence?.find(({ fieldId }) => fieldId === 'workspace');
     const workspace = sourceOf(values.workspace);
     const source = sourceOf(values.source);
-    if (workspace?.repositoryId && source && !sameSource(workspace, source))
+    if (
+      !scope.scriptWorkspace &&
+      workspace?.repositoryId &&
+      source &&
+      !sameSource(workspace, source)
+    )
       throw workspaceIssue('脚本绑定的源码与工作区来自不同 Git 提交');
-    const plannedWorkspace: ScriptWorkspacePlan | undefined =
-      workspace || input?.state === 'DEFERRED'
+    const plannedWorkspace: ScriptWorkspacePlan | undefined = scope.scriptWorkspace
+      ? scope.scriptWorkspace.plan
+      : workspace || input?.state === 'DEFERRED'
         ? {
             producerNodeId: input?.source?.nodeId,
             producerField: input?.source?.fieldId,
@@ -692,30 +704,39 @@ export class GraphNodeTasks implements OnModuleInit {
     workspace: GraphWorkspaceRef | undefined,
     scope: GraphNodeScope,
   ) {
-    if (!plan && !workspace) return;
-    if (
-      !plan ||
-      !workspace ||
-      (plan.repositoryId && plan.repositoryId !== workspace.repositoryId) ||
-      (plan.commitSha && plan.commitSha !== workspace.commitSha)
-    )
-      throw workspaceIssue('脚本实际工作区与已确认计划不一致');
-    if (!plan.producerNodeId || !plan.producerField) return;
+    if (!workspace && scope.values?.workspace === undefined && (!plan || plan.optional)) return;
+    if (!plan || !workspace) throw workspaceIssue('脚本实际工作区与已确认计划不一致');
     const binding = scope.inputEvidence?.find(({ fieldId }) => fieldId === 'workspace')?.source;
-    if (binding?.nodeId !== plan.producerNodeId || binding.fieldId !== plan.producerField)
-      throw workspaceIssue('脚本实际工作区来源与已确认计划不一致');
-    if (binding.kind !== 'OUTPUT') return;
+    const candidates = (plan.candidates ?? [plan]).filter(
+      ({ producerNodeId, producerField }) =>
+        (!producerNodeId && !producerField) ||
+        (binding?.nodeId === producerNodeId && binding?.fieldId === producerField),
+    );
+    if (!candidates.length) throw workspaceIssue('脚本实际工作区来源与已确认计划不一致');
+    const match = candidates.find(
+      ({ repositoryId, commitSha, deferred }) =>
+        ((deferred && repositoryId === undefined) || repositoryId === workspace.repositoryId) &&
+        ((deferred && commitSha === undefined) || commitSha === workspace.commitSha),
+    );
+    if (!match) throw workspaceIssue('脚本实际工作区与已确认计划不一致');
+    if (binding?.kind !== 'OUTPUT') return;
+    if (!scope.runId || !match.producerNodeId || !match.producerField)
+      throw workspaceIssue('脚本实际工作区必须由已确认的上游节点提供');
     const producer = await this.database.db
       .selectFrom('execution_node_runs')
       .select('output_json')
-      .where('run_id', '=', scope.runId!)
-      .where('node_id', '=', plan.producerNodeId)
+      .where('run_id', '=', scope.runId)
+      .where('node_id', '=', match.producerNodeId)
       .where('status', '=', 'SUCCESS')
       .executeTakeFirst();
     const original = producer?.output_json
-      ? workspaceOf(JSON.parse(producer.output_json)[plan.producerField])
+      ? workspaceOf(JSON.parse(producer.output_json)[match.producerField])
       : undefined;
-    if (original?.nodeRunId !== workspace.nodeRunId || original.runId !== workspace.runId)
+    if (
+      original?.nodeRunId !== workspace.nodeRunId ||
+      original.runId !== workspace.runId ||
+      !sameSource(original, workspace)
+    )
       throw workspaceIssue('脚本实际工作区必须由已确认的上游节点提供');
   }
 

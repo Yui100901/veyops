@@ -65,6 +65,11 @@ type BindingRead = {
   message?: string;
 };
 
+export interface GraphBindingOptions {
+  values: Pick<BindingRead, 'source' | 'value' | 'state'>[];
+  missing: boolean;
+}
+
 export interface GitRefValue {
   kind: 'BRANCH' | 'TAG' | 'COMMIT';
   value: string;
@@ -190,6 +195,55 @@ function readBinding(binding: GraphBinding | undefined, state: GraphBindingConte
   }
 }
 
+export function previewGraphBindingOptions(
+  binding: GraphBinding | undefined,
+  context: GraphBindingContext,
+  active: ReadonlySet<string>,
+  outputOptions: (nodeId: string, fieldId: string) => GraphBindingOptions | undefined,
+  requiredOutput: (nodeId: string, fieldId: string) => boolean,
+): GraphBindingOptions {
+  if (binding?.kind === 'FIRST_AVAILABLE') {
+    const values: GraphBindingOptions['values'] = [];
+    for (const source of binding.sources) {
+      const next = previewGraphBindingOptions(
+        source,
+        context,
+        active,
+        outputOptions,
+        requiredOutput,
+      );
+      values.push(...next.values);
+      if (!next.missing) return { values, missing: false };
+    }
+    return { values, missing: true };
+  }
+  if (binding?.kind === 'OUTPUT') {
+    const { nodeId, fieldId } = binding;
+    if (!active.has(nodeId)) return { values: [], missing: true };
+    const options = outputOptions(nodeId, fieldId);
+    if (options)
+      return {
+        values: options.values.map((entry) => ({
+          ...entry,
+          source: { kind: 'OUTPUT', nodeId, fieldId },
+        })),
+        missing: options.missing,
+      };
+  }
+  const entry = readBinding(binding, {
+    ...context,
+    producerStatus: (nodeId) => (active.has(nodeId) ? context.producerStatus?.(nodeId) : 'SKIPPED'),
+  });
+  if (entry.state === 'MISSING') return { values: [], missing: true };
+  return {
+    values: entry.state === 'INVALID' ? [] : [entry],
+    missing:
+      entry.state === 'DEFERRED' &&
+      binding?.kind === 'OUTPUT' &&
+      !requiredOutput(binding.nodeId, binding.fieldId),
+  };
+}
+
 function checkedBinding(
   field: GraphField,
   binding: GraphBinding | undefined,
@@ -288,7 +342,6 @@ export function inspectNodeInputs(
     compiled?.inputs ??
     (node.type === 'START' ? node.inputs : graphModulePorts(node, calledFlow)?.inputs) ??
     [];
-  const bindings = compiled?.inputBindings ?? flow.inputBindings?.[node.id] ?? {};
   const values: Values = Object.create(null);
   const evidence = fields.map((field) => {
     const binding: GraphBinding | undefined =
@@ -298,7 +351,7 @@ export function inspectNodeInputs(
             fieldId: field.id,
             onMissing: field.defaultValue === undefined ? undefined : 'USE_DEFAULT',
           }
-        : (bindings[field.id] ?? graphDefaultBinding(flow, node, field.id));
+        : nodeInputBinding(flow, node, field.id);
     const usesDeclaredDefault =
       binding?.kind === 'VALUE' &&
       node.declaredPorts &&
@@ -310,6 +363,11 @@ export function inspectNodeInputs(
     return read.evidence;
   });
   return { fields, values, evidence };
+}
+
+export function nodeInputBinding(flow: GraphFlow, node: GraphNode, fieldId: string) {
+  const bindings = flow.compiled?.nodes[node.id]?.inputBindings ?? flow.inputBindings?.[node.id];
+  return bindings?.[fieldId] ?? graphDefaultBinding(flow, node, fieldId);
 }
 
 export function inspectDeclaredNodeOutputs(

@@ -76,6 +76,10 @@ async function checkPlan(t: TestContext, url?: string) {
       name: 'Fixture source',
       cloneUrl: 'https://git.example.test/repository.git',
     });
+    const alternateRepo = await create(scope + '/repositories', {
+      name: 'Alternate source',
+      cloneUrl: 'https://git.example.test/alternate.git',
+    });
     const service = await create(scope + '/services', { name: 'Web', slug: 'web' });
     const empty = await create(scope + '/environment-sets', { name: 'Empty' });
     const plain = 'value-must-not-be-in-preview';
@@ -88,14 +92,23 @@ async function checkPlan(t: TestContext, url?: string) {
       ],
     });
     const pin = 'd'.repeat(40);
-    t.mock.method(app.get(RepositoryMetadataService), 'planGraphCheckout', async () => ({
-      repositoryId: repo.id,
-      repositoryName: repo.name,
-      commitSha: pin,
-      ref: pin,
-      fullClone: false,
-      access: { clone_url: repo.cloneUrl, credential_id: null },
-    }));
+    let alternatePin = 'b'.repeat(40);
+    t.mock.method(
+      app.get(RepositoryMetadataService),
+      'planGraphCheckout',
+      async (_projectId: string, { repositoryId }: { repositoryId: string }) => {
+        const selected = repositoryId === alternateRepo.id ? alternateRepo : repo;
+        const commitSha = repositoryId === alternateRepo.id ? alternatePin : pin;
+        return {
+          repositoryId: selected.id,
+          repositoryName: selected.name,
+          commitSha,
+          ref: commitSha,
+          fullClone: false,
+          access: { clone_url: selected.cloneUrl, credential_id: null },
+        };
+      },
+    );
     const files = t.mock.method(
       app.get(RepositoryMetadataService),
       'inspectGraphEnvironmentFile',
@@ -370,6 +383,147 @@ async function checkPlan(t: TestContext, url?: string) {
       idempotencyKey: randomUUID(),
     });
     assert.match(started.status, /QUEUED|RUNNING/);
+
+    const output = (nodeId: string, fieldId: string) => ({ kind: 'OUTPUT', nodeId, fieldId });
+    const firstChoice = (fieldId: string) => ({
+      kind: 'FIRST_AVAILABLE',
+      sources: [output('checkout-a', fieldId), output('checkout-b', fieldId)],
+    });
+    const checkout = (suffix: string, repositoryId: string) => ({
+      id: 'checkout-' + suffix,
+      name: '检出 ' + suffix,
+      type: 'CHECKOUT',
+      checkout: { repositoryId, mode: 'BRANCH', branch: 'main' },
+    });
+    const branches = (
+      await api
+        .put(base + path + '/draft')
+        .send({
+          expectedRevision: (await api.get(base + path).expect(200)).body.data.revision,
+          definition: {
+            flows: [],
+            canvas: {
+              nodes: [
+                { id: 'branch-test', name: '分支验证', type: 'START' },
+                {
+                  id: 'choice',
+                  name: '运行时输出',
+                  type: 'SHELL',
+                  shell: { location: 'MANAGER', command: 'printf b' },
+                  outputs: [{ id: 'choice', name: '分支', type: 'TEXT', required: true }],
+                },
+                {
+                  id: 'condition',
+                  name: '选择分支',
+                  type: 'CONDITION',
+                  condition: { key: 'input', value: 'a' },
+                },
+                checkout('a', repo.id),
+                checkout('b', alternateRepo.id),
+                {
+                  id: 'merge-check',
+                  name: '汇合检查',
+                  type: 'CHECK',
+                  shell: { location: 'MANAGER', command: 'git rev-parse HEAD' },
+                },
+                {
+                  id: 'verify-workspace',
+                  name: '检查传递的工作区',
+                  type: 'CHECK',
+                  shell: { location: 'TARGET', command: 'git rev-parse HEAD' },
+                },
+                end('branch-end'),
+              ],
+              edges: [
+                ...chain(['branch-test', 'choice', 'condition']),
+                { from: 'condition', to: 'checkout-b', when: 'FALSE' },
+                { from: 'condition', to: 'checkout-a', when: 'TRUE' },
+                { from: 'checkout-b', to: 'merge-check' },
+                ...chain(['checkout-a', 'merge-check', 'verify-workspace', 'branch-end']),
+              ],
+              endpoints: [
+                {
+                  startId: 'branch-test',
+                  endId: 'branch-end',
+                  inputBindings: {
+                    condition: { value: output('choice', 'choice') },
+                    'merge-check': {
+                      workspace: firstChoice('workspace'),
+                      source: firstChoice('source'),
+                    },
+                    'verify-workspace': {
+                      workspace: output('merge-check', 'workspace'),
+                      targets: { kind: 'VALUE', value: { serverIds: [first.id] } },
+                    },
+                  },
+                },
+              ],
+              templates: [],
+            },
+          },
+        })
+        .expect(200)
+    ).body.data;
+    const branchVersion = (await create(path + '/publish', { expectedRevision: branches.revision }))
+      .publishedVersion;
+    const branchArgs = { version: branchVersion };
+    const branchFlow = flow('branch-test');
+    const branchPreview = await create(branchFlow + '/preview', branchArgs);
+    const script = (preview: typeof branchPreview, nodeId: string) =>
+      preview.scripts.find((item: { nodeId: string }) => item.nodeId === nodeId);
+    assert.deepEqual(script(branchPreview, 'merge-check').workspace.candidates, [
+      {
+        producerNodeId: 'checkout-a',
+        producerField: 'workspace',
+        repositoryId: repo.id,
+        commitSha: pin,
+        deferred: false,
+      },
+      {
+        producerNodeId: 'checkout-b',
+        producerField: 'workspace',
+        repositoryId: alternateRepo.id,
+        commitSha: alternatePin,
+        deferred: false,
+      },
+    ]);
+    assert.deepEqual(
+      new Set(script(branchPreview, 'verify-workspace').workspace.candidates),
+      new Set([
+        {
+          producerNodeId: 'merge-check',
+          producerField: 'workspace',
+          repositoryId: repo.id,
+          commitSha: pin,
+          deferred: false,
+        },
+        {
+          producerNodeId: 'merge-check',
+          producerField: 'workspace',
+          repositoryId: alternateRepo.id,
+          commitSha: alternatePin,
+          deferred: false,
+        },
+      ]),
+    );
+    alternatePin = 'c'.repeat(40);
+    const changedPreview = await create(branchFlow + '/preview', branchArgs);
+    assert.notEqual(changedPreview.configurationHash, branchPreview.configurationHash);
+    assert.equal(
+      script(changedPreview, 'merge-check').workspace.candidates[1].commitSha,
+      alternatePin,
+    );
+    const staleBranch = await post(branchFlow + '/run', {
+      ...branchArgs,
+      expectedConfigurationHash: branchPreview.configurationHash,
+      expectedPlanSections: branchPreview.planSections,
+      idempotencyKey: randomUUID(),
+    }).expect(409);
+    assert.ok(
+      staleBranch.body.error.changes.some(
+        (change: string) => change.includes('汇合检查') && change.includes('脚本工作区'),
+      ),
+    );
   } finally {
     await app.close();
     await rm(data, { recursive: true, force: true });

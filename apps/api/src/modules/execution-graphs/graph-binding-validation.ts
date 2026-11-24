@@ -164,7 +164,7 @@ function outgoingBranches(flow: GraphFlow, node: GraphNode, edges: readonly Grap
   return edges.map((edge) => [edge]);
 }
 
-function possiblePaths(flow: GraphFlow, ordered: GraphNode[]) {
+export function graphBranchPaths(flow: GraphFlow, ordered: GraphNode[]) {
   const outgoing = new Map(ordered.map((node) => [node.id, [] as GraphEdge[]]));
   for (const edge of flow.edges) outgoing.get(edge.from)!.push(edge);
   let paths: PathScenario[] = [{ active: new Set([ordered[0]!.id]), branches: [], edges: [] }];
@@ -698,7 +698,7 @@ export function validateFlowBindings(
     }
   }
 
-  const paths = possiblePaths(flow, ordered);
+  const paths = graphBranchPaths(flow, ordered);
   const staticOrder = predecessors(flow.edges, ordered);
   const pathOrders = paths.map((path) => ({ path, order: predecessors(path.edges, ordered) }));
   const coverage = new Map<string, GraphDiagnostic>();
@@ -1117,7 +1117,7 @@ export function flowCandidateCatalog(
   const staticOrder = predecessors(flow.edges, ordered);
   let paths: { path: PathScenario; order: Map<string, Set<string>> }[] = [];
   try {
-    paths = possiblePaths(flow, ordered).map((path) => ({
+    paths = graphBranchPaths(flow, ordered).map((path) => ({
       path,
       order: predecessors(path.edges, ordered),
     }));

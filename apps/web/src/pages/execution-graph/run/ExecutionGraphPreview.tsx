@@ -67,6 +67,14 @@ interface DeferredBinding extends NodeScope {
   producerField?: string;
 }
 
+interface WorkspaceCandidate {
+  producerNodeId?: string;
+  producerField?: string;
+  repositoryId?: string;
+  commitSha?: string;
+  deferred: boolean;
+}
+
 interface ArtifactPreview {
   id: string;
   artifactId?: string;
@@ -193,12 +201,9 @@ export interface Preview extends DeliveryPreview {
     environmentId?: string;
     serviceId?: string;
     directory?: string;
-    workspace?: {
-      producerNodeId?: string;
-      producerField?: string;
-      repositoryId?: string;
-      commitSha?: string;
-      deferred: boolean;
+    workspace?: WorkspaceCandidate & {
+      candidates?: WorkspaceCandidate[];
+      optional?: boolean;
     };
   })[];
   executionPlan?: {
@@ -351,6 +356,26 @@ function names({ project, preview }: { project: ProjectDetail; preview: Preview 
     service: (id?: string) => named(id, project.services),
     environment: (id?: string) => named(id, project.environments),
   };
+}
+
+function WorkspaceSource({
+  candidate,
+  flowId,
+  name,
+}: {
+  candidate: WorkspaceCandidate;
+  flowId?: string;
+  name: ReturnType<typeof names>;
+}) {
+  return (
+    <>
+      {candidate.producerNodeId && name.node({ flowId, nodeId: candidate.producerNodeId })}
+      {candidate.producerField && <> / {candidate.producerField}</>}
+      {candidate.repositoryId && ` · ${name.repository(candidate.repositoryId)}`}{' '}
+      {candidate.commitSha && <code>{candidate.commitSha}</code>}
+      {candidate.deferred && ' · 等待上游工作区'}
+    </>
+  );
 }
 
 export const sourceName = (source: string) => sourceNames[source] ?? source;
@@ -935,17 +960,29 @@ export function ExecutionPlan({
                   工作目录 · <code>{script.directory}</code>
                 </small>
               )}
-              {script.workspace && (
-                <small>
-                  工作区 ·{' '}
-                  {script.workspace.producerNodeId &&
-                    name.node({ flowId: script.flowId, nodeId: script.workspace.producerNodeId })}
-                  {script.workspace.producerField && <> / {script.workspace.producerField}</>}
-                  {script.workspace.repositoryId &&
-                    ` · ${name.repository(script.workspace.repositoryId)}`}{' '}
-                  {script.workspace.commitSha && <code>{script.workspace.commitSha}</code>}
-                  {script.workspace.deferred && ' · 等待上游工作区'}
-                </small>
+              {script.workspace && (script.workspace.candidates || script.workspace.optional) ? (
+                <div className="execution-plan-workspaces">
+                  <small>工作区候选 · 按顺序使用实际可用的工作区</small>
+                  <ol>
+                    {(script.workspace.candidates ?? [script.workspace]).map((candidate, index) => (
+                      <li key={index}>
+                        <WorkspaceSource candidate={candidate} flowId={script.flowId} name={name} />
+                      </li>
+                    ))}
+                    {script.workspace.optional && <li>无候选可用时使用脚本自身的工作目录</li>}
+                  </ol>
+                </div>
+              ) : (
+                script.workspace && (
+                  <small>
+                    工作区 ·{' '}
+                    <WorkspaceSource
+                      candidate={script.workspace}
+                      flowId={script.flowId}
+                      name={name}
+                    />
+                  </small>
+                )
               )}
               <small>
                 {preview.environmentSet?.name ??

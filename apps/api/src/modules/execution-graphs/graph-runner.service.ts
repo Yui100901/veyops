@@ -71,6 +71,7 @@ import {
   type GraphNodePlan,
 } from './graph-node-tasks';
 import { latestReleaseInspections } from './graph-release-inspection.service';
+import { ScriptWorkspacePreview } from './graph-script-workspaces';
 import {
   assertAutomaticGraphFlow,
   assertGraphAutomation,
@@ -638,6 +639,11 @@ export class GraphRunnerService implements OnModuleInit {
     }
     return instances.map((row) => {
       const kind = row.artifact_kind ?? row.artifact_type;
+      const payload = row.build_payload
+        ? (JSON.parse(row.build_payload) as TaskPayload)
+        : undefined;
+      const scriptArtifact =
+        payload?.graphModule?.type === 'SHELL' || payload?.graphModule?.type === 'CHECK';
       return {
         ...graphArtifactInstance(row),
         id: row.id,
@@ -660,6 +666,9 @@ export class GraphRunnerService implements OnModuleInit {
         serviceId: row.service_id,
         environmentId: row.environment_id,
         commitSha: row.source_commit,
+        ...(scriptArtifact && {
+          workspaceRepositoryId: payload?.pipeline?.definition.repositoryId,
+        }),
         runId: row.graph_run_id,
         nodeRunId: row.graph_node_run_id,
       };
@@ -1450,8 +1459,9 @@ export class GraphRunnerService implements OnModuleInit {
           previewSelected?.has(id) === false ? 'SKIPPED' : undefined,
       };
       let previewSelected: ReadonlySet<string> | undefined;
-      const selection = flowSelection(current, args, state);
+      let selection = flowSelection(current, args, state);
       previewSelected = selection.selected;
+      let scriptWorkspaces: ScriptWorkspacePreview | undefined;
       const scope = declaredScope(current, args);
       for (const node of selection.ordered) {
         if (!previewSelected.has(node.id)) continue;
@@ -1631,6 +1641,13 @@ export class GraphRunnerService implements OnModuleInit {
               ]);
           }
         } else if (isNativeTask(node)) {
+          const scriptWorkspace =
+            node.type === 'SHELL' || node.type === 'CHECK'
+              ? (scriptWorkspaces ??= new ScriptWorkspacePreview(
+                  current,
+                  selection.ordered,
+                )).prepare(node, state, selection.matches)
+              : undefined;
           if (['SHELL', 'CHECK', 'HEALTH_CHECK', 'REGISTER_ARTIFACT'].includes(node.type))
             unbounded = true;
           if (!this.nodeTasks)
@@ -1648,6 +1665,7 @@ export class GraphRunnerService implements OnModuleInit {
               parameters: args.parameters,
               values,
               inputEvidence: input.evidence,
+              scriptWorkspace,
               trigger,
               fetchModeDeferred: input.evidence.some(
                 ({ fieldId, state }) => fieldId === 'fetchMode' && state === 'DEFERRED',
@@ -1693,28 +1711,39 @@ export class GraphRunnerService implements OnModuleInit {
           }
           const declarations = graphArtifactDeclarations(node);
           if (declarations?.length) {
-            const origin = values.workspace as Values | undefined;
-            const repositoryId = stringValue(origin?.repositoryId) ?? unversionedArtifactRepository;
-            const commitSha = stringValue(origin?.commitSha) ?? unversionedArtifactCommit;
-            const definition = Object.assign(new PipelineDefinitionDto(), { repositoryId });
-            const source = {
-              definition,
-              commitSha,
-              serviceId: referenceId(values.service) ?? scope.serviceId,
-              environmentId: referenceId(values.environment) ?? scope.environmentId,
-              ...(repositoryId !== unversionedArtifactRepository && {
-                sourceSnapshot: [{ repositoryId, commitSha }],
-              }),
-              ...('serverId' in plan && plan.serverId && { serverIds: [plan.serverId] }),
-            };
+            const workspace = scriptWorkspace?.plan;
+            const origins = workspace
+              ? [
+                  ...(workspace.candidates ?? [workspace]),
+                  ...(workspace.optional ? [undefined] : []),
+                ]
+              : [values.workspace as Values | undefined];
+            const sources = new Map<string, PreparedProduction>();
+            for (const origin of origins) {
+              const repositoryId =
+                stringValue(origin?.repositoryId) ?? unversionedArtifactRepository;
+              const commitSha = stringValue(origin?.commitSha) ?? unversionedArtifactCommit;
+              sources.set(`${repositoryId}:${commitSha}`, {
+                definition: Object.assign(new PipelineDefinitionDto(), { repositoryId }),
+                commitSha,
+                serviceId: referenceId(values.service) ?? scope.serviceId,
+                environmentId: referenceId(values.environment) ?? scope.environmentId,
+                ...(repositoryId !== unversionedArtifactRepository && {
+                  sourceSnapshot: [{ repositoryId, commitSha }],
+                }),
+                ...('serverId' in plan && plan.serverId && { serverIds: [plan.serverId] }),
+              });
+            }
             for (const artifact of declarations)
-              production.set(outputKey(node.id, graphArtifactPortId(artifact)), [
-                { ...source, kind: artifact.type },
-              ]);
+              production.set(
+                outputKey(node.id, graphArtifactPortId(artifact)),
+                [...sources.values()].map((source) => ({ ...source, kind: artifact.type })),
+              );
             if (declarations.length === 1)
-              production.set(outputKey(node.id, 'artifacts'), [
-                { ...source, kind: declarations[0]!.type },
-              ]);
+              production.set(
+                outputKey(node.id, 'artifacts'),
+                [...sources.values()].map((source) => ({ ...source, kind: declarations[0]!.type })),
+              );
           }
           if (plan.type === 'CHECKOUT') {
             const { repositoryId, repositoryName, ref, branch, tag, commitSha, fullClone } =
@@ -1748,6 +1777,8 @@ export class GraphRunnerService implements OnModuleInit {
               ...checkouts[node.id]!,
             });
           } else if (plan.type === 'SHELL' || plan.type === 'CHECK') {
+            if (scriptWorkspace)
+              scriptWorkspaces?.recordOutputs(node.id, scriptWorkspace.inputs, !plan.serverId);
             if (!plan.serverId && values.workspace)
               outputs.set(node.id, { workspace: values.workspace });
             scripts.push({
@@ -1817,7 +1848,10 @@ export class GraphRunnerService implements OnModuleInit {
               production.set(outputKey(node.id, fieldId), sources);
           }
         }
-        if (outputs.has(node.id)) previewSelected = flowSelection(current, args, state).selected;
+        if (outputs.has(node.id)) {
+          selection = flowSelection(current, args, state);
+          previewSelected = selection.selected;
+        }
       }
       const produced: Record<string, PreparedProduction[]> = Object.create(null);
       const confirmedOutputs: Values = Object.create(null);
@@ -1878,7 +1912,11 @@ export class GraphRunnerService implements OnModuleInit {
         ]),
         repositoryIds: unique([
           ...checkoutRows.map(({ repositoryId }) => repositoryId),
-          ...scripts.map(({ workspace }) => workspace?.repositoryId),
+          ...scripts.flatMap(({ workspace }) =>
+            workspace
+              ? (workspace.candidates ?? [workspace]).map(({ repositoryId }) => repositoryId)
+              : [],
+          ),
           ...environmentFiles.map((file) =>
             'repositoryId' in file ? file.repositoryId : undefined,
           ),
@@ -2000,6 +2038,11 @@ export class GraphRunnerService implements OnModuleInit {
         row.artifactIds,
         row.artifactFromNodeId,
         row.artifactFromField,
+        row.alternatives?.map(({ sourceSnapshot, artifactFromNodeId, artifactFromField }) => [
+          sourceSnapshot,
+          artifactFromNodeId,
+          artifactFromField,
+        ]),
         row.requireCodeReview,
         row.sourceReviews,
         row.sourceReviewPendingMaterialization,
@@ -3303,6 +3346,8 @@ export class GraphRunnerService implements OnModuleInit {
           revisions.every(
             (artifact) =>
               (!artifact.commitSha || artifact.commitSha === option.commitSha) &&
+              (!artifact.workspaceRepositoryId ||
+                artifact.workspaceRepositoryId === option.profile?.definition.repositoryId) &&
               (artifact.type === 'DOCKER_IMAGE' ? 'DOCKER_IMAGE' : 'FILE') ===
                 option.profile?.definition.artifactType,
           )

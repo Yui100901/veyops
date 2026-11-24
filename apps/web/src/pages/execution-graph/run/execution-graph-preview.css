@@ -36,6 +36,17 @@
   color: var(--muted);
 }
 
+.execution-plan-workspaces ol {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0.35rem 0 0;
+  padding-inline-start: 1.4rem;
+}
+
+.execution-plan-workspaces code {
+  overflow-wrap: anywhere;
+}
+
 .execution-plan-artifact-source,
 .execution-plan-approval {
   padding: 0.65rem 0.75rem;

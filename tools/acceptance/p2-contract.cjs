@@ -67,6 +67,143 @@ async function publish(api, path, extend) {
   return publishedVersion;
 }
 
+async function verifyAlternativeCheck({
+  api,
+  graph,
+  execute,
+  source,
+  baseRepository,
+  apiRepository,
+  serverId,
+}) {
+  const start = 'candidate-check-start';
+  const selector = 'candidate-check-selector';
+  const condition = 'candidate-check-condition';
+  const checkoutA = 'candidate-check-checkout-a';
+  const checkoutB = 'candidate-check-checkout-b';
+  const join = 'candidate-check-join';
+  const check = 'candidate-check-ssh';
+  const end = 'candidate-check-end';
+  const chosenContent = execFileSync('git', [
+    '--git-dir',
+    source.repositoryPath,
+    'show',
+    `${source.nextCommitSha}:index.html`,
+  ]);
+  const checksum = createHash('sha256').update(chosenContent).digest('hex');
+  const candidates = [
+    { nodeId: checkoutA, repositoryId: baseRepository, commitSha: source.commitSha },
+    { nodeId: checkoutB, repositoryId: apiRepository, commitSha: source.nextCommitSha },
+  ];
+  const useFirst = (fieldId) => ({
+    kind: 'FIRST_AVAILABLE',
+    sources: candidates.map(({ nodeId }) => output(nodeId, fieldId)),
+  });
+  const version = await publish(api, graph, (canvas) => {
+    addFlow(
+      canvas,
+      start,
+      end,
+      [
+        node(selector, 'FUNCTION', {
+          operation: 'SHELL',
+          shell: {
+            location: 'MANAGER',
+            command: `printf '%s\\n' 'VEYOPS_OUTPUT={"CHECK_BRANCH":"b"}'`,
+          },
+          outputs: [
+            { id: 'branch', name: '选择结果', type: 'TEXT', referenceName: 'CHECK_BRANCH' },
+          ],
+        }),
+        node(condition, 'CONDITION', { condition: { key: 'input', value: 'a' } }),
+        node(checkoutA, 'CHECKOUT'),
+        node(checkoutB, 'CHECKOUT'),
+        node(join, 'JOIN'),
+        node(check, 'CHECK', {
+          shell: {
+            location: 'TARGET',
+            command: `printf '%s\\n' '${checksum}  index.html' | sha256sum -c -`,
+          },
+        }),
+      ],
+      [
+        edge(start, selector),
+        edge(selector, condition),
+        edge(condition, checkoutA, 'TRUE'),
+        edge(condition, checkoutB, 'FALSE'),
+        edge(checkoutA, join),
+        edge(checkoutB, join),
+        edge(join, check),
+        edge(check, end),
+      ],
+      {
+        [condition]: { value: output(selector, 'branch') },
+        ...Object.fromEntries(
+          candidates.map(({ nodeId, repositoryId, commitSha }) => [
+            nodeId,
+            {
+              repository: value(repositoryId),
+              version: value({ kind: 'COMMIT', value: commitSha }),
+            },
+          ]),
+        ),
+        [check]: {
+          workspace: useFirst('workspace'),
+          source: useFirst('source'),
+          targets: targets(serverId),
+        },
+      },
+      { report: { type: 'REPORT', binding: output(check, 'report') } },
+    );
+  });
+  const run = await execute(start, {}, { version });
+  assert.deepEqual(
+    [...run.entry.checkouts].sort((left, right) => left.nodeId.localeCompare(right.nodeId)),
+    candidates,
+  );
+  const plannedCheck = run.entry.scripts.find(({ nodeId }) => nodeId === check);
+  assert.equal(plannedCheck.serverId, serverId);
+  assert.deepEqual(
+    plannedCheck.workspace.candidates.map(
+      ({ producerNodeId, producerField, repositoryId, commitSha }) => ({
+        nodeId: producerNodeId,
+        producerField,
+        repositoryId,
+        commitSha,
+      }),
+    ),
+    candidates.map((candidate) => ({ ...candidate, producerField: 'workspace' })),
+  );
+  const runNode = (id) => run.detail.nodes.find(({ nodeId }) => nodeId === id);
+  assert.equal(runNode(checkoutA)?.status, 'SKIPPED');
+  const selected = runNode(checkoutB);
+  assert.equal(selected?.status, 'SUCCESS');
+  assert.equal(selected.output.source.repositoryId, apiRepository);
+  assert.equal(selected.output.source.commitSha, source.nextCommitSha);
+  const checked = runNode(check);
+  assert.equal(checked?.status, 'SUCCESS');
+  assert.deepEqual(
+    checked.targets.map(({ serverId, status }) => [serverId, status]),
+    [[serverId, 'SUCCESS']],
+  );
+  for (const fieldId of ['workspace', 'source']) {
+    assert.deepEqual(
+      checked.inputs.find((entry) => entry.fieldId === fieldId)?.source,
+      output(checkoutB, fieldId),
+    );
+  }
+  assert.equal(run.detail.outputs.report.passed, true);
+  const log = await api.get(graph + '/runs/' + run.detail.id + '/nodes/' + check + '/logs');
+  assert.equal(log.source, 'TASK');
+  assert.match(log.content, /index\.html: OK/);
+  return {
+    runId: run.detail.id,
+    candidates,
+    selected: selected.output.source,
+    checkedOn: serverId,
+  };
+}
+
 async function verifyV2Templates({ api, fixture, execute, source, html }) {
   const project = await api.post('/projects', {
     name: '流程模板实机验收',
@@ -756,6 +893,15 @@ async function verifyP2Contract({ api, fixture, execute, source, shellArtifactId
     temporaryChildRun: nested.detail.id,
     failedTarget: failed,
     verifiedTarget: check.targets[0],
+    alternativeCheck: await verifyAlternativeCheck({
+      api,
+      graph,
+      execute,
+      source,
+      baseRepository,
+      apiRepository: apiRepository.id,
+      serverId: testA,
+    }),
     templates: await verifyV2Templates({ api, fixture, execute, source, html }),
     scriptCompose: await verifyScriptCompose({
       api,
