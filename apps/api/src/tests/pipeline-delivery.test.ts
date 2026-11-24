@@ -168,7 +168,7 @@ async function checkDelivery(databaseUrl?: string) {
       execute: async (
         target: { id: string },
         command: string,
-        options?: { onData?: (chunk: string) => void },
+        options?: { onData?: (chunk: string, stream?: 'stdout' | 'stderr') => void },
       ) => {
         remoteCommands.push({ serverId: target.id, command });
         if (command.includes('VEYOPS_WORKSPACE=')) {
@@ -200,10 +200,14 @@ async function checkDelivery(databaseUrl?: string) {
         }
         if (command.includes('config --images'))
           options?.onData?.(`${/^VEYOPS_IMAGE='([^']+)'/.exec(command)?.[1]}\n`);
-        if (command.includes('{{.ID}}')) options?.onData?.(`fixture-engine-${target.id}\n`);
-        if (command.includes('image inspect --format')) {
+        if (command.includes('{{.ID}}'))
+          options?.onData?.(`fixture-engine-${target.id}\n`, 'stdout');
+        if (
+          command.includes('image inspect --format') ||
+          (command.includes('image') && command.includes('inspect') && command.includes('{{.Id}}'))
+        ) {
           const platform = command.includes('{{.Architecture}}') ? ' linux/amd64' : '';
-          options?.onData?.(`${imageId}${platform}\n`);
+          options?.onData?.(`${imageId}${platform}\n`, 'stdout');
         }
         if (command.includes("printf 'VEYOPS_COMPOSE_IMAGE_ID="))
           options?.onData?.(`VEYOPS_COMPOSE_IMAGE_ID=${imageId}\n`);
