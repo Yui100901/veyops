@@ -1021,7 +1021,7 @@ export class PipelineExecutor {
       });
     }
     const composeYaml = await step('PACKAGE', '归档 Compose 配置', () =>
-      this.builds.remoteComposeSnapshot(target, work, session, Boolean(declaration)),
+      this.builds.remoteComposeSnapshot(target, work, session),
     );
     if ((snapshot.deployAfterBuild || snapshot.graph) && registryId && imageRepository) {
       const image = await step('IMAGE', '构建镜像、推送并固定Digest', () =>

@@ -263,6 +263,7 @@ export class ArtifactsService {
         : (artifact.sources ?? snapshot.artifactSources);
     const physicalJson = artifact.physical ? JSON.stringify(artifact.physical) : null;
     const locationKey = artifact.physical ? physicalKey(artifact.physical) : null;
+    const composeChecksum = artifact.composeYaml ? checksumOf(artifact.composeYaml) : null;
     await this.database.db.transaction().execute(async (tx) => {
       if (grouped || locationKey) await lockProjectGraph(tx);
       if (
@@ -293,6 +294,7 @@ export class ArtifactsService {
             'project_id',
             'pipeline_run_id',
             'physical_json',
+            'compose_checksum',
             'source_commit',
             'lifecycle_state',
           ])
@@ -307,6 +309,10 @@ export class ArtifactsService {
             previous.lifecycle_state !== 'ACTIVE'
           )
             throw new ConflictException('已登记的产物与本次恢复的实物不一致');
+          if (previous.compose_checksum !== composeChecksum)
+            throw new ConflictException(
+              '已登记的产物「' + artifact.name + '」的 Compose 归档与本次恢复不一致',
+            );
           return;
         }
       }
@@ -351,7 +357,7 @@ export class ArtifactsService {
             : (artifact.imageTag ?? null),
           image_digest: artifact.imageId ?? artifact.imageDigest ?? null,
           compose_yaml: artifact.composeYaml ?? null,
-          compose_checksum: artifact.composeYaml ? checksumOf(artifact.composeYaml) : null,
+          compose_checksum: composeChecksum,
           checksum: artifact.checksum ?? null,
           size_bytes: artifact.sizeBytes ?? null,
           source_commit: snapshot.commitSha,

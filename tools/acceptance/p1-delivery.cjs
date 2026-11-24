@@ -278,6 +278,7 @@ function createGraphRunner(api, fixture, evidence) {
         commitSha,
       })),
       targets: plan.executionPlan.targets,
+      scripts: plan.scripts,
       status: detail.status,
       decisions: [...decisions].map(([nodeId, receipt]) => ({ nodeId, ...receipt })),
       artifacts: runArtifacts.map((artifact) => ({

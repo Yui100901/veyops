@@ -59,7 +59,13 @@ interface PathScenario {
 
 type DiagnosticLocation = Pick<
   GraphDiagnostic,
-  'sourceNodeId' | 'sourceFieldId' | 'branchId' | 'edge'
+  | 'fieldId'
+  | 'fieldSection'
+  | 'artifactField'
+  | 'sourceNodeId'
+  | 'sourceFieldId'
+  | 'branchId'
+  | 'edge'
 >;
 
 function branchLocation(path: PathScenario): DiagnosticLocation {
@@ -110,10 +116,11 @@ function checkFields(
   const seen = new Set<string>();
   const references = new Map<string, GraphField>();
   const aliases = new Map<string, GraphField>();
+  const fieldSection = kind === 'INPUT' ? 'input' : 'output';
   for (const field of fields) {
     const error = validateGraphField(field, kind, functional);
-    if (error) fail(flow, node, error, field);
-    if (seen.has(field.id)) fail(flow, node, '字段标识不可重复', field);
+    if (error) fail(flow, node, error, field, { fieldSection });
+    if (seen.has(field.id)) fail(flow, node, '字段标识不可重复', field, { fieldSection });
     seen.add(field.id);
     for (const [value, group] of [
       [field.referenceName ?? field.id, references],
@@ -122,6 +129,7 @@ function checkFields(
       const existing = group.get(value);
       if (existing)
         fail(flow, node, '字段引用名或导出名不可重复', field, {
+          fieldSection,
           sourceNodeId: node.id,
           sourceFieldId: existing.id,
         });
@@ -353,12 +361,14 @@ function assertBinding(
   environment = false,
 ) {
   const { flow } = context;
-  const evidence =
-    binding.kind === 'OUTPUT'
+  const evidence: DiagnosticLocation = {
+    fieldSection: environment ? undefined : node.type === 'END' ? 'output' : 'input',
+    ...(binding.kind === 'OUTPUT'
       ? { sourceNodeId: binding.nodeId, sourceFieldId: binding.fieldId }
       : binding.kind === 'INPUT'
         ? { sourceNodeId: flow.id, sourceFieldId: binding.fieldId }
-        : {};
+        : {}),
+  };
   if (binding.onMissing === 'OMIT' && field.required !== false)
     fail(flow, node, '仅可选端口允许缺值时省略', field, evidence);
   if (binding.onMissing === 'USE_DEFAULT' && field.defaultValue === undefined)
@@ -377,7 +387,7 @@ function assertBinding(
   }
   if (binding.kind === 'AS_GIT_REF') {
     if (field.type !== 'GIT_REF' || field.multiple)
-      fail(flow, node, 'Git 引用转换仅用于单值 Git 版本端口', field);
+      fail(flow, node, 'Git 引用转换仅用于单值 Git 版本端口', field, evidence);
     assertBinding(
       context,
       node,
@@ -389,7 +399,7 @@ function assertBinding(
   }
   if (binding.kind === 'PROJECT_VALUE') {
     if (!environment || !['SHELL', 'CHECK'].includes(node.type))
-      fail(flow, node, '仅 Shell 或检查的环境变量可投影上游执行资源', field);
+      fail(flow, node, '仅 Shell 或检查的环境变量可投影上游执行资源', field, evidence);
     const { nodeId, fieldId } = binding.source;
     const producer = context.nodes.get(nodeId);
     const workspace = binding.projection === 'WORKSPACE_PATH';
@@ -398,6 +408,7 @@ function assertBinding(
       : ['BUILD', 'REGISTER_ARTIFACT', 'SHELL', 'CHECK'];
     if (!producer || !producerTypes.includes(producer.type))
       fail(flow, node, '投影须使用对应模块的正式输出', field, {
+        ...evidence,
         sourceNodeId: nodeId,
         sourceFieldId: fieldId,
       });
@@ -423,7 +434,7 @@ function assertBinding(
     const isConditionKey =
       binding.kind === 'ENVIRONMENT_KEY' && node.branch && field.id === 'value';
     if (!environment && !isConditionKey)
-      fail(flow, node, '凭据用于脚本环境注入，集合变量键也可供条件分支比较', field);
+      fail(flow, node, '凭据用于脚本环境注入，集合变量键也可供条件分支比较', field, evidence);
     if (
       binding.kind === 'ENVIRONMENT_KEY' &&
       !context.flow.nodes.some(
@@ -431,7 +442,7 @@ function assertBinding(
           entry.type === 'START' && entry.environmentSet && entry.environmentSet.mode !== 'NONE',
       )
     )
-      fail(flow, node, '当前开始节点未选择变量集合来源', field);
+      fail(flow, node, '当前开始节点未选择变量集合来源', field, evidence);
     return;
   }
   let source: GraphField | undefined;
@@ -439,7 +450,7 @@ function assertBinding(
   if (binding.kind === 'INPUT') source = context.inputs.get(binding.fieldId);
   if (binding.kind === 'CONTEXT') source = contextSource(context, binding.fieldId);
   if (binding.kind === 'NODE_INPUT') {
-    if (!environment) fail(flow, node, '仅节点环境注入可引用本节点的已解析输入', field);
+    if (!environment) fail(flow, node, '仅节点环境注入可引用本节点的已解析输入', field, evidence);
     source = context.nodeInputs.get(node.id)?.find((port) => port.id === binding.fieldId);
   }
   if (binding.kind === 'OUTPUT') {
@@ -461,13 +472,13 @@ function assertBinding(
       (!['BUILD', 'REGISTER_ARTIFACT', 'SHELL', 'CHECK'].includes(producer.type) &&
         source?.source !== 'CURRENT_RUN'))
   )
-    fail(flow, node, '仅能绑定本次运行由构建或登记模块产生的产物', field);
+    fail(flow, node, '仅能绑定本次运行由构建或登记模块产生的产物', field, evidence);
   if (binding.kind === 'VALUE') {
     if (
       !validatesLiteral(field, binding.value, node) &&
       !(environment && ['number', 'boolean'].includes(typeof binding.value))
     )
-      fail(flow, node, '固定值不符合字段类型或包含明文凭据', field);
+      fail(flow, node, '固定值不符合字段类型或包含明文凭据', field, evidence);
     return;
   }
   const scalarCondition =
@@ -495,7 +506,7 @@ function assertBinding(
         service.kind === 'VALUE' &&
         (graphRecord(service.value) ? service.value.serviceId : service.value) !== flow.serviceId)
     )
-      fail(flow, node, '发布结果来源与执行流关联的服务不一致', field);
+      fail(flow, node, '发布结果来源与执行流关联的服务不一致', field, evidence);
   }
 }
 
@@ -553,38 +564,48 @@ function validateArtifactConfig(flow: GraphFlow, node: GraphNode, ports: GraphFi
   for (const artifact of declaration ?? []) {
     const id = artifact.id ?? artifact.name;
     const port = ports.find((candidate) => candidate.id === id);
+    const invalid = (message: string, artifactField?: GraphDiagnostic['artifactField']): never =>
+      fail(flow, node, message, port, { fieldId: id, fieldSection: 'output', artifactField });
     if (!port || id === 'artifacts' || !safeGraphId(id))
-      fail(flow, node, '具名产物必须使用有效且不同于产物列表的端口标识', port);
+      invalid('具名产物必须使用有效且不同于产物列表的端口标识');
     const reference = artifact.referenceName ?? id;
     if (
       (artifact.referenceName !== undefined && !safeGraphReference(reference)) ||
       references.has(reference)
     )
-      fail(flow, node, '具名产物引用名无效或重复', port);
+      invalid('具名产物引用名无效或重复', 'referenceName');
     references.add(reference);
     if (artifact.type !== 'DOCKER_IMAGE' && artifact.imageReference)
-      fail(flow, node, '镜像地址只适用于 Docker 镜像产物', port);
+      invalid('镜像地址只适用于 Docker 镜像产物', 'imageReference');
     if (artifact.pathInput !== undefined) {
       const input = graphScriptInputs(node).find(({ id }) => id === artifact.pathInput);
       if (!script || artifact.type === 'DOCKER_IMAGE' || input?.type !== 'PATH' || input.multiple)
-        fail(flow, node, '路径来源必须是本节点声明的单值相对路径输入', port);
+        invalid('路径来源必须是本节点声明的单值相对路径输入', 'pathInput');
     }
     if (script && artifact.type === 'DOCKER_IMAGE' && !artifact.imageReference)
-      fail(flow, node, '脚本镜像产物须明确指定执行端已有的镜像引用', port);
+      invalid('脚本镜像产物须明确指定执行端已有的镜像引用', 'imageReference');
     if (script && artifact.type !== 'DOCKER_IMAGE' && !artifact.path && !artifact.pathInput)
-      fail(flow, node, '请填写相对产物路径或选择脚本的路径输入', port);
-    for (const value of [artifact.path, artifact.composeFilePath]) {
+      invalid('请填写相对产物路径或选择脚本的路径输入', 'path');
+    for (const field of ['path', 'composeFilePath'] as const) {
+      const value = artifact[field];
+      if (
+        field === 'path' &&
+        node.type === 'BUILD' &&
+        artifact.type !== 'DOCKER_IMAGE' &&
+        !value?.trim()
+      )
+        continue;
       if (
         value !== undefined &&
         !validateGraphValue({ id: 'path', name: '产物路径', type: 'PATH' }, value)
       )
-        fail(flow, node, '产物路径必须在工作区内', port);
+        invalid(field === 'path' ? '产物路径必须在工作区内' : 'Compose 路径必须在工作区内', field);
     }
     if (
       artifact.imageReference &&
       !validateGraphValue({ id: 'image', name: '镜像地址', type: 'IMAGE' }, artifact.imageReference)
     )
-      fail(flow, node, '镜像地址无效', port);
+      invalid('镜像地址无效', 'imageReference');
   }
 }
 
@@ -649,6 +670,7 @@ export function validateFlowBindings(
           node,
           '输入端口或绑定格式无效',
           port ?? { id: portId, name: portId, type: 'TEXT' },
+          { fieldSection: 'input' },
         );
     }
   }
@@ -660,6 +682,7 @@ export function validateFlowBindings(
         end,
         '结束字段或绑定格式无效',
         field ?? { id: fieldId, name: fieldId, type: 'TEXT' },
+        { fieldSection: 'output' },
       );
   }
 
@@ -729,9 +752,11 @@ export function validateFlowBindings(
         mapping &&
         (config?.envFile || !Object.keys(mapping).length || Object.keys(mapping).length > 30)
       )
-        fail(flow, node, '请选择单一路径或填写 1–30 条环境文件映射', fileField);
+        fail(flow, node, '请选择单一路径或填写 1–30 条环境文件映射', fileField, {
+          fieldSection: 'execution',
+        });
       if (!mapping && !config?.envFile && config?.required === true)
-        fail(flow, node, '必需环境文件应填写路径或映射', fileField);
+        fail(flow, node, '必需环境文件应填写路径或映射', fileField, { fieldSection: 'execution' });
       try {
         for (const file of mapping
           ? Object.values(mapping)
@@ -741,7 +766,9 @@ export function validateFlowBindings(
           environmentFilePath(file);
         if (config?.directory && config.directory !== '.') environmentFilePath(config.directory);
       } catch {
-        fail(flow, node, '环境文件必须使用有效的仓库内相对路径', fileField);
+        fail(flow, node, '环境文件必须使用有效的仓库内相对路径', fileField, {
+          fieldSection: 'execution',
+        });
       }
     }
     if (
@@ -891,6 +918,7 @@ export function validateFlowBindings(
               field,
               {
                 ...location,
+                fieldSection: node.type === 'END' ? 'output' : 'input',
                 sourceNodeId: source?.nodeId,
                 sourceFieldId: source?.fieldId,
               },
@@ -931,7 +959,7 @@ export function validateFlowBindings(
           node,
           `缺少脚本执行位置${branch}，请绑定工作区或服务器`,
           destinations.find((port) => port.id === 'targets'),
-          location,
+          { ...location, fieldSection: 'input' },
         );
       if (node.type === 'REGISTER_ARTIFACT' && !node.registerArtifacts?.artifacts.length)
         fail(flow, node, '请配置至少一个具名产物');

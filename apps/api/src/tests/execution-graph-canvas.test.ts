@@ -607,6 +607,99 @@ test('three entries share functional nodes and retain independent typed bindings
   assert.equal(flows[0]!.nodes.find((node) => node.id === 'build')?.moduleVersion, 1);
 });
 
+test('named file and directory outputs require a path even for optional artifacts', () => {
+  for (const type of ['FILE', 'DIRECTORY'] as const) {
+    for (const path of [undefined, '', '   ', '../dist', '/dist', 'dist/app']) {
+      const canvas = deliveryCanvas();
+      const build = canvas.nodes.find(({ id }) => id === 'build')!;
+      const declaration = build.build!.artifacts!.find(({ id }) => id === 'directory')!;
+      Object.assign(declaration, { type, path, required: false });
+      const serialized = JSON.parse(JSON.stringify(canvas)) as GraphCanvas;
+      assert.doesNotThrow(() => compileCanvas(serialized, false));
+      const issues = canvasIssues(serialized);
+      if (path === 'dist/app') {
+        assert.deepEqual(issues, []);
+        continue;
+      }
+      assert.deepEqual(
+        issues.map(({ flowId, nodeId, fieldId, fieldSection, artifactField }) => [
+          flowId,
+          nodeId,
+          fieldId,
+          fieldSection,
+          artifactField,
+        ]),
+        ['build-start', 'combined-start'].map((id) => [id, 'build', 'directory', 'output', 'path']),
+      );
+      const message = path?.trim() ? /产物路径必须在工作区内/ : /请填写「站点目录」/;
+      assert.ok(issues.every((issue) => message.test(issue.message)));
+    }
+  }
+});
+
+test('check and shell diagnostics identify the named output and its invalid control', () => {
+  for (const operation of ['CHECK', 'SHELL'] as const) {
+    const canvas: GraphCanvas = {
+      nodes: [
+        { id: 'start', type: 'START', name: '开始' },
+        {
+          id: 'script',
+          type: 'FUNCTION',
+          operation,
+          name: '脚本',
+          shell: {
+            location: 'MANAGER',
+            command: 'true',
+            artifacts: [
+              { id: 'first', name: '第一项', type: 'FILE', path: 'report.json' },
+              { id: 'second', name: '第二项', type: 'DOCKER_IMAGE', imageReference: 'example:ci' },
+            ],
+          },
+        },
+        { id: 'end', type: 'END', name: '结束' },
+      ],
+      edges: [
+        { from: 'start', to: 'script' },
+        { from: 'script', to: 'end' },
+      ],
+      endpoints: [{ startId: 'start', endId: 'end' }],
+      templates: [],
+    };
+    const declaration = canvas.nodes[1]!.shell!.artifacts![1]!;
+    for (const [artifactField, value] of [
+      ['imageReference', 'invalid image'],
+      ['composeFilePath', '../compose.yaml'],
+      ['referenceName', 'invalid name'],
+    ] as const) {
+      const previous = declaration[artifactField];
+      declaration[artifactField] = value;
+      const [issue, ...duplicates] = canvasIssues(canvas);
+      assert.deepEqual(duplicates, []);
+      assert.equal(issue?.flowId, 'start');
+      assert.equal(issue?.nodeId, 'script');
+      assert.equal(issue?.fieldId, 'second');
+      assert.equal(issue?.fieldSection, 'output');
+      assert.equal(issue?.artifactField, artifactField);
+      declaration[artifactField] = previous;
+    }
+    assert.deepEqual(canvasIssues(canvas), []);
+    const script = canvas.nodes[1]!;
+    script.inputs = [{ id: 'second', name: '同名输入', type: 'TEXT' }];
+    canvas.endpoints[0]!.inputBindings = {
+      script: { second: { kind: 'VALUE', value: 123 } },
+    };
+    const [inputIssue] = canvasIssues(canvas);
+    assert.equal(inputIssue?.fieldId, 'second');
+    assert.equal(inputIssue?.fieldSection, 'input');
+    assert.equal(inputIssue?.artifactField, undefined);
+
+    script.shell!.command = '';
+    const [commandIssue] = canvasIssues(canvas);
+    assert.equal(commandIssue?.fieldId, 'command');
+    assert.equal(commandIssue?.fieldSection, 'execution');
+  }
+});
+
 test('file and Compose publishing constrain known artifact kinds in the same catalog used by compilation', () => {
   const canvas = deliveryCanvas();
   const publish = canvas.nodes.find(({ id }) => id === 'deploy')!;

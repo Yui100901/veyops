@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { readFile, writeFile } = require('node:fs/promises');
 const { join } = require('node:path');
 
@@ -129,8 +129,12 @@ async function verifyV2Templates({ api, fixture, execute, source, html }) {
     return deploy;
   };
   configureBuild(ci.canvas);
-  ci.canvas.nodes.find(({ operation }) => operation === 'CHECK').shell.command =
-    'test -s index.html';
+  const check = ci.canvas.nodes.find(({ operation }) => operation === 'CHECK');
+  Object.assign(check.shell, { location: 'TARGET', command: 'test -s index.html' });
+  ci.canvas.endpoints[0].inputBindings[check.id].targets = {
+    kind: 'INPUT',
+    fieldId: 'buildTargets',
+  };
   const cdDeploy = configureDeploy(cd.canvas);
   const health = cd.canvas.nodes.find(({ operation }) => operation === 'HEALTH_CHECK');
   assert.equal(health.healthCheck.requireHealthy, true);
@@ -174,6 +178,10 @@ async function verifyV2Templates({ api, fixture, execute, source, html }) {
   const old = assertBuilt(previous, source.commitSha);
   assert.equal(previous.detail.outputs.report.passed, true);
   assert.deepEqual(previous.releases, []);
+  const plannedCheck = previous.entry.scripts.find(({ nodeId }) => nodeId === check.id);
+  assert.equal(plannedCheck.serverId, serverId);
+  assert.equal(plannedCheck.directory, '.');
+  assert.equal(plannedCheck.workspace.commitSha, source.commitSha);
 
   const minimalRun = await execute(
     minimalId,
@@ -234,6 +242,127 @@ async function verifyV2Templates({ api, fixture, execute, source, html }) {
     ci: { flowId: ci.startId, runId: previous.detail.id, artifactId: old.artifactId },
     minimal: { flowId: minimalId, runId: minimalRun.detail.id, artifactId: fresh.artifactId },
     cd: { flowId: cd.startId, runId: cdRun.detail.id, artifactId: old.artifactId, healthStatus },
+  };
+}
+
+async function verifyScriptCompose({
+  api,
+  project,
+  graph,
+  execute,
+  repositoryId,
+  serverId,
+  source,
+}) {
+  const service = await api.post(project + '/services', {
+    name: '脚本镜像验收服务',
+    slug: 'candidate-script-compose',
+    serviceType: 'WEB',
+  });
+  const start = 'candidate-script-compose';
+  const checkout = start + '-checkout';
+  const script = start + '-image';
+  const deploy = start + '-deploy';
+  const health = start + '-health';
+  const end = start + '-end';
+  const image = 'veyops-acceptance-script:1';
+  const template = [
+    'services:',
+    '  web:',
+    '    image: ${VEYOPS_IMAGE}',
+    '    ports:',
+    "      - '18082:8080'",
+    '',
+  ].join('\n');
+  const checksum = createHash('sha256').update(template).digest('hex');
+  const version = await publish(api, graph, (canvas) => {
+    addFlow(
+      canvas,
+      start,
+      end,
+      [
+        node(checkout, 'CHECKOUT'),
+        node(script, 'SHELL', {
+          shell: {
+            location: 'TARGET',
+            command: [
+              'set -eu',
+              'test -s index.html',
+              'mkdir -p ops',
+              "cat >ops/deployment.yaml <<'VEYOPS_COMPOSE'",
+              template.trimEnd(),
+              'VEYOPS_COMPOSE',
+              'docker build -t ' + image + ' .',
+            ].join('\n'),
+            artifacts: [
+              {
+                id: 'image',
+                name: '脚本镜像',
+                type: 'DOCKER_IMAGE',
+                imageReference: image,
+                composeFilePath: 'ops/deployment.yaml',
+                persist: false,
+              },
+            ],
+          },
+        }),
+        node(deploy, 'DEPLOY_ARTIFACT', {
+          deploy: {
+            method: 'COMPOSE',
+            deployPath: '/srv/veyops-stage0/contract-script-compose',
+            composeSource: { kind: 'ARTIFACT' },
+          },
+        }),
+        node(health, 'HEALTH_CHECK', {
+          healthCheck: {
+            command:
+              'node -e "fetch(\'http://127.0.0.1:18082/\').then(r=>{if(!r.ok)process.exitCode=1})"',
+            requireHealthy: true,
+          },
+        }),
+      ],
+      [
+        edge(start, checkout),
+        edge(checkout, script),
+        edge(script, deploy),
+        edge(deploy, health),
+        edge(health, end),
+      ],
+      {
+        [checkout]: {
+          repository: value(repositoryId),
+          version: value({ kind: 'COMMIT', value: source.commitSha }),
+        },
+        [script]: {
+          workspace: output(checkout, 'workspace'),
+          source: output(checkout, 'source'),
+          service: value({ serviceId: service.id }),
+          targets: targets(serverId),
+        },
+        [deploy]: {
+          artifact: output(script, 'image'),
+          service: value({ serviceId: service.id }),
+          targets: targets(serverId),
+        },
+        [health]: { release: output(deploy, 'release') },
+      },
+      { release: { type: 'RELEASE', binding: output(health, 'release') } },
+    );
+  });
+  const result = await execute(start, {}, { version });
+  const released = result.detail.outputs.release.targets[0];
+  assert.equal(released.serverId, serverId);
+  assert.equal(released.health, 'HEALTHY');
+  const record = result.releases.find(({ id }) => id === released.deploymentId);
+  assert.equal(record.artifactId, released.artifactInstanceId);
+  assert.equal(record.composeRelease.template.source, 'ARCHIVE');
+  assert.equal(record.composeRelease.template.path, 'ops/deployment.yaml');
+  assert.equal(record.composeRelease.template.checksum, checksum);
+  assert.match(record.composeRelease.imageId, /^sha256:[a-f0-9]{64}$/);
+  return {
+    runId: result.detail.id,
+    commitSha: source.commitSha,
+    deployment: record.composeRelease,
   };
 }
 
@@ -612,6 +741,15 @@ async function verifyP2Contract({ api, fixture, execute, source, shellArtifactId
     failedTarget: failed,
     verifiedTarget: check.targets[0],
     templates: await verifyV2Templates({ api, fixture, execute, source, html }),
+    scriptCompose: await verifyScriptCompose({
+      api,
+      project,
+      graph,
+      execute,
+      repositoryId: baseRepository,
+      serverId: composeA,
+      source,
+    }),
   };
 }
 

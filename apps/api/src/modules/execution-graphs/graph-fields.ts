@@ -9,6 +9,7 @@ import {
   ValidateIf,
   isUUID,
 } from 'class-validator';
+import type { GraphIssueLocation } from '../../core/execution-plan-issue';
 import { isGitBranchName } from '../projects/git-ref';
 import { graphRepositoryUrl } from '../projects/http-clone-url';
 import { relativePath } from '../pipelines/pipeline.validation';
@@ -123,7 +124,7 @@ export type GraphBinding = (
     }
 ) & { onMissing?: GraphMissingPolicy };
 
-export interface GraphDiagnostic {
+export interface GraphDiagnostic extends GraphIssueLocation {
   flowId?: string;
   nodeId?: string;
   fieldId?: string;

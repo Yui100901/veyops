@@ -188,6 +188,82 @@ async function checkGraph(url?: string) {
     assert.equal(initialGraph.publishedVersion, null);
     assert.equal(initialGraph.id, (await api.get(path).expect(200)).body.data.id);
     assert.notEqual(initialGraph.id, (await api.get(otherPath).expect(200)).body.data.id);
+    const repairPath =
+      root + '/projects/' + (await project('graph-build-path')) + '/execution-graph';
+    const { revision: blankRevision } = (await api.get(repairPath).expect(200)).body.data;
+    const canvas: GraphCanvas = {
+      nodes: [
+        {
+          id: 'start',
+          type: 'START',
+          name: '构建',
+          inputs: [{ id: 'repository', type: 'REPOSITORY', name: '仓库' }],
+        },
+        {
+          id: 'build',
+          type: 'FUNCTION',
+          operation: 'BUILD',
+          name: '构建程序',
+          build: { artifacts: [{ id: 'bundle', type: 'DIRECTORY', name: '目录' }] },
+        },
+        { id: 'end', type: 'END', name: '结束' },
+      ],
+      edges: [
+        { from: 'start', to: 'build' },
+        { from: 'build', to: 'end' },
+      ],
+      endpoints: [
+        {
+          startId: 'start',
+          endId: 'end',
+          inputBindings: {
+            build: { repository: { kind: 'INPUT', fieldId: 'repository' } },
+          },
+        },
+      ],
+      templates: [],
+    };
+    const verifyPath = (issue: Record<string, unknown>) => {
+      assert.deepEqual(
+        [issue.flowId, issue.nodeId, issue.fieldId, issue.fieldSection, issue.artifactField],
+        ['start', 'build', 'bundle', 'output', 'path'],
+      );
+      assert.match(String(issue.message), /请填写「目录」/);
+    };
+    const validation = (
+      await api
+        .post(repairPath + '/validate')
+        .send({ definition: { canvas } })
+        .expect(201)
+    ).body.data;
+    assert.equal(validation.issues.length, 1);
+    verifyPath(validation.issues[0]);
+    const incomplete = (
+      await api
+        .put(repairPath + '/draft')
+        .send({ expectedRevision: blankRevision, definition: { canvas } })
+        .expect(200)
+    ).body.data;
+    const reloaded = (await api.get(repairPath).expect(200)).body.data;
+    assert.equal(reloaded.draft.canvas.nodes[1].build.artifacts[0].id, 'bundle');
+    const failed = (
+      await api
+        .post(repairPath + '/publish')
+        .send({ expectedRevision: incomplete.revision })
+        .expect(400)
+    ).body.error;
+    verifyPath(failed.planIssue);
+    canvas.nodes[1]!.build!.artifacts![0]!.path = 'dist';
+    const repaired = (
+      await api
+        .put(repairPath + '/draft')
+        .send({ expectedRevision: incomplete.revision, definition: { canvas } })
+        .expect(200)
+    ).body.data;
+    await api
+      .post(repairPath + '/publish')
+      .send({ expectedRevision: repaired.revision })
+      .expect(201);
     const runDag = async (id: string, version: number, value: string) => {
       const flowPath = otherPath + '/flows/' + id;
       const args = { version, inputs: { parameters: { choice: value } } };

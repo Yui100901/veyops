@@ -81,6 +81,9 @@ export function namedArtifactSession(
   artifact: NamedArtifactDefinition,
 ): BuildSession {
   const definition = session.snapshot.definition;
+  // Graph build nodes always declare the path of each named file output.
+  if (session.snapshot.graph && artifact.type !== 'DOCKER_IMAGE' && !artifact.path?.trim())
+    throw new Error(`请填写「${artifact.name}」的工作区相对路径`);
   return {
     ...session,
     taskId: session.snapshot.graph
@@ -210,6 +213,16 @@ export const packScript = (
 
 export function enterRepositoryDirectory(work: string, repoPath: string) {
   return `cd -P ${q(work)}; veyops_repo=$PWD/repo; test ! -L "$veyops_repo"; cd -P "$veyops_repo"/${q(repoPath)}; case "$PWD" in "$veyops_repo"|"$veyops_repo"/*) ;; *) echo '构建工作目录超出仓库' >&2; exit 1 ;; esac`;
+}
+
+export function enterSourceDirectory(root: string, directory: string, initialize = false) {
+  const source = q(root);
+  return [
+    `cd -P -- ${source} && test "$PWD" = ${source} || exit 45`,
+    ...(initialize ? [`mkdir -p -- ${q('./' + directory)} || exit $?`] : []),
+    `cd -P -- ${q('./' + directory)} || exit $?`,
+    `case "$PWD" in ${source}|${source}/*) ;; *) exit 45 ;; esac`,
+  ].join('\n');
 }
 
 export function resolveRepositoryFile(path: string) {
@@ -464,48 +477,7 @@ export class BuildsService {
   ) {
     if (session.snapshot.graph?.workspace) {
       const { workspace, dependencies } = session.snapshot.graph;
-      const directory = await openGraphWorkspace(workspace);
-      const temporary = await mkdtemp(join(tmpdir(), 'veyops-workspace-'));
-      try {
-        const archive = join(temporary, 'checkout.tar.gz');
-        if (dependencies) {
-          await copyGraphRepository(workspace, join(temporary, 'repo'));
-          await copyGraphDependencies(dependencies, join(temporary, 'dependencies'));
-        }
-        const packaged = await this.runner.run(
-          'tar',
-          [
-            '-czf',
-            archive,
-            '-C',
-            dependencies ? temporary : directory,
-            'repo',
-            ...(dependencies ? ['dependencies'] : []),
-          ],
-          {
-            timeout: 300,
-            signal: session.context.signal,
-          },
-        );
-        const details = await lstat(archive).catch(() => undefined);
-        if (packaged.exitCode !== 0 || !details?.isFile() || details.size > maxArchiveBytes)
-          throw new Error('工作区打包失败或超过 1GiB');
-        const remoteArchive = work + '/checkout.tar.gz';
-        await this.ssh.upload(target, archive, remoteArchive, {
-          timeout: 300,
-          signal: session.context.signal,
-        });
-        await this.remote(
-          target,
-          `set -eu; tar -xzf ${q(remoteArchive)} --no-same-owner --no-same-permissions -C ${q(work)}; rm -- ${q(remoteArchive)}`,
-          session,
-          300,
-          '目标无法解包绑定工作区',
-        );
-      } finally {
-        await rm(temporary, { recursive: true, force: true });
-      }
-      return;
+      return this.transferGraphWorkspace(target, work, session, workspace, dependencies);
     }
     const source = node ? this.nodeSource(session.snapshot, node) : undefined;
     const secret = await this.gitSecret(
@@ -544,6 +516,53 @@ export class BuildsService {
       await this.ssh
         .execute(target, `rm -f -- ${q(response)}`, { timeout: 30 })
         .catch(() => undefined);
+    }
+  }
+
+  async transferGraphWorkspace(
+    target: SshTarget,
+    work: string,
+    session: BuildSession,
+    workspace: GraphWorkspaceRef,
+    dependencies?: Record<string, GraphWorkspaceRef>,
+  ) {
+    const directory = await openGraphWorkspace(workspace);
+    const temporary = await mkdtemp(join(tmpdir(), 'veyops-workspace-'));
+    try {
+      const archive = join(temporary, 'checkout.tar.gz');
+      if (dependencies) {
+        await copyGraphRepository(workspace, join(temporary, 'repo'));
+        await copyGraphDependencies(dependencies, join(temporary, 'dependencies'));
+      }
+      const packaged = await this.runner.run(
+        'tar',
+        [
+          '-czf',
+          archive,
+          '-C',
+          dependencies ? temporary : directory,
+          'repo',
+          ...(dependencies ? ['dependencies'] : []),
+        ],
+        { timeout: 300, signal: session.context.signal },
+      );
+      const details = await lstat(archive).catch(() => undefined);
+      if (packaged.exitCode !== 0 || !details?.isFile() || details.size > maxArchiveBytes)
+        throw new Error('工作区打包失败或超过 1GiB');
+      const remoteArchive = work + '/checkout.tar.gz';
+      await this.ssh.upload(target, archive, remoteArchive, {
+        timeout: 300,
+        signal: session.context.signal,
+      });
+      await this.remote(
+        target,
+        `set -eu; tar -xzf ${q(remoteArchive)} --no-same-owner --no-same-permissions -C ${q(work)}; rm -- ${q(remoteArchive)}`,
+        session,
+        300,
+        '目标无法解包绑定工作区',
+      );
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
     }
   }
   async remoteNodes(
@@ -763,41 +782,55 @@ export class BuildsService {
     target: SshTarget,
     work: string,
     session: BuildSession,
-    named = false,
+    source?: { root: string; directory: string; path: string },
   ) {
     const d = session.snapshot.definition;
-    const path =
-      work + (named ? `/compose-${session.taskId}.snapshot.yaml` : '/compose.snapshot.yaml');
+    const root = source?.root ?? work + '/repo';
+    const directory = relativePath(source?.directory ?? d.repoPath);
+    const file = relativePath(source?.path ?? d.composeFilePath);
+    const path = work + '/compose-' + randomUUID() + '.snapshot.yaml';
+    const localDirectory = await mkdtemp(join(tmpdir(), 'veyops-compose-'));
+    const local = join(localDirectory, 'compose.yaml');
     try {
       await this.remote(
         target,
-        `set -eu; ${enterRepositoryDirectory(work, d.repoPath)};
-candidate=${q('./' + d.composeFilePath)}
+        `set -eu
+${enterSourceDirectory(root, directory)}
+candidate=${q('./' + file)}
 if ! test -e "$candidate" && ! test -L "$candidate"; then exit 44; fi
-${resolveRepositoryFile(d.composeFilePath)}
-test -s "$veyops_file"; test "$(wc -c < "$veyops_file")" -le ${maxComposeBytes}
-umask 077; test ! -e ${q(path)}; test ! -L ${q(path)}; cp -- "$veyops_file" ${q(path)}`,
+veyops_file=$(realpath -- "$candidate") || exit 45
+case "$veyops_file" in ${q(root)}/*) ;; *) exit 45 ;; esac
+test -f "$veyops_file" && test -r "$veyops_file" || exit 46
+test -s "$veyops_file" && test "$(wc -c < "$veyops_file")" -le ${maxComposeBytes} || exit 47
+test "$(cd -P -- ${q(work)} && pwd -P)" = ${q(work)} || exit 45
+umask 077; set -C; cat -- "$veyops_file" > ${q(path)}
+test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exit 47`,
         session,
         30,
         'Compose 配置归档失败。请检查文件路径、权限和大小',
       );
-    } catch (error) {
-      if (
-        error instanceof BuildCommandError &&
-        error.exitCode === 44 &&
-        (!session.snapshot.deployAfterBuild || session.snapshot.managedCompose)
-      )
-        return;
-      throw error;
-    }
-    const directory = await mkdtemp(join(tmpdir(), 'veyops-compose-'));
-    const local = join(directory, 'compose.yaml');
-    try {
       await this.ssh.download(target, path, local, { timeout: 30, signal: session.context.signal });
       return await readComposeSnapshot(local);
+    } catch (error) {
+      if (error instanceof BuildCommandError) {
+        if (
+          error.exitCode === 44 &&
+          !source &&
+          (!session.snapshot.deployAfterBuild || session.snapshot.managedCompose)
+        )
+          return;
+        const reasons: Record<number, string> = {
+          44: '找不到 Compose 文件',
+          45: '工作目录或 Compose 文件路径无效，或超出工作区',
+          46: 'Compose 文件不是可读取的普通文件',
+          47: 'Compose 文件为空或超过 256 KiB',
+        };
+        if (reasons[error.exitCode])
+          throw new BuildCommandError(error.exitCode, reasons[error.exitCode]!);
+      }
+      throw error;
     } finally {
-      await rm(local, { force: true });
-      await rm(directory, { recursive: true, force: true });
+      await rm(localDirectory, { recursive: true, force: true });
     }
   }
   async retainRemoteArchive(

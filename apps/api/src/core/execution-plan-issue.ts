@@ -1,6 +1,11 @@
 import { HttpException } from '@nestjs/common';
 
-export interface ExecutionPlanIssue {
+export interface GraphIssueLocation {
+  fieldSection?: 'input' | 'execution' | 'output';
+  artifactField?: 'path' | 'pathInput' | 'imageReference' | 'composeFilePath' | 'referenceName';
+}
+
+export interface ExecutionPlanIssue extends GraphIssueLocation {
   code:
     | 'INPUT'
     | 'REPOSITORY'

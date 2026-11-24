@@ -162,7 +162,7 @@ class GraphShell {
 export class GraphArtifactDeclaration {
   @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) id?: string;
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
-  @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) referenceName?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(64) referenceName?: string;
   @IsIn(graphArtifactTypes) type!: GraphArtifactType;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) path?: string;
   @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) pathInput?: string;
@@ -371,6 +371,7 @@ export function runtimeGraphNode(node: GraphNode): GraphNode {
   throw new GraphCompileError({
     nodeId: node.id,
     fieldId: 'operation',
+    fieldSection: 'execution',
     message: '功能节点必须选择有效的执行方式',
   });
 }
@@ -686,22 +687,29 @@ export function annotateGraphIssue(error: unknown, flow: GraphFlow, node?: Graph
   throw error;
 }
 
-function missingNodeConfiguration(node: GraphNode): { fieldId: string; message: string }[] {
+function missingNodeConfiguration(node: GraphNode): GraphDiagnostic[] {
   if (node.type === 'BUILD')
     return (node.build?.artifacts ?? []).flatMap(({ id, name, type, path }) =>
-      type !== 'DOCKER_IMAGE' && path !== undefined && !path.trim()
-        ? [{ fieldId: id ?? name, message: `请填写「${name}」的工作区相对路径` }]
+      type !== 'DOCKER_IMAGE' && !path?.trim()
+        ? [
+            {
+              fieldId: id ?? name,
+              fieldSection: 'output',
+              artifactField: 'path',
+              message: `请填写「${name}」的工作区相对路径`,
+            },
+          ]
         : [],
     );
   if (
     (node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT') &&
     !node.deploy?.deployPath?.trim()
   )
-    return [{ fieldId: 'deployPath', message: '请填写节点的发布目录' }];
+    return [{ fieldId: 'deployPath', fieldSection: 'execution', message: '请填写节点的发布目录' }];
   if (node.type === 'HEALTH_CHECK' && !node.healthCheck?.command?.trim())
-    return [{ fieldId: 'command', message: '请填写健康检查命令' }];
+    return [{ fieldId: 'command', fieldSection: 'execution', message: '请填写健康检查命令' }];
   if ((node.type === 'SHELL' || node.type === 'CHECK') && !node.shell?.command?.trim())
-    return [{ fieldId: 'command', message: '请填写脚本或检查命令' }];
+    return [{ fieldId: 'command', fieldSection: 'execution', message: '请填写脚本或检查命令' }];
   return [];
 }
 
@@ -733,13 +741,13 @@ export function validateGraphDefinition(definition: GraphDefinition) {
         if (!definition.canvas && nodeIds.has(node.id))
           throw new BadRequestException('同一图版本中的节点 ID 必须唯一');
         nodeIds.add(node.id);
-        for (const { fieldId, message } of missingNodeConfiguration(node))
+        for (const issue of missingNodeConfiguration(node))
           issues.push({
+            ...issue,
             flowId: flow.id,
             nodeId: node.id,
-            fieldId,
             severity: 'ERROR',
-            message: `「${flow.name}」 → 「${node.name}」 · ${message}`,
+            message: `「${flow.name}」 → 「${node.name}」 · ${issue.message}`,
           });
         validateAdvancedNode(node);
         if ('delivery' in node || 'pipelineId' in node || 'pipelineVersion' in node)

@@ -24,7 +24,7 @@ import {
   type SshTarget,
 } from '../../infrastructure/ssh/ssh.service';
 import { TargetResolver } from '../command-center/target-resolver.service';
-import { BuildsService, type BuildSession } from '../builds/builds.service';
+import { BuildsService, enterSourceDirectory, type BuildSession } from '../builds/builds.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import {
   ArtifactOutputMissing,
@@ -39,6 +39,7 @@ import {
 import { PipelineDefinitionDto } from '../pipelines/pipeline.dto';
 import { PipelineExecutor } from '../pipelines/pipeline-executor.service';
 import { relativePath, shellQuote } from '../pipelines/pipeline.validation';
+import { assertGraphCompose } from '../pipelines/graph-compose';
 import { createTargetWorkspace, targetWorkspacePath } from '../pipelines/target-workspace';
 import { SystemSettingsService } from '../system/system-settings.service';
 import {
@@ -58,6 +59,7 @@ import { resolveGraphRepositorySelector } from '../projects/graph-repository-sel
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import type { CreateTaskInput, TaskExecutionContext, TaskRecord } from '../tasks/tasks.types';
 import type { GraphNode } from './execution-graph-definition';
+import type { GraphFieldEvidence } from './graph-run-bindings';
 import { graphArtifactDefinitions, graphArtifactOutputs } from './graph-artifact-values';
 import {
   graphScriptInputs,
@@ -115,7 +117,16 @@ export interface GraphNodeScope {
   nodeEnvironmentSources?: GraphVariableSource[];
   credentialNonces?: Readonly<Record<string, string>>;
   fetchModeDeferred?: boolean;
+  inputEvidence?: readonly GraphFieldEvidence[];
 }
+
+type ScriptWorkspacePlan = {
+  producerNodeId?: string;
+  producerField?: string;
+  repositoryId?: string;
+  commitSha?: string;
+  deferred: boolean;
+};
 
 export type GraphNodePlan =
   | { type: 'CHECKOUT'; source: GraphCheckoutSnapshot; fetchModeDeferred?: boolean }
@@ -130,6 +141,8 @@ export type GraphNodePlan =
       targetHash?: string;
       targetSelection?: DeploymentSelection;
       targetWorkspaceRoot?: string;
+      directory: string;
+      workspace?: ScriptWorkspacePlan;
       serviceId?: string;
       environmentId?: string;
       environment?: ExecutionVariables;
@@ -187,6 +200,19 @@ const sourceOf = (value: unknown) =>
   value && typeof value === 'object' ? (value as GraphEnvironmentSource) : undefined;
 const variablesOf = (value: unknown) =>
   value && typeof value === 'object' ? (value as GraphEnvironmentRef) : undefined;
+
+function sameSource(left: GraphEnvironmentSource, right: GraphEnvironmentSource) {
+  return left.repositoryId === right.repositoryId && left.commitSha === right.commitSha;
+}
+
+function workspaceIssue(message: string) {
+  return new ExecutionPlanIssueError({
+    code: 'INPUT',
+    fieldId: 'workspace',
+    fieldSection: 'input',
+    message,
+  });
+}
 
 export function graphCheckoutOutputs(
   snapshot: GraphCheckoutSnapshot,
@@ -590,6 +616,21 @@ export class GraphNodeTasks implements OnModuleInit {
       ...scriptInputs,
       ...(scope.nodeEnvironmentSources ?? []),
     ]);
+    const input = scope.inputEvidence?.find(({ fieldId }) => fieldId === 'workspace');
+    const workspace = sourceOf(values.workspace);
+    const source = sourceOf(values.source);
+    if (workspace?.repositoryId && source && !sameSource(workspace, source))
+      throw workspaceIssue('脚本绑定的源码与工作区来自不同 Git 提交');
+    const plannedWorkspace: ScriptWorkspacePlan | undefined =
+      workspace || input?.state === 'DEFERRED'
+        ? {
+            producerNodeId: input?.source?.nodeId,
+            producerField: input?.source?.fieldId,
+            repositoryId: workspace?.repositoryId ?? source?.repositoryId,
+            commitSha: workspace?.commitSha ?? source?.commitSha,
+            deferred: input?.state === 'DEFERRED',
+          }
+        : undefined;
     const base = {
       type: node.type,
       serviceId,
@@ -598,18 +639,43 @@ export class GraphNodeTasks implements OnModuleInit {
       configuredVariableSources: configured,
       variableSources,
       environmentFile: variableRef?.environmentFile,
+      directory: relativePath(node.shell?.directory || '.'),
+      workspace: plannedWorkspace,
     };
-    if (node.shell?.location === 'MANAGER' || !selection) return base;
-    const target = await this.targets.preview(selection);
+    if (node.shell?.location === 'MANAGER') return base;
+    const targetIssue = {
+      code: 'BUILD_TARGET',
+      fieldId: 'targets',
+      fieldSection: 'input',
+      targetSource: 'RUN_INPUT',
+    } as const;
+    const targetSelection = selection && directDeploymentSelection(selection, defaults.maxParallel);
+    if (!targetSelection) {
+      if (node.shell?.location === 'TARGET')
+        throw new ExecutionPlanIssueError({
+          ...targetIssue,
+          message: '目标端脚本或检查需要选择一台可用的服务器',
+        });
+      return base;
+    }
+    const target = await this.targets
+      .preview(targetSelection)
+      .catch((error: unknown) => withPlanIssue(error, targetIssue));
     if (target.targets.length !== 1)
-      throw new ConflictException('Shell 或检查节点必须选择一台可用的服务器');
+      throw new ExecutionPlanIssueError(
+        {
+          ...targetIssue,
+          message: '目标端脚本或检查需要选择一台可用的服务器',
+        },
+        409,
+      );
     return {
       ...base,
       serverId: target.targets[0]!.id,
       serverName: target.targets[0]!.name,
       targetHash: target.targetHash,
-      targetSelection: directDeploymentSelection(selection, defaults.maxParallel),
-      ...(graphArtifactDeclarations(node)?.length && {
+      targetSelection,
+      ...((plannedWorkspace || graphArtifactDeclarations(node)?.length) && {
         targetWorkspaceRoot: (await this.systemSettings.get(projectId)).targetWorkspaceRoot,
       }),
     };
@@ -619,6 +685,38 @@ export class GraphNodeTasks implements OnModuleInit {
     const available = await ownedGraphWorkspace(this.database.db, projectId, reference);
     await openGraphWorkspace(available);
     return available;
+  }
+
+  private async confirmedScriptWorkspace(
+    plan: ScriptWorkspacePlan | undefined,
+    workspace: GraphWorkspaceRef | undefined,
+    scope: GraphNodeScope,
+  ) {
+    if (!plan && !workspace) return;
+    if (
+      !plan ||
+      !workspace ||
+      (plan.repositoryId && plan.repositoryId !== workspace.repositoryId) ||
+      (plan.commitSha && plan.commitSha !== workspace.commitSha)
+    )
+      throw workspaceIssue('脚本实际工作区与已确认计划不一致');
+    if (!plan.producerNodeId || !plan.producerField) return;
+    const binding = scope.inputEvidence?.find(({ fieldId }) => fieldId === 'workspace')?.source;
+    if (binding?.nodeId !== plan.producerNodeId || binding.fieldId !== plan.producerField)
+      throw workspaceIssue('脚本实际工作区来源与已确认计划不一致');
+    if (binding.kind !== 'OUTPUT') return;
+    const producer = await this.database.db
+      .selectFrom('execution_node_runs')
+      .select('output_json')
+      .where('run_id', '=', scope.runId!)
+      .where('node_id', '=', plan.producerNodeId)
+      .where('status', '=', 'SUCCESS')
+      .executeTakeFirst();
+    const original = producer?.output_json
+      ? workspaceOf(JSON.parse(producer.output_json)[plan.producerField])
+      : undefined;
+    if (original?.nodeRunId !== workspace.nodeRunId || original.runId !== workspace.runId)
+      throw workspaceIssue('脚本实际工作区必须由已确认的上游节点提供');
   }
 
   private artifactTask(
@@ -713,7 +811,13 @@ export class GraphNodeTasks implements OnModuleInit {
           )
         : undefined;
     const reference = workspaceOf(values.workspace);
-    const workspace = reference ? await this.repositoryWorkspace(projectId, reference) : undefined;
+    const workspace = reference
+      ? await this.repositoryWorkspace(projectId, reference).catch((error: unknown) => {
+          if (plan.type === 'SHELL' || plan.type === 'CHECK')
+            throw workspaceIssue('绑定的工作区必须由当前项目的成功节点提供，且目录仍然有效');
+          throw error;
+        })
+      : undefined;
     const settings = { type: plan.type, ...identity, trigger: scope.trigger };
     const base: CreateTaskInput = {
       name: node.name,
@@ -839,14 +943,16 @@ export class GraphNodeTasks implements OnModuleInit {
 
     const config = node.shell;
     if (!config?.command?.trim()) throw new BadRequestException('请输入脚本命令');
-    if (workspace && plan.serverId)
-      throw new BadRequestException('管理端工作区不能直接绑定远程 Shell');
+    await this.confirmedScriptWorkspace(plan.workspace, workspace, scope);
+    const source = sourceOf(values.source);
+    if (workspace && source && !sameSource(workspace, source))
+      throw workspaceIssue('脚本实际源码与工作区来自不同 Git 提交');
     if (config.location === 'TARGET' && !plan.serverId)
       throw new BadRequestException('目标端 Shell 缺少确认的服务器');
     const targets = plan.serverId
       ? await this.targets.resolveForExecution({
           ...defaults,
-          serverIds: [plan.serverId],
+          ...(plan.targetSelection ?? { serverIds: [plan.serverId] }),
           expectedTargetHash: plan.targetHash,
           confirmed: true,
         })
@@ -882,11 +988,7 @@ export class GraphNodeTasks implements OnModuleInit {
       scope.nodeEnvironment,
       scope.credentialNonces,
     );
-    const source = values.source;
-    const commitSha =
-      source && typeof source === 'object' && 'commitSha' in source
-        ? text(source.commitSha)
-        : workspace?.commitSha;
+    const commitSha = source?.commitSha ?? workspace?.commitSha;
     const platform = {
       ...graphTriggerVariables(scope.trigger),
       ...(commitSha && { VEYOPS_GIT_COMMIT_SHA: commitSha }),
@@ -918,7 +1020,7 @@ export class GraphNodeTasks implements OnModuleInit {
           workspace: workspace ?? (!targets.length ? self : undefined),
           variables,
           variableSources,
-          targetDirectory: config.directory,
+          targetDirectory: plan.directory ?? config.directory,
           targetWorkspaceRoot: plan.targetWorkspaceRoot,
           shell: {
             command: config.command,
@@ -1066,25 +1168,37 @@ export class GraphNodeTasks implements OnModuleInit {
     const targetRunId = target && (await context.startTarget(target.id));
     const artifactSession =
       task.payload.pipeline && this.session(task, context, task.payload.pipeline, values, secrets);
+    const shellSession = this.session(task, context, snapshot, values, secrets);
     let targetWorkspace: string | undefined;
+    let sourceRoot: string | undefined;
+    let uncertainExecution = false;
     let exitCode: number | null = null;
     let declared: Record<string, unknown>;
     try {
       if (target) {
+        const relativeDirectory = relativePath(module.targetDirectory || '.');
         let directory = module.targetDirectory
           ? 'cd -P -- ' + shellQuote(relativePath(module.targetDirectory)) + ' || exit $?\n'
           : '';
-        if (artifactSession) {
+        if (module.workspace || artifactSession) {
           if (!module.targetWorkspaceRoot) throw new ConflictException('缺少已确认的脚本工作目录');
           const name = 'veyops-script-' + task.id;
           const workspaceReceipt = await this.builds.remoteCapture(
             target,
             createTargetWorkspace(module.targetWorkspaceRoot, name),
-            artifactSession,
+            shellSession,
             30,
           );
           targetWorkspace = targetWorkspacePath(workspaceReceipt, name);
-          directory = `cd -P -- ${shellQuote(targetWorkspace)} || exit $?\n${directory}case "$(pwd -P)" in ${shellQuote(targetWorkspace)}|${shellQuote(targetWorkspace)}/*) ;; *) exit 45 ;; esac\n`;
+          if (module.workspace)
+            await this.builds.transferGraphWorkspace(
+              target,
+              targetWorkspace,
+              shellSession,
+              module.workspace,
+            );
+          sourceRoot = module.workspace ? targetWorkspace + '/repo' : targetWorkspace;
+          directory = enterSourceDirectory(sourceRoot, relativeDirectory, !module.workspace) + '\n';
         }
         const result = await this.ssh.execute(target, directory + shell.command, {
           timeout: shell.timeout,
@@ -1100,7 +1214,7 @@ export class GraphNodeTasks implements OnModuleInit {
           createGraphWorkspace(module.workspace!),
         );
         const result = await this.builds.managerGraphShell(
-          this.session(task, context, snapshot, values, secrets),
+          shellSession,
           workspace,
           shell.command,
           module.targetDirectory ?? '.',
@@ -1136,13 +1250,14 @@ export class GraphNodeTasks implements OnModuleInit {
           message: '脚本输出的项目服务不存在、已归档或不属于当前项目',
         });
       if (artifactSession) {
-        if (target && targetWorkspace)
-          await this.collectTargetArtifacts(artifactSession, target, targetWorkspace);
+        if (target && targetWorkspace && sourceRoot)
+          await this.collectTargetArtifacts(artifactSession, target, targetWorkspace, sourceRoot);
         else if (module.workspace)
           await this.collectManagerArtifacts(artifactSession, module.workspace);
       }
     } catch (error) {
       output.finish();
+      uncertainExecution = error instanceof SshExecutionError && error.kind === 'NEEDS_ATTENTION';
       if (targetRunId)
         await context.finishTarget(
           targetRunId,
@@ -1152,7 +1267,7 @@ export class GraphNodeTasks implements OnModuleInit {
         );
       throw error;
     } finally {
-      if (target && targetWorkspace) {
+      if (target && targetWorkspace && !uncertainExecution) {
         const work = shellQuote(targetWorkspace);
         try {
           const cleanup = await this.ssh.execute(
@@ -1165,6 +1280,8 @@ export class GraphNodeTasks implements OnModuleInit {
           context.log('脚本临时工作目录清理失败\n', target.id);
         }
       }
+      if (target && targetWorkspace && uncertainExecution)
+        context.log('远程执行结果待核查，保留本次脚本工作目录\n', target.id);
     }
     if (targetRunId)
       await context.finishTarget(
@@ -1213,6 +1330,7 @@ export class GraphNodeTasks implements OnModuleInit {
     session: BuildSession,
     target: SshTarget,
     workspace: string,
+    sourceRoot: string,
   ) {
     const { snapshot, context } = session;
     for (const declaration of snapshot.definition.artifacts ?? []) {
@@ -1228,7 +1346,7 @@ export class GraphNodeTasks implements OnModuleInit {
               })
             : await this.physical.collectServerPath({
                 target,
-                workspace,
+                workspace: sourceRoot,
                 relativePath: posix.join(
                   snapshot.definition.repoPath,
                   relativePath(declaration.path!),
@@ -1237,6 +1355,33 @@ export class GraphNodeTasks implements OnModuleInit {
                 instanceId: artifactIdentity(snapshot, declaration.name, target.id).instanceId,
                 signal: context.signal,
               });
+        let composeYaml: string | undefined;
+        if (image && declaration.composeFilePath) {
+          const directory = snapshot.definition.repoPath;
+          const file = declaration.composeFilePath;
+          try {
+            composeYaml = await this.builds.remoteComposeSnapshot(target, workspace, session, {
+              root: sourceRoot,
+              directory,
+              path: file,
+            });
+            if (!composeYaml) throw new Error('无法读取 Compose 文件');
+            assertGraphCompose(composeYaml);
+          } catch (error) {
+            if (
+              context.signal.aborted ||
+              (error instanceof SshExecutionError && error.kind !== 'FAILED')
+            )
+              throw error;
+            throw new ExecutionPlanIssueError({
+              code: 'ARTIFACT',
+              fieldSection: 'output',
+              fieldId: declaration.name,
+              artifactField: 'composeFilePath',
+              message: `产物「${declaration.name}」的 Compose 文件「${posix.join(directory, file)}」归档失败：${error instanceof Error ? error.message : '文件不可用'}`,
+            });
+          }
+        }
         await this.artifacts.create(snapshot, {
           name: declaration.name,
           kind: declaration.type,
@@ -1248,6 +1393,7 @@ export class GraphNodeTasks implements OnModuleInit {
           imageId: physical.imageId,
           checksum: physical.sha256,
           sizeBytes: physical.sizeBytes,
+          composeYaml,
           persist: declaration.persist,
         });
         context.log('已登记产物 ' + declaration.name + '\n', target.id);

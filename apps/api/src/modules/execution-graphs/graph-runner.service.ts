@@ -1375,6 +1375,8 @@ export class GraphRunnerService implements OnModuleInit {
       serverName?: string;
       serviceId?: string;
       environmentId?: string;
+      directory: string;
+      workspace?: Extract<GraphNodePlan, { type: 'SHELL' | 'CHECK' }>['workspace'];
     }[] = [];
     const publishedDeliveries: Delivery[] = [];
     const plannedServices = new Set<string>();
@@ -1645,6 +1647,7 @@ export class GraphRunnerService implements OnModuleInit {
               environmentSet: environmentSet ?? null,
               parameters: args.parameters,
               values,
+              inputEvidence: input.evidence,
               trigger,
               fetchModeDeferred: input.evidence.some(
                 ({ fieldId, state }) => fieldId === 'fetchMode' && state === 'DEFERRED',
@@ -1754,6 +1757,8 @@ export class GraphRunnerService implements OnModuleInit {
               serverName: plan.serverName,
               serviceId: plan.serviceId,
               environmentId: plan.environmentId,
+              directory: plan.directory,
+              workspace: plan.workspace,
             });
           }
         } else if (child) {
@@ -1873,6 +1878,7 @@ export class GraphRunnerService implements OnModuleInit {
         ]),
         repositoryIds: unique([
           ...checkoutRows.map(({ repositoryId }) => repositoryId),
+          ...scripts.map(({ workspace }) => workspace?.repositoryId),
           ...environmentFiles.map((file) =>
             'repositoryId' in file ? file.repositoryId : undefined,
           ),
@@ -1967,8 +1973,11 @@ export class GraphRunnerService implements OnModuleInit {
     for (const { flowId, nodeId, plan } of scriptsPrepared) {
       if (plan.type !== 'SHELL' && plan.type !== 'CHECK') continue;
       section(flowId, nodeId, '执行目标及成员', [plan.serverId, plan.serverName, plan.targetHash]);
-      if (plan.targetWorkspaceRoot)
-        section(flowId, nodeId, '目标端脚本工作目录', plan.targetWorkspaceRoot);
+      section(flowId, nodeId, '脚本工作区和执行目录', [
+        plan.workspace,
+        plan.directory,
+        plan.targetWorkspaceRoot,
+      ]);
       section(flowId, nodeId, '变量及其来源', [
         plan.variableSources,
         createHmac('sha256', encryptionKey())
@@ -3215,6 +3224,9 @@ export class GraphRunnerService implements OnModuleInit {
         serviceId: referenceId(values.service) ?? scope.serviceId,
         environmentId: referenceId(values.environment) ?? scope.environmentId,
         values,
+        inputEvidence: row.evidence_json
+          ? (JSON.parse(row.evidence_json) as NodeEvidence).inputs
+          : undefined,
         credentialNonces: snapshot.credentials,
         nodeEnvironment: environment.variables,
         nodeEnvironmentSources: environment.sources,

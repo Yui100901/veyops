@@ -221,7 +221,10 @@ async function checkDelivery(databaseUrl?: string) {
         if (destination.endsWith('/compose.yaml')) composeUploads.push(contents);
       },
       download: async (_target: unknown, source: string, destination: string) => {
-        await writeFile(destination, source.endsWith('/compose.snapshot.yaml') ? compose : archive);
+        await writeFile(
+          destination,
+          /\/compose-[0-9a-f-]+\.snapshot\.yaml$/.test(source) ? compose : archive,
+        );
       },
     })
     .overrideProvider(RepositoryMetadataService)
@@ -2139,29 +2142,37 @@ async function checkDelivery(databaseUrl?: string) {
       .where('id', '=', buildTask.taskId)
       .executeTakeFirstOrThrow();
     const snapshot = (JSON.parse(payload) as { pipeline: PipelineSnapshot }).pipeline;
-    const imported = await app.get(ArtifactsService).create(
-      {
-        ...snapshot,
-        definition: {
-          ...snapshot.definition,
-          artifacts: [
-            {
-              name: 'imported',
-              type: 'DOCKER_IMAGE',
-              imageReference: 'fixture/test@' + imageDigest,
-            },
-          ],
-        },
+    const importedSnapshot: PipelineSnapshot = {
+      ...snapshot,
+      definition: {
+        ...snapshot.definition,
+        artifacts: [
+          {
+            name: 'imported',
+            type: 'DOCKER_IMAGE',
+            imageReference: 'fixture/test@' + imageDigest,
+          },
+        ],
       },
-      {
-        name: 'imported',
-        kind: 'DOCKER_IMAGE',
-        storageType: 'LOCAL_IMAGE',
-        imageReference: 'fixture/test:local',
-        imageId,
-        storageKey: produced.storageKey,
-      },
-    );
+    };
+    const imageArtifact = {
+      name: 'imported',
+      kind: 'DOCKER_IMAGE',
+      storageType: 'LOCAL_IMAGE',
+      imageReference: 'fixture/test:local',
+      imageId,
+      storageKey: produced.storageKey,
+      composeYaml: compose,
+    } as const;
+    const artifactsService = app.get(ArtifactsService);
+    const imported = await artifactsService.create(importedSnapshot, imageArtifact);
+    assert.equal((await artifactsService.create(importedSnapshot, imageArtifact)).id, imported.id);
+    for (const composeYaml of [undefined, compose + '# changed']) {
+      await assert.rejects(
+        artifactsService.create(importedSnapshot, { ...imageArtifact, composeYaml }),
+        /Compose 归档与本次恢复不一致/,
+      );
+    }
     const [importedRecord] = await list('/artifacts', {
       projectId: project.id,
       recordId: imported.id,
