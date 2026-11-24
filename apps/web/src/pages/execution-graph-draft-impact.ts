@@ -166,7 +166,8 @@ function fieldContracts(fields: readonly GraphField[] = []) {
 }
 
 function nodeContract(node: GraphNode) {
-  const artifacts = node.build?.artifacts ?? node.registerArtifacts?.artifacts ?? [];
+  const artifacts =
+    node.build?.artifacts ?? node.shell?.artifacts ?? node.registerArtifacts?.artifacts ?? [];
   return JSON.stringify([
     effectiveNodeType(node),
     node.moduleId,
@@ -177,7 +178,17 @@ function nodeContract(node: GraphNode) {
     node.shell?.location,
     node.build?.buildLocation,
     node.build?.dependencies ?? [],
-    artifacts.map(({ name, type, required, persist }) => [name, type, required, persist]),
+    artifacts.map((artifact) => [
+      artifact.id ?? artifact.name,
+      artifact.type,
+      artifact.referenceName,
+      artifact.required !== false,
+      artifact.persist !== false,
+      artifact.path,
+      artifact.pathInput,
+      artifact.imageReference,
+      artifact.composeFilePath,
+    ]),
     node.approval?.buildNodeId,
     node.approval?.releaseNodeId,
     node.switch?.cases,
