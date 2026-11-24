@@ -259,14 +259,6 @@ export interface ProjectAddressesTable {
   description: Generated<string>;
 }
 
-export interface ProjectDependenciesTable {
-  id: string;
-  project_id: string;
-  depends_on_project_id: string;
-  dependency_type: Generated<string>;
-  description: Generated<string>;
-}
-
 export interface PipelinesTable {
   id: string;
   project_id: string;
@@ -954,7 +946,6 @@ export interface Database {
   environment_variables: EnvironmentVariablesTable;
   service_environment_variables: ServiceEnvironmentVariablesTable;
   project_addresses: ProjectAddressesTable;
-  project_dependencies: ProjectDependenciesTable;
   pipelines: PipelinesTable;
   pipeline_versions: PipelineVersionsTable;
   pipeline_webhooks: PipelineWebhooksTable;

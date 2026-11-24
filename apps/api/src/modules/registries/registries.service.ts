@@ -23,7 +23,7 @@ import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { CredentialsService } from '../credentials/credentials.service';
 import { checkRegistryConnection, registryAddress } from './registry-connection';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import { assertProjectResourceRemovable } from '../projects/project-resource-protection';
 
 class RegistryDto {

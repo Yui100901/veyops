@@ -38,7 +38,7 @@ import { SshHostKeyMismatchError, SshService } from '../../infrastructure/ssh/ss
 import { summarizeProbe } from '../../infrastructure/ssh/server-probe';
 import { compareServerConfigurations } from './configuration-comparison';
 import { recentDeployments } from '../deployments/deployment-history';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import { assertProjectResourceRemovable } from '../projects/project-resource-protection';
 import { targetProjectReferences } from '../projects/project-resource-references';
 import type { Selectable } from 'kysely';

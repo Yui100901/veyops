@@ -115,8 +115,6 @@ async function checkResources(databaseUrl?: string) {
 
     const project = await create('/projects', { name: 'Fixture A', slug: 'fixture-a' });
     const peer = await create('/projects', { name: 'Fixture B', slug: 'fixture-b' });
-    const third = await create('/projects', { name: 'Fixture C', slug: 'fixture-c' });
-    const fourth = await create('/projects', { name: 'Fixture D', slug: 'fixture-d' });
     const root = '/projects/' + project.id;
     const service = await create(root + '/services', { name: 'Service', slug: 'service' });
     const environment = await create(root + '/environments', { name: 'Test', slug: 'test' });
@@ -455,34 +453,37 @@ async function checkResources(databaseUrl?: string) {
       ),
     );
 
-    const dependency = await create(root + '/dependencies', { dependsOnProjectId: peer.id });
-    assert.deepEqual((await fetch('/projects/' + peer.id)).dependents, [
-      {
-        id: dependency.id,
-        projectId: project.id,
-        projectName: 'Fixture A',
-        dependencyType: 'RUNTIME',
-        description: '',
-      },
-    ]);
-    await create('/projects/' + peer.id + '/dependencies', {
-      dependsOnProjectId: third.id,
-      dependencyType: 'DEPLOYMENT',
-    });
+    const detail = await fetch(root);
+    assert.equal('dependencies' in detail, false);
+    assert.equal('dependents' in detail, false);
+    const removedRoute = base + root + '/dependencies';
+    await api.post(removedRoute).send({ dependsOnProjectId: peer.id }).expect(404);
     await api
-      .post(base + '/projects/' + third.id + '/dependencies')
-      .send({ dependsOnProjectId: project.id })
-      .expect(409);
-    await api.delete(base + '/projects/' + peer.id).expect(409);
-    const reciprocal = await Promise.all([
-      api.post(base + root + '/dependencies').send({ dependsOnProjectId: fourth.id }),
-      api
-        .post(base + '/projects/' + fourth.id + '/dependencies')
-        .send({ dependsOnProjectId: project.id }),
-    ]);
-    assert.deepEqual(reciprocal.map((response) => response.status).sort(), [201, 409]);
+      .patch(removedRoute + '/' + peer.id)
+      .send({ dependsOnProjectId: peer.id })
+      .expect(404);
+    await api.delete(removedRoute + '/' + peer.id).expect(404);
+    const peerPath = base + '/projects/' + peer.id;
+    await api.delete(peerPath).expect(200);
+    await api.get(peerPath).expect(404);
     assert.ok(
-      (await fetch(root)).dependencies.some((row: { id: string }) => row.id === dependency.id),
+      (
+        await db
+          .selectFrom('projects')
+          .select('deleted_at')
+          .where('id', '=', peer.id)
+          .executeTakeFirstOrThrow()
+      ).deleted_at,
+    );
+    assert.equal(
+      (
+        await db
+          .selectFrom('services')
+          .select('project_id')
+          .where('id', '=', otherService.id)
+          .executeTakeFirstOrThrow()
+      ).project_id,
+      peer.id,
     );
     const pipeline = await create('/pipelines', {
       name: 'Test Pipeline',
@@ -520,7 +521,7 @@ test('SQLite resource management enforces ownership and preserves referenced res
   checkResources());
 const postgres = process.env.VEYOPS_TEST_POSTGRES_URL;
 test(
-  'PostgreSQL resource management serializes dependency changes and preserves references',
+  'PostgreSQL resource management enforces ownership and preserves referenced resources',
   { skip: !postgres },
   () => withIsolatedPostgres(postgres!, checkResources),
 );

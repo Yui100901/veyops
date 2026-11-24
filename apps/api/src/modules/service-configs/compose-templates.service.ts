@@ -18,7 +18,7 @@ import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import {
   activeComposeRevision,
   composeChecksum,

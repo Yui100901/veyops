@@ -32,7 +32,7 @@ import type { EnvironmentSetSummary } from '../projects/environment-sets.service
 import { storedDeploymentSelection } from '../deployment-targets/deployment-selection';
 import { archiveKey, isLocalImage } from './artifact-availability';
 import { ArtifactFilters } from '../projects/delivery-filters';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';

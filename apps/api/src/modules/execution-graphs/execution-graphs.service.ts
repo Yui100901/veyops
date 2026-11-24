@@ -4,7 +4,7 @@ import type { Kysely, Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
-import { lockProjectGraph, requireProject } from '../projects/project-relations';
+import { lockProjectGraph, requireProject } from '../projects/project-guards';
 import { graphResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
 import {

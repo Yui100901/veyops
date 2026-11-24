@@ -25,7 +25,7 @@ import { pendingReleaseApprovalTime, serviceReleasePolicy } from '../deployments
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
 import { storeDeliveryProfile } from '../pipelines/delivery-execution-profile';
 import { isStandaloneGraphBuild } from '../pipelines/pipeline.types';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import { taskPayloadResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
 

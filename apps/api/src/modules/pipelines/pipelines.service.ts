@@ -89,7 +89,7 @@ import {
   managedComposeReference,
   readManagedCompose,
 } from '../service-configs/compose-template-reference';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import type { GraphReleaseGate } from '../execution-graphs/graph-release-gates';
 import { graphComposeProject, graphRollbackBaselines } from './graph-release-context';
 import { assertGraphCompose } from './graph-compose';

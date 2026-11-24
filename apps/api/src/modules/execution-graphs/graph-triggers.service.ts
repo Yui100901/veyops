@@ -20,7 +20,7 @@ import {
   upcomingTimes,
 } from '../operation-schedules/operation-schedule-time';
 import type { ScheduleTiming } from '../operation-schedules/operation-schedule-time';
-import { lockProjectGraph, requireProject } from '../projects/project-relations';
+import { lockProjectGraph, requireProject } from '../projects/project-guards';
 import { graphTriggerReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';

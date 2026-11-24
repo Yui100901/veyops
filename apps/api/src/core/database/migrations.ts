@@ -2041,6 +2041,15 @@ export const migrationProvider: MigrationProvider = {
           await db.schema.alterTable('users').dropColumn('password_change_recommended').execute();
         },
       } satisfies Migration,
+      '035_remove_project_dependencies': {
+        async up(db) {
+          await db.schema.dropTable('project_dependencies').execute();
+        },
+        async down(db) {
+          const legacy = tables.find((table) => table.name === 'project_dependencies')!;
+          await createTables(db, [legacy], []);
+        },
+      } satisfies Migration,
     };
   },
 };

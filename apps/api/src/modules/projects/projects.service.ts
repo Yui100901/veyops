@@ -66,12 +66,7 @@ import {
   type DeploymentSelection,
 } from '../deployment-targets/deployment-selection';
 import { SystemSettingsService } from '../system/system-settings.service';
-import {
-  lockProjectGraph,
-  ProjectRelationsController,
-  ProjectRelationsService,
-  requireProject,
-} from './project-relations';
+import { lockProjectGraph, requireProject } from './project-guards';
 import {
   branchCache,
   httpCloneUrl,
@@ -166,7 +161,6 @@ export class ProjectsService {
   constructor(
     private readonly database: DatabaseService,
     private readonly audit: AuditService,
-    private readonly relations: ProjectRelationsService,
     private readonly metadata: RepositoryMetadataService,
     private readonly settings: SystemSettingsService,
   ) {}
@@ -293,9 +287,7 @@ export class ProjectsService {
   async detail(id: string) {
     const project = await this.get(id);
     const db = this.database.db;
-    const [dependencies, dependents, deploymentRows, deployments] = await Promise.all([
-      this.relations.dependencies(id),
-      this.relations.dependents(id),
+    const [deploymentRows, deployments] = await Promise.all([
       db
         .selectFrom('deployment_targets as targets')
         .leftJoin('deployment_target_servers as members', 'members.target_id', 'targets.id')
@@ -334,8 +326,6 @@ export class ProjectsService {
     }
     return {
       ...project,
-      dependencies,
-      dependents,
       deploymentTargets: [...deploymentTargets.values()],
       recentDeployments: deployments,
     };
@@ -520,14 +510,6 @@ export class ProjectsService {
     await this.database.db.transaction().execute(async (tx) => {
       await lockProjectGraph(tx);
       await requireProject(tx, id);
-      const dependent = await tx
-        .selectFrom('project_dependencies as dependencies')
-        .innerJoin('projects', 'projects.id', 'dependencies.project_id')
-        .select('dependencies.id')
-        .where('dependencies.depends_on_project_id', '=', id)
-        .where('projects.deleted_at', 'is', null)
-        .executeTakeFirst();
-      if (dependent) throw new ConflictException('项目仍被其他项目依赖，请先移除依赖');
       await tx
         .updateTable('projects')
         .set({ deleted_at: Date.now(), updated_at: Date.now() })
@@ -987,8 +969,8 @@ class ProjectsController {
 }
 @Global()
 @Module({
-  controllers: [ProjectsController, RepositoryMetadataController, ProjectRelationsController],
-  providers: [ProjectsService, RepositoryMetadataService, ProjectRelationsService],
+  controllers: [ProjectsController, RepositoryMetadataController],
+  providers: [ProjectsService, RepositoryMetadataService],
   exports: [ProjectsService, RepositoryMetadataService],
 })
 export class ProjectsModule {}

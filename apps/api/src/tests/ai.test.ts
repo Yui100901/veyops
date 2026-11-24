@@ -23,7 +23,6 @@ import {
 } from '../infrastructure/ai-provider/openai-compatible.service';
 import { ProjectsService } from '../modules/projects/projects.service';
 import { RepositoryMetadataService } from '../modules/projects/repository-metadata.service';
-import { ProjectRelationsService } from '../modules/projects/project-relations';
 import { SystemSettingsService } from '../modules/system/system-settings.service';
 import { ServersService } from '../modules/servers/servers.service';
 import { TasksService } from '../modules/tasks/tasks.service';
@@ -76,7 +75,6 @@ async function fixture() {
   const projects = new ProjectsService(
     database,
     audit,
-    new ProjectRelationsService(database, audit),
     new RepositoryMetadataService(database, credentials),
     new SystemSettingsService(database, audit),
   );

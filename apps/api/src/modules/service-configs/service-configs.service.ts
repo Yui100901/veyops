@@ -53,7 +53,7 @@ import { SystemSettingsService } from '../system/system-settings.service';
 import { readReleasePolicy } from '../deployments/release-policy';
 import type { ReleasePolicy } from '../pipelines/pipeline.types';
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import { unavailableReference } from '../projects/project-resource-protection';
 import {
   CredentialsService,

@@ -18,7 +18,7 @@ import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import { redactTaskLog } from '../tasks/task-log.service';
 import { serviceReleasePolicy } from './release-policy';
 import {

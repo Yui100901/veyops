@@ -9,7 +9,7 @@ import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
 import { archiveKey, lockAvailableArtifacts } from './artifact-availability';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import {
   archivePeers,
   ArtifactCleanupService,

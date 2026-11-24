@@ -29,7 +29,7 @@ import { DatabaseService } from '../../core/database/database.service';
 import { ServersService } from '../servers/servers.service';
 import { AuditService } from '../audit/audit.service';
 import { SystemSettingsService } from '../system/system-settings.service';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import {
   assertProjectResourceRemovable,
   ResourceReferenceConflict,

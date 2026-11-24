@@ -52,6 +52,19 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
     })
     .execute();
   await db
+    .insertInto('projects')
+    .values({
+      id: 'legacy-dependent-project',
+      name: 'Legacy dependent project',
+      slug: 'legacy-dependent',
+      created_by: 'existing-user',
+      created_at: now,
+      updated_at: now,
+    })
+    .execute();
+  await sql`insert into project_dependencies (id, project_id, depends_on_project_id)
+    values ('legacy-dependency', 'legacy-dependent-project', 'project')`.execute(db);
+  await db
     .insertInto('artifacts')
     .values({
       id: 'artifact',
@@ -220,6 +233,14 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
     values ('legacy-variable', 'legacy-config', 'LEGACY_VALUE', 'kept')`.execute(db);
   const graphUpgrade = await migrator.migrateToLatest();
   assert.ifError(graphUpgrade.error);
+  assert.equal(
+    (await db.introspection.getTables()).some(({ name }) => name === 'project_dependencies'),
+    false,
+  );
+  assert.deepEqual(await db.selectFrom('projects').select('id').orderBy('id').execute(), [
+    { id: 'legacy-dependent-project' },
+    { id: 'project' },
+  ]);
   assert.deepEqual(
     await db
       .selectFrom('service_environment_variables')
@@ -500,6 +521,7 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
   );
   const rollback = await migrator.migrateTo('001_initial');
   assert.ifError(rollback.error);
+  assert.deepEqual((await sql`select id from project_dependencies`.execute(db)).rows, []);
   assert.deepEqual(await db.selectFrom('tasks').select(['id', 'status']).orderBy('id').execute(), [
     { id: 'DEPLOY', status: 'PENDING' },
     { id: 'DEPLOY_ARTIFACT', status: 'CANCELLED' },

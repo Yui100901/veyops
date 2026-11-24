@@ -9,7 +9,7 @@ import type { PipelineDefinition } from '../pipelines/pipeline.types';
 import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
 import type { TaskPayload } from '../tasks/tasks.types';
 import type { AiContextDto, AiPolicyDto, AiRoutesDto } from './ai.dto';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 
 const contextRole = 'PAGE_CONTEXT';
 

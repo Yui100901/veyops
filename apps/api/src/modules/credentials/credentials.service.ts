@@ -25,7 +25,7 @@ import type { AuthRequest } from '../auth/auth.guard';
 import { AuditService } from '../audit/audit.service';
 import { pipelineNodeSecrets } from '../pipelines/pipeline-node-config';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import {
   assertProjectResourceRemovable,
   ResourceReferenceConflict,

@@ -27,7 +27,7 @@ import { ServersService } from './servers.service';
 import { AuditService } from '../audit/audit.service';
 import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import { targetProjectReferences } from '../projects/project-resource-references';
 import {
   assertProjectResourceRemovable,

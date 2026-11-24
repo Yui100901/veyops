@@ -18,7 +18,7 @@ import { TasksService } from '../tasks/tasks.service';
 import type { TaskPayload } from '../tasks/tasks.types';
 import { DeploymentsService } from './deployments.service';
 import { DeliveryRecordFilters } from '../projects/delivery-filters';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import type { ComposeReleaseEvidence } from '../service-configs/compose-template-reference';
 import {
   assertCurrentTargets,

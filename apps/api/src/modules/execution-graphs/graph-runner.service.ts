@@ -35,7 +35,7 @@ import { pendingReleaseApprovalTime } from '../deployments/release-policy';
 import { SourceReviewConflict } from '../deployments/release-source-policy';
 import type { ComposeTemplateReference } from '../service-configs/compose-template-reference';
 import type { SourceReviewProof } from '../deployments/source-review.service';
-import { lockProjectGraph, requireProject } from '../projects/project-relations';
+import { lockProjectGraph, requireProject } from '../projects/project-guards';
 import { runResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
 import {

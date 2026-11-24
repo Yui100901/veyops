@@ -38,7 +38,7 @@ import {
   variableCredentialType,
   variableCredentialValue,
 } from '../credentials/credentials.service';
-import { lockProjectGraph, requireProject } from './project-relations';
+import { lockProjectGraph, requireProject } from './project-guards';
 
 const externalCredentialTypes = ['API_KEY', 'API_SECRET', 'CUSTOM_SECRET', 'USERNAME_PASSWORD'];
 const credentialTypes = [variableCredentialType, ...externalCredentialTypes];

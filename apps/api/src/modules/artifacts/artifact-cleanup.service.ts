@@ -17,7 +17,7 @@ import type {
   Database,
 } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
-import { lockProjectGraph } from '../projects/project-relations';
+import { lockProjectGraph } from '../projects/project-guards';
 import { archiveKey, lockAvailableArtifacts } from './artifact-availability';
 import {
   activeArtifactTaskStatuses,

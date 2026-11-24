@@ -10,7 +10,7 @@ import { DatabaseService } from '../../core/database/database.service';
 import { initialGraphDraft } from '../../core/database/execution-graphs-migration';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
-import { lockProjectGraph, requireProject } from '../projects/project-relations';
+import { lockProjectGraph, requireProject } from '../projects/project-guards';
 import { graphResourceReferences } from '../projects/project-resource-extraction';
 import { unavailableReference } from '../projects/project-resource-protection';
 import { redactTaskLog } from '../tasks/task-log.service';
