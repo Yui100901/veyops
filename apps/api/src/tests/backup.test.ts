@@ -14,8 +14,11 @@ import { AuditService } from '../modules/audit/audit.service';
 import { CredentialsService } from '../modules/credentials/credentials.service';
 import { ExecutionGraphsService } from '../modules/execution-graphs/execution-graphs.service';
 import { GraphRunnerService } from '../modules/execution-graphs/graph-runner.service';
+import { GraphTriggersService } from '../modules/execution-graphs/graph-triggers.service';
 import type { GraphDefinition } from '../modules/execution-graphs/execution-graph-definition';
 import { PipelinesService } from '../modules/pipelines/pipelines.service';
+import { RepositoryMetadataService } from '../modules/projects/repository-metadata.service';
+import { TaskHandlerRegistry } from '../modules/tasks/task-handler.registry';
 import {
   createPostgresService,
   postgresTestUrl,
@@ -85,8 +88,12 @@ async function withGraphServices(
     providers: [
       ExecutionGraphsService,
       GraphRunnerService,
+      GraphTriggersService,
+      TaskHandlerRegistry,
       AuditService,
       { provide: DatabaseService, useValue: { db: database.db } },
+      { provide: CredentialsService, useValue: {} },
+      { provide: RepositoryMetadataService, useValue: {} },
       // This fixture uses only local log nodes; a delivery task must never be submitted.
       { provide: PipelinesService, useValue: {} },
     ],

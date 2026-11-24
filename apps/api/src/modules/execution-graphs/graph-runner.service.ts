@@ -1202,6 +1202,7 @@ export class GraphRunnerService implements OnModuleInit {
         profile.id,
         { ...base, artifactIds: ids },
         profile,
+        automation,
       );
       const wrapped = wrap(preview, profile);
       const archives = refs.flatMap((ref) => (ref.composeTemplate ? [ref.composeTemplate] : []));
@@ -1273,6 +1274,7 @@ export class GraphRunnerService implements OnModuleInit {
           commitSha: producer.commitSha,
         },
         profile,
+        automation,
       );
       const missingTarget =
         producer.serverIds?.length &&

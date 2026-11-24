@@ -205,6 +205,14 @@ async function checkTypedRuns(url?: string) {
         .expect(200);
       return post(graph + '/publish', { expectedRevision: draft.body.data.revision });
     };
+    await api
+      .patch(prefix + triggerPath + '/' + configured.id)
+      .send({
+        ...rule,
+        enabled: false,
+        parameterMappings: { choice: { source: 'EVENT', field: 'ref' } },
+      })
+      .expect(200);
     const deferred = await publish(deferredDefinition);
     const deferredFlow = graph + '/flows/entry';
     const deferredArgs = { version: deferred.publishedVersion };

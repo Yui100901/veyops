@@ -8,6 +8,7 @@ import test, { type TestContext } from 'node:test';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import { ExecutionPlanIssueError } from '../core/execution-plan-issue';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
 
 async function checkPlan(t: TestContext, url?: string) {
@@ -25,6 +26,7 @@ async function checkPlan(t: TestContext, url?: string) {
   });
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
+  const { BuildsService } = await import('../modules/builds/builds.service.js');
   const { GraphRunnerService } =
     await import('../modules/execution-graphs/graph-runner.service.js');
   const { RepositoryMetadataService } =
@@ -324,16 +326,41 @@ async function checkPlan(t: TestContext, url?: string) {
         /API 尚未放行/,
       );
       process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = 'API';
-      const automaticPlan = await runner.preview(project.id, 'combined', args(env.id), {
+      await assert.rejects(
+        runner.preview(project.id, 'combined', args(env.id), { automation }),
+        (error: unknown) =>
+          error instanceof ExecutionPlanIssueError &&
+          error.issue.nodeId === 'combined-build' &&
+          /自动构建不能使用.*敏感变量/.test(error.message),
+      );
+      const isolated = t.mock.method(
+        BuildsService,
+        'automaticManagerSocket',
+        async () => '/run/user/1000/fixture-docker.sock',
+      );
+      const cleanPlan = await create(combined + '/preview', args(empty.id));
+      await assert.rejects(
+        runner.preview(project.id, 'combined', args(empty.id), { automation }),
+        (error: unknown) =>
+          error instanceof ExecutionPlanIssueError &&
+          error.issue.nodeId === 'release' &&
+          /缺少有效的自动执行授权/.test(error.message),
+      );
+      await api
+        .patch(base + '/servers/' + first.id + '/automatic-execution')
+        .send({ enabled: true })
+        .expect(200);
+      const automaticPlan = await runner.preview(project.id, 'combined', args(empty.id), {
         automation,
       });
+      isolated.mock.restore();
       assert.ok(
         automaticPlan.gates.some(
           ({ nodeId, kind, releaseNodeId }) =>
             nodeId === 'approve-release' && kind === 'APPROVAL' && releaseNodeId === 'release',
         ),
       );
-      assert.deepEqual(automaticPlan.executionPlan.targets, defaultPlan.executionPlan.targets);
+      assert.deepEqual(automaticPlan.executionPlan.targets, cleanPlan.executionPlan.targets);
     } finally {
       if (previous === undefined) delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
       else process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = previous;

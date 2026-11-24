@@ -1631,6 +1631,7 @@ export class PipelinesService implements OnModuleInit {
     id: string,
     input: ArtifactDeployPreviewDto,
     profile?: DeliveryExecutionProfile,
+    automation?: GraphAutomation,
   ) {
     const {
       p,
@@ -1642,6 +1643,7 @@ export class PipelinesService implements OnModuleInit {
       artifactDetails,
       targets,
     } = await this.prepareArtifactDeploy(id, input, profile);
+    this.assertAutomaticReleaseVariables(automation, p.env.secretVariables);
     return {
       pipelineId: id,
       projectId: p.pipeline.projectId,
@@ -1674,6 +1676,7 @@ export class PipelinesService implements OnModuleInit {
     id: string,
     input: Omit<ArtifactDeployPreviewDto, 'artifactIds'> & { commitSha: string },
     profile?: DeliveryExecutionProfile,
+    automation?: GraphAutomation,
   ) {
     const p = await this.prepare(
       id,
@@ -1682,6 +1685,7 @@ export class PipelinesService implements OnModuleInit {
       undefined,
       profile,
     );
+    this.assertAutomaticReleaseVariables(automation, p.env.secretVariables);
     const requireCodeReview = Boolean(p.env.config?.releasePolicy?.requireCodeReview);
     if (requireCodeReview && !this.sourceReviews)
       throw new SourceReviewConflict('代码审核服务不可用');
@@ -1699,6 +1703,14 @@ export class PipelinesService implements OnModuleInit {
       rollbackBaseline: p.rollbackBaseline,
       executionConfiguration: this.executionConfiguration(p),
     };
+  }
+
+  private assertAutomaticReleaseVariables(
+    automation: GraphAutomation | undefined,
+    secretVariables: object,
+  ) {
+    if (automation && Object.keys(secretVariables).length)
+      throw new BadRequestException('自动发布不能使用敏感环境变量');
   }
 
   async deployArtifact(
@@ -1726,8 +1738,7 @@ export class PipelinesService implements OnModuleInit {
     )
       throw new ConflictException('产物、执行目标或配置已变化，请重新确认');
     const automation = options.graphAutomation;
-    if (automation && Object.keys(p.env.secretVariables).length)
-      throw new BadRequestException('自动发布不能使用敏感环境变量');
+    this.assertAutomaticReleaseVariables(automation, p.env.secretVariables);
     const scope = {
       projectId: p.pipeline.projectId,
       serviceId: p.pipeline.serviceId,

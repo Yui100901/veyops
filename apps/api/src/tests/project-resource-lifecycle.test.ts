@@ -27,6 +27,8 @@ async function checkLifecycle(url?: string) {
   const { configureApp } = await import('../bootstrap.js');
   const { GraphRunnerService } =
     await import('../modules/execution-graphs/graph-runner.service.js');
+  const { GraphTriggersService } =
+    await import('../modules/execution-graphs/graph-triggers.service.js');
   const app = (
     await Test.createTestingModule({ imports: [AppModule] }).compile()
   ).createNestApplication<NestExpressApplication>({ logger: false });
@@ -128,7 +130,7 @@ async function checkLifecycle(url?: string) {
     });
     const version = older.publishedVersion as number;
     const rule = {
-      name: 'Pins earlier version',
+      name: 'Follows current publication',
       kind: 'API',
       flowId: 'control',
       version,
@@ -136,6 +138,12 @@ async function checkLifecycle(url?: string) {
     };
     await post(graph + '/triggers', { ...rule, flowId: 'start' }).expect(403);
     const trigger = await make(graph + '/triggers', rule);
+    const triggerPath = graph + '/triggers/' + trigger.id;
+    const accepted = (
+      await post(triggerPath + '/invoke', { eventId: 'before-publication' }).expect(202)
+    ).body.data;
+    assert.equal(accepted.status, 'PENDING');
+    assert.equal(accepted.version, version);
     const review = await make(graph + '/flows/start/preview', { version });
     const live = await make(graph + '/flows/start/run', {
       version,
@@ -144,7 +152,12 @@ async function checkLifecycle(url?: string) {
     });
     assert.match(live.status, /QUEUED|RUNNING/);
 
-    await make(graph + '/publish', { expectedRevision: await save(graph) });
+    const updated = await make(graph + '/publish', { expectedRevision: await save(graph) });
+    const latest = updated.publishedVersion as number;
+    const [followed] = await get(graph + '/triggers');
+    assert.equal(followed.id, trigger.id);
+    assert.equal(followed.version, latest);
+    assert.equal(followed.enabled, true);
     const blocked = await client.delete(api + '/servers/' + tracked.id).expect(409);
     assert.ok(
       blocked.body.error.references.some(
@@ -152,15 +165,22 @@ async function checkLifecycle(url?: string) {
           ref.version === version && ref.state === 'RUNNABLE',
       ),
     );
-    await post(`${graph}/versions/${version}/retire`, {}).expect(409);
-    await client
-      .patch(`${api}${graph}/triggers/${trigger.id}`)
-      .send({ ...rule, enabled: false })
-      .expect(200);
+    const inFlight = await post(`${graph}/versions/${version}/retire`, {}).expect(409);
+    assert.match(inFlight.body.error.message, /已接收的触发事件/);
+    await app.get(GraphTriggersService).tick();
+    const [dispatched] = await get(triggerPath + '/events');
+    assert.equal(dispatched.id, accepted.id);
+    assert.equal(dispatched.status, 'QUEUED');
+    assert.equal(dispatched.version, version);
+    assert.equal((await get(`${graph}/runs/${dispatched.runId}`)).version, version);
     const retired = await make(`${graph}/versions/${version}/retire`, {});
     assert.ok(retired.retiredAt);
     assert.equal((await get(`${graph}/versions/${version}`)).retiredAt, retired.retiredAt);
     await post(graph + '/flows/start/preview', { version }).expect(409);
+    const nextEvent = (
+      await post(triggerPath + '/invoke', { eventId: 'after-retirement' }).expect(202)
+    ).body.data;
+    assert.equal(nextEvent.version, latest);
     const pending = await client.delete(api + '/servers/' + tracked.id).expect(409);
     assert.ok(
       pending.body.error.references.some((ref: { state: string }) => ref.state === 'PENDING'),
