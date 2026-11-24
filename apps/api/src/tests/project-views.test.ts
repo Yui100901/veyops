@@ -305,14 +305,22 @@ async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId:
         created_at: now,
       })
       .execute();
-    return async (envId: string, serverId: string, at: number, status: string, health: string) => {
+    return async (
+      envId: string,
+      serverId: string,
+      at: number,
+      status: string,
+      health: string,
+      release?: { scopeKey: string; activated?: boolean; error?: string; record?: boolean },
+    ) => {
       const [taskId, taskTargetId, runId, recordId] = [
         randomUUID(),
         randomUUID(),
         randomUUID(),
         randomUUID(),
       ];
-      const finishedAt = status === 'RUNNING' ? null : at + 1;
+      const pending = status === 'RUNNING' || status === 'PENDING';
+      const finishedAt = pending ? null : at + 1;
       await db
         .insertInto('tasks')
         .values({
@@ -337,6 +345,10 @@ async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId:
           task_id: taskId,
           server_id: serverId,
           status,
+          release_scope_key: release?.scopeKey,
+          error_summary: release?.error,
+          started_at: release && status !== 'PENDING' ? at : null,
+          finished_at: finishedAt,
           server_name_snapshot: 'Fixture',
           host_snapshot: '127.0.0.1',
         })
@@ -359,23 +371,26 @@ async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId:
           created_at: at,
         })
         .execute();
-      await db
-        .insertInto('deployment_records')
-        .values({
-          id: recordId,
-          pipeline_run_id: runId,
-          task_target_id: taskTargetId,
-          service_id: serviceId,
-          environment_id: envId,
-          server_id: serverId,
-          status,
-          health_status: health,
-          health_observed_at: health === 'HEALTHY' || health === 'FAILED' ? finishedAt : null,
-          started_at: at,
-          finished_at: finishedAt,
-        })
-        .execute();
-      return { taskId, recordId, serviceId };
+      if (release?.record !== false)
+        await db
+          .insertInto('deployment_records')
+          .values({
+            id: recordId,
+            pipeline_run_id: runId,
+            task_target_id: taskTargetId,
+            service_id: serviceId,
+            environment_id: envId,
+            server_id: serverId,
+            status,
+            release_scope_key: release?.scopeKey,
+            activated_at: release?.activated ? at : null,
+            health_status: health,
+            health_observed_at: health === 'HEALTHY' || health === 'FAILED' ? finishedAt : null,
+            started_at: at,
+            finished_at: finishedAt,
+          })
+          .execute();
+      return { taskId, taskTargetId, recordId, serviceId };
     };
   }
 
@@ -542,6 +557,102 @@ async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId:
   const repaired = (await get<ViewDetail>(api, `/views/all?serviceId=${web.id}`)).projects[0]!;
   assert.equal(repaired.deploymentStatus, 'HEALTHY');
   assert.equal(repaired.recentDeployments[0]?.taskId, fix.taskId);
+
+  const scopeKey = (serverId: string, location: string) =>
+    JSON.stringify([mixed.id, web.id, serverId, 'FILE', location]);
+  const first = scopeKey(firstServer, '/opt/first');
+  const second = scopeKey(firstServer, '/opt/second');
+  const third = scopeKey(secondServer, '/opt/first');
+  const old = await mixedDeploy(testing.id, firstServer, now + 80, 'SUCCESS', 'HEALTHY', {
+    scopeKey: first,
+    activated: true,
+  });
+  const rejected = await mixedDeploy(testing.id, firstServer, now + 90, 'FAILED', 'NOT_CHECKED', {
+    scopeKey: first,
+    record: false,
+    error: 'SSH failed password=fixture-hidden',
+  });
+  await mixedDeploy(testing.id, firstServer, now + 100, 'PENDING', 'NOT_CHECKED', {
+    scopeKey: first,
+    record: false,
+  });
+  const preparing = await mixedDeploy(
+    testing.id,
+    firstServer,
+    now + 110,
+    'RUNNING',
+    'NOT_CHECKED',
+    {
+      scopeKey: second,
+      record: false,
+    },
+  );
+  const fresh = await mixedDeploy(testing.id, secondServer, now + 115, 'SUCCESS', 'HEALTHY', {
+    scopeKey: third,
+    activated: true,
+  });
+  const released = await get<
+    {
+      scopeKey: string;
+      location: string;
+      current: { id: string } | null;
+      latestAttempt: {
+        taskTargetId: string;
+        deploymentRecordId: string | null;
+        status: string;
+        phase: string;
+        errorSummary: string | null;
+      };
+    }[]
+  >(viewer, detailPath);
+  const rejectedHead = released.find(({ scopeKey }) => scopeKey === first)!;
+  assert.equal(rejectedHead.current?.id, old.recordId);
+  assert.equal(rejectedHead.latestAttempt.taskTargetId, rejected.taskTargetId);
+  assert.equal(rejectedHead.latestAttempt.deploymentRecordId, null);
+  assert.equal(rejectedHead.latestAttempt.status, 'FAILED');
+  assert.equal(rejectedHead.latestAttempt.phase, 'PREPARE');
+  assert.equal(rejectedHead.latestAttempt.errorSummary, 'SSH failed password=[REDACTED]');
+  const preparingHead = released.find(({ scopeKey }) => scopeKey === second)!;
+  assert.equal(preparingHead.location, '/opt/second');
+  assert.equal(preparingHead.current, null);
+  assert.equal(preparingHead.latestAttempt.taskTargetId, preparing.taskTargetId);
+  assert.equal(preparingHead.latestAttempt.status, 'RUNNING');
+  const freshHead = released.find(({ scopeKey }) => scopeKey === third)!;
+  assert.equal(freshHead.latestAttempt.taskTargetId, fresh.taskTargetId);
+  assert.equal(freshHead.latestAttempt.deploymentRecordId, fresh.recordId);
+  assert.equal(freshHead.current?.id, fresh.recordId);
+
+  const failedRelease = await mixedDeploy(testing.id, firstServer, now + 120, 'FAILED', 'FAILED', {
+    scopeKey: first,
+    activated: true,
+  });
+  const attemptedRecord = await db
+    .selectFrom('deployment_records')
+    .selectAll()
+    .where('id', '=', failedRelease.recordId)
+    .executeTakeFirstOrThrow();
+  const restoredId = randomUUID();
+  await db
+    .insertInto('deployment_records')
+    .values({
+      ...attemptedRecord,
+      id: restoredId,
+      status: 'SUCCESS',
+      health_status: 'HEALTHY',
+      rollback_of_deployment_id: failedRelease.recordId,
+      started_at: now + 122,
+      activated_at: now + 123,
+      health_observed_at: now + 124,
+      finished_at: now + 124,
+    })
+    .execute();
+  const restoredHead = (await get<typeof released>(viewer, detailPath)).find(
+    ({ scopeKey }) => scopeKey === first,
+  )!;
+  assert.equal(restoredHead.current?.id, restoredId);
+  assert.equal(restoredHead.latestAttempt.taskTargetId, failedRelease.taskTargetId);
+  assert.equal(restoredHead.latestAttempt.deploymentRecordId, failedRelease.recordId);
+  assert.equal(restoredHead.latestAttempt.status, 'FAILED');
 }
 
 async function checkViews(databaseUrl?: string) {

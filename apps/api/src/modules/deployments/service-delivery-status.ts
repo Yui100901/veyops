@@ -1,15 +1,19 @@
-import type { Kysely } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
+import { redactTaskLog } from '../tasks/task-log.service';
 
 export async function serviceDeliveryHeads(database: Kysely<Database>, serviceIds: string[]) {
   if (!serviceIds.length) return [];
-  const base = database
+  const records = database
     .selectFrom('deployment_records as record')
     .innerJoin('pipeline_runs as run', 'run.id', 'record.pipeline_run_id')
     .leftJoin('servers as server', 'server.id', 'record.server_id')
     .leftJoin('task_targets as target', 'target.id', 'record.task_target_id')
     .select([
       'record.id',
+      'record.id as deploymentRecordId',
+      'record.task_target_id as taskTargetId',
+      'run.task_id as releaseTaskId',
       'record.service_id as serviceId',
       'record.environment_id as environmentId',
       'record.server_id as serverId',
@@ -19,60 +23,188 @@ export async function serviceDeliveryHeads(database: Kysely<Database>, serviceId
       'record.health_observed_at as healthObservedAt',
       'record.started_at as startedAt',
       'record.finished_at as finishedAt',
-      'run.created_at as runCreatedAt',
+      'run.created_at as queuedAt',
     ])
     .select(({ fn }) => [
       fn.coalesce('server.name', 'target.server_name_snapshot').as('serverName'),
       fn.coalesce('record.release_scope_key', 'record.environment_id').as('scopeKey'),
+      'target.release_scope_key as targetScopeKey',
+      'target.started_at as targetStartedAt',
+      'target.error_summary as errorSummary',
     ])
     .where('record.server_id', 'is not', null)
     .where('record.service_id', 'in', serviceIds);
-  const ranked = (current: boolean) =>
-    database
-      .selectFrom(base.as('heads'))
-      .selectAll()
-      .$if(current, (query) =>
-        query.where((eb) =>
-          eb.or([eb('activatedAt', 'is not', null), eb('status', '=', 'SUCCESS')]),
+
+  const fields = [
+    'id',
+    'deploymentRecordId',
+    'taskTargetId',
+    'releaseTaskId',
+    'serviceId',
+    'environmentId',
+    'serverId',
+    'status',
+    'healthStatus',
+    'activatedAt',
+    'healthObservedAt',
+    'startedAt',
+    'finishedAt',
+    'queuedAt',
+    'serverName',
+    'scopeKey',
+    'errorSummary',
+  ] as const;
+  const evidence = database
+    .with('records', () => records)
+    // The first record is the release the target tried. Automatic restoration may add a second.
+    .with('primaryRecords', (db) =>
+      db
+        .selectFrom('records')
+        .selectAll()
+        .select((eb) =>
+          eb.fn
+            .agg<number>('row_number', [])
+            .over((window) =>
+              window
+                .partitionBy(['taskTargetId', 'scopeKey'])
+                .orderBy(eb.fn.coalesce('startedAt', 'queuedAt'))
+                .orderBy('id'),
+            )
+            .as('ordinal'),
+        )
+        .where('targetScopeKey', 'is not', null)
+        .whereRef('targetScopeKey', '=', 'scopeKey'),
+    )
+    .with('attempts', (db) =>
+      db
+        .selectFrom('task_targets as target')
+        .innerJoin('pipeline_runs as run', 'run.task_id', 'target.task_id')
+        .innerJoin('tasks as task', 'task.id', 'target.task_id')
+        .leftJoin('servers as server', 'server.id', 'target.server_id')
+        .leftJoin('primaryRecords as record', (join) =>
+          join
+            .onRef('record.taskTargetId', '=', 'target.id')
+            .onRef('record.scopeKey', '=', 'target.release_scope_key')
+            .on('record.ordinal', '=', 1),
+        )
+        .select([
+          'target.id',
+          'record.deploymentRecordId',
+          'target.id as taskTargetId',
+          'target.task_id as releaseTaskId',
+          'run.service_id as serviceId',
+          'run.environment_id as environmentId',
+          'target.server_id as serverId',
+          'target.status',
+          'record.healthStatus',
+          'record.activatedAt',
+          'record.healthObservedAt',
+          'target.started_at as startedAt',
+          'target.finished_at as finishedAt',
+          'task.created_at as queuedAt',
+        ])
+        .select(({ fn }) => [
+          fn
+            .coalesce('server.name', 'target.server_name_snapshot')
+            .$castTo<string | null>()
+            .as('serverName'),
+          'target.release_scope_key as scopeKey',
+          'target.error_summary as errorSummary',
+        ])
+        .where('run.service_id', 'in', serviceIds)
+        .where('target.server_id', 'is not', null)
+        .where('target.release_scope_key', 'is not', null)
+        .where('target.started_at', 'is not', null)
+        .unionAll(
+          db
+            .selectFrom('records')
+            .select(fields)
+            .where((eb) =>
+              eb.or([
+                eb('targetScopeKey', 'is', null),
+                eb('targetStartedAt', 'is', null),
+                eb('targetScopeKey', '!=', eb.ref('scopeKey')),
+              ]),
+            ),
         ),
-      )
-      .select((eb) =>
-        eb.fn
-          .agg<number>('row_number', [])
-          .over((window) =>
-            window
-              .partitionBy(['serviceId', 'serverId', 'scopeKey'])
-              .orderBy(
-                current
-                  ? eb.fn.coalesce('activatedAt', 'startedAt', 'runCreatedAt')
-                  : eb.fn.coalesce('startedAt', 'runCreatedAt'),
-                'desc',
-              )
-              .orderBy('runCreatedAt', 'desc')
-              .orderBy('id', 'desc'),
-          )
-          .as('rank'),
-      );
-  const latest = (active: boolean) =>
-    database.selectFrom(ranked(active).as('ranked')).selectAll().where('rank', '=', 1).execute();
-  const [current, attempted] = await Promise.all([latest(true), latest(false)]);
-  const key = (row: (typeof attempted)[number]) =>
-    JSON.stringify([row.serviceId, row.serverId, row.scopeKey]);
-  const active = new Map(current.map((row) => [key(row), row]));
-  const status = (row: (typeof attempted)[number]) => ({
+    );
+  const rows = await evidence
+    .with('ranked', (db) =>
+      db
+        .selectFrom('attempts')
+        .select(fields)
+        .select(sql<'ATTEMPT' | 'CURRENT'>`'ATTEMPT'`.as('kind'))
+        .select((eb) =>
+          eb.fn
+            .agg<number>('row_number', [])
+            .over((window) =>
+              window
+                .partitionBy(['serviceId', 'serverId', 'scopeKey'])
+                .orderBy(eb.fn.coalesce('startedAt', 'queuedAt'), 'desc')
+                .orderBy('queuedAt', 'desc')
+                .orderBy('id', 'desc'),
+            )
+            .as('rank'),
+        )
+        .unionAll(
+          db
+            .selectFrom('records')
+            .select(fields)
+            .select(sql<'ATTEMPT' | 'CURRENT'>`'CURRENT'`.as('kind'))
+            .select((eb) =>
+              eb.fn
+                .agg<number>('row_number', [])
+                .over((window) =>
+                  window
+                    .partitionBy(['serviceId', 'serverId', 'scopeKey'])
+                    .orderBy(eb.fn.coalesce('activatedAt', 'startedAt', 'queuedAt'), 'desc')
+                    .orderBy('queuedAt', 'desc')
+                    .orderBy('id', 'desc'),
+                )
+                .as('rank'),
+            )
+            .where((eb) =>
+              eb.or([
+                eb('activatedAt', 'is not', null),
+                // Legacy successful releases predate explicit activation evidence.
+                eb.and([eb('targetScopeKey', 'is', null), eb('status', '=', 'SUCCESS')]),
+              ]),
+            ),
+        ),
+    )
+    .selectFrom('ranked')
+    .selectAll()
+    .where('rank', '=', 1)
+    .execute();
+  type HeadRow = (typeof rows)[number];
+  const key = (row: HeadRow) => JSON.stringify([row.serviceId, row.serverId, row.scopeKey]);
+  const active = new Map(
+    rows.filter((row) => row.kind === 'CURRENT').map((row) => [key(row), row]),
+  );
+  const status = (row: HeadRow) => ({
     id: row.id,
+    deploymentRecordId: row.deploymentRecordId,
+    taskTargetId: row.taskTargetId,
+    releaseTaskId: row.releaseTaskId,
+    environmentId: row.environmentId,
     status: row.status,
     healthStatus: row.healthStatus,
     healthObservedAt: row.healthObservedAt,
     activatedAt: row.activatedAt,
-    startedAt: row.startedAt ?? row.runCreatedAt,
+    startedAt: row.startedAt ?? row.queuedAt,
     finishedAt: row.finishedAt,
+    phase: row.deploymentRecordId ? ('RELEASE' as const) : ('PREPARE' as const),
+    errorSummary:
+      row.kind === 'ATTEMPT' && row.errorSummary
+        ? redactTaskLog(row.errorSummary).slice(0, 1000)
+        : null,
   });
-  return attempted
+  return rows
+    .filter((row) => row.kind === 'ATTEMPT')
     .sort(
       (left, right) =>
         (left.serverName ?? '').localeCompare(right.serverName ?? '') ||
-        left.id.localeCompare(right.id),
+        (left.scopeKey ?? '').localeCompare(right.scopeKey ?? ''),
     )
     .map((row) => {
       const activeRecord = active.get(key(row));
@@ -81,6 +213,7 @@ export async function serviceDeliveryHeads(database: Kysely<Database>, serviceId
         serverId: row.serverId!,
         serverName: row.serverName,
         environmentId: row.environmentId,
+        scopeKey: row.scopeKey!,
         current: activeRecord ? status(activeRecord) : null,
         latestAttempt: status(row),
       };
@@ -89,37 +222,52 @@ export async function serviceDeliveryHeads(database: Kysely<Database>, serviceId
 
 export async function serviceDeliveryStatus(database: Kysely<Database>, serviceId: string) {
   const heads = await serviceDeliveryHeads(database, [serviceId]);
-  const ids = [
+  if (!heads.length) return [];
+  const releases = heads.flatMap(({ current, latestAttempt }) =>
+    current ? [current, latestAttempt] : [latestAttempt],
+  );
+  const recordIds = [
     ...new Set(
-      heads.flatMap(({ current, latestAttempt }) =>
-        current ? [current.id, latestAttempt.id] : [latestAttempt.id],
+      releases.flatMap(({ deploymentRecordId }) =>
+        deploymentRecordId ? [deploymentRecordId] : [],
       ),
     ),
   ];
-  if (!ids.length) return [];
-  const records = await database
-    .selectFrom('deployment_records as record')
-    .innerJoin('pipeline_runs as release', 'release.id', 'record.pipeline_run_id')
-    .leftJoin('artifacts as artifact', 'artifact.id', 'record.artifact_id')
-    .leftJoin('pipeline_runs as build', 'build.id', 'artifact.pipeline_run_id')
-    .leftJoin('execution_node_runs as releaseNode', 'releaseNode.task_id', 'release.task_id')
-    .leftJoin('environments as environment', 'environment.id', 'record.environment_id')
-    .select([
-      'record.id',
-      'record.release_version as releaseVersion',
-      'release.task_id as releaseTaskId',
-      'releaseNode.run_id as releaseRunId',
-      'releaseNode.node_id as releaseNodeId',
-      'build.task_id as buildTaskId',
-      'artifact.graph_run_id as buildRunId',
-      'artifact.id as artifactInstanceId',
-      'artifact.logical_artifact_id as artifactId',
-      'artifact.artifact_name as artifactName',
-      'environment.name as environmentName',
-    ])
-    .select(({ fn }) => fn.coalesce('artifact.source_commit', 'release.commit_sha').as('commitSha'))
-    .where('record.id', 'in', ids)
-    .execute();
+  const taskIds = [...new Set(releases.map(({ releaseTaskId }) => releaseTaskId))];
+  const environmentIds = [...new Set(releases.map(({ environmentId }) => environmentId))];
+  const [records, nodes, environments] = await Promise.all([
+    recordIds.length
+      ? database
+          .selectFrom('deployment_records as record')
+          .innerJoin('pipeline_runs as release', 'release.id', 'record.pipeline_run_id')
+          .leftJoin('artifacts as artifact', 'artifact.id', 'record.artifact_id')
+          .leftJoin('pipeline_runs as build', 'build.id', 'artifact.pipeline_run_id')
+          .select([
+            'record.id',
+            'record.release_version as releaseVersion',
+            'build.task_id as buildTaskId',
+            'artifact.graph_run_id as buildRunId',
+            'artifact.id as artifactInstanceId',
+            'artifact.logical_artifact_id as artifactId',
+            'artifact.artifact_name as artifactName',
+          ])
+          .select(({ fn }) =>
+            fn.coalesce('artifact.source_commit', 'release.commit_sha').as('commitSha'),
+          )
+          .where('record.id', 'in', recordIds)
+          .execute()
+      : [],
+    database
+      .selectFrom('execution_node_runs')
+      .select(['task_id as releaseTaskId', 'run_id as releaseRunId', 'node_id as releaseNodeId'])
+      .where('task_id', 'in', taskIds)
+      .execute(),
+    database
+      .selectFrom('environments')
+      .select(['id', 'name'])
+      .where('id', 'in', environmentIds)
+      .execute(),
+  ]);
   const instances = [
     ...new Set(
       records.flatMap(({ artifactInstanceId }) => (artifactInstanceId ? [artifactInstanceId] : [])),
@@ -141,6 +289,8 @@ export async function serviceDeliveryStatus(database: Kysely<Database>, serviceI
         .execute()
     : [];
   const byRecord = new Map(records.map((record) => [record.id, record]));
+  const byTask = new Map(nodes.map((node) => [node.releaseTaskId, node]));
+  const environmentNames = new Map(environments.map(({ id, name }) => [id, name]));
   const byInstance = new Map<string, Omit<(typeof sources)[number], 'instanceId'>[]>();
   for (const { instanceId, ...source } of sources) {
     const matching = byInstance.get(instanceId);
@@ -148,17 +298,35 @@ export async function serviceDeliveryStatus(database: Kysely<Database>, serviceI
     else byInstance.set(instanceId, [source]);
   }
   const enrich = (head: (typeof heads)[number]['latestAttempt']) => {
-    const record = byRecord.get(head.id);
+    const record = head.deploymentRecordId ? byRecord.get(head.deploymentRecordId) : undefined;
     return {
-      ...head,
       ...record,
+      ...head,
+      ...byTask.get(head.releaseTaskId),
+      environmentName: environmentNames.get(head.environmentId) ?? null,
       artifactId: record?.artifactId ?? record?.artifactInstanceId,
       sources: byInstance.get(record?.artifactInstanceId ?? '') ?? [],
     };
   };
   return heads.map((head) => ({
     ...head,
+    ...releaseLocation(head.scopeKey),
     current: head.current ? enrich(head.current) : null,
     latestAttempt: enrich(head.latestAttempt),
   }));
+}
+
+function releaseLocation(scopeKey: string) {
+  if (!scopeKey.startsWith('[')) return {};
+  try {
+    const scope: unknown = JSON.parse(scopeKey);
+    if (!Array.isArray(scope)) return {};
+    const method: unknown = scope[3];
+    const location: unknown = scope[4];
+    if ((method === 'COMPOSE' || method === 'FILE') && typeof location === 'string')
+      return { method, location };
+  } catch {
+    return {};
+  }
+  return {};
 }

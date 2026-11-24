@@ -75,6 +75,7 @@ async function checkDelivery(databaseUrl?: string) {
   let registryPullFails = false;
   let failNextHealthCheck = false;
   let strictGraphProbeExitCode = 0;
+  let failReleaseLockOnServer: string | undefined;
   let archivePlatformMismatch = false;
   let auxiliaryCommit = 'c'.repeat(40);
   const moduleRef = await Test.createTestingModule({
@@ -171,6 +172,11 @@ async function checkDelivery(databaseUrl?: string) {
         options?: { onData?: (chunk: string, stream?: 'stdout' | 'stderr') => void },
       ) => {
         remoteCommands.push({ serverId: target.id, command });
+        if (
+          target.id === failReleaseLockOnServer &&
+          command.includes('mkdir -m 700 -- /var/tmp/.veyops-deployment-locks')
+        )
+          return { exitCode: 76 };
         if (command.includes('VEYOPS_WORKSPACE=')) {
           const leaf = /mkdir -- '(veyops-[\w-]+)'/.exec(command)?.[1];
           assert.ok(leaf);
@@ -1866,6 +1872,96 @@ async function checkDelivery(databaseUrl?: string) {
     assert.deepEqual(implicitLatest.reviewed.deliveries[0].artifactIds, [
       releaseNode.output.release.deployments[0].artifactId,
     ]);
+
+    const releasesForService = async () =>
+      (
+        await api
+          .get(`/api/v1/projects/${project.id}/services/${service.id}/delivery-status`)
+          .expect(200)
+      ).body.data.filter(
+        ({ method, location }: { method?: string; location?: string }) =>
+          method === 'COMPOSE' && location?.startsWith('veyops-'),
+      );
+    const latestTaskId = implicitLatest.detail.nodes.find(
+      ({ nodeId }: { nodeId: string }) => nodeId === 'deploy-node',
+    ).taskId;
+    const initialServiceReleases = await releasesForService();
+    const previousRelease = initialServiceReleases.find(
+      ({ latestAttempt }: { latestAttempt: { releaseTaskId: string } }) =>
+        latestAttempt.releaseTaskId === latestTaskId,
+    );
+    assert.ok(previousRelease, JSON.stringify(initialServiceReleases));
+    assert.ok(previousRelease.current.id);
+    assert.equal(previousRelease.current.id, previousRelease.latestAttempt.deploymentRecordId);
+    failReleaseLockOnServer = serverIds[0];
+    try {
+      const prepFailure = await submit('release', { image: savedImage });
+      assert.equal(prepFailure.detail.status, 'FAILED', JSON.stringify(prepFailure.detail.nodes));
+      const failedNode = prepFailure.detail.nodes.find(
+        ({ nodeId }: { nodeId: string }) => nodeId === 'deploy-node',
+      );
+      const [attempt] = await list(`/tasks/${failedNode.taskId}/targets`, {});
+      const targetRows = await releasesForService();
+      const target = targetRows.find(
+        ({ scopeKey }: { scopeKey: string }) => scopeKey === previousRelease.scopeKey,
+      );
+      const targetSnapshot = await db
+        .selectFrom('task_targets')
+        .select(['release_scope_key', 'started_at', 'status', 'error_summary'])
+        .where('id', '=', attempt.id)
+        .executeTakeFirstOrThrow();
+      assert.equal(targetSnapshot.release_scope_key, previousRelease.scopeKey);
+      assert.equal(target.current.id, previousRelease.current.id);
+      assert.equal(target.latestAttempt.id, attempt.id, JSON.stringify({ target, targetSnapshot }));
+      assert.equal(target.latestAttempt.taskTargetId, attempt.id);
+      assert.equal(target.latestAttempt.deploymentRecordId, null);
+      assert.equal(target.latestAttempt.releaseTaskId, failedNode.taskId);
+      assert.equal(target.latestAttempt.releaseRunId, prepFailure.detail.id);
+      assert.equal(target.latestAttempt.releaseNodeId, 'deploy-node');
+      assert.equal(target.latestAttempt.phase, 'PREPARE');
+      assert.equal(target.latestAttempt.status, 'FAILED');
+      assert.match(target.latestAttempt.errorSummary, /发布锁目录或部署路径校验失败/);
+      assert.equal((await list('/deployments', { taskId: failedNode.taskId })).length, 0);
+      const portal = (await api.get(`/api/v1/portal?serviceId=${service.id}`).expect(200)).body
+        .data;
+      const scope = portal.projects[0].services[0].targets.find(
+        ({ at }: { at: number }) => at === target.latestAttempt.finishedAt,
+      );
+      assert.equal(scope.current, 'SUCCESS');
+      assert.equal(scope.lastAttempt, 'FAILED');
+      assert.equal(scope.errorSummary, undefined);
+
+      failReleaseLockOnServer = serverIds[1];
+      const mixedRelease = await submit('release', { image: savedImage, targets: { serverIds } });
+      const mixedTaskId = mixedRelease.detail.nodes.find(
+        ({ nodeId }: { nodeId: string }) => nodeId === 'deploy-node',
+      ).taskId;
+      const mixedAttempt = (await api.get(`/api/v1/tasks/${mixedTaskId}`).expect(200)).body.data;
+      assert.equal(
+        mixedAttempt.status,
+        'PARTIAL_FAILED',
+        JSON.stringify(mixedRelease.detail.nodes),
+      );
+      const mixedTargets = (await releasesForService()).filter(
+        ({ latestAttempt }: { latestAttempt: { releaseTaskId: string } }) =>
+          latestAttempt.releaseTaskId === mixedTaskId,
+      );
+      assert.equal(mixedTargets.length, 2);
+      const activated = mixedTargets.find(
+        ({ serverId }: { serverId: string }) => serverId === serverIds[0],
+      );
+      const rejected = mixedTargets.find(
+        ({ serverId }: { serverId: string }) => serverId === serverIds[1],
+      );
+      assert.equal(activated.latestAttempt.status, 'SUCCESS');
+      assert.equal(activated.current.id, activated.latestAttempt.deploymentRecordId);
+      assert.notEqual(activated.current.id, previousRelease.current.id);
+      assert.equal(rejected.latestAttempt.status, 'FAILED');
+      assert.equal(rejected.latestAttempt.deploymentRecordId, null);
+      assert.equal(rejected.current, null);
+    } finally {
+      failReleaseLockOnServer = undefined;
+    }
     const historicalInput = args({ image: savedImage });
     const reviewPreview = graphPath + '/flows/release/preview';
     const guardedPlan = await create(graphPath + '/flows/guarded/preview', historicalInput);

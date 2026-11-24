@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { posix } from 'node:path';
+import { redactText } from '../../infrastructure/ssh/secret-redactor';
 import { SshExecutionError, SshService, SshTarget } from '../../infrastructure/ssh/ssh.service';
 import {
   BuildCommandError,
@@ -230,6 +231,8 @@ export class PipelineExecutor {
     if (!snapshot) throw new Error('缺少固定Pipeline快照');
     const buildOnly = snapshot.mode === 'BUILD_ONLY';
     const deployArtifact = snapshot.mode === 'DEPLOY_ARTIFACT';
+    const trackedPreparation =
+      deployArtifact && Boolean(snapshot.graphDeployment || snapshot.rollbackOfDeploymentId);
     const nodes = snapshot.definition.nodes;
     const packageNode = nodes?.find((node) => node.type === 'PACKAGE');
     const deployNode = nodes?.find((node) => node.type === 'DEPLOY');
@@ -257,30 +260,34 @@ export class PipelineExecutor {
     else {
       try {
         await this.deployments.assertApproval(task.id, snapshot, task.payload.targets);
+        if (
+          snapshot.releasePolicy &&
+          snapshot.releasePolicy.rollbackMode !== 'OFF' &&
+          !this.hasHealthCheck(snapshot)
+        )
+          throw new ConflictException('启用自动回滚需要配置发布健康检查');
       } catch (error) {
         if (
-          !snapshot.graphAutomation ||
+          !(snapshot.graphAutomation || trackedPreparation) ||
           !(error instanceof HttpException) ||
           error.getStatus() >= 500
         )
           throw error;
-        await this.failReleasePreflight(task, context, `自动发布复核失败：${error.message}`);
+        const prefix = snapshot.graphAutomation ? '自动发布复核失败' : '发布复核失败';
+        await this.failReleasePreflight(task, context, `${prefix}：${error.message}`);
         return;
       }
-      if (
-        snapshot.releasePolicy &&
-        snapshot.releasePolicy.rollbackMode !== 'OFF' &&
-        !this.hasHealthCheck(snapshot)
-      )
-        throw new ConflictException('启用自动回滚需要配置发布健康检查');
     }
     const deploymentInputs = new Map<string, DeploymentArtifact>();
+    const preparingTargets = new Map<string, string>();
     if (deployArtifact) {
       context.log('校验已归档的部署产物\n');
       let shared: DeploymentArtifact | undefined;
       try {
         for (const target of task.payload.targets) {
           if (context.signal.aborted) return;
+          if (trackedPreparation && !shared)
+            preparingTargets.set(target.id, await context.startTarget(target.id));
           const artifact =
             shared ?? (await this.artifacts.forDeployment(snapshot, target.id, target));
           deploymentInputs.set(target.id, artifact);
@@ -297,6 +304,7 @@ export class PipelineExecutor {
           task,
           context,
           `产物校验失败，未开始部署：${error.message}`,
+          trackedPreparation ? preparingTargets : undefined,
         );
         return;
       }
@@ -400,10 +408,12 @@ export class PipelineExecutor {
           const target = task.payload.targets[position++];
           if (!target) return;
           const managerBuilt = managerTarget?.serverId === target.id;
+          const preparedTargetId = preparingTargets.get(target.id);
+          preparingTargets.delete(target.id);
           const targetId =
             managerBuilt && managerTarget
               ? managerTarget.targetId
-              : await context.startTarget(target.id);
+              : (preparedTargetId ?? (await context.startTarget(target.id)));
           let deploymentId: string | undefined;
           let deploymentFinished = false;
           let lock: ReturnType<typeof deploymentLock> | undefined;
@@ -779,7 +789,10 @@ export class PipelineExecutor {
           } catch (caught) {
             status = this.builds.errorKind(caught);
             targetExitCode = commandExitCode(caught);
-            error = caught instanceof Error ? caught.message : 'Pipeline执行失败';
+            error =
+              caught instanceof Error
+                ? redactTaskLog(redactText(caught.message, session.secrets))
+                : 'Pipeline执行失败';
             if (
               locked &&
               !(caught instanceof BuildCommandError) &&
@@ -819,7 +832,11 @@ export class PipelineExecutor {
                   error += `。已恢复到发布 ${rollback.snapshot.commitSha}`;
                 } catch (rollbackError) {
                   if (rollbackError instanceof TaskLeaseUnavailableError) throw rollbackError;
-                  error += `。自动回滚失败：${rollbackError instanceof Error ? rollbackError.message : '结果未知'}`;
+                  const reason =
+                    rollbackError instanceof Error
+                      ? redactTaskLog(redactText(rollbackError.message, session.secrets))
+                      : '结果未知';
+                  error += `。自动回滚失败：${reason}`;
                 }
               } else error += '。没有可用的自动回滚基线';
             }
@@ -888,6 +905,10 @@ export class PipelineExecutor {
       );
       const failure = settled.find((result) => result.status === 'rejected');
       if (failure?.status === 'rejected') throw failure.reason;
+      if (!context.signal.aborted) {
+        for (const id of preparingTargets.values())
+          await context.finishTarget(id, 'CANCELLED', null, '因失败停止策略未开始部署');
+      }
     } finally {
       try {
         await manager?.cleanup();
@@ -901,13 +922,16 @@ export class PipelineExecutor {
     task: TaskRecord,
     context: TaskExecutionContext,
     reason: string,
+    preparingTargets?: ReadonlyMap<string, string>,
   ) {
     const summary = redactTaskLog(reason);
     context.log(`${summary}\n`);
     for (const target of task.payload.targets) {
       if (context.signal.aborted) return;
-      const id = await context.startTarget(target.id);
-      await context.finishTarget(id, 'FAILED', null, summary);
+      const id = preparingTargets
+        ? preparingTargets.get(target.id)
+        : await context.startTarget(target.id);
+      if (id) await context.finishTarget(id, 'FAILED', null, summary);
     }
   }
   private async trackStep<T>(

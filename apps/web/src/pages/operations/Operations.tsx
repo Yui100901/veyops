@@ -373,9 +373,11 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
       {value.pipelineGraph && (
         <Suspense fallback={<Loading />}>
           <DeliveryTaskStages
+            key={scope.serverId ?? ''}
             task={value}
             graph={value.pipelineGraph}
             targets={targets.data ?? []}
+            initialServerId={scope.serverId}
             steps={steps.data}
             stepsError={steps.error}
             retrySteps={steps.reload}

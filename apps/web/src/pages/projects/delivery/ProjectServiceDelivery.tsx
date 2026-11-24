@@ -8,7 +8,10 @@ import './project-service-delivery.css';
 
 interface Release {
   id: string;
+  deploymentRecordId: string | null;
   status: string;
+  phase: 'PREPARE' | 'RELEASE';
+  errorSummary: string | null;
   healthStatus: string | null;
   healthObservedAt: number | null;
   activatedAt: number | null;
@@ -37,6 +40,9 @@ interface Target {
   serverId: string;
   serverName: string | null;
   environmentId: string;
+  scopeKey: string;
+  method?: 'FILE' | 'COMPOSE';
+  location?: string;
   current: Release | null;
   latestAttempt: Release;
 }
@@ -46,11 +52,15 @@ function ReleaseEvidence({
   serviceId,
   label,
   release,
+  serverId,
+  attempt = false,
 }: {
   projectId: string;
   serviceId: string;
   label: string;
   release: Release | null;
+  serverId: string;
+  attempt?: boolean;
 }) {
   if (!release)
     return (
@@ -59,7 +69,7 @@ function ReleaseEvidence({
         <p className="mini-empty">暂无已激活记录</p>
       </section>
     );
-  const scope = { serviceId, recordId: release.id };
+  const scope = { serviceId, recordId: release.deploymentRecordId ?? undefined };
   const graphLink = (run: string, node?: string | null) =>
     '#' +
     graphWorkbenchPath(projectId, {
@@ -78,32 +88,51 @@ function ReleaseEvidence({
       </div>
       <dl className="graph-field-values">
         <div>
-          <dt>时间</dt>
-          <dd>{formatTime(release.activatedAt ?? release.finishedAt ?? release.startedAt)}</dd>
-        </div>
-        <div>
-          <dt>健康检查</dt>
+          <dt>{attempt || !release.activatedAt ? '开始时间' : '激活时间'}</dt>
           <dd>
-            {checked ? (
-              <Status
-                value={
-                  release.healthStatus === 'UNKNOWN'
-                    ? 'NEEDS_ATTENTION'
-                    : (release.healthStatus ?? 'UNKNOWN')
-                }
-              />
-            ) : (
-              '未检测'
-            )}
-            {checked && (
-              <small>
-                {release.healthObservedAt
-                  ? formatTime(release.healthObservedAt)
-                  : '历史记录未提供检查时间'}
-              </small>
-            )}
+            {formatTime(attempt ? release.startedAt : (release.activatedAt ?? release.startedAt))}
           </dd>
         </div>
+        {attempt && release.finishedAt != null && (
+          <div>
+            <dt>结束时间</dt>
+            <dd>{formatTime(release.finishedAt)}</dd>
+          </div>
+        )}
+        {attempt && (release.phase === 'PREPARE' || release.errorSummary) && (
+          <div>
+            <dt>{release.phase === 'PREPARE' ? '准备阶段' : '发布结果'}</dt>
+            <dd>
+              {release.errorSummary ||
+                (release.status === 'RUNNING' ? '正在准备目标及产物' : '准备阶段已结束')}
+            </dd>
+          </div>
+        )}
+        {release.deploymentRecordId && (
+          <div>
+            <dt>健康检查</dt>
+            <dd>
+              {checked ? (
+                <Status
+                  value={
+                    release.healthStatus === 'UNKNOWN'
+                      ? 'NEEDS_ATTENTION'
+                      : (release.healthStatus ?? 'UNKNOWN')
+                  }
+                />
+              ) : (
+                '未检测'
+              )}
+              {checked && (
+                <small>
+                  {release.healthObservedAt
+                    ? formatTime(release.healthObservedAt)
+                    : '历史记录未提供检查时间'}
+                </small>
+              )}
+            </dd>
+          </div>
+        )}
         {release.releaseVersion && (
           <div>
             <dt>发布版本</dt>
@@ -172,9 +201,11 @@ function ReleaseEvidence({
         )}
       </dl>
       <div className="row-actions">
-        <a className="text-link" href={'#' + deliveryPath(projectId, 'deployments', scope)}>
-          发布详情
-        </a>
+        {release.deploymentRecordId && (
+          <a className="text-link" href={'#' + deliveryPath(projectId, 'deployments', scope)}>
+            发布详情
+          </a>
+        )}
         {release.releaseRunId && (
           <a className="text-link" href={graphLink(release.releaseRunId, release.releaseNodeId)}>
             发布运行
@@ -197,7 +228,9 @@ function ReleaseEvidence({
         {release.releaseTaskId && (
           <a
             className="text-link"
-            href={'#' + deliveryTaskPath(release.releaseTaskId, 'deployments', scope)}
+            href={
+              '#' + deliveryTaskPath(release.releaseTaskId, 'deployments', { ...scope, serverId })
+            }
           >
             发布日志
           </a>
@@ -216,6 +249,7 @@ export function ProjectServiceDelivery({
 }) {
   const resource = useResource<Target[]>(
     `/projects/${projectId}/services/${serviceId}/delivery-status`,
+    5000,
   );
   return (
     <Section
@@ -232,7 +266,10 @@ export function ProjectServiceDelivery({
       ) : resource.data?.length ? (
         <div className="service-release-targets">
           {resource.data.map((target) => (
-            <details key={target.latestAttempt.id} open={resource.data?.length === 1}>
+            <details
+              key={`${target.serverId}:${target.scopeKey}`}
+              open={resource.data?.length === 1}
+            >
               <summary>
                 <span>
                   {target.serverName ?? target.serverId}
@@ -251,14 +288,23 @@ export function ProjectServiceDelivery({
                 >
                   查看服务器
                 </a>
+                {target.location && (
+                  <div className="field-note">
+                    {target.method === 'COMPOSE' ? 'Compose 项目' : '部署路径'} ·{' '}
+                    <code>{target.location}</code>
+                  </div>
+                )}
                 <div className="service-release-grid">
                   <ReleaseEvidence
                     projectId={projectId}
                     serviceId={serviceId}
                     label="当前已激活版本"
                     release={target.current}
+                    serverId={target.serverId}
                   />
-                  {target.current?.id === target.latestAttempt.id ? (
+                  {target.current?.deploymentRecordId === target.latestAttempt.deploymentRecordId &&
+                  target.current?.status === target.latestAttempt.status &&
+                  !target.latestAttempt.errorSummary ? (
                     <section className="service-release-evidence">
                       <h4>最近发布尝试</h4>
                       <p>
@@ -274,6 +320,8 @@ export function ProjectServiceDelivery({
                       serviceId={serviceId}
                       label="最近发布尝试"
                       release={target.latestAttempt}
+                      serverId={target.serverId}
+                      attempt
                     />
                   )}
                 </div>

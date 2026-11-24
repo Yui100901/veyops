@@ -2071,10 +2071,16 @@ export const migrationProvider: MigrationProvider = {
       } satisfies Migration,
       '039_deployment_health_observation': {
         async up(db) {
-          await db.schema.alterTable('deployment_records').addColumn('health_observed_at', 'bigint').execute();
+          await db.schema
+            .alterTable('deployment_records')
+            .addColumn('health_observed_at', 'bigint')
+            .execute();
         },
         async down(db) {
-          await db.schema.alterTable('deployment_records').dropColumn('health_observed_at').execute();
+          await db.schema
+            .alterTable('deployment_records')
+            .dropColumn('health_observed_at')
+            .execute();
         },
       } satisfies Migration,
       '036_graph_trigger_event_snapshots': {
@@ -2102,6 +2108,23 @@ export const migrationProvider: MigrationProvider = {
               .alterTable('execution_graph_trigger_events')
               .dropColumn(column)
               .execute();
+        },
+      } satisfies Migration,
+      '040_release_attempt_scopes': {
+        async up(db) {
+          await db.schema
+            .alterTable('task_targets')
+            .addColumn('release_scope_key', 'text')
+            .execute();
+          await db.schema
+            .createIndex('pipeline_runs_service_task')
+            .on('pipeline_runs')
+            .columns(['service_id', 'task_id'])
+            .execute();
+        },
+        async down(db) {
+          await db.schema.dropIndex('pipeline_runs_service_task').execute();
+          await db.schema.alterTable('task_targets').dropColumn('release_scope_key').execute();
         },
       } satisfies Migration,
     };

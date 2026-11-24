@@ -25,6 +25,7 @@
 
 .service-release-target {
   margin-top: 0.85rem;
+  overflow-wrap: anywhere;
 }
 
 .service-release-target > a {

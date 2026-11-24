@@ -337,6 +337,7 @@ export interface TaskTargetsTable {
   task_id: string;
   server_id: Generated<string | null>;
   server_name_snapshot: string;
+  release_scope_key: Generated<string | null>;
   host_snapshot: string;
   status: Generated<string>;
   exit_code: Generated<number | null>;

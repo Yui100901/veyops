@@ -22,6 +22,7 @@ import { TaskLogService, redactTaskLog } from './task-log.service';
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
 import type { CurrentUser } from '../auth/auth.decorators';
 import { pendingReleaseApprovalTime, serviceReleasePolicy } from '../deployments/release-policy';
+import { deploymentScopeKey } from '../deployments/deployment-scope';
 import { lockAvailableArtifacts } from '../artifacts/artifact-availability';
 import {
   graphUnscopedArtifactService,
@@ -260,6 +261,12 @@ export class TasksService {
             task_id: id,
             server_id: target.id,
             server_name_snapshot: target.name,
+            release_scope_key:
+              input.type === 'PIPELINE' &&
+              pipeline?.mode === 'DEPLOY_ARTIFACT' &&
+              (pipeline.graphDeployment || pipeline.rollbackOfDeploymentId)
+                ? deploymentScopeKey(pipeline, target.id)
+                : null,
             host_snapshot: target.host,
             port_snapshot: target.port,
             username_snapshot: target.username,

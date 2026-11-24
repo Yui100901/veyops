@@ -23,6 +23,7 @@ export default function DeliveryTaskStages({
   task,
   graph,
   targets,
+  initialServerId,
   steps,
   stepsError,
   retrySteps,
@@ -32,13 +33,14 @@ export default function DeliveryTaskStages({
   task: Task;
   graph: NonNullable<Task['pipelineGraph']>;
   targets: TaskTarget[];
+  initialServerId?: string | null;
   steps?: DeliveryTaskStep[];
   stepsError: string;
   retrySteps: () => void;
   selectedStepId?: string;
   onLog: (selection: DeliveryLogSelection) => void;
 }) {
-  const [serverId, setServerId] = useState('');
+  const [serverId, setServerId] = useState(initialServerId ?? '');
   const deployStage = task.deliveryStage === 'DEPLOY';
   const manager = !deployStage && graph.buildLocation === 'MANAGER';
   const selectedTarget = targets.find((target) => target.serverId === serverId) ?? targets[0];

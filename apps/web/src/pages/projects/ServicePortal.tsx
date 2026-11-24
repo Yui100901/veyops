@@ -41,9 +41,9 @@ const failed = new Set(['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT', 'NEEDS_ATTENTIO
 
 function DeliveryStatus({ targets }: { targets: PortalTarget[] }) {
   if (!targets.length) return <span>暂无发布记录</span>;
-  const current = targets.filter(({ current }) => current === 'SUCCESS');
+  const current = targets.filter(({ current }) => current != null);
   const uncertain = targets.filter(
-    ({ current, health }) => (current && current !== 'SUCCESS') || health === 'UNKNOWN',
+    ({ current, health }) => current === 'NEEDS_ATTENTION' || health === 'UNKNOWN',
   );
   const unhealthy = current.filter(({ health }) => health === 'FAILED' || health === 'UNHEALTHY');
   const healthy = current.filter(({ health }) => health === 'HEALTHY');
@@ -51,6 +51,8 @@ function DeliveryStatus({ targets }: { targets: PortalTarget[] }) {
     ({ health }) => !health || ['PENDING', 'NOT_CHECKED'].includes(health),
   );
   const latestFailure = targets.filter(({ lastAttempt }) => failed.has(lastAttempt));
+  const running = targets.filter(({ lastAttempt }) => lastAttempt === 'RUNNING');
+  const cancelled = targets.filter(({ lastAttempt }) => lastAttempt === 'CANCELLED');
   const checkedAt = Math.max(0, ...healthy.map(({ healthObservedAt }) => healthObservedAt ?? 0));
   const failedAt = Math.max(0, ...latestFailure.map(({ at }) => at ?? 0));
   return (
@@ -64,6 +66,8 @@ function DeliveryStatus({ targets }: { targets: PortalTarget[] }) {
       {unchecked.length > 0 && <li>{unchecked.length} 处未检测</li>}
       {unhealthy.length > 0 && <li>{unhealthy.length} 处健康检查失败</li>}
       {uncertain.length > 0 && <li>{uncertain.length} 处待核查</li>}
+      {running.length > 0 && <li>{running.length} 次发布执行中</li>}
+      {cancelled.length > 0 && <li>{cancelled.length} 次最近发布已取消</li>}
       {latestFailure.length > 0 && (
         <li>
           {latestFailure.length} 次最近发布失败{failedAt > 0 && <> · {formatTime(failedAt)}</>}
