@@ -84,6 +84,13 @@ async function checkDelivery(databaseUrl?: string) {
     .useValue({
       run: async (_command: string, args: string[], options: { gzipOutput?: { path: string } }) => {
         const script = args.at(-1) ?? '';
+        if (script.includes('GRAPH_TEMPLATE_CI_FAIL'))
+          return {
+            exitCode: 23,
+            stdout: 'fixture check failed\n',
+            stderr: '',
+          };
+        assert.ok(!script.includes('GRAPH_TEMPLATE_BUILD_BLOCKED'));
         if (script.includes('GRAPH_SHELL_FIXTURE')) {
           const secretsMount = args.find((arg) => arg.endsWith(',dst=/run/veyops,readonly'));
           assert.ok(secretsMount);
@@ -2253,6 +2260,7 @@ async function checkDelivery(databaseUrl?: string) {
     const templateApproval = expanded.canvas.nodes.find(
       ({ operation }) => operation === 'APPROVAL',
     )!;
+    templateApproval.approval!.timeoutSeconds = 60;
     const templateProbe = expanded.canvas.nodes.find(
       ({ operation }) => operation === 'HEALTH_CHECK',
     )!;
@@ -2324,6 +2332,26 @@ async function checkDelivery(databaseUrl?: string) {
       refused.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === templateRelease.id).taskId,
       null,
     );
+    const expired = await queueCd(cdRequest);
+    await db
+      .updateTable('execution_node_runs')
+      .set({ started_at: Date.now() - 61_000 })
+      .where('run_id', '=', expired.run.id)
+      .where('node_id', '=', templateApproval.id)
+      .execute();
+    const expiredApproval = expired.run.nodes.find(
+      ({ nodeId }: { nodeId: string }) => nodeId === templateApproval.id,
+    );
+    await api
+      .post(`/api/v1${graphPath}/runs/${expired.run.id}/nodes/${templateApproval.id}/decision`)
+      .send({ decision: 'APPROVE', expectedScopeHash: expiredApproval.output.scopeHash })
+      .expect(409);
+    const timedOut = await waitGraph(expired.run.id);
+    assert.equal(timedOut.status, 'TIMED_OUT');
+    assert.equal(
+      timedOut.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === templateRelease.id).taskId,
+      null,
+    );
     for (const [code, status, health] of [
       [0, 'SUCCESS', 'HEALTHY'],
       [10, 'FAILED', 'UNHEALTHY'],
@@ -2382,6 +2410,50 @@ async function checkDelivery(databaseUrl?: string) {
         .output.status,
       'UNHEALTHY',
     );
+
+    const ci = expandGraphTemplate('CI_BUILD', 'FILE');
+    const ciCheck = ci.canvas.nodes.find(({ operation }) => operation === 'CHECK')!;
+    const ciBuild = ci.canvas.nodes.find(({ operation }) => operation === 'BUILD')!;
+    ciCheck.shell!.command = 'echo GRAPH_TEMPLATE_CI_FAIL; exit 23';
+    ciBuild.build!.buildLocation = 'MANAGER';
+    ciBuild.build!.buildCommand = 'echo GRAPH_TEMPLATE_BUILD_BLOCKED';
+    ciBuild.build!.artifacts![0]!.path = 'app.jar';
+    const ciDraft = (
+      await api
+        .put('/api/v1' + graphPath + '/draft')
+        .send({ expectedRevision: fixedDraft.revision, definition: { canvas: ci.canvas } })
+        .expect(200)
+    ).body.data;
+    const ciVersion = (await create(graphPath + '/publish', { expectedRevision: ciDraft.revision }))
+      .publishedVersion;
+    const ciFlow = `${graphPath}/flows/${ci.startId}`;
+    const ciRequest = {
+      version: ciVersion,
+      inputs: {
+        parameters: {
+          repository: sharedRepo.id,
+          gitVersion: { kind: 'COMMIT', value: successfulCommit },
+        },
+      },
+    };
+    const ciPlan = await create(ciFlow + '/preview', ciRequest);
+    const ciQueued = await create(ciFlow + '/run', {
+      ...ciRequest,
+      idempotencyKey: randomUUID(),
+      expectedConfigurationHash: ciPlan.configurationHash,
+    });
+    const ciFailed = await waitGraph(ciQueued.id);
+    const findCiNode = (id: string) =>
+      ciFailed.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === id);
+    assert.equal(ciFailed.status, 'FAILED');
+    assert.equal(findCiNode(ciCheck.id).status, 'FAILED');
+    assert.equal(findCiNode(ciBuild.id).status, 'SKIPPED');
+    assert.equal(findCiNode(ciBuild.id).taskId, null);
+    assert.deepEqual(ciFailed.artifactIds, []);
+    const ciLog = (
+      await api.get(`/api/v1${graphPath}/runs/${ciFailed.id}/nodes/${ciCheck.id}/logs`).expect(200)
+    ).body.data;
+    assert.match(ciLog.content, /fixture check failed/);
 
     const archiveRevision = await create(managedPath, { source: 'ARCHIVE', expectedVersion: 2 });
     assert.equal(archiveRevision.version, 3);
