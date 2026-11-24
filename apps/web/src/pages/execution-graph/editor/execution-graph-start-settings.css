@@ -1,0 +1,53 @@
+.graph-start-setup {
+  gap: 0.85rem;
+}
+
+.graph-start-setup h4,
+.graph-start-resource-group p {
+  margin: 0;
+}
+
+.graph-start-resource-group,
+.graph-start-resource {
+  display: grid;
+  gap: 0.55rem;
+  min-inline-size: 0;
+}
+
+.graph-start-resource-group {
+  border-block-start: 1px solid var(--border);
+  padding-block-start: 0.75rem;
+}
+
+.graph-start-resource .checkbox-row {
+  min-height: unset;
+  color: var(--muted);
+}
+
+.graph-start-resource :is(select, input) {
+  max-inline-size: 100%;
+}
+
+.graph-action-sources {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+}
+
+.graph-action-sources > div,
+.graph-action-sources dd {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  min-width: 0;
+  margin: 0;
+}
+
+.graph-action-sources dt {
+  color: var(--muted);
+}
+
+.graph-action-sources .button {
+  overflow-wrap: anywhere;
+}

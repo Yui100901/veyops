@@ -77,6 +77,8 @@ export interface GraphField {
   type: GraphFieldType;
   required?: boolean;
   multiple?: boolean;
+  runtimeOverride?: boolean;
+  purpose?: 'BUILD_TARGETS' | 'RELEASE_TARGETS';
   defaultValue?: unknown;
   selection?: 'LATEST_COMPATIBLE';
   artifactType?: GraphArtifactType;
@@ -242,6 +244,7 @@ export type GraphEnvironmentSetSummary = { id: string; name: string; revision: n
 export interface GraphNode {
   id: string;
   type: keyof typeof graphNodeLabels;
+  contract?: 'PRESET';
   operation?: GraphOperation;
   inputDefaults?: Record<string, unknown>;
   environmentDefaults?: Record<string, string>;
@@ -306,6 +309,7 @@ export interface GraphFlow extends FlowBindings {
   name: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
+  compiled?: { nodes: Record<string, { inputBindings?: Record<string, GraphBinding> }> };
 }
 export interface GraphEndpoint extends FlowBindings {
   startId: string;

@@ -180,6 +180,51 @@ export class ExecutionGraphsService {
       .executeTakeFirstOrThrow();
   }
 
+  async publicationImpact(projectId: string, expectedRevision: number) {
+    await requireProject(this.database.db, projectId);
+    const graph = await this.graph(projectId);
+    this.checkRevision(graph.revision, expectedRevision);
+    const draft = JSON.parse(graph.draft_json) as GraphDefinition;
+    const definition = draft.canvas ? compileCanvas(draft.canvas, true) : draft;
+    const prior = graph.published_version
+      ? (JSON.parse(
+          (await this.publishedVersion(this.database.db, graph.id, graph.published_version))
+            .definition_json,
+        ) as GraphDefinition)
+      : { flows: [] };
+    const previous = new Map(prior.flows.map((flow) => [flow.id, flow] as const));
+    const next = new Map(definition.flows.map((flow) => [flow.id, flow] as const));
+    const rules = await this.database.db
+      .selectFrom('execution_graph_triggers')
+      .select(['flow_id', 'name', 'config_json'])
+      .where('project_id', '=', projectId)
+      .where('enabled', '=', 1)
+      .orderBy('name')
+      .execute();
+    const changed = [...new Set([...next.keys(), ...previous.keys()])].flatMap((id) => {
+      const before = previous.get(id);
+      const after = next.get(id);
+      if (JSON.stringify(before) === JSON.stringify(after)) return [];
+      return [
+        {
+          id,
+          name: (after ?? before)!.name,
+          change: !before ? 'ADDED' : !after ? 'REMOVED' : 'CHANGED',
+          triggers: rules
+            .filter(
+              (rule) => rule.flow_id === id || JSON.parse(rule.config_json).upstreamFlowId === id,
+            )
+            .map(({ name }) => name),
+        },
+      ];
+    });
+    return {
+      revision: graph.revision,
+      version: (graph.published_version ?? 0) + 1,
+      flows: changed,
+    };
+  }
+
   async publish(projectId: string, expectedRevision: number, userId: string) {
     await requireProject(this.database.db, projectId);
     const candidate = await this.graph(projectId);

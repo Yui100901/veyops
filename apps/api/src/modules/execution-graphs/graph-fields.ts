@@ -90,6 +90,10 @@ export class GraphField {
   @IsIn(Object.keys(graphFieldTypes)) type!: GraphFieldType;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() required?: boolean;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() multiple?: boolean;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() runtimeOverride?: boolean;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsIn(['BUILD_TARGETS', 'RELEASE_TARGETS'])
+  purpose?: 'BUILD_TARGETS' | 'RELEASE_TARGETS';
   @Allow() defaultValue?: unknown;
   @Allow() options?: unknown[];
   @ValidateIf((_o, v) => v !== undefined)
@@ -319,6 +323,19 @@ export function validateGraphField(
     return '字段名称、类型或标识无效';
   if (field.source && (declaration !== 'OUTPUT' || field.type !== 'ARTIFACT'))
     return '仅输出产物可以选择本次运行的来源约束';
+  if (
+    field.runtimeOverride !== undefined &&
+    (functional || declaration !== 'INPUT' || typeof field.runtimeOverride !== 'boolean')
+  )
+    return '运行时覆盖只能在开始节点参数配置';
+  if (
+    field.purpose !== undefined &&
+    (functional ||
+      declaration !== 'INPUT' ||
+      field.type !== 'TARGETS' ||
+      !['BUILD_TARGETS', 'RELEASE_TARGETS'].includes(field.purpose))
+  )
+    return '构建或发布目标用途只适用于开始节点目标参数';
   if (field.selection && (declaration !== 'INPUT' || field.type !== 'ARTIFACT'))
     return '仅产物输入可以使用最新兼容产物规则';
   if (declaration === 'OUTPUT' && field.type === 'CREDENTIAL') return '凭据引用仅可用于执行输入';

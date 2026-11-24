@@ -18,10 +18,12 @@ export function BuildFields({
   value,
   canEdit,
   change,
+  useStartDefaults,
 }: {
   section: 'input' | 'execution' | 'output';
   value: FlowBuildDefinition;
   canEdit: boolean;
+  useStartDefaults?: boolean;
   change: (value: FlowBuildDefinition) => void;
 }) {
   const hasNamedOutputs = !!value.artifacts?.length;
@@ -124,21 +126,26 @@ export function BuildFields({
     );
   return (
     <div className="form-grid graph-preset-fields">
-      <Field label="构建位置">
-        <select
-          disabled={!canEdit}
-          value={value.buildLocation ?? ''}
-          onChange={(e) =>
-            patch({
-              buildLocation: (e.target.value || undefined) as FlowBuildDefinition['buildLocation'],
-            })
-          }
-        >
-          <option value="">项目默认设置</option>
-          <option value="TARGET">目标服务器</option>
-          <option value="MANAGER">管理端隔离构建</option>
-        </select>
-      </Field>
+      {useStartDefaults ? (
+        <p className="field-note">构建位置在开始节点设置。</p>
+      ) : (
+        <Field label="构建位置">
+          <select
+            disabled={!canEdit}
+            value={value.buildLocation ?? ''}
+            onChange={(e) =>
+              patch({
+                buildLocation: (e.target.value ||
+                  undefined) as FlowBuildDefinition['buildLocation'],
+              })
+            }
+          >
+            <option value="">项目默认设置</option>
+            <option value="TARGET">目标服务器</option>
+            <option value="MANAGER">管理端隔离构建</option>
+          </select>
+        </Field>
+      )}
       <Text
         label="源码目录"
         placeholder="."

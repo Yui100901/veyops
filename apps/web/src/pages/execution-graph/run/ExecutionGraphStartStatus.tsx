@@ -90,11 +90,13 @@ export function ExecutionGraphStartStatus({
                 .join(' · ');
               const resource = issue.resourceType && resourceLabels[issue.resourceType];
               const reason =
-                issue.reason === 'NO_AVAILABLE_OPTIONS'
-                  ? resource
-                    ? `没有可选的${resource}。`
-                    : '没有可选值。'
-                  : `引用的${resource ?? '资源'}已不可用。`;
+                issue.reason === 'FIXED_INPUT_MISSING'
+                  ? '请在开始节点配置固定输入。'
+                  : issue.reason === 'NO_AVAILABLE_OPTIONS'
+                    ? resource
+                      ? `没有可选的${resource}。`
+                      : '没有可选值。'
+                    : `引用的${resource ?? '资源'}已不可用。`;
               const field = startFields?.find(({ id }) => id === issue.fieldId && issue.fieldName);
               const setupIssue: GraphSetupIssue | undefined =
                 issue.resourceType === 'REPOSITORY'

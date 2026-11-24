@@ -7,9 +7,13 @@ import type {
   DeploymentSelection,
   ProjectDetail,
   Repository,
+  Server,
   Service,
 } from '../../../models';
-import { DeploymentSelectionPicker, useDeploymentInventory } from '../../delivery/DeploymentSelection';
+import {
+  DeploymentSelectionPicker,
+  useDeploymentInventory,
+} from '../../delivery/DeploymentSelection';
 import {
   artifactInstanceId,
   artifactKindLabel,
@@ -18,7 +22,10 @@ import {
   type Artifact,
   type ArtifactRef,
 } from '../../delivery/Delivery';
-import { BranchSyncControls, useRepositoryBranches } from '../../projects/repositories/RepositoryBranches';
+import {
+  BranchSyncControls,
+  useRepositoryBranches,
+} from '../../projects/repositories/RepositoryBranches';
 import { GraphResourceDialog } from '../GraphResourceDialog';
 import { GraphResourceContext } from '../graph-resource-context';
 import { graphPresetTypePatch, matchingGraphPreset, presetReference } from './graph-field-presets';
@@ -431,8 +438,34 @@ function ArtifactValue({
   );
 }
 
-function TargetsValue({ project, field, value, change, disabled }: ValueProps) {
-  const inventory = useDeploymentInventory();
+function TargetsValue({ project, field, value, change, disabled, checkRequired }: ValueProps) {
+  const single = field.purpose === 'BUILD_TARGETS';
+  const inventory = useDeploymentInventory(!single);
+  const constructionServers = useResource<Server[]>(single ? '/servers' : null);
+  if (single) {
+    const selection = value as DeploymentSelection | undefined;
+    const selected =
+      selection?.serverIds?.length === 1 && !selection.groupIds?.length
+        ? selection.serverIds[0]
+        : undefined;
+    return (
+      <>
+        <ResourceSelect
+          label={field.name}
+          options={constructionServers.data ?? []}
+          value={selected}
+          change={(id) => change(id ? { serverIds: [id] } : undefined)}
+          disabled={disabled || constructionServers.loading}
+          required={checkRequired && field.required}
+          empty="采用平台执行配置"
+        />
+        {!selected && Boolean(selection?.serverIds?.length || selection?.groupIds?.length) && (
+          <p className="field-note">原有构建目标含多台服务器或分组，可改为一台服务器。</p>
+        )}
+        <ErrorBanner error={constructionServers.error} retry={constructionServers.reload} />
+      </>
+    );
+  }
   return (
     <>
       <strong>{field.name}</strong>
@@ -628,6 +661,7 @@ export function GraphFieldEditor({
   disabled,
   change,
   title,
+  allowRuntimeOverride,
 }: {
   type: 'input' | 'output';
   fields: GraphField[];
@@ -636,6 +670,7 @@ export function GraphFieldEditor({
   disabled?: boolean;
   change: (fields: GraphField[]) => void;
   title?: string;
+  allowRuntimeOverride?: boolean;
 }) {
   const [preset, setPreset] = useState('');
   const isInput = type === 'input';
@@ -786,6 +821,17 @@ export function GraphFieldEditor({
                 自动选择最新兼容产物
               </label>
             )}
+            {isInput && allowRuntimeOverride && (
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  disabled={disabled}
+                  checked={field.runtimeOverride !== false}
+                  onChange={(event) => patch(field.id, { runtimeOverride: event.target.checked })}
+                />
+                允许运行时修改
+              </label>
+            )}
             {isInput &&
               !field.selection &&
               [
@@ -930,6 +976,7 @@ export function GraphBindingField({
   directSource,
   nodeDefaults,
   referenceLookup,
+  allowFixedValue = true,
 }: {
   field: GraphField;
   choices: BindingChoice[];
@@ -946,6 +993,7 @@ export function GraphBindingField({
   directSource?: boolean;
   nodeDefaults?: boolean;
   referenceLookup?: boolean;
+  allowFixedValue?: boolean;
 }) {
   const [search, setSearch] = useState('');
   const selected = value ? bindingKey(value) : '';
@@ -1017,7 +1065,7 @@ export function GraphBindingField({
               {choiceLabel(choice)}
             </option>
           ))}
-          {(value?.kind === 'VALUE' || acceptsFixedGraphValue(field)) && (
+          {(value?.kind === 'VALUE' || (allowFixedValue && acceptsFixedGraphValue(field))) && (
             <option value="VALUE">当前执行流固定值</option>
           )}
           {(environment || allowEnvironmentKey) && (

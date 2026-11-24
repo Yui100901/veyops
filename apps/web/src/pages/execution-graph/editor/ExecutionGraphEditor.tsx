@@ -5,8 +5,11 @@ import { post, useResource, type GraphIssueLocation } from '../../../api';
 import { ErrorBanner, Field } from '../../../components';
 import type { ProjectDetail, Server } from '../../../models';
 import { graphDragType, NodeMap } from './ExecutionGraphCanvas';
+import { ExecutionGraphInputSummary } from './ExecutionGraphInputSummary';
+import { ExecutionGraphStartSettings, isStartBusinessField } from './ExecutionGraphStartSettings';
 import { ArtifactOutputEditor, BuildFields, DeployFields } from './ExecutionGraphPresets';
-import { GraphFieldEditor, useProjectEnvironmentSets } from './ExecutionGraphFields';
+import { GraphFieldEditor, GraphFieldValue } from './ExecutionGraphFields';
+import { actionCardText, graphActionSources, startCardText } from './graph-action-sources';
 import {
   canCreateStartParameter,
   ExecutionGraphBindings,
@@ -160,6 +163,10 @@ export function ProjectGraphEditor({
     setFocusRequest(undefined);
   }, [insertedStartId]);
   const catalog = useResource<GraphCatalog>('/projects/' + project.id + '/execution-graph/catalog');
+  const triggers = useResource<{ flowId: string; enabled: boolean }[]>(
+    project.archived ? null : '/projects/' + project.id + '/execution-graph/triggers',
+    8000,
+  );
   const activeNode =
     selection?.kind === 'node' ? canvas.nodes.find(({ id }) => id === selection.id) : undefined;
   const missingRepairNode = Boolean(
@@ -180,6 +187,13 @@ export function ProjectGraphEditor({
   }>();
   const activePair =
     activeNode && selectedPath?.nodes.has(activeNode.id) ? selectedPair : undefined;
+  const inspectedStartScope =
+    activeNode?.type === 'START'
+      ? (selectedPath?.nodes ?? reachable(canvas, activeNode.id))
+      : undefined;
+  const useStartDefaults = Boolean(
+    activePair && canvas.nodes.find(({ id }) => id === activePair.startId)?.contract === 'PRESET',
+  );
   const repairBinding =
     parameterRepair && activePair?.startId === parameterRepair.startId
       ? activePair.inputBindings?.[parameterRepair.consumerId]?.[parameterRepair.portId]
@@ -432,7 +446,7 @@ export function ProjectGraphEditor({
     const kind = payload.startsWith('type:') ? (payload.slice(5) as NodeType) : undefined;
     const node =
       kind && Object.hasOwn(graphNodeLabels, kind)
-        ? makeNode(kind, project)
+        ? makeNode(kind)
         : canvas.templates.find(({ id }) => payload === 'template:' + id);
     if (node) addNode(node, position);
   }
@@ -677,7 +691,7 @@ export function ProjectGraphEditor({
   }
   function selectNode(id: string) {
     select({ kind: 'node', id });
-    if (activeNode?.id !== id) setTab('input');
+    if (activeNode?.id !== id) setTab('execution');
     setFocusRequest(undefined);
     setDiagnosticEdge(undefined);
     setReveal(undefined);
@@ -691,6 +705,27 @@ export function ProjectGraphEditor({
     setConnector(undefined);
     setSource(undefined);
     setError('');
+  }
+  function actionSources(node: GraphNode, pair?: GraphEndpoint) {
+    if (!pair) return [];
+    const start = canvas.nodes.find(({ id }) => id === pair.startId);
+    const automatic =
+      catalogSnapshot?.canvas === canvas
+        ? catalogSnapshot.flows?.[pair.startId]?.nodes[node.id]?.automaticInputBindings
+        : undefined;
+    return graphActionSources(start, canvas.nodes, {
+      ...automatic,
+      ...pair.inputBindings?.[node.id],
+    });
+  }
+  function summarizeNode(node: GraphNode) {
+    if (node.type === 'START')
+      return startCardText(
+        node,
+        project,
+        triggers.data?.filter(({ flowId, enabled }) => enabled && flowId === node.id).length,
+      );
+    if (selectedPath?.nodes.has(node.id)) return actionCardText(actionSources(node, selectedPair));
   }
   function selectEdge(index: number) {
     select({ kind: 'edge', index });
@@ -776,7 +811,7 @@ export function ProjectGraphEditor({
         draggable
         className="graph-palette-node"
         onDragStart={(event) => drag(event, 'type:' + type)}
-        onClick={() => addNode(makeNode(type, project))}
+        onClick={() => addNode(makeNode(type))}
       >
         <Plus size={14} />
         {label}
@@ -883,7 +918,7 @@ export function ProjectGraphEditor({
                   <button
                     type="button"
                     className="button secondary small"
-                    onClick={() => createTemplate(makeNode(templateType, project))}
+                    onClick={() => createTemplate(makeNode(templateType))}
                   >
                     <Plus size={15} />
                     新建项目模板
@@ -997,6 +1032,7 @@ export function ProjectGraphEditor({
             reveal={reveal}
             onHighlight={hover}
             onSelect={selectNode}
+            nodeSummary={summarizeNode}
             onMove={
               canEdit
                 ? (id, position) =>
@@ -1091,6 +1127,21 @@ export function ProjectGraphEditor({
               )}
             {isFunction ? (
               <>
+                {activeNode && (
+                  <ExecutionGraphInputSummary
+                    entries={actionSources(activeNode, activePair)}
+                    onSource={(target) => {
+                      selectNode(target.nodeId);
+                      setReveal({ nodeId: target.nodeId });
+                      if (target.fieldId)
+                        setFocusRequest({
+                          nodeId: target.nodeId,
+                          fieldId: target.fieldId,
+                          fieldSection: target.section,
+                        });
+                    }}
+                  />
+                )}
                 <nav className="graph-inspector-tabs" aria-label="功能节点配置">
                   {(Object.keys(functionalTabs) as FunctionalTab[]).map((item) => (
                     <button
@@ -1099,7 +1150,9 @@ export function ProjectGraphEditor({
                       aria-pressed={tab === item}
                       onClick={() => setTab(item)}
                     >
-                      {functionalTabs[item]}
+                      {item === 'input' && effectiveNodeType(inspected) !== 'SHELL'
+                        ? '数据来源'
+                        : functionalTabs[item]}
                     </button>
                   ))}
                 </nav>
@@ -1111,9 +1164,8 @@ export function ProjectGraphEditor({
                       canvas={canvas}
                       canEdit={canEdit}
                       patch={patch}
-                      selectOperation={(operation) =>
-                        patch(changeOperation(inspected, operation, project))
-                      }
+                      useStartDefaults={useStartDefaults}
+                      selectOperation={(operation) => patch(changeOperation(inspected, operation))}
                     />
                   ) : (
                     <>
@@ -1163,9 +1215,29 @@ export function ProjectGraphEditor({
             )}
             {activeNode?.type === 'START' && (
               <>
+                <ExecutionGraphStartSettings
+                  node={activeNode}
+                  flowNodes={canvas.nodes.filter(({ id }) => inspectedStartScope?.has(id))}
+                  endpoint={activePair}
+                  project={project}
+                  canEdit={canEdit}
+                  change={(inputs, endpoint) => {
+                    if (!endpoint) patch({ inputs });
+                    else
+                      onChange({
+                        ...canvas,
+                        nodes: canvas.nodes.map((item) =>
+                          item.id === activeNode.id ? { ...item, inputs } : item,
+                        ),
+                        endpoints: canvas.endpoints.map((item) =>
+                          item.startId === endpoint.startId ? endpoint : item,
+                        ),
+                      });
+                  }}
+                />
                 {renderStart?.(activeNode.id)}
                 <StartEnvironmentFields
-                  projectId={project.id}
+                  project={project}
                   node={activeNode}
                   canEdit={canEdit}
                   patch={patch}
@@ -1178,8 +1250,18 @@ export function ProjectGraphEditor({
                     type="input"
                     disabled={!canEdit}
                     title="运行参数"
-                    fields={activeNode.inputs ?? []}
-                    change={(inputs) => patch({ inputs })}
+                    fields={(activeNode.inputs ?? []).filter(
+                      (field) => !isStartBusinessField(field),
+                    )}
+                    allowRuntimeOverride
+                    change={(inputs) =>
+                      patch({
+                        inputs: [
+                          ...(activeNode.inputs ?? []).filter(isStartBusinessField),
+                          ...inputs,
+                        ],
+                      })
+                    }
                   />
                 </details>
                 <details className="graph-field-card">
@@ -1190,7 +1272,7 @@ export function ProjectGraphEditor({
                     canEdit={canEdit}
                     assign={assignEnd}
                   />
-                  {selectedPair?.startId === activeNode.id && (
+                  {activeNode.contract !== 'PRESET' && selectedPair?.startId === activeNode.id && (
                     <Field label="此流关联发布的服务（可选）">
                       <select
                         value={selectedPair.serviceId ?? ''}
@@ -1505,142 +1587,56 @@ interface FieldsProps {
 
 function StartEnvironmentFields({
   node,
-  projectId,
+  project,
   canEdit,
   patch,
-}: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'> & { projectId: string }) {
-  const configuration = node.environmentSet ?? { mode: 'NONE' as const };
-  const sets = useProjectEnvironmentSets(projectId, configuration.mode !== 'NONE');
-  const fields = (node.inputs ?? []).filter(
-    ({ type, multiple }) => type === 'ENVIRONMENT_SET' && !multiple,
-  );
-  const field =
-    configuration.mode === 'INPUT'
-      ? fields.find(({ id }) => id === configuration.fieldId)
-      : undefined;
-  function addParameter() {
-    const id = node.inputs?.some((input) => input.id === 'environmentSetId')
-      ? graphKey('field')
-      : 'environmentSetId';
-    patch({
-      inputs: [
-        ...(node.inputs ?? []),
-        { id, name: '变量集合', type: 'ENVIRONMENT_SET', required: true },
-      ],
-      environmentSet: { mode: 'INPUT', fieldId: id },
-    });
+}: Pick<FieldsProps, 'node' | 'project' | 'canEdit' | 'patch'>) {
+  const configuration = node.environmentSet;
+  const fields = node.inputs ?? [];
+  const id =
+    (configuration?.mode === 'INPUT' ? configuration.fieldId : undefined) ?? 'environmentSet';
+  const field = fields.find((item) => item.id === id && item.type === 'ENVIRONMENT_SET');
+  const value =
+    configuration?.mode === 'FIXED' ? configuration.environmentSetId : field?.defaultValue;
+  const runtimeOverride = field ? field.runtimeOverride !== false : false;
+
+  function configure(defaultValue: unknown, allowOverride: boolean) {
+    const other = fields.filter((item) => item.id !== id);
+    if (defaultValue === undefined && !allowOverride) {
+      patch({ inputs: other, environmentSet: { mode: 'NONE' } });
+      return;
+    }
+    const input: GraphField = {
+      ...field,
+      id,
+      name: '变量集合',
+      type: 'ENVIRONMENT_SET',
+      required: false,
+      defaultValue,
+      runtimeOverride: allowOverride,
+    };
+    patch({ inputs: [...other, input], environmentSet: { mode: 'INPUT', fieldId: id } });
   }
+
   return (
-    <section className="graph-fields">
+    <section className="graph-properties" aria-label="变量集合" data-graph-node-field={id}>
       <h4>变量集合</h4>
-      <Field label="变量集合引用" hint="变量集合仅提供变量。构建和发布目标在各自节点配置。">
-        <select
-          data-graph-node-field="environmentSet"
+      <GraphFieldValue
+        project={project}
+        field={{ id, name: '变量集合', type: 'ENVIRONMENT_SET', required: false }}
+        value={value}
+        disabled={!canEdit}
+        change={(next) => configure(next, runtimeOverride)}
+      />
+      <label className="checkbox-row">
+        <input
+          type="checkbox"
           disabled={!canEdit}
-          value={configuration.mode}
-          onChange={(event) => {
-            if (event.target.value === 'NONE') patch({ environmentSet: { mode: 'NONE' } });
-            else if (event.target.value === 'FIXED') patch({ environmentSet: { mode: 'FIXED' } });
-            else if (fields.length)
-              patch({ environmentSet: { mode: 'INPUT', fieldId: fields[0].id } });
-            else addParameter();
-          }}
-        >
-          <option value="NONE">无引用，使用项目公共变量</option>
-          <option value="FIXED">固定变量集合</option>
-          <option value="INPUT">由运行或触发器选择</option>
-        </select>
-      </Field>
-      {configuration.mode === 'FIXED' && (
-        <Field label="固定变量集合">
-          <select
-            disabled={!canEdit || sets.loading}
-            value={configuration.environmentSetId ?? ''}
-            onChange={(event) =>
-              patch({
-                environmentSet: {
-                  mode: 'FIXED',
-                  environmentSetId: event.target.value || undefined,
-                },
-              })
-            }
-          >
-            <option value="">请选择</option>
-            {configuration.environmentSetId &&
-              !sets.data?.some(({ id }) => id === configuration.environmentSetId) && (
-                <option value={configuration.environmentSetId} disabled>
-                  原有变量集合不可用
-                </option>
-              )}
-            {sets.data?.map(({ id, name }) => (
-              <option key={id} value={id}>
-                {name}
-              </option>
-            ))}
-          </select>
-        </Field>
-      )}
-      {configuration.mode === 'INPUT' && (
-        <>
-          <Field label="变量集合参数">
-            <select
-              disabled={!canEdit}
-              value={field?.id ?? ''}
-              onChange={(event) =>
-                patch({
-                  environmentSet: { mode: 'INPUT', fieldId: event.target.value || undefined },
-                })
-              }
-            >
-              <option value="">请选择</option>
-              {fields.map(({ id, name }) => (
-                <option key={id} value={id}>
-                  {name}
-                </option>
-              ))}
-            </select>
-          </Field>
-          {!fields.length && canEdit && (
-            <button className="button secondary small" type="button" onClick={addParameter}>
-              添加变量集合参数
-            </button>
-          )}
-          {field && (
-            <Field label="允许选择的集合" hint="可多选，清空表示允许本项目的所有集合。">
-              <select
-                multiple
-                size={Math.max(2, Math.min(5, (sets.data ?? []).length))}
-                disabled={!canEdit || sets.loading}
-                value={field.options?.map(String) ?? []}
-                onChange={(event) => {
-                  const ids = Array.from(event.target.selectedOptions, ({ value }) => value);
-                  patch({
-                    inputs: node.inputs?.map((item) =>
-                      item.id === field.id
-                        ? {
-                            ...item,
-                            options: ids.length ? ids : undefined,
-                            defaultValue:
-                              !ids.length || ids.includes(String(item.defaultValue))
-                                ? item.defaultValue
-                                : undefined,
-                          }
-                        : item,
-                    ),
-                  });
-                }}
-              >
-                {sets.data?.map(({ id, name }) => (
-                  <option key={id} value={id}>
-                    {name}
-                  </option>
-                ))}
-              </select>
-            </Field>
-          )}
-        </>
-      )}
-      <ErrorBanner error={sets.error} retry={sets.reload} />
+          checked={runtimeOverride}
+          onChange={(event) => configure(value, event.target.checked)}
+        />
+        允许运行时选择变量集合
+      </label>
     </section>
   );
 }
@@ -1767,12 +1763,8 @@ function NodeIdentity({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canE
   );
 }
 
-function changeOperation(
-  node: GraphNode,
-  operation: GraphOperation,
-  project: ProjectDetail,
-): Partial<GraphNode> {
-  const next = makeNode(operation, project, false);
+function changeOperation(node: GraphNode, operation: GraphOperation): Partial<GraphNode> {
+  const next = makeNode(operation);
   return {
     type: 'FUNCTION',
     operation,
@@ -1844,8 +1836,10 @@ function NodeOperationFields({
   canEdit,
   patch,
   selectOperation,
+  useStartDefaults,
 }: Omit<FieldsProps, 'catalog'> & {
   selectOperation?: (operation: GraphOperation) => void;
+  useStartDefaults?: boolean;
 }) {
   const operation = effectiveNodeType(node);
   const downstream =
@@ -1889,18 +1883,47 @@ function NodeOperationFields({
         </Field>
       )}
       {operation === 'CHECKOUT' && (
-        <p className="field-note">
-          仓库、Git 版本和拉取方式在「输入」中声明，实际检出的提交会写入输出。
-        </p>
+        <>
+          <p className="field-note">
+            从开始配置或选定来源取得仓库与 Git 版本，记录实际检出的提交。
+          </p>
+          <Field label="拉取深度">
+            <select
+              disabled={!canEdit}
+              value={
+                node.checkout?.fullClone || node.inputDefaults?.fetchMode === 'FULL'
+                  ? 'FULL'
+                  : 'LATEST'
+              }
+              onChange={(event) => {
+                const inputs = { ...node.inputDefaults };
+                delete inputs.fetchMode;
+                patch({
+                  checkout: { ...node.checkout, fullClone: event.target.value === 'FULL' },
+                  inputDefaults: inputs,
+                });
+              }}
+            >
+              <option value="LATEST">只拉取选定提交</option>
+              <option value="FULL">拉取完整历史</option>
+            </select>
+          </Field>
+        </>
       )}
       {(operation === 'SHELL' || operation === 'CHECK') && (
-        <ShellFields node={node} canEdit={canEdit} patch={patch} />
+        <ShellFields
+          node={node}
+          canEdit={canEdit}
+          patch={patch}
+          useStartDefaults={useStartDefaults}
+        />
       )}
       {operation === 'BUILD' && (
         <BuildFields
           section="execution"
           value={node.build ?? {}}
           canEdit={canEdit}
+          useStartDefaults={useStartDefaults}
           change={(build) => patch({ build })}
         />
       )}
@@ -2247,25 +2270,37 @@ function SwitchFields({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canE
   );
 }
 
-function ShellFields({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'>) {
-  const servers = useResource<Server[]>('/servers');
+function ShellFields({
+  node,
+  canEdit,
+  patch,
+  useStartDefaults,
+}: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'> & { useStartDefaults?: boolean }) {
   const shell = node.shell ?? {};
+  const chooseServer = !useStartDefaults && shell.location !== 'MANAGER';
+  const servers = useResource<Server[]>(chooseServer ? '/servers' : null);
   return (
     <>
       <ErrorBanner error={servers.error} retry={servers.reload} />
       <Field label="执行位置">
         <select
           disabled={!canEdit}
-          value={shell.location ?? 'TARGET'}
+          value={shell.location ?? ''}
           onChange={(event) =>
-            patch({ shell: { ...shell, location: event.target.value as 'MANAGER' | 'TARGET' } })
+            patch({
+              shell: {
+                ...shell,
+                location: (event.target.value || undefined) as 'MANAGER' | 'TARGET' | undefined,
+              },
+            })
           }
         >
+          <option value="">继承可用的开始执行位置</option>
           <option value="MANAGER">管理端</option>
           <option value="TARGET">目标服务器</option>
         </select>
       </Field>
-      {shell.location !== 'MANAGER' && (
+      {chooseServer && (
         <Field label="执行服务器" hint="可在当前流绑定目标。">
           <select
             data-graph-node-field="targets"

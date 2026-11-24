@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Box, FolderGit2, Pencil, Plus, Trash2 } from 'lucide-react';
 import { formatTime, message, navigate, remove, useResource } from '../../api';
 import { Confirm, ErrorBanner, Loading, Section, Status } from '../../components';
-import type { DeploymentSummary, ProjectDetail, Repository, Service, User } from '../../models';
+import type { ProjectDetail, Repository, Service, User } from '../../models';
 import { RepositoryBinding } from './repositories/RepositoryBinding';
 import { ExecutionGraphStartList } from '../execution-graph/run/ExecutionGraphStartStatus';
 import { ProjectEnvironment } from './environments/ProjectEnvironment';
@@ -12,7 +12,7 @@ import { ProjectRepositoryEditor } from './repositories/ProjectRepositoryEditor'
 import { ProjectServiceEditor } from './ProjectServiceEditor';
 import { RepositoryDetails } from './repositories/RepositoryBrowser';
 import { repositoryBranchLabel } from './repositories/RepositoryBranches';
-import { DeploymentHistory } from '../infrastructure/ServerResources';
+import { ProjectServiceDelivery } from './delivery/ProjectServiceDelivery';
 import { deliveryPath } from '../delivery/delivery-route';
 import type { GraphDocument, GraphRun } from '../execution-graph/execution-graph-definition';
 import { graphResourcePanel, graphStartHref } from '../execution-graph/graph-workbench-context';
@@ -516,9 +516,6 @@ function ServiceDetails({
   const repos = useResource<{ repositoryId: string; repoPath: string; isPrimary: boolean }[]>(
     `/services/${serviceId}/repositories`,
   );
-  const deployments = useResource<DeploymentSummary[]>(
-    `/projects/${id}/services/${serviceId}/recent-deployments`,
-  );
   const recentRuns = useResource<GraphRun[]>(
     `/projects/${id}/services/${serviceId}/recent-graph-runs`,
   );
@@ -536,7 +533,7 @@ function ServiceDetails({
         </div>
         <div className="row-actions">
           <a className="button secondary small" href={'#' + deliveryPath(id, 'artifacts', scope)}>
-            查看服务产物
+            {user.role === 'VIEWER' || project.archived ? '查看服务产物' : '选择历史产物部署'}
           </a>
         </div>
       </Section>
@@ -647,28 +644,7 @@ function ServiceDetails({
           <p className="mini-empty">这个服务还没有执行流运行记录。</p>
         ) : null}
       </Section>
-      <Section
-        title="最近发布"
-        action={
-          <a className="text-link" href={'#' + deliveryPath(id, 'deployments', scope)}>
-            查看部署历史 →
-          </a>
-        }
-      >
-        <ErrorBanner error={deployments.error} retry={deployments.reload} />
-        {deployments.loading ? (
-          <Loading />
-        ) : (
-          !deployments.error && (
-            <DeploymentHistory
-              rows={deployments.data ?? []}
-              resolveName={(row) =>
-                project.environments.find(({ id }) => id === row.environmentId)?.name || '查看任务'
-              }
-            />
-          )
-        )}
-      </Section>
+      <ProjectServiceDelivery projectId={id} serviceId={serviceId} />
     </>
   );
 }

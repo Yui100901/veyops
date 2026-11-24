@@ -1,4 +1,3 @@
-import type { ProjectDetail } from '../../../models';
 import { placeFlowTemplate } from './ExecutionGraphCanvas';
 import {
   effectiveNodeType,
@@ -15,66 +14,16 @@ import type {
   GraphOperation,
 } from '../execution-graph-definition';
 
-export function makeNode(
-  type: GraphNode['type'],
-  project: ProjectDetail,
-  preset = true,
-): GraphNode {
+export function makeNode(type: GraphNode['type']): GraphNode {
   const name = graphNodeLabels[type];
   const operation = type === 'FUNCTION' ? 'SHELL' : type;
-  const repo = project.repositories.length === 1 ? project.repositories[0] : undefined;
   return authoredNode({
     id: graphKey('node'),
     type,
     name,
+    ...(type === 'START' && { contract: 'PRESET' as const }),
     ...(type === 'LOG' && { message: name }),
-    ...(operation === 'SHELL' || operation === 'CHECK'
-      ? { shell: { location: 'MANAGER' as const, timeout: 180 } }
-      : {}),
-    ...(preset && type === 'BUILD' && repo && { inputDefaults: { repository: repo.id } }),
-    ...(preset &&
-      type === 'CHECKOUT' && {
-        inputs: [
-          {
-            id: 'repository',
-            name: '项目仓库',
-            referenceName: 'GIT_REPOSITORY',
-            type: 'REPOSITORY' as const,
-            required: true,
-            defaultValue: repo?.cloneUrl,
-          },
-          {
-            id: 'fetchMode',
-            name: '拉取方式',
-            referenceName: 'GIT_FETCH_MODE',
-            type: 'GIT_FETCH_MODE' as const,
-            required: true,
-            defaultValue: 'LATEST',
-          },
-        ],
-        outputs: [
-          {
-            id: 'commitSha',
-            name: '检出提交',
-            referenceName: 'GIT_COMMIT_SHA',
-            type: 'TEXT' as const,
-            required: true,
-          },
-        ],
-      }),
-    ...(preset &&
-      type === 'REGISTER_ARTIFACT' && {
-        inputs: [
-          {
-            id: 'path',
-            name: '产物目录',
-            referenceName: 'ARTIFACT_DIR',
-            type: 'PATH' as const,
-            required: true,
-            defaultValue: './dist',
-          },
-        ],
-      }),
+    ...(operation === 'SHELL' || operation === 'CHECK' ? { shell: { timeout: 180 } } : {}),
     ...(type === 'BUILD' && { build: {} }),
     ...(type === 'LOAD_ENV' ? { loadEnvironment: { required: true } } : {}),
     ...(type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT'

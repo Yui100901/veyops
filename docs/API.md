@@ -174,6 +174,8 @@
 | `POST /versions/:version/retire` | 管理员或操作员停用旧发布版。先发布替代版本，再停用绑定该旧版的启用触发器。返回 `{version,retiredAt}`。停用版保留定义和运行历史，在途计划继续保护其资源。 |
 | `POST /versions/:version/restore` | 提交 `{expectedRevision}`，将发布版本载入草稿。 |
 | `POST /flows/:flowId/preview` | 提交 `{version,inputs:{parameters}}`。返回 `configurationHash`、`planSections`、参数和来源、`environmentSet`、`checkouts`、`deliveries`、图内审核及保护节点 `gates` 与节点端口证据。 |
+| `POST /flows/:flowId/run-defaults` | 提交 `{version,idempotencyKey}`。按最新发布版的默认值生成并确认计划，返回 `{outcome:"STARTED",runId,version}`。审批、回滚或源码审核要求显式确认时返回 `NEEDS_CONFIRMATION`。 |
+| `POST /publication-impact` | 提交 `{expectedRevision}`，返回准备发布的版本，以及新增、修改、移除的执行流和相关触发规则。 |
 | `POST /flows/:flowId/run` | 提交同样的版本和输入，附 `expectedConfigurationHash` 和 `idempotencyKey`。可原样传回 `planSections` 为 `expectedPlanSections`。配置变更返回 409，`error.changes` 给出失效字段或计划段落，重新预览后方可确认。相同确认可取回原运行。 |
 | `GET /runs`、`GET /runs/:runId` | 查询运行、任务和结束节点的 `outputs`。节点详情含 `inputs`、`environment`、`output`、逐目标状态和可定位的 `issue`。 |
 | `GET /runs/:runId/nodes/:nodeId/logs?offset=0` | 从字节偏移读取该节点日志，返回来源、摘要、状态、时间和下一偏移。 |
@@ -228,6 +230,8 @@ Shell 和检查的环境绑定可使用 `PROJECT_VALUE`，以 `source: {kind:"OU
 | `POST /restore` | 接受 `{cutoverId,confirmed:true}`。恢复最近一次切换的规则，返回 `suspendedTriggerIds` 供管理员核对需要保持停用的旧入口。 |
 
 草稿、资源或规则在确认前变化，或候选规则仍有待处理事件时返回 409。旧 Pipeline Webhook 仍启用时需先单独停用。已确认的在途运行沿用原图版本和快照。预演返回变量键、来源和敏感状态。
+
+构建发布工作台使用 `GET /delivery-flows` 按项目读取执行流名称、关联服务、草稿和发布状态、触发类型及最近运行。带参数运行只接收开始节点允许覆盖的字段。配置为固定默认值的字段同样禁止触发器映射。
 
 ### 执行图触发器
 
@@ -308,6 +312,7 @@ Shell 和检查的环境绑定可使用 `PROJECT_VALUE`，以 `source: {kind:"OU
 | GET  | /tasks                          | 最近100条任务                                                                            |
 | GET  | /tasks/:id                      | `{id,type,name,status,createdBy,createdAt,startedAt,finishedAt,errorSummary,result,...}` |
 | GET  | /tasks/:id/targets              | 每目标名称、Host、状态、退出码、错误摘要及 `canRetry`                                    |
+| GET  | /tasks/:id/command-reuse        | 管理员或原执行者可读取临时命令及上次确认的目标选择，用于重新预览和确认                                        |
 | GET  | /tasks/:id/steps                | 每目标步骤记录                                                                           |
 | GET  | /tasks/:id/logs?offset=0        | `{content,nextOffset}`；偏移单位字节，单次最多256 KiB                                    |
 | GET  | /tasks/:id/logs/stream?offset=0 | SSE，事件 `{content,nextOffset,status}`，id为偏移；支持Last-Event-ID                     |
@@ -480,3 +485,9 @@ API Key 不回显，更新时省略 Key 表示保留。AI 为空或禁用不会�
 | `PATCH /monitoring/servers/:id` | 管理员或运维员可更新单机 `enabled` 和首选 `interfaceName`，传 null 清除首选网卡。 |
 | `POST /monitoring/servers/:id/refresh` | 管理员或运维员刷新单机采样，同一台主机复用进行中的采集。关闭监控或采集并发已满时返回 409。 |
 | `POST /servers/configuration/compare` | 管理员或运维员传入不同服务器的 `baselineId` 和 `comparisonId`。每行 `EQUAL` 表示一致，`DIFFERENT` 表示有差异，`UNKNOWN` 表示至少一侧缺少事实。单侧 SSH 失败保留另一侧结果。 |
+## 服务门户与服务发布状态
+
+| 接口 | 权限与用途 |
+| --- | --- |
+| `GET /portal` | 登录用户可查看活动项目、服务、按配置排序的完整访问地址及发布状态摘要。可传 `q` 搜索项目、服务、地址名称和标签，或传 `tag`、`projectId`、`serviceId` 筛选。摘要包含最近尝试与当前版本的健康状态及已知观察时间。 |
+| `GET /projects/:id/services/:serviceId/delivery-status` | 登录用户可查看服务的逐目标当前发布和最近尝试。当前记录包括已确认激活的版本和需要核查的激活结果。响应关联发布、构建任务、产物及实际仓库提交。健康观察时间缺失的历史记录返回 `null`。 |

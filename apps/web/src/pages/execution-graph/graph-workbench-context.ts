@@ -1,7 +1,13 @@
 import type { ProjectDetail } from '../../models';
 import type { GraphIssueLocation } from '../../api';
-import { isReleaseNode } from './execution-graph-definition';
-import type { GraphBinding, GraphField, GraphFlow, GraphNode } from './execution-graph-definition';
+import { effectiveNodeType, isReleaseNode } from './execution-graph-definition';
+import type {
+  GraphArtifactType,
+  GraphBinding,
+  GraphField,
+  GraphFlow,
+  GraphNode,
+} from './execution-graph-definition';
 import type { DeliveryScope, DeliveryTab } from '../delivery/delivery-route';
 
 const resourcePanels = [
@@ -46,6 +52,8 @@ type GraphLocation = GraphWorkbenchScope &
     field?: string;
     returnStart?: string;
     returnField?: string;
+    artifactId?: string;
+    artifactType?: GraphArtifactType;
   };
 
 function queryPath(path: string, query: Record<string, string | number | null | undefined>) {
@@ -56,6 +64,30 @@ function queryPath(path: string, query: Record<string, string | number | null | 
 
 export function graphWorkbenchPath(projectId: string, location: GraphLocation = {}) {
   return queryPath(`/projects/${encodeURIComponent(projectId)}/execution-graph`, location);
+}
+
+export function releaseArtifactInput(flow: GraphFlow, artifactType?: GraphArtifactType) {
+  const inputIds = new Set<string>();
+  const collect = (binding: GraphBinding | undefined) => {
+    if (binding?.kind === 'INPUT') inputIds.add(binding.fieldId);
+    else if (binding?.kind === 'FIRST_AVAILABLE') binding.sources.forEach(collect);
+  };
+  for (const node of flow.nodes.filter((item) => effectiveNodeType(item) === 'DEPLOY_ARTIFACT'))
+    collect(
+      flow.compiled?.nodes[node.id]?.inputBindings?.artifact ??
+        flow.inputBindings?.[node.id]?.artifact,
+    );
+  const candidates = flow.nodes
+    .find(({ type }) => type === 'START')
+    ?.inputs?.filter(
+      (field) =>
+        field.type === 'ARTIFACT' &&
+        !field.multiple &&
+        field.runtimeOverride !== false &&
+        inputIds.has(field.id) &&
+        (!field.artifactType || !artifactType || field.artifactType === artifactType),
+    );
+  return candidates?.length === 1 ? candidates[0] : undefined;
 }
 
 export function graphStartHref(
@@ -143,7 +175,7 @@ const resourceKinds = {
 type ResourceType = keyof typeof resourceKinds;
 type ReadinessProject = Pick<ProjectDetail, (typeof resourceKinds)[ResourceType]>;
 export type GraphStartConfigurationIssue = {
-  reason: 'NO_AVAILABLE_OPTIONS' | 'RESOURCE_UNAVAILABLE';
+  reason: 'NO_AVAILABLE_OPTIONS' | 'RESOURCE_UNAVAILABLE' | 'FIXED_INPUT_MISSING';
   nodeId?: string;
   fieldId?: string;
   fieldName?: string;
@@ -306,7 +338,15 @@ export function graphStartReadiness(
         resourceId: parameters[id],
       });
     } else if (invalidResource || (missing && field.required !== false && !field.selection)) {
-      missingFields.push(field);
+      if (field.runtimeOverride === false)
+        issues.push({
+          reason: invalidResource ? 'RESOURCE_UNAVAILABLE' : 'FIXED_INPUT_MISSING',
+          nodeId: start?.id,
+          fieldId: id,
+          fieldName: name,
+          resourceType,
+        });
+      else missingFields.push(field);
     }
   }
 

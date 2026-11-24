@@ -483,6 +483,7 @@ export interface DeploymentRecordsTable {
   release_version: Generated<string | null>;
   deploy_path: Generated<string | null>;
   health_status: Generated<string | null>;
+  health_observed_at: Generated<number | null>;
   previous_deployment_id: Generated<string | null>;
   rollback_of_deployment_id: Generated<string | null>;
   release_snapshot_json: Generated<string | null>;

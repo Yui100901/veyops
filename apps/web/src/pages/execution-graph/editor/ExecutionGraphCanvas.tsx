@@ -183,6 +183,7 @@ export function NodeMap({
   onConnectSource,
   onConnectTarget,
   isRunnableStart,
+  nodeSummary,
 }: {
   flow: GraphFlow;
   selected?: string[];
@@ -204,6 +205,7 @@ export function NodeMap({
   onConnectSource?: (id: string) => void;
   onConnectTarget?: (id: string) => void;
   isRunnableStart?: (id: string) => boolean;
+  nodeSummary?: (node: GraphNode) => string | undefined;
 }) {
   const marker = useId();
   const [zoom, setZoom] = useState(100);
@@ -552,12 +554,15 @@ export function NodeMap({
                 height: cardHeight,
               };
               const className = `graph-node${highlighted?.has(node.id) ? ' graph-node-highlighted' : ''}${runnable ? ' graph-node-runnable' : ''}`;
+              const summary = nodeSummary?.(node);
               const label = (
                 <>
                   <Icon size={18} />
                   <span>
                     <strong>{node.name || '未命名节点'}</strong>
-                    <small>{runnable ? '开始 · 手动运行' : graphNodeTypeLabel(node)}</small>
+                    <small title={summary ?? undefined}>
+                      {summary || (runnable ? '开始 · 手动运行' : graphNodeTypeLabel(node))}
+                    </small>
                   </span>
                 </>
               );

@@ -1627,7 +1627,6 @@ async function checkDelivery(databaseUrl?: string) {
           {
             startId: 'auto-target-start',
             endId: 'auto-target-end',
-            serviceId: service.id,
             inputBindings: {
               'auto-target-check': { targets: input('targets') },
               'auto-target-build': { targets: input('targets') },

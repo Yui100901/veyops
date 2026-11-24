@@ -11,6 +11,7 @@ import { GraphNodeTasks } from './graph-node-tasks';
 import { GraphMigrationController } from './graph-migration.controller';
 import { GraphMigrationService } from './graph-migration.service';
 import { GraphReleaseInspectionService } from './graph-release-inspection.service';
+import { GraphFlowCatalogController } from './graph-flow-catalog.controller';
 
 @Module({
   imports: [PipelinesModule, CommandCenterModule],
@@ -20,6 +21,7 @@ import { GraphReleaseInspectionService } from './graph-release-inspection.servic
     GraphTriggersController,
     GraphTriggerHooksController,
     GraphMigrationController,
+    GraphFlowCatalogController,
   ],
   providers: [
     ExecutionGraphsService,

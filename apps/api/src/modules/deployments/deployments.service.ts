@@ -385,7 +385,7 @@ export class DeploymentsService {
   async recordGraphHealth(deploymentId: string, status: DeploymentHealth) {
     await this.database.db
       .updateTable('deployment_records')
-      .set({ health_status: status })
+      .set({ health_status: status, health_observed_at: Date.now() })
       .where('id', '=', deploymentId)
       .where('status', '=', 'SUCCESS')
       .execute();
@@ -421,13 +421,15 @@ export class DeploymentsService {
   ) {
     return this.database.db.transaction().execute(async (tx) => {
       if (lease && !(await lockTaskLease(tx, lease.taskId, lease.owner, true))) return false;
+      const finishedAt = Date.now();
       let update = tx
         .updateTable('deployment_records')
         .set({
           status,
           ...(artifactId !== undefined && { artifact_id: artifactId }),
           health_status: healthStatus,
-          finished_at: Date.now(),
+          health_observed_at: healthStatus === 'NOT_CHECKED' ? null : finishedAt,
+          finished_at: finishedAt,
         })
         .where('id', '=', id)
         .where('status', '=', 'RUNNING');

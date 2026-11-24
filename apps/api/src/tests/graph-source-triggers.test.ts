@@ -134,18 +134,37 @@ async function verify(t: TestContext, databaseUrl?: string) {
           definition: {
             canvas: {
               nodes: [
-                { id: 'flow', type: 'START', name: '开始' },
+                {
+                  id: 'flow',
+                  type: 'START',
+                  contract: 'PRESET',
+                  name: '开始',
+                  inputs: [
+                    {
+                      id: 'repository',
+                      type: 'REPOSITORY',
+                      name: '仓库',
+                      defaultValue: repository.id,
+                      runtimeOverride: false,
+                    },
+                    {
+                      id: 'gitVersion',
+                      type: 'GIT_REF',
+                      name: '版本',
+                      defaultValue: { kind: 'BRANCH', value: 'main' },
+                      runtimeOverride: false,
+                    },
+                  ],
+                },
                 {
                   id: 'code',
                   type: 'CHECKOUT',
                   name: '主仓库',
-                  checkout: { repositoryId: repository.id, mode: 'BRANCH', branch: 'main' },
                 },
                 {
                   id: 'other',
                   type: 'CHECKOUT',
                   name: '其他仓库',
-                  checkout: { repositoryId: secondary.id, mode: 'BRANCH', branch: 'main' },
                 },
                 { id: 'end', type: 'END', name: '结束' },
               ],
@@ -154,7 +173,18 @@ async function verify(t: TestContext, databaseUrl?: string) {
                 { from: 'code', to: 'other' },
                 { from: 'other', to: 'end' },
               ],
-              endpoints: [{ startId: 'flow', endId: 'end' }],
+              endpoints: [
+                {
+                  startId: 'flow',
+                  endId: 'end',
+                  inputBindings: {
+                    other: {
+                      repository: { kind: 'VALUE', value: secondary.id },
+                      version: { kind: 'VALUE', value: { kind: 'BRANCH', value: 'main' } },
+                    },
+                  },
+                },
+              ],
               templates: [],
             },
           },
@@ -176,7 +206,7 @@ async function verify(t: TestContext, databaseUrl?: string) {
       .set('Authorization', 'Bearer ' + draftHook.secret)
       .send({ eventId: 'unpublished-test', ref, commitSha: a })
       .expect(202);
-    assert.equal(disabledTest.body.data.status, 'TESTED');
+    assert.equal(disabledTest.body.data.status, 'TESTED', JSON.stringify(disabledTest.body.data));
     assert.equal(disabledTest.body.data.runId, null);
     const version = (await make(graphPath + '/publish', { expectedRevision: draft.revision }))
       .publishedVersion;

@@ -217,7 +217,7 @@ async function checkCustomViews(
   );
 }
 
-async function checkPresets(api: Api, db: Kysely<Database>, userId: string) {
+async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId: string) {
   const [mixed, unchecked, running, empty, inactive] = await Promise.all([
     project(api, 'Mixed targets', 'mixed'),
     project(api, 'Unchecked', 'unchecked'),
@@ -370,6 +370,7 @@ async function checkPresets(api: Api, db: Kysely<Database>, userId: string) {
           server_id: serverId,
           status,
           health_status: health,
+          health_observed_at: health === 'HEALTHY' || health === 'FAILED' ? finishedAt : null,
           started_at: at,
           finished_at: finishedAt,
         })
@@ -405,6 +406,63 @@ async function checkPresets(api: Api, db: Kysely<Database>, userId: string) {
     (await service(inactive.id, 'web')).id,
   );
   await inactiveDeploy(inactiveEnv.id, inactiveServer, now + 20, 'SUCCESS', 'HEALTHY');
+
+  const portal = await get<{
+    projects: {
+      id: string;
+      services: {
+        id: string;
+        addresses: { name: string; url: string }[];
+        targets: {
+          current: string;
+          health: string;
+          healthObservedAt: number;
+          lastAttempt: string;
+        }[];
+      }[];
+    }[];
+  }>(viewer, '/portal?q=DoCs');
+  assert.deepEqual(
+    portal.projects.map(({ id }) => id),
+    [mixed.id],
+  );
+  const [portalService] = portal.projects[0]!.services;
+  assert.ok(portalService);
+  assert.equal(portalService.id, web.id);
+  assert.deepEqual(portalService.addresses, [
+    { id: web.addresses[0]!.id, name: 'home', url: 'https://example.invalid/home' },
+    { id: web.addresses[1]!.id, name: 'docs', url: 'https://example.invalid/docs' },
+  ]);
+  assert.ok(
+    portalService.targets.some(
+      (target) =>
+        target.current === 'SUCCESS' &&
+        target.lastAttempt === 'FAILED' &&
+        target.health === 'HEALTHY' &&
+        target.healthObservedAt === now + 51,
+    ),
+  );
+  assert.ok(
+    portalService.targets.every((target) => !('serverId' in target) && !('taskId' in target)),
+  );
+  const detailPath = `/projects/${mixed.id}/services/${web.id}/delivery-status`;
+  const deliveryStatus = await get<
+    {
+      serverId: string;
+      current: { status: string; commitSha: string; startedAt: number };
+      latestAttempt: { id: string; status: string };
+    }[]
+  >(viewer, detailPath);
+  const lastFailed = deliveryStatus.find(({ serverId }) => serverId === secondServer)!;
+  assert.equal(lastFailed.current.status, 'SUCCESS');
+  assert.equal(lastFailed.current.startedAt, now + 50);
+  assert.equal(lastFailed.current.commitSha, 'a'.repeat(40));
+  assert.equal(lastFailed.latestAttempt.id, failed.recordId);
+  assert.equal(lastFailed.latestAttempt.status, 'FAILED');
+  await viewer.get(apiBase + detailPath.replace(mixed.id, unchecked.id)).expect(404);
+  const archivedService = await service(mixed.id, 'retired-link', ['archive-only']);
+  await api.delete(`${apiBase}/projects/${mixed.id}/services/${archivedService.id}`).expect(200);
+  assert.deepEqual((await get<typeof portal>(viewer, '/portal?q=archive-only')).projects, []);
 
   const all = await get<ViewDetail>(api, '/views/all');
   assert.equal(all.projects.find(({ id }) => id === empty.id)?.deploymentStatus, 'NOT_DEPLOYED');
@@ -564,8 +622,11 @@ async function checkViews(databaseUrl?: string) {
     await request(server)
       .get(apiBase + '/views')
       .expect(401);
+    await request(server)
+      .get(apiBase + '/portal')
+      .expect(401);
     await checkCustomViews(admin, operator, viewer, db, current.id);
-    await checkPresets(admin, db, current.id);
+    await checkPresets(admin, viewer, db, current.id);
   } finally {
     try {
       await app?.close();

@@ -69,27 +69,30 @@ const OperationsCenterPage = lazy(() =>
     default: OperationsCenterPage,
   })),
 );
+const ServicePortal = lazy(() =>
+  import('./pages/projects/ServicePortal').then(({ ServicePortal }) => ({ default: ServicePortal })),
+);
+const BuildsPortal = lazy(() =>
+  import('./pages/execution-graph/BuildsPortal').then(({ BuildsPortal }) => ({ default: BuildsPortal })),
+);
 
 const navigation = [
   {
-    label: '工作空间',
+    label: '工作台',
     items: [
-      { path: '/', name: '概览', icon: LayoutDashboard },
-      { path: '/projects', name: '项目管理', icon: FolderGit2 },
-      { path: '/views', name: '项目视图', icon: LayoutGrid },
-      { path: '/servers', name: '服务器', icon: Server },
-    ],
-  },
-  {
-    label: '运维与执行',
-    items: [
-      { path: '/operations', name: '运维中心', icon: Terminal },
+      { path: '/portal', name: '服务门户', icon: LayoutGrid },
+      { path: '/builds', name: '构建发布', icon: FolderGit2 },
+      { path: '/operations', name: '运维命令', icon: Terminal },
       { path: '/tasks', name: '任务中心', icon: ListTodo },
     ],
   },
   {
-    label: '管理',
+    label: '平台管理',
     items: [
+      { path: '/projects', name: '项目管理', icon: FolderGit2 },
+      { path: '/views', name: '项目视图', icon: LayoutGrid },
+      { path: '/servers', name: '服务器', icon: Server },
+      { path: '/overview', name: '平台概览', icon: LayoutDashboard },
       { path: '/registries', name: '镜像仓库', icon: Boxes },
       { path: '/credentials', name: '凭据中心', icon: KeyRound },
       { path: '/audit', name: '操作审计', icon: FileClock },
@@ -527,12 +530,15 @@ export function App() {
   );
   if (user.mustChangePassword || user.passwordChangeRecommended) return changePassword;
   const operationsTab = operationsTabForPath(routePath);
-  const navigationPath = operationsTab ? '/operations' : routePath;
+  const navigationPath = operationsTab ? '/operations' : routePath === '/' ? '/portal' : routePath;
   const current = navigation
     .flatMap((group) => group.items)
     .find((item) => navigationPath === item.path || navigationPath.startsWith(item.path + '/'));
   let page;
-  if (route === '/') page = <DashboardPage />;
+  if (routePath === '/' || routePath === '/portal')
+    page = <ServicePortal key={route} search={routeSearch} />;
+  else if (routePath === '/builds') page = <BuildsPortal user={user} />;
+  else if (routePath === '/overview') page = <DashboardPage />;
   else if (routePath === '/servers' || routePath === '/targets')
     page = <ServersPage user={user} search={routeSearch} />;
   else if (route === '/credentials') page = <CredentialsPage user={user} />;

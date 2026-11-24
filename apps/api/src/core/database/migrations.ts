@@ -2069,6 +2069,14 @@ export const migrationProvider: MigrationProvider = {
             .execute();
         },
       } satisfies Migration,
+      '039_deployment_health_observation': {
+        async up(db) {
+          await db.schema.alterTable('deployment_records').addColumn('health_observed_at', 'bigint').execute();
+        },
+        async down(db) {
+          await db.schema.alterTable('deployment_records').dropColumn('health_observed_at').execute();
+        },
+      } satisfies Migration,
       '036_graph_trigger_event_snapshots': {
         async up(db) {
           await db.schema

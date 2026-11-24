@@ -477,6 +477,12 @@ export class GraphTriggersService implements OnModuleInit {
       const field = fields.find((candidate) => candidate.id === id);
       if (!field || !mapping || !['VALUE', 'EVENT', 'UPSTREAM_OUTPUT'].includes(mapping.source))
         throw new BadRequestException('触发参数映射未引用有效的开始参数');
+      if (field.runtimeOverride === false)
+        throw this.triggerPlanIssue(
+          input.flowId,
+          '参数「' + field.name + '」采用已发布的默认值，触发器不能覆盖',
+          field.id,
+        );
       if (mapping.source === 'UPSTREAM_OUTPUT') {
         const upstream = upstreamDefinition.flows.find(({ id }) => id === input.upstreamFlowId);
         const output =

@@ -622,6 +622,8 @@ export function ExecutionGraphBindings({
   const functional = graphNodeFamily(node) === 'function';
   const compiled = endpoint && directory?.[endpoint.startId]?.nodes[node.id];
   const script = operation === 'SHELL' || operation === 'CHECK';
+  const custom = operation === 'SHELL';
+  const fixedContract = functional && !custom && start?.contract === 'PRESET';
   const inputTypes = catalog?.scriptInputTypes ?? scriptInputTypes;
   const outputTypes = catalog?.scriptOutputTypes ?? scriptOutputTypes;
   const nativeInputs = functional ? operationFields(node, 'inputs', canvas, catalog) : [];
@@ -731,16 +733,18 @@ export function ExecutionGraphBindings({
       }),
     });
   if (section === 'output') {
-    const declared = functional ? (node.outputs ?? []) : [];
+    const declared = custom
+      ? (node.outputs ?? []).filter((field) => !nativeOutputs.some(({ id }) => id === field.id))
+      : [];
     const implicit = outputs.filter((port) => !declared.some(({ id }) => id === port.id));
     return (
       <>
-        {canEdit && patchNode && functional && (
+        {canEdit && patchNode && custom && (
           <AddFunctionField
             kind="outputs"
             node={node}
-            nativePorts={nativeOutputs}
-            allowCustom={script}
+            nativePorts={[]}
+            allowCustom
             catalog={catalog}
             patch={patchNode}
           />
@@ -789,7 +793,7 @@ export function ExecutionGraphBindings({
             <summary>查看执行结果字段</summary>
             <dl className="graph-field-values">
               {implicit.map((field) => (
-                <div key={field.id}>
+                <div key={field.id} data-graph-node-field={field.id}>
                   <dt>{field.name}</dt>
                   <dd>
                     <code>{field.referenceName ?? field.id}</code> ·{' '}
@@ -854,8 +858,10 @@ export function ExecutionGraphBindings({
       {!patchNode && <h4>{isEnd ? '最终输出' : '输入'}</h4>}
       {functional && (
         <p className="field-note">
-          同名变量可作为候选来源。选择后会把来源保存到当前执行流。
-          {script && (
+          {fixedContract
+            ? '步骤使用开始配置和上游结果。可为当前执行流选择具体来源。'
+            : '同名变量可作为候选来源。选择后会把来源保存到当前执行流。'}
+          {custom && (
             <>
               {' '}
               脚本可以用 <code>$引用名称</code> 读取已声明的输入。
@@ -863,12 +869,12 @@ export function ExecutionGraphBindings({
           )}
         </p>
       )}
-      {canEdit && patchNode && functional && (
+      {canEdit && patchNode && custom && (
         <AddFunctionField
           kind="inputs"
           node={node}
-          nativePorts={nativeInputs.filter((port) => fields.some(({ id }) => id === port.id))}
-          allowCustom={script}
+          nativePorts={[]}
+          allowCustom
           catalog={catalog}
           candidates={candidates}
           patch={patchNode}
@@ -907,7 +913,12 @@ export function ExecutionGraphBindings({
                 )
               : [];
           const typeLabel = catalog?.fieldTypes[field.type] ?? field.type;
-          const fixed = Boolean(patchNode && !review && acceptsFixedGraphValue(field));
+          const startResource =
+            fixedContract &&
+            ['REPOSITORY', 'TARGETS', 'SERVICE', 'GIT_REF', 'ARTIFACT'].includes(field.type);
+          const fixed = Boolean(
+            patchNode && !review && !startResource && acceptsFixedGraphValue(field),
+          );
           const fallback =
             isEnd || review ? undefined : configuredFallback(node, field, start, endpoint);
           const implicitHint = bound
@@ -916,7 +927,7 @@ export function ExecutionGraphBindings({
               ? '来源缺值时采用节点默认值。'
               : undefined
             : sourceLabels.length
-              ? `同名候选 · ${sourceLabels.join('、')}`
+              ? `自动来源 · ${sourceLabels.join('、')}`
               : possibleSources.length
                 ? '同名候选来源 · ' + possibleSources.map(({ label }) => label).join('、')
                 : fallback;
@@ -935,6 +946,7 @@ export function ExecutionGraphBindings({
             start &&
             !isEnd &&
             !review &&
+            !startResource &&
             canCreateStartParameter(field) &&
             (repairFieldIds?.has(field.id) ||
               (bound && hasMissingGraphBindingSource(bound, choices)) ||
@@ -990,7 +1002,7 @@ export function ExecutionGraphBindings({
               className="graph-inspector-port"
               data-graph-node-field={field.id}
             >
-              {declared && (
+              {declared && custom && !native && (
                 <FunctionFieldNames
                   field={field}
                   native={native}
@@ -1019,6 +1031,7 @@ export function ExecutionGraphBindings({
                   directSource={Boolean(review)}
                   nodeDefaults={fixed}
                   referenceLookup={declared || undefined}
+                  allowFixedValue={!startResource}
                   allowEnvironmentKey={Boolean(
                     node.branch &&
                     field.id === 'value' &&

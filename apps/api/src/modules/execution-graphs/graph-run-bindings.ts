@@ -505,6 +505,17 @@ export function checkedParameters(
   );
 }
 
+/** Validate the caller's overrides before resolving defaults or frozen run parameters. */
+export function assertRuntimeParameterOverrides(flow: GraphFlow, supplied?: Values) {
+  for (const field of flowStart(flow).inputs ?? [])
+    if (field.runtimeOverride === false && Object.hasOwn(supplied ?? {}, field.id))
+      throw graphInputIssue(
+        flow,
+        '开始参数「' + field.name + '」使用已发布配置，不允许本次运行修改',
+        field,
+      );
+}
+
 export function declaredScope(flow: GraphFlow, inputs: GraphInputsDto) {
   const fields = flowStart(flow).inputs ?? [];
   const find = (type: GraphField['type']) => {
@@ -566,10 +577,17 @@ export function referenceId(value: unknown): string | undefined {
 }
 
 export function graphEnvironmentSetId(flow: GraphFlow, inputs: GraphInputsDto) {
-  const config = flowStart(flow).environmentSet;
+  const start = flowStart(flow);
+  const config = start.environmentSet;
   if (config?.mode === 'FIXED') return config.environmentSetId;
   if (config?.mode === 'INPUT' && config.fieldId)
     return stringValue(entry(inputs.parameters, config.fieldId));
+  if (!config && start.contract === 'PRESET') {
+    const candidates = start.inputs?.filter(
+      (field) => field.type === 'ENVIRONMENT_SET' && !field.multiple,
+    );
+    if (candidates?.length === 1) return stringValue(entry(inputs.parameters, candidates[0]!.id));
+  }
   return undefined;
 }
 

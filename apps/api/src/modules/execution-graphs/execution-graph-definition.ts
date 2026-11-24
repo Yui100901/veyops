@@ -264,6 +264,7 @@ export class GraphNode {
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
   @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) referenceName?: string;
   @IsIn([...nodeTypes, 'FUNCTION']) type!: (typeof nodeTypes)[number] | 'FUNCTION';
+  @ValidateIf((_o, v) => v !== undefined) @IsIn(['PRESET']) contract?: 'PRESET';
   @ValidateIf((node, value) => node.type === 'FUNCTION' || value !== undefined)
   @IsIn(functionOperations)
   operation?: (typeof functionOperations)[number];

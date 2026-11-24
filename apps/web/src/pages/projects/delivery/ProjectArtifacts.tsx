@@ -17,8 +17,12 @@ import {
 } from '../../delivery/Delivery';
 import { deliveryPath, type DeliveryScope } from '../../delivery/delivery-route';
 import { ArtifactRetentionPolicy } from '../../delivery/ArtifactRetention';
-import { graphKey } from '../../execution-graph/execution-graph-definition';
-import { graphWorkbenchPath } from '../../execution-graph/graph-workbench-context';
+import { graphKey, type GraphDocument } from '../../execution-graph/execution-graph-definition';
+import {
+  graphStartReadiness,
+  graphWorkbenchPath,
+  releaseArtifactInput,
+} from '../../execution-graph/graph-workbench-context';
 import type { EnvironmentSetSummary } from '../environments/ProjectEnvironmentSets';
 import { serverResourceHref } from '../../infrastructure/server-resource-route';
 import './project-artifacts.css';
@@ -26,6 +30,80 @@ import './project-artifacts.css';
 interface ArtifactDetail {
   artifactId: string;
   instances: Artifact[];
+}
+
+function ArtifactReleaseChoices({
+  project,
+  artifactId,
+  artifact,
+  scope,
+}: {
+  project: ProjectDetail;
+  artifactId: string;
+  artifact: Artifact;
+  scope: DeliveryScope;
+}) {
+  const path = `/projects/${encodeURIComponent(project.id)}/execution-graph`;
+  const graph = useResource<Pick<GraphDocument, 'publishedVersion'>>(path);
+  const version = graph.data?.publishedVersion;
+  const published = useResource<{ version: number; definition: GraphDocument['draft'] }>(
+    version ? path + '/versions/' + version : null,
+  );
+  const artifactKind = artifact.kind ?? artifact.artifactType;
+  const artifactType =
+    artifactKind === 'FILE' || artifactKind === 'DIRECTORY' || artifactKind === 'DOCKER_IMAGE'
+      ? artifactKind
+      : undefined;
+  const serviceId =
+    scope.serviceId ||
+    (project.services.some(({ id }) => id === artifact.serviceId) ? artifact.serviceId : undefined);
+  const graphScope = { serviceId: serviceId || undefined };
+  const flows = published.data?.definition.flows.flatMap((flow) => {
+    const field = releaseArtifactInput(flow, artifactType);
+    return field && graphStartReadiness(flow, graphScope, project).status !== 'CONTEXT_MISMATCH'
+      ? [{ flow, field }]
+      : [];
+  });
+  return (
+    <details className="graph-field-card">
+      <summary>使用此产物部署</summary>
+      <ErrorBanner
+        error={graph.error || published.error}
+        retry={graph.error ? graph.reload : published.reload}
+      />
+      {graph.loading || published.loading ? (
+        <Loading />
+      ) : flows?.length ? (
+        <div className="row-actions">
+          {flows.map(({ flow, field }) => (
+            <a
+              key={flow.id}
+              className="button secondary small"
+              href={
+                '#' +
+                graphWorkbenchPath(project.id, {
+                  ...graphScope,
+                  pane: 'run',
+                  start: flow.id,
+                  field: field.id,
+                  artifactId,
+                  artifactType,
+                  version: published.data?.version,
+                  deliveryTab: 'artifacts',
+                  recordId: artifactId,
+                })
+              }
+            >
+              {flow.name}
+            </a>
+          ))}
+        </div>
+      ) : (
+        !graph.error &&
+        !published.error && <p className="mini-empty">暂无可以接收此产物的已发布执行流。</p>
+      )}
+    </details>
+  );
 }
 
 interface CleanupInstance {
@@ -567,6 +645,14 @@ function Details({
           )}
         </div>
         <ErrorBanner error={error || detail.error} />
+        {canVerify && active.length > 0 && !artifact.temporary && (
+          <ArtifactReleaseChoices
+            project={project}
+            artifactId={artifactId}
+            artifact={artifact}
+            scope={scope}
+          />
+        )}
         <div className="table-scroll">
           <table>
             <thead>

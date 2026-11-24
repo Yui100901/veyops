@@ -4,7 +4,12 @@ import type { Kysely, Selectable, Transaction } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import { isGitBranchName } from '../projects/git-ref';
 import { resolveGraphRepositorySelector } from '../projects/graph-repository-selectors';
-import type { GraphDefinition, GraphFlow } from './execution-graph-definition';
+import {
+  orderedFlowNodes,
+  type GraphDefinition,
+  type GraphFlow,
+} from './execution-graph-definition';
+import { flowCandidateCatalog } from './graph-binding-validation';
 import type { GraphBinding } from './graph-fields';
 import {
   graphDeliveryId,
@@ -81,16 +86,20 @@ export async function resolveTriggerSource(
   if (!flow) throw new BadRequestException('已发布的图没有当前开始节点');
   if (settings.ref && !validBranchRef(settings.ref))
     throw new BadRequestException('请输入有效的分支完整引用，如 refs/heads/main');
+  const inferred =
+    !flow.compiled && flowStart(flow).contract === 'PRESET'
+      ? flowCandidateCatalog(flow, definition.flows, orderedFlowNodes(flow)).nodes
+      : undefined;
   const checkouts = [];
   for (const node of flow.nodes.filter(
     ({ type, operation }) => type === 'CHECKOUT' || operation === 'CHECKOUT',
   )) {
-    const repository = staticBinding(
-      flow,
-      nodeInputBinding(flow, node, 'repository'),
-      settings.parameterMappings,
-    );
-    const input = nodeInputBinding(flow, node, 'repository');
+    const checkoutBinding = (fieldId: string) =>
+      flow.inputBindings?.[node.id]?.[fieldId] ??
+      inferred?.[node.id]?.automaticInputBindings[fieldId] ??
+      nodeInputBinding(flow, node, fieldId);
+    const input = checkoutBinding('repository');
+    const repository = staticBinding(flow, input, settings.parameterMappings);
     const mapping = input?.kind === 'INPUT' && settings.parameterMappings?.[input.fieldId];
     const eventRepository = mapping && mapping.source === 'EVENT' && mapping.field === 'repository';
     const selector =
@@ -110,11 +119,7 @@ export async function resolveTriggerSource(
       .where('archived_at', 'is', null)
       .executeTakeFirst();
     if (!row) continue;
-    const selected = staticBinding(
-      flow,
-      nodeInputBinding(flow, node, 'version'),
-      settings.parameterMappings,
-    );
+    const selected = staticBinding(flow, checkoutBinding('version'), settings.parameterMappings);
     const version =
       selected && typeof selected === 'object'
         ? (selected as { kind?: string; value?: string; byEvent?: boolean })

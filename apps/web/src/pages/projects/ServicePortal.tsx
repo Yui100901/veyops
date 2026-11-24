@@ -1,0 +1,191 @@
+import { useState, type FormEvent } from 'react';
+import { Search } from 'lucide-react';
+import { formatTime, navigate, useResource } from '../../api';
+import {
+  Empty,
+  ErrorBanner,
+  Field,
+  Loading,
+  PageHeader,
+  RefreshButton,
+  Section,
+} from '../../components';
+import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
+import { projectResourcePath } from './project-workspace-route';
+import './service-portal.css';
+
+type PortalTarget = {
+  current: string | null;
+  health: string | null;
+  healthObservedAt: number | null;
+  lastAttempt: string;
+  at: number | null;
+};
+
+interface PortalResult {
+  projects: {
+    id: string;
+    name: string;
+    tags: string[];
+    services: {
+      id: string;
+      name: string;
+      addresses: ProjectAccessLink[];
+      targets: PortalTarget[];
+    }[];
+  }[];
+  tags: string[];
+}
+
+const failed = new Set(['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION']);
+
+function DeliveryStatus({ targets }: { targets: PortalTarget[] }) {
+  if (!targets.length) return <span>暂无发布记录</span>;
+  const current = targets.filter(({ current }) => current === 'SUCCESS');
+  const uncertain = targets.filter(
+    ({ current, health }) => (current && current !== 'SUCCESS') || health === 'UNKNOWN',
+  );
+  const unhealthy = current.filter(({ health }) => health === 'FAILED' || health === 'UNHEALTHY');
+  const healthy = current.filter(({ health }) => health === 'HEALTHY');
+  const unchecked = current.filter(
+    ({ health }) => !health || ['PENDING', 'NOT_CHECKED'].includes(health),
+  );
+  const latestFailure = targets.filter(({ lastAttempt }) => failed.has(lastAttempt));
+  const checkedAt = Math.max(0, ...healthy.map(({ healthObservedAt }) => healthObservedAt ?? 0));
+  const failedAt = Math.max(0, ...latestFailure.map(({ at }) => at ?? 0));
+  return (
+    <ul className="portal-delivery-summary">
+      <li>{current.length ? `${current.length} 处已激活` : '暂无已激活版本'}</li>
+      {healthy.length > 0 && (
+        <li>
+          {healthy.length} 处已健康{checkedAt > 0 && <> · {formatTime(checkedAt)}</>}
+        </li>
+      )}
+      {unchecked.length > 0 && <li>{unchecked.length} 处未检测</li>}
+      {unhealthy.length > 0 && <li>{unhealthy.length} 处健康检查失败</li>}
+      {uncertain.length > 0 && <li>{uncertain.length} 处待核查</li>}
+      {latestFailure.length > 0 && (
+        <li>
+          {latestFailure.length} 次最近发布失败{failedAt > 0 && <> · {formatTime(failedAt)}</>}
+        </li>
+      )}
+    </ul>
+  );
+}
+
+export function ServicePortal({ search }: { search?: string }) {
+  const filters = new URLSearchParams(search);
+  const [keyword, setKeyword] = useState(filters.get('q') ?? '');
+  const [tag, setTag] = useState(filters.get('tag') ?? '');
+  const query = new URLSearchParams();
+  for (const field of ['q', 'tag', 'projectId', 'serviceId']) {
+    const value = filters.get(field);
+    if (value) query.set(field, value);
+  }
+  const resource = useResource<PortalResult>(`/portal${query.size ? '?' + query : ''}`);
+  function searchServices(event: FormEvent) {
+    event.preventDefault();
+    const next = new URLSearchParams(query);
+    next.delete('q');
+    next.delete('tag');
+    if (keyword.trim()) next.set('q', keyword.trim());
+    if (tag) next.set('tag', tag);
+    navigate(`/portal${next.size ? '?' + next : ''}`);
+  }
+  return (
+    <>
+      <PageHeader
+        title="服务门户"
+        description=""
+        action={<RefreshButton onClick={resource.reload} />}
+      />
+      <form className="portal-filters panel" onSubmit={searchServices}>
+        <Field label="搜索服务">
+          <input
+            type="search"
+            value={keyword}
+            maxLength={160}
+            onChange={(event) => setKeyword(event.target.value)}
+            placeholder="项目、服务、地址名称或标签"
+          />
+        </Field>
+        <Field label="项目标签">
+          <select value={tag} onChange={(event) => setTag(event.target.value)}>
+            <option value="">全部标签</option>
+            {resource.data?.tags.map((value) => (
+              <option key={value}>{value}</option>
+            ))}
+          </select>
+        </Field>
+        <div className="row-actions">
+          <button type="submit" className="primary">
+            <Search size={16} aria-hidden="true" /> 搜索
+          </button>
+          {!!query.size && (
+            <a className="button secondary" href="#/portal">
+              清除筛选
+            </a>
+          )}
+        </div>
+      </form>
+      <ErrorBanner error={resource.error} retry={resource.reload} />
+      {resource.loading ? (
+        <Loading />
+      ) : (
+        !resource.error &&
+        (resource.data?.projects.length ? (
+          <div className="portal-projects">
+            {resource.data.projects.map((project) => (
+              <Section
+                key={project.id}
+                title={project.name}
+                subtitle={project.tags.length ? project.tags.join(' · ') : undefined}
+                action={
+                  <a className="text-link" href={'#' + projectResourcePath(project.id)}>
+                    查看项目
+                  </a>
+                }
+              >
+                {project.services.length ? (
+                  <div className="portal-services">
+                    {project.services.map((service) => (
+                      <div className="portal-service" key={service.id}>
+                        <div className="portal-service-header">
+                          <h3>
+                            <a
+                              className="text-link"
+                              href={
+                                '#' +
+                                projectResourcePath(project.id, {
+                                  resource: 'services',
+                                  serviceId: service.id,
+                                })
+                              }
+                            >
+                              {service.name}
+                            </a>
+                          </h3>
+                          <DeliveryStatus targets={service.targets} />
+                        </div>
+                        <ProjectAccessLinks addresses={service.addresses} showEmpty />
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mini-empty">暂无服务</p>
+                )}
+              </Section>
+            ))}
+          </div>
+        ) : (
+          <Empty
+            title={query.size ? '没有找到匹配的服务' : '暂无项目和服务'}
+            description={
+              query.size ? '更换关键词或清除筛选。' : '项目中的服务和访问地址登记后会在这里显示。'
+            }
+          />
+        ))
+      )}
+    </>
+  );
+}

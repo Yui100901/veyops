@@ -221,6 +221,116 @@ interface BindingContext {
 
 type PathOrder = { path: PathScenario; order: Map<string, Set<string>> };
 
+type InferredBinding = { binding?: GraphBinding; issue?: string };
+
+function presetBinding(
+  context: BindingContext,
+  node: GraphNode,
+  field: GraphField,
+  paths: PathOrder[],
+): InferredBinding {
+  const { flow, inputs, nodes, outputs } = context;
+  const ancestors = paths
+    .filter(({ path }) => path.active.has(node.id))
+    .map(({ order }) => order.get(node.id)!);
+  const isBuild = node.type === 'BUILD';
+  const isScript = node.type === 'SHELL' || node.type === 'CHECK';
+  const isRelease = node.type === 'DEPLOY_ARTIFACT' || node.type === 'ROLLBACK_ARTIFACT';
+  const useStart = (choices: GraphField[]): InferredBinding => {
+    if (choices.length > 1) return { issue: '开始节点有多个可用来源，请为此字段选择一项' };
+    const choice = choices[0];
+    return choice ? { binding: { kind: 'INPUT', fieldId: choice.id } } : {};
+  };
+  const useType = (type: GraphField['type']) =>
+    useStart(
+      [...inputs.values()].filter(
+        (candidate) => candidate.type === type && compatibleGraphFields(field, candidate),
+      ),
+    );
+  if (field.id === 'service' && (isBuild || isScript || isRelease)) {
+    if (flow.serviceId) return {};
+    return useType('SERVICE');
+  }
+  if (field.id === 'environment' && (isBuild || isScript || isRelease))
+    return useType('ENVIRONMENT');
+  if (field.id === 'targets' && (isBuild || isScript || isRelease)) {
+    if (
+      (isBuild && node.build?.buildLocation === 'MANAGER') ||
+      (isScript && node.shell?.location === 'MANAGER')
+    )
+      return {};
+    const purpose = isRelease ? 'RELEASE_TARGETS' : 'BUILD_TARGETS';
+    const standardId = isRelease ? 'releaseTargets' : 'buildTargets';
+    return useStart(
+      [...inputs.values()].filter(
+        (candidate) =>
+          candidate.type === 'TARGETS' &&
+          compatibleGraphFields(field, candidate) &&
+          (candidate.purpose ? candidate.purpose === purpose : candidate.id === standardId),
+      ),
+    );
+  }
+
+  const checkout = (producer: GraphNode) => producer.type === 'CHECKOUT';
+  const reachableCheckouts = [...nodes.values()].some(
+    (producer) => checkout(producer) && ancestors.some((ancestors) => ancestors.has(producer.id)),
+  );
+  if (
+    (node.type === 'CHECKOUT' ||
+      (isBuild &&
+        !reachableCheckouts &&
+        !bindingAt(flow, node, 'workspace') &&
+        !bindingAt(flow, node, 'source'))) &&
+    (field.id === 'repository' || field.id === 'version')
+  ) {
+    const selected = useType(field.id === 'repository' ? 'REPOSITORY' : 'GIT_REF');
+    if (selected.binding && field.id === 'version')
+      return { binding: { ...selected.binding, onMissing: 'REPOSITORY_DEFAULT' } };
+    return selected;
+  }
+
+  let producerMatches: ((producer: GraphNode, port: GraphField) => boolean) | undefined;
+  if (
+    (field.id === 'workspace' || field.id === 'source') &&
+    (isBuild || isScript || node.type === 'LOAD_ENV' || node.type === 'REGISTER_ARTIFACT')
+  ) {
+    const counterpart = bindingAt(flow, node, field.id === 'source' ? 'workspace' : 'source');
+    if (counterpart && counterpart.kind !== 'OUTPUT') return {};
+    producerMatches = (producer, port) =>
+      checkout(producer) &&
+      port.id === field.id &&
+      (!counterpart || counterpart.nodeId === producer.id);
+  } else if (field.id === 'variables' && (isBuild || isScript)) {
+    producerMatches = (producer, port) => producer.type === 'LOAD_ENV' && port.id === 'variables';
+  } else if (field.id === 'release' && node.type === 'HEALTH_CHECK') {
+    producerMatches = (producer, port) =>
+      ['DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT'].includes(producer.type) && port.id === 'release';
+  } else if (field.id === 'artifact' && isRelease) {
+    producerMatches = (producer, port) =>
+      (producer.type === 'BUILD' ||
+        producer.type === 'REGISTER_ARTIFACT' ||
+        producer.type === 'CHECK' ||
+        producer.type === 'SHELL') &&
+      port.type === 'ARTIFACT' &&
+      !port.multiple;
+  }
+  if (!producerMatches) return {};
+  const choices = [...nodes.values()].flatMap((producer) =>
+    ancestors.some((ids) => ids.has(producer.id))
+      ? (outputs.get(producer.id) ?? [])
+          .filter((port) => producerMatches(producer, port) && compatibleGraphFields(field, port))
+          .map((port) => ({ producer, port }))
+      : [],
+  );
+  if (!choices.length && field.id === 'artifact' && isRelease) return useType('ARTIFACT');
+  if (choices.length > 1) return { issue: '存在多个兼容的上游来源，请选择此步骤所需的具体结果' };
+  const selected = choices[0];
+  if (!selected) return {};
+  if (selected.port.required === false || ancestors.some((ids) => !ids.has(selected.producer.id)))
+    return { issue: '上游结果无法覆盖每条到达路径，请选择覆盖完整的来源' };
+  return { binding: { kind: 'OUTPUT', nodeId: selected.producer.id, fieldId: selected.port.id } };
+}
+
 function suggestedInputBinding(
   context: BindingContext,
   node: GraphNode,
@@ -323,10 +433,18 @@ function contextSource(context: BindingContext, id: string) {
   if (!definition) return undefined;
   if (id === 'serviceId' && context.flow.serviceId) return { ...definition, required: true };
   if (id === 'environmentSetId') {
-    const set = context.flow.nodes.find(({ type }) => type === 'START')?.environmentSet;
+    const start = context.flow.nodes.find(({ type }) => type === 'START');
+    const set = start?.environmentSet;
     const selected = set?.fieldId && context.inputs.get(set.fieldId);
     if (set?.mode === 'FIXED' || (selected && guarantee(selected)))
       return { ...definition, required: true };
+    if (!set && start?.contract === 'PRESET') {
+      const candidates = [...context.inputs.values()].filter(
+        (field) => field.type === 'ENVIRONMENT_SET' && !field.multiple,
+      );
+      if (candidates.length === 1 && guarantee(candidates[0]!))
+        return { ...definition, required: true };
+    }
   }
   if (id === 'environmentId' || id === 'serviceId') {
     const matches = [...context.inputs.values()].filter(
@@ -547,6 +665,29 @@ function available(
   }
 }
 
+function checkoutOnPath(
+  context: BindingContext,
+  binding: GraphBinding | undefined,
+  ancestors: ReadonlySet<string>,
+): string | undefined {
+  if (binding?.kind === 'OUTPUT')
+    return context.nodes.get(binding.nodeId)?.type === 'CHECKOUT' && ancestors.has(binding.nodeId)
+      ? binding.nodeId
+      : undefined;
+  if (binding?.kind !== 'FIRST_AVAILABLE') return undefined;
+  for (const candidate of binding.sources) {
+    const checkout = checkoutOnPath(context, candidate, ancestors);
+    if (checkout) return checkout;
+    // An available or optional non-checkout source may win the selection at runtime.
+    if (
+      available(context, candidate, ancestors) ||
+      producerBindings(candidate).some(({ nodeId }) => ancestors.has(nodeId))
+    )
+      return undefined;
+  }
+  return undefined;
+}
+
 function validateArtifactConfig(flow: GraphFlow, node: GraphNode, ports: GraphField[]) {
   const declaration = graphArtifactDeclarations(node);
   const script = node.type === 'SHELL' || node.type === 'CHECK';
@@ -616,9 +757,21 @@ export function validateFlowBindings(
 ) {
   const start = ordered[0]!;
   const end = ordered.at(-1)!;
+  const preset = start.contract === 'PRESET';
   const flows = new Map(definitions.map((candidate) => [candidate.id, candidate]));
   const nodes = new Map(ordered.map((node) => [node.id, node]));
   checkFields(flow, start, start.inputs ?? [], 'INPUT');
+  const missingFixed = start.inputs?.find(
+    (field) =>
+      field.runtimeOverride === false &&
+      field.required !== false &&
+      field.defaultValue === undefined &&
+      field.selection !== 'LATEST_COMPATIBLE',
+  );
+  if (missingFixed)
+    fail(flow, start, '不可覆盖的必填参数需要已发布默认值', missingFixed, {
+      fieldSection: 'input',
+    });
   checkFields(flow, end, end.outputs ?? [], 'OUTPUT');
   const inputs = new Map((start.inputs ?? []).map((input) => [input.id, input]));
   const set = start.environmentSet;
@@ -714,6 +867,28 @@ export function validateFlowBindings(
   };
   for (const node of ordered) {
     const ports = nodePorts.get(node.id);
+    if (node.type !== 'START' && node.contract !== undefined)
+      fail(flow, node, '固定契约只能在开始节点声明');
+    if (preset && node.type !== 'START' && node.type !== 'END') {
+      const declarations = [
+        ...(node.inputs ?? []),
+        ...(node.outputs ?? []),
+        ...(node.shell?.params ?? []),
+        ...(node.shell?.outputs ?? []),
+      ];
+      const standard = graphOperationPorts(node, flows.get(node.flowId ?? ''));
+      const native = new Set(
+        [...(standard?.inputs ?? []), ...(standard?.outputs ?? [])].map(({ id }) => id),
+      );
+      const forbidden = declarations.find((field) => node.type !== 'SHELL' || native.has(field.id));
+      if (forbidden)
+        fail(
+          flow,
+          node,
+          '预设动作使用系统定义的固定端口，自定义命令可声明自己的脚本字段',
+          forbidden,
+        );
+    }
     if (node.declaredPorts)
       validateFunctionalDeclarations(flow, node, flows.get(node.flowId ?? ''));
     if (node.inputDefaults !== undefined) {
@@ -849,11 +1024,14 @@ export function validateFlowBindings(
           node.declaredPorts &&
           node.inputs?.some(({ id }) => id === field.id) &&
           field.defaultValue !== undefined;
+        const inferred =
+          preset && !explicit ? presetBinding(context, node, field, pathOrders) : undefined;
+        if (inferred?.issue) fail(flow, node, inferred.issue, field, { fieldSection: 'input' });
         const binding = explicit
           ? declaredDefault && explicit.onMissing === undefined
             ? { ...explicit, onMissing: 'USE_DEFAULT' as const }
             : explicit
-          : graphDefaultBinding(flow, node, field.id);
+          : (inferred?.binding ?? graphDefaultBinding(flow, node, field.id));
         return [field.id, binding];
       }),
     );
@@ -902,6 +1080,18 @@ export function validateFlowBindings(
         ? `（分支 ${path.branches.map(({ label }) => label).join(' / ')}）`
         : '';
       const location = branchLocation(path);
+      if (preset) {
+        const workspace = checkoutOnPath(context, bindings.get('workspace'), ancestors);
+        const source = checkoutOnPath(context, bindings.get('source'), ancestors);
+        if (workspace && source && workspace !== source)
+          fail(
+            flow,
+            node,
+            '工作区和 Git 来源必须来自同一次检出' + branch,
+            destinations.find(({ id }) => id === 'workspace'),
+            { ...location, fieldSection: 'input' },
+          );
+      }
       for (const field of destinations) {
         const binding = bindings.get(field.id);
         const needsValue = field.required !== false || binding?.onMissing === 'ERROR';
@@ -1108,7 +1298,7 @@ export function flowCandidateCatalog(
   flow: GraphFlow,
   flows: GraphFlow[],
   ordered: GraphNode[],
-  nodeId: string,
+  nodeId?: string,
 ) {
   const start = flow.nodes.find(({ type }) => type === 'START');
   if (!start) return { nodes: {} };
@@ -1144,7 +1334,7 @@ export function flowCandidateCatalog(
   return {
     nodes: Object.fromEntries(
       ordered
-        .filter(({ id }) => id === nodeId)
+        .filter(({ id }) => !nodeId || id === nodeId)
         .map((node) => {
           const candidates: GraphCandidate[] = [];
           for (const field of inputs.values())
@@ -1204,7 +1394,10 @@ export function flowCandidateCatalog(
               candidates,
               automaticInputBindings: Object.fromEntries(
                 (ports.get(node.id)?.inputs ?? []).flatMap((field) => {
-                  const binding = suggestedInputBinding(context, node, field, staticOrder, paths);
+                  const binding =
+                    start.contract === 'PRESET'
+                      ? presetBinding(context, node, field, paths).binding
+                      : suggestedInputBinding(context, node, field, staticOrder, paths);
                   return binding ? [[field.id, binding]] : [];
                 }),
               ),

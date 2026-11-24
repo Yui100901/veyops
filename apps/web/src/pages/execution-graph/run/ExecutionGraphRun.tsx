@@ -15,7 +15,12 @@ import {
 } from './ExecutionGraphRepairLinks';
 import { GraphRunResults, planIssueLabels, repairKind } from './ExecutionGraphRunEvidence';
 import { ExecutionGraphStartStatus } from './ExecutionGraphStartStatus';
-import { branchLabel, graphKey, graphNodeLabels, isReleaseNode } from '../execution-graph-definition';
+import {
+  branchLabel,
+  graphKey,
+  graphNodeLabels,
+  isReleaseNode,
+} from '../execution-graph-definition';
 import type { GraphBinding, GraphField, GraphFlow, GraphRun } from '../execution-graph-definition';
 import { projectGraphPath, projectResourcePath } from '../../projects/project-workspace-route';
 import { graphStartReadiness, type GraphWorkbenchScope } from '../graph-workbench-context';
@@ -167,6 +172,12 @@ export function ExecutionGraphStart({
   const fixedSets = useProjectEnvironmentSets(project.id, !!fixedSetId);
   const fixedSet = fixedSets.data?.find(({ id }) => id === fixedSetId);
   const fields = startNode?.inputs ?? [];
+  const runtimeFields = fields.filter(({ runtimeOverride }) => runtimeOverride !== false);
+  const runtimePresets = Object.fromEntries(
+    runtimeFields.flatMap(({ id }) =>
+      initialInputs && Object.hasOwn(initialInputs, id) ? [[id, initialInputs[id]]] : [],
+    ),
+  );
   const draftKey = JSON.stringify([
     flow.id,
     workbenchScope.serviceId,
@@ -176,14 +187,17 @@ export function ExecutionGraphStart({
   const parameters: Record<string, unknown> = {
     ...Object.fromEntries(
       fields.map((field) => {
-        const edit = Object.hasOwn(edits, field.id) ? edits[field.id] : undefined;
+        const edit =
+          field.runtimeOverride !== false && Object.hasOwn(edits, field.id)
+            ? edits[field.id]
+            : undefined;
         return [
           field.id,
           edit?.schema === parameterSchema(field) ? edit.value : field.defaultValue,
         ];
       }),
     ),
-    ...initialInputs,
+    ...runtimePresets,
   };
   const readiness = graphStartReadiness(flow, workbenchScope, project, parameters);
   const fieldRefs = useRef(new Map<string, HTMLElement>());
@@ -203,6 +217,7 @@ export function ExecutionGraphStart({
   const [preview, setPreview] = useState<Preview>();
   const [revision, setRevision] = useState<{ previous: Preview; sections: string[] }>();
   const key = useRef('');
+  const defaultsKey = useRef<{ version: number; value: string } | undefined>(undefined);
   const active = useRef(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -224,6 +239,49 @@ export function ExecutionGraphStart({
     return () => window.cancelAnimationFrame(frame);
   }, [focusFieldId]);
   const base = path + '/flows/' + encodeURIComponent(flow.id);
+  const useDefaults =
+    startNode?.contract === 'PRESET' &&
+    !preview &&
+    !revision &&
+    !Object.keys(edits).length &&
+    !Object.keys(initialInputs ?? {}).length;
+  async function runDefaults() {
+    if (active.current) return;
+    active.current = true;
+    setBusy(true);
+    setError('');
+    setPlanIssue(undefined);
+    if (defaultsKey.current?.version !== version)
+      defaultsKey.current = { version, value: graphKey('defaults') };
+    try {
+      const result = await post<
+        { outcome: 'STARTED'; runId: string } | { outcome: 'NEEDS_CONFIRMATION'; reason: string }
+      >(base + '/run-defaults', { version, idempotencyKey: defaultsKey.current.value });
+      if (result.outcome === 'STARTED') {
+        onRun(result.runId);
+      } else {
+        const checked = await post<Preview>(base + '/preview', {
+          version,
+          inputs: runtimeInputs(),
+        });
+        key.current = graphKey('run');
+        setPreview(checked);
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.planIssue) {
+        setPlanIssue(err.planIssue);
+        const field =
+          err.planIssue.parameterId ??
+          (err.planIssue.nodeId === startNode?.id ? err.planIssue.fieldId : undefined);
+        if (field) window.requestAnimationFrame(() => focusRunField(fieldRefs.current.get(field)));
+      } else {
+        setError(message(err));
+      }
+    } finally {
+      active.current = false;
+      setBusy(false);
+    }
+  }
   async function submit() {
     if (active.current) return;
     active.current = true;
@@ -270,7 +328,7 @@ export function ExecutionGraphStart({
   function runtimeInputs(): Inputs {
     return {
       parameters: Object.fromEntries(
-        fields.flatMap((field) => {
+        runtimeFields.flatMap((field) => {
           const value = parameters[field.id];
           if (value === undefined) return [];
           const serviceValue = (item: unknown) =>
@@ -292,7 +350,7 @@ export function ExecutionGraphStart({
       [field.id]: { schema: parameterSchema(field), value },
     };
     if (field.type === 'SERVICE') {
-      for (const candidate of fields) {
+      for (const candidate of runtimeFields) {
         if (candidate.type === 'ARTIFACT') {
           next[candidate.id] = { schema: parameterSchema(candidate), value: undefined };
         }
@@ -328,7 +386,7 @@ export function ExecutionGraphStart({
           onFocusParameter={openParameter}
         />
       )}
-      {initialInputs && Object.keys(initialInputs).length > 0 && (
+      {Object.keys(runtimePresets).length > 0 && (
         <p className="field-note">已填入当前入口传来的参数。</p>
       )}
       <fieldset
@@ -353,8 +411,8 @@ export function ExecutionGraphStart({
             </a>
           </p>
         )}
-        {fields.length ? (
-          fields.map((field) => (
+        {runtimeFields.length ? (
+          runtimeFields.map((field) => (
             <div
               key={field.id}
               className="graph-run-field"
@@ -368,7 +426,7 @@ export function ExecutionGraphStart({
                 field={field}
                 project={project}
                 scope={artifactFieldScope(field, flow, parameters, scope)}
-                disabled={Boolean(initialInputs && Object.hasOwn(initialInputs, field.id))}
+                disabled={Object.hasOwn(runtimePresets, field.id)}
                 checkRequired
                 canManageProjectResources
                 value={parameters[field.id]}
@@ -502,7 +560,21 @@ export function ExecutionGraphStart({
             返回修改参数
           </button>
         )}
-        <button type="submit" className="button primary" disabled={busy}>
+        {useDefaults && (
+          <button
+            type="button"
+            className="button primary"
+            disabled={busy}
+            onClick={() => void runDefaults()}
+          >
+            <Play size={15} /> 按默认配置立即运行
+          </button>
+        )}
+        <button
+          type="submit"
+          className={`button ${useDefaults ? 'secondary' : 'primary'}`}
+          disabled={busy}
+        >
           <Play size={15} />
           {busy ? '处理中…' : preview ? '确认启动' : revision ? '重新预览' : '预览运行'}
         </button>

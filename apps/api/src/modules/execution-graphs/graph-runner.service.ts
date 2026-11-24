@@ -62,7 +62,12 @@ import {
   type GraphFlow,
   type GraphNode,
 } from './execution-graph-definition';
-import type { GraphInputsDto, GraphPreviewDto, GraphRunDto } from './graph-runner.controller';
+import type {
+  GraphInputsDto,
+  GraphPreviewDto,
+  GraphRunDefaultsDto,
+  GraphRunDto,
+} from './graph-runner.controller';
 import { graphInputIssue, withNodePlanIssue, withPlanIssue } from './graph-execution-plan-issues';
 import {
   GraphNodeTasks,
@@ -105,6 +110,7 @@ import {
   artifactBindingRefs,
   artifactReferenceInstances,
   bindingContext,
+  assertRuntimeParameterOverrides,
   bindingValue,
   checkedParameters,
   declaredScope,
@@ -399,6 +405,7 @@ export type GraphPlanAuthorizer = (scope: GraphPlanAccessScope) => void | Promis
 
 export interface GraphRunControl {
   authorizePlan?: GraphPlanAuthorizer;
+  requestIdentity?: string;
   beforeInsert?: (tx: Transaction<Database>) => Promise<void>;
   afterInsert?: (tx: Transaction<Database>, runId: string) => Promise<void>;
 }
@@ -1039,9 +1046,13 @@ export class GraphRunnerService implements OnModuleInit {
               repositoryId,
             }),
           );
+      const startSelectedTarget =
+        flowStart(flow).contract === 'PRESET' &&
+        Boolean(base.serverIds?.length || base.groupIds?.length);
       const definition = Object.assign(new PipelineDefinitionDto(), settings, {
         repositoryId,
-        inheritBuildLocation: !settings.buildLocation,
+        ...(startSelectedTarget && { buildLocation: 'TARGET' }),
+        inheritBuildLocation: !settings.buildLocation && !startSelectedTarget,
         ...(settings.artifacts && { artifacts: graphArtifactDefinitions(settings.artifacts) }),
       });
       const variableBinding = values.variables as GraphEnvironmentRef | undefined;
@@ -1386,6 +1397,16 @@ export class GraphRunnerService implements OnModuleInit {
       definitionOverride ??
       (await this.published(projectId, request.version, this.database.db, !allowRetired));
     const flow = this.flow(definition, flowId);
+    if (!rootId && !automation) {
+      assertRuntimeParameterOverrides(flow, request.inputs?.parameters);
+      if (
+        flowStart(flow).contract === 'PRESET' &&
+        Object.entries(request.inputs ?? {}).some(
+          ([field, value]) => value !== undefined && !['parameters', 'value'].includes(field),
+        )
+      )
+        throw graphInputIssue(flow, '请使用当前开始节点允许覆盖的运行参数');
+    }
     if (automation) assertAutomaticGraphFlow(definition, flowId, automation.kind);
     const inputs = await this.resolveParameters(
       projectId,
@@ -2332,6 +2353,70 @@ export class GraphRunnerService implements OnModuleInit {
     return { ...values, status: 'QUEUED', created_at: Date.now() };
   }
 
+  private async confirmLatestVersion(db: Kysely<Database>, projectId: string, version: number) {
+    const graph = await db
+      .selectFrom('execution_graphs')
+      .select('published_version')
+      .where('project_id', '=', projectId)
+      .executeTakeFirst();
+    if (graph?.published_version !== version)
+      throw new ConflictException('已发布版本已变化，请刷新后运行');
+  }
+
+  async runDefaults(
+    projectId: string,
+    flowId: string,
+    request: GraphRunDefaultsDto,
+    userId: string,
+  ) {
+    const db = this.database.db;
+    await requireProject(db, projectId);
+    const requestIdentity = digest(['MANUAL_DEFAULTS', flowId, request.version]);
+    const previous = await db
+      .selectFrom('execution_flow_runs')
+      .select(['id', 'request_hash', 'version'])
+      .where('project_id', '=', projectId)
+      .where('created_by', '=', userId)
+      .where('idempotency_key', '=', request.idempotencyKey)
+      .executeTakeFirst();
+    if (previous) {
+      checkRequest(previous, requestIdentity);
+      await this.advance(previous.id);
+      return { outcome: 'STARTED' as const, runId: previous.id, version: previous.version };
+    }
+    await this.confirmLatestVersion(db, projectId, request.version);
+    const preview = await this.preview(projectId, flowId, { version: request.version });
+    const gate = preview.gates.find(
+      ({ kind }) => kind === 'APPROVAL' || kind === 'SOURCE_REVIEW' || kind === 'ROLLBACK_ARTIFACT',
+    );
+    const release = preview.deliveries.find(
+      (entry) => entry.requireApproval || entry.requireCodeReview,
+    );
+    if (gate || release)
+      return {
+        outcome: 'NEEDS_CONFIRMATION' as const,
+        version: request.version,
+        nodeId: gate?.nodeId ?? release?.nodeId,
+        reason: '请预览发布条件和目标后确认运行',
+      };
+    const run = await this.run(
+      projectId,
+      flowId,
+      {
+        ...request,
+        expectedConfigurationHash: preview.configurationHash,
+        expectedPlanSections: preview.planSections,
+      },
+      userId,
+      undefined,
+      {
+        requestIdentity,
+        beforeInsert: (tx) => this.confirmLatestVersion(tx, projectId, request.version),
+      },
+    );
+    return { outcome: 'STARTED' as const, runId: run.id, version: run.version };
+  }
+
   async run(
     projectId: string,
     flowId: string,
@@ -2341,13 +2426,15 @@ export class GraphRunnerService implements OnModuleInit {
     control?: GraphRunControl,
   ) {
     const db = this.database.db;
-    const requestHash = digest([
-      flowId,
-      request.version,
-      request.inputs ?? {},
-      request.expectedConfigurationHash,
-      ...(origin ? [origin.triggerType] : []),
-    ]);
+    const requestHash =
+      control?.requestIdentity ??
+      digest([
+        flowId,
+        request.version,
+        request.inputs ?? {},
+        request.expectedConfigurationHash,
+        ...(origin ? [origin.triggerType] : []),
+      ]);
     await requireProject(db, projectId);
     const previous = () =>
       db

@@ -55,6 +55,11 @@ export class GraphRunDto extends GraphPreviewDto {
   @Matches(/^[a-zA-Z0-9_-]{1,120}$/) idempotencyKey!: string;
 }
 
+export class GraphRunDefaultsDto {
+  @IsInt() @Min(1) version!: number;
+  @Matches(/^[a-zA-Z0-9_-]{1,120}$/) idempotencyKey!: string;
+}
+
 export class GraphApprovalDecisionDto {
   @IsIn(['APPROVE', 'REJECT']) decision!: 'APPROVE' | 'REJECT';
   @IsOptional() @Matches(/^[a-f0-9]{64}$/) expectedScopeHash?: string;
@@ -86,6 +91,17 @@ export class GraphRunnerController {
     @Req() req: AuthRequest,
   ) {
     return this.runner.run(projectId, flowId, body, req.user.id);
+  }
+
+  @Post('flows/:flowId/run-defaults')
+  @Roles('ADMIN', 'OPERATOR')
+  runDefaults(
+    @Param('id', ParseUUIDPipe) projectId: string,
+    @Param('flowId') flowId: string,
+    @Body() body: GraphRunDefaultsDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.runner.runDefaults(projectId, flowId, body, req.user.id);
   }
 
   @Get('runs')

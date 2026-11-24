@@ -100,6 +100,15 @@ export class ExecutionGraphsController {
       throw new ExecutionPlanIssueError({ code: 'CONFIGURATION', ...error.issue });
     }
   }
+
+  @Post('publication-impact')
+  @Roles('ADMIN', 'OPERATOR')
+  impact(
+    @Param('projectId', ParseUUIDPipe) projectId: string,
+    @Body() input: ExpectedGraphRevisionDto,
+  ) {
+    return this.graphs.publicationImpact(projectId, input.expectedRevision);
+  }
   @Get('versions')
   versions(@Param('projectId', ParseUUIDPipe) projectId: string) {
     return this.graphs.versions(projectId);

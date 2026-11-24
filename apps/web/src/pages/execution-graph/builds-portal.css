@@ -1,0 +1,36 @@
+.builds-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr));
+  gap: 0.8rem;
+  margin-block-end: 1rem;
+}
+
+.builds-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.builds-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.65rem 1rem;
+  padding: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.builds-list li + li {
+  border-block-start: 1px solid var(--border);
+}
+
+.builds-flow-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.7rem;
+  margin-block-start: 0.3rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}

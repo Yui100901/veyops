@@ -458,6 +458,24 @@ async function verify(databaseUrl?: string) {
     ).body.data;
     assert.equal(keptHistory.version, latestVersion);
     assert.equal(keptHistory.nodes[1].log, 'new visual version');
+
+    const summary = (await admin.get(root + '/delivery-flows').expect(200)).body.data;
+    const targetFlow = summary.find(
+      (entry: { projectId: string }) => entry.projectId === project.id,
+    ).flows[0];
+    assert.equal(targetFlow.id, 'target');
+    const quick = { version: targetFlow.version, idempotencyKey: 'repeat-default-run' };
+    const route = path + '/flows/target/run-defaults';
+    const [left, right] = await Promise.all([
+      admin.post(route).send(quick).expect(201),
+      admin.post(route).send(quick).expect(201),
+    ]);
+    assert.equal(left.body.data.outcome, 'STARTED');
+    assert.equal(left.body.data.runId, right.body.data.runId);
+    await admin
+      .post(route)
+      .send({ ...quick, version: latestVersion, idempotencyKey: 'outdated-default-run' })
+      .expect(409);
   } finally {
     await app.close();
     await rm(dir, { recursive: true, force: true });

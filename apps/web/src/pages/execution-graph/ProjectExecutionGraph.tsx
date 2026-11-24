@@ -15,6 +15,8 @@ import {
 import { Confirm, ErrorBanner, Field, Loading, Modal, PageHeader, Section } from '../../components';
 import type { ProjectDetail, User } from '../../models';
 import { NodeMap } from './editor/ExecutionGraphCanvas';
+import { ExecutionGraphInputSummary } from './editor/ExecutionGraphInputSummary';
+import { actionCardText, graphActionSources, startCardText } from './editor/graph-action-sources';
 import { ProjectGraphEditor } from './editor/ExecutionGraphEditor';
 import { ExecutionGraphMigration } from './ExecutionGraphMigration';
 import { PublishedNodeDetails, showSelectedNode } from './editor/ExecutionGraphNodeDetails';
@@ -40,6 +42,7 @@ import { effectiveNodeType, graphNodeTypeLabel } from './execution-graph-definit
 import { GraphResourceContext } from './graph-resource-context';
 import type {
   GraphCanvas,
+  GraphArtifactType,
   GraphCatalog,
   GraphDocument,
   GraphEdge,
@@ -55,6 +58,7 @@ import {
   graphScopeBackHref,
   graphStartReadiness,
   graphWorkbenchPath,
+  releaseArtifactInput,
   type GraphPane,
   type GraphWorkbenchScope,
 } from './graph-workbench-context';
@@ -180,6 +184,14 @@ function Workspace({
   const linkedNode = params.get('node') ?? undefined;
   const linkedFlow = params.get('flow') ?? undefined;
   const linkedStart = params.get('start') ?? undefined;
+  const linkedArtifactId = params.get('artifactId') ?? undefined;
+  const rawArtifactType = params.get('artifactType');
+  const linkedArtifactType =
+    rawArtifactType === 'FILE' ||
+    rawArtifactType === 'DIRECTORY' ||
+    rawArtifactType === 'DOCKER_IMAGE'
+      ? rawArtifactType
+      : undefined;
   const linkedField = params.get('field') ?? undefined;
   const linkedFieldLocation = readGraphIssueLocation(
     params.get('fieldSection'),
@@ -208,6 +220,16 @@ function Workspace({
   const [redo, setRedo] = useState<GraphCanvas[]>([]);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [publication, setPublication] = useState<{
+    revision: number;
+    version: number;
+    flows: {
+      id: string;
+      name: string;
+      change: 'ADDED' | 'CHANGED' | 'REMOVED';
+      triggers: string[];
+    }[];
+  }>();
   const [issues, setIssues] = useState<GraphIssue[]>([]);
   const [conflict, setConflict] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -260,7 +282,7 @@ function Workspace({
     });
   }
 
-  async function persist(action: 'save' | 'publish' | 'reload' | 'validate') {
+  async function persist(action: 'save' | 'publish' | 'reload' | 'validate', confirmed = false) {
     if (saving.current) return;
     saving.current = true;
     setBusy(true);
@@ -278,6 +300,12 @@ function Workspace({
           setNotice('发布检查通过');
           return;
         }
+        if (!confirmed) {
+          setPublication(
+            await post(path + '/publication-impact', { expectedRevision: graph.revision }),
+          );
+          return;
+        }
       }
       let saved: GraphDocument;
       if (action === 'save')
@@ -292,6 +320,7 @@ function Workspace({
         saved = await post(path + '/publish', { expectedRevision: graph.revision });
       else saved = await api(path);
       setGraph(saved);
+      setPublication(undefined);
       setCanvas(saved.draft.canvas ?? emptyCanvas);
       setIssues([]);
       if (action === 'reload') {
@@ -508,6 +537,48 @@ function Workspace({
           {notice}
         </p>
       )}
+      {pane === 'draft' && !dirty && publication?.revision === graph.revision && (
+        <Section
+          title={`确认发布 v${publication.version}`}
+          subtitle="发布后，新的运行和兼容的触发规则将使用此版本。"
+        >
+          <div className="form-body">
+            {publication.flows.length ? (
+              <ul>
+                {publication.flows.map((flow) => (
+                  <li key={flow.id}>
+                    <strong>{flow.name}</strong> ·{' '}
+                    {flow.change === 'ADDED' ? '新增' : flow.change === 'REMOVED' ? '移除' : '修改'}
+                    {!!flow.triggers.length && (
+                      <div className="field-note">涉及规则 · {flow.triggers.join('、')}</div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="field-note">执行流定义与当前发布版一致。</p>
+            )}
+            <div className="row-actions">
+              <button
+                type="button"
+                className="button secondary"
+                disabled={busy}
+                onClick={() => setPublication(undefined)}
+              >
+                返回草稿
+              </button>
+              <button
+                type="button"
+                className="button primary"
+                disabled={busy}
+                onClick={() => void persist('publish', true)}
+              >
+                确认发布
+              </button>
+            </div>
+          </div>
+        </Section>
+      )}
       {pane === 'run' && (
         <Section
           className="graph-run-section"
@@ -522,7 +593,7 @@ function Workspace({
               <Loading />
             ) : publishedRun.data && publishedRun.data.version === runVersion ? (
               <PublishedRun
-                key={`${publishedRun.data.version}:${linkedStart ?? ''}:${linkedNode ?? ''}:${linkedFlow ?? ''}:${scope.serviceId ?? ''}:${scope.environmentId ?? ''}`}
+                key={`${publishedRun.data.version}:${linkedStart ?? ''}:${linkedNode ?? ''}:${linkedFlow ?? ''}:${scope.serviceId ?? ''}:${scope.environmentId ?? ''}:${linkedArtifactId ?? ''}`}
                 published={publishedRun.data}
                 project={project}
                 path={path}
@@ -533,6 +604,8 @@ function Workspace({
                 canManageTriggers={canEdit && isAdmin}
                 triggerIssueHref={triggerIssueHref}
                 startId={linkedStart}
+                artifactId={linkedArtifactId}
+                artifactType={linkedArtifactType}
                 focusFieldId={linkedField}
                 inspectNodeId={linkedNode}
                 inspectFlowId={linkedFlow}
@@ -737,6 +810,8 @@ function PublishedRun({
   canManageTriggers,
   triggerIssueHref,
   startId,
+  artifactId,
+  artifactType,
   focusFieldId,
   inspectNodeId,
   inspectFlowId,
@@ -752,6 +827,8 @@ function PublishedRun({
   canManageTriggers: boolean;
   triggerIssueHref: (issue: TriggerPreflightIssue) => string;
   startId?: string;
+  artifactId?: string;
+  artifactType?: GraphArtifactType;
   focusFieldId?: string;
   inspectNodeId?: string;
   inspectFlowId?: string;
@@ -770,8 +847,23 @@ function PublishedRun({
       item.nodes.some((node) => node.type === 'START' && node.id === startId),
   );
   const readiness = selected && starts.get(selected.id);
-  const flow = readiness && readiness.status !== 'CONTEXT_MISMATCH' ? selected : undefined;
-  const initialInputs = readiness && 'parameters' in readiness ? readiness.parameters : undefined;
+  const artifactField =
+    artifactId && selected ? releaseArtifactInput(selected, artifactType) : undefined;
+  const invalidArtifact = Boolean(
+    artifactId &&
+    (!artifactField || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(artifactId)),
+  );
+  const flow =
+    readiness && readiness.status !== 'CONTEXT_MISMATCH' && !invalidArtifact ? selected : undefined;
+  const initialInputs =
+    readiness && 'parameters' in readiness
+      ? {
+          ...readiness.parameters,
+          ...(artifactField &&
+            artifactId &&
+            !invalidArtifact && { [artifactField.id]: artifactId }),
+        }
+      : undefined;
   const start = selected?.nodes.find(({ type }) => type === 'START');
   const heading = useRef<HTMLHeadingElement>(null);
   const stickyCanvas = useRef<HTMLDivElement>(null);
@@ -781,6 +873,9 @@ function PublishedRun({
   }, [canRun, flow, focusFieldId, inspectNodeId]);
   return (
     <>
+      {invalidArtifact && (
+        <ErrorBanner error="当前执行流没有唯一可覆盖且类型匹配的部署产物输入，请选择其他发布流程。" />
+      )}
       {scoped && (
         <div className="graph-fields graph-scoped-starts">
           <h3>关联的开始节点</h3>
@@ -1183,6 +1278,14 @@ function PublishedNodes({
   const inspectedNode = inspectedFlow?.nodes.find(({ id }) => id === selected) ?? node;
   const highlight = (hovered && flowsByStart.get(hovered)) || flowsByStart.get(selected);
   const highlightedEdges = new Set(highlight?.edges.map(edgeKey));
+  function actionSources(item: GraphNode, selectedFlow: GraphFlow | undefined) {
+    if (!selectedFlow) return [];
+    return graphActionSources(
+      selectedFlow.nodes.find(({ type }) => type === 'START'),
+      selectedFlow.nodes,
+      selectedFlow.compiled?.nodes[item.id]?.inputBindings ?? selectedFlow.inputBindings?.[item.id],
+    );
+  }
   function selectNode(id: string) {
     setSelected(id);
     const start = runnable(id);
@@ -1206,6 +1309,11 @@ function PublishedNodes({
       onHighlight={setHovered}
       isRunnableStart={onChooseFlow ? (id) => Boolean(runnable(id)) : undefined}
       onSelect={selectNode}
+      nodeSummary={(item) =>
+        item.type === 'START'
+          ? startCardText(item, project)
+          : actionCardText(actionSources(item, inspectedFlow))
+      }
       reveal={stickyCanvas && expanded ? reveal : undefined}
     />
   );
@@ -1273,6 +1381,10 @@ function PublishedNodes({
                     </small>
                   </div>
                 </header>
+                <ExecutionGraphInputSummary
+                  entries={actionSources(inspectedNode, inspectedFlow)}
+                  onSource={({ nodeId }) => selectNode(nodeId)}
+                />
                 {definition.canvas &&
                 flowsWithNode.length > 1 &&
                 effectiveNodeType(node) !== 'START' ? (

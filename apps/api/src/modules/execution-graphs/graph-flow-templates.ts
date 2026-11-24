@@ -88,6 +88,7 @@ export function expandGraphTemplate(
     id: `start-${randomUUID()}`,
     name: template.name,
     type: 'START',
+    contract: 'PRESET',
     inputs: startInputs,
   };
   const end: GraphNode = {
@@ -129,14 +130,20 @@ export function expandGraphTemplate(
     source: output(checkout, 'source'),
   };
   if (check && workspace) {
-    check.shell = { location: 'MANAGER', timeout: 180 };
+    check.shell = { timeout: 180 };
     inputBindings[check.id] = workspace;
   }
 
   // A service is optional for a standalone build and required when its artefact is deployed.
   startInputs.push({ id: 'service', name: '项目服务', type: 'SERVICE', required: Boolean(deploy) });
   if (build && workspace) {
-    startInputs.push({ id: 'buildTargets', name: '构建目标', type: 'TARGETS', required: false });
+    startInputs.push({
+      id: 'buildTargets',
+      name: '构建目标',
+      type: 'TARGETS',
+      required: false,
+      purpose: 'BUILD_TARGETS',
+    });
     build.build = {
       artifacts: [
         {
@@ -176,7 +183,13 @@ export function expandGraphTemplate(
         artifactType,
         required: true,
       });
-    startInputs.push({ id: 'releaseTargets', name: '发布目标', type: 'TARGETS', required: true });
+    startInputs.push({
+      id: 'releaseTargets',
+      name: '发布目标',
+      type: 'TARGETS',
+      required: true,
+      purpose: 'RELEASE_TARGETS',
+    });
     deploy.deploy = {
       method: artifactType === 'DOCKER_IMAGE' ? 'COMPOSE' : 'FILE',
       ...(artifactType === 'DOCKER_IMAGE' && { composeSource: { kind: 'ARTIFACT' } }),

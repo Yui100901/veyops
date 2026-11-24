@@ -68,7 +68,8 @@ export function ExecutionGraphTriggerEditor({
       ? '/projects/' + project.id + '/repositories/' + form.repositoryId + '/branches'
       : null,
   );
-  const fields = flows.find(({ id }) => id === startId)?.inputs ?? [];
+  const startFields = flows.find(({ id }) => id === startId)?.inputs ?? [];
+  const fields = startFields.filter(({ runtimeOverride }) => runtimeOverride !== false);
   const upstreamOutputs =
     form.kind === 'UPSTREAM' && form.upstreamStatus === 'SUCCESS'
       ? (flows.find(({ id }) => id === form.upstreamFlowId)?.outputs ?? [])
@@ -104,7 +105,19 @@ export function ExecutionGraphTriggerEditor({
       const enabled =
         action === 'enable' ||
         ((action === 'save' || action === 'check') && Boolean(rule?.enabled));
-      const body = triggerRequest(form, enabled, latestVersion);
+      const body = triggerRequest(
+        {
+          ...form,
+          parameterMappings: Object.fromEntries(
+            Object.entries(form.parameterMappings ?? {}).filter(
+              ([id]) =>
+                !startFields.some((field) => field.id === id && field.runtimeOverride === false),
+            ),
+          ),
+        },
+        enabled,
+        latestVersion,
+      );
       if (action === 'check') {
         await check({ ...body, enabled: !!latestVersion });
         return;
