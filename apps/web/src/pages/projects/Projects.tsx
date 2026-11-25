@@ -358,7 +358,6 @@ export function ProjectsPage({ user, search }: { user: User; search?: string }) 
                     )}
                   </section>
                   <ProjectAccessLinks
-                    compact
                     showEmpty
                     title="服务访问"
                     addresses={project.addresses ?? []}

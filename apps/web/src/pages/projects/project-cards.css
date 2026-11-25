@@ -181,25 +181,6 @@
   overflow-wrap: anywhere;
   user-select: text;
 }
-.project-access-address {
-  grid-column: 1 / -1;
-  min-width: 0;
-  border-top: 1px solid #b4d6c9;
-}
-.project-access-address > summary {
-  min-height: 30px;
-  padding: 0.35rem 0.55rem;
-  cursor: pointer;
-  color: #35565f;
-  font-size: 0.82rem;
-}
-.project-access-address[open] .project-access-expand,
-.project-access-address:not([open]) .project-access-collapse {
-  display: none;
-}
-.project-access-address > .project-access-url {
-  display: block;
-}
 .project-access-feedback,
 .project-access-empty {
   color: #526675;

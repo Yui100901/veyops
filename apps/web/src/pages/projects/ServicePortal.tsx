@@ -190,7 +190,7 @@ export function ServicePortal({ search }: { search?: string }) {
                           </h3>
                           <DeliveryStatus targets={service.targets} />
                         </div>
-                        <ProjectAccessLinks addresses={service.addresses} compact showEmpty />
+                        <ProjectAccessLinks addresses={service.addresses} showEmpty />
                       </div>
                     ))}
                   </div>

@@ -49,7 +49,7 @@ async function copyUrl(url: string) {
   }
 }
 
-function AccessLinkList({ links, compact }: { links: AccessLink[]; compact: boolean }) {
+function AccessLinkList({ links }: { links: AccessLink[] }) {
   const [feedback, setFeedback] = useState('');
 
   async function copyAddress(link: AccessLink) {
@@ -81,17 +81,7 @@ function AccessLinkList({ links, compact }: { links: AccessLink[]; compact: bool
               <Copy size={15} aria-hidden="true" />
               复制
             </button>
-            {compact ? (
-              <details className="project-access-address">
-                <summary>
-                  <span className="project-access-expand">显示地址</span>
-                  <span className="project-access-collapse">隐藏地址</span>
-                </summary>
-                <code className="project-access-url">{link.url}</code>
-              </details>
-            ) : (
-              <code className="project-access-url">{link.url}</code>
-            )}
+            <code className="project-access-url">{link.url}</code>
           </li>
         ))}
       </ul>
@@ -108,13 +98,11 @@ export function ProjectAccessLinks({
   addresses,
   serviceHref,
   showEmpty = false,
-  compact = false,
   title = '访问地址',
 }: {
   addresses: ProjectAccessLink[];
   serviceHref?: (serviceId: string) => string;
   showEmpty?: boolean;
-  compact?: boolean;
   title?: string;
 }) {
   const links = addresses.flatMap((address) => {
@@ -149,12 +137,12 @@ export function ProjectAccessLinks({
                   '其他地址'
                 )}
               </h5>
-              <AccessLinkList links={group} compact={compact} />
+              <AccessLinkList links={group} />
             </li>
           ))}
         </ul>
       ) : (
-        <AccessLinkList links={links} compact={compact} />
+        <AccessLinkList links={links} />
       )}
     </div>
   );
