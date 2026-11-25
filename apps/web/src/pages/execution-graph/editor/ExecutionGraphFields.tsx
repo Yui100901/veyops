@@ -63,13 +63,15 @@ interface ValueProps {
   canManageProjectResources?: boolean;
   checkRequired?: boolean;
   repositoryAddress?: boolean;
+  artifactInstancesOnly?: boolean;
+  credentialTypes?: readonly string[];
 }
 
 function stringValue(value: unknown) {
   return typeof value === 'string' ? value : '';
 }
 
-function referenceId(value: unknown) {
+export function referenceId(value: unknown) {
   if (value && typeof value === 'object') {
     if ('serviceId' in value) return stringValue(value.serviceId);
     if ('artifactId' in value) return stringValue(value.artifactId);
@@ -296,6 +298,7 @@ function ArtifactValue({
   disabled,
   scope,
   checkRequired,
+  artifactInstancesOnly,
 }: ValueProps) {
   const query = new URLSearchParams({ projectId: project.id });
   if (scope?.serviceId) query.set('serviceId', scope.serviceId);
@@ -334,7 +337,10 @@ function ArtifactValue({
       (field.acceptedArtifactTypes && !field.acceptedArtifactTypes.some((type) => type === kind)) ||
       (scope?.deliveryMethod === 'FILE' && kind === 'DOCKER_IMAGE') ||
       (scope?.serviceId && artifact.serviceId !== scope.serviceId) ||
-      (server && servers.size > 0 && !servers.has(server))
+      (server &&
+        servers.size > 0 &&
+        !servers.has(server) &&
+        (!artifactInstancesOnly || kind === 'DOCKER_IMAGE'))
     )
       continue;
     const id = artifactLogicalId(artifact);
@@ -360,12 +366,13 @@ function ArtifactValue({
       !servers.size ||
       selectableInstances.some((item) => !targetOf(item)) ||
       [...servers].every((server) => selectableInstances.some((item) => targetOf(item) === server));
-    if (selectableInstances.length && compatible)
+    if (!artifactInstancesOnly && selectableInstances.length && compatible)
       selectable.set(artifactId, {
         name: title + ' · ' + selectableInstances.length + ' 个实例',
         ref: { artifactId },
       });
     if (
+      artifactInstancesOnly ||
       (!compatible && field.multiple) ||
       (!field.multiple && selectableInstances.length > 1 && servers.size <= 1)
     )
@@ -377,7 +384,7 @@ function ArtifactValue({
           : server
             ? (serverNames.get(server) ?? server)
             : '管理端';
-        selectable.set(artifactId + ':' + instanceId, {
+        selectable.set(artifactInstancesOnly ? instanceId : artifactId + ':' + instanceId, {
           name: title + ' · ' + location,
           ref: { artifactId, instanceId },
         });
@@ -425,7 +432,10 @@ function ArtifactValue({
           label={field.name}
           options={rows}
           value={selected[0]}
-          change={(id) => change(id ? selectable.get(id)?.ref : undefined)}
+          change={(id) => {
+            const ref = id ? selectable.get(id)?.ref : undefined;
+            change(artifactInstancesOnly ? ref?.instanceId : ref);
+          }}
           disabled={disabled || versions.loading || pendingTargets}
           required={checkRequired && field.required && !latest}
           empty={latest ? '使用最新兼容产物' : '选择已有产物'}
@@ -497,13 +507,22 @@ function TargetsValue({ project, field, value, change, disabled, checkRequired }
   );
 }
 
-function CredentialsValue({ field, value, change, disabled, checkRequired }: ValueProps) {
+function CredentialsValue({
+  field,
+  value,
+  change,
+  disabled,
+  checkRequired,
+  credentialTypes,
+}: ValueProps) {
   const credentials = useResource<Credential[]>('/credentials');
   return (
     <>
       <ResourceSelect
         label={field.name}
-        options={credentials.data ?? []}
+        options={(credentials.data ?? []).filter(
+          ({ type }) => !credentialTypes || credentialTypes.includes(type),
+        )}
         value={value}
         change={change}
         disabled={disabled}

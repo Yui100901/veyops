@@ -24,10 +24,15 @@ import {
 import type { GraphBinding, GraphField, GraphFlow, GraphRun } from '../execution-graph-definition';
 import { projectGraphPath, projectResourcePath } from '../../projects/project-workspace-route';
 import { graphStartReadiness, type GraphWorkbenchScope } from '../graph-workbench-context';
+import {
+  simplifiedConditionField,
+  simplifiedModel,
+  simplifiedRuntimeInputs,
+} from '../simplified-flow';
 
 export { ExecutionGraphHistory } from './ExecutionGraphHistory';
 
-type Inputs = { parameters: Record<string, unknown> };
+type Inputs = { parameters: Record<string, unknown>; value?: string };
 type ParameterEdits = Record<string, { schema: string; value: unknown }>;
 export type GraphRunDrafts = Map<string, ParameterEdits>;
 
@@ -177,12 +182,15 @@ export function ExecutionGraphStart({
   onRun: (id: string) => void;
 }) {
   const startNode = flow.nodes.find(({ type }) => type === 'START');
+  const simplified = flow.model === simplifiedModel;
+  const start = simplified ? startNode?.start : undefined;
   const setConfiguration = startNode?.environmentSet;
   const fixedSetId =
-    setConfiguration?.mode === 'FIXED' ? setConfiguration.environmentSetId : undefined;
+    start?.environmentSetId ??
+    (setConfiguration?.mode === 'FIXED' ? setConfiguration.environmentSetId : undefined);
   const fixedSets = useProjectEnvironmentSets(project.id, !!fixedSetId);
   const fixedSet = fixedSets.data?.find(({ id }) => id === fixedSetId);
-  const fields = startNode?.inputs ?? [];
+  const fields = simplified ? simplifiedRuntimeInputs(flow, project) : (startNode?.inputs ?? []);
   const runtimeFields = fields.filter(({ runtimeOverride }) => runtimeOverride !== false);
   const runtimePresets = Object.fromEntries(
     runtimeFields.flatMap(({ id }) =>
@@ -191,6 +199,7 @@ export function ExecutionGraphStart({
   );
   const draftKey = JSON.stringify([
     flow.id,
+    flow.model,
     workbenchScope.serviceId,
     workbenchScope.environmentId,
   ]);
@@ -223,9 +232,11 @@ export function ExecutionGraphStart({
     repositoryId: scopedValue('REPOSITORY') as string | undefined,
     environmentId: scopedValue('ENVIRONMENT') as string | undefined,
     serviceId:
+      start?.release?.serviceId ??
       (flow.compiled?.presetResourceGroups ? undefined : flow.serviceId) ??
       serviceReferenceId(scopedValue('SERVICE')),
-    targets: scopedValue('TARGETS') as DeploymentSelection | undefined,
+    targets: start?.release?.targets ?? (scopedValue('TARGETS') as DeploymentSelection | undefined),
+    deliveryMethod: simplified ? flow.nodes.find(isReleaseNode)?.deploy?.method : undefined,
   };
   const [preview, setPreview] = useState<Preview>();
   const [revision, setRevision] = useState<{ previous: Preview; sections: string[] }>();
@@ -253,7 +264,8 @@ export function ExecutionGraphStart({
   }, [focusFieldId]);
   const base = path + '/flows/' + encodeURIComponent(flow.id);
   const useDefaults =
-    startNode?.contract === 'PRESET' &&
+    (simplified || startNode?.contract === 'PRESET') &&
+    !start?.release?.useUpstreamArtifact &&
     !preview &&
     !revision &&
     !Object.keys(edits).length &&
@@ -339,6 +351,24 @@ export function ExecutionGraphStart({
     }
   }
   function runtimeInputs(): Inputs {
+    if (simplified) {
+      const value = parameters[simplifiedConditionField];
+      return {
+        value: typeof value === 'string' && value !== '' ? value : undefined,
+        parameters: Object.fromEntries(
+          runtimeFields.flatMap((field) => {
+            const edit = edits[field.id];
+            if (field.id === simplifiedConditionField) return [];
+            if (!Object.hasOwn(runtimePresets, field.id) && edit?.schema !== parameterSchema(field))
+              return [];
+            const value = parameters[field.id];
+            return value === undefined || (value === '' && field.type !== 'TEXT')
+              ? []
+              : [[field.id, value]];
+          }),
+        ),
+      };
+    }
     return {
       parameters: Object.fromEntries(
         runtimeFields.flatMap((field) => {
@@ -402,6 +432,9 @@ export function ExecutionGraphStart({
       {Object.keys(runtimePresets).length > 0 && (
         <p className="field-note">已填入当前入口传来的参数。</p>
       )}
+      {start?.release?.useUpstreamArtifact && !start.release.allowArtifactOverride && (
+        <p className="field-note">此流使用上游产物，通过配置的上游触发器运行。</p>
+      )}
       <fieldset
         disabled={busy || Boolean(preview || revision)}
         hidden={Boolean(preview || revision)}
@@ -438,10 +471,22 @@ export function ExecutionGraphStart({
               <GraphFieldValue
                 field={field}
                 project={project}
-                scope={parameterFieldScope(field, flow, parameters, scope)}
+                scope={
+                  simplified
+                    ? {
+                        ...scope,
+                        repositoryId:
+                          field.type === 'GIT_REF'
+                            ? start?.sources?.find(({ id }) => 'git:' + id === field.id)
+                                ?.repositoryId
+                            : scope.repositoryId,
+                      }
+                    : parameterFieldScope(field, flow, parameters, scope)
+                }
                 disabled={Object.hasOwn(runtimePresets, field.id)}
                 checkRequired
                 canManageProjectResources
+                artifactInstancesOnly={simplified}
                 value={parameters[field.id]}
                 change={(value) => updateParameter(field, value)}
               />
@@ -586,7 +631,10 @@ export function ExecutionGraphStart({
         <button
           type="submit"
           className={`button ${useDefaults ? 'secondary' : 'primary'}`}
-          disabled={busy}
+          disabled={
+            busy ||
+            Boolean(start?.release?.useUpstreamArtifact && !start.release.allowArtifactOverride)
+          }
         >
           <Play size={15} />
           {busy ? '处理中…' : preview ? '确认启动' : revision ? '重新预览' : '预览运行'}

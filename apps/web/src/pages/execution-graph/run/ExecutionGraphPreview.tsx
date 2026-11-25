@@ -9,6 +9,7 @@ import type {
 } from '../execution-graph-definition';
 import { deliveryPath } from '../../delivery/delivery-route';
 import {
+  artifactKindLabel,
   artifactVerificationLabels,
   type ArtifactPhysical,
   type ArtifactVerification,
@@ -16,6 +17,7 @@ import {
 import { projectResourcePath } from '../../projects/project-workspace-route';
 import { graphWorkbenchPath } from '../graph-workbench-context';
 import { serverResourceHref } from '../../infrastructure/server-resource-route';
+import type { SimplifiedPublicPlan } from '../simplified-flow';
 import './execution-graph-preview.css';
 
 interface NodeScope {
@@ -155,6 +157,7 @@ interface DeliveryPreview extends NodeScope {
 type ReleaseGateKind = 'SOURCE_REVIEW' | 'APPROVAL' | 'HEALTH_CHECK' | 'ROLLBACK_ARTIFACT';
 
 export interface Preview extends DeliveryPreview {
+  simplified?: SimplifiedPublicPlan;
   configurationHash: string;
   planSections?: Record<string, string>;
   version: number;
@@ -195,6 +198,7 @@ export interface Preview extends DeliveryPreview {
     fullClone?: boolean;
     fetchMode?: 'LATEST' | 'FULL';
     fetchModeDeferred?: boolean;
+    directory?: string;
   })[];
   scripts?: (NodeScope & {
     serverId?: string;
@@ -720,6 +724,132 @@ function previewGates(preview: Preview): NonNullable<Preview['gates']> {
   );
 }
 
+export function SimplifiedPlanDetails({
+  plan,
+  project,
+  showSources = false,
+}: {
+  plan: SimplifiedPublicPlan;
+  project: ProjectDetail;
+  showSources?: boolean;
+}) {
+  const release = plan.release;
+  const finish = plan.finish;
+  return (
+    <>
+      <section>
+        <h4>执行工作区</h4>
+        <div className="execution-plan-row">
+          <span>
+            {plan.location === 'MANAGER'
+              ? '管理端'
+              : '目标端 · ' + (plan.serverName ?? plan.serverId ?? '—')}
+          </span>
+          {plan.workspacePath && <code>{plan.workspacePath}</code>}
+        </div>
+      </section>
+      {showSources && Boolean(plan.sources?.length) && (
+        <section>
+          <h4>实际源码与提交</h4>
+          {plan.sources.map((source) => (
+            <div key={source.id} className="execution-plan-row">
+              <strong>
+                {source.repositoryName ??
+                  project.repositories.find(({ id }) => id === source.repositoryId)?.name ??
+                  source.repositoryId}
+              </strong>
+              <code>{source.commitSha}</code>
+              <small>
+                工作区相对路径 · <code>{source.path}</code>
+              </small>
+            </div>
+          ))}
+        </section>
+      )}
+      {release && (
+        <section>
+          <h4>{release.method === 'COMPOSE' ? 'Docker Compose 发布' : '受管文件发布'}</h4>
+          <div className="execution-plan-row">
+            <strong>
+              {project.services.find(({ id }) => id === release.serviceId)?.name ??
+                release.serviceId}
+            </strong>
+            {release.artifactId && (
+              <small>
+                产物实例 · <code>{release.artifactId}</code>
+              </small>
+            )}
+            {release.contentPath && (
+              <small>
+                快照发布内容 · <code>{release.contentPath}</code>
+              </small>
+            )}
+            {release.compose?.path && (
+              <small>
+                Compose 配置 · <code>{release.compose.path}</code>
+              </small>
+            )}
+            <small>
+              目标发布目录 · <code>{release.deployPath}</code>
+            </small>
+          </div>
+        </section>
+      )}
+      <section>
+        <h4>结束结果</h4>
+        <div className="execution-plan-row">
+          {finish.saveWorkspace && (
+            <span>
+              {finish.retention === 'RUN' ? '工作区快照保留至本次运行结束' : '归档工作区快照'}
+            </span>
+          )}
+          {finish.image?.reference && (
+            <span>
+              登记镜像 <code>{finish.image.reference}</code>
+            </span>
+          )}
+          {finish.requireRelease && (
+            <span>
+              {finish.requireRelease === 'HEALTHY'
+                ? '检查所有目标均已激活且健康'
+                : '检查所有目标均已激活'}
+            </span>
+          )}
+          {!finish.saveWorkspace && !finish.image?.reference && !finish.requireRelease && (
+            <span>汇总动作状态</span>
+          )}
+        </div>
+      </section>
+      {Boolean(plan.artifacts?.length) && (
+        <section>
+          <h4>已登记的交付产物</h4>
+          {plan.artifacts?.map((artifact) => (
+            <div key={artifact.id} className="execution-plan-row">
+              <a
+                className="text-link"
+                href={'#' + deliveryPath(project.id, 'artifacts', { recordId: artifact.id })}
+              >
+                {artifact.name} · {artifactKindLabel(artifact.kind)}
+              </a>
+              {artifact.digest && <code>{artifact.digest}</code>}
+              {artifact.checksum && (
+                <small>
+                  校验和 · <code>{artifact.checksum}</code>
+                </small>
+              )}
+              {artifact.commitSha && (
+                <small>
+                  源码提交 · <code>{artifact.commitSha}</code>
+                </small>
+              )}
+            </div>
+          ))}
+        </section>
+      )}
+    </>
+  );
+}
+
 export function ExecutionPlan({
   preview,
   project,
@@ -737,6 +867,7 @@ export function ExecutionPlan({
   const releaseSteps = previewGates(preview);
   return (
     <div className="execution-plan">
+      {preview.simplified && <SimplifiedPlanDetails plan={preview.simplified} project={project} />}
       <section>
         <h4>入口变量集合</h4>
         {preview.environmentSet ? (
@@ -805,6 +936,11 @@ export function ExecutionPlan({
                 {checkoutModeLabel(checkout)}
               </span>
               <code>{checkout.commitSha}</code>
+              {checkout.directory && (
+                <small>
+                  工作区相对路径 · <code>{checkout.directory}</code>
+                </small>
+              )}
               {(checkout.ref || checkout.versionSource) && (
                 <small>
                   {[checkout.ref, checkout.versionSource && sourceName(checkout.versionSource)]

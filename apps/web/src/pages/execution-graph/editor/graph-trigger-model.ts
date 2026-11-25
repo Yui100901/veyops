@@ -1,5 +1,6 @@
 import type { GraphIssueLocation } from '../../../api';
 import type { GraphDocument, GraphField } from '../execution-graph-definition';
+import type { SimplifiedSource } from '../simplified-flow';
 
 export const triggerChoices = {
   RUN: '定时构建',
@@ -33,6 +34,7 @@ export interface TriggerConfig {
   enabled: boolean;
   version?: number | null;
   parameterMappings?: Record<string, ParameterMapping>;
+  sourceId?: string | null;
   repositoryId?: string | null;
   ref?: string | null;
   refPrefix?: string | null;
@@ -111,6 +113,8 @@ export interface TriggerFlow {
   name: string;
   inputs: GraphField[];
   outputs: GraphField[];
+  sources?: SimplifiedSource[];
+  useUpstreamArtifact?: boolean;
 }
 
 export function triggerChoice(rule: TriggerConfig): TriggerChoice {
@@ -136,6 +140,10 @@ export function triggerFlows(definition: GraphDocument['draft']): TriggerFlow[] 
         name: start.name,
         inputs: start.inputs ?? [],
         outputs: (endId ? nodes.get(endId)?.outputs : undefined) ?? [],
+        ...(definition.canvas?.model === 'FLOW_V2' && {
+          sources: start.start?.sources ?? [],
+          useUpstreamArtifact: start.start?.release?.useUpstreamArtifact,
+        }),
       },
     ];
   });
@@ -173,9 +181,13 @@ export function triggerRequest(config: TriggerConfig, enabled: boolean, version?
       }),
     }),
     ...(hasSource && {
-      repositoryId: config.repositoryId || undefined,
-      ref: config.ref?.trim() || undefined,
-      refPrefix: config.refPrefix?.trim() || undefined,
+      ...(config.sourceId && choice !== 'API'
+        ? { sourceId: config.sourceId }
+        : {
+            repositoryId: config.repositoryId || undefined,
+            ref: config.ref?.trim() || undefined,
+            refPrefix: config.refPrefix?.trim() || undefined,
+          }),
     }),
     ...(config.kind === 'WEBHOOK' && {
       webhookProtocol: config.webhookProtocol ?? 'SIGNED',

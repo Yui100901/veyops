@@ -1,4 +1,5 @@
 import type { GraphIssueLocation } from '../../api';
+import type { SimplifiedFinish, SimplifiedStart, simplifiedModel } from './simplified-flow';
 
 export const graphNodeLabels = {
   START: '开始',
@@ -259,6 +260,8 @@ export interface GraphNode {
   contract?: 'PRESET';
   buildLocation?: 'INHERIT' | 'MANAGER' | 'TARGET';
   sameHostRelease?: boolean;
+  start?: SimplifiedStart;
+  finish?: SimplifiedFinish;
   operation?: GraphOperation;
   inputDefaults?: Record<string, unknown>;
   environmentDefaults?: Record<string, string>;
@@ -288,9 +291,9 @@ export interface GraphNode {
   outputs?: GraphField[];
   moduleId?: string;
   moduleVersion?: number;
-  condition?: { key: 'input' | 'commitSha'; value: string };
-  branch?: { cases: { id: string; value: string; label?: string }[] };
-  switch?: { key: 'input' | 'commitSha'; cases: string[] };
+  condition?: { key: 'input' | 'commitSha'; value: string; parameterKey?: string };
+  branch?: { cases: { id: string; value: string; label?: string }[]; parameterKey?: string };
+  switch?: { key: 'input' | 'commitSha'; cases: string[]; parameterKey?: string };
   delaySeconds?: number;
   approval?: { timeoutSeconds?: number; releaseNodeId?: string; buildNodeId?: string };
   healthCheck?: { command?: string; timeoutSeconds?: number; requireHealthy?: boolean };
@@ -323,6 +326,7 @@ export interface GraphFlow extends FlowBindings {
   name: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
+  model?: typeof simplifiedModel;
   compiled?: {
     presetResourceGroups?: true;
     nodes: Record<string, { inputBindings?: Record<string, GraphBinding> }>;
@@ -333,6 +337,7 @@ export interface GraphEndpoint extends FlowBindings {
   endId: string;
 }
 export interface GraphCanvas {
+  model?: typeof simplifiedModel;
   nodes: GraphNode[];
   edges: GraphEdge[];
   endpoints: GraphEndpoint[];

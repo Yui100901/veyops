@@ -14,14 +14,20 @@ import type {
   GraphOperation,
 } from '../execution-graph-definition';
 
-export function makeNode(type: GraphNode['type']): GraphNode {
-  const name = graphNodeLabels[type];
+export function makeNode(type: GraphNode['type'], model?: GraphCanvas['model']): GraphNode {
+  const simple = model === 'FLOW_V2';
+  const name =
+    simple && (type === 'FUNCTION' || type === 'SHELL') ? '执行命令' : graphNodeLabels[type];
   const operation = type === 'FUNCTION' ? 'SHELL' : type;
   return authoredNode({
     id: graphKey('node'),
     type,
     name,
-    ...(type === 'START' && { contract: 'PRESET' as const }),
+    ...(type === 'START' &&
+      (simple
+        ? { start: { execution: { location: 'INHERIT' as const } } }
+        : { contract: 'PRESET' as const })),
+    ...(simple && type === 'END' && { finish: {} }),
     ...(type === 'LOG' && { message: name }),
     ...(operation === 'SHELL' || operation === 'CHECK' ? { shell: { timeout: 180 } } : {}),
     ...(type === 'BUILD' && { build: {} }),
@@ -65,6 +71,8 @@ export function appendFlowTemplate(
   expansion: GraphFlowExpansion,
 ): GraphCanvas {
   const { canvas: fragment, startId } = expansion;
+  if (canvas.model !== fragment.model && (canvas.nodes.length || canvas.templates.length))
+    throw new Error('请使用相同定义的流程模板。');
   if (
     canvas.nodes.length + fragment.nodes.length > 500 ||
     canvas.edges.length + fragment.edges.length > 1500 ||
@@ -85,6 +93,7 @@ export function appendFlowTemplate(
   const nodes = placeFlowTemplate(canvas, fragment);
   return {
     ...canvas,
+    model: fragment.model ?? canvas.model,
     nodes: [
       ...canvas.nodes,
       ...nodes.map((node) => (node.id === startId ? { ...node, name } : node)),

@@ -59,16 +59,22 @@ export function ExecutionGraphTriggerEditor({
   const choice = triggerChoice(form);
   const hasSource = choice === 'POLL' || choice === 'WEBHOOK' || choice === 'API';
   const signed = choice === 'WEBHOOK' && form.webhookProtocol === 'SIGNED';
+  const start = flows.find(({ id }) => id === startId);
+  const sources = start?.sources?.filter(
+    ({ repositoryId, ref }) => repositoryId && (!ref || ref.kind === 'BRANCH'),
+  );
+  const showSources = sources !== undefined && choice !== 'API' && hasSource;
+  const sourceId = form.sourceId ?? (sources?.length === 1 ? sources[0]?.id : undefined);
   const timeZone = useResource<{ timeZone: string }>(
     form.kind === 'CRON' ? '/operation-schedules/time-zone' : null,
   );
   const credentials = useResource<Credential[]>(signed ? '/credentials' : null);
   const branches = useResource<{ branches: { name: string }[] }>(
-    hasSource && form.repositoryId
+    hasSource && !showSources && form.repositoryId
       ? '/projects/' + project.id + '/repositories/' + form.repositoryId + '/branches'
       : null,
   );
-  const startFields = flows.find(({ id }) => id === startId)?.inputs ?? [];
+  const startFields = start?.inputs ?? [];
   const fields = startFields.filter(({ runtimeOverride }) => runtimeOverride !== false);
   const upstreamOutputs =
     form.kind === 'UPSTREAM' && form.upstreamStatus === 'SUCCESS'
@@ -78,6 +84,8 @@ export function ExecutionGraphTriggerEditor({
     form.name.trim() &&
     (form.kind !== 'CRON' || form.cron?.trim()) &&
     (!signed || form.credentialId) &&
+    (!showSources || sources.some(({ id }) => id === sourceId)) &&
+    (!start?.useUpstreamArtifact || (choice === 'UPSTREAM' && form.upstreamStatus === 'SUCCESS')) &&
     (form.kind !== 'UPSTREAM' || form.upstreamFlowId),
   );
 
@@ -108,12 +116,18 @@ export function ExecutionGraphTriggerEditor({
       const body = triggerRequest(
         {
           ...form,
-          parameterMappings: Object.fromEntries(
-            Object.entries(form.parameterMappings ?? {}).filter(
-              ([id]) =>
-                !startFields.some((field) => field.id === id && field.runtimeOverride === false),
-            ),
-          ),
+          ...(showSources && { sourceId }),
+          parameterMappings:
+            start?.sources !== undefined
+              ? {}
+              : Object.fromEntries(
+                  Object.entries(form.parameterMappings ?? {}).filter(
+                    ([id]) =>
+                      !startFields.some(
+                        (field) => field.id === id && field.runtimeOverride === false,
+                      ),
+                  ),
+                ),
         },
         enabled,
         latestVersion,
@@ -172,6 +186,7 @@ export function ExecutionGraphTriggerEditor({
                   cronMode,
                   parameterMappings: {},
                   webhookProtocol: next === 'WEBHOOK' ? 'GITEA' : undefined,
+                  sourceId: undefined,
                   repositoryId: undefined,
                   ref: undefined,
                   refPrefix: undefined,
@@ -311,7 +326,30 @@ export function ExecutionGraphTriggerEditor({
               </Field>
             </>
           )}
-          {hasSource && (
+          {showSources && (
+            <Field label="源码来源" hint="从开始节点选择要跟踪的分支。">
+              <select
+                value={sourceId ?? ''}
+                onChange={(event) =>
+                  patch({
+                    sourceId: event.target.value || undefined,
+                    repositoryId: undefined,
+                    ref: undefined,
+                    refPrefix: undefined,
+                  })
+                }
+              >
+                <option value="">请选择源码来源</option>
+                {sources.map(({ id, repositoryId, ref }) => (
+                  <option key={id} value={id}>
+                    {triggerSourceName(project, repositoryId)} · {ref?.value || '仓库默认分支'}
+                  </option>
+                ))}
+              </select>
+              {!sources.length && <p className="field-note">请先在开始节点加入跟踪分支的源码。</p>}
+            </Field>
+          )}
+          {hasSource && !showSources && (
             <>
               <Field label="仓库">
                 <select
@@ -376,7 +414,10 @@ export function ExecutionGraphTriggerEditor({
             首次检查立即构建
           </label>
         )}
-        {Boolean(fields.length) && (
+        {start?.useUpstreamArtifact && (
+          <p className="field-note">此执行流使用上游产物，触发条件选择“上游成功”。</p>
+        )}
+        {start?.sources === undefined && Boolean(fields.length) && (
           <details className="graph-field-card" open={form.kind === 'UPSTREAM' || undefined}>
             <summary>高级参数映射</summary>
             <div className="graph-fields">

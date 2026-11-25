@@ -106,7 +106,10 @@ export function ExecutionGraphResourceLinks({
   );
   add('servers', node.shell?.serverId);
   if (node.type === 'START') {
-    add('services', flow?.serviceId);
+    add('services', node.start?.release?.serviceId ?? flow?.serviceId);
+    for (const source of node.start?.sources ?? []) add('repositories', source.repositoryId);
+    add('servers', node.start?.execution?.serverId);
+    add('environment-sets', node.start?.environmentSetId);
     if (node.environmentSet?.mode === 'FIXED')
       add('environment-sets', node.environmentSet.environmentSetId);
     for (const field of node.inputs ?? []) addField(field);

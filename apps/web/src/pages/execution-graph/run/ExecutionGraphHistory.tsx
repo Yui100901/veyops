@@ -15,7 +15,8 @@ import { NodeMap } from '../editor/ExecutionGraphCanvas';
 import { ConfiguredNodeExecution } from '../editor/ExecutionGraphNodeDetails';
 import { ExecutionGraphNodeLogs } from './ExecutionGraphNodeLogs';
 import { ExecutionGraphStickyCanvas, scrollBelowGraphCanvas } from './ExecutionGraphStickyCanvas';
-import { FieldEvidenceList, sourceName } from './ExecutionGraphPreview';
+import { FieldEvidenceList, SimplifiedPlanDetails, sourceName } from './ExecutionGraphPreview';
+import type { SimplifiedPublicPlan } from '../simplified-flow';
 import {
   ExecutionGraphParameterLink,
   ExecutionGraphRepairLinks,
@@ -65,6 +66,7 @@ interface RunNode {
   startedAt?: number | null;
   finishedAt?: number | null;
   taskId?: string;
+  snapshotTaskId?: string;
   childRunId?: string | null;
   inputs?: GraphFieldEvidence[];
   outputFields?: GraphFieldEvidence[];
@@ -110,6 +112,7 @@ interface RunDetail extends GraphRun {
   definition?: GraphFlow;
   trigger?: Record<string, unknown>;
   environmentSet?: GraphEnvironmentSetSummary | null;
+  simplified?: SimplifiedPublicPlan;
 }
 
 function failedRunStatus(status: string) {
@@ -619,6 +622,11 @@ function RunDetails({
                       </a>
                     </div>
                   )}
+                  {item.simplified && (
+                    <div className="execution-plan">
+                      <SimplifiedPlanDetails plan={item.simplified} project={project} showSources />
+                    </div>
+                  )}
                   <GraphRunResults
                     values={item.outputs}
                     labels={Object.fromEntries(
@@ -642,18 +650,26 @@ function RunDetails({
                   ) : null}
                   {item.artifactIds?.length ? (
                     <div className="heading-actions">
-                      {item.artifactIds.map((id) => (
-                        <a
-                          key={id}
-                          className="text-link"
-                          href={
-                            '#' +
-                            deliveryPath(projectId, 'artifacts', { ...deliveryScope, recordId: id })
-                          }
-                        >
-                          查看产物 {id.slice(0, 8)}
-                        </a>
-                      ))}
+                      {item.artifactIds
+                        .filter(
+                          (id) =>
+                            !item.simplified?.artifacts?.some((artifact) => artifact.id === id),
+                        )
+                        .map((id) => (
+                          <a
+                            key={id}
+                            className="text-link"
+                            href={
+                              '#' +
+                              deliveryPath(projectId, 'artifacts', {
+                                ...deliveryScope,
+                                recordId: id,
+                              })
+                            }
+                          >
+                            查看产物 {id.slice(0, 8)}
+                          </a>
+                        ))}
                     </div>
                   ) : null}
                   <a className="text-link" href={graphRunHref(projectId, item.id, scope, delivery)}>
@@ -754,6 +770,11 @@ function RunDetails({
                           查看逐目标任务日志
                         </a>
                       )}
+                      {n.snapshotTaskId && n.snapshotTaskId !== n.taskId && (
+                        <a className="button secondary small" href={'#/tasks/' + n.snapshotTaskId}>
+                          查看交付快照日志
+                        </a>
+                      )}
                     </div>
                     {item.definition && (
                       <RunNodeRecovery
@@ -778,6 +799,16 @@ function RunDetails({
                       status={n.status}
                       legacy={n.log}
                     />
+                    {item.simplified && typeof n.output?.directory === 'string' && (
+                      <p className="field-note">
+                        实际工作目录 · <code>{n.output.directory}</code>
+                      </p>
+                    )}
+                    {item.simplified &&
+                      typeof n.output?.exitCode === 'number' &&
+                      !n.targets?.length && (
+                        <p className="field-note">退出码 {n.output.exitCode}</p>
+                      )}
                     <FieldEvidenceList
                       title="节点输入"
                       fields={n.inputs}

@@ -36,6 +36,12 @@ import {
   scrollBelowGraphCanvas,
 } from './run/ExecutionGraphStickyCanvas';
 import { ExecutionGraphTemplateDialog } from './editor/ExecutionGraphTemplateDialog';
+import {
+  SimplifiedActionSettings,
+  SimplifiedEndSettings,
+  SimplifiedStartSettings,
+} from './editor/SimplifiedFlowSettings';
+import { isNativeDockerBuild, simplifiedModel } from './simplified-flow';
 import { ExecutionGraphTriggers } from './editor/ExecutionGraphTriggers';
 import { triggerFlows, type TriggerPreflightIssue } from './editor/graph-trigger-model';
 import { GraphVersionTools } from './ExecutionGraphVersions';
@@ -73,7 +79,21 @@ type PublishedGraph = {
   retiredAt?: number | null;
 };
 
-const emptyCanvas: GraphCanvas = { nodes: [], edges: [], endpoints: [], templates: [] };
+const emptyCanvas: GraphCanvas = {
+  model: simplifiedModel,
+  nodes: [],
+  edges: [],
+  endpoints: [],
+  templates: [],
+};
+
+function isLegacyDraft(canvas: GraphCanvas) {
+  return !canvas.model && Boolean(canvas.nodes.length || canvas.templates.length);
+}
+
+function editableCanvas(canvas?: GraphCanvas): GraphCanvas {
+  return canvas && (canvas.model || isLegacyDraft(canvas)) ? canvas : emptyCanvas;
+}
 
 export default function ProjectExecutionGraph({
   id,
@@ -215,7 +235,7 @@ function Workspace({
     (scope.serviceId && !service) || (scope.environmentId && !environment),
   );
   const [graph, setGraph] = useState(initial);
-  const [canvas, setCanvasState] = useState(initial.draft.canvas ?? emptyCanvas);
+  const [canvas, setCanvasState] = useState(() => editableCanvas(initial.draft.canvas));
   const latestCanvas = useRef(canvas);
   const [undo, setUndo] = useState<GraphCanvas[]>([]);
   const [redo, setRedo] = useState<GraphCanvas[]>([]);
@@ -238,7 +258,7 @@ function Workspace({
   const [templateOpen, setTemplateOpen] = useState(false);
   const [insertedStart, setInsertedStart] = useState<string>();
   const saving = useRef(false);
-  const dirty = canvas !== (graph.draft.canvas ?? emptyCanvas);
+  const dirty = canvas !== editableCanvas(graph.draft.canvas);
   useRouteBlocker(canEdit && dirty, setLeaving);
   const latest = useResource<PublishedGraph>(
     graph.publishedVersion ? path + '/versions/' + graph.publishedVersion : null,
@@ -300,7 +320,7 @@ function Workspace({
           }),
         });
         setGraph(draft);
-        setCanvas(draft.draft.canvas ?? emptyCanvas);
+        setCanvas(editableCanvas(draft.draft.canvas));
         setPublication(undefined);
         setIssues([]);
         setConflict(false);
@@ -313,7 +333,7 @@ function Workspace({
           definition: {
             flows: [],
             canvas:
-              action === 'validate' ? latestCanvas.current : (draft.draft.canvas ?? emptyCanvas),
+              action === 'validate' ? latestCanvas.current : editableCanvas(draft.draft.canvas),
           },
         });
         setIssues(result.issues);
@@ -335,7 +355,7 @@ function Workspace({
       } else saved = await api(path);
       setGraph(saved);
       setPublication(undefined);
-      setCanvas(saved.draft.canvas ?? emptyCanvas);
+      setCanvas(editableCanvas(saved.draft.canvas));
       setIssues([]);
       if (action === 'reload') {
         setUndo([]);
@@ -392,7 +412,7 @@ function Workspace({
     if (save) {
       if (!(await persist('save'))) return;
     } else {
-      setCanvas(graph.draft.canvas ?? emptyCanvas);
+      setCanvas(editableCanvas(graph.draft.canvas));
       setUndo([]);
       setRedo([]);
       setIssues([]);
@@ -416,7 +436,8 @@ function Workspace({
 
   function insertTemplate(expansion: GraphFlowExpansion) {
     if (!canEdit || saving.current) throw new Error('此草稿暂时无法编辑，请稍后重试。');
-    edit(appendFlowTemplate(latestCanvas.current, expansion));
+    const previous = latestCanvas.current;
+    edit(appendFlowTemplate(isLegacyDraft(previous) ? emptyCanvas : previous, expansion));
     setInsertedStart(expansion.startId);
   }
 
@@ -653,7 +674,7 @@ function Workspace({
                   disabled={busy}
                   onClick={() => setTemplateOpen(true)}
                 >
-                  <ListPlus size={16} /> 插入流程模板
+                  <ListPlus size={16} /> {isLegacyDraft(canvas) ? '用简化模板重建' : '插入流程模板'}
                 </button>
                 <button
                   type="button"
@@ -702,6 +723,8 @@ function Workspace({
           {canEdit && templateOpen && (
             <ExecutionGraphTemplateDialog
               path={path}
+              model={simplifiedModel}
+              replaceDraft={isLegacyDraft(canvas)}
               insert={insertTemplate}
               close={() => setTemplateOpen(false)}
             />
@@ -785,7 +808,7 @@ function Workspace({
             setUndo((history) => [...history.slice(-49), canvas]);
             setRedo([]);
             setGraph(saved);
-            setCanvas(saved.draft.canvas ?? emptyCanvas);
+            setCanvas(editableCanvas(saved.draft.canvas));
             navigate(panePath('draft'));
             setError('');
             setNotice('已将 v' + restored + ' 恢复到草稿');
@@ -1246,7 +1269,8 @@ function PublishedNodes({
   renderResources?: (node: GraphNode, flow?: GraphFlow) => React.ReactNode;
   children?: React.ReactNode;
 }) {
-  const catalog = useResource<GraphCatalog>(path + '/catalog');
+  const simplified = definition.canvas?.model === simplifiedModel;
+  const catalog = useResource<GraphCatalog>(simplified ? null : path + '/catalog');
   const targetNames = useGraphTargetNames(
     definition.flows.some(({ nodes }) => nodes.some(isReleaseNode)),
   );
@@ -1267,6 +1291,7 @@ function PublishedNodes({
   const flow: GraphFlow | undefined = definition.canvas
     ? {
         id: 'canvas',
+        model: definition.canvas.model,
         name: '执行图',
         nodes: definition.canvas.nodes,
         edges: definition.canvas.edges,
@@ -1397,10 +1422,12 @@ function PublishedNodes({
                     </small>
                   </div>
                 </header>
-                <ExecutionGraphInputSummary
-                  entries={actionSources(inspectedNode, inspectedFlow)}
-                  onSource={({ nodeId }) => selectNode(nodeId)}
-                />
+                {!simplified && (
+                  <ExecutionGraphInputSummary
+                    entries={actionSources(inspectedNode, inspectedFlow)}
+                    onSource={({ nodeId }) => selectNode(nodeId)}
+                  />
+                )}
                 {definition.canvas &&
                 flowsWithNode.length > 1 &&
                 effectiveNodeType(node) !== 'START' ? (
@@ -1421,13 +1448,42 @@ function PublishedNodes({
                 )}
                 {renderResources?.(inspectedNode, inspectedFlow)}
                 {catalog.error && <ErrorBanner error={catalog.error} retry={catalog.reload} />}
-                <PublishedNodeDetails
-                  node={inspectedNode}
-                  flow={inspectedFlow}
-                  definition={definition}
-                  catalog={catalog.data}
-                  project={project}
-                />
+                {simplified && inspectedNode.type === 'START' ? (
+                  <SimplifiedStartSettings
+                    node={inspectedNode}
+                    project={project}
+                    canEdit={false}
+                    patch={() => {}}
+                    flowNodes={inspectedFlow?.nodes ?? []}
+                  />
+                ) : simplified && inspectedNode.type === 'END' ? (
+                  <SimplifiedEndSettings
+                    node={inspectedNode}
+                    canEdit={false}
+                    patch={() => {}}
+                    nativeBuild={inspectedFlow?.nodes.some(isNativeDockerBuild)}
+                  />
+                ) : simplified && inspectedNode.type === 'FUNCTION' ? (
+                  <SimplifiedActionSettings
+                    node={inspectedNode}
+                    project={project}
+                    canEdit={false}
+                    patch={() => {}}
+                    selectOperation={() => {}}
+                    sources={
+                      inspectedFlow?.nodes.find(({ type }) => type === 'START')?.start?.sources ??
+                      []
+                    }
+                  />
+                ) : (
+                  <PublishedNodeDetails
+                    node={inspectedNode}
+                    flow={inspectedFlow}
+                    definition={definition}
+                    catalog={catalog.data}
+                    project={project}
+                  />
+                )}
               </>
             ) : (
               <>

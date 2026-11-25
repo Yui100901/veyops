@@ -3,6 +3,7 @@ import { message, post, useResource } from '../../../api';
 import { ErrorBanner, Field, Loading, Modal } from '../../../components';
 import type {
   GraphArtifactType,
+  GraphCanvas,
   GraphCatalog,
   GraphFlowExpansion,
 } from '../execution-graph-definition';
@@ -15,10 +16,14 @@ const artifactNames: Record<GraphArtifactType, string> = {
 
 export function ExecutionGraphTemplateDialog({
   path,
+  model,
+  replaceDraft,
   insert,
   close,
 }: {
   path: string;
+  model?: GraphCanvas['model'];
+  replaceDraft?: boolean;
   insert: (expansion: GraphFlowExpansion) => void;
   close: () => void;
 }) {
@@ -33,7 +38,7 @@ export function ExecutionGraphTemplateDialog({
 
   async function expand(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (pending.current || !template?.artifactTypes.includes(artifact)) return;
+    if (pending.current || !template || !template.artifactTypes.includes(artifact)) return;
     pending.current = true;
     setBusy(true);
     setError('');
@@ -42,6 +47,7 @@ export function ExecutionGraphTemplateDialog({
         await post<GraphFlowExpansion>(path + '/draft/templates/expand', {
           templateId,
           artifactType: artifact,
+          ...(model && { model }),
         }),
       );
       close();
@@ -55,8 +61,12 @@ export function ExecutionGraphTemplateDialog({
 
   return (
     <Modal
-      title="插入流程模板"
-      description="选择模板和主产物类型，作为一条新执行流加入草稿。"
+      title={replaceDraft ? '用简化模板重建草稿' : '插入流程模板'}
+      description={
+        replaceDraft
+          ? '替换当前草稿中的执行流和节点。已发布版本可继续查看，保存前可撤销本次替换。'
+          : '从模板创建一条新执行流。'
+      }
       onClose={() => {
         if (!pending.current) close();
       }}
@@ -96,8 +106,8 @@ export function ExecutionGraphTemplateDialog({
               ))}
             </fieldset>
           )}
-          {template && (
-            <Field label="主产物类型">
+          {template && template.artifactTypes.length > 1 && (
+            <Field label={model ? '交付类型' : '主产物类型'}>
               <select
                 disabled={busy}
                 value={artifact}
@@ -117,7 +127,7 @@ export function ExecutionGraphTemplateDialog({
             取消
           </button>
           <button type="submit" className="button primary" disabled={!template || busy}>
-            {busy ? '正在插入…' : '插入此流程'}
+            {busy ? '正在生成…' : replaceDraft ? '替换当前草稿' : '插入此流程'}
           </button>
         </div>
       </form>

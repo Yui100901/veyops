@@ -46,6 +46,12 @@ import {
   reachable,
 } from './execution-graph-draft-impact';
 import { authoredNode, makeNode } from './graph-presets';
+import {
+  SimplifiedActionSettings,
+  SimplifiedEndSettings,
+  SimplifiedStartSettings,
+} from './SimplifiedFlowSettings';
+import { isNativeDockerBuild, simplifiedActions, simplifiedModel } from '../simplified-flow';
 import './execution-graph-editor.css';
 
 type NodeType = GraphNode['type'];
@@ -75,7 +81,14 @@ function focusInspectorField(inspector: HTMLElement, focus: FieldFocus, bound: b
   const binding = section.querySelector<HTMLElement>(
     `.graph-binding-field[data-graph-field="${escaped}"]`,
   );
-  const configured = section.querySelector<HTMLElement>(`[data-graph-node-field="${escaped}"]`);
+  const path = focus.fieldId.split('.');
+  let configured = section.querySelector<HTMLElement>(`[data-graph-node-field="${escaped}"]`);
+  while (!configured && path.length > 1) {
+    path.pop();
+    configured = section.querySelector<HTMLElement>(
+      `[data-graph-node-field="${CSS.escape(path.join('.'))}"]`,
+    );
+  }
   const declaration = section.querySelector<HTMLDetailsElement>(
     `details[data-graph-field="${escaped}"]`,
   );
@@ -133,6 +146,7 @@ export function ProjectGraphEditor({
   initialFieldLocation?: GraphIssueLocation;
   insertedStartId?: string;
 }) {
+  const simplified = canvas.model === simplifiedModel;
   const [selection, select] = useState<Selection | undefined>(
     initialNodeId ? { kind: 'node', id: initialNodeId } : undefined,
   );
@@ -167,7 +181,9 @@ export function ProjectGraphEditor({
     setConnector(undefined);
     setFocusRequest(undefined);
   }, [insertedStartId]);
-  const catalog = useResource<GraphCatalog>('/projects/' + project.id + '/execution-graph/catalog');
+  const catalog = useResource<GraphCatalog>(
+    simplified ? null : '/projects/' + project.id + '/execution-graph/catalog',
+  );
   const triggers = useResource<{ flowId: string; enabled: boolean }[]>(
     project.archived ? null : '/projects/' + project.id + '/execution-graph/triggers',
     8000,
@@ -197,6 +213,13 @@ export function ProjectGraphEditor({
     activeNode?.type === 'START'
       ? (selectedPath?.nodes ?? reachable(canvas, activeNode.id))
       : undefined;
+  const inspectedActionStart =
+    simplified && activeNode
+      ? (canvas.nodes.find((node) => node.id === activePair?.startId) ??
+        canvas.nodes.find(
+          (node) => node.type === 'START' && reachable(canvas, node.id).has(activeNode.id),
+        ))
+      : undefined;
   const useStartDefaults = Boolean(
     activePair && canvas.nodes.find(({ id }) => id === activePair.startId)?.contract === 'PRESET',
   );
@@ -223,7 +246,7 @@ export function ProjectGraphEditor({
   const catalogNodeId = activeNode?.id;
   const catalogFlowId = selectedPair?.startId;
   useEffect(() => {
-    if (!hasActiveFlowNode || !catalogNodeId || !catalogFlowId) return;
+    if (simplified || !hasActiveFlowNode || !catalogNodeId || !catalogFlowId) return;
     const query = new URLSearchParams({ flow: catalogFlowId, node: catalogNodeId });
     let current = true;
     const timer = window.setTimeout(() => {
@@ -242,7 +265,7 @@ export function ProjectGraphEditor({
       current = false;
       window.clearTimeout(timer);
     };
-  }, [project.id, canvas, hasActiveFlowNode, catalogFlowId, catalogNodeId]);
+  }, [project.id, canvas, hasActiveFlowNode, catalogFlowId, catalogNodeId, simplified]);
   const highlight = pathHighlight(canvas, hovered) ?? selectedPath;
   const diagnosticEdgeIndex = diagnosticEdge
     ? canvas.edges.findIndex(
@@ -291,7 +314,7 @@ export function ProjectGraphEditor({
           ? 'execution'
           : 'input');
     if (repairTab === 'input' && pendingBindings) return;
-    if (isFunction && tab !== repairTab) {
+    if (!simplified && isFunction && tab !== repairTab) {
       setTab(repairTab);
       return;
     }
@@ -301,7 +324,7 @@ export function ProjectGraphEditor({
       handledFocus.current = focusRequest;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [focusRequest, inspected, pendingBindings, boundField, isFunction, tab]);
+  }, [focusRequest, inspected, pendingBindings, boundField, isFunction, tab, simplified]);
 
   function recordImpact(next: GraphCanvas, message: string, startIds: string[], nodeId?: string) {
     const flows = [...new Set(startIds)].map((id) => ({
@@ -365,6 +388,7 @@ export function ProjectGraphEditor({
       return authoredNode(next);
     }
     const endpoints = canvas.endpoints.map((pair) => {
+      if (simplified) return pair;
       if (nextOutputs && pair.endId === inspected.id)
         return {
           ...pair,
@@ -421,7 +445,7 @@ export function ProjectGraphEditor({
             : canvas.edges,
           endpoints,
         };
-    if (!template && changedNodeContract(inspected, updated)) {
+    if (!simplified && !template && changedNodeContract(inspected, updated)) {
       recordImpact(
         next,
         '节点的字段或执行动作已变更，请复核以下执行流的绑定。',
@@ -452,7 +476,7 @@ export function ProjectGraphEditor({
     const kind = payload.startsWith('type:') ? (payload.slice(5) as NodeType) : undefined;
     const node =
       kind && Object.hasOwn(graphNodeLabels, kind)
-        ? makeNode(kind)
+        ? makeNode(kind, canvas.model)
         : canvas.templates.find(({ id }) => payload === 'template:' + id);
     if (node) addNode(node, position);
   }
@@ -472,7 +496,7 @@ export function ProjectGraphEditor({
       ...canvas,
       endpoints: [
         ...canvas.endpoints.filter((pair) => pair.startId !== startId),
-        ...(endId ? [{ ...retained, startId, endId }] : []),
+        ...(endId ? [simplified ? { startId, endId } : { ...retained, startId, endId }] : []),
       ],
     };
     recordImpact(next, '开始与结束节点的配对已更新。', changedTopologyFlows(canvas, next), startId);
@@ -589,7 +613,9 @@ export function ProjectGraphEditor({
               return from !== id && remaining.length ? [[from, remaining]] : [];
             }),
           );
-          return { ...pair, inputBindings, environmentBindings, edgeSelections };
+          return simplified
+            ? { ...pair, edgeSelections }
+            : { ...pair, inputBindings, environmentBindings, edgeSelections };
         }),
     };
     recordImpact(next, '节点已删除，请复核以下执行流。', [
@@ -734,6 +760,19 @@ export function ProjectGraphEditor({
     setFocusRequest({ nodeId, fieldId, fieldSection: 'input' });
   }
   function summarizeNode(node: GraphNode) {
+    if (simplified) {
+      if (node.type === 'START')
+        return (
+          node.start?.sources
+            ?.map(
+              ({ repositoryId }) =>
+                project.repositories.find(({ id }) => id === repositoryId)?.name,
+            )
+            .filter(Boolean)
+            .join(' · ') || undefined
+        );
+      return node.shell?.directory || node.build?.repoPath;
+    }
     if (node.type === 'START')
       return startCardText(
         node,
@@ -826,7 +865,7 @@ export function ProjectGraphEditor({
         draggable
         className="graph-palette-node"
         onDragStart={(event) => drag(event, 'type:' + type)}
-        onClick={() => addNode(makeNode(type))}
+        onClick={() => addNode(makeNode(type, canvas.model))}
       >
         <Plus size={14} />
         {label}
@@ -881,18 +920,23 @@ export function ProjectGraphEditor({
               {paletteButton('END')}
             </div>
             <div className="graph-palette-group">
-              <h4>功能节点</h4>
-              {paletteButton('FUNCTION', '新建自定义节点')}
+              <h4>{simplified ? '执行动作' : '功能节点'}</h4>
+              {paletteButton('FUNCTION', simplified ? '执行命令' : '新建自定义节点')}
               <details className="graph-palette-templates">
                 <summary>系统模板</summary>
                 <div className="graph-palette-group">
-                  {systemNodePresets.map((operation) => paletteButton(operation))}
+                  {(simplified
+                    ? simplifiedActions.filter((action) => action !== 'SHELL')
+                    : systemNodePresets
+                  ).map((operation) => paletteButton(operation))}
                 </div>
               </details>
-              <details className="graph-palette-templates">
-                <summary>高级节点</summary>
-                <div className="graph-palette-group">{paletteButton('DELAY')}</div>
-              </details>
+              {!simplified && (
+                <details className="graph-palette-templates">
+                  <summary>高级节点</summary>
+                  <div className="graph-palette-group">{paletteButton('DELAY')}</div>
+                </details>
+              )}
               <details className="graph-palette-templates" open={template ? true : undefined}>
                 <summary>
                   项目模板{canvas.templates.length ? ' · ' + canvas.templates.length : ''}
@@ -923,7 +967,7 @@ export function ProjectGraphEditor({
                       onChange={(event) => setTemplateType(event.target.value as NodeType)}
                     >
                       <option value="FUNCTION">空白功能节点</option>
-                      {graphOperations.map((type) => (
+                      {(simplified ? simplifiedActions : graphOperations).map((type) => (
                         <option key={type} value={type}>
                           {graphNodeLabels[type]}
                         </option>
@@ -933,7 +977,7 @@ export function ProjectGraphEditor({
                   <button
                     type="button"
                     className="button secondary small"
-                    onClick={() => createTemplate(makeNode(templateType))}
+                    onClick={() => createTemplate(makeNode(templateType, canvas.model))}
                   >
                     <Plus size={15} />
                     新建项目模板
@@ -1116,8 +1160,14 @@ export function ProjectGraphEditor({
               <p>{template ? '项目模板' : isFunction ? '功能节点' : '节点属性'}</p>
               <h3 tabIndex={-1}>{inspected.name || graphNodeTypeLabel(inspected)}</h3>
             </header>
-            <NodeIdentity node={inspected} canEdit={canEdit} patch={patch} />
-            {parameterRepair?.consumerId === inspected.id &&
+            <NodeIdentity
+              node={inspected}
+              canEdit={canEdit}
+              patch={patch}
+              simplified={simplified}
+            />
+            {!simplified &&
+              parameterRepair?.consumerId === inspected.id &&
               repairBinding?.kind === 'INPUT' &&
               repairBinding.fieldId === parameterRepair.field.id && (
                 <div className="graph-editor-repair">
@@ -1140,7 +1190,72 @@ export function ProjectGraphEditor({
                   </button>
                 </div>
               )}
-            {isFunction ? (
+            {simplified ? (
+              <>
+                {isFunction ? (
+                  <SimplifiedActionSettings
+                    node={inspected}
+                    project={project}
+                    canEdit={canEdit}
+                    patch={patch}
+                    sources={inspectedActionStart?.start?.sources ?? []}
+                    selectOperation={(operation) =>
+                      patch(changeOperation(inspected, operation, canvas.model))
+                    }
+                  />
+                ) : inspected.type === 'START' ? (
+                  <>
+                    <SimplifiedStartSettings
+                      node={inspected}
+                      project={project}
+                      canEdit={canEdit}
+                      patch={patch}
+                      flowNodes={canvas.nodes.filter(({ id }) => inspectedStartScope?.has(id))}
+                    />
+                    {renderResources?.(inspected, activePair)}
+                    {renderStart?.(inspected.id)}
+                    <details className="graph-field-card">
+                      <summary>画布结构设置</summary>
+                      <StartPair
+                        node={inspected}
+                        canvas={canvas}
+                        canEdit={canEdit}
+                        assign={assignEnd}
+                      />
+                    </details>
+                  </>
+                ) : inspected.type === 'END' ? (
+                  <>
+                    <SimplifiedEndSettings
+                      node={inspected}
+                      canEdit={canEdit}
+                      patch={patch}
+                      nativeBuild={canvas.nodes.some(
+                        (candidate) =>
+                          isNativeDockerBuild(candidate) &&
+                          reachable(canvas, candidate.id).has(inspected.id),
+                      )}
+                    />
+                    <EndPairs
+                      node={inspected}
+                      canvas={canvas}
+                      canEdit={canEdit}
+                      assign={assignEnd}
+                    />
+                  </>
+                ) : (
+                  <NodeOperationFields
+                    node={inspected}
+                    project={project}
+                    canvas={canvas}
+                    canEdit={canEdit}
+                    patch={patch}
+                    simplifiedStart={inspectedActionStart?.start ?? {}}
+                  />
+                )}
+                {activeNode && activePair && renderBranches(activeNode, activePair)}
+              </>
+            ) : isFunction ? (
               <>
                 {activeNode && (
                   <ExecutionGraphInputSummary
@@ -1240,7 +1355,7 @@ export function ProjectGraphEditor({
                 {activeNode && renderResources?.(activeNode, activePair)}
               </>
             )}
-            {activeNode?.type === 'START' && (
+            {!simplified && activeNode?.type === 'START' && (
               <>
                 <ExecutionGraphStartSettings
                   node={activeNode}
@@ -1328,7 +1443,7 @@ export function ProjectGraphEditor({
                 </details>
               </>
             )}
-            {activeNode?.type === 'END' && (
+            {!simplified && activeNode?.type === 'END' && (
               <>
                 <EndPairs
                   key={activeNode.id}
@@ -1347,7 +1462,7 @@ export function ProjectGraphEditor({
                 />
               </>
             )}
-            {!isFunction && activeNode && activePair && (
+            {!simplified && !isFunction && activeNode && activePair && (
               <>
                 {renderBranches(activeNode, activePair)}
                 {activeNode.type !== 'START' && (
@@ -1772,7 +1887,12 @@ function LoadEnvironmentFields({
   );
 }
 
-function NodeIdentity({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'>) {
+function NodeIdentity({
+  node,
+  canEdit,
+  patch,
+  simplified,
+}: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'> & { simplified?: boolean }) {
   return (
     <div className="graph-inspector-identity">
       <Field label="节点名称">
@@ -1783,20 +1903,26 @@ function NodeIdentity({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canE
           onChange={(event) => patch({ name: event.target.value })}
         />
       </Field>
-      <Field label="节点引用名" hint="留空时系统分配。">
-        <input
-          readOnly={!canEdit}
-          maxLength={64}
-          value={node.referenceName ?? ''}
-          onChange={(event) => patch({ referenceName: event.target.value || undefined })}
-        />
-      </Field>
+      {!simplified && (
+        <Field label="节点引用名" hint="留空时系统分配。">
+          <input
+            readOnly={!canEdit}
+            maxLength={64}
+            value={node.referenceName ?? ''}
+            onChange={(event) => patch({ referenceName: event.target.value || undefined })}
+          />
+        </Field>
+      )}
     </div>
   );
 }
 
-function changeOperation(node: GraphNode, operation: GraphOperation): Partial<GraphNode> {
-  const next = makeNode(operation);
+function changeOperation(
+  node: GraphNode,
+  operation: GraphOperation,
+  model?: GraphCanvas['model'],
+): Partial<GraphNode> {
+  const next = makeNode(operation, model);
   return {
     type: 'FUNCTION',
     operation,
@@ -1869,9 +1995,11 @@ function NodeOperationFields({
   patch,
   selectOperation,
   useStartDefaults,
+  simplifiedStart,
 }: Omit<FieldsProps, 'catalog'> & {
   selectOperation?: (operation: GraphOperation) => void;
   useStartDefaults?: boolean;
+  simplifiedStart?: GraphNode['start'];
 }) {
   const operation = effectiveNodeType(node);
   const downstream =
@@ -1884,8 +2012,41 @@ function NodeOperationFields({
   const downstreamBuilds = canvas.nodes.filter(
     (candidate) => downstream?.has(candidate.id) && effectiveNodeType(candidate) === 'BUILD',
   );
+  const branch = node.condition ?? node.branch ?? node.switch;
+  const variableNames =
+    simplifiedStart?.variables
+      ?.filter(({ credentialId, value }) => !credentialId && value !== undefined)
+      .map(({ key }) => key)
+      .filter(Boolean) ?? [];
+  function changeParameterKey(parameterKey?: string) {
+    if (node.condition) patch({ condition: { ...node.condition, parameterKey } });
+    else if (node.branch) patch({ branch: { ...node.branch, parameterKey } });
+    else if (node.switch) patch({ switch: { ...node.switch, parameterKey } });
+  }
   return (
     <>
+      {simplifiedStart && branch && (
+        <Field label="比较值来源">
+          <select
+            data-graph-node-field="parameterKey"
+            disabled={!canEdit}
+            value={branch.parameterKey ?? ''}
+            onChange={(event) => changeParameterKey(event.target.value || undefined)}
+          >
+            <option value="">运行时填写的条件值</option>
+            {variableNames.map((key) => (
+              <option key={key} value={key}>
+                {key}
+              </option>
+            ))}
+            {branch.parameterKey && !variableNames.includes(branch.parameterKey) && (
+              <option value={branch.parameterKey} disabled>
+                {branch.parameterKey}（已不可用）
+              </option>
+            )}
+          </select>
+        </Field>
+      )}
       {selectOperation && (
         <Field label="执行操作" hint="更换操作会重置节点输入、执行配置、输出和环境变量。">
           <select
@@ -2069,21 +2230,27 @@ function NodeOperationFields({
       )}
       {operation === 'CONDITION' && !node.branch && (
         <div className="form-grid">
-          <Field label="等于" hint="在当前流绑定比较值。">
+          <Field label="等于" hint={simplifiedStart ? undefined : '在当前流绑定比较值。'}>
             <input
               readOnly={!canEdit}
               value={node.condition?.value ?? ''}
               maxLength={500}
               onChange={(event) =>
                 patch({
-                  condition: { key: node.condition?.key ?? 'input', value: event.target.value },
+                  condition: {
+                    ...node.condition,
+                    key: node.condition?.key ?? 'input',
+                    value: event.target.value,
+                  },
                 })
               }
             />
           </Field>
         </div>
       )}
-      {operation === 'SWITCH' && <SwitchFields node={node} canEdit={canEdit} patch={patch} />}
+      {operation === 'SWITCH' && (
+        <SwitchFields node={node} canEdit={canEdit} patch={patch} simplified={!!simplifiedStart} />
+      )}
       {operation === 'DELAY' && (
         <Field label="等待时间（秒）">
           <input
@@ -2183,7 +2350,7 @@ function ConditionBranchFields({
   patch,
 }: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'>) {
   const cases = node.branch?.cases ?? [];
-  const save = (next: typeof cases) => patch({ branch: { cases: next } });
+  const save = (next: typeof cases) => patch({ branch: { ...node.branch, cases: next } });
   const edit = (id: string, changes: Partial<(typeof cases)[number]>) =>
     save(cases.map((rule) => (rule.id === id ? { ...rule, ...changes } : rule)));
   function moveUp(index: number) {
@@ -2250,11 +2417,16 @@ function ConditionBranchFields({
   );
 }
 
-function SwitchFields({ node, canEdit, patch }: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'>) {
+function SwitchFields({
+  node,
+  canEdit,
+  patch,
+  simplified,
+}: Pick<FieldsProps, 'node' | 'canEdit' | 'patch'> & { simplified?: boolean }) {
   const config = node.switch ?? { key: 'input', cases: [] };
   return (
     <>
-      <p className="field-note">设置下面的匹配项，并在当前流绑定比较值。</p>
+      {!simplified && <p className="field-note">设置下面的匹配项，并在当前流绑定比较值。</p>}
       {config.cases.map((value, index) => (
         <Field label={'选项 ' + (index + 1)} key={index}>
           <input

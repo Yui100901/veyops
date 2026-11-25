@@ -9,6 +9,7 @@ import type {
   GraphNode,
 } from './execution-graph-definition';
 import type { DeliveryScope, DeliveryTab } from '../delivery/delivery-route';
+import { simplifiedModel, simplifiedReleaseInput } from './simplified-flow';
 
 const resourcePanels = [
   'settings',
@@ -67,6 +68,7 @@ export function graphWorkbenchPath(projectId: string, location: GraphLocation = 
 }
 
 export function releaseArtifactInput(flow: GraphFlow, artifactType?: GraphArtifactType) {
+  if (flow.model === simplifiedModel) return simplifiedReleaseInput(flow, artifactType);
   const inputIds = new Set<string>();
   const collect = (binding: GraphBinding | undefined) => {
     if (binding?.kind === 'INPUT') inputIds.add(binding.fieldId);
@@ -218,14 +220,16 @@ function knownRepository(node: GraphNode, bindings?: Record<string, GraphBinding
 }
 
 function scopeBinding(flow: GraphFlow, port: ScopeType) {
-  const inputs = flow.nodes.find(({ type }) => type === 'START')?.inputs ?? [];
+  const start = flow.nodes.find(({ type }) => type === 'START');
+  const inputs = start?.inputs ?? [];
   const type = port === 'service' ? 'SERVICE' : 'ENVIRONMENT';
   const fields = inputs.filter((input) => input.type === type && !input.multiple);
   const fixed = new Set<string>();
   const directInputs = new Set<string>();
   let dynamic = false;
   const groupedService = port === 'service' && flow.compiled?.presetResourceGroups;
-  if (port === 'service' && !groupedService && flow.serviceId) fixed.add(flow.serviceId);
+  const serviceId = start?.start?.release?.serviceId ?? flow.serviceId;
+  if (port === 'service' && !groupedService && serviceId) fixed.add(serviceId);
   const hasReleases = groupedService && flow.nodes.some(isReleaseNode);
   for (const node of flow.nodes) {
     if (node.type === 'FLOW_CALL' || (hasReleases && !isReleaseNode(node))) continue;
@@ -297,6 +301,34 @@ export function graphStartReadiness(
   const start = flow.nodes.find(({ type }) => type === 'START');
   const issues: GraphStartConfigurationIssue[] = [];
   const missingFields: GraphField[] = [];
+  if (flow.model === simplifiedModel && start?.start) {
+    for (const source of start.start.sources ?? []) {
+      if (source.repositoryId && project?.repositories.some(({ id }) => id === source.repositoryId))
+        continue;
+      if (source.repositoryId && !project) continue;
+      issues.push({
+        reason: source.repositoryId ? 'RESOURCE_UNAVAILABLE' : 'FIXED_INPUT_MISSING',
+        nodeId: start.id,
+        fieldId: 'start.sources.' + source.id + '.repositoryId',
+        fieldName: '项目仓库',
+        resourceType: 'REPOSITORY',
+        resourceId: source.repositoryId,
+      });
+    }
+    const serviceId = start.start.release?.serviceId;
+    if (serviceId && project && !project.services.some(({ id }) => id === serviceId)) {
+      issues.push({
+        reason: 'RESOURCE_UNAVAILABLE',
+        nodeId: start.id,
+        fieldId: 'start.release.serviceId',
+        fieldName: '项目服务',
+        resourceType: 'SERVICE',
+        resourceId: serviceId,
+      });
+    }
+    const artifact = simplifiedReleaseInput(flow);
+    if (artifact?.required && !inputs?.[artifact.id]) missingFields.push(artifact);
+  }
   for (const field of start?.inputs ?? []) {
     const { id, name, type } = field;
     const resourceType = isResourceType(type) ? type : undefined;
