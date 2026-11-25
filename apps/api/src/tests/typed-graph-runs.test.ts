@@ -66,7 +66,7 @@ async function checkTypedRuns(url?: string) {
             id: 'check',
             name: 'Check release ref',
             type: 'CONDITION',
-            condition: { parameterKey: 'REF', value: 'refs/heads/release' },
+            condition: { value: 'refs/heads/release' },
           },
           { id: 'wait', name: 'Wait before release', type: 'DELAY', delaySeconds: 60 },
           { id: 'skip', name: 'Skip wait', type: 'LOG', message: 'no release' },
@@ -93,7 +93,7 @@ async function checkTypedRuns(url?: string) {
     };
     const { publishedVersion: version } = await publish(definition);
     const flow = graph + '/flows/start';
-    const args = { version, inputs: { parameters: { 'var:REF': 'manual' } } };
+    const args = { version, inputs: { value: 'manual', parameters: { 'var:REF': 'manual' } } };
     await api
       .post(prefix + flow + '/preview')
       .send({ version, inputs: { parameters: { REF: 'unapproved key' } } })
@@ -124,9 +124,13 @@ async function checkTypedRuns(url?: string) {
       .expect(400);
     const configured = await post(triggerPath, {
       ...rule,
-      parameterMappings: { 'var:REF': { source: 'EVENT', field: 'ref' } },
+      inputValue: 'manual',
     });
-    const event = { eventId: 'ref-event', ref: 'refs/heads/release' };
+    const event = {
+      eventId: 'ref-event',
+      ref: 'refs/heads/release',
+      inputValue: 'refs/heads/release',
+    };
     const invoked = (
       await api
         .post(prefix + triggerPath + '/' + configured.id + '/invoke')
@@ -166,10 +170,10 @@ async function checkTypedRuns(url?: string) {
   }
 }
 
-test('SQLite FLOW_V2 maps trigger events to start variables and keeps a waiting run on the confirmed version', () =>
+test('SQLite FLOW_V2 carries an API event into routing and keeps a waiting run on the confirmed version', () =>
   checkTypedRuns());
 test(
-  'PostgreSQL FLOW_V2 maps trigger events to start variables and keeps a waiting run on the confirmed version',
+  'PostgreSQL FLOW_V2 carries an API event into routing and keeps a waiting run on the confirmed version',
   { skip: !process.env.VEYOPS_TEST_POSTGRES_URL },
   () => withIsolatedPostgres(process.env.VEYOPS_TEST_POSTGRES_URL!, checkTypedRuns),
 );

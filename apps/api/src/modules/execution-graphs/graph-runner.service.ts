@@ -55,6 +55,7 @@ import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { TasksService } from '../tasks/tasks.service';
 import { terminalTaskStatuses, type TaskPayload } from '../tasks/tasks.types';
 import { redactTaskLog } from '../tasks/task-log.service';
+import { variableCredentialType } from '../credentials/credentials.service';
 import {
   defaultApprovalSeconds,
   orderedFlowNodes,
@@ -519,7 +520,7 @@ export class GraphRunnerService implements OnModuleInit {
   private currentFlow(definition: GraphDefinition, id: string) {
     const flow = this.flow(definition, id);
     if (definition.canvas?.model !== 'FLOW_V2' || flow.model !== 'FLOW_V2')
-      throw new ConflictException('此执行流使用旧版编排，请发布简化执行链后运行');
+      throw new ConflictException('此执行流使用旧版编排，请发布简化执行链（FLOW_V2）后运行');
     return flow;
   }
 
@@ -2862,6 +2863,10 @@ export class GraphRunnerService implements OnModuleInit {
         if (digest(latest) !== digest(previous))
           throw new ConflictException('变量集合已变化，请重新预览');
       }
+      // V2 plans also freeze encrypted values resolved from project variable collections.
+      const confirmedCredentialTypes = simplified
+        ? [...variableCredentialTypes, variableCredentialType]
+        : variableCredentialTypes;
       for (const [credentialId, nonce] of Object.entries(credentials)) {
         const active = await tx
           .selectFrom('credentials')
@@ -2869,7 +2874,7 @@ export class GraphRunnerService implements OnModuleInit {
           .where('id', '=', credentialId)
           .where('nonce', '=', nonce)
           .where('status', '=', 'ACTIVE')
-          .where('type', 'in', variableCredentialTypes)
+          .where('type', 'in', confirmedCredentialTypes)
           .executeTakeFirst();
         if (!active) throw new ConflictException('节点引用的凭据已变化，请重新预览');
       }

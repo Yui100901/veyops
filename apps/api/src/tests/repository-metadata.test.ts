@@ -669,6 +669,13 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   );
   await viewer.get(`${metadataPath}/environment-files`).query({ commitSha: first }).expect(403);
   await operator.get(`${metadataPath}/environment-files`).query({ commitSha: 'main' }).expect(400);
+  const existingPipelines = (await db.selectFrom('pipelines').select('id').execute())
+    .map(({ id }) => id)
+    .sort();
+  const existingTasks = (await db.selectFrom('tasks').select('id').execute())
+    .map(({ id }) => id)
+    .sort();
+  assert.ok(existingTasks.includes(namedCheckout.taskId));
   const environmentFiles = await operator
     .get(`${metadataPath}/environment-files`)
     .query({ commitSha: first })
@@ -991,10 +998,14 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   conflictingDraft = true;
   await operator.post('/api/v1/ai/repository-analysis').send(nodeDraftRequest).expect(502);
   conflictingDraft = false;
-  assert.equal((await db.selectFrom('pipelines').select('id').execute()).length, 0);
-  assert.deepEqual(await db.selectFrom('tasks').select('id').execute(), [
-    { id: namedCheckout.taskId },
-  ]);
+  assert.deepEqual(
+    (await db.selectFrom('pipelines').select('id').execute()).map(({ id }) => id).sort(),
+    existingPipelines,
+  );
+  assert.deepEqual(
+    (await db.selectFrom('tasks').select('id').execute()).map(({ id }) => id).sort(),
+    existingTasks,
+  );
   assert.deepEqual((await operator.get(`${metadataPath}/connection`).expect(200)).body.data, {
     ok: true,
     defaultBranch: 'main',

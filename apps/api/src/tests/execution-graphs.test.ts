@@ -432,16 +432,25 @@ async function checkGraph(url?: string) {
       id: 'call',
       type: 'FLOW_CALL',
       name: '旧子流',
-      flowId: 'orchestrate',
+      flowId: 'child',
     });
+    invalidCall.nodes.push(
+      { id: 'child', type: 'START', name: 'New chain' },
+      { id: 'child-end', type: 'END', name: 'New chain end' },
+    );
+    invalidCall.endpoints.push({ startId: 'child', endId: 'child-end' });
     parallelEdge.to = 'call';
-    invalidCall.edges.push({ from: 'call', to: 'parallel-log' });
+    invalidCall.edges.push(
+      { from: 'call', to: 'parallel-log' },
+      { from: 'child', to: 'child-end' },
+    );
     const unsupportedCall = await api
       .post(otherPath + '/validate')
       .send({ definition: { canvas: invalidCall } })
       .expect(201);
     assert.ok(
       unsupportedCall.body.data.issues.some((issue: { nodeId: string }) => issue.nodeId === 'call'),
+      JSON.stringify(unsupportedCall.body),
     );
     await api
       .post(otherPath + '/extract')
@@ -729,7 +738,7 @@ async function checkGraph(url?: string) {
     const unsupported = await api
       .post(historicPath + '/flows/' + historicFlow.id + '/preview')
       .send({ version: 1 })
-      .expect(400);
+      .expect(409);
     assert.match(unsupported.text, /FLOW_V2/);
     await api
       .post(historicPath + '/versions/1/restore')

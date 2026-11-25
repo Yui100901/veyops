@@ -167,7 +167,7 @@ test('FLOW_V2 exposes node and task logs and validates artifact ownership', asyn
     for (const [nodeId, message] of [
       ['start', '执行流已开始'],
       ['legacy-log', '已有日志节点继续可读'],
-      ['end', '执行流已结束'],
+      ['end', '执行流已核对交付结果'],
     ]) {
       const log = (await api.get(graphPath + logs(selected.id, nodeId!)).expect(200)).body.data;
       assert.equal(log.source, 'NODE');

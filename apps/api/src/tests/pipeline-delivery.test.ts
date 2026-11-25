@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import type { ProcessOptions } from '../infrastructure/build-runner/process-runner.service';
 
 let testDirectory: Promise<string> | undefined;
 const deliveryDirectory = () =>
@@ -67,18 +68,22 @@ async function checkDelivery(databaseUrl?: string) {
   const releaseLinks = new Map<string, string>();
   const transferredArchives: string[] = [];
   const flowArchives: string[] = [];
+  let captureFlowUpload = false;
   let failedBuildServer: string | undefined;
   let registryPullFails = false;
   let failNextHealthCheck = false;
   let failReleaseLockOnServer: string | undefined;
   let archivePlatformMismatch = false;
   let auxiliaryCommit = 'c'.repeat(40);
+  const processRunner = new ProcessRunnerService();
   const moduleRef = await Test.createTestingModule({
     imports: [AppModule, LegacyDeliveryFixtureModule],
   })
     .overrideProvider(ProcessRunnerService)
     .useValue({
-      run: async (_command: string, args: string[], options: { gzipOutput?: { path: string } }) => {
+      run: async (command: string, args: string[], options: ProcessOptions) => {
+        if (command === 'tar' && args[0] === '-czf')
+          return processRunner.run(command, args, options);
         const script = args.at(-1) ?? '';
         const checkout = script.includes('fetch --no-recurse-submodules --no-tags --depth=1');
         if (checkout || script.includes("printf 'VEYOPS_ARTIFACT")) {
@@ -184,10 +189,13 @@ async function checkDelivery(databaseUrl?: string) {
           return { exitCode: 1 };
         return { exitCode: 0 };
       },
-      upload: async (target: { id: string }, source: string, destination: string) => {
-        if (destination.startsWith('/opt/current-veyops-flow/')) {
-          const contents = await readFile(source);
-          assert.deepEqual([...contents.subarray(0, 2)], [0x1f, 0x8b]);
+      upload: async (target: { id: string }, source: string) => {
+        if (captureFlowUpload) {
+          const result = await processRunner.run('tar', ['-xOzf', source, './index.html'], {
+            timeout: 10,
+          });
+          assert.equal(result.exitCode, 0, result.stderr);
+          assert.equal(result.stdout, 'verified release');
           flowArchives.push(target.id);
         } else {
           assert.deepEqual(await readFile(source), archive);
@@ -1414,19 +1422,31 @@ async function checkDelivery(databaseUrl?: string) {
       assert.fail('Graph run did not reach ' + states.join('/'));
     };
     const initialActivations = activations().length;
+    captureFlowUpload = true;
     const flowRun = await submit();
     const pending = await wait(flowRun.id, ['WAITING', 'FAILED']);
-    assert.equal(pending.status, 'WAITING', JSON.stringify(pending.nodes));
+    if (pending.status !== 'WAITING') {
+      const node = pending.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === approve.id);
+      const failedTask = node?.taskId && (await getTask(node.taskId));
+      assert.fail(JSON.stringify({ nodes: pending.nodes, task: failedTask?.errorSummary }));
+    }
     assert.equal(activations().length, initialActivations);
     assert.equal(flowArchives.length, 0);
-    await create(graphPath + '/runs/' + pending.id + '/nodes/' + approve.id + '/decision', {
+    const gate = pending.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === approve.id);
+    const decision = graphPath + '/runs/' + pending.id + '/nodes/' + approve.id + '/decision';
+    assert.ok(gate.output.scopeHash);
+    assert.equal(gate.output.scope.artifactIds.length, 1);
+    await post(decision, { decision: 'APPROVE', expectedScopeHash: '0'.repeat(64) }).expect(409);
+    assert.equal(activations().length, initialActivations);
+    await create(decision, {
       decision: 'APPROVE',
+      expectedScopeHash: gate.output.scopeHash,
     });
     const completed = await wait(flowRun.id, ['SUCCESS', 'FAILED']);
     assert.equal(completed.status, 'SUCCESS', JSON.stringify(completed.nodes));
     assert.deepEqual(flowArchives, [serverIds[0]]);
     assert.equal(activations().length, initialActivations + 1);
-    assert.equal(completed.artifactIds.length, 1);
+    assert.deepEqual(completed.artifactIds, gate.output.scope.artifactIds);
     const failedRun = await submit({
       parameters: { 'git:app': { kind: 'COMMIT', value: failingCommit } },
     });
