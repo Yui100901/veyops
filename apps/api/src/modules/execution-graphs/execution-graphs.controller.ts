@@ -21,7 +21,7 @@ import {
 import { ExecutionGraphsService } from './execution-graphs.service';
 import { GraphCompileError, graphCatalog, safeGraphId } from './graph-fields';
 import { ExecutionPlanIssueError } from '../../core/execution-plan-issue';
-import { ExpandGraphTemplateDto, graphFlowTemplates } from './graph-flow-templates';
+import { ExpandGraphTemplateDto, simplifiedFlowTemplates } from './graph-flow-templates';
 
 @Controller('projects/:projectId/execution-graph')
 export class ExecutionGraphsController {
@@ -44,7 +44,7 @@ export class ExecutionGraphsController {
   @Get('catalog')
   async catalog(@Param('projectId', ParseUUIDPipe) projectId: string) {
     await this.graphs.get(projectId);
-    return { ...graphCatalog, flowTemplates: graphFlowTemplates };
+    return { ...graphCatalog, flowTemplates: simplifiedFlowTemplates };
   }
   @Post('draft/templates/expand')
   @Roles('ADMIN', 'OPERATOR')

@@ -2110,6 +2110,17 @@ export const migrationProvider: MigrationProvider = {
               .execute();
         },
       } satisfies Migration,
+      '041_execution_flow_workspace': {
+        async up(db) {
+          await db.schema
+            .alterTable('execution_flow_runs')
+            .addColumn('workspace_path', 'text')
+            .execute();
+        },
+        async down(db) {
+          await db.schema.alterTable('execution_flow_runs').dropColumn('workspace_path').execute();
+        },
+      } satisfies Migration,
       '040_release_attempt_scopes': {
         async up(db) {
           await db.schema

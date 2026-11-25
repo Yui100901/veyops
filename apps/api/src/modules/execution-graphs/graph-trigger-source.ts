@@ -25,7 +25,15 @@ export type TriggerSourceConfig = {
   webhookProtocol?: GraphWebhookProtocol;
   generatedCredential?: boolean;
   repositoryId?: string;
+  sourceId?: string;
   ref?: string;
+};
+
+export type TriggerCheckoutScope = {
+  repositoryId: string;
+  ref: string;
+  nodeId: string;
+  sourceId?: string;
 };
 
 export type SourceScope = {
@@ -75,17 +83,57 @@ function staticBinding(
   return binding !== undefined ? { unresolved: true } : undefined;
 }
 
+async function simplifiedTriggerSource(
+  db: Kysely<Database>,
+  projectId: string,
+  flow: GraphFlow,
+  settings: TriggerSourceConfig,
+): Promise<TriggerCheckoutScope> {
+  const node = flow.nodes.find(
+    ({ type, operation }) => type === 'CHECKOUT' || operation === 'CHECKOUT',
+  );
+  const sources = flowStart(flow).start?.sources ?? [];
+  if (!node || (!settings.sourceId && sources.length > 1))
+    throw new BadRequestException('请选择唯一的开始节点源码项作为触发来源');
+  const source = settings.sourceId
+    ? sources.find(({ id }) => id === settings.sourceId)
+    : sources[0];
+  if (
+    !source?.repositoryId ||
+    (settings.repositoryId && settings.repositoryId !== source.repositoryId)
+  )
+    throw new BadRequestException('选定的开始节点源码项或其项目仓库已不可用');
+  const row = await db
+    .selectFrom('repositories')
+    .select('default_branch')
+    .where('id', '=', source.repositoryId)
+    .where('project_id', '=', projectId)
+    .where('archived_at', 'is', null)
+    .executeTakeFirst();
+  const branch = source.ref
+    ? source.ref.kind === 'BRANCH'
+      ? source.ref.value
+      : undefined
+    : row?.default_branch;
+  const ref = branch ? branchPrefix + branch : undefined;
+  if (!row || !ref || !validBranchRef(ref) || (settings.ref && settings.ref !== ref))
+    throw new BadRequestException('开始节点源码项需配置匹配的分支，使用默认分支时仓库需先同步');
+  return { repositoryId: source.repositoryId, ref, nodeId: node.id, sourceId: source.id };
+}
+
 export async function resolveTriggerSource(
   db: Kysely<Database>,
   projectId: string,
   flowId: string,
   settings: TriggerSourceConfig & { parameterMappings?: Record<string, GraphParameterMapping> },
   definition: GraphDefinition,
-) {
+): Promise<TriggerCheckoutScope> {
   const flow = definition.flows.find(({ id }) => id === flowId);
   if (!flow) throw new BadRequestException('已发布的图没有当前开始节点');
   if (settings.ref && !validBranchRef(settings.ref))
     throw new BadRequestException('请输入有效的分支完整引用，如 refs/heads/main');
+  if (flow.model === 'FLOW_V2') return simplifiedTriggerSource(db, projectId, flow, settings);
+  if (settings.sourceId) throw new BadRequestException('当前执行流不支持开始源码项');
   const inferred =
     !flow.compiled && flowStart(flow).contract === 'PRESET'
       ? flowCandidateCatalog(flow, definition.flows, orderedFlowNodes(flow)).nodes

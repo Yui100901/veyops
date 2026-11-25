@@ -37,7 +37,11 @@ import type {
   BuildOutput,
   NamedArtifactDefinition,
 } from '../pipelines/pipeline.types';
-import { relativePath, shellQuote as q } from '../pipelines/pipeline.validation';
+import {
+  normalizeRelativePath,
+  relativePath,
+  shellQuote as q,
+} from '../pipelines/pipeline.validation';
 import type { TaskExecutionContext } from '../tasks/tasks.types';
 import {
   copyGraphDependencies,
@@ -74,6 +78,8 @@ export interface BuildSession {
   secrets: string[];
   webhookDocker?: { socket: string; config: string };
 }
+type DockerSession = Pick<BuildSession, 'taskId' | 'context' | 'secrets' | 'webhookDocker'>;
+type ContainerSession = DockerSession & { snapshot: { definition: { buildImage: string } } };
 export type RunPipelineNode = <T>(node: PipelineNode, run: () => Promise<T>) => Promise<T>;
 
 export function namedArtifactSession(
@@ -1159,6 +1165,109 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     }
   }
 
+  async managerFlowCommand(
+    session: DockerSession,
+    workspace: string,
+    command: string,
+    directory: string,
+    variables: Record<string, string>,
+    timeout: number,
+    automation: boolean,
+    image = helperImage(),
+  ) {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,199}$/.test(image))
+      throw new ConflictException('无效构建容器镜像');
+    const builds = join(dataDirectory, 'builds');
+    await mkdir(builds, { recursive: true, mode: 0o700 });
+    const secrets = await mkdtemp(join(builds, 'flow-command-'));
+    try {
+      const container = { ...session, snapshot: { definition: { buildImage: image } } };
+      if (automation) await this.configureWebhookDocker(container, secrets);
+      await writeFile(join(secrets, 'shell.env'), exportedVariables(variables), { mode: 0o600 });
+      return await this.container(
+        container,
+        workspace,
+        `${enterSourceDirectory('/workspace', directory)}\n. /run/veyops/shell.env\n${command}`,
+        secrets,
+        undefined,
+        undefined,
+        timeout,
+        undefined,
+        (text) => session.context.log(text),
+      );
+    } finally {
+      await rm(secrets, { recursive: true, force: true });
+    }
+  }
+
+  async archiveFlowImage(session: BuildSession, imageId: string) {
+    if (!/^sha256:[a-f0-9]{64}$/.test(imageId))
+      throw new ConflictException('执行流镜像缺少有效的 Image ID');
+    const builds = join(dataDirectory, 'builds');
+    await mkdir(builds, { recursive: true, mode: 0o700 });
+    const root = await mkdtemp(join(builds, 'flow-image-'));
+    const reference = localImageTag(session);
+    try {
+      if (session.snapshot.graphAutomation) await this.configureWebhookDocker(session, root);
+      await this.local(session, ['image', 'tag', imageId, reference], 30, '已确认的镜像 ID 不可用');
+      const archive = await this.retainManagerImageArchive(session, root, reference);
+      return { imageReference: reference, ...archive };
+    } finally {
+      await this.runDocker(session, ['image', 'rm', reference], 30).catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  async buildFlowImage(
+    session: DockerSession,
+    workspace: string,
+    directory: string,
+    dockerfile: string,
+    reference: string,
+    timeout: number,
+    automation: boolean,
+  ) {
+    const base = await realpath(workspace);
+    const context = await realpath(resolve(base, directory));
+    const path = await realpath(resolve(context, dockerfile));
+    const inside = (root: string, candidate: string) => {
+      const child = relative(root, candidate);
+      return child !== '..' && !child.startsWith('..' + sep) && !isAbsolute(child);
+    };
+    if (!inside(base, context) || !inside(context, path) || !(await lstat(path)).isFile())
+      throw new ConflictException('Dockerfile 或构建目录超出本次工作区');
+    const builds = join(dataDirectory, 'builds');
+    await mkdir(builds, { recursive: true, mode: 0o700 });
+    const root = await mkdtemp(join(builds, 'flow-docker-'));
+    try {
+      if (automation) await this.configureWebhookDocker(session, root);
+      await this.local(session, ['build', '--tag', reference, '--file', path, context], timeout);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  async flowComposeSnapshot(
+    session: BuildSession,
+    workspace: string,
+    path: string,
+    target?: SshTarget,
+  ) {
+    path = normalizeRelativePath(path);
+    if (target)
+      return this.remoteComposeSnapshot(target, workspace, session, {
+        root: workspace,
+        directory: '.',
+        path,
+      });
+    const base = await realpath(workspace);
+    const candidate = await realpath(resolve(base, path));
+    const child = relative(base, candidate);
+    if (!child || child === '..' || child.startsWith('..' + sep) || isAbsolute(child))
+      throw new ConflictException('Compose 文件超出本次工作区');
+    return readComposeSnapshot(candidate);
+  }
+
   private async managerNamedArtifacts(
     session: BuildSession,
     root: string,
@@ -1496,7 +1605,7 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     await rename(archive, path);
     return { path, checksum, sizeBytes: details.size };
   }
-  private async configureWebhookDocker(session: BuildSession, root: string) {
+  private async configureWebhookDocker(session: DockerSession, root: string) {
     const socket = await BuildsService.automaticManagerSocket(false);
     const config = join(root, 'docker-config');
     await mkdir(config, { mode: 0o700 });
@@ -1508,7 +1617,7 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     BuildsService.assertAutomaticDockerInfo(result.stdout);
   }
   private async container(
-    session: BuildSession,
+    session: ContainerSession,
     workspace: string,
     script: string,
     secretDir?: string,
@@ -1560,7 +1669,7 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     }
   }
   private runDocker(
-    session: BuildSession,
+    session: DockerSession,
     args: string[],
     timeout: number,
     options: {
@@ -1586,7 +1695,7 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     });
   }
   private async local(
-    session: BuildSession,
+    session: DockerSession,
     args: string[],
     timeout: number,
     failureMessage = '管理端 Docker 步骤失败',

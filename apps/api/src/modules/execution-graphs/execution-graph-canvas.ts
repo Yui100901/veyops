@@ -2,6 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { redactTaskLog } from '../tasks/task-log.service';
 import { flowCandidateCatalog } from './graph-binding-validation';
+import { validateSimplifiedCanvas } from './simplified-flow-definition';
 import {
   annotateGraphIssue,
   graphDynamicOutlets,
@@ -102,7 +103,8 @@ export function withDraftCanvas(
 }
 
 function validateCanvas(canvas: GraphCanvas) {
-  const byId = new Map(canvas.nodes.map((node) => [node.id, runtimeGraphNode(node)]));
+  const simplified = canvas.model === 'FLOW_V2';
+  const byId = new Map(canvas.nodes.map((node) => [node.id, runtimeGraphNode(node, simplified)]));
   const ids = new Set([...canvas.nodes, ...canvas.templates].map(({ id }) => id));
   if (ids.size !== canvas.nodes.length + canvas.templates.length)
     throw new BadRequestException('画布节点和功能节点库中的 ID 必须唯一');
@@ -154,7 +156,7 @@ function validateCanvas(canvas: GraphCanvas) {
     if (text.some((value) => value && redactTaskLog(value) !== value))
       throw new BadRequestException('节点配置包含明文凭据，请移除敏感值');
   }
-  canvas.templates.forEach(runtimeGraphNode);
+  canvas.templates.forEach((node) => runtimeGraphNode(node, simplified));
   return { byId, edges };
 }
 
@@ -273,6 +275,7 @@ function deriveFlow(
 /** Derive runnable projections from canvas data without trusting client-supplied flows. */
 export function compileCanvas(input: GraphCanvas, publish: boolean): GraphDefinition {
   const canvas = withNodeReferences(input);
+  if (canvas.model === 'FLOW_V2') validateSimplifiedCanvas(canvas);
   const { byId, edges } = validateCanvas(canvas);
   const scopes = canvas.endpoints.map((endpoint) => flowScope(endpoint, edges));
   const owners = new Set(scopes.flatMap(({ included }) => [...included]));
@@ -287,10 +290,15 @@ export function compileCanvas(input: GraphCanvas, publish: boolean): GraphDefini
     }
   }
   const definition = { canvas, flows };
+  if (canvas.model === 'FLOW_V2')
+    flows.forEach((flow) => {
+      flow.model = 'FLOW_V2';
+    });
   if (publish) {
     validateNodeReferences(canvas, flows);
     const compiled = validateGraphDefinition(definition, { publication: true });
     for (const flow of flows) {
+      if (flow.model === 'FLOW_V2') continue;
       flow.compiled = compiled[flow.id];
       flow.nodes = flow.nodes.map((node) => {
         const module = graphModulePorts(node);
@@ -302,6 +310,7 @@ export function compileCanvas(input: GraphCanvas, publish: boolean): GraphDefini
 }
 
 export function canvasCatalog(canvas: GraphCanvas, flowId: string, nodeId: string) {
+  if (canvas.model === 'FLOW_V2') return {};
   const { flows } = compileCanvas(canvas, false);
   const flow = flows.find(({ id }) => id === flowId);
   return flow

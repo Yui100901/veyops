@@ -43,14 +43,20 @@ async function checkTemplates(databaseUrl?: string) {
     assert.equal(draft.revision, 1);
     assert.equal(draft.publishedVersion, null);
     const seed: GraphCanvas = draft.draft.canvas;
+    assert.equal(seed.model, 'FLOW_V2');
     assert.equal(seed.endpoints.length, 1);
     assert.deepEqual(
       seed.nodes.map((node) => node.operation ?? node.type),
       ['START', 'CHECKOUT', 'BUILD', 'DEPLOY_ARTIFACT', 'END'],
     );
     assert.equal(seed.edges.length, 4);
-    assert.equal(seed.nodes[2]?.build?.artifacts?.[0]?.type, 'DIRECTORY');
-    assert.equal(seed.nodes[2]?.build?.artifacts?.[0]?.collection, 'WORK_DIRECTORY');
+    assert.equal(seed.nodes[0]?.start?.execution?.location, 'INHERIT');
+    assert.equal(seed.nodes[4]?.finish?.saveWorkspace, true);
+    assert.equal(seed.nodes[4]?.finish?.requireRelease, 'ACTIVATED');
+    assert.ok(
+      seed.nodes.every(({ inputs, outputs }) => inputs === undefined && outputs === undefined),
+    );
+    assert.equal(seed.endpoints[0]?.inputBindings, undefined);
     assert.deepEqual((await api.get(path).expect(200)).body.data, draft);
     assert.deepEqual((await api.get(`${path}/runs`).expect(200)).body.data, []);
     const { flowTemplates } = (await api.get(`${path}/catalog`).expect(200)).body.data;
@@ -60,11 +66,13 @@ async function checkTemplates(databaseUrl?: string) {
     );
 
     const expand = `${path}/draft/templates/expand`;
-    const payload = { templateId: 'CD_DEPLOY', artifactType: 'DOCKER_IMAGE' };
+    const payload = { templateId: 'CD_DEPLOY' };
     const [left, right] = await Promise.all([
       api.post(expand).send(payload).expect(201),
       api.post(expand).send(payload).expect(201),
     ]);
+    assert.equal(left.body.data.canvas.model, 'FLOW_V2');
+    assert.equal(left.body.data.canvas.nodes.at(-1).finish.requireRelease, 'HEALTHY');
     assert.notEqual(left.body.data.startId, right.body.data.startId);
     assert.ok(
       left.body.data.canvas.nodes.some(
@@ -126,41 +134,76 @@ async function checkTemplates(databaseUrl?: string) {
           fieldId,
         }),
       ),
-      [{ flowId: seed.nodes[0]!.id, nodeId: seed.nodes[3]!.id, fieldId: 'deployPath' }],
+      [
+        {
+          flowId: seed.nodes[0]!.id,
+          nodeId: seed.nodes[0]!.id,
+          fieldId: 'start.sources.source.repositoryId',
+        },
+      ],
     );
     await api.post(`${path}/publish`).send({ expectedRevision: saved.revision }).expect(400);
 
+    const repository = (
+      await api
+        .post(`${root}/projects/${project.id}/repositories`)
+        .send({ name: 'Template Git', cloneUrl: 'https://git.example.test/project.git' })
+        .expect(201)
+    ).body.data;
+    const service = (
+      await api
+        .post(`${root}/projects/${project.id}/services`)
+        .send({ name: 'Template service', slug: 'template' })
+        .expect(201)
+    ).body.data;
+    const credential = (
+      await api
+        .post(`${root}/credentials`)
+        .send({ name: 'Template SSH', type: 'SSH_PASSWORD', secret: { password: 'fixture' } })
+        .expect(201)
+    ).body.data;
+    const target = (
+      await api
+        .post(`${root}/servers`)
+        .send({
+          name: 'Template target',
+          host: 'ssh.example.test',
+          port: 22,
+          username: 'template',
+          credentialId: credential.id,
+          hostKeyFingerprint: 'a'.repeat(64),
+        })
+        .expect(201)
+    ).body.data;
     const ready = structuredClone(seed);
-    ready.nodes[2]!.build!.buildCommand = 'mkdir -p dist';
-    ready.nodes[3]!.deploy!.deployPath = '/tmp/veyops-flow-template-fixture';
+    const start = ready.nodes[0]!.start!;
+    start.sources![0]!.repositoryId = repository.id;
+    ready.nodes[2]!.build = { repoPath: 'project', buildCommand: 'mkdir -p dist' };
+    start.release = {
+      serviceId: service.id,
+      targets: { serverIds: [target.id] },
+      deployPath: '/tmp/veyops-flow-template-fixture',
+    };
     const missingSelection = await api
       .post(`${path}/validate`)
       .send({ definition: { canvas: ready } })
       .expect(201);
-    assert.equal(missingSelection.body.data.issues[0].fieldId, 'artifactPath');
-    ready.nodes[3]!.deploy!.artifactPath = 'dist/';
+    assert.equal(missingSelection.body.data.issues[0].fieldId, 'start.release.contentPath');
+    start.release.contentPath = 'project/dist/';
     const readyDraft = (await save(ready, saved.revision).expect(200)).body.data;
     const published = (
       await api.post(`${path}/publish`).send({ expectedRevision: readyDraft.revision }).expect(201)
     ).body.data;
     assert.equal(published.publishedVersion, 1);
-    await api.post(`${path}/flows/${seed.nodes[0]!.id}/preview`).send({ version: 1 }).expect(400);
 
     const ci: GraphCanvas = (
       await api.post(expand).send({ templateId: 'CI_BUILD', artifactType: 'DIRECTORY' }).expect(201)
     ).body.data.canvas;
     const check = ci.nodes.find(({ operation }) => operation === 'CHECK')!;
     const build = ci.nodes.find(({ operation }) => operation === 'BUILD')!;
-    const targetParameter = ci.nodes
-      .find(({ type }) => type === 'START')!
-      .inputs!.find(({ id }) => id === 'buildTargets')!;
-    assert.equal(targetParameter.required, false);
-    check.shell = { ...check.shell, location: 'TARGET', command: 'test -d .' };
-    ci.endpoints[0]!.inputBindings![check.id]!.targets = {
-      kind: 'INPUT',
-      fieldId: targetParameter.id,
-    };
-    build.build!.buildCommand = 'mkdir -p dist';
+    ci.nodes.find(({ type }) => type === 'START')!.start!.sources![0]!.repositoryId = repository.id;
+    check.shell = { ...check.shell, directory: 'project', command: 'test -d .' };
+    build.build = { repoPath: 'project', buildCommand: 'mkdir -p dist' };
     const ciValidated = await api
       .post(`${path}/validate`)
       .send({ definition: { canvas: ci } })

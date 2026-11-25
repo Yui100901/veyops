@@ -837,6 +837,7 @@ export interface Database {
     request_hash: string;
     configuration_hash: string;
     inputs_json: string;
+    workspace_path: Generated<string | null>;
     status: string;
     created_at: number;
     finished_at: Generated<number | null>;

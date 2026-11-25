@@ -12,6 +12,8 @@ import { GraphMigrationController } from './graph-migration.controller';
 import { GraphMigrationService } from './graph-migration.service';
 import { GraphReleaseInspectionService } from './graph-release-inspection.service';
 import { GraphFlowCatalogController } from './graph-flow-catalog.controller';
+import { FlowWorkspaceService } from './flow-workspace.service';
+import { SimplifiedFlowRunService } from './simplified-flow-run.service';
 
 @Module({
   imports: [PipelinesModule, CommandCenterModule],
@@ -28,6 +30,8 @@ import { GraphFlowCatalogController } from './graph-flow-catalog.controller';
     GraphRunnerService,
     GraphTriggersService,
     GraphNodeTasks,
+    FlowWorkspaceService,
+    SimplifiedFlowRunService,
     GraphMigrationService,
     GraphReleaseInspectionService,
   ],

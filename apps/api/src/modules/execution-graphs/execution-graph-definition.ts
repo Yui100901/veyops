@@ -35,6 +35,11 @@ import {
   type GraphDiagnostic,
 } from './graph-fields';
 import { validateFlowBindings, type GraphCompiledFlow } from './graph-binding-validation';
+import {
+  SimplifiedFinish,
+  SimplifiedStart,
+  validateSimplifiedFlow,
+} from './simplified-flow-definition';
 
 const idFormat = /^[A-Za-z0-9_-]{1,64}$/;
 const maxFlows = 50;
@@ -69,6 +74,9 @@ const functionOperations = nodeTypes.filter(
 
 class GraphCondition {
   @IsOptional() @IsIn(['input', 'commitSha']) key?: 'input' | 'commitSha';
+  @ValidateIf((_o, v) => v !== undefined)
+  @Matches(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/)
+  parameterKey?: string;
   @IsString() @MaxLength(2000) value!: string;
 }
 
@@ -85,6 +93,9 @@ class GraphBranchCase {
 }
 
 class GraphBranch {
+  @ValidateIf((_o, v) => v !== undefined)
+  @Matches(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/)
+  parameterKey?: string;
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(maxSwitchCases)
@@ -95,6 +106,9 @@ class GraphBranch {
 
 class GraphSwitch {
   @IsOptional() @IsIn(['input', 'commitSha']) key?: 'input' | 'commitSha';
+  @ValidateIf((_o, v) => v !== undefined)
+  @Matches(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/)
+  parameterKey?: string;
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(maxSwitchCases)
@@ -280,6 +294,16 @@ export class GraphNode {
   @IsIn(['INHERIT', 'MANAGER', 'TARGET'])
   buildLocation?: 'INHERIT' | 'MANAGER' | 'TARGET';
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() sameHostRelease?: boolean;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => SimplifiedStart)
+  start?: SimplifiedStart;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => SimplifiedFinish)
+  finish?: SimplifiedFinish;
   @ValidateIf((node, value) => node.type === 'FUNCTION' || value !== undefined)
   @IsIn(functionOperations)
   operation?: (typeof functionOperations)[number];
@@ -379,11 +403,11 @@ export class GraphNode {
 }
 
 /** The canvas keeps editable function nodes. Execution uses the existing native modules. */
-export function runtimeGraphNode(node: GraphNode): GraphNode {
+export function runtimeGraphNode(node: GraphNode, simplified = false): GraphNode {
   if (node.type !== 'FUNCTION' && node.operation === undefined) return node;
   const { operation, ...definition } = node;
   if (node.type === 'FUNCTION' && operation && functionOperations.includes(operation))
-    return { ...definition, type: operation, declaredPorts: true };
+    return { ...definition, type: operation, ...(!simplified && { declaredPorts: true }) };
   throw new GraphCompileError({
     nodeId: node.id,
     fieldId: 'operation',
@@ -432,6 +456,7 @@ class GraphFlowConfiguration {
 }
 export class GraphFlow extends GraphFlowConfiguration {
   declare compiled?: GraphCompiledFlow;
+  @ValidateIf((_o, v) => v !== undefined) @IsIn(['FLOW_V2']) model?: 'FLOW_V2';
   @Matches(idFormat) id!: string;
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
   @IsArray()
@@ -455,6 +480,7 @@ export class GraphEndpoint extends GraphFlowConfiguration {
 }
 
 export class GraphCanvas {
+  @ValidateIf((_o, v) => v !== undefined) @IsIn(['FLOW_V2']) model?: 'FLOW_V2';
   @IsArray()
   @IsObject({ each: true })
   @ArrayMaxSize(500)
@@ -757,11 +783,13 @@ export function validateGraphDefinition(
         if (!safeGraphId(node.id)) throw new BadRequestException('节点 ID 无效');
         if (node.type === 'FUNCTION' || node.operation !== undefined)
           throw new BadRequestException('功能节点须在画布中声明后编译');
-        for (const [fieldId, directory] of [
-          ['repoPath', node.build?.repoPath],
-          ['directory', node.shell?.directory],
-          ['artifactPath', node.shell?.artifactPath ?? node.deploy?.artifactPath],
-        ] as const) {
+        for (const [fieldId, directory] of flow.model === 'FLOW_V2'
+          ? []
+          : ([
+              ['repoPath', node.build?.repoPath],
+              ['directory', node.shell?.directory],
+              ['artifactPath', node.shell?.artifactPath ?? node.deploy?.artifactPath],
+            ] as const)) {
           if (!directory?.trim()) continue;
           try {
             relativePath(directory.trim());
@@ -779,7 +807,7 @@ export function validateGraphDefinition(
         if (!definition.canvas && nodeIds.has(node.id))
           throw new BadRequestException('同一图版本中的节点 ID 必须唯一');
         nodeIds.add(node.id);
-        for (const issue of missingNodeConfiguration(node))
+        for (const issue of flow.model === 'FLOW_V2' ? [] : missingNodeConfiguration(node))
           issues.push({
             ...issue,
             flowId: flow.id,
@@ -788,6 +816,8 @@ export function validateGraphDefinition(
             message: `「${flow.name}」 → 「${node.name}」 · ${issue.message}`,
           });
         validateAdvancedNode(node);
+        if (flow.model !== 'FLOW_V2' && (node.start !== undefined || node.finish !== undefined))
+          throw new BadRequestException('开始配置与结束核对需使用简化流程画布');
         if (
           node.buildLocation !== undefined &&
           (node.type !== 'START' || node.contract !== 'PRESET')
@@ -890,6 +920,12 @@ export function validateGraphDefinition(
   const compiled = new Map<string, GraphCompiledFlow>();
   for (const flow of definition.flows) {
     try {
+      if (flow.model === 'FLOW_V2') {
+        if (definition.canvas?.model !== 'FLOW_V2')
+          throw new GraphCompileError({ flowId: flow.id, message: '简化流程需要提交画布' });
+        validateSimplifiedFlow(flow, orderedFlowNodes(flow));
+        continue;
+      }
       compiled.set(
         flow.id,
         validateFlowBindings(flow, definition.flows, orderedFlowNodes(flow), publication),

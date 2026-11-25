@@ -23,7 +23,10 @@ export function graphCheckoutEvent(
 ): GraphCheckoutEvent | undefined {
   if (
     !trigger ||
-    !['POLL', 'GITEA', 'BEARER'].includes(String(trigger.eventSource)) ||
+    !(
+      ['POLL', 'GITEA', 'BEARER'].includes(String(trigger.eventSource)) ||
+      (trigger.eventSource === 'SIGNED' && typeof trigger.sourceId === 'string')
+    ) ||
     (nodeId && trigger.checkoutNodeId && trigger.checkoutNodeId !== nodeId) ||
     typeof trigger.repositoryId !== 'string' ||
     typeof trigger.ref !== 'string' ||

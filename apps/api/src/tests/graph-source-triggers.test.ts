@@ -397,6 +397,135 @@ async function verify(t: TestContext, databaseUrl?: string) {
     assert.ok(
       !(await events(hooks.id)).some(({ eventId }: { eventId: string }) => eventId === 'bad-sig'),
     );
+
+    const latest = (await api.get(graphPath).expect(200)).body.data;
+    const simplified = (
+      await api
+        .put(graphPath + '/draft')
+        .send({
+          expectedRevision: latest.revision,
+          definition: {
+            canvas: {
+              model: 'FLOW_V2',
+              nodes: [
+                {
+                  id: 'simple-start',
+                  type: 'START',
+                  name: '开始两路检出',
+                  start: {
+                    execution: { location: 'MANAGER' },
+                    sources: [
+                      {
+                        id: 'selected',
+                        repositoryId: repository.id,
+                        ref: { kind: 'BRANCH', value: 'review-alt' },
+                        parentDirectory: 'selected',
+                      },
+                      {
+                        id: 'independent',
+                        repositoryId: repository.id,
+                        ref: { kind: 'BRANCH', value: 'main' },
+                        parentDirectory: 'independent',
+                      },
+                    ],
+                  },
+                },
+                { id: 'simple-checkout', type: 'CHECKOUT', name: '检出' },
+                { id: 'simple-end', type: 'END', name: '结束' },
+              ],
+              edges: [
+                { from: 'simple-start', to: 'simple-checkout' },
+                { from: 'simple-checkout', to: 'simple-end' },
+              ],
+              endpoints: [{ startId: 'simple-start', endId: 'simple-end' }],
+              templates: [],
+            },
+          },
+        })
+        .expect(200)
+    ).body.data;
+    for (const rule of [poll, hooks, generic])
+      await api
+        .patch(rules + '/' + rule.id)
+        .send({
+          ...common,
+          kind: rule.kind,
+          cronMode: rule.cronMode,
+          cron: rule.cron,
+          timeZone: rule.timeZone,
+          webhookProtocol: rule.webhookProtocol,
+          enabled: false,
+        })
+        .expect(200);
+    const simpleVersion = (
+      await make(graphPath + '/publish', { expectedRevision: simplified.revision })
+    ).publishedVersion;
+    const signatureSecret = randomBytes(32).toString('hex');
+    const signatureCredential = await make(prefix + '/credentials', {
+      name: 'V2 signatures',
+      type: 'CUSTOM_SECRET',
+      secret: { value: signatureSecret },
+    });
+    const settings = {
+      name: 'V2 signed checkout',
+      enabled: true,
+      flowId: 'simple-start',
+      kind: 'WEBHOOK',
+      webhookProtocol: 'SIGNED',
+      credentialId: signatureCredential.id,
+      version: simpleVersion,
+    };
+    const { BuildsService } = await import('../modules/builds/builds.service.js');
+    t.mock.method(BuildsService, 'automaticManagerSocket', async () => '/tmp/fixture-build.sock');
+    const missingSource = (
+      await api
+        .post(rules + '/preflight')
+        .send(settings)
+        .expect(200)
+    ).body.data;
+    assert.equal(missingSource.eligible, false);
+    assert.match(missingSource.issue.message, /开始节点源码项/);
+    const scoped = await make(rules, { ...settings, sourceId: 'selected' });
+    assert.equal(scoped.sourceId, 'selected');
+    const sendScoped = async (eventId: string, repositoryId: string, gitRef: string) => {
+      const raw = JSON.stringify({ repositoryId, ref: gitRef, commitSha: head });
+      const time = String(Math.floor(Date.now() / 1000));
+      const signature =
+        'sha256=' +
+        createHmac('sha256', signatureSecret)
+          .update(time + '.' + eventId + '.' + raw)
+          .digest('hex');
+      return (
+        await publicApi
+          .post(scoped.receivePath)
+          .type('json')
+          .set('x-veyops-timestamp', time)
+          .set('x-veyops-delivery', eventId)
+          .set('x-veyops-signature', signature)
+          .send(raw)
+          .expect(202)
+      ).body.data;
+    };
+    assert.equal((await sendScoped('other-repo', secondary.id, ref)).status, 'IGNORED');
+    assert.equal(
+      (await sendScoped('other-ref', repository.id, 'refs/heads/main')).status,
+      'IGNORED',
+    );
+    const scopedEvent = await sendScoped('scoped-push', repository.id, ref);
+    assert.equal(scopedEvent.status, 'PENDING');
+    assert.equal(scopedEvent.metadata.sourceId, 'selected');
+    assert.equal((await sendScoped('scoped-push', repository.id, ref)).id, scopedEvent.id);
+    seen.length = 0;
+    await service.tick();
+    const scopedEvents = await events(scoped.id);
+    assert.equal(
+      scopedEvents.find(({ id }: { id: string }) => id === scopedEvent.id).status,
+      'QUEUED',
+      JSON.stringify(scopedEvents),
+    );
+    assert.ok(seen.some((entry) => entry.branch === 'review-alt' && entry.requestedSha === head));
+    assert.ok(seen.some((entry) => entry.branch === 'main' && entry.requestedSha === undefined));
+    assert.ok(!seen.some((entry) => entry.branch === 'main' && entry.requestedSha));
   } finally {
     await app.close();
     await rm(dir, { recursive: true, force: true });

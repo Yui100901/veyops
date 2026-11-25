@@ -78,8 +78,9 @@ async function makeRepository() {
   return sha;
 }
 
-async function testTarget(command) {
-  const key = (await readFile('/accept/host-ssh/test-b.pub', 'utf8')).trim().split(/\s+/)[1];
+async function testTarget(command, target = 'test-b') {
+  assert.ok(['test-a', 'test-b'].includes(target));
+  const key = (await readFile(`/accept/host-ssh/${target}.pub`, 'utf8')).trim().split(/\s+/)[1];
   const fingerprint = createHash('sha256').update(Buffer.from(key, 'base64')).digest('hex');
   const privateKey = await readFile('/accept/host-ssh/fixture-admin', 'utf8');
   const ssh = new Client();
@@ -102,7 +103,7 @@ async function testTarget(command) {
         });
       });
       ssh.connect({
-        host: 'test-b',
+        host: target,
         username: 'root',
         privateKey,
         hostVerifier: (hostKey) =>
@@ -343,4 +344,4 @@ async function verifyWorkDirectory({ api, fixture, execute }) {
   };
 }
 
-module.exports = { verifyWorkDirectory };
+module.exports = { testTarget, verifyWorkDirectory };

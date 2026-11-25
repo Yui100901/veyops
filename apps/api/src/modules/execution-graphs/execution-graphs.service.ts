@@ -21,6 +21,7 @@ import {
 import { GraphCompileError, type GraphDiagnostic } from './graph-fields';
 import { expandGraphTemplate, type ExpandGraphTemplateDto } from './graph-flow-templates';
 import { GraphTriggersService } from './graph-triggers.service';
+import { validateSimplifiedSourceDirectories } from './simplified-flow-definition';
 
 function graphResponse(row: Selectable<Database['execution_graphs']>) {
   return {
@@ -54,10 +55,13 @@ export class ExecutionGraphsService {
     return graphResponse(await this.graph(projectId));
   }
 
-  async expandTemplate(projectId: string, { templateId, artifactType }: ExpandGraphTemplateDto) {
+  async expandTemplate(
+    projectId: string,
+    { templateId, artifactType, model = 'FLOW_V2' }: ExpandGraphTemplateDto,
+  ) {
     await requireProject(this.database.db, projectId);
     await this.graph(projectId);
-    return expandGraphTemplate(templateId, artifactType);
+    return expandGraphTemplate(templateId, artifactType, model);
   }
 
   private async lockDraft(tx: Transaction<Database>, projectId: string, expectedRevision: number) {
@@ -93,16 +97,38 @@ export class ExecutionGraphsService {
         state: 'RUNNABLE',
       }),
     );
-    if (!reference) return;
-    const flow = definition.flows.find(({ id }) => id === reference.flowId);
-    const node = flow?.nodes.find(({ id }) => id === reference.nodeId);
-    const path = [flow?.name, node?.name, reference.fieldId].filter(Boolean).join(' → ');
-    throw new GraphCompileError({
-      flowId: reference.flowId,
-      nodeId: reference.nodeId,
-      fieldId: reference.fieldId,
-      message: (path ? path + ' · ' : '') + '引用的资源不存在、已停用或不属于当前项目',
-    });
+    if (reference) {
+      const flow = definition.flows.find(({ id }) => id === reference.flowId);
+      const node = flow?.nodes.find(({ id }) => id === reference.nodeId);
+      const path = [flow?.name, node?.name, reference.fieldId].filter(Boolean).join(' → ');
+      throw new GraphCompileError({
+        flowId: reference.flowId,
+        nodeId: reference.nodeId,
+        fieldId: reference.fieldId,
+        message: (path ? path + ' · ' : '') + '引用的资源不存在、已停用或不属于当前项目',
+      });
+    }
+    if (definition.canvas?.model !== 'FLOW_V2') return;
+    const ids = [
+      ...new Set(
+        definition.flows.flatMap(({ nodes }) =>
+          nodes.flatMap(
+            ({ start }) =>
+              start?.sources?.flatMap(({ repositoryId }) => (repositoryId ? [repositoryId] : [])) ??
+              [],
+          ),
+        ),
+      ),
+    ];
+    if (!ids.length) return;
+    const rows = await tx
+      .selectFrom('repositories')
+      .select(['id', 'clone_url'])
+      .where('project_id', '=', projectId)
+      .where('id', 'in', ids)
+      .execute();
+    const urls = new Map(rows.map(({ id, clone_url }) => [id, clone_url]));
+    for (const flow of definition.flows) validateSimplifiedSourceDirectories(flow, urls);
   }
 
   async validate(

@@ -470,7 +470,10 @@ export class ProjectsService {
             project_id: id,
             revision: 1,
             draft_json: JSON.stringify(
-              compileCanvas(expandGraphTemplate('MINIMAL_CI_CD').canvas, false),
+              compileCanvas(
+                expandGraphTemplate('MINIMAL_CI_CD', undefined, 'FLOW_V2').canvas,
+                false,
+              ),
             ),
             created_at: now,
             updated_at: now,

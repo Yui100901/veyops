@@ -46,9 +46,15 @@ export const graphFlowTemplates = templates.map(({ id, name, operations }) => ({
   artifactTypes: graphArtifactTypes,
 }));
 
+export const simplifiedFlowTemplates = graphFlowTemplates.map((template) => ({
+  ...template,
+  artifactTypes: ['DIRECTORY'] as const,
+}));
+
 export class ExpandGraphTemplateDto {
   @Allow() templateId!: TemplateId;
   @Allow() artifactType?: GraphArtifactType;
+  @Allow() model?: 'FLOW_V2';
 }
 
 function invalidTemplateField(path: keyof ExpandGraphTemplateDto, message: string): never {
@@ -75,11 +81,15 @@ const output = (node: GraphNode, fieldId: string): GraphBinding => ({
 export function expandGraphTemplate(
   templateId: TemplateId,
   artifactType: GraphArtifactType = 'DIRECTORY',
+  model?: 'FLOW_V2',
 ): { canvas: GraphCanvas; startId: string } {
   const template = templates.find(({ id }) => id === templateId);
   if (!template) invalidTemplateField('templateId', '请选择有效的流程模板');
   if (!graphArtifactTypes.includes(artifactType))
     invalidTemplateField('artifactType', '请选择文件、目录或 Docker 镜像');
+  if (model !== undefined && model !== 'FLOW_V2')
+    invalidTemplateField('model', '请选择有效的执行流定义');
+  if (model === 'FLOW_V2') return expandSimplifiedTemplate(template, artifactType);
   const startInputs: GraphField[] = [];
   const endOutputs: GraphField[] = [];
   const inputBindings: NonNullable<GraphEndpoint['inputBindings']> = {};
@@ -221,4 +231,59 @@ export function expandGraphTemplate(
       templates: [],
     },
   };
+}
+
+function expandSimplifiedTemplate(
+  template: (typeof templates)[number],
+  artifactType: GraphArtifactType,
+) {
+  const builds = template.id !== 'CD_DEPLOY';
+  const deploys = template.id !== 'CI_BUILD';
+  const image = artifactType === 'DOCKER_IMAGE';
+  const start: GraphNode = {
+    id: `start-${randomUUID()}`,
+    name: template.name,
+    type: 'START',
+    start: {
+      ...(builds && {
+        sources: [{ id: 'source' }],
+        execution: { location: 'INHERIT' },
+      }),
+      ...(deploys && { release: {} }),
+    },
+  };
+  const end: GraphNode = {
+    id: `end-${randomUUID()}`,
+    name: '结束',
+    type: 'END',
+    finish: {
+      saveWorkspace: builds,
+      ...(builds && { retention: 'PERSISTENT' }),
+      ...(image && builds && { image: {} }),
+      ...(deploys && { requireRelease: template.id === 'CD_DEPLOY' ? 'HEALTHY' : 'ACTIVATED' }),
+    },
+  };
+  const actions: GraphNode[] = template.operations.map((operation) => ({
+    id: `node-${randomUUID()}`,
+    name: labels[operation],
+    type: 'FUNCTION',
+    operation,
+    ...(operation === 'CHECK' && { shell: { timeout: 180 } }),
+    ...(operation === 'DEPLOY_ARTIFACT' && { deploy: { method: image ? 'COMPOSE' : 'FILE' } }),
+    ...(operation === 'HEALTH_CHECK' && {
+      healthCheck: { timeoutSeconds: 30, requireHealthy: true },
+    }),
+  }));
+  const nodes = [start, ...actions, end].map((node, index) => ({
+    ...node,
+    position: { x: 48 + index * 244, y: 64 },
+  }));
+  const canvas: GraphCanvas = {
+    model: 'FLOW_V2',
+    nodes,
+    edges: nodes.slice(1).map(({ id }, index) => ({ from: nodes[index]!.id, to: id })),
+    endpoints: [{ startId: start.id, endId: end.id }],
+    templates: [],
+  };
+  return { startId: start.id, canvas };
 }

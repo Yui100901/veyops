@@ -4,6 +4,7 @@ import type { Transaction } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import type { ExecutionVariables } from '../../infrastructure/execution-variables';
 import type { GraphModulePayload } from '../execution-graphs/graph-node-tasks';
+import type { SimplifiedActionPayload } from '../execution-graphs/simplified-flow-run.service';
 import type { DeliveryExecutionProfile } from '../pipelines/delivery-execution-profile';
 import type { TargetSelectionDto } from '../command-center/command.dto';
 
@@ -46,6 +47,7 @@ export interface AiRepairOrigin {
 }
 export interface TaskPayload {
   graphModule?: GraphModulePayload;
+  simplifiedAction?: SimplifiedActionPayload;
   environment?: ExecutionVariables;
   aiRepair?: AiRepairOrigin;
   targets: SshTarget[];

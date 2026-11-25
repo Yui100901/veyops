@@ -83,6 +83,11 @@ export function branchMatch(
   }
   const configuration = node.condition ?? node.switch;
   if (!configuration && !node.branch) return undefined;
+  if (flow.model === 'FLOW_V2') {
+    const key = (node.condition ?? node.branch ?? node.switch)?.parameterKey;
+    const value = key ? inputs.parameters?.[key] : inputs.value;
+    return value === undefined ? undefined : graphConditionMatch(node, value);
+  }
   const explicit =
     flow.compiled?.nodes[node.id]?.inputBindings.value ?? flow.inputBindings?.[node.id]?.value;
   const output = state?.outputs?.get(node.id);

@@ -12,7 +12,7 @@ case "$revision" in *[!a-f0-9]*) exit 2 ;; esac
 test "${#revision}" -eq 40 || exit 2
 case "$database" in sqlite|postgres) ;; *) printf '%s\n' 'Choose sqlite or postgres.' >&2; exit 2 ;; esac
 case "$mode" in
-  acceptance) test -z "$bind" ;;
+  acceptance|flow-v2) test -z "$bind" ;;
   preview)
     if ! printf '%s\n' "$bind" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}:[1-9][0-9]{3,4}$' ||
        [ "${bind%:*}" = 0.0.0.0 ] || [ "${bind##*:}" -gt 65535 ]; then
@@ -20,7 +20,7 @@ case "$mode" in
       exit 2
     fi
     ;;
-  *) printf '%s\n' 'Choose acceptance or preview.' >&2; exit 2 ;;
+  *) printf '%s\n' 'Choose acceptance, flow-v2 or preview.' >&2; exit 2 ;;
 esac
 
 repo=$(git rev-parse --show-toplevel)

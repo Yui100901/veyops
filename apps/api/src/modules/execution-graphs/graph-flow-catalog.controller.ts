@@ -11,6 +11,8 @@ import { flowStart, presetReleaseServiceIds, referenceId } from './graph-run-bin
 
 function belongsToServices(flow: GraphFlow, definition: GraphDefinition) {
   const start = flowStart(flow);
+  if (flow.model === 'FLOW_V2')
+    return start.start?.release?.serviceId ? [start.start.release.serviceId] : [];
   if (
     start.contract === 'PRESET' &&
     flow.nodes.some(({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT')
@@ -124,9 +126,10 @@ export class GraphFlowCatalogController {
       >();
       for (const node of draft.canvas?.nodes ?? []) {
         if (node.type === 'START') {
-          const serviceId = referenceId(
-            node.inputs?.find(({ type }) => type === 'SERVICE')?.defaultValue,
-          );
+          const serviceId =
+            draft.canvas?.model === 'FLOW_V2'
+              ? node.start?.release?.serviceId
+              : referenceId(node.inputs?.find(({ type }) => type === 'SERVICE')?.defaultValue);
           notes.set(node.id, {
             id: node.id,
             name: node.name,

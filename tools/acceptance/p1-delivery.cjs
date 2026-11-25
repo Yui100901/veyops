@@ -8,6 +8,7 @@ const { verifyArtifactRecovery, verifyWorkerRecovery } = require('./p1-recovery.
 const { verifySharedDelivery } = require('./p1-shared-delivery.cjs');
 const { prepareP2Repository, verifyP2Contract } = require('./p2-contract.cjs');
 const { verifyWorkDirectory } = require('./work-directory-live.cjs');
+const { verifyFlowV2 } = require('./flow-v2-live.cjs');
 const {
   initializeDemo,
   loadDemo,
@@ -492,13 +493,13 @@ async function verifyBackup(
 async function run() {
   assert.match(revision, /^[0-9a-f]{40}$/);
   assert.equal(fixtureImage, 'busybox:1.36');
-  assert.ok(['acceptance', 'preview'].includes(mode ?? 'acceptance'));
+  assert.ok(['acceptance', 'flow-v2', 'preview'].includes(mode ?? 'acceptance'));
   assert.equal(process.env.DOCKER_HOST, 'unix:///accept/targets/test-a/docker.sock');
   assert.ok(['sqlite', 'postgres'].includes(process.env.DATABASE_CLIENT));
   const demo = loadDemo('/accept/examples/refactor-stage0/project.yaml');
   const gitRoot = acceptanceRoot + '/repo';
   const source = await prepareDemoRepository(demo, gitRoot);
-  if (mode !== 'preview') prepareP2Repository(gitRoot, source);
+  if (mode === 'acceptance' || !mode) prepareP2Repository(gitRoot, source);
   const git = serveDemoGit(gitRoot);
   git.listen(8088, '0.0.0.0');
   await once(git, 'listening');
@@ -571,6 +572,14 @@ async function run() {
       runs: [],
     };
     const execute = createGraphRunner(api, fixture, evidence);
+    if (mode === 'flow-v2') {
+      evidence.flowV2 = await verifyFlowV2({ api, fixture, execute });
+      await writeFile(acceptanceRoot + '/evidence.json', JSON.stringify(evidence, null, 2) + '\n', {
+        flag: 'wx',
+      });
+      console.log('VEYOPS_ACCEPTANCE_FLOW_V2 ' + JSON.stringify(evidence.flowV2));
+      return;
+    }
     const manager = await execute(
       'manager-build',
       {},

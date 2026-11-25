@@ -1,0 +1,579 @@
+import { BadRequestException } from '@nestjs/common';
+import { Type } from 'class-transformer';
+import {
+  ArrayMaxSize,
+  ArrayUnique,
+  IsArray,
+  IsBoolean,
+  IsIn,
+  IsInt,
+  IsObject,
+  IsString,
+  IsUUID,
+  Length,
+  Matches,
+  Max,
+  MaxLength,
+  Min,
+  ValidateIf,
+  ValidateNested,
+} from 'class-validator';
+import { posix } from 'node:path';
+import { normalizeRelativePath, safeDeployPath } from '../pipelines/pipeline.validation';
+import { isGitBranchName } from '../projects/git-ref';
+import { httpCloneUrl } from '../projects/http-clone-url';
+import { redactTaskLog } from '../tasks/task-log.service';
+import type { GraphCanvas, GraphFlow, GraphNode } from './execution-graph-definition';
+import { graphBranchPaths } from './graph-binding-validation';
+import { GraphCompileError, safeGraphEnvironmentKey } from './graph-fields';
+
+const idFormat = /^[A-Za-z0-9_-]{1,64}$/;
+const variableFormat = /^[a-zA-Z_][a-zA-Z0-9_]{0,127}$/;
+const shaFormat = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
+
+export class SimplifiedGitRef {
+  @IsIn(['BRANCH', 'TAG', 'COMMIT']) kind!: 'BRANCH' | 'TAG' | 'COMMIT';
+  @IsString() @Length(1, 255) value!: string;
+}
+
+export class SimplifiedSource {
+  @Matches(idFormat) id!: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() repositoryId?: string;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => SimplifiedGitRef)
+  ref?: SimplifiedGitRef;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) parentDirectory?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() allowRefOverride?: boolean;
+}
+
+export class SimplifiedExecution {
+  @IsIn(['INHERIT', 'MANAGER', 'TARGET']) location!: 'INHERIT' | 'MANAGER' | 'TARGET';
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() serverId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() groupId?: string;
+}
+
+export class SimplifiedReleaseTargets {
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ArrayUnique()
+  @IsUUID(undefined, { each: true })
+  serverIds?: string[];
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ArrayUnique()
+  @IsUUID(undefined, { each: true })
+  groupIds?: string[];
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsIn(['PARALLEL', 'SEQUENTIAL'])
+  strategy?: 'PARALLEL' | 'SEQUENTIAL';
+  @ValidateIf((_o, v) => v !== undefined) @IsInt() @Min(1) @Max(10) maxParallel?: number;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsIn(['CONTINUE', 'STOP'])
+  failurePolicy?: 'CONTINUE' | 'STOP';
+}
+
+export class SimplifiedComposeFile {
+  @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) sourceId?: string;
+  @IsString() @Length(1, 1024) path!: string;
+}
+
+export class SimplifiedRelease {
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() serviceId?: string;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => SimplifiedReleaseTargets)
+  targets?: SimplifiedReleaseTargets;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() reuseExecutionServer?: boolean;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) deployPath?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) contentPath?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() artifactId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() useUpstreamArtifact?: boolean;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() allowArtifactOverride?: boolean;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => SimplifiedComposeFile)
+  compose?: SimplifiedComposeFile;
+}
+
+export class SimplifiedVariable {
+  @Matches(variableFormat) key!: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(65536) value?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() credentialId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() allowOverride?: boolean;
+}
+
+export class SimplifiedDotenv {
+  @Matches(idFormat) sourceId!: string;
+  @IsString() @Length(1, 1024) path!: string;
+}
+
+export class SimplifiedStart {
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsArray()
+  @ArrayMaxSize(20)
+  @IsObject({ each: true })
+  @ValidateNested({ each: true })
+  @Type(() => SimplifiedSource)
+  sources?: SimplifiedSource[];
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => SimplifiedExecution)
+  execution?: SimplifiedExecution;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => SimplifiedRelease)
+  release?: SimplifiedRelease;
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() environmentSetId?: string;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsObject({ each: true })
+  @ValidateNested({ each: true })
+  @Type(() => SimplifiedVariable)
+  variables?: SimplifiedVariable[];
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => SimplifiedDotenv)
+  dotenv?: SimplifiedDotenv;
+}
+
+export class SimplifiedFinishImage {
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @Length(1, 512) reference?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsUUID() registryId?: string;
+}
+
+export class SimplifiedFinish {
+  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() saveWorkspace?: boolean;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsIn(['PERSISTENT', 'RUN'])
+  retention?: 'PERSISTENT' | 'RUN';
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ArrayUnique()
+  @IsString({ each: true })
+  @MaxLength(1024, { each: true })
+  excludePaths?: string[];
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => SimplifiedFinishImage)
+  image?: SimplifiedFinishImage;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsIn(['ACTIVATED', 'HEALTHY'])
+  requireRelease?: 'ACTIVATED' | 'HEALTHY';
+}
+
+export function simplifiedRelativePath(path?: string) {
+  return normalizeRelativePath(path?.trim() || '.');
+}
+
+export function simplifiedSourceDirectory(cloneUrl: string, parentDirectory?: string) {
+  const safeUrl = new URL(httpCloneUrl(cloneUrl));
+  let name: string;
+  try {
+    name = decodeURIComponent(safeUrl.pathname.replace(/\/+$/, '').split('/').at(-1) ?? '').replace(
+      /\.git$/i,
+      '',
+    );
+  } catch {
+    throw new BadRequestException('无法从仓库地址生成检出目录');
+  }
+  if (!name.trim() || name === '.' || name.includes('/') || /^\.(git|veyops)$/i.test(name))
+    throw new BadRequestException('无法从仓库地址生成安全的检出目录');
+  const parent = simplifiedRelativePath(parentDirectory);
+  if (parent.split('/').some((part) => /^\.(git|veyops)$/i.test(part)))
+    throw new BadRequestException('检出父目录包含 Git 或平台保留名称');
+  return posix.join(parent, normalizeRelativePath(name));
+}
+
+export function simplifiedGitRefValid(ref: SimplifiedGitRef) {
+  switch (ref.kind) {
+    case 'COMMIT':
+      return shaFormat.test(ref.value);
+    case 'BRANCH':
+    case 'TAG':
+      return isGitBranchName(ref.value);
+    default:
+      return false;
+  }
+}
+
+const obsoleteFields = [
+  'contract',
+  'buildLocation',
+  'sameHostRelease',
+  'declaredPorts',
+  'moduleId',
+  'moduleVersion',
+  'inputDefaults',
+  'environmentDefaults',
+  'inputs',
+  'outputs',
+  'environmentSet',
+  'registerArtifacts',
+  'loadEnvironment',
+] as const;
+const obsoleteActionFields = {
+  checkout: ['repositoryId', 'mode', 'branch', 'tag', 'commitSha'],
+  shell: ['serverId', 'location', 'params', 'outputs', 'artifacts', 'artifactPath'],
+  build: [
+    'repositoryId',
+    'branch',
+    'commitSha',
+    'buildLocation',
+    'artifactType',
+    'outputPath',
+    'artifacts',
+    'registryId',
+    'imageRepository',
+    'dependencies',
+  ],
+  deploy: ['deployPath', 'artifactPath', 'composeSource'],
+  approval: ['releaseNodeId', 'buildNodeId'],
+} as const;
+
+function nodeIssue(node: GraphNode, fieldId: string, message: string, flowId?: string): never {
+  throw new GraphCompileError({
+    flowId: flowId ?? (node.type === 'START' ? node.id : undefined),
+    nodeId: node.id,
+    fieldId,
+    fieldSection: 'execution',
+    severity: 'ERROR',
+    message: `「${node.name}」 · ${message}`,
+  });
+}
+
+export function validateSimplifiedCanvas(canvas: GraphCanvas) {
+  for (const node of [...canvas.nodes, ...canvas.templates]) {
+    for (const field of obsoleteFields) {
+      if (node[field] !== undefined)
+        nodeIssue(node, field, '新流程使用开始配置和结尾核对规则，请移除旧字段');
+    }
+    for (const [section, fields] of Object.entries(obsoleteActionFields)) {
+      const config = node[section as keyof typeof obsoleteActionFields];
+      if (!config) continue;
+      for (const field of fields)
+        if (Reflect.get(config, field) !== undefined)
+          nodeIssue(node, section + '.' + field, '请在开始节点配置运行资源，在结束节点配置交付');
+    }
+    if (node.start !== undefined && node.type !== 'START')
+      nodeIssue(node, 'start', '仅开始节点可配置运行资源');
+    if (node.finish !== undefined && node.type !== 'END')
+      nodeIssue(node, 'finish', '仅结束节点可配置交付结果');
+  }
+  for (const endpoint of canvas.endpoints) {
+    for (const field of [
+      'inputBindings',
+      'outputBindings',
+      'environmentBindings',
+      'serviceId',
+      'edgeSelections',
+    ] as const) {
+      if (endpoint[field] === undefined) continue;
+      const start = canvas.nodes.find(({ id }) => id === endpoint.startId);
+      if (start) nodeIssue(start, field, '执行流通过控制连线决定步骤顺序，请移除旧绑定');
+    }
+  }
+}
+
+function safeRelative(node: GraphNode, id: string, value: string | undefined, flowId: string) {
+  try {
+    return simplifiedRelativePath(value);
+  } catch {
+    return nodeIssue(node, id, '请填写不含父级跳转的相对路径', flowId);
+  }
+}
+
+export function validateSimplifiedSourceDirectories(
+  flow: GraphFlow,
+  repositoryUrls: ReadonlyMap<string, string>,
+) {
+  const start = flow.nodes.find(({ type }) => type === 'START')!;
+  const directories: string[] = [];
+  for (const source of start.start?.sources ?? []) {
+    const url = source.repositoryId && repositoryUrls.get(source.repositoryId);
+    if (!url) continue;
+    let directory: string;
+    try {
+      directory = simplifiedSourceDirectory(url, source.parentDirectory);
+    } catch {
+      nodeIssue(
+        start,
+        'start.sources.' + source.id + '.parentDirectory',
+        '无法生成安全的检出目录',
+        flow.id,
+      );
+    }
+    if (
+      directories.some(
+        (previous) =>
+          previous === directory ||
+          previous.startsWith(directory + '/') ||
+          directory.startsWith(previous + '/'),
+      )
+    )
+      nodeIssue(
+        start,
+        'start.sources.' + source.id + '.parentDirectory',
+        '源码目录重名或相互包含，请修改检出父目录',
+        flow.id,
+      );
+    directories.push(directory);
+  }
+}
+
+const workspaceActions = new Set(['CHECKOUT', 'SHELL', 'CHECK', 'BUILD']);
+const simpleActions = new Set([
+  'START',
+  'END',
+  'CHECKOUT',
+  'SHELL',
+  'CHECK',
+  'BUILD',
+  'DEPLOY_ARTIFACT',
+  'ROLLBACK_ARTIFACT',
+  'APPROVAL',
+  'SOURCE_REVIEW',
+  'HEALTH_CHECK',
+  'LOG',
+  'DELAY',
+  'CONDITION',
+  'SWITCH',
+  'PARALLEL',
+  'JOIN',
+]);
+
+export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
+  const start = ordered[0]!;
+  const finish = ordered.at(-1)!;
+  const config = start.start ?? {};
+  const report = (id: string, message: string) => nodeIssue(start, id, message, flow.id);
+  const sources = config.sources ?? [];
+  const sourceIds = new Set<string>();
+  for (const source of sources) {
+    if (sourceIds.has(source.id)) report('start.sources.' + source.id, '源码标识不能重复');
+    sourceIds.add(source.id);
+    if (!source.repositoryId)
+      report('start.sources.' + source.id + '.repositoryId', '请选择项目仓库');
+    if (source.ref && !simplifiedGitRefValid(source.ref))
+      report('start.sources.' + source.id + '.ref', '请选择有效的分支、标签或完整提交 SHA');
+    safeRelative(
+      start,
+      'start.sources.' + source.id + '.parentDirectory',
+      source.parentDirectory,
+      flow.id,
+    );
+  }
+  const checkouts = ordered.filter(({ type }) => type === 'CHECKOUT');
+  if (checkouts.length && !sources.length) report('start.sources', '请配置代码拉取使用的项目仓库');
+  if (checkouts.length > 1)
+    nodeIssue(
+      checkouts[1]!,
+      'operation',
+      '一次运行只需一个代码拉取动作，它会检出开始节点配置的仓库',
+      flow.id,
+    );
+  if (sources.length && !checkouts.length)
+    report('start.sources', '请添加代码拉取动作以检出配置的仓库');
+
+  const execution = config.execution;
+  if (execution?.serverId && execution.groupId)
+    report('start.execution', '请为工作区选择一台执行服务器或一个分组');
+  if (execution?.location === 'TARGET' && !execution.serverId && !execution.groupId)
+    report('start.execution', '目标端工作区需要一台执行服务器或一个分组');
+  const keys = new Set<string>();
+  for (const { key, value, credentialId, allowOverride } of config.variables ?? []) {
+    if (!safeGraphEnvironmentKey(key) || keys.has(key))
+      report('start.variables.' + key, '变量名不合法、已保留或重复');
+    if ((value === undefined) === (credentialId === undefined))
+      report('start.variables.' + key, '请填写普通值或选择一项凭据');
+    if ((value !== undefined && redactTaskLog(value) !== value) || (credentialId && allowOverride))
+      report('start.variables.' + key, '敏感值须使用凭据引用，凭据变量不能接受运行时文本覆盖');
+    keys.add(key);
+  }
+  if (config.dotenv) {
+    if (!sourceIds.has(config.dotenv.sourceId))
+      report('start.dotenv.sourceId', '请选择变量文件的源码项');
+    if (safeRelative(start, 'start.dotenv.path', config.dotenv.path, flow.id) === '.')
+      report('start.dotenv.path', '请填写变量文件路径');
+  }
+
+  const deploys = ordered.filter(
+    ({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT',
+  );
+  if (deploys.length > 1)
+    nodeIssue(deploys[1]!, 'operation', '一条流程配置一个受管发布动作', flow.id);
+  if (!deploys.length && config.release?.useUpstreamArtifact)
+    report('start.release.useUpstreamArtifact', '接收上游产物需要同一流程中的受管发布');
+  if (deploys.length) {
+    const release = config.release;
+    if (deploys[0]!.type === 'ROLLBACK_ARTIFACT' && !release?.artifactId)
+      report('start.release.artifactId', '按产物回滚需要在开始节点指定曾成功发布的实例');
+    if (!release?.serviceId) report('start.release.serviceId', '请选择发布的项目服务');
+    if (release?.useUpstreamArtifact && release.artifactId)
+      report('start.release.artifactId', '请在固定历史产物与接收上游产物之间选择一种来源');
+    if (!release?.deployPath?.trim()) report('start.release.deployPath', '请填写目标发布目录');
+    try {
+      safeDeployPath(release!.deployPath!.trim());
+    } catch {
+      report('start.release.deployPath', '请填写安全的目标端绝对发布目录');
+    }
+    if (release?.reuseExecutionServer) {
+      if (execution?.location === 'MANAGER')
+        report('start.release.reuseExecutionServer', '使用管理端构建时请单独选择发布目标');
+    } else if (!release?.targets?.serverIds?.length && !release?.targets?.groupIds?.length) {
+      report('start.release.targets', '请选择发布服务器或分组');
+    }
+    if (deploys[0]!.deploy?.method !== 'COMPOSE') {
+      if (!release?.contentPath?.trim())
+        report('start.release.contentPath', '请选择发布内容，发布整个快照时请显式填写 .');
+      safeRelative(start, 'start.release.contentPath', release?.contentPath, flow.id);
+    }
+  }
+  if (finish.finish?.requireRelease && !deploys.length)
+    nodeIssue(finish, 'finish.requireRelease', '核对发布结果需要受管发布动作', flow.id);
+  for (const [index, path] of (finish.finish?.excludePaths ?? []).entries())
+    if (safeRelative(finish, 'finish.excludePaths.' + index, path, flow.id) === '.')
+      nodeIssue(finish, 'finish.excludePaths.' + index, '排除项须位于工作区下', flow.id);
+
+  const dockerBuilds = ordered.filter(
+    (node) => node.type === 'BUILD' && node.build?.dockerfilePath,
+  );
+  if (dockerBuilds.length > 1)
+    nodeIssue(
+      dockerBuilds[1]!,
+      'build.dockerfilePath',
+      '每次运行只能登记一个内置构建镜像',
+      flow.id,
+    );
+  if (dockerBuilds.length && (finish.finish?.image?.registryId || finish.finish?.image?.reference))
+    nodeIssue(finish, 'finish.image', '内置 Docker 构建会自动登记本次构建镜像', flow.id);
+  const ancestors = new Map<string, Set<string>>();
+  for (const node of ordered) {
+    if (!simpleActions.has(node.type))
+      nodeIssue(node, 'operation', '当前简化流程尚未支持此动作', flow.id);
+    if (
+      ['DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT'].includes(node.type) &&
+      node.deploy?.method === 'COMPOSE'
+    ) {
+      const compose = config.release?.compose;
+      const existing = config.release?.artifactId || config.release?.useUpstreamArtifact;
+      if (!existing && !finish.finish?.image?.reference && !dockerBuilds.length)
+        nodeIssue(finish, 'finish.image.reference', '从本次构建发布时请登记一个镜像引用', flow.id);
+      if (!existing && !compose)
+        report('start.release.compose', '从本次构建发布时请选择 Compose 文件');
+      if (compose) {
+        safeRelative(start, 'start.release.compose.path', compose.path, flow.id);
+        if (!/\.ya?ml$/i.test(compose.path))
+          report('start.release.compose.path', '请选择 YAML 文件');
+        if (compose.sourceId && !sources.some(({ id }) => id === compose.sourceId))
+          report('start.release.compose.sourceId', '请选择此流开始节点中的源码');
+        if (existing && !compose.sourceId)
+          report(
+            'start.release.compose.sourceId',
+            '历史发布请选择固定提交中的 Compose 文件，或沿用产物内的文件',
+          );
+      }
+    }
+    const parameter =
+      node.condition?.parameterKey ?? node.branch?.parameterKey ?? node.switch?.parameterKey;
+    if (
+      parameter &&
+      !(config.variables ?? []).some(({ key, credentialId }) => key === parameter && !credentialId)
+    )
+      nodeIssue(node, 'parameterKey', '分支条件须选择开始节点的普通变量', flow.id);
+    if (node.type === 'BUILD') {
+      safeRelative(node, 'build.repoPath', node.build?.repoPath, flow.id);
+      if (node.build?.dockerfilePath) {
+        if (safeRelative(node, 'build.dockerfilePath', node.build.dockerfilePath, flow.id) === '.')
+          nodeIssue(node, 'build.dockerfilePath', '请选择构建目录下的 Dockerfile', flow.id);
+      } else if (!node.build?.buildCommand?.trim() && !node.build?.installCommand?.trim())
+        nodeIssue(node, 'build.buildCommand', '请填写构建命令', flow.id);
+    }
+    if (node.type === 'SHELL' || node.type === 'CHECK') {
+      safeRelative(node, 'shell.directory', node.shell?.directory, flow.id);
+      if (!node.shell?.command?.trim()) nodeIssue(node, 'shell.command', '请填写执行命令', flow.id);
+    }
+    if (node.type === 'HEALTH_CHECK' && !node.healthCheck?.command?.trim())
+      nodeIssue(node, 'healthCheck.command', '请填写健康检查命令', flow.id);
+    const parents = new Set<string>();
+    for (const { from } of flow.edges.filter(({ to }) => to === node.id)) {
+      parents.add(from);
+      for (const ancestor of ancestors.get(from) ?? []) parents.add(ancestor);
+    }
+    ancestors.set(node.id, parents);
+  }
+  const release = deploys[0];
+  for (const node of ordered) {
+    if ((node.type === 'APPROVAL' || node.type === 'HEALTH_CHECK') && !release)
+      nodeIssue(node, 'operation', '此动作需要同一流程中的受管发布', flow.id);
+    if (node.type === 'APPROVAL' && release && !ancestors.get(release.id)?.has(node.id))
+      nodeIssue(node, 'operation', '请将审批连在发布之前', flow.id);
+    if (node.type === 'HEALTH_CHECK' && release && !ancestors.get(node.id)?.has(release.id))
+      nodeIssue(node, 'operation', '请将健康检查连在发布之后', flow.id);
+    if (node.type === 'SOURCE_REVIEW' && !sources.length)
+      nodeIssue(node, 'operation', '源码审核需要开始节点的仓库', flow.id);
+  }
+  if (
+    finish.finish?.requireRelease === 'HEALTHY' &&
+    !ordered.some(({ type }) => type === 'HEALTH_CHECK')
+  )
+    nodeIssue(finish, 'finish.requireRelease', '请在发布后添加健康检查', flow.id);
+  if (!release) return;
+  const probes = ordered.filter(({ type }) => type === 'HEALTH_CHECK');
+  const approvals = ordered.filter(({ type }) => type === 'APPROVAL');
+  for (const path of graphBranchPaths(flow, ordered)) {
+    if (!path.active.has(release.id)) {
+      if (finish.finish?.requireRelease)
+        nodeIssue(
+          finish,
+          'finish.requireRelease',
+          '要求核对发布结果时，每条分支均须执行受管发布',
+          flow.id,
+        );
+      continue;
+    }
+    if (release.type === 'ROLLBACK_ARTIFACT' && !approvals.some(({ id }) => path.active.has(id)))
+      nodeIssue(release, 'operation', '每条回滚分支都须先完成人工审批', flow.id);
+    if (
+      finish.finish?.requireRelease === 'HEALTHY' &&
+      !probes.some(({ id }) => path.active.has(id))
+    )
+      nodeIssue(
+        finish,
+        'finish.requireRelease',
+        '要求健康时，每条发布分支均须执行健康检查',
+        flow.id,
+      );
+    if (config.release?.artifactId || config.release?.useUpstreamArtifact) continue;
+    const happensBefore = new Map<string, Set<string>>();
+    for (const node of ordered) {
+      const direct = path.edges.filter(({ to }) => to === node.id).map(({ from }) => from);
+      happensBefore.set(
+        node.id,
+        new Set(direct.flatMap((from) => [from, ...(happensBefore.get(from) ?? [])])),
+      );
+    }
+    const stage = approvals.find(({ id }) => path.active.has(id)) ?? release;
+    const before = happensBefore.get(stage.id)!;
+    const writers = ordered.filter(
+      ({ id, type }) => workspaceActions.has(type) && path.active.has(id),
+    );
+    if (!writers.some(({ id }) => before.has(id)))
+      report('start.release.artifactId', '请选择历史产物，或在固化交付内容前添加工作区动作');
+    for (const node of writers) {
+      if (!before.has(node.id) && !happensBefore.get(node.id)?.has(stage.id))
+        nodeIssue(node, 'operation', '请用连线明确此动作与固化交付内容的先后关系', flow.id);
+    }
+  }
+}

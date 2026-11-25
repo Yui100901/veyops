@@ -52,6 +52,7 @@ export class GraphTriggerDto {
   @IsOptional() @IsIn(upstreamResults) upstreamStatus?: UpstreamResult;
   @IsOptional() @IsObject() parameterMappings?: Record<string, GraphParameterMapping>;
   @IsOptional() @IsUUID() repositoryId?: string;
+  @IsOptional() @Matches(/^[A-Za-z0-9_-]{1,64}$/) sourceId?: string;
   @IsOptional() @IsIn(sourceCronModes) cronMode?: SourceCronMode;
   @IsOptional() @IsBoolean() buildOnFirstObservation?: boolean;
   @IsOptional() @IsIn(graphWebhookProtocols) webhookProtocol?: GraphWebhookProtocol;

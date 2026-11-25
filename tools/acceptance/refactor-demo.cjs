@@ -192,7 +192,7 @@ function serveDemoGit(gitRoot) {
       return res.writeHead(404).end();
     const url = new URL(req.url, 'http://localhost');
     const allowed =
-      /^\/(?:storefront|dependency|work-snapshot)\.git\/(info\/refs|git-upload-pack)$/.exec(
+      /^\/(?:storefront|dependency|work-snapshot|flow-v2-source)\.git\/(info\/refs|git-upload-pack)$/.exec(
         url.pathname,
       );
     const discovery =

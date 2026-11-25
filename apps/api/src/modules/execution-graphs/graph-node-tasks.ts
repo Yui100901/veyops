@@ -81,6 +81,7 @@ import {
   type GraphAutomation,
 } from './graph-automatic-delivery';
 import { GraphScriptOutput } from './graph-script-output';
+import { SimplifiedFlowRunService } from './simplified-flow-run.service';
 import { graphReleaseResult, type GraphReleaseResult } from './graph-release-gates';
 import { readReleaseOutput } from './graph-release-result';
 import {
@@ -351,6 +352,7 @@ export class GraphNodeTasks implements OnModuleInit {
     private readonly physical: ArtifactPhysicalService,
     private readonly systemSettings: SystemSettingsService,
     @Optional() private readonly pipelineExecutor?: PipelineExecutor,
+    @Optional() private readonly simplified?: SimplifiedFlowRunService,
   ) {}
 
   onModuleInit() {
@@ -358,6 +360,10 @@ export class GraphNodeTasks implements OnModuleInit {
       type: 'GRAPH_MODULE',
       execute: async (task, context) => {
         try {
+          if (task.payload.simplifiedAction) {
+            if (!this.simplified) throw new ConflictException('运行工作区服务不可用');
+            return { graphOutputs: await this.simplified.execute(task, context) };
+          }
           return { graphOutputs: await this.execute(task, context) };
         } catch (error) {
           context.log(error instanceof Error ? error.message + '\n' : '功能节点失败\n');
@@ -1642,10 +1648,14 @@ export class GraphNodeTasks implements OnModuleInit {
     taskId: string,
     node: GraphNode,
     db: Kysely<Database> = this.database.db,
+    simplified = false,
   ): Promise<Record<string, unknown>> {
     const declarations = graphArtifactDeclarations(node);
     let artifactValues = {};
-    if (node.type === 'BUILD' || node.type === 'REGISTER_ARTIFACT' || declarations?.length) {
+    if (
+      !simplified &&
+      (node.type === 'BUILD' || node.type === 'REGISTER_ARTIFACT' || declarations?.length)
+    ) {
       const rows = await db
         .selectFrom('artifacts')
         .innerJoin('pipeline_runs', 'pipeline_runs.id', 'artifacts.pipeline_run_id')

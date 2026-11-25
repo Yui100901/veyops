@@ -93,10 +93,12 @@ interface TriggerEventInput {
   checkedAt?: number;
   previousCommitSha?: string;
   checkoutNodeId?: string;
+  sourceId?: string;
   eventSource?: 'POLL' | 'GITEA' | 'BEARER' | 'SIGNED';
   upstreamRunId?: string;
   upstreamStatus?: string;
   upstreamVersion?: number;
+  upstreamArtifactId?: string;
 }
 
 function eventFields(row: Event): TriggerEventInput {
@@ -165,6 +167,7 @@ function visibleRule(row: Rule) {
     upstreamStatus,
     parameterMappings,
     repositoryId,
+    sourceId,
     refPrefix,
     cronMode,
     buildOnFirstObservation,
@@ -188,6 +191,7 @@ function visibleRule(row: Rule) {
     upstreamStatus,
     parameterMappings,
     repositoryId,
+    sourceId,
     refPrefix,
     cronMode,
     buildOnFirstObservation,
@@ -301,6 +305,7 @@ export class GraphTriggersService implements OnModuleInit {
             cronMode,
             buildOnFirstObservation: input.buildOnFirstObservation ?? false,
             repositoryId: input.repositoryId,
+            sourceId: input.sourceId,
             ref: input.ref,
           }
         : { cronMode };
@@ -312,6 +317,7 @@ export class GraphTriggersService implements OnModuleInit {
     return {
       webhookProtocol,
       repositoryId: input.repositoryId,
+      sourceId: input.sourceId,
       ref: input.ref,
       refPrefix: webhookProtocol === 'SIGNED' ? input.refPrefix : undefined,
     };
@@ -390,7 +396,7 @@ export class GraphTriggersService implements OnModuleInit {
 
   private async sourceObservation(row: Rule, definition?: GraphDefinition) {
     const settings = config(row);
-    if (settings.cronMode !== 'POLL' && !sourceWebhook(settings.webhookProtocol)) return undefined;
+    if (!this.sourceRule(row.kind as GraphTriggerKind, settings)) return undefined;
     const scope = await this.sourceDefinition(row, settings, definition)
       .then((published) =>
         this.resolveSourceScope(row.project_id, { flowId: row.flow_id, settings }, published),
@@ -408,6 +414,7 @@ export class GraphTriggersService implements OnModuleInit {
       error: row.source_error || undefined,
       resolvedRepositoryId: scope?.repositoryId,
       resolvedRef: scope?.ref,
+      resolvedSourceId: scope?.sourceId,
     };
   }
 
@@ -659,7 +666,7 @@ export class GraphTriggersService implements OnModuleInit {
     return (
       settings.cronMode === 'POLL' ||
       (kind === 'WEBHOOK' &&
-        (settings.webhookProtocol === 'GITEA' || settings.webhookProtocol === 'BEARER'))
+        (Boolean(settings.sourceId) || sourceWebhook(settings.webhookProtocol)))
     );
   }
 
@@ -695,9 +702,32 @@ export class GraphTriggersService implements OnModuleInit {
       !definition.flows.some(({ id }) => id === settings.upstreamFlowId)
     )
       throw this.triggerPlanIssue(input.flowId, '发布版本中缺少上游执行流', 'upstreamFlowId');
-    const checkout = this.sourceRule(input.kind, settings)
+    const flow = definition.flows.find(({ id }) => id === input.flowId);
+    const start = flow?.model === 'FLOW_V2' ? flowStart(flow).start : undefined;
+    const useUpstreamArtifact = start?.release?.useUpstreamArtifact;
+    if (
+      useUpstreamArtifact &&
+      (!start.release?.serviceId || !flow?.nodes.some(({ type }) => type === 'DEPLOY_ARTIFACT'))
+    )
+      throw this.triggerPlanIssue(
+        input.flowId,
+        '使用上游产物需要选择受管发布服务',
+        'start.release.serviceId',
+      );
+    if (useUpstreamArtifact && (input.kind !== 'UPSTREAM' || settings.upstreamStatus !== 'SUCCESS'))
+      throw this.triggerPlanIssue(
+        input.flowId,
+        '使用上游产物的流程需要关联上游成功事件',
+        'start.release.useUpstreamArtifact',
+      );
+    const sourceRule =
+      this.sourceRule(input.kind, settings) ||
+      (input.kind === 'WEBHOOK' && Boolean(start?.sources?.length));
+    const checkout = sourceRule
       ? await this.resolveSourceScope(projectId, { flowId: input.flowId, settings }, definition)
       : undefined;
+    if (checkout && settings.refPrefix && !checkout.ref.startsWith(settings.refPrefix))
+      throw this.triggerPlanIssue(input.flowId, '分支前缀与开始节点的源码项不匹配', 'sourceId');
     const mappings = settings.parameterMappings ?? {};
     const incoming: TriggerEventInput = {
       ...(input.kind === 'CRON' && { scheduledAt: Date.now() }),
@@ -705,7 +735,11 @@ export class GraphTriggersService implements OnModuleInit {
         upstreamRunId: 'preview',
         upstreamStatus: settings.upstreamStatus,
       }),
-      ...(checkout && { repositoryId: checkout.repositoryId, ref: checkout.ref }),
+      ...(checkout && {
+        repositoryId: checkout.repositoryId,
+        ref: checkout.ref,
+        sourceId: checkout.sourceId,
+      }),
     };
     if (
       checkout &&
@@ -780,6 +814,7 @@ export class GraphTriggersService implements OnModuleInit {
         automation,
         definitionOverride: { graphId, definition },
         pendingArtifactParameters: artifacts,
+        ...(useUpstreamArtifact && { trigger: { upstreamArtifactPending: true } }),
       },
     );
     return checkout;
@@ -863,7 +898,16 @@ export class GraphTriggersService implements OnModuleInit {
       if (input.version !== undefined && input.version !== version)
         throw new ConflictException('已发布版本已变化，请刷新后启用触发器');
       const definition = await this.published(projectId, version);
-      await this.checkPlan(projectId, graph.id, input, version, definition, settings, triggerId);
+      const checkout = await this.checkPlan(
+        projectId,
+        graph.id,
+        input,
+        version,
+        definition,
+        settings,
+        triggerId,
+      );
+      settings.sourceId ??= checkout?.sourceId;
     }
     settings.unpublished = !version;
     return this.database.db.transaction().execute(async (tx) => {
@@ -994,6 +1038,8 @@ export class GraphTriggersService implements OnModuleInit {
     const references = graphTriggerReferences(definition, source, settings);
     if (await unavailableReference(db, projectId, references))
       throw this.triggerPlanIssue(source.flowId, '触发器引用的资源不可用，请检查参数映射');
+    if (settings.sourceId)
+      await this.resolveSourceScope(projectId, { flowId: source.flowId, settings }, definition, db);
   }
 
   private async ensureNoUpstreamLoop(
@@ -1448,7 +1494,7 @@ export class GraphTriggersService implements OnModuleInit {
           tx,
         );
       });
-    if (protocol === 'SIGNED') {
+    if (protocol === 'SIGNED' && !settings.sourceId) {
       if (
         (settings.repositoryId && settings.repositoryId !== delivery.repositoryId) ||
         (settings.refPrefix && !delivery.ref?.startsWith(settings.refPrefix)) ||
@@ -1467,8 +1513,11 @@ export class GraphTriggersService implements OnModuleInit {
         { flowId: rule.flow_id, settings },
         await this.sourceDefinition(rule, settings),
       );
+      if (protocol === 'SIGNED' && delivery.repositoryId !== scope.repositoryId)
+        return store('IGNORED', '推送仓库与规则中登记的仓库不匹配');
       fields.repositoryId = scope.repositoryId;
       fields.checkoutNodeId = scope.nodeId;
+      fields.sourceId = scope.sourceId;
       const repository = await this.sourceRepository(rule.project_id, scope.repositoryId);
       if (
         protocol === 'GITEA' &&
@@ -1483,7 +1532,11 @@ export class GraphTriggersService implements OnModuleInit {
       if (!(error instanceof HttpException)) throw error;
       return store('REJECTED', redactTaskLog(error.message).slice(0, 500));
     }
-    if (scope.ref !== fields.ref) return store('IGNORED', '推送分支与规则不匹配');
+    if (
+      scope.ref !== fields.ref ||
+      (settings.refPrefix && !fields.ref.startsWith(settings.refPrefix))
+    )
+      return store('IGNORED', '推送分支与规则不匹配');
     if (test) return store('TESTED');
 
     const key = this.sourceKey(rule, scope);
@@ -1578,6 +1631,7 @@ export class GraphTriggersService implements OnModuleInit {
       repositoryId: scope.repositoryId,
       ref: scope.ref,
       checkoutNodeId: scope.nodeId,
+      sourceId: scope.sourceId,
     });
     const key = this.sourceKey(rule, scope);
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -1732,13 +1786,51 @@ export class GraphTriggersService implements OnModuleInit {
         .transaction()
         .execute(async (tx) => {
           await this.lockRule(tx, rule);
-          for (const run of runs)
-            await this.recordEvent(tx, rule, run.id, {
+          const definition = await this.published(rule.project_id, rule.version, tx, false);
+          const flow = definition.flows.find(({ id }) => id === rule.flow_id);
+          const release = flow?.model === 'FLOW_V2' ? flowStart(flow).start?.release : undefined;
+          const deploy = flow?.nodes.find(({ type }) => type === 'DEPLOY_ARTIFACT');
+          const artifactType = deploy?.deploy?.method === 'COMPOSE' ? 'DOCKER_IMAGE' : 'FILE';
+          for (const run of runs) {
+            const fields = {
               value: settings.inputValue,
               upstreamRunId: run.id,
               upstreamStatus: run.status,
               upstreamVersion: run.version,
-            });
+            };
+            if (!release?.useUpstreamArtifact) {
+              await this.recordEvent(tx, rule, run.id, fields);
+              continue;
+            }
+            const artifacts =
+              run.status === 'SUCCESS' && release.serviceId && deploy
+                ? await tx
+                    .selectFrom('artifacts')
+                    .select('id')
+                    .where('graph_run_id', '=', run.id)
+                    .where('project_id', '=', rule.project_id)
+                    .where('service_id', '=', release.serviceId)
+                    .where('artifact_type', '=', artifactType)
+                    .where('temporary_root_id', 'is', null)
+                    .where('lifecycle_state', '=', 'ACTIVE')
+                    .where('pruned_at', 'is', null)
+                    .where('verification_status', '=', 'AVAILABLE')
+                    .limit(2)
+                    .execute()
+                : [];
+            if (artifacts.length === 1)
+              await this.recordEvent(tx, rule, run.id, {
+                ...fields,
+                upstreamArtifactId: artifacts[0]!.id,
+              });
+            else
+              await this.recordEvent(tx, rule, run.id, fields, {
+                status: 'REJECTED',
+                error: artifacts.length
+                  ? '上游有多个可用产物，无法确定主产物'
+                  : '上游缺少该服务可重发的已登记产物',
+              });
+          }
         })
         .catch((error: unknown) => {
           if (!(error instanceof ConflictException)) throw error;

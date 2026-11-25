@@ -233,6 +233,10 @@ function authoredScope(
 }
 
 function flowReferences(source: ReferenceSource, flow: GraphFlow, flows: Map<string, GraphFlow>) {
+  if (flow.model === 'FLOW_V2')
+    return flow.nodes.flatMap((node) =>
+      simplifiedNodeReferences({ ...source, flowId: flow.id, flowName: flow.name }, node),
+    );
   const grouped = flow.compiled?.presetResourceGroups;
   const serviceId = grouped ? undefined : flow.serviceId;
   const context = { ...source, flowId: flow.id, flowName: flow.name, serviceId };
@@ -284,6 +288,46 @@ function flowReferences(source: ReferenceSource, flow: GraphFlow, flows: Map<str
   ];
 }
 
+function simplifiedNodeReferences(source: ReferenceSource, node: GraphNode) {
+  const config = node.start;
+  const context = {
+    ...source,
+    nodeId: node.id,
+    nodeName: node.name,
+    serviceId: config?.release?.serviceId,
+  };
+  const field = (fieldId: string) => ({ ...context, fieldId });
+  return [
+    ...(config?.sources ?? []).flatMap(({ id, repositoryId }) =>
+      referenceRows(field('start.sources.' + id + '.repositoryId'), 'REPOSITORY', repositoryId),
+    ),
+    ...(config?.execution?.location === 'MANAGER'
+      ? []
+      : [
+          ...referenceRows(
+            field('start.execution.serverId'),
+            'SERVER',
+            config?.execution?.serverId,
+          ),
+          ...referenceRows(
+            field('start.execution.groupId'),
+            'SERVER_GROUP',
+            config?.execution?.groupId,
+          ),
+        ]),
+    ...referenceRows(field('start.environmentSetId'), 'ENVIRONMENT_SET', config?.environmentSetId),
+    ...(config?.variables ?? []).flatMap(({ key, credentialId }) =>
+      referenceRows(field('start.variables.' + key + '.credentialId'), 'CREDENTIAL', credentialId),
+    ),
+    ...referenceRows(field('start.release.serviceId'), 'SERVICE', config?.release?.serviceId),
+    ...(config?.release?.reuseExecutionServer
+      ? []
+      : selectionReferences(field('start.release.targets'), config?.release?.targets)),
+    ...referenceRows(field('start.release.artifactId'), 'ARTIFACT', config?.release?.artifactId),
+    ...referenceRows(field('finish.image.registryId'), 'REGISTRY', node.finish?.image?.registryId),
+  ];
+}
+
 /** Read only typed resource-bearing values, never opaque user scripts or variable data. */
 export function graphResourceReferences(
   definition: GraphDefinition,
@@ -300,6 +344,10 @@ export function graphResourceReferences(
     ...definition.canvas.nodes.filter(({ id }) => !compiledNodeIds.has(id)),
     ...(definition.canvas.templates ?? []),
   ];
+  if (definition.canvas.model === 'FLOW_V2') {
+    rows.push(...rawNodes.flatMap((node) => simplifiedNodeReferences(context, node)));
+    return rows;
+  }
   rows.push(
     ...rawNodes.flatMap((node) =>
       nodeReferences(
@@ -470,6 +518,9 @@ export function runResourceReferences(
   const root = { ...source, sourceKind: 'RUN', runId: source.sourceId } as const;
   const read = (source: ReferenceSource, value: unknown): ProjectResourceReference[] => {
     const prepared = objectValue(value);
+    const simplified = objectValue(prepared.simplified);
+    const release = objectValue(simplified.release);
+    const executionServer = objectValue(objectValue(simplified.placement).target);
     const inputs = objectValue(prepared.inputs);
     const parameters = objectValue(inputs.parameters);
     const lookup = definition?.flows?.find((flow) => flow.id === source.flowId);
@@ -492,6 +543,19 @@ export function runResourceReferences(
       ...referenceRows(context, 'CREDENTIAL', Object.keys(objectValue(prepared.credentials))),
       ...credentialReferences(context, prepared.frozenEnvironment),
       ...referenceRows(context, 'ARTIFACT', inputs.artifactIds),
+      ...referenceRows(context, 'ARTIFACT', release.artifactId),
+      ...referenceRows(context, 'SERVICE', simplified.serviceId),
+      ...selectionReferences(context, simplified.buildSelection),
+      ...selectionReferences(context, release.targets),
+      ...referenceRows(context, 'SERVER', [executionServer.id, ...samples(release.serverIds)]),
+      ...referenceRows(context, 'CREDENTIAL', executionServer.credentialId),
+      ...samples(simplified.sources).flatMap((entry) => {
+        const checkout = objectValue(objectValue(entry).source);
+        return [
+          ...referenceRows(context, 'REPOSITORY', checkout.repositoryId),
+          ...referenceRows(context, 'CREDENTIAL', objectValue(checkout.access).credential_id),
+        ];
+      }),
       ...(context.state === 'HISTORY'
         ? referenceRows(context, 'REPOSITORY', objectValue(prepared.trigger).repositoryId)
         : []),

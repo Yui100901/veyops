@@ -158,6 +158,7 @@ function outgoingBranches(flow: GraphFlow, node: GraphNode, edges: readonly Grap
   )
     return edges.map((edge) => [edge]);
   if (node.type !== 'CONDITION' && node.type !== 'SWITCH') return [edges];
+  if (flow.model === 'FLOW_V2') return edges.map((edge) => [edge]);
   const binding = bindingAt(flow, node, 'value');
   if (binding?.kind === 'VALUE') {
     const branch = graphConditionMatch(node, binding.value);

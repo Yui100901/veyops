@@ -53,7 +53,7 @@ import {
 } from '../projects/environment-sets.service';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { TasksService } from '../tasks/tasks.service';
-import type { TaskPayload } from '../tasks/tasks.types';
+import { terminalTaskStatuses, type TaskPayload } from '../tasks/tasks.types';
 import { redactTaskLog } from '../tasks/task-log.service';
 import {
   defaultApprovalSeconds,
@@ -143,6 +143,7 @@ import {
   graphArtifactPortId,
 } from './graph-artifact-values';
 import { normalizeRelativePath } from '../pipelines/pipeline.validation';
+import { SimplifiedFlowRunService, type SimplifiedRunPlan } from './simplified-flow-run.service';
 import {
   activeFlowStatuses,
   branchMatch,
@@ -227,6 +228,7 @@ interface Delivery {
 }
 interface RunSnapshot {
   inputs: GraphInputsDto;
+  simplified?: SimplifiedRunPlan;
   environmentSet?: EnvironmentSetSummary | null;
   frozenEnvironment?: FrozenEnvironmentSet;
   parameterSources?: Record<string, GraphFieldSource>;
@@ -260,7 +262,10 @@ interface NodeEvidence {
   outputFields?: GraphFieldEvidence[];
   issue?: ExecutionPlanIssue;
   variableSources?: GraphVariableSource[];
+  snapshotTaskId?: string;
 }
+
+type SimplifiedStage = 'ACTION' | 'SNAPSHOT' | 'RELEASE' | 'HEALTH';
 
 interface CheckoutProvenance {
   versionSource: string;
@@ -457,6 +462,8 @@ function taskStatus(status: string, availableAt: number) {
   return status;
 }
 
+class FlowWorkspaceBusy extends Error {}
+
 @Injectable()
 export class GraphRunnerService implements OnModuleInit {
   private readonly logger = new Logger(GraphRunnerService.name);
@@ -470,6 +477,7 @@ export class GraphRunnerService implements OnModuleInit {
     @Optional() private readonly tasks?: TasksService,
     @Optional() private readonly nodeTasks?: GraphNodeTasks,
     @Optional() private readonly repositories?: RepositoryMetadataService,
+    @Optional() private readonly simplifiedRuns?: SimplifiedFlowRunService,
   ) {}
 
   onModuleInit() {
@@ -1454,6 +1462,195 @@ export class GraphRunnerService implements OnModuleInit {
     });
   }
 
+  private async prepareSimplified(
+    projectId: string,
+    graphId: string,
+    definition: GraphDefinition,
+    flow: GraphFlow,
+    request: GraphPreviewDto,
+    trigger?: Values,
+    automation?: GraphAutomation,
+    authorizePlan?: GraphPlanAuthorizer,
+  ) {
+    if (!this.simplifiedRuns) throw new ConflictException('运行工作区服务不可用');
+    if (automation) assertAutomaticGraphFlow(definition, flow.id, automation.kind);
+    const { plan, selectedSet, environmentSet } = await this.simplifiedRuns.plan(
+      projectId,
+      flow,
+      request.version,
+      request.inputs ?? {},
+      trigger,
+      automation,
+    );
+    const target = plan.placement.location === 'TARGET' ? plan.placement.target : undefined;
+    const release = plan.release;
+    const inputs: GraphInputsDto = { value: plan.value, parameters: plan.environment.variables };
+    const selection = flowSelection(flow, inputs);
+    if (release && selection.selected.has(release.nodeId)) {
+      const required = [
+        [
+          release.requireApproval || Boolean(release.rollbackBaseline),
+          'APPROVAL',
+          '发布前需要人工审批',
+        ],
+        [release.requireCodeReview, 'SOURCE_REVIEW', '发布前需要审核实际源码'],
+      ] as const;
+      for (const [enabled, type, message] of required) {
+        if (
+          enabled &&
+          !selection.ordered.some((node) => node.type === type && selection.selected.has(node.id))
+        )
+          throw new ExecutionPlanIssueError({
+            code: 'CONFIGURATION',
+            flowId: flow.id,
+            nodeId: release.nodeId,
+            message,
+          });
+      }
+    }
+    const routing = graphPreviewRouting(flow, selection).edges;
+    const checkout = flow.nodes.find(({ type }) => type === 'CHECKOUT');
+    const sources = plan.sources.map(({ id, source, directory }) => ({
+      id,
+      repositoryId: source.repositoryId,
+      repositoryName: source.repositoryName,
+      commitSha: source.commitSha,
+      ref: source.ref,
+      branch: source.branch,
+      tag: source.tag,
+      path: directory,
+    }));
+    if (authorizePlan)
+      await authorizePlan({
+        serverIds: [...new Set([...(target ? [target.id] : []), ...(release?.serverIds ?? [])])],
+        repositoryIds: [...new Set(sources.map(({ repositoryId }) => repositoryId))],
+        serviceIds: release ? [release.serviceId] : [],
+        unbounded:
+          flow.nodes.some(({ type }) => ['CHECK', 'SHELL', 'BUILD'].includes(type)) ||
+          Boolean(release?.artifactId),
+      });
+    const publicRelease: Delivery | undefined = release && {
+      nodeId: release.nodeId,
+      flowId: flow.id,
+      pipelineId: release.profile.id,
+      pipelineVersion: 1,
+      serviceId: release.serviceId,
+      environmentId: graphDeliveryEnvironment(projectId).id,
+      commitSha: sources[0]?.commitSha ?? unversionedArtifactCommit,
+      serverIds: release.serverIds,
+      requireApproval: release.requireApproval,
+      requireCodeReview: release.requireCodeReview,
+      artifactIds: release.artifactId ? [release.artifactId] : [],
+      rollbackBaseline: release.rollbackBaseline,
+      sourceSnapshot: sources,
+      pipelineHash: release.planHash,
+      profile: release.profile,
+    };
+    const deliveries = publicRelease ? [publicDelivery(publicRelease, definition)] : [];
+    const plans: Record<string, Delivery | GraphNodePlan> = Object.fromEntries(
+      flow.nodes
+        .filter(({ type }) => type === 'HEALTH_CHECK')
+        .map(({ id }) => [id, { type: 'HEALTH_CHECK' as const }]),
+    );
+    const configurationHash = digest([graphId, request.version, flow.id, plan]);
+    const preview = {
+      ...deliveries[0],
+      projectId,
+      graphId,
+      flowId: flow.id,
+      flowName: flow.name,
+      version: request.version,
+      configurationHash,
+      environmentSet,
+      parameters: {},
+      parameterSources: {},
+      routing,
+      nodes: selection.ordered.map(({ id, name, type }) => ({
+        nodeId: id,
+        name,
+        type,
+        selected: selection.selected.has(id),
+        conditional: false,
+      })),
+      deliveries,
+      checkouts: checkout
+        ? sources.map((source) => ({
+            ...source,
+            nodeId: checkout.id,
+            flowId: flow.id,
+            versionSource: 'START',
+            fullClone: checkout.checkout?.fullClone,
+            directory: source.path,
+          }))
+        : [],
+      scripts: selection.ordered
+        .filter(({ type }) => ['BUILD', 'CHECK', 'SHELL'].includes(type))
+        .map((node) => ({
+          nodeId: node.id,
+          flowId: flow.id,
+          serverId: target?.id,
+          serverName: target?.name,
+          directory: normalizeRelativePath(
+            (node.type === 'BUILD' ? node.build?.repoPath : node.shell?.directory) || '.',
+          ),
+        })),
+      gates: flow.nodes.flatMap(({ id, name, type }) =>
+        type === 'APPROVAL' ||
+        type === 'SOURCE_REVIEW' ||
+        type === 'HEALTH_CHECK' ||
+        type === 'ROLLBACK_ARTIFACT'
+          ? [{ nodeId: id, flowId: flow.id, name, kind: type, releaseNodeId: release?.nodeId }]
+          : [],
+      ),
+      executionPlan: {
+        targets: [],
+        settings: [],
+        environmentFiles: [],
+        variables: [],
+        deferred: [],
+      },
+      planSections: { 开始配置与交付: configurationHash } as Record<string, string>,
+      simplified: {
+        location: plan.placement.location,
+        serverId: target?.id,
+        serverName: target?.name,
+        sources,
+        finish: plan.finish,
+        release: release && {
+          serviceId: release.serviceId,
+          serverIds: release.serverIds,
+          artifactId: release.artifactId,
+          deployPath: release.deployPath,
+          contentPath: release.path,
+          method: release.method,
+        },
+      },
+    };
+    const credentials = Object.fromEntries(
+      Object.entries(plan.environment.secretVariables).flatMap(([key, credentialId]) => {
+        const nonce = plan.environment.secretCredentialNonces?.[key];
+        return nonce ? [[credentialId, nonce]] : [];
+      }),
+    );
+    const children: Record<string, PreparedChild> = {};
+    const parameterSources: Record<string, GraphFieldSource> = {};
+    const checkoutProvenance: Record<string, CheckoutProvenance> = {};
+    return {
+      preview,
+      flow,
+      inputs,
+      plans,
+      children,
+      environmentSet,
+      frozenEnvironment: selectedSet,
+      parameterSources,
+      checkoutProvenance,
+      credentials,
+      environmentSets: selectedSet ? [selectedSet] : [],
+      simplified: plan,
+    };
+  }
+
   private async prepare(
     projectId: string,
     flowId: string,
@@ -1473,6 +1670,17 @@ export class GraphRunnerService implements OnModuleInit {
       definitionOverride ??
       (await this.published(projectId, request.version, this.database.db, !allowRetired));
     const flow = this.flow(definition, flowId);
+    if (flow.model === 'FLOW_V2')
+      return this.prepareSimplified(
+        projectId,
+        graphId,
+        definition,
+        flow,
+        request,
+        trigger,
+        automation,
+        authorizePlan,
+      );
     if (!rootId && !automation) {
       assertRuntimeParameterOverrides(flow, request.inputs?.parameters);
       if (
@@ -2364,6 +2572,7 @@ export class GraphRunnerService implements OnModuleInit {
       checkoutProvenance: prepared.checkoutProvenance,
       credentials,
       environmentSets: await Promise.all(sets.values()),
+      simplified: undefined,
     };
   }
 
@@ -2445,7 +2654,10 @@ export class GraphRunnerService implements OnModuleInit {
   }
 
   private runValues(
-    values: Omit<Run, 'created_at' | 'finished_at' | 'status' | 'task_id' | 'trigger_type'> &
+    values: Omit<
+      Run,
+      'created_at' | 'finished_at' | 'status' | 'task_id' | 'trigger_type' | 'workspace_path'
+    > &
       Pick<Partial<Run>, 'trigger_type'>,
   ) {
     return { ...values, status: 'QUEUED', created_at: Date.now() };
@@ -2560,6 +2772,7 @@ export class GraphRunnerService implements OnModuleInit {
       checkoutProvenance,
       parameterSources,
       credentials,
+      simplified,
     } = await this.prepare(projectId, flowId, request, {
       trigger: origin?.metadata,
       automation: origin?.authorization,
@@ -2593,6 +2806,11 @@ export class GraphRunnerService implements OnModuleInit {
       await lockProjectGraph(tx);
       await this.lockProject(tx, projectId);
       const confirmed = await this.published(projectId, request.version, tx, true);
+      if (simplified) {
+        await this.simplifiedRuns!.confirm(tx, simplified);
+        const existing = simplified.release?.artifactId;
+        if (existing) await lockAvailableArtifacts(tx, [existing]);
+      }
       for (const previous of environmentSets) {
         const latest = await resolveEnvironmentSet(tx, projectId, previous.id).catch(
           (error: unknown) => {
@@ -2615,12 +2833,14 @@ export class GraphRunnerService implements OnModuleInit {
         if (!active) throw new ConflictException('节点引用的凭据已变化，请重新预览');
       }
       if (
+        simplified ||
         confirmed.definition.flows.some(({ nodes }) =>
           nodes.some((node) => isDelivery(node) || graphArtifactDeclarations(node)?.length),
         )
       )
         await ensureGraphDeliveryEnvironment(tx, projectId);
       if (
+        simplified ||
         confirmed.definition.flows.some(({ nodes }) =>
           nodes.some((node) => node.type === 'BUILD' || graphArtifactDeclarations(node)?.length),
         )
@@ -2656,7 +2876,15 @@ export class GraphRunnerService implements OnModuleInit {
           flowId,
           state: 'PENDING',
         },
-        { inputs, environmentSet, frozenEnvironment, credentials, deliveries: plans, children },
+        {
+          inputs,
+          environmentSet,
+          frozenEnvironment,
+          credentials,
+          deliveries: plans,
+          children,
+          simplified,
+        },
       );
       if (
         await unavailableReference(
@@ -2694,6 +2922,7 @@ export class GraphRunnerService implements OnModuleInit {
             checkoutProvenance,
             parameterSources,
             credentials,
+            simplified,
             deliveries: plans,
             children,
             trigger: origin?.metadata,
@@ -2997,6 +3226,7 @@ export class GraphRunnerService implements OnModuleInit {
       const { definition } = await this.published(run.project_id, run.version, tx);
       const flow = this.flow(definition, run.flow_id);
       const snapshot = JSON.parse(run.inputs_json) as RunSnapshot;
+      const plan = snapshot.simplified;
       const rows = await tx
         .selectFrom('execution_node_runs')
         .selectAll()
@@ -3050,11 +3280,29 @@ export class GraphRunnerService implements OnModuleInit {
         : [];
       const byTask = new Map(jobStates.map((job) => [job.id, job]));
       const byChild = new Map(childStates.map((child) => [child.id, child]));
+      const snapshotReady = new Set<string>();
+      let workspacePath = run.workspace_path ?? undefined;
+      if (plan) {
+        for (const row of rows) {
+          const fact = JSON.parse(row.output_json ?? '{}') as Values;
+          if (
+            fact.snapshotReady === true ||
+            (JSON.parse(row.evidence_json ?? '{}') as NodeEvidence).snapshotTaskId
+          )
+            snapshotReady.add(row.node_id);
+          if (typeof fact.workspacePath === 'string') workspacePath ??= fact.workspacePath;
+        }
+      }
+      const busy = jobStates.some(
+        (task) => !isNodeTerminal(taskStatus(task.status, task.available_at)),
+      );
       const ready: {
         node: NodeRun;
         action: GraphNode;
         values: Values;
         environment: ReturnType<typeof inspectNodeEnvironment>;
+        stage?: SimplifiedStage;
+        workspacePath?: string;
       }[] = [];
       const cancel: string[] = [];
       const now = Date.now();
@@ -3065,13 +3313,36 @@ export class GraphRunnerService implements OnModuleInit {
           const task = byTask.get(row.task_id)!;
           let status = taskStatus(task.status, task.available_at);
           if (isNodeTerminal(status)) {
-            const output =
-              (status === 'SUCCESS' ||
-                isRelease(node) ||
-                (node.type === 'HEALTH_CHECK' && status === 'NEEDS_ATTENTION')) &&
-              this.nodeTasks
-                ? await this.nodeTasks.output(task.id, node, tx)
+            const payload = plan ? (JSON.parse(task.payload_json) as TaskPayload) : undefined;
+            const action = payload?.simplifiedAction;
+            const output = action
+              ? (JSON.parse(task.result_json ?? '{}') as { graphOutputs?: Values }).graphOutputs
+              : (status === 'SUCCESS' ||
+                    isRelease(node) ||
+                    (node.type === 'HEALTH_CHECK' && status === 'NEEDS_ATTENTION')) &&
+                  this.nodeTasks
+                ? await this.nodeTasks.output(task.id, node, tx, Boolean(plan))
                 : undefined;
+            if (typeof output?.workspacePath === 'string') workspacePath ??= output.workspacePath;
+            if (action?.stage === 'SNAPSHOT' && status === 'SUCCESS' && output?.snapshotReady) {
+              const previousEvidence = JSON.parse(row.evidence_json ?? '{}') as NodeEvidence;
+              row.evidence_json = JSON.stringify({ ...previousEvidence, snapshotTaskId: task.id });
+              row.output_json = JSON.stringify(output);
+              await tx
+                .updateTable('execution_node_runs')
+                .set({
+                  task_id: null,
+                  status: 'PENDING',
+                  output_json: row.output_json,
+                  evidence_json: row.evidence_json,
+                })
+                .where('id', '=', row.id)
+                .execute();
+              row.task_id = null;
+              row.status = 'PENDING';
+              snapshotReady.add(node.id);
+              continue;
+            }
             if (node.type === 'HEALTH_CHECK') {
               if (output?.status === 'UNKNOWN') status = 'NEEDS_ATTENTION';
               else if (
@@ -3081,12 +3352,12 @@ export class GraphRunnerService implements OnModuleInit {
               )
                 status = 'FAILED';
             }
-            if (isRelease(node) && status === 'SUCCESS') {
+            if (isRelease(node) && !action && status === 'SUCCESS') {
               const release = output?.release as { status?: string } | undefined;
               if (release?.status !== 'SUCCESS') status = 'NEEDS_ATTENTION';
             }
             const invalidOutput =
-              status === 'SUCCESS'
+              status === 'SUCCESS' && !plan
                 ? await this.recordDeclaredOutputs(tx, row, flow, node, output)
                 : undefined;
             if (invalidOutput) status = 'FAILED';
@@ -3207,6 +3478,149 @@ export class GraphRunnerService implements OnModuleInit {
           continue;
         }
         if (parents.some(({ from }) => !isNodeTerminal(byId.get(from)!.status))) continue;
+        if (plan && this.simplifiedRuns) {
+          const ownSnapshot = plan.release && !plan.release.artifactId;
+          const shouldSnapshot =
+            snapshotReady.size === 0 &&
+            ((ownSnapshot && (node.type === 'APPROVAL' || node.type === 'DEPLOY_ARTIFACT')) ||
+              (node.type === 'END' &&
+                (plan.finish.saveWorkspace || plan.finish.image || plan.nativeDocker) &&
+                !plan.release?.artifactId));
+          const script = ['CHECKOUT', 'SHELL', 'CHECK', 'BUILD'].includes(node.type);
+          const release = plan.release && outputs.get(plan.release.nodeId)?.release;
+          const stage = shouldSnapshot
+            ? 'SNAPSHOT'
+            : script
+              ? 'ACTION'
+              : isRelease(node)
+                ? 'RELEASE'
+                : node.type === 'HEALTH_CHECK'
+                  ? 'HEALTH'
+                  : undefined;
+          if (stage) {
+            if (rows.some((entry) => entry.status === 'NEEDS_ATTENTION')) {
+              await this.terminalNode(
+                tx,
+                row,
+                'SKIPPED',
+                '同次运行存在状态未确认的动作，停止派发后续任务。',
+              );
+            } else if (!busy && !ready.length) {
+              ready.push({
+                node: row,
+                action: node,
+                values:
+                  stage === 'HEALTH'
+                    ? { release }
+                    : stage === 'SNAPSHOT'
+                      ? {
+                          imageId: [...outputs.values()].find(
+                            (entry) => typeof entry.imageId === 'string',
+                          )?.imageId,
+                        }
+                      : {},
+                stage,
+                workspacePath,
+                environment: { variables: plan.environment, sources: [], evidence: [] },
+              });
+            }
+            continue;
+          }
+          if (node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW') {
+            try {
+              let scope: GraphGateScope | undefined;
+              if (row.status !== 'WAITING') {
+                if (node.type === 'APPROVAL' && plan.release)
+                  scope = await this.simplifiedRuns.releaseScope(tx, run.id, plan.release);
+                if (node.type === 'SOURCE_REVIEW') {
+                  const artifactIds = plan.release?.artifactId ? [plan.release.artifactId] : [];
+                  const sources = artifactIds.length
+                    ? await artifactReviewSources(tx, artifactIds)
+                    : reviewSources(plan.sources.map(({ source }) => source));
+                  if (!sources.length) throw new ConflictException('源码审核缺少已确认的实际提交');
+                  scope = { kind: 'SOURCE_REVIEW', sources, artifactIds };
+                }
+              }
+              await this.waitAtNode(tx, row, node, now, scope, run.configuration_hash);
+            } catch (error) {
+              if (!(error instanceof HttpException)) throw error;
+              await this.terminalNode(tx, row, 'FAILED', error.message, undefined, now);
+            }
+            continue;
+          }
+          if (node.type === 'END') {
+            try {
+              const artifacts = await this.simplifiedRuns.snapshotArtifacts(tx, run.id);
+              const artifactIds = artifacts.map(({ id }) => id);
+              if (plan.release?.artifactId) artifactIds.push(plan.release.artifactId);
+              if (
+                plan.finish.saveWorkspace &&
+                !artifacts.some(({ artifact_type }) => artifact_type === 'FILE')
+              )
+                throw new ConflictException('结束节点未收到已验证的工作区快照');
+              if (
+                (plan.finish.image || plan.nativeDocker) &&
+                !artifacts.some(({ artifact_type }) => artifact_type === 'DOCKER_IMAGE')
+              )
+                throw new ConflictException('结束节点未收到已验证的镜像');
+              const health = [...outputs.values()]
+                .map((output) => output.release as { operation?: string } | undefined)
+                .find((result) => result?.operation === 'CHECK');
+              if (plan.finish.requireRelease) {
+                const expected = plan.release;
+                const result = graphReleaseResult(release);
+                if (
+                  !expected ||
+                  result.status !== 'SUCCESS' ||
+                  result.serviceId !== expected.serviceId ||
+                  !sameIds(
+                    expected.serverIds,
+                    result.targets.map(({ serverId }) => serverId),
+                  ) ||
+                  result.targets.some(
+                    (target) =>
+                      target.status !== 'SUCCESS' ||
+                      !target.artifactInstanceId ||
+                      !artifactIds.includes(target.artifactInstanceId),
+                  )
+                )
+                  throw new ConflictException('结束节点缺少计划内全部目标的激活及产物证据');
+                if (plan.finish.requireRelease === 'HEALTHY') {
+                  const checked = graphReleaseResult(health);
+                  if (
+                    checked.healthStatus !== 'HEALTHY' ||
+                    checked.serviceId !== result.serviceId ||
+                    !sameIds(
+                      checked.targets.map(({ deploymentId }) => deploymentId!),
+                      result.targets.map(({ deploymentId }) => deploymentId!),
+                    )
+                  )
+                    throw new ConflictException('结束节点缺少本次激活版本的健康证据');
+                }
+              }
+              await this.terminalNode(
+                tx,
+                row,
+                'SUCCESS',
+                '执行流已核对交付结果。',
+                {
+                  artifactIds,
+                  release,
+                  health,
+                  workspacePath,
+                  sources: [...outputs.values()].flatMap((output) =>
+                    Array.isArray(output.sources) ? output.sources : [],
+                  ),
+                },
+                now,
+              );
+            } catch (error) {
+              if (!(error instanceof HttpException)) throw error;
+              await this.terminalNode(tx, row, 'FAILED', error.message, undefined, now);
+            }
+            continue;
+          }
+        }
         if (node.type === 'DELAY' || node.type === 'APPROVAL' || node.type === 'SOURCE_REVIEW') {
           try {
             const rootId = snapshot.rootId ?? run.id;
@@ -3380,7 +3794,7 @@ export class GraphRunnerService implements OnModuleInit {
         .set({ status, finished_at: finished ? now : null })
         .where('id', '=', run.id)
         .execute();
-      return { run, flow, definition, snapshot, ready, cancel };
+      return { run, flow, definition, snapshot, ready, cancel, status, workspacePath };
     });
   }
 
@@ -3526,6 +3940,7 @@ export class GraphRunnerService implements OnModuleInit {
     node: NodeRun,
     taskId: string,
     pipelineId?: string,
+    serialized = false,
   ) {
     await this.lockProject(tx, run.project_id);
     const locked = await this.lockRun(tx, run.id);
@@ -3557,7 +3972,21 @@ export class GraphRunnerService implements OnModuleInit {
       .where('id', '=', node.id)
       .executeTakeFirstOrThrow();
     if (current.task_id === taskId) return;
-    if (current.status !== 'PENDING') throw new ConflictException('节点已停止等待');
+    if (current.status !== 'PENDING') {
+      if (serialized) throw new FlowWorkspaceBusy();
+      throw new ConflictException('节点已停止等待');
+    }
+    if (serialized) {
+      const outstanding = await tx
+        .selectFrom('execution_node_runs as n')
+        .innerJoin('tasks as t', 't.id', 'n.task_id')
+        .select('n.id')
+        .where('n.run_id', '=', run.id)
+        .where('n.id', '!=', node.id)
+        .where('t.status', 'not in', terminalTaskStatuses)
+        .executeTakeFirst();
+      if (outstanding) throw new FlowWorkspaceBusy();
+    }
     await tx
       .updateTable('execution_node_runs')
       .set({ task_id: taskId, status: 'QUEUED' })
@@ -3659,7 +4088,7 @@ export class GraphRunnerService implements OnModuleInit {
             }
           }
         : undefined,
-      (tx, id) => this.linkTask(tx, run, row, id),
+      (tx, id) => this.linkTask(tx, run, row, id, undefined, Boolean(snapshot.simplified)),
     );
   }
 
@@ -3958,7 +4387,7 @@ export class GraphRunnerService implements OnModuleInit {
     if (this.tasks)
       for (const taskId of state.cancel)
         await this.tasks.cancel(taskId, false).catch(() => undefined);
-    for (const { node, action, values, environment } of state.ready) {
+    for (const { node, action, values, environment, stage, workspacePath } of state.ready) {
       try {
         const automatic =
           isGraphTriggerKind(state.run.trigger_type) ||
@@ -3975,7 +4404,30 @@ export class GraphRunnerService implements OnModuleInit {
             needsAuthorization,
           );
         }
-        if (node.node_type === 'FLOW_CALL') {
+        const delivery = state.snapshot.simplified;
+        if (delivery && stage && stage !== 'HEALTH') {
+          if (!this.simplifiedRuns || !this.tasks)
+            throw new ConflictException('运行工作区服务不可用');
+          const link = (tx: Transaction<Database>, id: string) =>
+            this.linkTask(tx, state.run, node, id, undefined, true);
+          if (stage === 'RELEASE')
+            await this.simplifiedRuns.deploy(state.run, node, delivery, link);
+          else
+            await this.tasks.create(
+              this.simplifiedRuns.task(
+                state.run,
+                node,
+                action,
+                delivery,
+                stage,
+                workspacePath,
+                stringValue(values.imageId),
+              ),
+              state.run.created_by,
+              (tx) => this.simplifiedRuns!.verifyTask(state.run, delivery, tx),
+              link,
+            );
+        } else if (node.node_type === 'FLOW_CALL') {
           const childId = await this.callChild(
             state.run,
             node,
@@ -3998,6 +4450,7 @@ export class GraphRunnerService implements OnModuleInit {
           await this.dispatch(state.run, node, state.flow, state.snapshot, values, environment);
         }
       } catch (error) {
+        if (error instanceof FlowWorkspaceBusy) continue;
         // A task id proves a committed dispatch even if a response or post-commit audit failed.
         const reason =
           error instanceof HttpException ? error.message : '节点无法提交，请查看任务或重新运行。';
@@ -4020,7 +4473,18 @@ export class GraphRunnerService implements OnModuleInit {
           .execute();
       }
     }
-    if (state.ready.length || state.cancel.length) await this.settle(runId);
+    const final = state.ready.length || state.cancel.length ? await this.settle(runId) : state;
+    if (
+      final?.snapshot.simplified &&
+      final.workspacePath &&
+      isNodeTerminal(final.status) &&
+      final.status !== 'NEEDS_ATTENTION'
+    )
+      await this.simplifiedRuns?.cleanup(
+        final.run.id,
+        final.snapshot.simplified,
+        final.workspacePath,
+      );
   }
 
   private async taskChanged(taskId: string) {
@@ -4315,6 +4779,7 @@ export class GraphRunnerService implements OnModuleInit {
       .leftJoin('tasks as t', 'n.task_id', 't.id')
       .select([
         'r.inputs_json',
+        'r.workspace_path as workspacePath',
         'n.node_id as nodeId',
         'n.node_type as type',
         'n.name',
@@ -4339,9 +4804,8 @@ export class GraphRunnerService implements OnModuleInit {
     if (!row) throw new NotFoundException('执行记录不存在');
     const { definition } = await this.published(projectId, row.version);
     const flow = this.flow(definition, row.flowId);
-    const { inputs, trigger, environmentSet, parameterSources, checkoutProvenance } = JSON.parse(
-      row.inputs_json,
-    ) as RunSnapshot;
+    const { inputs, trigger, environmentSet, parameterSources, checkoutProvenance, simplified } =
+      JSON.parse(row.inputs_json) as RunSnapshot;
     const deliveries = rows.flatMap(({ dispatch, type }) => {
       if (!dispatch || (type !== 'BUILD' && !isRelease({ type: type as GraphNode['type'] })))
         return [];
@@ -4407,6 +4871,7 @@ export class GraphRunnerService implements OnModuleInit {
             ? taskStatus(n.taskStatus, n.availableAt ?? 0)
             : n.nodeStatus,
         taskId: n.nodeTaskId,
+        snapshotTaskId: evidence?.snapshotTaskId,
         logSource: n.nodeTaskId ? 'TASK' : 'NODE',
         childRunId: n.childRunId,
         startedAt: n.taskStartedAt ?? n.nodeStartedAt,
@@ -4432,10 +4897,16 @@ export class GraphRunnerService implements OnModuleInit {
     const built = await this.taskArtifacts(
       rows.flatMap((n) => (n.nodeTaskId ? [n.nodeTaskId] : [])),
     );
+    const snapshots =
+      simplified && this.simplifiedRuns
+        ? await this.simplifiedRuns.snapshotArtifacts(this.database.db, id)
+        : [];
     const artifacts = [
       ...new Set([
         ...deliveries.flatMap((d) => d.artifactIds),
         ...built.map((artifact) => artifact.id),
+        ...snapshots.map(({ id }) => id),
+        ...(simplified?.release?.artifactId ? [simplified.release.artifactId] : []),
       ]),
     ];
     return {
@@ -4464,6 +4935,41 @@ export class GraphRunnerService implements OnModuleInit {
           ?.output ?? {},
       deliveries,
       artifactIds: artifacts,
+      simplified: simplified && {
+        location: simplified.placement.location,
+        serverId:
+          simplified.placement.location === 'TARGET' ? simplified.placement.target.id : undefined,
+        serverName:
+          simplified.placement.location === 'TARGET' ? simplified.placement.target.name : undefined,
+        sources: simplified.sources.map(({ id, directory, source }) => ({
+          id,
+          path: directory,
+          repositoryId: source.repositoryId,
+          repositoryName: source.repositoryName,
+          commitSha: source.commitSha,
+          ref: source.ref,
+          branch: source.branch,
+          tag: source.tag,
+        })),
+        finish: simplified.finish,
+        release: simplified.release && {
+          serviceId: simplified.release.serviceId,
+          serverIds: simplified.release.serverIds,
+          artifactId: simplified.release.artifactId,
+          deployPath: simplified.release.deployPath,
+          contentPath: simplified.release.path,
+          method: simplified.release.method,
+        },
+        workspacePath: row.workspacePath,
+        artifacts: snapshots.map((artifact) => ({
+          id: artifact.id,
+          name: artifact.artifact_name,
+          kind: artifact.artifact_kind,
+          checksum: artifact.checksum,
+          digest: artifact.image_digest,
+          commitSha: artifact.source_commit,
+        })),
+      },
       nodes,
     };
   }
