@@ -52,7 +52,7 @@ import {
   SimplifiedEndSettings,
   SimplifiedStartSettings,
 } from './SimplifiedFlowSettings';
-import { isNativeDockerBuild, simplifiedActions, simplifiedModel } from '../simplified-flow';
+import { simplifiedActions, simplifiedModel } from '../simplified-flow';
 import './execution-graph-editor.css';
 
 type NodeType = GraphNode['type'];
@@ -223,7 +223,22 @@ export function ProjectGraphEditor({
   const targetNames = useGraphTargetNames(canvas.nodes.some(isReleaseNode));
   const inspectedStartScope =
     activeNode?.type === 'START'
-      ? (selectedPath?.nodes ?? reachable(canvas, activeNode.id))
+      ? (pathHighlight(canvas, activeNode.id)?.nodes ?? reachable(canvas, activeNode.id))
+      : undefined;
+  const inspectedEndPaths =
+    activeNode?.type === 'END'
+      ? canvas.endpoints.flatMap(({ startId, endId }) => {
+          const path = endId === activeNode.id && pathHighlight(canvas, startId);
+          return path ? [path.nodes] : [];
+        })
+      : [];
+  const inspectedEndScope =
+    activeNode?.type === 'END'
+      ? activePair && selectedPath
+        ? selectedPath.nodes
+        : inspectedEndPaths.length
+          ? new Set(inspectedEndPaths.flatMap((path) => [...path]))
+          : reachable(canvas, activeNode.id, true)
       : undefined;
   const inspectedActionStart =
     simplified && activeNode
@@ -1257,13 +1272,17 @@ export function ProjectGraphEditor({
                   <>
                     <SimplifiedEndSettings
                       node={inspected}
+                      project={project}
                       canEdit={canEdit}
                       patch={patch}
-                      nativeBuild={canvas.nodes.some(
-                        (candidate) =>
-                          isNativeDockerBuild(candidate) &&
-                          reachable(canvas, candidate.id).has(inspected.id),
-                      )}
+                      flowNodes={canvas.nodes.filter(({ id }) => inspectedEndScope?.has(id))}
+                      hasReleaseOnAllFlows={
+                        inspectedEndPaths.length
+                          ? inspectedEndPaths.every((path) =>
+                              canvas.nodes.some((item) => path.has(item.id) && isReleaseNode(item)),
+                            )
+                          : undefined
+                      }
                     />
                     <EndPairs
                       node={inspected}
@@ -2019,7 +2038,7 @@ function FunctionPortFields({
   return null;
 }
 
-function NodeOperationFields({
+export function NodeOperationFields({
   node,
   project,
   canvas,

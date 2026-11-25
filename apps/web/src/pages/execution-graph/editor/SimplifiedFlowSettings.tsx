@@ -1,7 +1,7 @@
 import { Plus, Trash2 } from 'lucide-react';
 import { useId } from 'react';
 import { useResource } from '../../../api';
-import { ErrorBanner, Field } from '../../../components';
+import { Field } from '../../../components';
 import type { DeploymentSelection, ProjectDetail, ProjectExecutionSettings } from '../../../models';
 import {
   effectiveNodeType,
@@ -20,6 +20,7 @@ import {
   type SimplifiedStart,
 } from '../simplified-flow';
 import { GraphFieldValue, referenceId } from './ExecutionGraphFields';
+import { SimplifiedImageSettings } from './SimplifiedImageSettings';
 
 type NodeSettings = {
   node: GraphNode;
@@ -114,23 +115,16 @@ export function SimplifiedStartSettings({
   const release = start.release ?? {};
   const releaseAction = flowNodes.find(isReleaseNode);
   const rollback = releaseAction && effectiveNodeType(releaseAction) === 'ROLLBACK_ARTIFACT';
-  const hasRelease = Boolean(
-    releaseAction ||
-    release.targets ||
-    release.reuseExecutionServer ||
-    release.deployPath ||
-    release.contentPath ||
-    release.artifactId ||
-    release.useUpstreamArtifact ||
-    release.allowArtifactOverride,
-  );
+  const staleRelease =
+    !releaseAction &&
+    Object.entries(release).some(([field, value]) => field !== 'serviceId' && value);
   const savesArtifact = flowNodes.some(
     (item) =>
-      effectiveNodeType(item) === 'BUILD' ||
-      item.finish?.saveWorkspace ||
-      item.finish?.image?.reference,
+      ['CHECKOUT', 'BUILD', 'CHECK', 'SHELL'].includes(effectiveNodeType(item)) ||
+      item.finish?.images?.length,
   );
   const composeRelease = releaseAction?.deploy?.method === 'COMPOSE';
+  const images = flowNodes.find(({ type }) => type === 'END')?.finish?.images ?? [];
   const historical = Boolean(release.artifactId || release.useUpstreamArtifact);
   const runtime = useResource<ProjectExecutionSettings>(
     execution.location === 'INHERIT' ? '/projects/' + project.id + '/execution-settings' : null,
@@ -315,16 +309,36 @@ export function SimplifiedStartSettings({
           </div>
         )}
       </fieldset>
-      {!hasRelease &&
+      {staleRelease && (
+        <div className="graph-field-card" data-graph-node-field="start.release">
+          <p className="field-note">
+            这条执行流已没有受管发布动作。请清除发布专用配置后再发布执行图。
+          </p>
+          {canEdit && (
+            <button
+              type="button"
+              className="button secondary small"
+              onClick={() =>
+                patchStart({
+                  release: release.serviceId ? { serviceId: release.serviceId } : undefined,
+                })
+              }
+            >
+              清除发布配置
+            </button>
+          )}
+        </div>
+      )}
+      {!releaseAction &&
         (savesArtifact || release.serviceId) &&
         control(
           'start.release.serviceId',
           '产物归属服务（可选）',
           'SERVICE',
           release.serviceId,
-          (value) => patchStart({ release: value ? { serviceId: value as string } : undefined }),
+          (value) => changeRelease({ serviceId: value as string | undefined }),
         )}
-      {hasRelease && (
+      {releaseAction && (
         <fieldset className="graph-fields" data-graph-node-field="start.release">
           <legend>受管发布</legend>
           <div className="form-grid">
@@ -366,6 +380,30 @@ export function SimplifiedStartSettings({
           </div>
           {composeRelease && (
             <div className="form-grid" data-graph-node-field="start.release.compose">
+              {!historical && (
+                <Field label="本次发布镜像" hint="镜像登记项由本流的结束节点配置。">
+                  <select
+                    data-graph-node-field="start.release.imageId"
+                    value={release.imageId ?? (images.length === 1 ? images[0]?.id : '')}
+                    disabled={!canEdit}
+                    onChange={(event) =>
+                      changeRelease({ imageId: event.target.value || undefined })
+                    }
+                  >
+                    <option value="">选择镜像登记项</option>
+                    {release.imageId && !images.some(({ id }) => id === release.imageId) && (
+                      <option value={release.imageId} disabled>
+                        原登记项已移除
+                      </option>
+                    )}
+                    {images.map(({ id, name }) => (
+                      <option key={id} value={id}>
+                        {name || '未命名镜像'}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              )}
               <Field label="Compose 配置来源">
                 <select
                   data-graph-node-field="start.release.compose.sourceId"
@@ -450,10 +488,23 @@ export function SimplifiedStartSettings({
                       useUpstreamArtifact,
                       ...(useUpstreamArtifact && {
                         artifactId: undefined,
+                        imageId: undefined,
                         ...(!release.compose?.sourceId && { compose: undefined }),
                       }),
+                      ...(!useUpstreamArtifact && { upstreamArtifactName: undefined }),
                     })
                   }
+                />
+              )}
+              {release.useUpstreamArtifact && (
+                <SimplifiedText
+                  id="start.release.upstreamArtifactName"
+                  label="上游产物登记名称"
+                  value={release.upstreamArtifactName}
+                  placeholder={composeRelease ? 'team/api' : 'workspace'}
+                  hint="上游登记多件同类型产物时，填写要使用的名称。"
+                  canEdit={canEdit}
+                  change={(upstreamArtifactName) => changeRelease({ upstreamArtifactName })}
                 />
               )}
               {(rollback || !release.useUpstreamArtifact) && (
@@ -473,6 +524,7 @@ export function SimplifiedStartSettings({
                       ...(rollback && { useUpstreamArtifact: undefined }),
                       ...(typeof value === 'string' &&
                         !release.compose?.sourceId && { compose: undefined }),
+                      ...(typeof value === 'string' && { imageId: undefined }),
                     })
                   }
                   disabled={!canEdit}
@@ -648,14 +700,21 @@ export function SimplifiedStartSettings({
 
 export function SimplifiedEndSettings({
   node,
+  project,
   canEdit,
   patch,
-  nativeBuild,
-}: Omit<NodeSettings, 'project'> & { nativeBuild?: boolean }) {
+  flowNodes,
+  hasReleaseOnAllFlows = flowNodes.some(isReleaseNode),
+}: NodeSettings & { flowNodes: GraphNode[]; hasReleaseOnAllFlows?: boolean }) {
   const finish = node.finish ?? {};
-  const registries = useResource<{ id: string; name: string }[]>(
-    finish.image && !nativeBuild ? '/registries' : null,
-  );
+  const saveWorkspace = finish.saveWorkspace !== false;
+  const startRelease = flowNodes.find((item) => item.type === 'START')?.start?.release;
+  const requiresFileSnapshot =
+    !startRelease?.artifactId &&
+    !startRelease?.useUpstreamArtifact &&
+    flowNodes.some(
+      (item) => effectiveNodeType(item) === 'DEPLOY_ARTIFACT' && item.deploy?.method !== 'COMPOSE',
+    );
   const change = (next: Partial<SimplifiedFinish>) => patch({ finish: { ...finish, ...next } });
   return (
     <fieldset className="graph-fields" data-graph-node-field="finish">
@@ -663,25 +722,29 @@ export function SimplifiedEndSettings({
       <Check
         label="保存工作区"
         id="finish.saveWorkspace"
-        value={finish.saveWorkspace}
+        value={saveWorkspace}
         canEdit={canEdit}
         change={(saveWorkspace) => change({ saveWorkspace })}
       />
-      {finish.saveWorkspace && (
+      {(saveWorkspace || requiresFileSnapshot) && (
         <div className="form-grid">
-          <Field label="保留范围">
-            <select
-              value={finish.retention ?? 'PERSISTENT'}
-              disabled={!canEdit}
-              data-graph-node-field="finish.retention"
-              onChange={(event) =>
-                change({ retention: event.target.value as SimplifiedFinish['retention'] })
-              }
-            >
-              <option value="PERSISTENT">登记并可历史重发</option>
-              <option value="RUN">仅供本次运行</option>
-            </select>
-          </Field>
+          {saveWorkspace ? (
+            <Field label="保留范围">
+              <select
+                value={finish.retention ?? 'PERSISTENT'}
+                disabled={!canEdit}
+                data-graph-node-field="finish.retention"
+                onChange={(event) =>
+                  change({ retention: event.target.value as SimplifiedFinish['retention'] })
+                }
+              >
+                <option value="PERSISTENT">登记并可历史重发</option>
+                <option value="RUN">仅供本次运行</option>
+              </select>
+            </Field>
+          ) : (
+            <p className="field-note">使用本次文件发布时会生成仅供本次运行的临时快照。</p>
+          )}
           <Field label="排除路径" hint="工作区相对路径，每行一项。">
             <textarea
               data-graph-node-field="finish.excludePaths"
@@ -702,75 +765,47 @@ export function SimplifiedEndSettings({
           </Field>
         </div>
       )}
-      {nativeBuild && (
-        <p className="field-note" data-graph-node-field="finish.image.reference">
-          Dockerfile 构建自动登记实际镜像身份。
-          {finish.image && '请关闭已有的外部镜像登记配置。'}
-        </p>
-      )}
-      {(!nativeBuild || finish.image) && (
-        <Check
-          label="登记 Docker 镜像"
-          id="finish.image"
-          value={Boolean(finish.image)}
-          canEdit={canEdit}
-          change={(enabled) => change({ image: enabled ? {} : undefined })}
-        />
-      )}
-      {!nativeBuild && finish.image && (
-        <div className="form-grid">
-          <SimplifiedText
-            id="finish.image.reference"
-            label="镜像引用"
-            placeholder="app:build-452"
-            hint={
-              finish.image.registryId
-                ? '填写仓库名和镜像摘要，例如 registry.example.com/app@sha256:…。'
-                : '填写本次执行端上的镜像引用。'
+      <SimplifiedImageSettings
+        node={node}
+        canEdit={canEdit}
+        project={project}
+        flowNodes={flowNodes}
+        patch={patch}
+      />
+      {hasReleaseOnAllFlows ? (
+        <Field label="发布结果核对">
+          <select
+            data-graph-node-field="finish.requireRelease"
+            disabled={!canEdit}
+            value={finish.requireRelease ?? ''}
+            onChange={(event) =>
+              change({
+                requireRelease: (event.target.value ||
+                  undefined) as SimplifiedFinish['requireRelease'],
+              })
             }
-            canEdit={canEdit}
-            value={finish.image.reference}
-            change={(reference) => change({ image: { ...finish.image, reference } })}
-          />
-          <Field label="镜像仓库（可选）">
-            <select
-              data-graph-node-field="finish.image.registryId"
-              value={finish.image.registryId ?? ''}
-              disabled={!canEdit}
-              onChange={(event) =>
-                change({
-                  image: { ...finish.image, registryId: event.target.value || undefined },
-                })
-              }
+          >
+            <option value="">汇总动作状态</option>
+            <option value="ACTIVATED">所有目标均已激活</option>
+            <option value="HEALTHY">所有目标均已激活且健康</option>
+          </select>
+        </Field>
+      ) : finish.requireRelease ? (
+        <div className="graph-field-card" data-graph-node-field="finish.requireRelease">
+          <p className="field-note">
+            此结束节点对应的执行流中存在未配置受管发布的流程。请清除发布结果核对后再发布执行图。
+          </p>
+          {canEdit && (
+            <button
+              type="button"
+              className="button secondary small"
+              onClick={() => change({ requireRelease: undefined })}
             >
-              <option value="">保存在执行服务器</option>
-              {registries.data?.map(({ id, name }) => (
-                <option key={id} value={id}>
-                  {name}
-                </option>
-              ))}
-            </select>
-            <ErrorBanner error={registries.error} retry={registries.reload} />
-          </Field>
+              清除发布结果核对
+            </button>
+          )}
         </div>
-      )}
-      <Field label="发布结果核对">
-        <select
-          data-graph-node-field="finish.requireRelease"
-          disabled={!canEdit}
-          value={finish.requireRelease ?? ''}
-          onChange={(event) =>
-            change({
-              requireRelease: (event.target.value ||
-                undefined) as SimplifiedFinish['requireRelease'],
-            })
-          }
-        >
-          <option value="">汇总动作状态</option>
-          <option value="ACTIVATED">所有目标均已激活</option>
-          <option value="HEALTHY">所有目标均已激活且健康</option>
-        </select>
-      </Field>
+      ) : null}
     </fieldset>
   );
 }

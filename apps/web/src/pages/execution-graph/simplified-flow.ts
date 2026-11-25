@@ -35,6 +35,8 @@ export interface SimplifiedRelease {
   artifactId?: string;
   allowArtifactOverride?: boolean;
   useUpstreamArtifact?: boolean;
+  upstreamArtifactName?: string;
+  imageId?: string;
   compose?: { sourceId?: string; path: string };
 }
 
@@ -58,8 +60,16 @@ export interface SimplifiedFinish {
   saveWorkspace?: boolean;
   retention?: 'PERSISTENT' | 'RUN';
   excludePaths?: string[];
-  image?: { reference?: string; registryId?: string };
+  images?: SimplifiedFinishImage[];
   requireRelease?: 'ACTIVATED' | 'HEALTHY';
+}
+
+export interface SimplifiedFinishImage {
+  id: string;
+  name: string;
+  source: 'BUILT_IN' | 'WORKSPACE' | 'REGISTRY';
+  reference?: string;
+  registryId?: string;
 }
 
 export const simplifiedActions = [
@@ -119,6 +129,9 @@ export interface SimplifiedPublicPlan {
     path: string;
   }[];
   finish: SimplifiedFinish;
+  workspaceRetention?: 'PERSISTENT' | 'RUN' | 'OFF';
+  imageTagVariable?: string;
+  imageTag?: string;
   release?: {
     serviceId: string;
     serverIds: string[];
@@ -126,6 +139,7 @@ export interface SimplifiedPublicPlan {
     deployPath: string;
     contentPath?: string;
     method: string;
+    image?: { id: string; name: string };
     compose?: { sourceId?: string; path: string };
   };
   workspacePath?: string;
@@ -136,6 +150,9 @@ export interface SimplifiedPublicPlan {
     checksum?: string | null;
     digest?: string | null;
     commitSha?: string | null;
+    temporary?: boolean;
+    lifecycleState?: 'ACTIVE' | 'CLEANING' | 'DELETED';
+    imageReference?: string;
   }[];
 }
 

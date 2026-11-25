@@ -18,7 +18,7 @@ import { NodeMap } from './editor/ExecutionGraphCanvas';
 import { ExecutionGraphInputSummary } from './editor/ExecutionGraphInputSummary';
 import { actionCardText, graphActionSources, startCardText } from './editor/graph-action-sources';
 import { useGraphTargetNames } from './editor/graph-start-groups';
-import { ProjectGraphEditor } from './editor/ExecutionGraphEditor';
+import { NodeOperationFields, ProjectGraphEditor } from './editor/ExecutionGraphEditor';
 import { PublishedNodeDetails, showSelectedNode } from './editor/ExecutionGraphNodeDetails';
 import { ExecutionGraphResourceLinks } from './ExecutionGraphResourceLinks';
 import {
@@ -40,7 +40,7 @@ import {
   SimplifiedEndSettings,
   SimplifiedStartSettings,
 } from './editor/SimplifiedFlowSettings';
-import { isNativeDockerBuild, simplifiedModel } from './simplified-flow';
+import { simplifiedActions, simplifiedModel } from './simplified-flow';
 import { ExecutionGraphTriggers } from './editor/ExecutionGraphTriggers';
 import { triggerFlows, type TriggerPreflightIssue } from './editor/graph-trigger-model';
 import { GraphVersionTools } from './ExecutionGraphVersions';
@@ -1358,6 +1358,7 @@ function PublishedNodes({
     flowsWithNode.find(({ id }) => id === (definition.canvas ? inspectionFlowId : flow.id)) ??
     flowsWithNode[0];
   const inspectedNode = inspectedFlow?.nodes.find(({ id }) => id === selected) ?? node;
+  const inspectedStart = inspectedFlow?.nodes.find(({ type }) => type === 'START')?.start;
   const simplified =
     (inspectedFlow?.model ?? definition.canvas?.model ?? inspectedNode?.model) === simplifiedModel;
   const highlight = (hovered && flowsByStart.get(hovered)) || flowsByStart.get(selected);
@@ -1507,21 +1508,31 @@ function PublishedNodes({
                 ) : simplified && inspectedNode.type === 'END' ? (
                   <SimplifiedEndSettings
                     node={inspectedNode}
+                    project={project}
                     canEdit={false}
                     patch={() => {}}
-                    nativeBuild={inspectedFlow?.nodes.some(isNativeDockerBuild)}
+                    flowNodes={inspectedFlow?.nodes ?? []}
                   />
-                ) : simplified && inspectedNode.type === 'FUNCTION' ? (
+                ) : simplified &&
+                  simplifiedActions.some(
+                    (action) => action === effectiveNodeType(inspectedNode),
+                  ) ? (
                   <SimplifiedActionSettings
                     node={inspectedNode}
                     project={project}
                     canEdit={false}
                     patch={() => {}}
                     selectOperation={() => {}}
-                    sources={
-                      inspectedFlow?.nodes.find(({ type }) => type === 'START')?.start?.sources ??
-                      []
-                    }
+                    sources={inspectedStart?.sources ?? []}
+                  />
+                ) : simplified && definition.canvas ? (
+                  <NodeOperationFields
+                    node={inspectedNode}
+                    project={project}
+                    canvas={definition.canvas}
+                    canEdit={false}
+                    patch={() => {}}
+                    simplifiedStart={inspectedStart ?? {}}
                   />
                 ) : (
                   <PublishedNodeDetails

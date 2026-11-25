@@ -776,7 +776,20 @@ export function SimplifiedPlanDetails({
             </strong>
             {release.artifactId && (
               <small>
-                产物实例 · <code>{release.artifactId}</code>
+                产物实例 ·{' '}
+                <a
+                  className="text-link"
+                  href={
+                    '#' + deliveryPath(project.id, 'artifacts', { recordId: release.artifactId })
+                  }
+                >
+                  <code>{release.artifactId}</code>
+                </a>
+              </small>
+            )}
+            {release.image && (
+              <small>
+                本次发布镜像 · <code>{release.image.name}</code>
               </small>
             )}
             {release.contentPath && (
@@ -798,16 +811,24 @@ export function SimplifiedPlanDetails({
       <section>
         <h4>结束结果</h4>
         <div className="execution-plan-row">
-          {finish.saveWorkspace && (
+          {plan.workspaceRetention === 'PERSISTENT' && <span>保存工作区快照，可历史重发</span>}
+          {plan.workspaceRetention === 'RUN' && <span>工作区快照仅供本次运行使用</span>}
+          {plan.workspaceRetention === 'OFF' && <span>本次不生成工作区快照</span>}
+          {plan.imageTagVariable && (
             <span>
-              {finish.retention === 'RUN' ? '工作区快照保留至本次运行结束' : '归档工作区快照'}
+              脚本镜像标签变量 <code>{plan.imageTagVariable}</code>
             </span>
           )}
-          {finish.image?.reference && (
+          {plan.imageTag && (
             <span>
-              登记镜像 <code>{finish.image.reference}</code>
+              本次镜像 Tag <code>{plan.imageTag}</code>
             </span>
           )}
+          {finish.images?.map(({ id, name, reference }) => (
+            <span key={id}>
+              登记镜像 <code>{reference ?? name}</code>
+            </span>
+          ))}
           {finish.requireRelease && (
             <span>
               {finish.requireRelease === 'HEALTHY'
@@ -815,14 +836,15 @@ export function SimplifiedPlanDetails({
                 : '检查所有目标均已激活'}
             </span>
           )}
-          {!finish.saveWorkspace && !finish.image?.reference && !finish.requireRelease && (
-            <span>汇总动作状态</span>
-          )}
+          {!plan.workspaceRetention &&
+            !finish.images?.length &&
+            !finish.requireRelease &&
+            !plan.artifacts?.length && <span>汇总动作状态</span>}
         </div>
       </section>
       {Boolean(plan.artifacts?.length) && (
         <section>
-          <h4>已登记的交付产物</h4>
+          <h4>本次交付产物</h4>
           {plan.artifacts?.map((artifact) => (
             <div key={artifact.id} className="execution-plan-row">
               <a
@@ -831,6 +853,11 @@ export function SimplifiedPlanDetails({
               >
                 {artifact.name} · {artifactKindLabel(artifact.kind)}
               </a>
+              {artifact.temporary && <span className="tag">运行内临时产物</span>}
+              {artifact.lifecycleState === 'CLEANING' && <span className="tag">清理中</span>}
+              {artifact.lifecycleState === 'DELETED' && <span className="tag">已清理</span>}
+              {artifact.id === release?.artifactId && <span className="tag">本次发布使用</span>}
+              {artifact.imageReference && <code>{artifact.imageReference}</code>}
               {artifact.digest && <code>{artifact.digest}</code>}
               {artifact.checksum && (
                 <small>
