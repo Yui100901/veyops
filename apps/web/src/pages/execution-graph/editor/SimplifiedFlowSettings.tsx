@@ -947,6 +947,9 @@ export function SimplifiedActionSettings({
             {text('build.buildImage', '构建环境镜像（可选）', build.buildImage, (buildImage) =>
               patch({ build: { ...build, buildImage } }),
             )}
+            {timeout('build.timeout', build.timeout, (timeout) =>
+              patch({ build: { ...build, timeout } }),
+            )}
           </div>
           <Check
             id="build.dockerfilePath"

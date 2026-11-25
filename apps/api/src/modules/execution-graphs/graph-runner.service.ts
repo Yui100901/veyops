@@ -2610,11 +2610,14 @@ export class GraphRunnerService implements OnModuleInit {
       .executeTakeFirst();
     if (!row) return undefined;
     const snapshot = JSON.parse(values.inputs_json) as RunSnapshot;
-    const { ordered, selected } = flowSelection(flow, inputs, {
-      ...bindingContext(values.project_id, flow, inputs, undefined, snapshot.trigger),
-      environmentSet: snapshot.frozenEnvironment,
-      parameterSources: snapshot.parameterSources,
-    });
+    const initialContext = snapshot.simplified
+      ? undefined
+      : {
+          ...bindingContext(values.project_id, flow, inputs, undefined, snapshot.trigger),
+          environmentSet: snapshot.frozenEnvironment,
+          parameterSources: snapshot.parameterSources,
+        };
+    const { ordered, selected } = flowSelection(flow, inputs, initialContext);
     await tx
       .insertInto('execution_node_runs')
       .values(
@@ -3245,13 +3248,15 @@ export class GraphRunnerService implements OnModuleInit {
         ),
       );
       const trigger = snapshot.trigger ?? { triggeredAt: run.created_at };
-      const bindings = {
-        ...bindingContext(run.project_id, flow, snapshot.inputs, outputs, trigger),
-        environmentSet: snapshot.frozenEnvironment,
-        parameterSources: snapshot.parameterSources,
-        credentialNonces: snapshot.credentials,
-        producerStatus: (id: string) => byId.get(id)?.status,
-      };
+      const bindings = plan
+        ? { context: {}, outputs }
+        : {
+            ...bindingContext(run.project_id, flow, snapshot.inputs, outputs, trigger),
+            environmentSet: snapshot.frozenEnvironment,
+            parameterSources: snapshot.parameterSources,
+            credentialNonces: snapshot.credentials,
+            producerStatus: (id: string) => byId.get(id)?.status,
+          };
       let selection = flowSelection(flow, snapshot.inputs, bindings);
       const tasks = rows.flatMap((row) => (row.task_id ? [row.task_id] : []));
       const children = rows.flatMap((row) => (row.child_run_id ? [row.child_run_id] : []));
@@ -4036,13 +4041,19 @@ export class GraphRunnerService implements OnModuleInit {
         throw new ConflictException('脚本实际读取的产物与已确认计划不一致');
       scriptArtifact = { path, instances: [instance] };
     }
-    const scope = declaredScope(flow, snapshot.inputs);
-    await this.validateNodeResources(
-      run.project_id,
-      graphScriptInputs(action),
-      values,
-      snapshot.rootId ?? run.id,
-    );
+    const scope = snapshot.simplified
+      ? {
+          serviceId: snapshot.simplified.serviceId,
+          environmentId: graphDeliveryEnvironment(run.project_id).id,
+        }
+      : declaredScope(flow, snapshot.inputs);
+    if (!snapshot.simplified)
+      await this.validateNodeResources(
+        run.project_id,
+        graphScriptInputs(action),
+        values,
+        snapshot.rootId ?? run.id,
+      );
     const task = await this.nodeTasks.task(
       run.project_id,
       action,

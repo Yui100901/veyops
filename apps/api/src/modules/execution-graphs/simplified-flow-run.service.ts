@@ -391,6 +391,7 @@ export class SimplifiedFlowRunService {
         automation,
         finish,
       });
+      fixedRelease.profile.graphReleaseEnvironmentFile = dotenvPin;
       if (automation) await assertAutomaticTargets(this.database.db, fixedRelease.serverIds);
     }
     const plan: SimplifiedRunPlan = {
@@ -602,7 +603,8 @@ export class SimplifiedFlowRunService {
     expectedImageId?: string,
   ): CreateTaskInput {
     const target = plan.placement.location === 'TARGET' ? plan.placement.target : undefined;
-    const timeout = stage === 'SNAPSHOT' ? 600 : (node.shell?.timeout ?? 1200);
+    const timeout =
+      stage === 'SNAPSHOT' ? 600 : (node.build?.timeout ?? node.shell?.timeout ?? 1200);
     const payload: CreateTaskInput['payload'] = {
       simplifiedAction: {
         projectId: run.project_id,
@@ -688,7 +690,7 @@ export class SimplifiedFlowRunService {
   async verifyTask(run: FlowRunIdentity, plan: SimplifiedRunPlan, tx: Transaction<Database>) {
     if (plan.placement.location === 'TARGET') {
       const target = plan.placement.target;
-      const [current] = await this.servers.snapshot([target.id]);
+      const [current] = await this.servers.snapshot([target.id], tx);
       if (JSON.stringify(current) !== JSON.stringify(target))
         throw new ConflictException('构建服务器的 SSH 配置发生变化，请重新预览');
       if (plan.automation) await assertAutomaticTargets(tx, [target]);

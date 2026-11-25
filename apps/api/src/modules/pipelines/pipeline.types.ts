@@ -2,6 +2,7 @@ import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import type { DeploymentSelection } from '../deployment-targets/deployment-selection';
 import type { GraphExecutionScope } from '../execution-graphs/graph-workspace';
 import type { GraphAutomation } from '../execution-graphs/graph-automatic-delivery';
+import type { GraphEnvironmentFilePin } from '../execution-graphs/graph-environment';
 
 export interface NamedArtifactDefinition {
   name: string;
@@ -97,6 +98,7 @@ export interface PipelineDefinition {
   nodes?: PipelineNode[];
 }
 export interface PipelineSnapshot {
+  graphReleaseEnvironmentFile?: GraphEnvironmentFilePin;
   managedCompose?: import('../service-configs/compose-template-reference').ManagedComposeReference;
   graphDeployment?: {
     method: 'FILE' | 'COMPOSE';

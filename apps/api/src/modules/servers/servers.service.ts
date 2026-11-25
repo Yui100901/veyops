@@ -129,8 +129,8 @@ export class ServersService {
         .execute()
     ).map(present);
   }
-  private withAuthorization() {
-    return this.database.db
+  private withAuthorization(db = this.database.db) {
+    return db
       .selectFrom('servers')
       .leftJoin('credentials as ssh', (join) =>
         join
@@ -141,8 +141,8 @@ export class ServersService {
       .selectAll('servers')
       .select('ssh.nonce as active_ssh_nonce');
   }
-  async get(id: string, includeInactive = false) {
-    const row = await this.withAuthorization()
+  async get(id: string, includeInactive = false, db = this.database.db) {
+    const row = await this.withAuthorization(db)
       .where('servers.id', '=', id)
       .$if(!includeInactive, (query) => query.where('servers.is_active', '=', 1))
       .executeTakeFirst();
@@ -192,11 +192,11 @@ export class ServersService {
     });
     return this.get(id);
   }
-  async snapshot(ids: string[]) {
+  async snapshot(ids: string[], db = this.database.db) {
     const unique = [...new Set(ids)];
     if (!unique.length || unique.length > 100)
       throw new BadRequestException('必须明确选择 1–100 台服务器');
-    return Promise.all(unique.map((id) => this.get(id)));
+    return Promise.all(unique.map((id) => this.get(id, false, db)));
   }
   async compareConfiguration(dto: CompareConfigurationDto, userId: string) {
     const baselineId = dto.baselineId.toLowerCase();

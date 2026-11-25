@@ -391,6 +391,18 @@ export class BuildsService {
       values.VEYOPS_SERVICE_ID = snapshot.serviceId;
     if (snapshot.projectName !== undefined) values.VEYOPS_PROJECT_NAME = snapshot.projectName;
     if (snapshot.serviceName !== undefined) values.VEYOPS_SERVICE_NAME = snapshot.serviceName;
+    if (snapshot.graphReleaseEnvironmentFile) {
+      if (!this.repositories) throw new ConflictException('仓库环境文件读取服务不可用');
+      const loaded = await this.repositories.readGraphEnvironmentFile(
+        snapshot.projectId,
+        snapshot.graphReleaseEnvironmentFile,
+      );
+      for (const [name, value] of Object.entries(loaded)) {
+        if (/^VEYOPS_/i.test(name)) continue;
+        secrets.push(value);
+        if (!Object.hasOwn(values, name)) values[name] = value;
+      }
+    }
     if (snapshot.graph) {
       const { variables, trigger } = snapshot.graph;
       let loaded: Record<string, string> | undefined;

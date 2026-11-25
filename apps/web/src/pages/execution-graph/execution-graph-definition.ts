@@ -220,6 +220,7 @@ export interface FlowBuildDefinition {
   buildCommand?: string;
   outputPath?: string;
   dockerfilePath?: string;
+  timeout?: number;
   imageRepository?: string;
   registryId?: string;
   artifacts?: GraphArtifactOutput[];

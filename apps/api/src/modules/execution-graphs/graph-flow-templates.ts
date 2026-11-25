@@ -48,7 +48,7 @@ export const graphFlowTemplates = templates.map(({ id, name, operations }) => ({
 
 export const simplifiedFlowTemplates = graphFlowTemplates.map((template) => ({
   ...template,
-  artifactTypes: ['DIRECTORY'] as const,
+  artifactTypes: ['DIRECTORY', 'DOCKER_IMAGE'] as const,
 }));
 
 export class ExpandGraphTemplateDto {
@@ -249,7 +249,7 @@ function expandSimplifiedTemplate(
         sources: [{ id: 'source' }],
         execution: { location: 'INHERIT' },
       }),
-      ...(deploys && { release: {} }),
+      ...(deploys && { release: image && builds ? { compose: { path: 'compose.yaml' } } : {} }),
     },
   };
   const end: GraphNode = {
@@ -259,7 +259,6 @@ function expandSimplifiedTemplate(
     finish: {
       saveWorkspace: builds,
       ...(builds && { retention: 'PERSISTENT' }),
-      ...(image && builds && { image: {} }),
       ...(deploys && { requireRelease: template.id === 'CD_DEPLOY' ? 'HEALTHY' : 'ACTIVATED' }),
     },
   };
@@ -269,6 +268,7 @@ function expandSimplifiedTemplate(
     type: 'FUNCTION',
     operation,
     ...(operation === 'CHECK' && { shell: { timeout: 180 } }),
+    ...(operation === 'BUILD' && image && { build: { dockerfilePath: 'Dockerfile' } }),
     ...(operation === 'DEPLOY_ARTIFACT' && { deploy: { method: image ? 'COMPOSE' : 'FILE' } }),
     ...(operation === 'HEALTH_CHECK' && {
       healthCheck: { timeoutSeconds: 30, requireHealthy: true },

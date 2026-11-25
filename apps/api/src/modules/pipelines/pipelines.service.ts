@@ -1804,6 +1804,7 @@ export class PipelinesService implements OnModuleInit {
       deploymentArtifacts: references,
       sourceBuildTaskId: source.task_id,
       graphGate: options.graphGate,
+      graphReleaseEnvironmentFile: options.profile?.graphReleaseEnvironmentFile,
       graphRollback,
       ...(options.profile && { artifactServiceScope: true }),
       ...(automation && {

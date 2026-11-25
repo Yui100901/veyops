@@ -12,7 +12,7 @@ case "$revision" in *[!a-f0-9]*) exit 2 ;; esac
 test "${#revision}" -eq 40 || exit 2
 case "$database" in sqlite|postgres) ;; *) printf '%s\n' 'Choose sqlite or postgres.' >&2; exit 2 ;; esac
 case "$mode" in
-  acceptance|flow-v2) test -z "$bind" ;;
+  acceptance|flow-v2|flow-v2-image) test -z "$bind" ;;
   preview)
     if ! printf '%s\n' "$bind" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}:[1-9][0-9]{3,4}$' ||
        [ "${bind%:*}" = 0.0.0.0 ] || [ "${bind##*:}" -gt 65535 ]; then
@@ -20,7 +20,7 @@ case "$mode" in
       exit 2
     fi
     ;;
-  *) printf '%s\n' 'Choose acceptance, flow-v2 or preview.' >&2; exit 2 ;;
+  *) printf '%s\n' 'Choose acceptance, flow-v2, flow-v2-image or preview.' >&2; exit 2 ;;
 esac
 
 repo=$(git rev-parse --show-toplevel)
@@ -57,11 +57,16 @@ network="$prefix-net"
 preview_network="$prefix-preview"
 manager="$prefix-api"
 postgres="$prefix-db"
-targets='test-a test-b production-a production-b'
+case "$mode" in
+  flow-v2) targets='test-a test-b' ;;
+  flow-v2-image) targets='test-a' ;;
+  *) targets='test-a test-b production-a production-b' ;;
+esac
 cleanup() {
   status=$?
   trap - EXIT INT TERM
-  for name in "$manager" "$postgres" "$prefix-test-a" "$prefix-test-b" "$prefix-production-a" "$prefix-production-b"; do
+  for target in api db $targets; do
+    name="$prefix-$target"
     if [ "$(docker inspect --type container --format '{{index .Config.Labels "veyops.acceptance"}}' "$name" 2>/dev/null || :)" = "$prefix" ]; then
       docker rm -fv "$name" >/dev/null || :
     fi
@@ -165,12 +170,18 @@ for target in $targets; do
   fi
 done
 
-# Copy image archives locally before loading them to avoid masking a failed save in a pipeline.
-docker image save -o "$work/images.tar" "$site_image" "$target_image"
-for target in $targets; do
-  target_docker "$target" image load -i "$work/images.tar" >"$work/targets/$target/image-load.log"
-done
-rm -f -- "$work/images.tar"
+# Save before loading so a failed save cannot be masked by a pipeline.
+case "$mode" in
+  flow-v2) ;;
+  flow-v2-image) docker image save -o "$work/images.tar" "$site_image" ;;
+  *) docker image save -o "$work/images.tar" "$site_image" "$target_image" ;;
+esac
+if [ "$mode" != flow-v2 ]; then
+  for target in $targets; do
+    target_docker "$target" image load -i "$work/images.tar" >"$work/targets/$target/image-load.log"
+  done
+  rm -f -- "$work/images.tar"
+fi
 
 if [ "$database" = postgres ]; then
   password=$(openssl rand -hex 24)

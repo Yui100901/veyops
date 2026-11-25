@@ -458,6 +458,8 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
     );
   if (dockerBuilds.length && (finish.finish?.image?.registryId || finish.finish?.image?.reference))
     nodeIssue(finish, 'finish.image', '内置 Docker 构建会自动登记本次构建镜像', flow.id);
+  if (!dockerBuilds.length && finish.finish?.image && !finish.finish.image.reference)
+    nodeIssue(finish, 'finish.image.reference', '请填写要登记的镜像引用', flow.id);
   const ancestors = new Map<string, Set<string>>();
   for (const node of ordered) {
     if (!simpleActions.has(node.type))

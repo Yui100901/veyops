@@ -8,7 +8,7 @@ const { verifyArtifactRecovery, verifyWorkerRecovery } = require('./p1-recovery.
 const { verifySharedDelivery } = require('./p1-shared-delivery.cjs');
 const { prepareP2Repository, verifyP2Contract } = require('./p2-contract.cjs');
 const { verifyWorkDirectory } = require('./work-directory-live.cjs');
-const { verifyFlowV2 } = require('./flow-v2-live.cjs');
+const { verifyFlowV2, verifyFlowV2Image } = require('./flow-v2-live.cjs');
 const {
   initializeDemo,
   loadDemo,
@@ -99,11 +99,11 @@ function createApi() {
   };
 }
 
-async function readTargets() {
+async function readTargets(hosts = targetNames) {
   const privateKey = await readFile(acceptanceRoot + '/host-ssh/fixture-admin', 'utf8');
   return Object.fromEntries(
     await Promise.all(
-      targetNames.map(async (host) => {
+      hosts.map(async (host) => {
         const pub = await readFile(`${acceptanceRoot}/host-ssh/${host}.pub`, 'utf8');
         const publicKey = pub.trim().split(/\s+/)[1];
         assert.ok(publicKey, `缺少 ${host} 的 SSH 主机公钥`);
@@ -117,6 +117,30 @@ async function readTargets() {
       }),
     ),
   );
+}
+
+async function registerFlowV2Targets(api, hosts) {
+  const targets = await readTargets(hosts);
+  const credential = await api.post('/credentials', {
+    name: 'Flow V2 isolated fixture SSH key',
+    type: 'SSH_KEY',
+    secret: { privateKey: targets[hosts[0]].privateKey },
+  });
+  const serverIds = {};
+  for (const [host, { username, hostKeyFingerprint }] of Object.entries(targets)) {
+    const endpoint = { host, port: 22 };
+    const probe = await api.post('/servers/host-key/probe', endpoint);
+    assert.equal(probe.fingerprint, hostKeyFingerprint, '隔离主机的 SSH 指纹不匹配');
+    const server = await api.post('/servers', {
+      ...endpoint,
+      name: 'Flow V2 ' + host,
+      username,
+      credentialId: credential.id,
+      hostKeyAcceptanceToken: probe.acceptanceToken,
+    });
+    serverIds[host] = server.id;
+  }
+  return { serverIds };
 }
 
 function projectQuery(path, projectId, criteria = {}) {
@@ -493,12 +517,13 @@ async function verifyBackup(
 async function run() {
   assert.match(revision, /^[0-9a-f]{40}$/);
   assert.equal(fixtureImage, 'busybox:1.36');
-  assert.ok(['acceptance', 'flow-v2', 'preview'].includes(mode ?? 'acceptance'));
+  assert.ok(['acceptance', 'flow-v2', 'flow-v2-image', 'preview'].includes(mode ?? 'acceptance'));
   assert.equal(process.env.DOCKER_HOST, 'unix:///accept/targets/test-a/docker.sock');
   assert.ok(['sqlite', 'postgres'].includes(process.env.DATABASE_CLIENT));
-  const demo = loadDemo('/accept/examples/refactor-stage0/project.yaml');
+  const focused = mode === 'flow-v2' || mode === 'flow-v2-image';
+  const demo = focused ? undefined : loadDemo('/accept/examples/refactor-stage0/project.yaml');
   const gitRoot = acceptanceRoot + '/repo';
-  const source = await prepareDemoRepository(demo, gitRoot);
+  const source = demo && (await prepareDemoRepository(demo, gitRoot));
   if (mode === 'acceptance' || !mode) prepareP2Repository(gitRoot, source);
   const git = serveDemoGit(gitRoot);
   git.listen(8088, '0.0.0.0');
@@ -517,6 +542,20 @@ async function run() {
     if (mode !== 'preview') {
       await api.post('/auth/dismiss-password-reminder');
       assert.equal((await api.get('/auth/me')).passwordChangeRecommended, false);
+    }
+    if (focused) {
+      const targets = mode === 'flow-v2' ? ['test-a', 'test-b'] : ['test-a'];
+      const fixture = await registerFlowV2Targets(api, targets);
+      const evidence = { revision, database: process.env.DATABASE_CLIENT, targets, runs: [] };
+      const execute = createGraphRunner(api, fixture, evidence);
+      const verify = mode === 'flow-v2' ? verifyFlowV2 : verifyFlowV2Image;
+      evidence.flowV2 = await verify({ api, fixture, execute, docker });
+      evidence.projectId = evidence.flowV2.projectId;
+      await writeFile(acceptanceRoot + '/evidence.json', JSON.stringify(evidence, null, 2) + '\n', {
+        flag: 'wx',
+      });
+      console.log('VEYOPS_ACCEPTANCE_FLOW_V2 ' + JSON.stringify(evidence.flowV2));
+      return;
     }
     const demoConfig = {
       call: api.call,
@@ -572,14 +611,6 @@ async function run() {
       runs: [],
     };
     const execute = createGraphRunner(api, fixture, evidence);
-    if (mode === 'flow-v2') {
-      evidence.flowV2 = await verifyFlowV2({ api, fixture, execute });
-      await writeFile(acceptanceRoot + '/evidence.json', JSON.stringify(evidence, null, 2) + '\n', {
-        flag: 'wx',
-      });
-      console.log('VEYOPS_ACCEPTANCE_FLOW_V2 ' + JSON.stringify(evidence.flowV2));
-      return;
-    }
     const manager = await execute(
       'manager-build',
       {},

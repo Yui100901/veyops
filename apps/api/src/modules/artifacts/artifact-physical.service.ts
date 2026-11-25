@@ -618,19 +618,15 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
           return outcome('CHANGED');
         if ((await this.dockerId(target, physical.builderId, signal)) !== physical.engineId)
           return outcome('CHANGED', 'Docker 引擎与登记时不同');
-        const current = await this.image(physical.imageId, target, physical.builderId, signal);
-        if (!current) {
-          const reference = physical.imageReference;
-          const replaced =
-            reference && imageReference.test(reference)
-              ? await this.image(reference, target, physical.builderId, signal)
-              : undefined;
-          return outcome(replaced ? 'CHANGED' : 'MISSING');
-        }
+        const reference = physical.imageReference;
+        if (!reference || !imageReference.test(reference)) return outcome('CHANGED');
+        const current = await this.image(reference, target, physical.builderId, signal);
+        if (!current) return outcome('MISSING', '已登记的镜像引用不存在');
         return outcome(
           current.imageId === physical.imageId && current.platform === physical.platform
             ? 'AVAILABLE'
             : 'CHANGED',
+          current.imageId === physical.imageId ? undefined : '镜像引用已指向不同的 Image ID',
         );
       }
       if (physical.kind === 'DOCKER_IMAGE' || !physical.sha256 || !sha256.test(physical.sha256))

@@ -1,18 +1,22 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { mkdir, readFile, readlink, writeFile } = require('node:fs/promises');
+const { createHash, randomUUID } = require('node:crypto');
+const { watch } = require('node:fs');
+const { mkdir, readFile, readdir, readlink, writeFile } = require('node:fs/promises');
+const { setTimeout: sleep } = require('node:timers/promises');
 const { testTarget } = require('./work-directory-live.cjs');
 
 const originalContent = '<main>VeyOps shared-workspace delivery</main>\n';
 const sourceDirectory = 'nested/flow-v2-source';
 const targetDirectory = '/srv/veyops-stage0/flow-v2';
 const activation = '/accept/targets/test-b/deploy/flow-v2/current';
+const composeSource = ['services:', '  web:', '    image: ${VEYOPS_IMAGE}', ''].join('\n');
 
 function git(...args) {
   return execFileSync('git', args, { encoding: 'utf8', timeout: 15_000 }).trim();
 }
 
-async function repositoryFixture() {
+async function repositoryFixture(nativeImage = false) {
   const worktree = '/accept/flow-v2-source';
   const bare = '/accept/repo/flow-v2-source.git';
   await mkdir(worktree);
@@ -35,6 +39,18 @@ async function repositoryFixture() {
   await writeFile(worktree + '/index.html', originalContent);
   await writeFile(worktree + '/.env.test', 'FIXTURE_ONLY=sample\n');
   await writeFile(worktree + '/source-note.txt', 'Source file outside the release subdirectory\n');
+  if (nativeImage) {
+    await writeFile(
+      worktree + '/Dockerfile',
+      [
+        'FROM busybox:1.36',
+        'COPY index.html /site/index.html',
+        'CMD ["httpd", "-f", "-p", "8080", "-h", "/site"]',
+        '',
+      ].join('\n'),
+    );
+    await writeFile(worktree + '/compose.yaml', composeSource);
+  }
   const sha = commit('Initial fixture');
   await writeFile(worktree + '/index.html', '<main>New branch head</main>\n');
   const nextSha = commit('New unreleased fixture');
@@ -216,4 +232,211 @@ async function verifyFlowV2({ api, fixture, execute }) {
   };
 }
 
-module.exports = { verifyFlowV2 };
+async function verifyComposeActivation(run, image, serverId, directory, docker) {
+  assert.equal(run.releases.length, 1);
+  const [deployment] = run.releases;
+  assert.equal(deployment.status, 'SUCCESS');
+  assert.equal(deployment.serverId, serverId);
+  assert.equal(deployment.artifactId, image.id);
+  assert.equal(deployment.isCurrent, true);
+  const { imageId, template, composeProject, dockerEngineId } = deployment.composeRelease;
+  assert.equal(imageId, image.imageId);
+  assert.equal(dockerEngineId, docker('test-a', 'info', '--format', '{{.ID}}'));
+  assert.equal(template.source, 'ARCHIVE');
+  assert.equal(template.checksum, createHash('sha256').update(composeSource).digest('hex'));
+  assert.equal(await readlink(directory + '/current'), 'releases/' + deployment.taskId);
+  assert.equal(await readFile(directory + '/current/compose.yaml', 'utf8'), composeSource);
+  const container = docker(
+    'test-a',
+    'ps',
+    '--filter',
+    'label=com.docker.compose.project=' + composeProject,
+    '--filter',
+    'label=com.docker.compose.service=web',
+    '--format',
+    '{{.ID}}',
+  );
+  assert.match(container, /^[0-9a-f]{12,64}$/);
+  assert.equal(docker('test-a', 'inspect', '--format', '{{.Image}}', container), imageId);
+  assert.equal(
+    docker('test-a', 'exec', container, 'wget', '-q', '-O', '-', 'http://127.0.0.1:8080/'),
+    originalContent.trim(),
+  );
+  return { deployment, container, composeProject };
+}
+
+async function rejectChangedImage(api, graph, flow, version, plan) {
+  const path = graph + '/flows/' + flow;
+  const response = await api.request('POST', path + '/run', {
+    version,
+    inputs: { parameters: {} },
+    idempotencyKey: randomUUID(),
+    expectedConfigurationHash: plan.configurationHash,
+    expectedPlanSections: plan.planSections,
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    assert.equal(response.status, 409, JSON.stringify(payload));
+    assert.match(payload.error.message, /产物|镜像|配置/);
+    return { status: 'REJECTED', reason: payload.error.message };
+  }
+  const deadline = Date.now() + 3 * 60_000;
+  while (Date.now() < deadline) {
+    const detail = await api.get(graph + '/runs/' + payload.data.id);
+    if (!['QUEUED', 'RUNNING', 'WAITING', 'CANCEL_REQUESTED'].includes(detail.status)) {
+      assert.equal(detail.status, 'FAILED', JSON.stringify(detail.nodes));
+      const failed = detail.nodes.find(
+        ({ type, status }) => type === 'DEPLOY_ARTIFACT' && status === 'FAILED',
+      );
+      assert.ok(failed, JSON.stringify(detail.nodes));
+      return { status: 'FAILED', runId: detail.id, reason: failed.log };
+    }
+    await sleep(500);
+  }
+  assert.fail('Historical replay did not finish after the image tag was changed');
+}
+
+async function verifyFlowV2Image({ api, fixture, execute, docker }) {
+  const source = await repositoryFixture(true);
+  const project = await api.post('/projects', {
+    name: '简化执行流镜像验收',
+    slug: 'flow-v2-image-live',
+  });
+  const projectPath = '/projects/' + project.id;
+  const graph = projectPath + '/execution-graph';
+  const repository = await api.post(projectPath + '/repositories', {
+    name: 'Docker fixture source',
+    cloneUrl: 'http://manager:8088/flow-v2-source.git',
+  });
+  const service = await api.post(projectPath + '/services', {
+    name: 'Flow V2 Compose site',
+    slug: 'flow-v2-compose',
+    serviceType: 'WEB',
+  });
+  const serverId = fixture.serverIds['test-a'];
+  assert.ok(serverId);
+  const directory = '/accept/targets/test-a/deploy/flow-v2-image';
+  const release = {
+    serviceId: service.id,
+    targets: { serverIds: [serverId] },
+    deployPath: '/srv/veyops-stage0/flow-v2-image',
+  };
+  const { canvas, startId } = await api.post(graph + '/draft/templates/expand', {
+    templateId: 'MINIMAL_CI_CD',
+    model: 'FLOW_V2',
+    artifactType: 'DOCKER_IMAGE',
+  });
+  const start = canvas.nodes.find(({ id }) => id === startId);
+  const build = canvas.nodes.find(({ operation }) => operation === 'BUILD');
+  const finish = canvas.nodes.find(({ type }) => type === 'END');
+  start.start = {
+    sources: [
+      {
+        id: 'source',
+        repositoryId: repository.id,
+        ref: { kind: 'BRANCH', value: 'main' },
+        parentDirectory: 'nested',
+      },
+    ],
+    execution: { location: 'TARGET', serverId },
+    release: { ...release, compose: { path: sourceDirectory + '/compose.yaml' } },
+  };
+  build.build = { repoPath: sourceDirectory, dockerfilePath: 'Dockerfile' };
+  finish.finish = { saveWorkspace: true, retention: 'PERSISTENT', requireRelease: 'ACTIVATED' };
+  const version = await publish(api, graph, canvas);
+  const initialRun = await execute(startId, {}, { projectId: project.id, version });
+  assert.equal(initialRun.detail.simplified.sources[0].commitSha, source.sha);
+  assert.deepEqual(initialRun.artifacts.map(({ kind }) => kind).sort(), [
+    'DIRECTORY',
+    'DOCKER_IMAGE',
+  ]);
+  const image = initialRun.artifacts.find(({ kind }) => kind === 'DOCKER_IMAGE');
+  const workspace = initialRun.artifacts.find(({ kind }) => kind === 'DIRECTORY');
+  assert.notEqual(image.id, workspace.id);
+  assert.equal(workspace.physical.collection, 'WORK_DIRECTORY');
+  assert.equal(image.serverId, serverId);
+  assert.equal(image.sourceCommit, source.sha);
+  assert.equal(image.physical.location, 'DOCKER_ENGINE');
+  assert.equal(image.physical.owner, 'MANAGED');
+  assert.match(image.imageId, /^sha256:[a-f0-9]{64}$/);
+  const reference = image.physical.imageReference;
+  assert.match(reference, /^veyops-build\/[a-f0-9-]+:[a-f0-9-]+$/);
+  const inspect = (ref) => docker('test-a', 'image', 'inspect', '--format', '{{.Id}}', ref);
+  assert.equal(inspect(reference), image.imageId);
+  const original = await verifyComposeActivation(initialRun, image, serverId, directory, docker);
+
+  const replay = 'historical-image-release';
+  const deploy = 'historical-image-deploy';
+  const end = 'historical-image-end';
+  canvas.nodes.push(
+    {
+      id: replay,
+      type: 'START',
+      name: '生产镜像重发',
+      start: { release: { ...release, artifactId: image.id } },
+    },
+    {
+      id: deploy,
+      type: 'FUNCTION',
+      operation: 'DEPLOY_ARTIFACT',
+      name: '部署归档镜像',
+      deploy: { method: 'COMPOSE' },
+    },
+    { id: end, type: 'END', name: '核对镜像激活', finish: { requireRelease: 'ACTIVATED' } },
+  );
+  canvas.edges.push({ from: replay, to: deploy }, { from: deploy, to: end });
+  canvas.endpoints.push({ startId: replay, endId: end });
+  const replayVersion = await publish(api, graph, canvas);
+  const plan = await api.post(graph + '/flows/' + replay + '/preview', {
+    version: replayVersion,
+    inputs: { parameters: {} },
+  });
+  assert.equal(plan.simplified.release.artifactId, image.id);
+  const releaseEntries = (await readdir(directory + '/releases')).sort();
+  const unexpectedWrites = [];
+  const changes = watch(directory + '/releases', (event, file) =>
+    unexpectedWrites.push({ event, file }),
+  );
+  let refused;
+  try {
+    const replacement = inspect('busybox:1.36');
+    assert.notEqual(replacement, image.imageId);
+    docker('test-a', 'image', 'tag', replacement, reference);
+    assert.equal(inspect(reference), replacement);
+    assert.equal(inspect(image.imageId), image.imageId);
+    refused = await rejectChangedImage(api, graph, replay, replayVersion, plan);
+    assert.deepEqual((await readdir(directory + '/releases')).sort(), releaseEntries);
+    assert.deepEqual(unexpectedWrites, [], '镜像身份不匹配时发布端目录发生了写入');
+    const stillActive = await verifyComposeActivation(
+      initialRun,
+      image,
+      serverId,
+      directory,
+      docker,
+    );
+    assert.equal(stillActive.container, original.container);
+  } finally {
+    changes.close();
+    docker('test-a', 'image', 'tag', image.imageId, reference);
+  }
+  const replayed = await execute(replay, {}, { projectId: project.id, version: replayVersion });
+  const restored = await verifyComposeActivation(replayed, image, serverId, directory, docker);
+  assert.equal(restored.composeProject, original.composeProject);
+  assert.notEqual(restored.deployment.id, original.deployment.id);
+  return {
+    projectId: project.id,
+    serverId,
+    sourceCommitSha: source.sha,
+    buildRunId: initialRun.detail.id,
+    replayRunId: replayed.detail.id,
+    imageArtifactId: image.id,
+    directoryArtifactId: workspace.id,
+    imageId: image.imageId,
+    composeChecksum: original.deployment.composeRelease.template.checksum,
+    initialDeploymentId: original.deployment.id,
+    replayDeploymentId: restored.deployment.id,
+    changedImageAttempt: refused,
+  };
+}
+
+module.exports = { verifyFlowV2, verifyFlowV2Image };

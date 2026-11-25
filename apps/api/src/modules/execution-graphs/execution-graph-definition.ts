@@ -246,6 +246,7 @@ export class GraphBuildSettings {
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(65536) buildCommand?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(300) outputPath?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(300) dockerfilePath?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsInt() @Min(1) @Max(7200) timeout?: number;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(250) imageRepository?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() registryId?: string;
   @ValidateIf((_o, v) => v !== undefined)

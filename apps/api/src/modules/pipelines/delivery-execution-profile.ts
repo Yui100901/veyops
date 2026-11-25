@@ -2,7 +2,10 @@ import { createHash } from 'node:crypto';
 import type { Transaction } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import type { PipelineDefinition } from './pipeline.types';
-import type { GraphVariableSnapshot } from '../execution-graphs/graph-environment';
+import type {
+  GraphEnvironmentFilePin,
+  GraphVariableSnapshot,
+} from '../execution-graphs/graph-environment';
 
 export type GraphDeliveryConfiguration = {
   method: 'FILE' | 'COMPOSE';
@@ -26,6 +29,7 @@ export interface DeliveryExecutionProfile {
   definition: PipelineDefinition;
   authoredFields: string[];
   graphVariables?: GraphVariableSnapshot;
+  graphReleaseEnvironmentFile?: GraphEnvironmentFilePin;
   artifactRootRunId?: string;
   delivery?: GraphDeliveryConfiguration;
 }
