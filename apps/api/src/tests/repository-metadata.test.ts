@@ -633,7 +633,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   ).body.data;
   const worker = app.get(TaskWorkerService);
   let detail;
-  for (const deadline = Date.now() + 30_000; Date.now() < deadline; ) {
+  for (const deadline = Date.now() + 30_000; Date.now() < deadline;) {
     await worker.tick();
     detail = (await admin.get(graphPath + '/runs/' + run.id).expect(200)).body.data;
     if (['SUCCESS', 'FAILED'].includes(detail.status)) break;
