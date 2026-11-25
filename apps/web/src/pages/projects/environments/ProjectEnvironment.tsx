@@ -14,16 +14,16 @@ export function ProjectEnvironment({
   project,
   environment,
   user,
-  view,
-  viewSearch,
+  origin,
+  originQuery,
   panel,
   graphBack,
 }: {
   project: ProjectDetail;
   environment: Environment;
   user: User;
-  view?: string;
-  viewSearch?: string;
+  origin?: string;
+  originQuery?: string;
   panel?: string;
   graphBack: GraphResourceReturn;
 }) {
@@ -33,8 +33,8 @@ export function ProjectEnvironment({
     '#' +
     projectResourcePath(project.id, {
       ...graphBack,
-      view,
-      viewSearch,
+      origin,
+      originQuery,
       resource: 'environments',
       environmentId: environment.id,
       panel: tab,
@@ -55,7 +55,7 @@ export function ProjectEnvironment({
         <div className="row-actions">
           <a
             className="button secondary small"
-            href={'#' + projectGraphPath(project.id, { view, viewSearch })}
+            href={'#' + projectGraphPath(project.id, { origin, originQuery })}
           >
             打开执行图
           </a>
@@ -63,7 +63,7 @@ export function ProjectEnvironment({
             className="button secondary small"
             href={
               '#' +
-              projectResourcePath(project.id, { resource: 'environment-sets', view, viewSearch })
+              projectResourcePath(project.id, { resource: 'environment-sets', origin, originQuery })
             }
           >
             查看变量集合

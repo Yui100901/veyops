@@ -170,7 +170,10 @@ export function workspaceRecentDeployments(
 
 export async function recentDeployments(
   database: Kysely<Database>,
-  scope: { projectId: string; serviceId?: string; environmentId?: string } | { serverId: string },
+  scope:
+    | { projectId: string; serviceId?: string; environmentId?: string }
+    | { serverId: string }
+    | { serverIds: readonly string[] },
   limit = 20,
 ) {
   let query = deploymentRuns(database).select(summaryColumns);
@@ -179,6 +182,10 @@ export async function recentDeployments(
     if (scope.serviceId) query = query.where('deployment.service_id', '=', scope.serviceId);
     if (scope.environmentId)
       query = query.where('deployment.environment_id', '=', scope.environmentId);
-  } else query = query.where('deployment.server_id', '=', scope.serverId);
+  } else if ('serverId' in scope) query = query.where('deployment.server_id', '=', scope.serverId);
+  else {
+    if (!scope.serverIds.length) return [];
+    query = query.where('deployment.server_id', 'in', scope.serverIds);
+  }
   return query.orderBy('run.created_at', 'desc').orderBy('deployment.id').limit(limit).execute();
 }

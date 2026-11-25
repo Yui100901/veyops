@@ -159,8 +159,8 @@ function RunNodeRecovery({
   const artifactHref =
     '#' +
     deliveryPath(project.id, 'artifacts', {
-      view: scope.view,
-      viewSearch: scope.viewSearch,
+      origin: scope.origin,
+      originQuery: scope.originQuery,
       ...(artifactRefs.length === 1
         ? { recordId: artifactRefs[0]?.id }
         : {
@@ -202,8 +202,8 @@ function RunNodeRecovery({
                 projectResourcePath(project.id, {
                   resource: 'repositories',
                   repositoryId: repository?.id,
-                  view: scope.view,
-                  viewSearch: scope.viewSearch,
+                  origin: scope.origin,
+                  originQuery: scope.originQuery,
                 })
               }
             >
@@ -233,8 +233,8 @@ function RunNodeRecovery({
                     resource: 'environments',
                     environmentId: issue.environmentId,
                     panel: 'targets',
-                    view: scope.view,
-                    viewSearch: scope.viewSearch,
+                    origin: scope.origin,
+                    originQuery: scope.originQuery,
                   })
                 }
               >
@@ -479,8 +479,8 @@ function RunDetails({
   const deliveryScope = {
     serviceId: scope.serviceId,
     environmentId: scope.environmentId,
-    view: scope.view,
-    viewSearch: scope.viewSearch,
+    origin: scope.origin,
+    originQuery: scope.originQuery,
   };
   const nodeHref = (node: string) =>
     '#' + graphWorkbenchPath(projectId, { ...scope, ...delivery, run: item?.id, node });
@@ -614,7 +614,8 @@ function RunDetails({
                           projectResourcePath(projectId, {
                             resource: 'environment-sets',
                             environmentSetId: item.environmentSet.id,
-                            view: scope.view,
+                            origin: scope.origin,
+                            originQuery: scope.originQuery,
                           })
                         }
                       >
@@ -624,7 +625,13 @@ function RunDetails({
                   )}
                   {item.simplified && (
                     <div className="execution-plan">
-                      <SimplifiedPlanDetails plan={item.simplified} project={project} showSources />
+                      <SimplifiedPlanDetails
+                        plan={item.simplified}
+                        project={project}
+                        origin={scope.origin}
+                        originQuery={scope.originQuery}
+                        showSources
+                      />
                     </div>
                   )}
                   <GraphRunResults

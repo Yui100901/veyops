@@ -16,14 +16,18 @@ import {
 import type {
   DeploymentSummary,
   Server,
+  ServerDeployedService,
   ServerDetail,
   ServerGroup,
   ServerProjectReference,
+  ServerReleaseHead,
 } from '../../models';
+import { workspaceOrigin, type EntryOrigin } from '../../workspace-navigation';
 import { ServerPicker } from '../operations/BatchTargets';
 import { ServerMonitoring } from './ServerMonitoring';
 import type { MonitorRow } from './monitoring-data';
 import { graphWorkbenchPath } from '../execution-graph/graph-workbench-context';
+import { deliveryPath, deliveryTaskPath } from '../delivery/delivery-route';
 import { projectResourcePath } from '../projects/project-workspace-route';
 import { readServerResourceLocation, serverResourceHref } from './server-resource-route';
 
@@ -231,9 +235,11 @@ function GroupEditor({
 export function DeploymentHistory({
   rows,
   resolveName,
+  origin,
 }: {
   rows: DeploymentSummary[];
   resolveName?: (row: DeploymentSummary) => string;
+  origin: EntryOrigin;
 }) {
   return rows.length ? (
     <div className="table-scroll">
@@ -250,8 +256,21 @@ export function DeploymentHistory({
           {rows.map((row) => (
             <tr key={row.id}>
               <td>
-                <a className="text-link" href={`#/tasks/${row.taskId}`}>
-                  {resolveName?.(row) || '查看任务'}
+                <a
+                  className="text-link"
+                  href={
+                    '#' +
+                    (row.projectId
+                      ? deliveryPath(row.projectId, 'deployments', {
+                          ...origin,
+                          serviceId: row.serviceId,
+                          serverId: row.serverId,
+                          recordId: row.id,
+                        })
+                      : deliveryTaskPath(row.taskId, 'deployments', origin))
+                  }
+                >
+                  {resolveName?.(row) || '查看记录'}
                 </a>
                 <small className="cell-sub mono" title={row.releaseVersion}>
                   {row.releaseVersion?.slice(0, 12)}
@@ -271,6 +290,107 @@ export function DeploymentHistory({
     </div>
   ) : (
     <p className="mini-empty">暂无部署记录</p>
+  );
+}
+
+function ServerDeployedServices({
+  rows = [],
+  origin,
+}: {
+  rows?: ServerDeployedService[];
+  origin: EntryOrigin;
+}) {
+  function releaseLink(row: ServerDeployedService, release: ServerReleaseHead) {
+    const scope = { ...origin, serverId: row.serverId, serviceId: row.serviceId };
+    return (
+      '#' +
+      (release.deploymentRecordId
+        ? deliveryPath(row.projectId, 'deployments', {
+            ...scope,
+            recordId: release.deploymentRecordId,
+          })
+        : deliveryTaskPath(release.releaseTaskId, 'deployments', scope))
+    );
+  }
+  return (
+    <section>
+      <h3 className="field-title">已部署服务</h3>
+      {rows.length ? (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>项目与服务</th>
+                <th>实际目标与发布范围</th>
+                <th>当前版本</th>
+                <th>最近尝试</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={JSON.stringify([row.serviceId, row.serverId, row.scopeKey])}>
+                  <td>
+                    <a
+                      className="text-link"
+                      href={
+                        '#' +
+                        projectResourcePath(row.projectId, {
+                          ...origin,
+                          resource: 'services',
+                          serviceId: row.serviceId,
+                        })
+                      }
+                    >
+                      {row.serviceName}
+                    </a>
+                    <small className="cell-sub">{row.projectName}</small>
+                  </td>
+                  <td>
+                    <a className="text-link" href={serverResourceHref({ serverId: row.serverId })}>
+                      {row.serverName ?? row.serverId}
+                    </a>
+                    <small className="cell-sub">
+                      {row.location
+                        ? (row.method === 'COMPOSE' ? 'Docker Compose · ' : '文件 · ') +
+                          row.location
+                        : (row.current.environmentName ?? '交付范围未登记')}
+                    </small>
+                  </td>
+                  <td>
+                    <a className="text-link" href={releaseLink(row, row.current)}>
+                      {row.current.releaseVersion?.slice(0, 12) || '查看当前版本'}
+                    </a>
+                    <div className="tags">
+                      <Status value={row.current.status} />
+                      <Status
+                        value={
+                          row.current.healthStatus === 'UNKNOWN' && row.current.healthObservedAt
+                            ? '健康未知'
+                            : (row.current.healthStatus ?? 'NOT_CHECKED')
+                        }
+                      />
+                    </div>
+                  </td>
+                  <td>
+                    <a className="text-link" href={releaseLink(row, row.latestAttempt)}>
+                      <Status value={row.latestAttempt.status} />
+                    </a>
+                    <small className="cell-sub">
+                      {formatTime(row.latestAttempt.finishedAt ?? row.latestAttempt.startedAt)}
+                    </small>
+                    {row.latestAttempt.errorSummary && (
+                      <small className="cell-sub">{row.latestAttempt.errorSummary}</small>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="mini-empty">暂无已激活的服务。</p>
+      )}
+    </section>
   );
 }
 
@@ -332,6 +452,7 @@ export function ServerGroupOverview({
   search?: string;
 }) {
   const { projectId, returnPath } = readServerResourceLocation(search);
+  const origin = workspaceOrigin('servers', new URLSearchParams({ groupId: group.id }).toString());
   return (
     <InlineEditor title={group.name} description={group.description} onClose={onClose} wide>
       <div className="form-body">
@@ -353,6 +474,13 @@ export function ServerGroupOverview({
         )}
         <h3 className="field-title">项目引用</h3>
         <ServerProjectReferences projects={group.projects} />
+        <ServerDeployedServices rows={group.deployedServices} origin={origin} />
+        <h3 className="field-title">最近部署</h3>
+        <DeploymentHistory
+          rows={group.recentDeployments ?? []}
+          resolveName={(row) => servers.find(({ id }) => row.serverId === id)?.name ?? '查看记录'}
+          origin={origin}
+        />
       </div>
     </InlineEditor>
   );
@@ -376,6 +504,7 @@ export function ServerOverview({
   onAuthorizationChange: () => void;
 }) {
   const entry = server;
+  const origin = workspaceOrigin('servers', new URLSearchParams({ serverId: entry.id }).toString());
   const [metrics, setMetrics] = useState(initialMetrics);
   const [authorizationBusy, setAuthorizationBusy] = useState(false);
   const [authorizationError, setAuthorizationError] = useState('');
@@ -452,6 +581,7 @@ export function ServerOverview({
             </div>
             <h3 className="field-title">项目引用</h3>
             <ServerProjectReferences projects={entry.projects} />
+            <ServerDeployedServices rows={entry.deployedServices} origin={origin} />
             <h3 className="field-title">连接检测</h3>
             {entry.probeHistory?.length ? (
               <div className="table-scroll">
@@ -522,7 +652,7 @@ export function ServerOverview({
               <p className="mini-empty">暂无命令记录</p>
             )}
             <h3 className="field-title">最近部署</h3>
-            <DeploymentHistory rows={entry.recentDeployments ?? []} />
+            <DeploymentHistory rows={entry.recentDeployments ?? []} origin={origin} />
           </>
         )}
       </div>

@@ -2,8 +2,12 @@ import { sql, type Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import { redactTaskLog } from '../tasks/task-log.service';
 
-export async function serviceDeliveryHeads(database: Kysely<Database>, serviceIds: string[]) {
-  if (!serviceIds.length) return [];
+export async function serviceDeliveryHeads(
+  database: Kysely<Database>,
+  serviceIds: readonly string[] | undefined,
+  serverIds?: readonly string[],
+) {
+  if (serviceIds?.length === 0 || serverIds?.length === 0 || (!serviceIds && !serverIds)) return [];
   const records = database
     .selectFrom('deployment_records as record')
     .innerJoin('pipeline_runs as run', 'run.id', 'record.pipeline_run_id')
@@ -33,7 +37,8 @@ export async function serviceDeliveryHeads(database: Kysely<Database>, serviceId
       'target.error_summary as errorSummary',
     ])
     .where('record.server_id', 'is not', null)
-    .where('record.service_id', 'in', serviceIds);
+    .$if(Boolean(serviceIds), (query) => query.where('record.service_id', 'in', serviceIds!))
+    .$if(Boolean(serverIds), (query) => query.where('record.server_id', 'in', serverIds!));
 
   const fields = [
     'id',
@@ -111,7 +116,8 @@ export async function serviceDeliveryHeads(database: Kysely<Database>, serviceId
           'target.release_scope_key as scopeKey',
           'target.error_summary as errorSummary',
         ])
-        .where('run.service_id', 'in', serviceIds)
+        .$if(Boolean(serviceIds), (query) => query.where('run.service_id', 'in', serviceIds!))
+        .$if(Boolean(serverIds), (query) => query.where('target.server_id', 'in', serverIds!))
         .where('target.server_id', 'is not', null)
         .where('target.release_scope_key', 'is not', null)
         .where('target.started_at', 'is not', null)
@@ -222,6 +228,44 @@ export async function serviceDeliveryHeads(database: Kysely<Database>, serviceId
 
 export async function serviceDeliveryStatus(database: Kysely<Database>, serviceId: string) {
   const heads = await serviceDeliveryHeads(database, [serviceId]);
+  return deliveryDetails(database, heads);
+}
+
+export async function deployedServicesForServers(
+  database: Kysely<Database>,
+  serverIds: readonly string[],
+) {
+  const heads = (await serviceDeliveryHeads(database, undefined, [...new Set(serverIds)])).filter(
+    ({ current }) => current !== null,
+  );
+  if (!heads.length) return [];
+  const [services, details] = await Promise.all([
+    database
+      .selectFrom('services as service')
+      .innerJoin('projects as project', 'project.id', 'service.project_id')
+      .select([
+        'service.id as serviceId',
+        'service.name as serviceName',
+        'project.id as projectId',
+        'project.name as projectName',
+      ])
+      .where('service.id', 'in', [...new Set(heads.map(({ serviceId }) => serviceId))])
+      .where('service.archived_at', 'is', null)
+      .where('project.deleted_at', 'is', null)
+      .execute(),
+    deliveryDetails(database, heads),
+  ]);
+  const byService = new Map(services.map((service) => [service.serviceId, service]));
+  return details.flatMap((detail) => {
+    const service = byService.get(detail.serviceId);
+    return service && detail.current ? [{ ...detail, ...service, current: detail.current }] : [];
+  });
+}
+
+async function deliveryDetails(
+  database: Kysely<Database>,
+  heads: Awaited<ReturnType<typeof serviceDeliveryHeads>>,
+) {
   if (!heads.length) return [];
   const releases = heads.flatMap(({ current, latestAttempt }) =>
     current ? [current, latestAttempt] : [latestAttempt],
@@ -329,4 +373,18 @@ function releaseLocation(scopeKey: string) {
     return {};
   }
   return {};
+}
+const abnormalHealth = new Set(['FAILED', 'UNHEALTHY', 'UNKNOWN']);
+const abnormalResults = new Set(['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION']);
+
+export function serviceDeliveryAbnormal(target: {
+  current: string | null;
+  health: string | null;
+  lastAttempt: string;
+}) {
+  return (
+    abnormalResults.has(target.current ?? '') ||
+    abnormalHealth.has(target.health ?? '') ||
+    abnormalResults.has(target.lastAttempt)
+  );
 }

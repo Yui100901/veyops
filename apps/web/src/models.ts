@@ -58,6 +58,33 @@ export interface ServerGroup {
   description?: string;
   serverIds: string[];
   projects?: ServerProjectReference[];
+  deployedServices?: ServerDeployedService[];
+  recentDeployments?: DeploymentSummary[];
+}
+export interface ServerDeployedService {
+  projectId: string;
+  projectName: string;
+  serviceId: string;
+  serviceName: string;
+  serverId: string;
+  serverName: string | null;
+  scopeKey: string;
+  method?: 'FILE' | 'COMPOSE';
+  location?: string;
+  current: ServerReleaseHead;
+  latestAttempt: ServerReleaseHead;
+}
+export interface ServerReleaseHead {
+  status: string;
+  healthStatus: string | null;
+  healthObservedAt: number | null;
+  environmentName: string | null;
+  releaseVersion?: string | null;
+  deploymentRecordId: string | null;
+  releaseTaskId: string;
+  startedAt: number;
+  finishedAt: number | null;
+  errorSummary: string | null;
 }
 export interface ServerProjectReference extends Pick<Project, 'id' | 'name' | 'slug'> {
   references?: {
@@ -143,6 +170,7 @@ export interface ServerDetail extends Server {
   groups: Pick<ServerGroup, 'id' | 'name'>[];
   projects: ServerProjectReference[];
   recentDeployments: DeploymentSummary[];
+  deployedServices: ServerDeployedService[];
   recentCommands: {
     id: string;
     taskId: string;

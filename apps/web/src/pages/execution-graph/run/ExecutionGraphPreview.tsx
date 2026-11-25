@@ -727,10 +727,14 @@ function previewGates(preview: Preview): NonNullable<Preview['gates']> {
 export function SimplifiedPlanDetails({
   plan,
   project,
+  origin,
+  originQuery,
   showSources = false,
 }: {
   plan: SimplifiedPublicPlan;
   project: ProjectDetail;
+  origin?: string;
+  originQuery?: string;
   showSources?: boolean;
 }) {
   const release = plan.release;
@@ -780,7 +784,12 @@ export function SimplifiedPlanDetails({
                 <a
                   className="text-link"
                   href={
-                    '#' + deliveryPath(project.id, 'artifacts', { recordId: release.artifactId })
+                    '#' +
+                    deliveryPath(project.id, 'artifacts', {
+                      recordId: release.artifactId,
+                      origin,
+                      originQuery,
+                    })
                   }
                 >
                   <code>{release.artifactId}</code>
@@ -849,7 +858,14 @@ export function SimplifiedPlanDetails({
             <div key={artifact.id} className="execution-plan-row">
               <a
                 className="text-link"
-                href={'#' + deliveryPath(project.id, 'artifacts', { recordId: artifact.id })}
+                href={
+                  '#' +
+                  deliveryPath(project.id, 'artifacts', {
+                    recordId: artifact.id,
+                    origin,
+                    originQuery,
+                  })
+                }
               >
                 {artifact.name} · {artifactKindLabel(artifact.kind)}
               </a>
@@ -881,12 +897,14 @@ export function ExecutionPlan({
   preview,
   project,
   returnPath,
-  view,
+  origin,
+  originQuery,
 }: {
   preview: Preview;
   project: ProjectDetail;
   returnPath?: string;
-  view?: string;
+  origin?: string;
+  originQuery?: string;
 }) {
   const plan = preview.executionPlan;
   const name = names({ project, preview });
@@ -894,7 +912,14 @@ export function ExecutionPlan({
   const releaseSteps = previewGates(preview);
   return (
     <div className="execution-plan">
-      {preview.simplified && <SimplifiedPlanDetails plan={preview.simplified} project={project} />}
+      {preview.simplified && (
+        <SimplifiedPlanDetails
+          plan={preview.simplified}
+          project={project}
+          origin={origin}
+          originQuery={originQuery}
+        />
+      )}
       <section>
         <h4>入口变量集合</h4>
         {preview.environmentSet ? (
@@ -905,7 +930,8 @@ export function ExecutionPlan({
               projectResourcePath(project.id, {
                 resource: 'environment-sets',
                 environmentSetId: preview.environmentSet.id,
-                view,
+                origin,
+                originQuery,
               })
             }
           >
@@ -925,7 +951,8 @@ export function ExecutionPlan({
                 href={
                   '#' +
                   graphWorkbenchPath(project.id, {
-                    view,
+                    origin,
+                    originQuery,
                     pane: 'published',
                     version: preview.version,
                     flow: gate.flowId,
@@ -1266,7 +1293,10 @@ export function ExecutionPlan({
                     <a
                       key={serverId}
                       className="text-link"
-                      href={'#' + deliveryPath(project.id, 'deployments', { recordId, view })}
+                      href={
+                        '#' +
+                        deliveryPath(project.id, 'deployments', { recordId, origin, originQuery })
+                      }
                     >
                       {plan?.targets
                         .flatMap(({ servers }) => servers)

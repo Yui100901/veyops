@@ -26,8 +26,8 @@ const resourcePanels = [
 export type GraphWorkbenchScope = {
   serviceId?: string;
   environmentId?: string;
-  view?: string;
-  viewSearch?: string;
+  origin?: string;
+  originQuery?: string;
   resourcePanel?: (typeof resourcePanels)[number];
 };
 export type GraphPane = 'run' | 'draft' | 'published' | 'history';

@@ -4,6 +4,7 @@ import { Boxes, FolderGit2, GitFork, Settings2 } from 'lucide-react';
 import { useResource } from '../../api';
 import { ErrorBanner, Loading, PageHeader } from '../../components';
 import type { ProjectDetail, User } from '../../models';
+import { workspaceBackLink } from '../../workspace-navigation';
 import type { GraphRunDrafts } from '../execution-graph/run/ExecutionGraphRun';
 import { ProjectConfiguration } from './settings/ProjectConfiguration';
 import { ProjectDelivery } from './delivery/ProjectDelivery';
@@ -26,20 +27,18 @@ export function ProjectWorkspace({
     `/projects/${id}${entry === 'artifacts' || entry === 'graph' ? '/delivery-context' : ''}`,
   );
   const project = projectResource.data;
-  const backPath = location.view
-    ? `/views/${location.view}${location.viewSearch ? '?' + location.viewSearch : ''}`
-    : '/projects';
+  const back = workspaceBackLink(location);
   const scope = {
-    view: location.view,
-    viewSearch: location.viewSearch,
+    origin: location.origin,
+    originQuery: location.originQuery,
     serviceId: location.serviceId,
     environmentId: location.environmentId,
   };
   const title = project?.name || '项目工作台';
   return (
     <div className="project-workspace">
-      <a href={'#' + backPath} className="back-link">
-        {location.view ? '← 返回项目视图' : '← 返回项目列表'}
+      <a href={'#' + back.path} className="back-link">
+        ← 返回{back.label}
       </a>
       <PageHeader
         eyebrow={project?.slug.toUpperCase() ?? '项目'}
@@ -93,7 +92,7 @@ export function ProjectWorkspace({
           project={project}
           user={user}
           onSaved={projectResource.reload}
-          backPath={backPath}
+          backPath={back.path}
         />
       ) : (
         <ProjectResources

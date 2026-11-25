@@ -29,6 +29,8 @@ import { Roles } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { lockProjectGraph } from '../projects/project-guards';
 import { targetProjectReferences } from '../projects/project-resource-references';
+import { deployedServicesForServers } from '../deployments/service-delivery-status';
+import { recentDeployments } from '../deployments/deployment-history';
 import {
   assertProjectResourceRemovable,
   unavailableReference,
@@ -81,7 +83,12 @@ class ServerGroupsController {
       this.members(id),
       targetProjectReferences(this.database.db, 'SERVER_GROUP', id),
     ]);
-    return { ...group, serverIds: members.map(({ server_id }) => server_id), projects };
+    const serverIds = members.map(({ server_id }) => server_id);
+    const [deployedServices, deployments] = await Promise.all([
+      deployedServicesForServers(this.database.db, serverIds),
+      recentDeployments(this.database.db, { serverIds }),
+    ]);
+    return { ...group, serverIds, projects, deployedServices, recentDeployments: deployments };
   }
   @Get(':id/project-references') async projectReferences(@Param('id', ParseUUIDPipe) id: string) {
     await this.group(id);

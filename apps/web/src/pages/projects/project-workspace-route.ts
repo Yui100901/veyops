@@ -1,4 +1,5 @@
 import { deliveryPath, deliveryTabs, type DeliveryTab } from '../delivery/delivery-route';
+import { readWorkspaceOrigin } from '../../workspace-navigation';
 import {
   graphResourcePanel,
   graphWorkbenchPath,
@@ -24,8 +25,8 @@ export type ResourceKind = keyof typeof projectResources | 'environments';
 export type ProjectScope = {
   serviceId?: string;
   environmentId?: string;
-  view?: string;
-  viewSearch?: string;
+  origin?: string;
+  originQuery?: string;
 };
 export type GraphResourceReturn = {
   graphPane?: GraphPane;
@@ -64,8 +65,8 @@ export function graphSetupResourceHref(
     '#' +
     projectResourcePath(id, {
       ...destination,
-      view: origin.view,
-      viewSearch: origin.viewSearch,
+      origin: origin.origin,
+      originQuery: origin.originQuery,
       graphPane: 'run',
       graphVersion: origin.version?.toString(),
       graphStart: origin.start,
@@ -80,15 +81,15 @@ export function graphSetupResourceHref(
 export function graphResourceReturnHref(
   id: string,
   context: GraphResourceReturn,
-  view?: string,
-  viewSearch?: string,
+  origin?: string,
+  originQuery?: string,
 ) {
   const version = Number(context.graphVersion);
   return (
     '#' +
     graphWorkbenchPath(id, {
-      view,
-      viewSearch,
+      origin,
+      originQuery,
       pane: context.graphPane,
       version: Number.isSafeInteger(version) && version > 0 ? version : undefined,
       node: context.graphNode,
@@ -116,17 +117,10 @@ export function readProjectWorkspace(path: string, search?: string) {
   if (!match) return;
   const [, id, section] = match;
   const params = new URLSearchParams(search);
-  const rawView = params.get('view') ?? '';
-  const viewSearch = new URLSearchParams(params.get('viewSearch') ?? '');
-  for (const [key, value] of [...viewSearch]) {
-    if (!['serviceId', 'serverId', 'groupId'].includes(key) || !/^[\w-]+$/.test(value))
-      viewSearch.delete(key);
-  }
   const scope: ProjectScope = {
-    view: /^(all|production|testing|abnormal|[a-f0-9-]{36})$/.test(rawView) ? rawView : undefined,
+    ...readWorkspaceOrigin(params),
     serviceId: params.get('serviceId') || undefined,
     environmentId: params.get('environmentId') || undefined,
-    viewSearch: viewSearch.size ? viewSearch.toString() : undefined,
   };
   const rawResource = params.get('resource') ?? '';
   const legacyConfig = params.get('section') === 'deployment';
@@ -172,8 +166,8 @@ export function projectEntryPath(id: string, entry: Entry, scope: ProjectScope) 
   if (entry === 'artifacts') return deliveryPath(id, 'artifacts', scope);
   if (entry === 'configuration') {
     const params = new URLSearchParams();
-    if (scope.view) params.set('view', scope.view);
-    if (scope.viewSearch) params.set('viewSearch', scope.viewSearch);
+    if (scope.origin) params.set('origin', scope.origin);
+    if (scope.originQuery) params.set('originQuery', scope.originQuery);
     return `/projects/${encodeURIComponent(id)}/configuration${params.size ? '?' + params : ''}`;
   }
   return projectResourcePath(id, {

@@ -205,7 +205,8 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
   const deliveryScope = {
     serviceId: value.serviceId,
     environmentId: value.environmentId,
-    view: scope.view,
+    origin: scope.origin,
+    originQuery: scope.originQuery,
   };
   const returnToDelivery = value.projectId && deliveryTaskReturn(value.projectId, search);
   const analysis = value.result?.aiAnalysis;

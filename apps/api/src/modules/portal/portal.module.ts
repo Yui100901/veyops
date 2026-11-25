@@ -8,9 +8,10 @@ import {
   ParseUUIDPipe,
   Query,
 } from '@nestjs/common';
-import { IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
+import { IsIn, IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
 import { DatabaseService } from '../../core/database/database.service';
 import {
+  serviceDeliveryAbnormal,
   serviceDeliveryHeads,
   serviceDeliveryStatus,
 } from '../deployments/service-delivery-status';
@@ -21,6 +22,7 @@ class PortalQuery {
   @IsOptional() @IsString() @MaxLength(64) tag?: string;
   @IsOptional() @IsUUID() projectId?: string;
   @IsOptional() @IsUUID() serviceId?: string;
+  @IsOptional() @IsIn(['true', 'false']) abnormal?: 'true' | 'false';
 }
 
 @Injectable()
@@ -110,13 +112,16 @@ export class PortalService {
       else byDelivery.set(serviceId, [summary]);
     }
     return {
-      projects: projects.map((project) => ({
-        ...project,
-        services: project.services.map((service) => ({
-          ...service,
-          targets: byDelivery.get(service.id) ?? [],
-        })),
-      })),
+      projects: projects.flatMap((project) => {
+        const services = project.services.flatMap((service) => {
+          const targets = byDelivery.get(service.id) ?? [];
+          const abnormal = targets.some(serviceDeliveryAbnormal);
+          return filters.abnormal === 'true' && !abnormal
+            ? []
+            : [{ ...service, targets, abnormal }];
+        });
+        return filters.abnormal === 'true' && !services.length ? [] : [{ ...project, services }];
+      }),
       tags: [...tags].sort((left, right) => left.localeCompare(right)),
     };
   }

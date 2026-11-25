@@ -241,19 +241,13 @@
 
 自动执行有外部影响的节点时，入口类型须在 API 和执行器进程的 `VEYOPS_AUTO_DELIVERY_TRIGGERS` 中放行。通过 `PATCH /servers/:id/automatic-execution` 提交 `{enabled:true}` 为已验证 SSH 身份的目标授权。目标端使用私有工作目录，管理端运行器使用 `WEBHOOK_BUILD_DOCKER_SOCKET`。发布继续执行已配置的审批、资源权限和产物校验。
 
-## 项目视图
+## 服务门户、项目发布和服务器
 
-| 方法   | 路径       | 请求 / 说明                                                                |
-| ------ | ---------- | -------------------------------------------------------------------------- |
-| GET    | /views     | 返回 `{views,defaultViewId}`，包含全部项目、异常项目及当前账号的自定义视图 |
-| GET    | /views/:id | 返回视图详情、排序后的项目、各项目的服务、发布状态、近期发布和访问地址     |
-| POST   | /views     | `{name,description?,projectIds,isDefault?}`，`projectIds` 的顺序即显示顺序 |
-| PATCH  | /views/:id | 使用同一请求结构更新自定义视图与项目列表                                   |
-| DELETE | /views/:id | 删除当前账号的自定义视图                                                   |
+`GET /portal` 接受 `q`、`tag`、`projectId`、`serviceId` 和 `abnormal=true`。异常按服务过滤。当前版本和最近一次发布尝试分别返回，例如当前健康与最近发布失败可以同时存在。健康检查失败、待核查和首次发布失败均计入异常。未检测、未发布、执行中或取消独立展示。
 
-预设 ID 为 `all`、`abnormal`。详情可用 `serviceId`、`serverId` 或 `groupId` 筛选。`serverId` 和 `groupId` 二选一，分组按当前启用成员展开。目标筛选考虑项目引用和实际部署，发布记录按所选服务和服务器过滤。发布状态按同一项目、服务和实际服务器的最新部署判断。未经健康验证的成功发布显示为待验证。
+`GET /projects?include=addresses` 返回活动项目和有序服务地址。`GET /delivery-flows` 返回按项目分组的草稿及当前已发布执行流，带草稿存在、未发布修改和最近运行信息。项目卡片的快捷运行提交所显示的版本及幂等键。
 
-所有登录角色均可读取预设。管理员或运维人员可保存和设置自己的自定义视图为默认。无自定义默认时打开「全部项目」。设为默认会替换当前账号的旧默认，删除视图只移除它和项目的关联。
+`GET /servers/:id` 和 `GET /server-groups/:id` 的 `deployedServices` 按项目服务、实际服务器和发布范围提供当前版本及最近尝试。分组查询使用当前启用成员。只有失败尝试的服务可从原发布记录或门户异常入口查看。
 
 ## 系统运行设置
 

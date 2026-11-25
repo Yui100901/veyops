@@ -1,10 +1,15 @@
 .portal-filters {
   display: grid;
-  grid-template-columns: minmax(12rem, 2fr) minmax(9rem, 1fr) auto;
+  grid-template-columns: minmax(11rem, 2fr) minmax(8rem, 1fr) auto auto;
   gap: 0.85rem;
   align-items: end;
   padding: 1rem;
   margin-bottom: 1rem;
+}
+
+.portal-filters .checkbox-row {
+  min-height: 36px;
+  white-space: nowrap;
 }
 
 .portal-projects,
@@ -46,7 +51,7 @@
   list-style: none;
 }
 
-@media (max-width: 720px) {
+@media (max-width: 800px) {
   .portal-filters {
     grid-template-columns: minmax(0, 1fr);
   }

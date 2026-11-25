@@ -80,8 +80,8 @@ function recordHref(
   return (
     '#' +
     deliveryPath(projectId, tab, {
-      view: deliveryScope.view,
-      viewSearch: deliveryScope.viewSearch,
+      origin: deliveryScope.origin,
+      originQuery: deliveryScope.originQuery,
       recordId,
     })
   );
@@ -131,8 +131,8 @@ export function ExecutionGraphReviewScope({
                         projectResourcePath(projectId, {
                           resource: 'repositories',
                           repositoryId,
-                          view: deliveryScope.view ?? undefined,
-                          viewSearch: deliveryScope.viewSearch ?? undefined,
+                          origin: deliveryScope.origin ?? undefined,
+                          originQuery: deliveryScope.originQuery ?? undefined,
                         })
                       }
                     >
@@ -165,8 +165,8 @@ export function ExecutionGraphReviewScope({
                   projectResourcePath(projectId, {
                     resource: 'services',
                     serviceId: review.serviceId,
-                    view: deliveryScope.view ?? undefined,
-                    viewSearch: deliveryScope.viewSearch ?? undefined,
+                    origin: deliveryScope.origin ?? undefined,
+                    originQuery: deliveryScope.originQuery ?? undefined,
                   })
                 }
               >

@@ -50,11 +50,6 @@ const ProjectWorkspace = lazy(() =>
     default: ProjectWorkspace,
   })),
 );
-const ProjectViewsPage = lazy(() =>
-  import('./pages/projects/ProjectViews').then(({ ProjectViewsPage }) => ({
-    default: ProjectViewsPage,
-  })),
-);
 const SystemPage = lazy(() =>
   import('./pages/settings/System').then(({ SystemPage }) => ({ default: SystemPage })),
 );
@@ -70,35 +65,25 @@ const OperationsCenterPage = lazy(() =>
   })),
 );
 const ServicePortal = lazy(() =>
-  import('./pages/projects/ServicePortal').then(({ ServicePortal }) => ({ default: ServicePortal })),
+  import('./pages/projects/ServicePortal').then(({ ServicePortal }) => ({
+    default: ServicePortal,
+  })),
 );
-const BuildsPortal = lazy(() =>
-  import('./pages/execution-graph/BuildsPortal').then(({ BuildsPortal }) => ({ default: BuildsPortal })),
-);
-
 const navigation = [
-  {
-    label: '工作台',
-    items: [
-      { path: '/portal', name: '服务门户', icon: LayoutGrid },
-      { path: '/builds', name: '构建发布', icon: FolderGit2 },
-      { path: '/operations', name: '运维命令', icon: Terminal },
-      { path: '/tasks', name: '任务中心', icon: ListTodo },
-    ],
-  },
-  {
-    label: '平台管理',
-    items: [
-      { path: '/projects', name: '项目管理', icon: FolderGit2 },
-      { path: '/views', name: '项目视图', icon: LayoutGrid },
-      { path: '/servers', name: '服务器', icon: Server },
-      { path: '/overview', name: '平台概览', icon: LayoutDashboard },
-      { path: '/registries', name: '镜像仓库', icon: Boxes },
-      { path: '/credentials', name: '凭据中心', icon: KeyRound },
-      { path: '/audit', name: '操作审计', icon: FileClock },
-      { path: '/settings', name: '系统设置', icon: Settings2 },
-    ],
-  },
+  { path: '/portal', name: '服务门户', icon: LayoutGrid },
+  { path: '/projects', name: '项目发布', icon: FolderGit2 },
+  { path: '/operations', name: '运维命令', icon: Terminal },
+  { path: '/tasks', name: '任务中心', icon: ListTodo },
+  { path: '/servers', name: '服务器', icon: Server },
+  { path: '/platform', name: '平台管理', icon: Settings2 },
+];
+
+const platformPages = [
+  { path: '/overview', name: '平台概览', icon: LayoutDashboard },
+  { path: '/credentials', name: '凭据中心', icon: KeyRound },
+  { path: '/registries', name: '镜像仓库', icon: Boxes },
+  { path: '/audit', name: '操作审计', icon: FileClock },
+  { path: '/settings', name: '系统设置', icon: Settings2 },
 ];
 
 const routeTitles: Record<string, string> = {
@@ -112,6 +97,25 @@ const routeTitles: Record<string, string> = {
   '/ai': 'AI 助手',
   '/notifications': '通知',
 };
+
+function Redirect({ path }: { path: string }) {
+  useEffect(() => {
+    window.location.replace('#' + path);
+  }, [path]);
+  return <Loading />;
+}
+
+function PlatformNavigation({ selected }: { selected: string }) {
+  return (
+    <nav className="resource-section-switcher platform-page-nav" aria-label="平台管理">
+      {platformPages.map(({ path, name, icon: Icon }) => (
+        <a key={path} href={'#' + path} aria-current={path === selected ? 'page' : undefined}>
+          <Icon size={17} aria-hidden="true" /> {name}
+        </a>
+      ))}
+    </nav>
+  );
+}
 
 function Brand({ inverse = false }: { inverse?: boolean }) {
   return (
@@ -530,24 +534,37 @@ export function App() {
   );
   if (user.mustChangePassword || user.passwordChangeRecommended) return changePassword;
   const operationsTab = operationsTabForPath(routePath);
-  const navigationPath = operationsTab ? '/operations' : routePath === '/' ? '/portal' : routePath;
-  const current = navigation
-    .flatMap((group) => group.items)
-    .find((item) => navigationPath === item.path || navigationPath.startsWith(item.path + '/'));
+  const platformPage =
+    routePath === '/platform'
+      ? platformPages[0]
+      : platformPages.find(({ path }) => routePath === path || routePath.startsWith(path + '/'));
+  const navigationPath = platformPage
+    ? '/platform'
+    : operationsTab
+      ? '/operations'
+      : routePath === '/'
+        ? '/portal'
+        : routePath === '/targets'
+          ? '/servers'
+          : routePath;
+  const current = navigation.find(
+    (item) => navigationPath === item.path || navigationPath.startsWith(item.path + '/'),
+  );
   let page;
   if (routePath === '/' || routePath === '/portal')
     page = <ServicePortal key={route} search={routeSearch} />;
-  else if (routePath === '/builds') page = <BuildsPortal user={user} />;
-  else if (routePath === '/overview') page = <DashboardPage />;
+  else if (routePath === '/builds')
+    page = <Redirect path={'/projects' + (routeSearch ? '?' + routeSearch : '')} />;
+  else if (routePath === '/platform' || routePath === '/overview') page = <DashboardPage />;
   else if (routePath === '/servers' || routePath === '/targets')
     page = <ServersPage user={user} search={routeSearch} />;
-  else if (route === '/credentials') page = <CredentialsPage user={user} />;
-  else if (route === '/projects') page = <ProjectsPage user={user} />;
+  else if (routePath === '/credentials') page = <CredentialsPage user={user} />;
+  else if (routePath === '/projects') page = <ProjectsPage user={user} search={routeSearch} />;
   else if (projectRoute)
     page = <ProjectWorkspace key={projectRoute.id} route={projectRoute} user={user} />;
   else if (routePath === '/views' || routePath.startsWith('/views/'))
     page = (
-      <ProjectViewsPage user={user} id={routePath.slice(7) || undefined} search={routeSearch} />
+      <Redirect path={routePath === '/views/abnormal' ? '/portal?abnormal=true' : '/portal'} />
     );
   else if (
     (routeRoot === 'artifacts' || routeRoot === 'deployments') &&
@@ -562,13 +579,13 @@ export function App() {
     page = <DeliveryRecordsPage key={route} type="artifacts" user={user} />;
   else if (routePath === '/deployments')
     page = <DeliveryRecordsPage key={route} type="deployments" user={user} />;
-  else if (route === '/registries') page = <RegistriesPage user={user} />;
+  else if (routePath === '/registries') page = <RegistriesPage user={user} />;
   else if (operationsTab) page = <OperationsCenterPage tab={operationsTab} user={user} />;
-  else if (route === '/tasks') page = <TasksPage />;
+  else if (routePath === '/tasks') page = <TasksPage />;
   else if (route.startsWith('/tasks/'))
     page = <TaskPage key={route} id={routePath.slice(7)} user={user} search={routeSearch} />;
-  else if (route === '/audit') page = <AuditPage />;
-  else if (route === '/settings') page = <SystemPage user={user} />;
+  else if (routePath === '/audit') page = <AuditPage />;
+  else if (routePath === '/settings') page = <SystemPage user={user} />;
   else if (routePath === '/settings/backups') page = <BackupsPage user={user} />;
   else if (routePath === '/settings/users') page = <UsersPage user={user} />;
   else if (routePath === '/settings/smtp') page = <NotificationSmtpPage user={user} />;
@@ -601,22 +618,17 @@ export function App() {
             <small>个人 / 单团队</small>
           </span>
         </div>
-        <nav aria-label="主导航">
-          {navigation.map((group) => (
-            <div className="nav-group" key={group.label}>
-              <div className="nav-label">{group.label}</div>
-              {group.items.map((item) => (
-                <a
-                  href={`#${item.path}`}
-                  key={item.path}
-                  className={item === current ? 'active' : ''}
-                  aria-current={item === current ? 'page' : undefined}
-                >
-                  <item.icon size={18} />
-                  <span>{item.name}</span>
-                </a>
-              ))}
-            </div>
+        <nav className="nav-group" aria-label="主导航">
+          {navigation.map((item) => (
+            <a
+              href={`#${item.path}`}
+              key={item.path}
+              className={item === current ? 'active' : ''}
+              aria-current={item === current ? 'page' : undefined}
+            >
+              <item.icon size={18} />
+              <span>{item.name}</span>
+            </a>
           ))}
         </nav>
         <div className="sidebar-bottom">
@@ -665,7 +677,9 @@ export function App() {
             </button>
             <span className="topbar-workspace">工作空间</span>
             <span className="breadcrumb-slash">/</span>
-            <strong>{routeTitles[routePath] ?? current?.name ?? '页面'}</strong>
+            <strong>
+              {routeTitles[routePath] ?? platformPage?.name ?? current?.name ?? '页面'}
+            </strong>
           </div>
           <div className="topbar-right">
             <NotificationBell key={user.id} active={routePath === '/notifications'} />
@@ -684,6 +698,7 @@ export function App() {
         </header>
         <main className="main-content">
           <ErrorBanner error={error} />
+          {platformPage && <PlatformNavigation selected={platformPage.path} />}
           <Suspense fallback={<Loading />}>{page}</Suspense>
         </main>
       </div>

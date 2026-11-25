@@ -1,3 +1,5 @@
+import { readWorkspaceOrigin } from '../../workspace-navigation';
+
 export const deliveryTabs = {
   artifacts: '构建产物',
   deployments: '部署与回滚',
@@ -20,8 +22,8 @@ export type DeliveryScope = {
   pipelineRunId?: string | null;
   taskId?: string | null;
   repositoryId?: string | null;
-  view?: string | null;
-  viewSearch?: string | null;
+  origin?: string | null;
+  originQuery?: string | null;
 };
 
 export function readDeliveryScope(params: URLSearchParams): DeliveryScope {
@@ -39,8 +41,7 @@ export function readDeliveryScope(params: URLSearchParams): DeliveryScope {
     pipelineRunId: params.get('pipelineRunId'),
     taskId: params.get('taskId'),
     repositoryId: params.get('repositoryId'),
-    view: params.get('view'),
-    viewSearch: params.get('viewSearch'),
+    ...readWorkspaceOrigin(params),
   };
 }
 

@@ -39,6 +39,7 @@ import { SshHostKeyMismatchError, SshService } from '../../infrastructure/ssh/ss
 import { summarizeProbe } from '../../infrastructure/ssh/server-probe';
 import { compareServerConfigurations } from './configuration-comparison';
 import { recentDeployments } from '../deployments/deployment-history';
+import { deployedServicesForServers } from '../deployments/service-delivery-status';
 import { lockProjectGraph } from '../projects/project-guards';
 import { assertProjectResourceRemovable } from '../projects/project-resource-protection';
 import { targetProjectReferences } from '../projects/project-resource-references';
@@ -217,7 +218,7 @@ export class ServersService {
   async detail(id: string) {
     const server = await this.get(id, true);
     const db = this.database.db;
-    const [groups, projects, deployments, commands, probes] = await Promise.all([
+    const [groups, projects, deployments, deployedServices, commands, probes] = await Promise.all([
       db
         .selectFrom('server_groups as groups')
         .innerJoin('server_group_members as members', 'members.group_id', 'groups.id')
@@ -227,6 +228,7 @@ export class ServersService {
         .execute(),
       targetProjectReferences(db, 'SERVER', id),
       recentDeployments(db, { serverId: id }),
+      deployedServicesForServers(db, [id]),
       db
         .selectFrom('task_targets as targets')
         .innerJoin('tasks as tasks', 'tasks.id', 'targets.task_id')
@@ -261,6 +263,7 @@ export class ServersService {
       groups,
       projects,
       recentDeployments: deployments,
+      deployedServices,
       recentCommands: commands,
       probeHistory: probes.map((row) => {
         const detail = JSON.parse(row.details_json) as {

@@ -25,8 +25,8 @@ export function ExecutionGraphResourceLinks({
   scope: GraphWorkbenchScope;
 }) {
   const context = {
-    view: scope.view,
-    viewSearch: scope.viewSearch,
+    origin: scope.origin,
+    originQuery: scope.originQuery,
     graphPane: pane,
     graphVersion: version === undefined ? undefined : String(version),
     graphNode: node.id,

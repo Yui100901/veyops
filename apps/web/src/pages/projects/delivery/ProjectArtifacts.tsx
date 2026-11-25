@@ -167,8 +167,8 @@ function sourceHref(projectId: string, artifact: Artifact, scope: DeliveryScope)
       node: artifact.graphNodeId ?? undefined,
       recordId: artifactLogicalId(artifact),
       deliveryTab: 'artifacts',
-      view: scope.view ?? undefined,
-      viewSearch: scope.viewSearch ?? undefined,
+      origin: scope.origin ?? undefined,
+      originQuery: scope.originQuery ?? undefined,
     })
   );
 }
@@ -259,7 +259,7 @@ function ProjectArtifactList({
     else groups.set(id, [artifact]);
   }
   const serverNames = new Map((servers.data ?? []).map(({ id, name }) => [id, name]));
-  const routeScope = { view: scope.view, viewSearch: scope.viewSearch };
+  const routeScope = { origin: scope.origin, originQuery: scope.originQuery };
 
   function apply(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

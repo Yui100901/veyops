@@ -99,7 +99,7 @@ function DashboardSummary({ data }: { data: Dashboard }) {
       value: data.services.abnormal,
       icon: TriangleAlert,
       detail: '查看异常项目',
-      link: '/views/abnormal',
+      link: '/portal?abnormal=true',
       color: 'red',
     },
   ];

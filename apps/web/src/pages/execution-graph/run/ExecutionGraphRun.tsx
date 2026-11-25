@@ -334,7 +334,8 @@ export function ExecutionGraphStart({
                 projectResourcePath(project.id, {
                   resource: 'environment-sets',
                   environmentSetId: fixedSetId,
-                  view: workbenchScope.view,
+                  origin: workbenchScope.origin,
+                  originQuery: workbenchScope.originQuery,
                 })
               }
             >
@@ -442,7 +443,8 @@ export function ExecutionGraphStart({
           <ExecutionPlan
             preview={preview}
             project={project}
-            view={workbenchScope.view}
+            origin={workbenchScope.origin}
+            originQuery={workbenchScope.originQuery}
             returnPath={projectGraphPath(project.id, {
               ...workbenchScope,
               start: flow.id,

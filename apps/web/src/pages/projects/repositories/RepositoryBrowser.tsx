@@ -197,7 +197,8 @@ export function RepositoryDetails({
   environments,
   onClose,
   onSynced,
-  view,
+  origin,
+  originQuery,
   panel,
   actions,
   graphBack,
@@ -209,7 +210,8 @@ export function RepositoryDetails({
   user: User;
   onClose: () => void;
   onSynced?: () => void;
-  view?: string;
+  origin?: string;
+  originQuery?: string;
   panel?: string;
   actions?: ReactNode;
   graphBack?: GraphResourceReturn;
@@ -224,7 +226,8 @@ export function RepositoryDetails({
       ...graphBack,
       resource: 'repositories',
       repositoryId: repository.id,
-      view,
+      origin,
+      originQuery,
       panel: next === panel ? undefined : next,
     });
   async function checkConnection() {
@@ -281,7 +284,10 @@ export function RepositoryDetails({
               </a>
             </>
           )}
-          <a className="text-link" href={'#' + projectGraphPath(projectId, { view })}>
+          <a
+            className="text-link"
+            href={'#' + projectGraphPath(projectId, { origin, originQuery })}
+          >
             打开项目执行图 →
           </a>
           <ContextAIButton

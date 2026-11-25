@@ -10,6 +10,7 @@ import { Test } from '@nestjs/testing';
 import type { Kysely } from 'kysely';
 import request from 'supertest';
 import type { Database } from '../core/database/schema';
+import { deploymentScopeKey } from '../modules/deployments/deployment-scope';
 
 const base = '/api/v1';
 const postgres = process.env.VEYOPS_TEST_POSTGRES_URL;
@@ -111,7 +112,13 @@ async function seedWorkspace(db: Kysely<Database>, userId: string) {
     environment: typeof production,
     runOffset: number,
     startedOffset: number | null,
-    deployments: { server: number | null; status: string; health: string }[],
+    deployments: {
+      server: number | null;
+      status: string;
+      health: string;
+      path?: string;
+      prepareOnly?: boolean;
+    }[],
   ) {
     const service = services[label]!;
     const [pipelineId, versionId, taskId, runId] = [
@@ -181,6 +188,18 @@ async function seedWorkspace(db: Kysely<Database>, userId: string) {
       const taskTargetId = randomUUID();
       const id = `00000000-0000-4000-8000-${String(++deploymentId).padStart(12, '0')}`;
       const finishedAt = deployment.status === 'RUNNING' ? null : now + 1;
+      const scopeKey =
+        deployment.path && serverId
+          ? deploymentScopeKey(
+              {
+                projectId: service.project_id,
+                serviceId: service.id,
+                environmentId: environment.id,
+                definition: { artifactType: 'FILE', deployPath: deployment.path },
+              },
+              serverId,
+            )
+          : null;
       await db
         .insertInto('task_targets')
         .values({
@@ -190,8 +209,12 @@ async function seedWorkspace(db: Kysely<Database>, userId: string) {
           server_name_snapshot: serverName,
           host_snapshot: '127.0.0.1',
           status: deployment.status,
+          release_scope_key: scopeKey,
+          started_at: scopeKey ? now : null,
+          finished_at: scopeKey ? finishedAt : null,
         })
         .execute();
+      if (deployment.prepareOnly) continue;
       await db
         .insertInto('deployment_records')
         .values({
@@ -202,6 +225,8 @@ async function seedWorkspace(db: Kysely<Database>, userId: string) {
           environment_id: environment.id,
           server_id: serverId,
           status: deployment.status,
+          release_scope_key: scopeKey,
+          activated_at: scopeKey && deployment.status === 'SUCCESS' ? now : null,
           health_status: deployment.health,
           release_version: sha,
           started_at: startedAt,
@@ -263,6 +288,35 @@ async function seedWorkspace(db: Kysely<Database>, userId: string) {
   return {
     expectedRecent: [...pending, ...attention, ...retired.reverse(), ...unknown, ...mixedPeer],
     taskCount,
+    servers,
+    async addScopedReleases() {
+      const productionAt = '/opt/release-current';
+      const alternateAt = '/opt/release-second';
+      const [current] = await deploy('Mixed', production, 110, 110, [
+        {
+          server: 0,
+          ...healthy,
+          path: productionAt,
+        },
+      ]);
+      const [alternate] = await deploy('Mixed', production, 111, 111, [
+        {
+          server: 0,
+          ...healthy,
+          path: alternateAt,
+        },
+      ]);
+      await deploy('Mixed', production, 112, 112, [
+        {
+          server: 0,
+          status: 'FAILED',
+          health: 'NOT_CHECKED',
+          path: productionAt,
+          prepareOnly: true,
+        },
+      ]);
+      return { current: current!, alternate: alternate!, productionAt, alternateAt };
+    },
   };
 }
 
@@ -316,7 +370,10 @@ async function checkDashboard(url?: string) {
     assert.deepEqual(empty.recentFailedTasks, []);
     await api.post(base + '/auth/dismiss-password-reminder').expect(200);
 
-    const { expectedRecent, taskCount } = await seedWorkspace(db, userId);
+    const { expectedRecent, taskCount, servers, addScopedReleases } = await seedWorkspace(
+      db,
+      userId,
+    );
     const failures = [
       'FAILED',
       'PARTIAL_FAILED',
@@ -371,6 +428,73 @@ async function checkDashboard(url?: string) {
     );
     assert.deepEqual(result.recentDeployments, expectedRecent);
     await api.get(base + '/tasks/' + result.recentDeployments[0].taskId).expect(200);
+
+    const { current, alternate, productionAt, alternateAt } = await addScopedReleases();
+    const groupId = randomUUID();
+    const members = [servers[0]!, servers[1]!, servers[3]!];
+    await db
+      .insertInto('server_groups')
+      .values({ id: groupId, name: 'Delivery hosts', created_at: time })
+      .execute();
+    await db
+      .insertInto('server_group_members')
+      .values(
+        members.map((entry, index) => ({
+          server_id: entry.id,
+          group_id: groupId,
+          sort_order: index,
+          created_at: time,
+        })),
+      )
+      .execute();
+    type Deployed = {
+      projectName: string;
+      serviceId: string;
+      serviceName: string;
+      serverId: string;
+      location?: string;
+      scopeKey: string;
+      current: { deploymentRecordId: string; healthStatus: string | null };
+      latestAttempt: { status: string; phase: string; deploymentRecordId: string | null };
+    };
+    const isScoped = (entry: Deployed) => entry.serviceId === current.serviceId && entry.location;
+    const single = (await api.get(base + '/servers/' + members[0]!.id).expect(200)).body.data
+      .deployedServices as Deployed[];
+    assert.ok(single.every((entry) => entry.serverId === members[0]!.id));
+    assert.ok(new Set(single.map(({ serviceId }) => serviceId)).size > 1);
+    assert.ok(
+      !single.some(({ serviceName }) => serviceName === 'Pending' || serviceName === 'Attention'),
+    );
+    const byPath = new Map(single.filter(isScoped).map((entry) => [entry.location, entry]));
+    assert.equal(byPath.size, 2);
+    assert.equal(byPath.get(productionAt)?.projectName, 'Checkout');
+    assert.equal(byPath.get(productionAt)?.current.deploymentRecordId, current.id);
+    assert.equal(byPath.get(productionAt)?.current.healthStatus, 'HEALTHY');
+    assert.deepEqual(
+      (({ status, phase, deploymentRecordId }) => ({ status, phase, deploymentRecordId }))(
+        byPath.get(productionAt)!.latestAttempt,
+      ),
+      { status: 'FAILED', phase: 'PREPARE', deploymentRecordId: null },
+    );
+    assert.equal(byPath.get(alternateAt)?.current.deploymentRecordId, alternate.id);
+    const group = (await api.get(base + '/server-groups/' + groupId).expect(200)).body.data;
+    const items = group.deployedServices as Deployed[];
+    assert.deepEqual(group.serverIds, [members[0]!.id, members[1]!.id]);
+    assert.deepEqual(new Set(items.map(({ serverId }) => serverId)), new Set(group.serverIds));
+    assert.equal(
+      new Set(
+        items.map(({ serviceId, serverId, scopeKey }) =>
+          JSON.stringify([serviceId, serverId, scopeKey]),
+        ),
+      ).size,
+      items.length,
+    );
+    assert.equal(items.filter(isScoped).length, 2);
+    assert.ok(
+      group.recentDeployments.every(({ serverId }: { serverId: string }) =>
+        group.serverIds.includes(serverId),
+      ),
+    );
   } finally {
     try {
       await app?.close();

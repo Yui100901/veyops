@@ -68,7 +68,7 @@ import {
   type GraphPane,
   type GraphWorkbenchScope,
 } from './graph-workbench-context';
-import { readProjectWorkspace } from '../projects/project-workspace-route';
+import { readWorkspaceOrigin } from '../../workspace-navigation';
 import './execution-graph.css';
 import './run/graph-start.css';
 
@@ -204,8 +204,7 @@ function Workspace({
   const scope: GraphWorkbenchScope = {
     serviceId: params.get('serviceId') || undefined,
     environmentId: params.get('environmentId') || undefined,
-    view: params.get('view') || undefined,
-    viewSearch: readProjectWorkspace('/projects/' + project.id, search)?.location.viewSearch,
+    ...readWorkspaceOrigin(params),
     resourcePanel: graphResourcePanel(params.get('resourcePanel')),
   };
   const delivery = graphReturnDelivery(params);

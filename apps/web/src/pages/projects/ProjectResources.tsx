@@ -38,9 +38,9 @@ function editable(kind: ResourceKind): kind is EditableKind {
   return kind === 'repositories' || kind === 'services';
 }
 
-function detail(kind: EditableKind, id: string, view?: string, viewSearch?: string): Location {
-  if (kind === 'repositories') return { resource: kind, repositoryId: id, view, viewSearch };
-  return { resource: kind, serviceId: id, view, viewSearch };
+function detail(kind: EditableKind, id: string, origin?: string, originQuery?: string): Location {
+  if (kind === 'repositories') return { resource: kind, repositoryId: id, origin, originQuery };
+  return { resource: kind, serviceId: id, origin, originQuery };
 }
 
 export function ProjectResources({
@@ -51,8 +51,8 @@ export function ProjectResources({
 }: Props & { location: Location }) {
   const { id } = project;
   const {
-    view,
-    viewSearch,
+    origin,
+    originQuery,
     resource,
     serviceId,
     environmentId,
@@ -107,7 +107,7 @@ export function ProjectResources({
       : null,
   );
   const resourceHref = (kind?: ResourceKind) =>
-    '#' + projectResourcePath(id, { ...graphBack, view, viewSearch, resource: kind });
+    '#' + projectResourcePath(id, { ...graphBack, origin, originQuery, resource: kind });
   async function archive() {
     if (!deleting) return;
     setBusy(true);
@@ -117,7 +117,7 @@ export function ProjectResources({
       const archivedDetail = [service?.id, repository?.id].includes(deleting.item.id);
       if (archivedDetail)
         navigate(
-          projectResourcePath(id, { ...graphBack, view, viewSearch, resource: deleting.kind }),
+          projectResourcePath(id, { ...graphBack, origin, originQuery, resource: deleting.kind }),
         );
       setDeleting(undefined);
       await reload();
@@ -157,10 +157,10 @@ export function ProjectResources({
   return (
     <div className="project-resources">
       {!resource && (
-        <ProjectResourceSummary project={project} view={view} viewSearch={viewSearch} />
+        <ProjectResourceSummary project={project} origin={origin} originQuery={originQuery} />
       )}
       {graphPane && (
-        <a className="back-link" href={graphResourceReturnHref(id, graphBack, view, viewSearch)}>
+        <a className="back-link" href={graphResourceReturnHref(id, graphBack, origin, originQuery)}>
           {graphPane === 'run' && graphStart ? '← 返回运行参数' : '← 返回执行图'}
         </a>
       )}
@@ -193,7 +193,7 @@ export function ProjectResources({
               if (!editor.item)
                 navigate(
                   projectResourcePath(id, {
-                    ...detail('services', item.id, view, viewSearch),
+                    ...detail('services', item.id, origin, originQuery),
                     ...graphBack,
                   }),
                 );
@@ -208,7 +208,7 @@ export function ProjectResources({
             onClose={() => {
               setEditor(undefined);
               if (addingRepository)
-                navigate(projectResourcePath(id, { ...graphBack, view, viewSearch, resource }));
+                navigate(projectResourcePath(id, { ...graphBack, origin, originQuery, resource }));
             }}
             onSaved={async (item) => {
               setEditor(undefined);
@@ -216,7 +216,7 @@ export function ProjectResources({
               if (!editor.item)
                 navigate(
                   projectResourcePath(id, {
-                    ...detail(editor.kind, item.id, view, viewSearch),
+                    ...detail(editor.kind, item.id, origin, originQuery),
                     ...graphBack,
                   }),
                 );
@@ -270,7 +270,7 @@ export function ProjectResources({
                                     href={
                                       '#' +
                                       projectResourcePath(id, {
-                                        ...detail(kind, item.id, view, viewSearch),
+                                        ...detail(kind, item.id, origin, originQuery),
                                         ...graphBack,
                                       })
                                     }
@@ -299,8 +299,8 @@ export function ProjectResources({
                                             '#' +
                                             projectGraphPath(id, {
                                               serviceId: item.id,
-                                              view,
-                                              viewSearch,
+                                              origin,
+                                              originQuery,
                                               pane: 'history',
                                               run: latest.id,
                                             })
@@ -330,8 +330,8 @@ export function ProjectResources({
               project={project}
               user={user}
               service={service}
-              view={view}
-              viewSearch={viewSearch}
+              origin={origin}
+              originQuery={originQuery}
               panel={panel}
               graphBack={graphBack}
               actions={itemActions('services', service)}
@@ -343,8 +343,8 @@ export function ProjectResources({
               user={user}
               environment={environment}
               panel={panel}
-              view={view}
-              viewSearch={viewSearch}
+              origin={origin}
+              originQuery={originQuery}
               graphBack={graphBack}
             />
           )}
@@ -360,8 +360,8 @@ export function ProjectResources({
                           '#' +
                           projectResourcePath(id, {
                             ...graphBack,
-                            view,
-                            viewSearch,
+                            origin,
+                            originQuery,
                             resource,
                             environmentId: entry.id,
                           })
@@ -385,7 +385,8 @@ export function ProjectResources({
               projectId={id}
               user={user}
               repository={repository}
-              view={view}
+              origin={origin}
+              originQuery={originQuery}
               panel={panel}
               graphBack={graphBack}
               services={project.services}
@@ -395,8 +396,8 @@ export function ProjectResources({
                 navigate(
                   projectResourcePath(id, {
                     ...graphBack,
-                    view,
-                    viewSearch,
+                    origin,
+                    originQuery,
                     resource: 'repositories',
                   }),
                 )
@@ -410,8 +411,8 @@ export function ProjectResources({
               projectArchived={project.archived}
               user={user}
               environmentSetId={environmentSetId}
-              view={view}
-              viewSearch={viewSearch}
+              origin={origin}
+              originQuery={originQuery}
             />
           )}
         </>
@@ -434,12 +435,12 @@ export function ProjectResources({
 
 function ProjectResourceSummary({
   project,
-  view,
-  viewSearch,
+  origin,
+  originQuery,
 }: {
   project: ProjectDetail;
-  view?: string;
-  viewSearch?: string;
+  origin?: string;
+  originQuery?: string;
 }) {
   const runs = useResource<{ id: string; flowName: string; status: string; createdAt: number }[]>(
     `/projects/${project.id}/execution-graph/runs`,
@@ -452,7 +453,7 @@ function ProjectResourceSummary({
         <a
           className="text-link"
           key={kind}
-          href={'#' + projectResourcePath(project.id, { resource: kind, view, viewSearch })}
+          href={'#' + projectResourcePath(project.id, { resource: kind, origin, originQuery })}
         >
           {projectResources[kind]} <strong>{project[kind].length}</strong>
         </a>
@@ -460,7 +461,8 @@ function ProjectResourceSummary({
       <a
         className="text-link"
         href={
-          '#' + projectResourcePath(project.id, { resource: 'environment-sets', view, viewSearch })
+          '#' +
+          projectResourcePath(project.id, { resource: 'environment-sets', origin, originQuery })
         }
       >
         变量集合 <strong>{project.environmentSetCount ?? 0}</strong>
@@ -468,7 +470,8 @@ function ProjectResourceSummary({
       <a
         className="text-link"
         href={
-          '#' + projectGraphPath(project.id, { view, viewSearch, pane: 'history', run: latest?.id })
+          '#' +
+          projectGraphPath(project.id, { origin, originQuery, pane: 'history', run: latest?.id })
         }
       >
         {latest ? `最近运行 · ${latest.flowName} · ${formatTime(latest.createdAt)}` : '运行记录'}
@@ -482,28 +485,28 @@ function ServiceDetails({
   project,
   user,
   service,
-  view,
-  viewSearch,
+  origin,
+  originQuery,
   panel,
   actions,
   graphBack,
 }: Pick<Props, 'project' | 'user'> & {
   service: Service;
-  view?: string;
-  viewSearch?: string;
+  origin?: string;
+  originQuery?: string;
   panel?: string;
   actions: React.ReactNode;
   graphBack: GraphResourceReturn;
 }) {
   const { id } = project;
   const serviceId = service.id;
-  const scope: ProjectScope = { serviceId, view, viewSearch };
+  const scope: ProjectScope = { serviceId, origin, originQuery };
   const graphScope = { ...scope, resourcePanel: graphResourcePanel(panel) };
   const path = (subpanel?: string) =>
     projectResourcePath(id, {
       ...graphBack,
-      view,
-      viewSearch,
+      origin,
+      originQuery,
       resource: 'services',
       serviceId,
       panel: subpanel,
@@ -597,7 +600,7 @@ function ServiceDetails({
                     '#' +
                     projectResourcePath(
                       id,
-                      detail('repositories', link.repositoryId, view, viewSearch),
+                      detail('repositories', link.repositoryId, origin, originQuery),
                     )
                   }
                 >

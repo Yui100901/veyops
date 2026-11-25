@@ -134,7 +134,7 @@ export function OperationsCenterPage({ tab, user }: { tab: OperationsTab; user: 
   return (
     <>
       <PageHeader
-        title="运维中心"
+        title="运维命令"
         description="选择服务器和执行范围，预览命令或方案，并在任务中心查看逐台执行结果。"
         action={
           <a href="#/tasks" className="button secondary">

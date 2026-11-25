@@ -42,8 +42,8 @@ export function ProjectDelivery({
     pipelineRunId,
     taskId,
     repositoryId,
-    view,
-    viewSearch,
+    origin,
+    originQuery,
   } = scope;
   if (!providedProject && resource.loading) return <Loading />;
   const project = providedProject ?? resource.data;
@@ -65,7 +65,7 @@ export function ProjectDelivery({
         <ErrorBanner error="所选服务、环境或仓库不属于当前项目。" />
         <a
           className="button secondary small"
-          href={'#' + deliveryPath(id, tab, { view, viewSearch })}
+          href={'#' + deliveryPath(id, tab, { origin, originQuery })}
         >
           返回项目交付记录
         </a>
@@ -76,16 +76,16 @@ export function ProjectDelivery({
     environmentId,
     commit,
     repositoryId,
-    view,
-    viewSearch,
+    origin,
+    originQuery,
   };
   const historyHref =
     '#' +
     projectGraphPath(id, {
       serviceId: serviceId ?? undefined,
       environmentId: environmentId ?? undefined,
-      view: view ?? undefined,
-      viewSearch: viewSearch ?? undefined,
+      origin: origin ?? undefined,
+      originQuery: originQuery ?? undefined,
       pane: 'history',
     });
   if (tab === 'approvals') {
@@ -113,8 +113,8 @@ export function ProjectDelivery({
     const values = new FormData(event.currentTarget);
     navigate(
       deliveryPath(id, tab, {
-        view,
-        viewSearch,
+        origin,
+        originQuery,
         serviceId: String(values.get('serviceId') || ''),
         environmentId: String(values.get('environmentId') || ''),
         commit: String(values.get('commit') || '').trim(),
@@ -148,8 +148,8 @@ export function ProjectDelivery({
               resource: 'services',
               serviceId,
               environmentId: environmentId || undefined,
-              view: view || undefined,
-              viewSearch: viewSearch || undefined,
+              origin: origin || undefined,
+              originQuery: originQuery || undefined,
             })
           }
         >
@@ -243,7 +243,7 @@ export function ProjectDelivery({
           pipelineRunId ||
           taskId ||
           repositoryId) && (
-          <a className="text-link" href={'#' + deliveryPath(id, tab, { view, viewSearch })}>
+          <a className="text-link" href={'#' + deliveryPath(id, tab, { origin, originQuery })}>
             清除筛选
           </a>
         )}

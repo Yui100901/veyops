@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { Search } from 'lucide-react';
 import { formatTime, navigate, useResource } from '../../api';
+import { workspaceOrigin } from '../../workspace-navigation';
 import {
   Empty,
   ErrorBanner,
@@ -37,7 +38,7 @@ interface PortalResult {
   tags: string[];
 }
 
-const failed = new Set(['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION']);
+const failed = new Set(['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT']);
 
 function DeliveryStatus({ targets }: { targets: PortalTarget[] }) {
   if (!targets.length) return <span>暂无发布记录</span>;
@@ -51,6 +52,7 @@ function DeliveryStatus({ targets }: { targets: PortalTarget[] }) {
     ({ health }) => !health || ['PENDING', 'NOT_CHECKED'].includes(health),
   );
   const latestFailure = targets.filter(({ lastAttempt }) => failed.has(lastAttempt));
+  const latestUncertain = targets.filter(({ lastAttempt }) => lastAttempt === 'NEEDS_ATTENTION');
   const running = targets.filter(({ lastAttempt }) => lastAttempt === 'RUNNING');
   const cancelled = targets.filter(({ lastAttempt }) => lastAttempt === 'CANCELLED');
   const checkedAt = Math.max(0, ...healthy.map(({ healthObservedAt }) => healthObservedAt ?? 0));
@@ -73,6 +75,7 @@ function DeliveryStatus({ targets }: { targets: PortalTarget[] }) {
           {latestFailure.length} 次最近发布失败{failedAt > 0 && <> · {formatTime(failedAt)}</>}
         </li>
       )}
+      {latestUncertain.length > 0 && <li>{latestUncertain.length} 次最近发布待核查</li>}
     </ul>
   );
 }
@@ -81,20 +84,27 @@ export function ServicePortal({ search }: { search?: string }) {
   const filters = new URLSearchParams(search);
   const [keyword, setKeyword] = useState(filters.get('q') ?? '');
   const [tag, setTag] = useState(filters.get('tag') ?? '');
+  const abnormal = filters.get('abnormal') === 'true';
   const query = new URLSearchParams();
-  for (const field of ['q', 'tag', 'projectId', 'serviceId']) {
+  for (const field of ['q', 'tag', 'projectId', 'serviceId', 'abnormal']) {
     const value = filters.get(field);
     if (value) query.set(field, value);
   }
   const resource = useResource<PortalResult>(`/portal${query.size ? '?' + query : ''}`);
-  function searchServices(event: FormEvent) {
-    event.preventDefault();
+  const source = workspaceOrigin('portal', query.toString());
+  function applyFilters(onlyAbnormal: boolean) {
     const next = new URLSearchParams(query);
     next.delete('q');
     next.delete('tag');
+    next.delete('abnormal');
     if (keyword.trim()) next.set('q', keyword.trim());
     if (tag) next.set('tag', tag);
+    if (onlyAbnormal) next.set('abnormal', 'true');
     navigate(`/portal${next.size ? '?' + next : ''}`);
+  }
+  function searchServices(event: FormEvent) {
+    event.preventDefault();
+    applyFilters(abnormal);
   }
   return (
     <>
@@ -121,6 +131,14 @@ export function ServicePortal({ search }: { search?: string }) {
             ))}
           </select>
         </Field>
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={abnormal}
+            onChange={(event) => applyFilters(event.target.checked)}
+          />
+          仅看异常
+        </label>
         <div className="row-actions">
           <button type="submit" className="primary">
             <Search size={16} aria-hidden="true" /> 搜索
@@ -145,7 +163,7 @@ export function ServicePortal({ search }: { search?: string }) {
                 title={project.name}
                 subtitle={project.tags.length ? project.tags.join(' · ') : undefined}
                 action={
-                  <a className="text-link" href={'#' + projectResourcePath(project.id)}>
+                  <a className="text-link" href={'#' + projectResourcePath(project.id, source)}>
                     查看项目
                   </a>
                 }
@@ -161,6 +179,7 @@ export function ServicePortal({ search }: { search?: string }) {
                               href={
                                 '#' +
                                 projectResourcePath(project.id, {
+                                  ...source,
                                   resource: 'services',
                                   serviceId: service.id,
                                 })
@@ -171,7 +190,7 @@ export function ServicePortal({ search }: { search?: string }) {
                           </h3>
                           <DeliveryStatus targets={service.targets} />
                         </div>
-                        <ProjectAccessLinks addresses={service.addresses} showEmpty />
+                        <ProjectAccessLinks addresses={service.addresses} compact showEmpty />
                       </div>
                     ))}
                   </div>

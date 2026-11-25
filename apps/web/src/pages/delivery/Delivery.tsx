@@ -322,7 +322,8 @@ export function ArtifactOrigins({
                         deliveryPath(projectId, 'artifacts', {
                           serviceId: scope.serviceId,
                           environmentId: scope.environmentId,
-                          view: scope.view,
+                          origin: scope.origin,
+                          originQuery: scope.originQuery,
                           repositoryId: source.repositoryId,
                           commit: source.commitSha,
                         })
@@ -502,7 +503,8 @@ export function DeliveryRecordsPage({
                         projectGraphPath(project.id, {
                           serviceId: scope.serviceId || undefined,
                           environmentId: scope.environmentId || undefined,
-                          view: scope.view || undefined,
+                          origin: scope.origin || undefined,
+                          originQuery: scope.originQuery || undefined,
                         })
                       : '#/projects'
                   }
@@ -715,7 +717,8 @@ export function DeliveryRecordsPage({
                                       serviceId: scope.serviceId,
                                       environmentId: scope.environmentId,
                                       commit: scope.commit,
-                                      view: scope.view,
+                                      origin: scope.origin,
+                                      originQuery: scope.originQuery,
                                       recordId: r.artifactId,
                                     })
                                   }

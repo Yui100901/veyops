@@ -21,15 +21,15 @@ type CredentialOption = { id: string; name: string; type: string };
 export function ProjectEnvironmentSets({
   projectId,
   environmentSetId,
-  view,
-  viewSearch,
+  origin,
+  originQuery,
   user,
   projectArchived = false,
 }: {
   projectId: string;
   environmentSetId?: string;
-  view?: string;
-  viewSearch?: string;
+  origin?: string;
+  originQuery?: string;
   user: User;
   projectArchived?: boolean;
 }) {
@@ -50,8 +50,8 @@ export function ProjectEnvironmentSets({
     projectResourcePath(projectId, {
       resource: 'environment-sets',
       environmentSetId: id,
-      view,
-      viewSearch,
+      origin,
+      originQuery,
     });
   const initial: EnvironmentSet | undefined = isNew
     ? { id: '', name: '', description: '', archivedAt: null, revision: 0, variables: [] }
