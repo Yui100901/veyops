@@ -8,7 +8,6 @@ import { join } from 'node:path';
 import request from 'supertest';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
-import type { GraphField } from '../modules/execution-graphs/graph-fields';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
 import { replaceVariables } from './helpers/variable-scope';
 
@@ -145,8 +144,16 @@ async function checkResources(databaseUrl?: string) {
     assert.equal(editedRepo.defaultBranch, null);
     assert.equal(editedRepo.branchSyncStatus, 'ERROR');
     const graphPath = root + '/execution-graph';
-    const publishResourceReferences = async (inputs: GraphField[]) => {
+    const environmentSet = await create(root + '/environment-sets', { name: 'Flow variables' });
+    const publishResourceReferences = async (withRelease: boolean) => {
       const { revision } = await fetch(graphPath);
+      const actions = withRelease
+        ? [
+            { id: 'shell', type: 'SHELL', name: '构建文件', shell: { command: 'mkdir -p dist' } },
+            { id: 'deploy', type: 'DEPLOY_ARTIFACT', name: '发布', deploy: { method: 'FILE' } },
+          ]
+        : [];
+      const order = ['start', ...actions.map(({ id }) => id), 'end'];
       const draft = await api
         .put(base + graphPath + '/draft')
         .send({
@@ -154,16 +161,28 @@ async function checkResources(databaseUrl?: string) {
           definition: {
             flows: [],
             canvas: {
+              model: 'FLOW_V2',
               nodes: [
                 {
                   id: 'start',
                   type: 'START',
                   name: '目标选择',
-                  inputs,
+                  ...(withRelease && {
+                    start: {
+                      environmentSetId: environmentSet.id,
+                      release: {
+                        targets: { groupIds: [group.id] },
+                        serviceId: service.id,
+                        deployPath: '/srv/resource-fixture',
+                        contentPath: 'dist',
+                      },
+                    },
+                  }),
                 },
+                ...actions,
                 { id: 'end', type: 'END', name: '完成' },
               ],
-              edges: [{ from: 'start', to: 'end' }],
+              edges: order.slice(1).map((to, index) => ({ from: order[index]!, to })),
               endpoints: [{ startId: 'start', endId: 'end' }],
               templates: [],
             },
@@ -175,19 +194,25 @@ async function checkResources(databaseUrl?: string) {
       });
       return published.publishedVersion as number;
     };
-    const resourceVersion = await publishResourceReferences([
-      { id: 'targets', name: '目标', type: 'TARGETS', defaultValue: { groupIds: [group.id] } },
-      { id: 'service', name: '服务', type: 'SERVICE', defaultValue: service.id },
-      { id: 'environment', name: '环境', type: 'ENVIRONMENT', defaultValue: environment.id },
-    ]);
+    const resourceVersion = await publishResourceReferences(true);
     const blockedGroup = await api.delete(base + '/server-groups/' + group.id).expect(409);
     assert.ok(
       blockedGroup.body.error.references.some(
         (ref: { sourceKind: string; state: string; fieldId: string }) =>
-          ref.sourceKind === 'GRAPH' && ref.state === 'RUNNABLE' && ref.fieldId === 'targets',
+          ref.sourceKind === 'GRAPH' &&
+          ref.state === 'RUNNABLE' &&
+          ref.fieldId === 'start.release.targets',
       ),
     );
     const graphInventory = await fetch(root + '/resource-references');
+    assert.ok(
+      graphInventory.references.some(
+        (ref: { resourceId: string; state: string; fieldId: string }) =>
+          ref.resourceId === environmentSet.id &&
+          ref.state === 'RUNNABLE' &&
+          ref.fieldId === 'start.environmentSetId',
+      ),
+    );
     assert.ok(
       graphInventory.servers
         .find((row: { id: string }) => row.id === server.id)
@@ -266,8 +291,7 @@ async function checkResources(databaseUrl?: string) {
       .send({ expectedRevision: otherService.revision, addresses: [address] })
       .expect(400);
     await api.delete(base + root + '/services/' + service.id).expect(409);
-    await api.delete(base + root + '/environments/' + environment.id).expect(409);
-    await publishResourceReferences([]);
+    await publishResourceReferences(false);
     await create(`${graphPath}/versions/${resourceVersion}/retire`, {});
     assert.equal((await fetch(configuredScope + '/config')).targetId, fixtureTarget.id);
     assert.equal((await fetch(configuredScope + '/variables')).variables[0].key, 'SERVICE_MODE');

@@ -119,7 +119,8 @@ async function checkPlan(t: TestContext, url?: string) {
         source: { repositoryId: string; commitSha: string },
         paths: string[],
       ) => {
-        assert.deepEqual(source, { repositoryId: repo.id, commitSha: pin });
+        assert.equal(source.repositoryId, repo.id);
+        assert.equal(source.commitSha, pin);
         assert.equal(paths.length, 1);
         if (paths[0] === '.env') return { path: '.env', keys: ['UNEXPECTED_FALLBACK'] };
         return paths.includes('.env.test')
@@ -130,468 +131,185 @@ async function checkPlan(t: TestContext, url?: string) {
     const snapshots = t.mock.method(app.get(ServersService), 'snapshot');
     const path = scope + '/execution-graph';
     const draft = (await api.get(base + path).expect(200)).body.data;
-    const sourceInputs = (
-      repositoryId: string,
-      ref: { kind: string; value: string },
-      suffix = '',
-    ) => [
-      {
-        id: 'repository' + suffix,
-        name: '项目仓库' + suffix,
-        type: 'REPOSITORY',
-        defaultValue: repositoryId,
-      },
-      { id: 'gitVersion' + suffix, name: 'Git 版本' + suffix, type: 'GIT_REF', defaultValue: ref },
-    ];
-    const sourceBindings = (suffix = '') => ({
-      repository: { kind: 'INPUT', fieldId: 'repository' + suffix },
-      version: { kind: 'INPUT', fieldId: 'gitVersion' + suffix },
-    });
-    const start = (id: string, extra: object[] = []) => ({
-      id,
-      name: id,
-      type: 'START',
-      inputs: [
-        { id: 'environmentSet', name: '变量集合', type: 'ENVIRONMENT_SET', required: true },
-        { id: 'configuration', name: '配置', type: 'TEXT', required: true },
-        ...sourceInputs(repo.id, { kind: 'COMMIT', value: pin }),
-        ...extra,
-      ],
-      environmentSet: { mode: 'INPUT', fieldId: 'environmentSet' },
-    });
-    const end = (id: string) => ({ id, name: id, type: 'END' });
-    const build = (id: string, buildLocation: string) => ({
-      id,
-      name: id,
-      type: 'BUILD',
-      build: {
-        buildLocation,
-        buildCommand: 'npm run build',
-        artifacts: [{ name: 'output', type: 'FILE', path: 'dist/file.zip' }],
-      },
-    });
-    const chain = (ids: string[]) => ids.slice(1).map((to, index) => ({ from: ids[index], to }));
-    const revision = (
-      await api
-        .put(base + path + '/draft')
-        .send({
-          expectedRevision: draft.revision,
-          definition: {
-            flows: [],
-            canvas: {
-              nodes: [
-                start('build-only'),
-                {
-                  id: 'checkout',
-                  name: '检出固定源码',
-                  type: 'CHECKOUT',
-                },
-                {
-                  id: 'load',
-                  name: '载入变量文件',
-                  type: 'LOAD_ENV',
-                  loadEnvironment: {
-                    required: false,
-                    pathRule: {
-                      key: 'configuration',
-                      paths: { empty: '.env.empty', test: '.env.test' },
-                    },
-                  },
-                },
-                build('manager', 'MANAGER'),
-                end('end-build'),
-                start('combined', [
-                  {
-                    id: 'releaseTargets',
-                    name: '发布目标',
-                    type: 'TARGETS',
-                    required: true,
-                    defaultValue: { groupIds: [group.id] },
-                  },
-                ]),
-                build('combined-build', 'MANAGER'),
-                {
-                  id: 'approve-release',
-                  name: '确认发布',
-                  type: 'APPROVAL',
-                  approval: { releaseNodeId: 'release' },
-                },
-                {
-                  id: 'release',
-                  name: 'Release',
-                  type: 'DEPLOY_ARTIFACT',
-                  deploy: { deployPath: '/opt/veyops-fixture' },
-                },
-                {
-                  ...end('end-release'),
-                  outputs: [
-                    { id: 'released', name: 'Release result', type: 'RELEASE', required: true },
-                  ],
-                },
-                start('target-only'),
-                build('target', 'TARGET'),
-                end('end-target'),
-              ],
-              edges: [
-                ...chain(['build-only', 'checkout', 'load', 'manager', 'end-build']),
-                ...chain([
-                  'combined',
-                  'combined-build',
-                  'approve-release',
-                  'release',
-                  'end-release',
-                ]),
-                ...chain(['target-only', 'target', 'end-target']),
-              ],
-              endpoints: [
-                {
-                  startId: 'build-only',
-                  endId: 'end-build',
-                  serviceId: service.id,
-                  inputBindings: {
-                    checkout: sourceBindings(),
-                    load: { source: { kind: 'OUTPUT', nodeId: 'checkout', fieldId: 'source' } },
-                    manager: {
-                      ...sourceBindings(),
-                      variables: { kind: 'OUTPUT', nodeId: 'load', fieldId: 'variables' },
-                    },
-                  },
-                },
-                {
-                  startId: 'combined',
-                  endId: 'end-release',
-                  serviceId: service.id,
-                  inputBindings: {
-                    'combined-build': sourceBindings(),
-                    release: {
-                      artifact: { kind: 'OUTPUT', nodeId: 'combined-build', fieldId: 'output' },
-                      targets: { kind: 'INPUT', fieldId: 'releaseTargets' },
-                    },
-                  },
-                  outputBindings: {
-                    released: { kind: 'OUTPUT', nodeId: 'release', fieldId: 'release' },
-                  },
-                },
-                {
-                  startId: 'target-only',
-                  endId: 'end-target',
-                  serviceId: service.id,
-                  inputBindings: { target: sourceBindings() },
-                },
-              ],
-              templates: [],
-            },
-          },
-        })
-        .expect(200)
-    ).body.data.revision;
-    const version = (await create(path + '/publish', { expectedRevision: revision }))
-      .publishedVersion;
     const flow = (id: string) => path + '/flows/' + id;
-    const args = (environmentSet: string, targets?: string[]) => ({
-      version,
-      inputs: {
-        parameters: {
-          environmentSet,
-          configuration: environmentSet === empty.id ? 'empty' : 'test',
-          ...(targets && { releaseTargets: { serverIds: targets } }),
+    const source = { id: 'main', repositoryId: repo.id, ref: { kind: 'COMMIT', value: pin } };
+    const release = {
+      serviceId: service.id,
+      targets: { groupIds: [group.id] },
+      deployPath: '/opt/veyops-fixture',
+      contentPath: 'repository/dist',
+    };
+    const makeFlow = (id: string, start: object, managed = false) => {
+      const nodes = [
+        { id, name: id, type: 'START', start },
+        { id: id + '-checkout', name: '检出固定源码', type: 'CHECKOUT' },
+        {
+          id: id + '-build',
+          name: '构建',
+          type: 'BUILD',
+          build: { buildCommand: 'npm run build', repoPath: 'repository' },
         },
-      },
+        ...(managed
+          ? [
+              { id: id + '-approval', name: '确认发布', type: 'APPROVAL' },
+              {
+                id: id + '-release',
+                name: '发布',
+                type: 'DEPLOY_ARTIFACT',
+                deploy: { method: 'FILE' },
+              },
+            ]
+          : []),
+        { id: id + '-end', name: '结束', type: 'END' },
+      ];
+      return {
+        nodes,
+        edges: nodes.slice(1).map(({ id: to }, index) => ({ from: nodes[index]!.id, to })),
+        endpoint: { startId: id, endId: id + '-end' },
+      };
+    };
+    const managed = { sources: [source], execution: { location: 'MANAGER' }, release };
+    const builds = [
+      makeFlow('fresh', {
+        sources: [
+          source,
+          {
+            id: 'alternate',
+            repositoryId: alternateRepo.id,
+            ref: { kind: 'BRANCH', value: 'main' },
+          },
+        ],
+        execution: { location: 'MANAGER' },
+        environmentSetId: env.id,
+        dotenv: { sourceId: 'main', path: '.env.test' },
+      }),
+      makeFlow('combined', { ...managed, environmentSetId: empty.id }, true),
+      makeFlow('sensitive', { ...managed, environmentSetId: env.id }, true),
+      makeFlow('target', {
+        sources: [source],
+        execution: { location: 'TARGET', serverId: second.id },
+      }),
+    ];
+    const response = await api
+      .put(base + path + '/draft')
+      .send({
+        expectedRevision: draft.revision,
+        definition: {
+          canvas: {
+            model: 'FLOW_V2',
+            templates: [],
+            nodes: builds.flatMap(({ nodes }) => nodes),
+            edges: builds.flatMap(({ edges }) => edges),
+            endpoints: builds.map(({ endpoint }) => endpoint),
+          },
+        },
+      })
+      .expect(200);
+    const { publishedVersion: version } = await create(path + '/publish', {
+      expectedRevision: response.body.data.revision,
     });
-    const previewOnly = await create(flow('build-only') + '/preview', args(empty.id));
-    const previewWithDefaults = await create(flow('build-only') + '/preview', args(env.id));
+    const args = { version };
+    const fresh = await create(flow('fresh') + '/preview', args);
     assert.equal(snapshots.mock.callCount(), 0);
-    assert.deepEqual(previewOnly.executionPlan.targets[0].servers, []);
-    assert.deepEqual(previewOnly.executionPlan.environmentFiles[0], {
-      flowId: 'build-only',
-      nodeId: 'load',
-      status: 'SKIPPED',
-      source: 'NODE',
-      required: false,
-      repositoryId: repo.id,
-      commitSha: pin,
-      path: '.env.empty',
-      mappingKey: 'configuration',
-    });
-    assert.ok(
-      !previewOnly.executionPlan.variables.some(
-        (v: { key: string }) => v.key === 'UNEXPECTED_FALLBACK',
-      ),
+    assert.equal(fresh.simplified.location, 'MANAGER');
+    assert.deepEqual(
+      fresh.checkouts.map(({ directory, commitSha }: { directory: string; commitSha: string }) => [
+        directory,
+        commitSha,
+      ]),
+      [
+        ['repository', pin],
+        ['alternate', alternatePin],
+      ],
     );
-    assert.equal(previewWithDefaults.executionPlan.targets[0].source, 'MANAGER');
-    assert.equal(previewWithDefaults.executionPlan.environmentFiles[0].path, '.env.test');
-    assert.equal(previewWithDefaults.executionPlan.environmentFiles[0].commitSha, pin);
-    assert.ok(files.mock.callCount() >= 2);
-    assert.ok(
-      previewWithDefaults.executionPlan.variables.some(
-        (v: { nodeId: string; key: string; source: string; sensitive: boolean }) =>
-          v.nodeId === 'load' &&
-          v.key === 'OVERLAP' &&
-          v.source === 'ENVIRONMENT_SET' &&
-          v.sensitive === false,
-      ),
+    assert.equal(fresh.scripts[0].directory, 'repository');
+    assert.equal(fresh.environmentSet.id ?? fresh.environmentSet.setId, env.id);
+    assert.equal(files.mock.callCount(), 1);
+    assert.doesNotMatch(
+      JSON.stringify(fresh),
+      /value-must-not-be-in-preview|secret-must-not-be-in-preview/,
     );
-    assert.ok(!JSON.stringify(previewWithDefaults).includes(plain));
-    assert.ok(!JSON.stringify(previewWithDefaults).includes(secret));
-
-    const missing = await post(flow('target-only') + '/preview', args(env.id)).expect(400);
-    assert.match(missing.body.error.message, /target.*缺少构建服务器/);
+    const target = await create(flow('target') + '/preview', args);
+    assert.equal(target.simplified.location, 'TARGET');
+    assert.equal(target.simplified.serverId, second.id);
     const combined = flow('combined');
-    const defaultPlan = await create(combined + '/preview', args(env.id));
-    assert.equal(defaultPlan.deliveries[1].requireApproval, false);
+    const preview = await create(combined + '/preview', args);
+    assert.equal(preview.simplified.location, 'MANAGER');
+    assert.deepEqual(preview.simplified.release.serverIds, [first.id]);
+    assert.equal(preview.simplified.release.contentPath, 'repository/dist');
+    assert.equal(preview.deliveries[0].requireApproval, false);
     const runner = app.get(GraphRunnerService);
     const automation = { kind: 'API' as const, ruleId: 'fixture', revision: '1' };
     const previous = process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
     try {
       delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
       await assert.rejects(
-        runner.preview(project.id, 'combined', args(env.id), { automation }),
+        runner.preview(project.id, 'combined', args, { automation }),
         /API 尚未放行/,
       );
       process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = 'API';
-      await assert.rejects(
-        runner.preview(project.id, 'combined', args(env.id), { automation }),
-        (error: unknown) =>
-          error instanceof ExecutionPlanIssueError &&
-          error.issue.nodeId === 'combined-build' &&
-          /自动构建不能使用.*敏感变量/.test(error.message),
-      );
       const isolated = t.mock.method(
         BuildsService,
         'automaticManagerSocket',
         async () => '/run/user/1000/fixture-docker.sock',
       );
-      const cleanPlan = await create(combined + '/preview', args(empty.id));
-      await assert.rejects(
-        runner.preview(project.id, 'combined', args(empty.id), { automation }),
-        (error: unknown) =>
-          error instanceof ExecutionPlanIssueError &&
-          error.issue.nodeId === 'release' &&
-          /缺少有效的自动执行授权/.test(error.message),
-      );
-      await api
-        .patch(base + '/servers/' + first.id + '/automatic-execution')
-        .send({ enabled: true })
-        .expect(200);
-      const automaticPlan = await runner.preview(project.id, 'combined', args(empty.id), {
-        automation,
-      });
-      isolated.mock.restore();
-      assert.ok(
-        automaticPlan.gates.some(
-          ({ nodeId, kind, releaseNodeId }) =>
-            nodeId === 'approve-release' && kind === 'APPROVAL' && releaseNodeId === 'release',
-        ),
-      );
-      assert.deepEqual(automaticPlan.executionPlan.targets, cleanPlan.executionPlan.targets);
+      try {
+        await assert.rejects(
+          runner.preview(project.id, 'sensitive', args, { automation }),
+          (error: unknown) =>
+            error instanceof ExecutionPlanIssueError &&
+            error.issue.fieldId === 'variables' &&
+            /敏感变量/.test(error.message),
+        );
+        await assert.rejects(
+          runner.preview(project.id, 'combined', args, { automation }),
+          /缺少有效的自动执行授权/,
+        );
+        await api
+          .patch(base + '/servers/' + first.id + '/automatic-execution')
+          .send({ enabled: true })
+          .expect(200);
+        const automatic = await runner.preview(project.id, 'combined', args, { automation });
+        assert.ok(
+          automatic.gates.some(
+            ({ nodeId, kind, releaseNodeId }) =>
+              nodeId === 'combined-approval' &&
+              kind === 'APPROVAL' &&
+              releaseNodeId === 'combined-release',
+          ),
+        );
+        assert.deepEqual(automatic.deliveries[0]!.serverIds, [first.id]);
+      } finally {
+        isolated.mock.restore();
+      }
     } finally {
       if (previous === undefined) delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
       else process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = previous;
     }
-    assert.deepEqual(
-      defaultPlan.executionPlan.targets.map((item: { purpose: string; source: string }) => [
-        item.purpose,
-        item.source,
-      ]),
-      [
-        ['BUILD', 'MANAGER'],
-        ['RELEASE', 'RUN_INPUT'],
-      ],
-    );
-    assert.deepEqual(
-      defaultPlan.executionPlan.targets[1].servers.map((s: { id: string }) => s.id),
-      [first.id],
-    );
-    assert.ok(
-      defaultPlan.executionPlan.deferred.some(
-        (item: { producerField: string }) => item.producerField === 'output',
-      ),
-    );
+
+    const run = (endpoint: string, plan: { configurationHash: string; planSections: object }) =>
+      post(endpoint + '/run', {
+        ...args,
+        expectedConfigurationHash: plan.configurationHash,
+        expectedPlanSections: plan.planSections,
+        idempotencyKey: randomUUID(),
+      });
     await api
       .patch(base + '/server-groups/' + group.id)
       .send({ name: 'Release', serverIds: [first.id, second.id] })
       .expect(200);
-    const stale = await post(combined + '/run', {
-      ...args(env.id),
-      expectedConfigurationHash: defaultPlan.configurationHash,
-      expectedPlanSections: defaultPlan.planSections,
-      idempotencyKey: randomUUID(),
-    }).expect(409);
-    assert.ok(stale.body.error.changes.some((change: string) => change.includes('执行目标及成员')));
+    await run(combined, preview).expect(409);
+    const changed = await create(combined + '/preview', args);
+    assert.deepEqual(new Set(changed.simplified.release.serverIds), new Set([first.id, second.id]));
+    assert.notEqual(changed.configurationHash, preview.configurationHash);
 
-    const explicit = await create(combined + '/preview', args(env.id, [first.id]));
-    assert.equal(explicit.executionPlan.targets[1].source, 'RUN_INPUT');
-    assert.deepEqual(
-      explicit.executionPlan.targets[1].servers.map((s: { id: string }) => s.id),
-      [first.id],
-    );
-
-    const started = await create(flow('build-only') + '/run', {
-      ...args(env.id),
-      expectedConfigurationHash: previewWithDefaults.configurationHash,
-      expectedPlanSections: previewWithDefaults.planSections,
-      idempotencyKey: randomUUID(),
-    });
-    assert.match(started.status, /QUEUED|RUNNING/);
-
-    const output = (nodeId: string, fieldId: string) => ({ kind: 'OUTPUT', nodeId, fieldId });
-    const firstChoice = (fieldId: string) => ({
-      kind: 'FIRST_AVAILABLE',
-      sources: [output('checkout-a', fieldId), output('checkout-b', fieldId)],
-    });
-    const checkout = (suffix: string) => ({
-      id: 'checkout-' + suffix,
-      name: '检出 ' + suffix,
-      type: 'CHECKOUT',
-    });
-    const branches = (
-      await api
-        .put(base + path + '/draft')
-        .send({
-          expectedRevision: (await api.get(base + path).expect(200)).body.data.revision,
-          definition: {
-            flows: [],
-            canvas: {
-              nodes: [
-                {
-                  id: 'branch-test',
-                  name: '分支验证',
-                  type: 'START',
-                  inputs: [
-                    ...sourceInputs(repo.id, { kind: 'BRANCH', value: 'main' }, '-a'),
-                    ...sourceInputs(alternateRepo.id, { kind: 'BRANCH', value: 'main' }, '-b'),
-                  ],
-                },
-                {
-                  id: 'choice',
-                  name: '运行时输出',
-                  type: 'SHELL',
-                  shell: { location: 'MANAGER', command: 'printf b' },
-                  outputs: [{ id: 'choice', name: '分支', type: 'TEXT', required: true }],
-                },
-                {
-                  id: 'condition',
-                  name: '选择分支',
-                  type: 'CONDITION',
-                  condition: { key: 'input', value: 'a' },
-                },
-                checkout('a'),
-                checkout('b'),
-                {
-                  id: 'merge-check',
-                  name: '汇合检查',
-                  type: 'CHECK',
-                  shell: { location: 'MANAGER', command: 'git rev-parse HEAD' },
-                },
-                {
-                  id: 'verify-workspace',
-                  name: '检查传递的工作区',
-                  type: 'CHECK',
-                  shell: { location: 'TARGET', command: 'git rev-parse HEAD' },
-                },
-                end('branch-end'),
-              ],
-              edges: [
-                ...chain(['branch-test', 'choice', 'condition']),
-                { from: 'condition', to: 'checkout-b', when: 'FALSE' },
-                { from: 'condition', to: 'checkout-a', when: 'TRUE' },
-                { from: 'checkout-b', to: 'merge-check' },
-                ...chain(['checkout-a', 'merge-check', 'verify-workspace', 'branch-end']),
-              ],
-              endpoints: [
-                {
-                  startId: 'branch-test',
-                  endId: 'branch-end',
-                  inputBindings: {
-                    condition: { value: output('choice', 'choice') },
-                    'checkout-a': sourceBindings('-a'),
-                    'checkout-b': sourceBindings('-b'),
-                    'merge-check': {
-                      workspace: firstChoice('workspace'),
-                      source: firstChoice('source'),
-                    },
-                    'verify-workspace': {
-                      workspace: output('merge-check', 'workspace'),
-                      targets: { kind: 'VALUE', value: { serverIds: [first.id] } },
-                    },
-                  },
-                },
-              ],
-              templates: [],
-            },
-          },
-        })
-        .expect(200)
-    ).body.data;
-    const branchVersion = (await create(path + '/publish', { expectedRevision: branches.revision }))
-      .publishedVersion;
-    const branchArgs = { version: branchVersion };
-    const branchFlow = flow('branch-test');
-    const branchPreview = await create(branchFlow + '/preview', branchArgs);
-    const script = (preview: typeof branchPreview, nodeId: string) =>
-      preview.scripts.find((item: { nodeId: string }) => item.nodeId === nodeId);
-    const inputs = branchPreview.nodes.find(
-      (item: { nodeId: string }) => item.nodeId === 'merge-check',
-    ).inputs;
-    for (const fieldId of ['workspace', 'source']) {
-      const field = inputs.find((item: { fieldId: string }) => item.fieldId === fieldId);
-      assert.equal(field.state, 'DEFERRED');
-      assert.equal(field.source, undefined);
-      assert.equal(field.value, undefined);
-    }
-    assert.deepEqual(script(branchPreview, 'merge-check').workspace.candidates, [
-      {
-        producerNodeId: 'checkout-a',
-        producerField: 'workspace',
-        repositoryId: repo.id,
-        commitSha: pin,
-        deferred: false,
-      },
-      {
-        producerNodeId: 'checkout-b',
-        producerField: 'workspace',
-        repositoryId: alternateRepo.id,
-        commitSha: alternatePin,
-        deferred: false,
-      },
-    ]);
-    assert.deepEqual(
-      new Set(script(branchPreview, 'verify-workspace').workspace.candidates),
-      new Set([
-        {
-          producerNodeId: 'merge-check',
-          producerField: 'workspace',
-          repositoryId: repo.id,
-          commitSha: pin,
-          deferred: false,
-        },
-        {
-          producerNodeId: 'merge-check',
-          producerField: 'workspace',
-          repositoryId: alternateRepo.id,
-          commitSha: alternatePin,
-          deferred: false,
-        },
-      ]),
-    );
     alternatePin = 'c'.repeat(40);
-    const changedPreview = await create(branchFlow + '/preview', branchArgs);
-    assert.notEqual(changedPreview.configurationHash, branchPreview.configurationHash);
-    assert.equal(
-      script(changedPreview, 'merge-check').workspace.candidates[1].commitSha,
-      alternatePin,
-    );
-    const staleBranch = await post(branchFlow + '/run', {
-      ...branchArgs,
-      expectedConfigurationHash: branchPreview.configurationHash,
-      expectedPlanSections: branchPreview.planSections,
-      idempotencyKey: randomUUID(),
-    }).expect(409);
-    assert.ok(
-      staleBranch.body.error.changes.some(
-        (change: string) => change.includes('汇合检查') && change.includes('脚本工作区'),
-      ),
-    );
+    await run(flow('fresh'), fresh).expect(409);
+    const refreshed = await create(flow('fresh') + '/preview', args);
+    assert.equal(refreshed.checkouts[1].commitSha, alternatePin);
+    assert.notEqual(refreshed.configurationHash, fresh.configurationHash);
+    const started = await run(flow('fresh'), refreshed).expect(201);
+    assert.match(started.body.data.status, /QUEUED|RUNNING/);
   } finally {
     await app.close();
     await rm(data, { recursive: true, force: true });

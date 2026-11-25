@@ -9,68 +9,69 @@ import test from 'node:test';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import { initialGraphDraft } from '../core/database/execution-graphs-migration';
 import type { GraphCanvas } from '../modules/execution-graphs/execution-graph-definition';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
 
-const choice = { id: 'choice', name: '分支选择', type: 'TEXT' } as const;
-const choiceBinding = { kind: 'INPUT', fieldId: choice.id } as const;
+const choice = { variables: [{ key: 'CHOICE', value: 'ordinary', allowOverride: true }] };
+const parameters = (value: string) => ({ 'var:CHOICE': value });
 
 const plainBranchCanvas: GraphCanvas = {
+  model: 'FLOW_V2',
   nodes: [
-    { id: 'start-plain', type: 'START', name: '普通分叉', inputs: [choice] },
+    { id: 'start-plain', type: 'START', name: '普通分叉', start: choice },
     {
       id: 'rules',
       type: 'CONDITION',
       name: '条件分支',
       branch: {
+        parameterKey: 'CHOICE',
         cases: [
           { id: 'publish', value: 'release' },
           { id: 'verify', value: 'test' },
         ],
       },
     },
-    { id: 'parallel-approval', type: 'APPROVAL', name: '并行审批' },
-    { id: 'selected-path', type: 'APPROVAL', name: '匹配路径审批' },
+    { id: 'parallel-delay', type: 'DELAY', name: '并行等待', delaySeconds: 60 },
+    { id: 'selected-path', type: 'DELAY', name: '匹配路径等待', delaySeconds: 60 },
     { id: 'default-path', type: 'LOG', name: '默认路径', message: 'default' },
     { id: 'combined', type: 'LOG', name: '下游任务', message: 'merged' },
     {
       id: 'end-plain',
       type: 'END',
       name: '结束',
-      outputs: [{ id: 'chosen', type: 'TEXT', name: '选中规则' }],
     },
   ],
   edges: [
     { from: 'start-plain', to: 'rules' },
-    { from: 'start-plain', to: 'parallel-approval' },
+    { from: 'start-plain', to: 'parallel-delay' },
     { from: 'rules', to: 'selected-path', when: 'CASE:publish' },
     { from: 'rules', to: 'selected-path', when: 'CASE:verify' },
     { from: 'rules', to: 'default-path', when: 'DEFAULT' },
     { from: 'selected-path', to: 'combined' },
     { from: 'default-path', to: 'combined' },
-    { from: 'parallel-approval', to: 'combined' },
+    { from: 'parallel-delay', to: 'combined' },
     { from: 'combined', to: 'end-plain' },
   ],
   endpoints: [
     {
       startId: 'start-plain',
       endId: 'end-plain',
-      inputBindings: { rules: { value: choiceBinding } },
-      outputBindings: { chosen: { kind: 'OUTPUT', nodeId: 'rules', fieldId: 'branchId' } },
     },
   ],
   templates: [],
 };
 
 const dagCanvas: GraphCanvas = {
+  model: 'FLOW_V2',
   nodes: [
-    { id: 'orchestrate', type: 'START', name: '条件与并行', inputs: [choice] },
+    { id: 'orchestrate', type: 'START', name: '条件与并行', start: choice },
     { id: 'split', type: 'PARALLEL', name: '并行' },
     {
       id: 'choose',
       type: 'CONDITION',
       name: '判断',
-      condition: { value: 'release' },
+      condition: { value: 'release', parameterKey: 'CHOICE' },
     },
     { id: 'yes', type: 'LOG', name: '发布分支', message: 'release-path' },
     { id: 'no', type: 'LOG', name: '常规分支', message: 'regular-path' },
@@ -95,22 +96,22 @@ const dagCanvas: GraphCanvas = {
     {
       startId: 'orchestrate',
       endId: 'dag-end',
-      inputBindings: { choose: { value: choiceBinding } },
     },
   ],
   templates: [],
 };
 
 const advancedCanvas: GraphCanvas = {
+  model: 'FLOW_V2',
   nodes: [
-    { id: 'advanced', type: 'START', name: '可控交付', inputs: [choice] },
+    { id: 'advanced', type: 'START', name: '可控流程', start: choice },
     {
       id: 'switch',
       type: 'SWITCH',
       name: '选择执行路径',
-      switch: { cases: ['approve', 'delay'] },
+      switch: { cases: ['approve', 'delay'], parameterKey: 'CHOICE' },
     },
-    { id: 'approve', type: 'APPROVAL', name: '发布确认', approval: { timeoutSeconds: 60 } },
+    { id: 'approve', type: 'LOG', name: '执行命令', message: 'approved path chosen' },
     { id: 'continue', type: 'LOG', name: '继续发布', message: 'approved-path' },
     { id: 'delay', type: 'DELAY', name: '等待', delaySeconds: 60 },
     { id: 'default', type: 'LOG', name: '普通检查', message: 'default-path' },
@@ -128,9 +129,7 @@ const advancedCanvas: GraphCanvas = {
     { from: 'default', to: 'join' },
     { from: 'join', to: 'end' },
   ],
-  endpoints: [
-    { startId: 'advanced', endId: 'end', inputBindings: { switch: { value: choiceBinding } } },
-  ],
+  endpoints: [{ startId: 'advanced', endId: 'end' }],
   templates: [],
 };
 
@@ -192,19 +191,15 @@ async function checkGraph(url?: string) {
       root + '/projects/' + (await project('graph-build-path')) + '/execution-graph';
     const { revision: blankRevision } = (await api.get(repairPath).expect(200)).body.data;
     const canvas: GraphCanvas = {
+      model: 'FLOW_V2',
       nodes: [
-        {
-          id: 'start',
-          type: 'START',
-          name: '构建',
-          inputs: [{ id: 'repository', type: 'REPOSITORY', name: '仓库' }],
-        },
+        { id: 'start', type: 'START', name: '构建' },
         {
           id: 'build',
           type: 'FUNCTION',
           operation: 'BUILD',
           name: '构建程序',
-          build: { artifacts: [{ id: 'bundle', type: 'DIRECTORY', name: '目录' }] },
+          build: { buildCommand: 'npm run build', repoPath: '../outside' },
         },
         { id: 'end', type: 'END', name: '结束' },
       ],
@@ -212,23 +207,14 @@ async function checkGraph(url?: string) {
         { from: 'start', to: 'build' },
         { from: 'build', to: 'end' },
       ],
-      endpoints: [
-        {
-          startId: 'start',
-          endId: 'end',
-          inputBindings: {
-            build: { repository: { kind: 'INPUT', fieldId: 'repository' } },
-          },
-        },
-      ],
+      endpoints: [{ startId: 'start', endId: 'end' }],
       templates: [],
     };
     const verifyPath = (issue: Record<string, unknown>) => {
       assert.deepEqual(
-        [issue.flowId, issue.nodeId, issue.fieldId, issue.fieldSection, issue.artifactField],
-        ['start', 'build', 'bundle', 'output', 'path'],
+        [issue.flowId, issue.nodeId, issue.fieldId],
+        ['start', 'build', 'build.repoPath'],
       );
-      assert.match(String(issue.message), /请填写「目录」/);
     };
     const validation = (
       await api
@@ -245,7 +231,7 @@ async function checkGraph(url?: string) {
         .expect(200)
     ).body.data;
     const reloaded = (await api.get(repairPath).expect(200)).body.data;
-    assert.equal(reloaded.draft.canvas.nodes[1].build.artifacts[0].id, 'bundle');
+    assert.equal(reloaded.draft.canvas.nodes[1].build.repoPath, '../outside');
     const failed = (
       await api
         .post(repairPath + '/publish')
@@ -253,8 +239,7 @@ async function checkGraph(url?: string) {
         .expect(400)
     ).body.error;
     verifyPath(failed.planIssue);
-    canvas.nodes[1]!.build!.artifacts![0]!.path = 'dist';
-    canvas.nodes[1]!.build!.artifacts![0]!.collection = 'PATH';
+    canvas.nodes[1]!.build!.repoPath = 'app';
     const repaired = (
       await api
         .put(repairPath + '/draft')
@@ -267,7 +252,7 @@ async function checkGraph(url?: string) {
       .expect(201);
     const runDag = async (id: string, version: number, value: string) => {
       const flowPath = otherPath + '/flows/' + id;
-      const args = { version, inputs: { parameters: { choice: value } } };
+      const args = { version, inputs: { parameters: parameters(value) } };
       const preview = (
         await api
           .post(flowPath + '/preview')
@@ -339,7 +324,7 @@ async function checkGraph(url?: string) {
     };
     const plainFlow = plainPath + '/flows/start-plain';
     const initialPlainVersion = await publishPlain(plainBranchCanvas);
-    const args = { version: initialPlainVersion, inputs: { parameters: { choice: 'release' } } };
+    const args = { version: initialPlainVersion, inputs: { parameters: parameters('release') } };
     const before = (
       await api
         .post(plainFlow + '/preview')
@@ -385,17 +370,27 @@ async function checkGraph(url?: string) {
         .expect(201)
     ).body.data;
     assert.equal(pendingJoin.status, 'WAITING');
-    assert.equal(state(pendingJoin, 'parallel-approval'), 'WAITING');
+    assert.equal(state(pendingJoin, 'parallel-delay'), 'WAITING');
     assert.equal(state(pendingJoin, 'combined'), 'PENDING');
     assert.equal(state(pendingJoin, 'default-path'), 'SKIPPED');
-    await api
-      .post(plainPath + '/runs/' + pendingJoin.id + '/nodes/selected-path/decision')
-      .send({ decision: 'APPROVE' })
-      .expect(201);
-    await api
-      .post(plainPath + '/runs/' + pendingJoin.id + '/nodes/parallel-approval/decision')
-      .send({ decision: 'APPROVE' })
-      .expect(201);
+    const db = app.get(DatabaseService).db;
+    const worker = app.get(TaskWorkerService);
+    const wake = async (runId: string, nodeId: string) => {
+      await db
+        .updateTable('execution_node_runs')
+        .set({ started_at: Date.now() - 61_000 })
+        .where('run_id', '=', runId)
+        .where('node_id', '=', nodeId)
+        .execute();
+      await worker.tick();
+    };
+    await wake(pendingJoin.id, 'selected-path');
+    const stillWaiting = (await api.get(plainPath + '/runs/' + pendingJoin.id).expect(200)).body
+      .data;
+    assert.equal(state(stillWaiting, 'selected-path'), 'SUCCESS');
+    assert.equal(state(stillWaiting, 'parallel-delay'), 'WAITING');
+    assert.equal(state(stillWaiting, 'combined'), 'PENDING');
+    await wake(pendingJoin.id, 'parallel-delay');
     const rerun = (
       await api
         .post(plainFlow + '/run')
@@ -404,37 +399,11 @@ async function checkGraph(url?: string) {
     ).body.data;
     assert.equal(rerun.id, pendingJoin.id);
     assert.equal(rerun.status, 'SUCCESS');
-    assert.deepEqual(rerun.outputs, { chosen: 'CASE:publish' });
+    assert.equal(findNode(rerun, 'rules').output?.branchId, 'CASE:publish');
     assert.equal(
       rerun.nodes.filter(({ nodeId }: { nodeId: string }) => nodeId === 'combined').length,
       1,
     );
-    const blocked = (
-      await api
-        .post(plainFlow + '/run')
-        .send({ ...identity, idempotencyKey: randomUUID() })
-        .expect(201)
-    ).body.data;
-    const blockedPath = plainPath + '/runs/' + blocked.id + '/nodes/';
-    const rejectedBranch = (
-      await api
-        .post(blockedPath + 'selected-path/decision')
-        .send({ decision: 'REJECT' })
-        .expect(201)
-    ).body.data;
-    assert.equal(state(rejectedBranch, 'parallel-approval'), 'WAITING');
-    assert.equal(state(rejectedBranch, 'combined'), 'SKIPPED');
-    assert.match(
-      rejectedBranch.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === 'combined').log,
-      /匹配路径审批/,
-    );
-    const failedJoin = (
-      await api
-        .post(blockedPath + 'parallel-approval/decision')
-        .send({ decision: 'APPROVE' })
-        .expect(201)
-    ).body.data;
-    assert.equal(failedJoin.status, 'FAILED');
     const cancelJoin = (
       await api
         .post(plainFlow + '/run')
@@ -449,7 +418,7 @@ async function checkGraph(url?: string) {
     ).body.data;
     assert.equal(cancelledJoin.status, 'CANCELLED');
     assert.equal(state(cancelledJoin, 'rules'), 'SUCCESS');
-    assert.equal(state(cancelledJoin, 'parallel-approval'), 'CANCELLED');
+    assert.equal(state(cancelledJoin, 'parallel-delay'), 'CANCELLED');
     assert.equal(state(cancelledJoin, 'combined'), 'SKIPPED');
     assert.equal(state(cancelledJoin, 'end-plain'), 'SKIPPED');
     assert.equal(state(dagRun, 'yes'), 'SUCCESS');
@@ -457,91 +426,31 @@ async function checkGraph(url?: string) {
     assert.equal(state(dagRun, 'parallel-log'), 'SUCCESS');
     assert.equal(state(dagRun, 'all-join'), 'SUCCESS');
     assert.equal(findNode(dagRun, 'choose').output?.matched, true);
-    const calls = new Set(['choose', 'yes', 'no', 'branch-join']);
-    const reusableCanvas: GraphCanvas = {
-      nodes: [
-        ...dagCanvas.nodes,
-        { id: 'reusable-check', type: 'START', name: '可复用的判断', inputs: [choice] },
-        { id: 'child-end', type: 'END', name: '子流结束' },
-        { id: 'call-branch', name: '执行子流', type: 'FLOW_CALL', flowId: 'reusable-check' },
-      ],
-      edges: [
-        ...dagCanvas.edges.filter(({ from, to }) => calls.has(from) === calls.has(to)),
-        { from: 'split', to: 'call-branch' },
-        { from: 'call-branch', to: 'all-join' },
-        { from: 'reusable-check', to: 'choose' },
-        { from: 'branch-join', to: 'child-end' },
-      ],
-      endpoints: [
-        {
-          startId: 'orchestrate',
-          endId: 'dag-end',
-          inputBindings: { 'call-branch': { choice: choiceBinding } },
-        },
-        {
-          startId: 'reusable-check',
-          endId: 'child-end',
-          inputBindings: { choose: { value: choiceBinding } },
-        },
-      ],
-      templates: [],
-    };
-    const replaced = (
-      await api
-        .put(otherPath + '/draft')
-        .send({ expectedRevision: dagDraft.revision, definition: { canvas: reusableCanvas } })
-        .expect(200)
-    ).body.data;
+    const invalidCall = structuredClone(dagCanvas);
+    const parallelEdge = invalidCall.edges.find(({ to }) => to === 'parallel-log')!;
+    invalidCall.nodes.push({
+      id: 'call',
+      type: 'FLOW_CALL',
+      name: '旧子流',
+      flowId: 'orchestrate',
+    });
+    parallelEdge.to = 'call';
+    invalidCall.edges.push({ from: 'call', to: 'parallel-log' });
+    const unsupportedCall = await api
+      .post(otherPath + '/validate')
+      .send({ definition: { canvas: invalidCall } })
+      .expect(201);
+    assert.ok(
+      unsupportedCall.body.data.issues.some((issue: { nodeId: string }) => issue.nodeId === 'call'),
+    );
     await api
       .post(otherPath + '/extract')
       .send({})
       .expect(404);
-    const dagV2 = (
-      await api
-        .post(otherPath + '/publish')
-        .send({ expectedRevision: replaced.revision })
-        .expect(201)
-    ).body.data.publishedVersion;
-    const called = await runDag('orchestrate', dagV2, 'test');
-    const call = called.nodes.find((n: { type: string }) => n.type === 'FLOW_CALL');
-    assert.equal(call.status, 'SUCCESS');
-    assert.ok(call.childRunId);
-    const child = (await api.get(otherPath + '/runs/' + call.childRunId).expect(200)).body.data;
-    assert.equal(child.parentRunId, called.id);
-    assert.equal(child.version, dagV2);
-    assert.equal(state(child, 'yes'), 'SKIPPED');
-    assert.equal(state(child, 'no'), 'SUCCESS');
-    assert.equal(findNode(child, 'choose').output?.matched, false);
-    const direct = await runDag(child.flowId, dagV2, 'release');
-    assert.equal(state(direct, 'yes'), 'SUCCESS');
-    const calledAgain = await runDag('orchestrate', dagV2, 'release');
-    const nextChild = calledAgain.nodes.find((n: { type: string }) => n.type === 'FLOW_CALL');
-    assert.notEqual(nextChild.childRunId, call.childRunId);
-    assert.equal(nextChild.status, 'SUCCESS');
-    const recursive = structuredClone(reusableCanvas);
-    const outgoing = recursive.edges.find(({ from }) => from === 'branch-join')!;
-    recursive.nodes.push({
-      id: 'recursive-call',
-      type: 'FLOW_CALL',
-      name: '递归',
-      flowId: 'orchestrate',
-    });
-    recursive.edges.push({ from: 'recursive-call', to: outgoing.to });
-    outgoing.to = 'recursive-call';
-    const recursiveDraft = (
-      await api
-        .put(otherPath + '/draft')
-        .send({ expectedRevision: replaced.revision, definition: { canvas: recursive } })
-        .expect(200)
-    ).body.data;
-    const recursivePublish = await api
-      .post(otherPath + '/publish')
-      .send({ expectedRevision: recursiveDraft.revision })
-      .expect(400);
-    assert.match(recursivePublish.text, /执行流调用存在循环依赖/);
     const flowId = 'check';
     const definition = (message: string) => ({
       canvas: {
+        model: 'FLOW_V2',
         nodes: [
           { id: flowId, type: 'START', name: '核对项目' },
           { id: 'report', type: 'LOG', name: '记录结果', message },
@@ -640,7 +549,6 @@ async function checkGraph(url?: string) {
     const pinned = (await api.get(path + '/versions/' + v1).expect(200)).body.data;
     assert.deepEqual(pinned.definition.canvas, originalDraft.draft.canvas);
     await api.get(otherPath + '/runs/' + runId).expect(404);
-    const db = app.get(DatabaseService).db;
     // Timestamps may tie on both databases. The opaque run cursor must preserve UUID order.
     await db
       .updateTable('execution_flow_runs')
@@ -731,7 +639,7 @@ async function checkGraph(url?: string) {
       .send({ expectedRevision: savedAdvanced.revision })
       .expect(201);
     const start = async (value: string) => {
-      const args = { version: 1, inputs: { parameters: { choice: value } } };
+      const args = { version: 1, inputs: { parameters: parameters(value) } };
       const endpoint = advancedPath + '/flows/advanced';
       const preview = (
         await api
@@ -752,78 +660,32 @@ async function checkGraph(url?: string) {
     };
     const details = async (id: string) =>
       (await api.get(advancedPath + '/runs/' + id).expect(200)).body.data;
-    const decisionPath = (id: string) => advancedPath + '/runs/' + id + '/nodes/approve/decision';
     const automatic = await start('ordinary');
     assert.equal(automatic.status, 'SUCCESS');
     assert.equal(findNode(automatic, 'switch').output?.matched, 'DEFAULT');
     assert.equal(findNode(automatic, 'switch').output?.branchId, 'DEFAULT');
     assert.equal(findNode(automatic, 'approve').status, 'SKIPPED');
-    const pending = await start('approve');
-    assert.equal(pending.status, 'WAITING');
-    assert.equal(findNode(pending, 'switch').output?.matched, 'CASE:0');
+    const selected = await start('approve');
+    assert.equal(selected.status, 'SUCCESS');
+    assert.equal(findNode(selected, 'switch').output?.matched, 'CASE:0');
     assert.equal(
-      findNode(pending, 'switch').output?.branchId,
+      findNode(selected, 'switch').output?.branchId,
       'CASE:' + createHash('sha256').update('approve').digest('hex'),
     );
-    assert.equal(findNode(pending, 'continue').status, 'PENDING');
-    assert.ok(Number(findNode(pending, 'approve').output?.expiresAt) > Date.now());
-    await db
-      .insertInto('users')
-      .values({
-        id: randomUUID(),
-        username: 'graph-operator',
-        password_hash: admin.password_hash,
-        role: 'OPERATOR',
-        status: 'ACTIVE',
-        created_at: Date.now(),
-        updated_at: Date.now(),
-      })
-      .execute();
-    const operator = request.agent(app.getHttpServer());
-    await operator
-      .post(root + '/auth/login')
-      .send({ username: 'graph-operator', password })
-      .expect(201);
-    await operator.post(decisionPath(pending.id)).send({ decision: 'APPROVE' }).expect(403);
-    const competing = await Promise.all([
-      api.post(decisionPath(pending.id)).send({ decision: 'APPROVE' }),
-      api.post(decisionPath(pending.id)).send({ decision: 'APPROVE' }),
-    ]);
-    assert.deepEqual(competing.map(({ status }) => status).sort(), [201, 409]);
-    const approved = await details(pending.id);
-    assert.equal(approved.status, 'SUCCESS');
-    assert.equal(findNode(approved, 'approve').output?.decision, 'APPROVE');
-    assert.equal(findNode(approved, 'continue').status, 'SUCCESS');
+    assert.equal(findNode(selected, 'continue').status, 'SUCCESS');
 
-    const rejected = await start('approve');
-    const rejection = (
-      await api.post(decisionPath(rejected.id)).send({ decision: 'REJECT' }).expect(201)
-    ).body.data;
-    assert.equal(rejection.status, 'FAILED');
-    assert.equal(findNode(rejection, 'continue').status, 'SKIPPED');
-    assert.equal(findNode(rejection, 'approve').output?.decision, 'REJECT');
-    const late = await start('approve');
     const waiting = await start('delay');
     assert.equal(waiting.status, 'WAITING');
     assert.equal(findNode(waiting, 'switch').output?.matched, 'CASE:1');
     const wakeAt = Number(findNode(waiting, 'delay').output?.wakeAt);
     assert.ok(wakeAt > Date.now());
-    const worker = app.get(TaskWorkerService);
     await worker.tick();
     const beforeWake = await details(waiting.id);
     assert.equal(findNode(beforeWake, 'delay').output?.wakeAt, wakeAt);
     assert.equal(beforeWake.status, 'WAITING');
-    await db
-      .updateTable('execution_node_runs')
-      .set({ started_at: Date.now() - 61_000 })
-      .where('run_id', 'in', [late.id, waiting.id])
-      .where('status', '=', 'WAITING')
-      .execute();
-    await api.post(decisionPath(late.id)).send({ decision: 'APPROVE' }).expect(409);
-    assert.equal((await details(late.id)).status, 'TIMED_OUT');
-    await worker.tick();
+    await wake(waiting.id, 'delay');
     assert.equal((await details(waiting.id)).status, 'SUCCESS');
-    const cancelled = await start('approve');
+    const cancelled = await start('delay');
     const cancelledDetail = (
       await api
         .post(advancedPath + '/runs/' + cancelled.id + '/cancel')
@@ -831,7 +693,52 @@ async function checkGraph(url?: string) {
         .expect(201)
     ).body.data;
     assert.equal(cancelledDetail.status, 'CANCELLED');
-    assert.equal(findNode(cancelledDetail, 'approve').status, 'CANCELLED');
+    assert.equal(findNode(cancelledDetail, 'delay').status, 'CANCELLED');
+
+    const historicProject = await project('historic-graph');
+    const historicPath = root + '/projects/' + historicProject + '/execution-graph';
+    const historicGraph = (await api.get(historicPath).expect(200)).body.data;
+    const historicDefinition = JSON.parse(initialGraphDraft);
+    const historicFlow = historicDefinition.flows[0];
+    const adminId = await db
+      .selectFrom('users')
+      .select('id')
+      .where('username', '=', 'root')
+      .executeTakeFirstOrThrow();
+    await db.transaction().execute(async (transaction) => {
+      await transaction
+        .insertInto('execution_graph_versions')
+        .values({
+          id: randomUUID(),
+          graph_id: historicGraph.id,
+          version: 1,
+          source_revision: historicGraph.revision,
+          definition_json: initialGraphDraft,
+          created_at: Date.now(),
+          created_by: adminId.id,
+        })
+        .execute();
+      await transaction
+        .updateTable('execution_graphs')
+        .set({ published_version: 1, draft_json: initialGraphDraft })
+        .where('id', '=', historicGraph.id)
+        .execute();
+    });
+    const historicVersion = (await api.get(historicPath + '/versions/1').expect(200)).body.data;
+    assert.deepEqual(historicVersion.definition.flows[0].nodes, historicFlow.nodes);
+    const unsupported = await api
+      .post(historicPath + '/flows/' + historicFlow.id + '/preview')
+      .send({ version: 1 })
+      .expect(400);
+    assert.match(unsupported.text, /FLOW_V2/);
+    await api
+      .post(historicPath + '/versions/1/restore')
+      .send({ expectedRevision: historicGraph.revision })
+      .expect(400);
+    await api
+      .put(historicPath + '/draft')
+      .send({ expectedRevision: historicGraph.revision, definition: historicDefinition })
+      .expect(400);
 
     await api.delete(root + '/projects/' + id).expect(200);
     await api.get(path + '/runs/' + runId).expect(200);

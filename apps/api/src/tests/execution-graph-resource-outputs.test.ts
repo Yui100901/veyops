@@ -10,7 +10,7 @@ import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 
-test('graph nodes expose default logs and return only current-project service references', async () => {
+test('FLOW_V2 exposes node and task logs and validates artifact ownership', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'veyops-graph-output-'));
   const initial = randomBytes(16).toString('hex');
   const password = randomBytes(16).toString('hex');
@@ -59,25 +59,16 @@ test('graph nodes expose default logs and return only current-project service re
     const serviceId = await create(`/projects/${projectId}/services`, 'valid-service');
     const foreignServiceId = await create(`/projects/${otherId}/services`, 'other-service');
 
-    app.get(BuildsService).managerGraphShell = async ({ variables }, _w, _c, _d, _t, onData) => {
-      const selected = variables.FIXTURE_SOURCE === 'other' ? foreignServiceId : serviceId;
-      onData(
-        `自动采集的脚本日志\nVEYOPS_OUTPUT=${JSON.stringify({ PROJECT_SERVICE: { serviceId: selected } })}\n`,
-        'stdout',
-      );
+    app.get(BuildsService).managerFlowCommand = async (
+      { context },
+      _workspace,
+      _command,
+      _directory,
+      variables,
+    ) => {
+      assert.equal(variables.VEYOPS_SERVICE_ID, serviceId);
+      context.log('自动采集的脚本日志');
       return { exitCode: 0, stdout: '', stderr: '' };
-    };
-    const serviceOutput = {
-      id: 'returnedService',
-      name: '项目服务',
-      type: 'SERVICE',
-      referenceName: 'PROJECT_SERVICE',
-    };
-    const source = {
-      id: 'sourceChoice',
-      name: '服务来源',
-      type: 'TEXT',
-      referenceName: 'FIXTURE_SOURCE',
     };
     const graphPath = `${root}/projects/${projectId}/execution-graph`;
     const draft = (await api.get(graphPath).expect(200)).body.data;
@@ -88,9 +79,15 @@ test('graph nodes expose default logs and return only current-project service re
           expectedRevision: draft.revision,
           definition: {
             canvas: {
+              model: 'FLOW_V2',
               templates: [],
               nodes: [
-                { id: 'start', name: '开始', type: 'START', inputs: [source] },
+                {
+                  id: 'start',
+                  name: '开始',
+                  type: 'START',
+                  start: { execution: { location: 'MANAGER' }, release: { serviceId } },
+                },
                 {
                   id: 'legacy-log',
                   name: '旧日志节点',
@@ -102,33 +99,16 @@ test('graph nodes expose default logs and return only current-project service re
                   name: '选择服务',
                   type: 'FUNCTION',
                   operation: 'SHELL',
-                  shell: { location: 'MANAGER', command: 'printf ok' },
-                  inputs: [{ ...source, id: 'scriptSource' }],
-                  outputs: [serviceOutput],
+                  shell: { command: 'printf ok' },
                 },
-                { id: 'end', name: '结束', type: 'END', outputs: [serviceOutput] },
+                { id: 'end', name: '结束', type: 'END', finish: { saveWorkspace: false } },
               ],
               edges: [
                 { from: 'start', to: 'legacy-log' },
                 { from: 'legacy-log', to: 'shell' },
                 { from: 'shell', to: 'end' },
               ],
-              endpoints: [
-                {
-                  startId: 'start',
-                  endId: 'end',
-                  inputBindings: {
-                    shell: { scriptSource: { kind: 'INPUT', fieldId: 'sourceChoice' } },
-                  },
-                  outputBindings: {
-                    returnedService: {
-                      kind: 'OUTPUT',
-                      nodeId: 'shell',
-                      fieldId: 'returnedService',
-                    },
-                  },
-                },
-              ],
+              endpoints: [{ startId: 'start', endId: 'end' }],
             },
           },
         })
@@ -142,8 +122,8 @@ test('graph nodes expose default logs and return only current-project service re
     ).body.data.publishedVersion;
     const worker = app.get(TaskWorkerService);
     const flow = graphPath + '/flows/start';
-    const launch = async (sourceChoice: string) => {
-      const args = { version, inputs: { parameters: { sourceChoice } } };
+    const launch = async () => {
+      const args = { version };
       const preview = (
         await api
           .post(flow + '/preview')
@@ -169,8 +149,8 @@ test('graph nodes expose default logs and return only current-project service re
       assert.fail('Service output flow did not settle');
     };
 
-    const selected = await launch('same');
-    assert.deepEqual(selected.outputs, { returnedService: { serviceId } });
+    const selected = await launch();
+    assert.equal(selected.status, 'SUCCESS');
     const logs = (runId: string, nodeId: string) => `/runs/${runId}/nodes/${nodeId}/logs`;
     const shellLog = (await api.get(graphPath + logs(selected.id, 'shell')).expect(200)).body.data;
     assert.equal(shellLog.source, 'TASK');
@@ -198,11 +178,23 @@ test('graph nodes expose default logs and return only current-project service re
       .expect(404);
     await api.get(graphPath + logs(selected.id, 'shell') + '?offset=-1').expect(400);
 
-    const rejected = await launch('other');
-    assert.equal(rejected.status, 'FAILED');
-    const rejectedLog = (await api.get(graphPath + logs(rejected.id, 'shell')).expect(200)).body
-      .data;
-    assert.match(rejectedLog.summary + rejectedLog.content, /不属于当前项目/);
+    const { revision, draft: current } = (await api.get(graphPath).expect(200)).body.data;
+    current.canvas.nodes[0].start.release.serviceId = foreignServiceId;
+    const validation = await api
+      .post(graphPath + '/validate')
+      .send({ definition: current })
+      .expect(201);
+    const [ownership] = validation.body.data.issues;
+    assert.equal(ownership.fieldId, 'start.release.serviceId');
+    assert.match(ownership.message, /不属于当前项目/);
+    const rejected = await api
+      .put(graphPath + '/draft')
+      .send({ expectedRevision: revision, definition: current })
+      .expect(200);
+    await api
+      .post(graphPath + '/publish')
+      .send({ expectedRevision: rejected.body.data.revision })
+      .expect(400);
   } finally {
     await app.close();
     await rm(dir, { recursive: true, force: true });

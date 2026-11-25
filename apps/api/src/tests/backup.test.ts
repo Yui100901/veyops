@@ -12,12 +12,19 @@ import { DatabaseService } from '../core/database/database.service';
 import { initialGraphDraft } from '../core/database/execution-graphs-migration';
 import { AuditService } from '../modules/audit/audit.service';
 import { CredentialsService } from '../modules/credentials/credentials.service';
+import { ArtifactPhysicalService } from '../modules/artifacts/artifact-physical.service';
+import { ArtifactsService } from '../modules/artifacts/artifacts.service';
+import { BuildsService } from '../modules/builds/builds.service';
 import { ExecutionGraphsService } from '../modules/execution-graphs/execution-graphs.service';
+import { FlowWorkspaceService } from '../modules/execution-graphs/flow-workspace.service';
 import { GraphRunnerService } from '../modules/execution-graphs/graph-runner.service';
 import { GraphTriggersService } from '../modules/execution-graphs/graph-triggers.service';
+import { SimplifiedFlowRunService } from '../modules/execution-graphs/simplified-flow-run.service';
 import type { GraphDefinition } from '../modules/execution-graphs/execution-graph-definition';
 import { PipelinesService } from '../modules/pipelines/pipelines.service';
 import { RepositoryMetadataService } from '../modules/projects/repository-metadata.service';
+import { ServersService } from '../modules/servers/servers.service';
+import { SystemSettingsService } from '../modules/system/system-settings.service';
 import { TaskHandlerRegistry } from '../modules/tasks/task-handler.registry';
 import {
   createPostgresService,
@@ -89,13 +96,28 @@ async function withGraphServices(
       ExecutionGraphsService,
       GraphRunnerService,
       GraphTriggersService,
+      SimplifiedFlowRunService,
       TaskHandlerRegistry,
       AuditService,
       { provide: DatabaseService, useValue: { db: database.db } },
       { provide: CredentialsService, useValue: {} },
       { provide: RepositoryMetadataService, useValue: {} },
+      {
+        provide: SystemSettingsService,
+        useValue: { get: async () => ({ defaultBuildLocation: 'MANAGER' }) },
+      },
+      { provide: FlowWorkspaceService, useValue: {} },
+      { provide: BuildsService, useValue: {} },
+      { provide: ServersService, useValue: {} },
+      { provide: ArtifactsService, useValue: {} },
+      { provide: ArtifactPhysicalService, useValue: {} },
       // This fixture uses only local log nodes; a delivery task must never be submitted.
-      { provide: PipelinesService, useValue: {} },
+      {
+        provide: PipelinesService,
+        useValue: {
+          graphVariables: async () => ({ variables: {}, secretVariables: {}, variableSources: [] }),
+        },
+      },
     ],
   }).compile();
   try {
@@ -158,24 +180,34 @@ async function seed(database: DatabaseService, key: Buffer) {
     })
     .execute();
   await withGraphServices(database, async (graphs, runner) => {
-    const draft: GraphDefinition = JSON.parse(initialGraphDraft);
-    const flow = draft.flows[0];
     const report = { id: 'report', type: 'LOG' as const, name: '验收日志', message: historicalLog };
-    flow.nodes.splice(1, 0, report);
-    flow.edges = [
-      { from: 'start', to: report.id },
-      { from: report.id, to: 'end' },
-    ];
+    const draft: GraphDefinition = {
+      flows: [],
+      canvas: {
+        model: 'FLOW_V2',
+        nodes: [
+          { id: 'start', type: 'START', name: '开始' },
+          report,
+          { id: 'end', type: 'END', name: '结束' },
+        ],
+        edges: [
+          { from: 'start', to: report.id },
+          { from: report.id, to: 'end' },
+        ],
+        endpoints: [{ startId: 'start', endId: 'end' }],
+        templates: [],
+      },
+    };
     let saved = await graphs.save(
       graphProject,
       { expectedRevision: 1, definition: draft },
       sampleUser,
     );
     await graphs.publish(graphProject, saved.revision, sampleUser);
-    const preview = await runner.preview(graphProject, flow.id, { version: 1 });
+    const preview = await runner.preview(graphProject, 'start', { version: 1 });
     await runner.run(
       graphProject,
-      flow.id,
+      'start',
       {
         version: 1,
         expectedConfigurationHash: preview.configurationHash,
@@ -211,6 +243,7 @@ async function verify(
     assert.equal(task.log_file_key, taskLog);
     await withGraphServices(database, async (graphs, runner) => {
       assert.equal((await graphs.get(graphProject)).publishedVersion, 2);
+      assert.equal((await graphs.version(graphProject, 2)).definition.canvas?.model, 'FLOW_V2');
       assert.equal(
         (await graphs.version(graphProject, 2)).definition.flows[0].nodes[1].message,
         'second version',

@@ -66,12 +66,12 @@ async function checkLifecycle(url?: string) {
       const { revision } = await get(graphPath);
       const nodes = serverId
         ? [
-            start,
+            { ...start, start: { execution: { location: 'TARGET', serverId } } },
             {
               id: 'shell',
               type: 'SHELL',
               name: 'Pinned SSH host',
-              shell: { location: 'TARGET', serverId, command: 'true' },
+              shell: { command: 'true' },
             },
             end,
           ]
@@ -85,6 +85,7 @@ async function checkLifecycle(url?: string) {
             definition: {
               flows: [],
               canvas: {
+                model: 'FLOW_V2',
                 nodes: [
                   ...nodes,
                   { id: 'control', type: 'START', name: 'Control flow' },

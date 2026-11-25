@@ -25,6 +25,9 @@ async function checkTypedRuns(url?: string) {
   });
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
+  const { DatabaseService } = await import('../core/database/database.service.js');
+  const { GraphRunnerService } =
+    await import('../modules/execution-graphs/graph-runner.service.js');
   const { GraphTriggersService } =
     await import('../modules/execution-graphs/graph-triggers.service.js');
   const app = (
@@ -35,13 +38,11 @@ async function checkTypedRuns(url?: string) {
     await app.init();
     const api = request.agent(app.getHttpServer());
     const prefix = '/api/v1';
-    const post = async (path: string, body: object) =>
-      (
-        await api
-          .post(prefix + path)
-          .send(body)
-          .expect(201)
-      ).body.data;
+    const post = async (path: string, body: object) => {
+      const response = await api.post(prefix + path).send(body);
+      assert.equal(response.status, 201, path + ' ' + JSON.stringify(response.body));
+      return response.body.data;
+    };
     const get = async (path: string) => (await api.get(prefix + path).expect(200)).body.data;
     await post('/auth/login', { username: 'root', password: initial });
     await api
@@ -51,96 +52,79 @@ async function checkTypedRuns(url?: string) {
     await post('/auth/login', { username: 'root', password });
     const project = await post('/projects', { name: 'Typed flow', slug: 'typed-flow' });
     const graph = `/projects/${project.id}/execution-graph`;
-    const field = { id: 'choice', name: 'Deploy decision', type: 'TEXT', required: true };
-    const input = { kind: 'INPUT', fieldId: 'choice' };
-    const fromCall = { kind: 'OUTPUT', nodeId: 'call', fieldId: 'choice' };
     const definition = {
-      flows: [],
       canvas: {
+        model: 'FLOW_V2',
         nodes: [
-          { id: 'parent', name: 'Parent', type: 'START', inputs: [field] },
-          { id: 'call', name: 'Call decision', type: 'FLOW_CALL', flowId: 'child' },
+          {
+            id: 'start',
+            name: 'Choose a route',
+            type: 'START',
+            start: { variables: [{ key: 'REF', value: 'manual', allowOverride: true }] },
+          },
           {
             id: 'check',
-            name: 'Check decision',
+            name: 'Check release ref',
             type: 'CONDITION',
-            condition: { key: 'input', value: 'refs/heads/release' },
+            condition: { parameterKey: 'REF', value: 'refs/heads/release' },
           },
-          { id: 'yes', name: 'Deploy', type: 'LOG', message: 'deploy-branch' },
-          { id: 'no', name: 'Stay', type: 'LOG', message: 'stay-branch' },
-          { id: 'join', name: 'Continue', type: 'JOIN' },
-          { id: 'end', name: 'Return result', type: 'END', outputs: [field] },
-          { id: 'child', name: 'Receive decision', type: 'START', inputs: [field] },
-          { id: 'child-end', name: 'Return decision', type: 'END', outputs: [field] },
+          { id: 'wait', name: 'Wait before release', type: 'DELAY', delaySeconds: 60 },
+          { id: 'skip', name: 'Skip wait', type: 'LOG', message: 'no release' },
+          { id: 'end', name: 'Continue', type: 'END' },
         ],
         edges: [
-          { from: 'parent', to: 'call' },
-          { from: 'call', to: 'check' },
-          { from: 'check', to: 'yes', when: 'TRUE' },
-          { from: 'check', to: 'no', when: 'FALSE' },
-          { from: 'yes', to: 'join' },
-          { from: 'no', to: 'join' },
-          { from: 'join', to: 'end' },
-          { from: 'child', to: 'child-end' },
+          { from: 'start', to: 'check' },
+          { from: 'check', to: 'wait', when: 'TRUE' },
+          { from: 'check', to: 'skip', when: 'FALSE' },
+          { from: 'wait', to: 'end' },
+          { from: 'skip', to: 'end' },
         ],
-        endpoints: [
-          {
-            startId: 'parent',
-            endId: 'end',
-            inputBindings: { call: { choice: input }, check: { value: fromCall } },
-            outputBindings: { choice: fromCall },
-          },
-          { startId: 'child', endId: 'child-end', outputBindings: { choice: input } },
-        ],
+        endpoints: [{ startId: 'start', endId: 'end' }],
         templates: [],
       },
     };
-    const current = await get(graph);
-    const saved = (
-      await api
+    const publish = async (nextDefinition: object) => {
+      const { revision } = await get(graph);
+      const draft = await api
         .put(prefix + graph + '/draft')
-        .send({ expectedRevision: current.revision, definition })
-        .expect(200)
-    ).body.data;
-    const published = await post(graph + '/publish', { expectedRevision: saved.revision });
-    const version = published.publishedVersion;
-    const flow = graph + '/flows/parent';
+        .send({ expectedRevision: revision, definition: nextDefinition })
+        .expect(200);
+      return post(graph + '/publish', { expectedRevision: draft.body.data.revision });
+    };
+    const { publishedVersion: version } = await publish(definition);
+    const flow = graph + '/flows/start';
+    const args = { version, inputs: { parameters: { 'var:REF': 'manual' } } };
     await api
       .post(prefix + flow + '/preview')
-      .send({ version })
+      .send({ version, inputs: { parameters: { REF: 'unapproved key' } } })
       .expect(400);
-
-    const args = { version, inputs: { parameters: { choice: 'manual' } } };
-    const checked = await post(flow + '/preview', args);
-    assert.equal(checked.parameters.choice, 'manual');
+    const plan = await post(flow + '/preview', args);
     const manual = await post(flow + '/run', {
       ...args,
       idempotencyKey: randomUUID(),
-      expectedConfigurationHash: checked.configurationHash,
+      expectedConfigurationHash: plan.configurationHash,
     });
-    const detail = await get(graph + '/runs/' + manual.id);
-    assert.equal(detail.status, 'SUCCESS');
-    assert.equal(detail.outputs.choice, 'manual');
-    assert.equal(
-      detail.nodes.find((node: { nodeId: string }) => node.nodeId === 'yes').status,
-      'SKIPPED',
-    );
+    const status = (run: { nodes: { nodeId: string; status: string }[] }, id: string) =>
+      run.nodes.find(({ nodeId }) => nodeId === id)?.status;
+    assert.equal(manual.status, 'SUCCESS');
+    assert.equal(status(manual, 'wait'), 'SKIPPED');
+    assert.equal(status(manual, 'skip'), 'SUCCESS');
 
     const triggerPath = graph + '/triggers';
     const rule = {
-      name: 'Typed automation',
+      name: 'Ref-aware automation',
       kind: 'API',
-      flowId: 'parent',
+      flowId: 'start',
       version,
       enabled: true,
     };
     await api
       .post(prefix + triggerPath)
-      .send(rule)
+      .send({ ...rule, parameterMappings: { UNKNOWN: { source: 'EVENT', field: 'ref' } } })
       .expect(400);
     const configured = await post(triggerPath, {
       ...rule,
-      parameterMappings: { choice: { source: 'EVENT', field: 'ref' } },
+      parameterMappings: { 'var:REF': { source: 'EVENT', field: 'ref' } },
     });
     const event = { eventId: 'ref-event', ref: 'refs/heads/release' };
     const invoked = (
@@ -154,92 +138,38 @@ async function checkTypedRuns(url?: string) {
     const queued = events.find((item: { id: string }) => item.id === invoked.id);
     assert.equal(queued.status, 'QUEUED');
     const automated = await get(graph + '/runs/' + queued.runId);
-    assert.equal(automated.status, 'SUCCESS');
-    assert.equal(automated.outputs.choice, event.ref);
+    assert.equal(automated.status, 'WAITING');
     assert.equal(automated.trigger.eventId, event.eventId);
     assert.equal(automated.trigger.ref, event.ref);
-    assert.equal(
-      automated.nodes.find((node: { nodeId: string }) => node.nodeId === 'no').status,
-      'SKIPPED',
-    );
+    assert.equal(status(automated, 'skip'), 'SKIPPED');
+    assert.equal(status(automated, 'wait'), 'WAITING');
 
-    const clock = { id: 'clock', name: 'Started at', type: 'NUMBER', required: true };
-    const deferredDefinition = {
-      flows: [],
-      canvas: {
-        nodes: [
-          { id: 'entry', type: 'START', name: 'Start' },
-          { id: 'approve', type: 'APPROVAL', name: 'Approve' },
-          { id: 'call-child', type: 'FLOW_CALL', name: 'Call child', flowId: 'clock-child' },
-          { id: 'exit', type: 'END', name: 'End', outputs: [clock] },
-          { id: 'clock-child', type: 'START', name: 'Child', inputs: [clock] },
-          { id: 'clock-end', type: 'END', name: 'Child end', outputs: [clock] },
-        ],
-        edges: [
-          { from: 'entry', to: 'approve' },
-          { from: 'approve', to: 'call-child' },
-          { from: 'call-child', to: 'exit' },
-          { from: 'clock-child', to: 'clock-end' },
-        ],
-        endpoints: [
-          {
-            startId: 'entry',
-            endId: 'exit',
-            inputBindings: { 'call-child': { clock: { kind: 'CONTEXT', fieldId: 'triggeredAt' } } },
-            outputBindings: { clock: { kind: 'OUTPUT', nodeId: 'call-child', fieldId: 'clock' } },
-          },
-          {
-            startId: 'clock-child',
-            endId: 'clock-end',
-            outputBindings: { clock: { kind: 'INPUT', fieldId: 'clock' } },
-          },
-        ],
-        templates: [],
-      },
-    };
-    const publish = async (nextDefinition: object) => {
-      const { revision } = await get(graph);
-      const draft = await api
-        .put(prefix + graph + '/draft')
-        .send({ expectedRevision: revision, definition: nextDefinition })
-        .expect(200);
-      return post(graph + '/publish', { expectedRevision: draft.body.data.revision });
-    };
-    await api
-      .patch(prefix + triggerPath + '/' + configured.id)
-      .send({
-        ...rule,
-        enabled: false,
-        parameterMappings: { choice: { source: 'EVENT', field: 'ref' } },
-      })
-      .expect(200);
-    const deferred = await publish(deferredDefinition);
-    const deferredFlow = graph + '/flows/entry';
-    const deferredArgs = { version: deferred.publishedVersion };
-    const preview = await post(deferredFlow + '/preview', deferredArgs);
-    const pending = await post(deferredFlow + '/run', {
-      ...deferredArgs,
-      idempotencyKey: randomUUID(),
-      expectedConfigurationHash: preview.configurationHash,
-    });
-    assert.equal(pending.status, 'WAITING');
-    await publish(definition);
-    await post(`${graph}/versions/${deferred.publishedVersion}/retire`, {});
-    const resumed = await post(`${graph}/runs/${pending.id}/nodes/approve/decision`, {
-      decision: 'APPROVE',
-    });
+    const updated = structuredClone(definition);
+    updated.canvas.nodes.find(({ id }) => id === 'skip')!.message = 'new version';
+    await publish(updated);
+    await post(graph + '/versions/' + version + '/retire', {});
+    await app
+      .get(DatabaseService)
+      .db.updateTable('execution_node_runs')
+      .set({ started_at: Date.now() - 61_000 })
+      .where('run_id', '=', automated.id)
+      .where('node_id', '=', 'wait')
+      .execute();
+    await app.get(GraphRunnerService).tick();
+    const resumed = await get(graph + '/runs/' + automated.id);
     assert.equal(resumed.status, 'SUCCESS');
-    assert.ok(resumed.outputs.clock > 0);
+    assert.equal(resumed.version, version);
+    assert.equal(status(resumed, 'end'), 'SUCCESS');
   } finally {
     await app.close();
     await rm(data, { recursive: true, force: true });
   }
 }
 
-test('SQLite typed runs bind child inputs and outputs, choose result branches and map trigger events', () =>
+test('SQLite FLOW_V2 maps trigger events to start variables and keeps a waiting run on the confirmed version', () =>
   checkTypedRuns());
 test(
-  'PostgreSQL typed runs bind child inputs and outputs, choose result branches and map trigger events',
+  'PostgreSQL FLOW_V2 maps trigger events to start variables and keeps a waiting run on the confirmed version',
   { skip: !process.env.VEYOPS_TEST_POSTGRES_URL },
   () => withIsolatedPostgres(process.env.VEYOPS_TEST_POSTGRES_URL!, checkTypedRuns),
 );

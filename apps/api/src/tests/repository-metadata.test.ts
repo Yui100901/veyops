@@ -488,91 +488,48 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     shallow: false,
   });
   const graphPath = `/api/v1/projects/${project}/execution-graph`;
-  const repoInput = {
-    id: 'repository',
-    name: '仓库名',
-    referenceName: 'GIT_REPOSITORY_NAME',
-    type: 'REPOSITORY',
-    defaultValue: create.cloneUrl,
-  };
   const graph = {
     flows: [],
     canvas: {
+      model: 'FLOW_V2' as const,
       nodes: [
-        { id: 'default', name: '默认仓库', type: 'START', inputs: [repoInput] },
         {
-          id: 'supplied',
-          name: '上游指定仓库',
+          id: 'default',
+          name: '默认仓库',
           type: 'START',
-          inputs: [{ ...repoInput, id: 'upstreamRepo' }],
-        },
-        {
-          id: 'checkout',
-          name: '手工配置检出节点',
-          type: 'FUNCTION',
-          operation: 'CHECKOUT',
-          inputs: [{ ...repoInput, defaultValue: undefined }],
+          start: {
+            execution: { location: 'MANAGER' },
+            sources: [{ id: 'main', repositoryId: id }],
+          },
         },
         {
           id: 'named',
           name: '具名源码',
           type: 'START',
-          contract: 'PRESET',
-          inputs: [
-            {
-              id: 'repository',
-              name: '主干源码',
-              type: 'REPOSITORY',
-              defaultValue: id,
-              runtimeOverride: false,
-            },
-            {
-              id: 'gitVersion',
-              name: '主干版本',
-              type: 'GIT_REF',
-              defaultValue: { kind: 'BRANCH', value: 'main' },
-              runtimeOverride: false,
-            },
-            {
-              id: 'repository-2',
-              name: '联调源码',
-              type: 'REPOSITORY',
-              defaultValue: id,
-              runtimeOverride: false,
-            },
-            {
-              id: 'gitVersion-2',
-              name: '联调版本',
-              type: 'GIT_REF',
-              defaultValue: { kind: 'BRANCH', value: 'feature/release' },
-            },
-          ],
+          start: {
+            execution: { location: 'MANAGER' },
+            sources: [
+              { id: 'main', repositoryId: id, ref: { kind: 'BRANCH', value: 'main' } },
+              {
+                id: 'feature',
+                repositoryId: id,
+                parentDirectory: 'second',
+                ref: { kind: 'BRANCH', value: 'feature/release' },
+                allowRefOverride: true,
+              },
+            ],
+          },
         },
+        { id: 'checkout', name: '检出', type: 'FUNCTION', operation: 'CHECKOUT' },
         { id: 'named-checkout', name: '具名检出', type: 'FUNCTION', operation: 'CHECKOUT' },
         { id: 'end', name: '完成检出', type: 'END' },
       ],
       endpoints: [
-        {
-          startId: 'default',
-          endId: 'end',
-          inputBindings: { checkout: { repository: { kind: 'INPUT', fieldId: 'repository' } } },
-        },
-        {
-          startId: 'supplied',
-          endId: 'end',
-          inputBindings: { checkout: { repository: { kind: 'INPUT', fieldId: 'upstreamRepo' } } },
-        },
-        {
-          startId: 'named',
-          endId: 'end',
-          inputBindings: {
-            'named-checkout': { repository: { kind: 'INPUT', fieldId: 'repository-2' } },
-          },
-        },
+        { startId: 'default', endId: 'end' },
+        { startId: 'named', endId: 'end' },
       ],
       edges: [
         { from: 'default', to: 'checkout' },
-        { from: 'supplied', to: 'checkout' },
         { from: 'checkout', to: 'end' },
         { from: 'named', to: 'named-checkout' },
         { from: 'named-checkout', to: 'end' },
@@ -580,35 +537,34 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
       templates: [],
     },
   };
-  const legacy = structuredClone(graph);
+  const directCheckout = structuredClone(graph);
   Object.assign(
-    legacy.canvas.nodes.find(({ id }) => id === 'checkout')!,
-    { checkout: { repositoryId: id } },
+    directCheckout.canvas.nodes.find(({ id }) => id === 'checkout')!,
+    {
+      checkout: { repositoryId: id },
+    },
   );
+  const rejected = await admin
+    .post(graphPath + '/validate')
+    .send({ definition: directCheckout })
+    .expect(201);
+  assert.ok(
+    rejected.body.data.issues.some(
+      ({ nodeId, fieldId }: Record<string, string>) =>
+        nodeId === 'checkout' && fieldId === 'checkout.repositoryId',
+    ),
+    JSON.stringify(rejected.body),
+  );
+  const legacy = { ...graph, canvas: { ...graph.canvas, model: undefined } };
   const legacyCheck = await admin
     .post(graphPath + '/validate')
     .send({ definition: legacy })
     .expect(201);
-  assert.ok(
-    legacyCheck.body.data.issues.some(
-      ({ flowId, nodeId, fieldId, fieldSection, sourceNodeId }: Record<string, string>) =>
-        flowId === 'default' &&
-        nodeId === 'checkout' &&
-        fieldId === 'repository' &&
-        fieldSection === 'execution' &&
-        sourceNodeId === 'default',
-    ),
-  );
-  const legacyBefore = (await admin.get(graphPath).expect(200)).body.data;
-  const legacyDraft = (
-    await admin
-      .put(graphPath + '/draft')
-      .send({ expectedRevision: legacyBefore.revision, definition: legacy })
-      .expect(200)
-  ).body.data;
+  assert.match(legacyCheck.body.data.issues[0].message, /FLOW_V2/);
+  const beforeLegacy = (await admin.get(graphPath).expect(200)).body.data;
   await admin
-    .post(graphPath + '/publish')
-    .send({ expectedRevision: legacyDraft.revision })
+    .put(graphPath + '/draft')
+    .send({ expectedRevision: beforeLegacy.revision, definition: legacy })
     .expect(400);
   const currentGraph = (await admin.get(graphPath).expect(200)).body.data;
   const savedGraph = (
@@ -623,27 +579,14 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
       .send({ expectedRevision: savedGraph.revision })
       .expect(201)
   ).body.data;
-  for (const [flow, source] of [
-    ['default', 'DEFAULT'],
-    ['supplied', 'INPUT'],
-  ]) {
-    const preview = (
-      await admin
-        .post(`${graphPath}/flows/${flow}/preview`)
-        .send({
-          version: published.publishedVersion,
-          inputs: { parameters: flow === 'supplied' ? { upstreamRepo: id } : {} },
-        })
-        .expect(201)
-    ).body.data;
-    assert.equal(preview.checkouts[0].repositoryId, id);
-    assert.equal(preview.checkouts[0].commitSha, main);
-    const checkout = preview.nodes.find((node: { nodeId: string }) => node.nodeId === 'checkout');
-    const repository = checkout.inputs.find(
-      (field: { fieldId: string }) => field.fieldId === 'repository',
-    );
-    assert.equal(repository.source.kind, source);
-  }
+  const defaultPlan = (
+    await admin
+      .post(graphPath + '/flows/default/preview')
+      .send({ version: published.publishedVersion })
+      .expect(201)
+  ).body.data;
+  assert.equal(defaultPlan.checkouts[0].repositoryId, id);
+  assert.equal(defaultPlan.checkouts[0].commitSha, main);
   const namedPath = graphPath + '/flows/named';
   const args = { version: published.publishedVersion };
   const preview = (
@@ -653,8 +596,11 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
       .expect(201)
   ).body.data;
   assert.equal(preview.checkouts[0].repositoryId, id);
-  assert.equal(preview.checkouts[0].branch, 'feature/release');
-  assert.equal(preview.checkouts[0].commitSha, feature);
+  assert.equal(preview.checkouts[1].branch, 'feature/release');
+  assert.deepEqual(
+    preview.checkouts.map(({ commitSha }: { commitSha: string }) => commitSha),
+    [main, feature],
+  );
   const run = (
     await admin
       .post(namedPath + '/run')
@@ -677,34 +623,37 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   const namedCheckout = detail.nodes.find(
     ({ nodeId }: { nodeId: string }) => nodeId === 'named-checkout',
   );
-  assert.equal(namedCheckout.output.commitSha, feature);
+  assert.deepEqual(
+    namedCheckout.output.sources.map(({ commitSha }: { commitSha: string }) => commitSha),
+    [main, feature],
+  );
   const changedRef = (
     await admin
       .post(namedPath + '/preview')
       .send({
         ...args,
-        inputs: { parameters: { 'gitVersion-2': { kind: 'TAG', value: 'release/v1' } } },
+        inputs: { parameters: { 'git:feature': { kind: 'TAG', value: 'release/v1' } } },
       })
       .expect(201)
   ).body.data;
-  assert.equal(changedRef.checkouts[0].commitSha, main);
+  assert.equal(changedRef.checkouts[1].commitSha, main);
   const missingRef = await admin
     .post(namedPath + '/preview')
     .send({
       ...args,
       inputs: {
-        parameters: { 'gitVersion-2': { kind: 'BRANCH', value: 'missing-fixture-branch' } },
+        parameters: { 'git:feature': { kind: 'BRANCH', value: 'missing-fixture-branch' } },
       },
     })
     .expect(400);
-  assert.equal(missingRef.body.error.planIssue.parameterId, 'gitVersion-2');
+  assert.equal(missingRef.body.error.planIssue.fieldId, 'sources');
   const defaults = (
     await admin
       .post(namedPath + '/preview')
       .send(args)
       .expect(201)
   ).body.data;
-  assert.equal(defaults.checkouts[0].commitSha, feature);
+  assert.equal(defaults.checkouts[1].commitSha, feature);
   await admin.delete(metadataPath).expect(409);
   await assert.rejects(metadata.checkoutGraphSource(other, shallow), /仓库不存在/);
   assert.deepEqual(

@@ -103,6 +103,7 @@ async function verify(databaseUrl?: string) {
             expectedRevision: graph.revision,
             definition: {
               canvas: {
+                model: 'FLOW_V2',
                 nodes: flows.flatMap(({ nodes }) => nodes),
                 edges: flows.flatMap(({ edges }) => edges),
                 endpoints: flows.map(({ id }) => ({ startId: id, endId: id + '-end' })),

@@ -3,14 +3,12 @@ import assert from 'node:assert/strict';
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { after, mock, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
-import type { GraphNode } from '../modules/execution-graphs/execution-graph-definition';
-import type { PipelineSnapshot } from '../modules/pipelines/pipeline.types';
 
 let testDirectory: Promise<string> | undefined;
 const deliveryDirectory = () =>
@@ -47,9 +45,6 @@ async function checkDelivery(databaseUrl?: string) {
   const { PipelineTriggersService } =
     await import('../modules/pipeline-triggers/pipeline-triggers.service.js');
   const { BuildsService } = await import('../modules/builds/builds.service.js');
-  const { ArtifactsService } = await import('../modules/artifacts/artifacts.service.js');
-  const { GraphTriggersService } =
-    await import('../modules/execution-graphs/graph-triggers.service.js');
   const { expandGraphTemplate } =
     await import('../modules/execution-graphs/graph-flow-templates.js');
   const { RepositoryMetadataService } =
@@ -62,7 +57,6 @@ async function checkDelivery(databaseUrl?: string) {
   const managedV2 = compose + '# Service environment revision 2\n';
   const repositoryComposePath = 'deploy/compose.yaml';
   const repositoryCompose = compose + '# Pinned repository Compose file\n';
-  let repositoryComposeRead = repositoryCompose;
   const composeUploads: string[] = [];
   const imageDigest = `sha256:${'1'.repeat(64)}`;
   const imageId = `sha256:${'2'.repeat(64)}`;
@@ -72,10 +66,10 @@ async function checkDelivery(databaseUrl?: string) {
   const remoteCommands: { serverId: string; command: string }[] = [];
   const releaseLinks = new Map<string, string>();
   const transferredArchives: string[] = [];
+  const flowArchives: string[] = [];
   let failedBuildServer: string | undefined;
   let registryPullFails = false;
   let failNextHealthCheck = false;
-  let strictGraphProbeExitCode = 0;
   let failReleaseLockOnServer: string | undefined;
   let archivePlatformMismatch = false;
   let auxiliaryCommit = 'c'.repeat(40);
@@ -86,46 +80,6 @@ async function checkDelivery(databaseUrl?: string) {
     .useValue({
       run: async (_command: string, args: string[], options: { gzipOutput?: { path: string } }) => {
         const script = args.at(-1) ?? '';
-        if (script.includes('GRAPH_TEMPLATE_CI_FAIL'))
-          return {
-            exitCode: 23,
-            stdout: 'fixture check failed\n',
-            stderr: '',
-          };
-        assert.ok(!script.includes('GRAPH_TEMPLATE_BUILD_BLOCKED'));
-        if (script.includes('GRAPH_SHELL_FIXTURE')) {
-          const secretsMount = args.find((arg) => arg.endsWith(',dst=/run/veyops,readonly'));
-          assert.ok(secretsMount);
-          const secrets = secretsMount.slice(
-            'type=bind,src='.length,
-            -',dst=/run/veyops,readonly'.length,
-          );
-          assert.equal(dirname(secrets), join(directory, 'builds'));
-          assert.equal(args.at(-5), buildHelperImage);
-          const path = args.find((arg) => arg.endsWith(',dst=/workspace'))!;
-          const workspace = path.slice('type=bind,src='.length, -',dst=/workspace'.length);
-          const destination = join(workspace, 'repo', 'custom-dist');
-          await mkdir(destination, { recursive: true });
-          await writeFile(join(destination, 'index.html'), '<h1>Shell output</h1>');
-          return {
-            exitCode: 0,
-            stdout: 'VEYOPS_OUTPUT={"result":"generated"}\nVEYOPS_EXIT_CODE=0\n',
-            stderr: '',
-          };
-        }
-        if (script.includes('GRAPH_DEPENDENCY_FIXTURE')) {
-          const mount = args.find((argument) => argument.endsWith(',dst=/workspace'))!;
-          const workspace = mount.slice('type=bind,src='.length, -',dst=/workspace'.length);
-          assert.equal(
-            await readFile(join(workspace, 'repo', 'origin.txt'), 'utf8'),
-            successfulCommit,
-          );
-          assert.equal(
-            await readFile(join(workspace, 'dependencies', 'schema', 'origin.txt'), 'utf8'),
-            auxiliaryCommit,
-          );
-          await writeFile(join(workspace, 'repo', 'app.jar'), archive);
-        }
         const checkout = script.includes('fetch --no-recurse-submodules --no-tags --depth=1');
         if (checkout || script.includes("printf 'VEYOPS_ARTIFACT")) {
           const mount = args.find((arg) => arg.endsWith(',dst=/workspace'))!;
@@ -187,8 +141,6 @@ async function checkDelivery(databaseUrl?: string) {
           failNextHealthCheck = false;
           return { exitCode: 1 };
         }
-        if (command.includes('GRAPH_TEMPLATE_HEALTH_CHECK'))
-          return { exitCode: strictGraphProbeExitCode };
         const switched = /ln -s '([^']+)' '[^']+'; mv -Tf -- '[^']+' '([^']+)'/.exec(command);
         if (switched) releaseLinks.set(`${target.id}:${switched[2]}`, switched[1]!);
         const reading = /^readlink -- '([^']+)'$/.exec(command);
@@ -232,9 +184,15 @@ async function checkDelivery(databaseUrl?: string) {
           return { exitCode: 1 };
         return { exitCode: 0 };
       },
-      upload: async (target: { id: string }, source: string) => {
-        assert.deepEqual(await readFile(source), archive);
-        transferredArchives.push(target.id);
+      upload: async (target: { id: string }, source: string, destination: string) => {
+        if (destination.startsWith('/opt/current-veyops-flow/')) {
+          const contents = await readFile(source);
+          assert.deepEqual([...contents.subarray(0, 2)], [0x1f, 0x8b]);
+          flowArchives.push(target.id);
+        } else {
+          assert.deepEqual(await readFile(source), archive);
+          transferredArchives.push(target.id);
+        }
       },
       uploadContent: async (_target: unknown, contents: string, destination: string) => {
         if (destination.endsWith('/compose.yaml')) composeUploads.push(contents);
@@ -257,7 +215,7 @@ async function checkDelivery(databaseUrl?: string) {
       ) => {
         assert.equal(commitSha, successfulCommit);
         assert.equal(path, repositoryComposePath);
-        return repositoryComposeRead;
+        return repositoryCompose;
       },
       planGraphCheckout: async (
         _projectId: string,
@@ -265,6 +223,7 @@ async function checkDelivery(databaseUrl?: string) {
       ) => ({
         ...source,
         commitSha: source.commitSha ?? successfulCommit,
+        access: { clone_url: 'https://repo.example.test/team/app.git', credential_id: null },
       }),
       checkoutGraphSource: async (
         _projectId: string,
@@ -1343,1126 +1302,11 @@ async function checkDelivery(databaseUrl?: string) {
     }
 
     const graphPath = '/projects/' + project.id + '/execution-graph';
-    const dependencyRepo = await create('/projects/' + project.id + '/repositories', {
-      name: 'Graph schema',
-      cloneUrl: 'https://repo.example.test/team/schema.git',
-    });
-    await api
-      .put('/api/v1/services/' + service.id + '/repositories')
-      .send({
-        repositories: [{ repositoryId: repo.id, repoPath: '.', isPrimary: true }],
-      })
-      .expect(200);
-    const graph = (await api.get('/api/v1' + graphPath).expect(200)).body.data;
     const graphEnv = await create('/projects/' + project.id + '/environments', {
       name: 'Graph release',
       slug: 'graph-release',
       environmentType: 'TESTING',
     });
-    const scoped = [{ id: 'service', name: '服务', type: 'SERVICE', defaultValue: service.id }];
-    const version = {
-      id: 'version',
-      name: '源码版本',
-      type: 'GIT_REF',
-      defaultValue: { kind: 'COMMIT', value: successfulCommit },
-    };
-    const targets = {
-      id: 'targets',
-      name: '服务器',
-      type: 'TARGETS',
-      defaultValue: { serverIds: [serverIds[0]] },
-    };
-    const historical = {
-      id: 'image',
-      name: '历史镜像',
-      type: 'ARTIFACT',
-      artifactType: 'DOCKER_IMAGE',
-    };
-    const from = (nodeId: string, fieldId: string) => ({ kind: 'OUTPUT', nodeId, fieldId });
-    const input = (fieldId: string) => ({ kind: 'INPUT', fieldId });
-    const outputs = [
-      {
-        id: 'jar',
-        name: 'JAR 产物',
-        type: 'ARTIFACT',
-        artifactType: 'FILE',
-        source: 'CURRENT_RUN',
-      },
-      {
-        id: 'image',
-        name: 'Docker 镜像',
-        type: 'ARTIFACT',
-        artifactType: 'DOCKER_IMAGE',
-        source: 'CURRENT_RUN',
-      },
-    ];
-    const fixedGit = (id: string, type: 'REPOSITORY' | 'GIT_REF', defaultValue: unknown) => ({
-      id,
-      name: id,
-      type,
-      defaultValue,
-      runtimeOverride: false,
-    });
-    const checkoutInputs = [
-      fixedGit('actualRepo', 'REPOSITORY', sharedRepo.id),
-      fixedGit('schemaRepo', 'REPOSITORY', dependencyRepo.id),
-      fixedGit('schemaVersion', 'GIT_REF', { kind: 'COMMIT', value: auxiliaryCommit }),
-      fixedGit('unusedRepo', 'REPOSITORY', repo.id),
-      fixedGit('unusedVersion', 'GIT_REF', { kind: 'COMMIT', value: successfulCommit }),
-    ];
-    const typedNodes = [
-      {
-        id: 'custom',
-        type: 'START',
-        name: 'Shell 构建',
-        inputs: [
-          ...scoped,
-          {
-            id: 'outputDir',
-            name: '产物目录',
-            referenceName: 'ARTIFACT_DIR',
-            type: 'PATH',
-            defaultValue: 'custom-dist',
-          },
-        ],
-      },
-      {
-        id: 'script',
-        type: 'SHELL',
-        name: '生成文件',
-        shell: {
-          location: 'MANAGER',
-          command: 'echo GRAPH_SHELL_FIXTURE',
-          params: [{ id: 'OUT_DIR', name: '输出目录', type: 'PATH' }],
-          artifacts: [
-            { id: 'static', name: '站点目录', type: 'DIRECTORY', pathInput: 'OUT_DIR' },
-            {
-              id: 'html',
-              name: '临时首页',
-              type: 'FILE',
-              path: 'custom-dist/index.html',
-              persist: false,
-            },
-            { name: 'optional', type: 'FILE', path: 'missing-shell-output', required: false },
-          ],
-        },
-        outputs: [{ id: 'result', name: '结果', type: 'TEXT' }],
-      },
-      {
-        id: 'custom-end',
-        type: 'END',
-        name: '返回目录',
-        outputs: [
-          {
-            id: 'directory',
-            name: '静态站点',
-            type: 'ARTIFACT',
-            artifactType: 'DIRECTORY',
-            source: 'CURRENT_RUN',
-          },
-        ],
-      },
-      {
-        id: 'build',
-        type: 'START',
-        name: '仅构建',
-        inputs: [...scoped, version, ...checkoutInputs],
-      },
-      {
-        id: 'composed',
-        type: 'START',
-        name: '构建并部署',
-        inputs: [...scoped, version, targets, ...checkoutInputs],
-      },
-      {
-        id: 'release',
-        type: 'START',
-        name: '发布历史镜像',
-        inputs: [...scoped, targets, historical],
-      },
-      {
-        id: 'guarded',
-        type: 'START',
-        name: '审核后发布历史镜像',
-        inputs: [...scoped, targets, historical],
-      },
-      { id: 'review-image', type: 'SOURCE_REVIEW', name: '审核实际镜像来源' },
-      {
-        id: 'approve-image',
-        type: 'APPROVAL',
-        name: '批准具体发布范围',
-        approval: { releaseNodeId: 'deploy-node' },
-      },
-      {
-        id: 'latest',
-        type: 'START',
-        name: '发布最新镜像',
-        inputs: [...scoped, targets, { ...historical, selection: 'LATEST_COMPATIBLE' }],
-      },
-      {
-        id: 'repository-template',
-        type: 'START',
-        name: '使用仓库 Compose 模板发布',
-        inputs: [...scoped, targets, historical],
-      },
-      {
-        id: 'git-actual',
-        type: 'CHECKOUT',
-        name: '实际服务源码',
-      },
-      {
-        id: 'git-schema',
-        type: 'CHECKOUT',
-        name: '实际构建依赖',
-      },
-      {
-        id: 'git-unused',
-        type: 'CHECKOUT',
-        name: '未绑定的源码',
-      },
-      {
-        id: 'build-node',
-        type: 'BUILD',
-        name: '构建归档',
-        build: {
-          buildLocation: 'MANAGER',
-          dependencies: ['schema'],
-          buildCommand: 'echo GRAPH_DEPENDENCY_FIXTURE',
-          artifacts: [
-            { name: 'jar', type: 'FILE', path: 'app.jar' },
-            { name: 'image', type: 'DOCKER_IMAGE', path: 'Dockerfile' },
-          ],
-        },
-      },
-      {
-        id: 'auto-target-start',
-        type: 'START',
-        name: '目标端定时构建',
-        inputs: [
-          targets,
-          fixedGit('repository', 'REPOSITORY', repo.id),
-          fixedGit('gitVersion', 'GIT_REF', { kind: 'BRANCH', value: 'main' }),
-        ],
-      },
-      {
-        id: 'auto-target-check',
-        type: 'CHECK',
-        name: '目标端检查',
-        shell: { location: 'TARGET', command: 'echo GRAPH_AUTOMATIC_TARGET_CHECK' },
-      },
-      {
-        id: 'auto-target-build',
-        type: 'BUILD',
-        name: '目标端构建文件',
-        build: {
-          buildLocation: 'TARGET',
-          buildCommand: 'echo GRAPH_AUTOMATIC_TARGET_BUILD',
-          artifacts: [{ name: 'jar', type: 'FILE', path: 'app.jar' }],
-        },
-      },
-      { id: 'auto-target-end', type: 'END', name: '目标端构建结束' },
-      {
-        id: 'deploy-node',
-        type: 'DEPLOY_ARTIFACT',
-        name: '部署共享节点',
-        deploy: {
-          method: 'COMPOSE',
-          deployPath: '/opt/graph-native',
-          healthCheckCommand: 'test -f compose.yaml',
-        },
-      },
-      {
-        id: 'deploy-repository',
-        type: 'DEPLOY_ARTIFACT',
-        name: '使用固定版本 Compose 模板部署',
-        deploy: {
-          method: 'COMPOSE',
-          deployPath: '/opt/graph-repository-template',
-          healthCheckCommand: 'test -f compose.yaml',
-          composeSource: {
-            kind: 'REPOSITORY_FILE',
-            repositoryId: sharedRepo.id,
-            commitSha: successfulCommit,
-            path: repositoryComposePath,
-          },
-        },
-      },
-      { id: 'build-end', type: 'END', name: '返回 JAR 和镜像', outputs },
-      {
-        id: 'release-end',
-        type: 'END',
-        name: '返回发布',
-        outputs: [{ id: 'release', name: '发布结果', type: 'RELEASE' }],
-      },
-    ];
-    const edges = [
-      ['custom', 'script'],
-      ['script', 'custom-end'],
-      ['build', 'git-actual'],
-      ['composed', 'git-actual'],
-      ['git-actual', 'git-schema'],
-      ['git-schema', 'git-unused'],
-      ['git-unused', 'build-node'],
-      ['auto-target-start', 'auto-target-check'],
-      ['auto-target-check', 'auto-target-build'],
-      ['auto-target-build', 'auto-target-end'],
-      ['build-node', 'build-end'],
-      ['build-node', 'deploy-node'],
-      ['release', 'deploy-node'],
-      ['guarded', 'review-image'],
-      ['review-image', 'approve-image'],
-      ['approve-image', 'deploy-node'],
-      ['latest', 'deploy-node'],
-      ['deploy-node', 'release-end'],
-      ['repository-template', 'deploy-repository'],
-      ['deploy-repository', 'release-end'],
-    ].map(([from, to]) => ({ from, to }));
-    const buildBindings = {
-      'git-actual': { repository: input('actualRepo'), version: input('version') },
-      'git-schema': { repository: input('schemaRepo'), version: input('schemaVersion') },
-      'git-unused': { repository: input('unusedRepo'), version: input('unusedVersion') },
-      'build-node': {
-        workspace: from('git-actual', 'workspace'),
-        dependency_schema: from('git-schema', 'workspace'),
-      },
-    };
-    const releaseEndpoint = (startId: string, artifact: object) => ({
-      startId,
-      endId: 'release-end',
-      serviceId: service.id,
-      inputBindings: {
-        ...(startId === 'composed' && buildBindings),
-        ...(startId === 'guarded' && { 'review-image': { artifact } }),
-        'deploy-node': {
-          artifact,
-          ...(startId === 'guarded' && { review: from('review-image', 'review') }),
-        },
-      },
-      outputBindings: { release: from('deploy-node', 'release') },
-    });
-    const definitionWithDelivery = {
-      flows: [],
-      canvas: {
-        nodes: typedNodes,
-        edges,
-        templates: [],
-        endpoints: [
-          {
-            startId: 'custom',
-            endId: 'custom-end',
-            inputBindings: {
-              script: { OUT_DIR: input('outputDir') },
-            },
-            outputBindings: { directory: from('script', 'static') },
-          },
-          {
-            startId: 'build',
-            endId: 'build-end',
-            inputBindings: buildBindings,
-            outputBindings: { jar: from('build-node', 'jar'), image: from('build-node', 'image') },
-          },
-          {
-            startId: 'auto-target-start',
-            endId: 'auto-target-end',
-            inputBindings: {
-              'auto-target-check': { targets: input('targets') },
-              'auto-target-build': {
-                targets: input('targets'),
-                repository: input('repository'),
-                version: input('gitVersion'),
-              },
-            },
-          },
-          releaseEndpoint('composed', from('build-node', 'image')),
-          releaseEndpoint('release', input('image')),
-          releaseEndpoint('guarded', input('image')),
-          releaseEndpoint('latest', input('image')),
-          {
-            startId: 'repository-template',
-            endId: 'release-end',
-            serviceId: service.id,
-            inputBindings: { 'deploy-repository': { artifact: input('image') } },
-            outputBindings: { release: from('deploy-repository', 'release') },
-          },
-        ],
-      },
-    };
-    const edited = (
-      await api
-        .put('/api/v1' + graphPath + '/draft')
-        .send({ expectedRevision: graph.revision, definition: definitionWithDelivery })
-        .expect(200)
-    ).body.data;
-    const published = await create(graphPath + '/publish', { expectedRevision: edited.revision });
-    const waitGraph = async (id: string) => {
-      for (let attempt = 0; attempt < 120; attempt++) {
-        const detail = (await api.get('/api/v1' + graphPath + '/runs/' + id).expect(200)).body.data;
-        if (
-          !['QUEUED', 'RUNNING', 'WAITING', 'PENDING', 'CANCEL_REQUESTED'].includes(detail.status)
-        )
-          return detail;
-        await worker.tick();
-        await delay(15);
-      }
-      assert.fail('Graph run did not finish: ' + id);
-    };
-    const args = (parameters: object = {}) => ({
-      version: published.publishedVersion,
-      inputs: { parameters },
-    });
-    const submit = async (entry: string, inputs: object = {}) => {
-      const path = graphPath + '/flows/' + entry;
-      const request = args(inputs);
-      const reviewed = await create(path + '/preview', request);
-      const confirmed = {
-        ...request,
-        idempotencyKey: randomUUID(),
-        expectedConfigurationHash: reviewed.configurationHash,
-      };
-      const run = await create(path + '/run', confirmed);
-      assert.equal((await create(path + '/run', confirmed)).id, run.id);
-      return { reviewed, detail: await waitGraph(run.id) };
-    };
-    const custom = await submit('custom');
-    const scriptTaskId = custom.detail.nodes.find(
-      ({ nodeId }: { nodeId: string }) => nodeId === 'script',
-    ).taskId;
-    const scriptLog =
-      scriptTaskId &&
-      (await api.get('/api/v1/tasks/' + scriptTaskId + '/logs').expect(200)).body.data.content;
-    assert.equal(custom.detail.status, 'SUCCESS', scriptLog ?? JSON.stringify(custom.detail.nodes));
-    assert.equal(custom.detail.outputs.directory.type, 'DIRECTORY');
-    assert.equal(custom.detail.outputs.directory.instances.length, 1);
-    const scriptResult = custom.detail.nodes.find(
-      (node: { nodeId: string }) => node.nodeId === 'script',
-    );
-    assert.equal(
-      scriptResult.inputs.find(({ fieldId }: { fieldId: string }) => fieldId === 'OUT_DIR').value,
-      'custom-dist',
-    );
-    assert.equal(scriptResult.output.result, 'generated');
-    assert.equal(scriptResult.output.static.name, '站点目录');
-    assert.equal(scriptResult.output.html.scope, 'TEMPORARY');
-    assert.equal(scriptResult.output.html.rootRunId, custom.detail.id);
-    assert.equal(scriptResult.output.optional, undefined);
-    assert.equal(scriptResult.output.artifacts.length, 2);
-    const beforePublish = remoteCommands.length;
-    const onlyBuild = await submit('build');
-    assert.deepEqual(onlyBuild.reviewed.deliveries[0].serverIds, []);
-    assert.equal(onlyBuild.detail.status, 'SUCCESS', JSON.stringify(onlyBuild.detail.nodes));
-    assert.deepEqual(
-      onlyBuild.reviewed.deliveries[0].sourceSnapshot.map(
-        (source: { repositoryId: string }) => source.repositoryId,
-      ),
-      [sharedRepo.id, dependencyRepo.id],
-    );
-    assert.equal(remoteCommands.length, beforePublish, 'Standalone manager build never opens SSH');
-    const artifactRows = await db
-      .selectFrom('artifacts')
-      .selectAll()
-      .where('graph_run_id', '=', onlyBuild.detail.id)
-      .orderBy('artifact_name')
-      .execute();
-    assert.deepEqual(
-      artifactRows.map((row) => [row.artifact_name, row.artifact_kind, row.source_commit]),
-      [
-        ['image', 'DOCKER_IMAGE', successfulCommit],
-        ['jar', 'FILE', successfulCommit],
-      ],
-    );
-    assert(artifactRows.every((row) => row.graph_node_run_id && row.checksum === checksum));
-    const savedImage = artifactRows[0]!.id;
-    const [produced] = await list('/artifacts', {
-      projectId: project.id,
-      serviceId: service.id,
-      recordId: savedImage,
-    });
-    assert.equal(produced.name, 'image');
-    assert.equal(produced.graphRunId, onlyBuild.detail.id);
-    assert.equal(produced.graphNodeName, '构建归档');
-    assert.equal(produced.graphVersion, published.publishedVersion);
-    assert.equal(produced.imageOrigin, 'BUILD');
-    assert.deepEqual(produced.composeTemplate, {
-      source: 'ARCHIVE',
-      path: 'compose.yaml',
-      checksum: createHash('sha256').update(compose).digest('hex'),
-    });
-    assert.deepEqual(
-      produced.sources.map(
-        (source: { repositoryId: string; commitSha: string; subject: string }) => [
-          source.repositoryId,
-          source.commitSha,
-          source.subject,
-        ],
-      ),
-      [
-        [sharedRepo.id, successfulCommit, 'Fixture ' + successfulCommit.slice(0, 8)],
-        [dependencyRepo.id, auxiliaryCommit, 'Fixture ' + auxiliaryCommit.slice(0, 8)],
-      ],
-    );
-    assert.ok(
-      produced.sources.every(
-        (source: { workspace?: { runId: string } }) =>
-          source.workspace?.runId === onlyBuild.detail.id,
-      ),
-    );
-    assert.equal(
-      (
-        await list('/artifacts', {
-          projectId: project.id,
-          recordId: savedImage,
-          repositoryId: dependencyRepo.id,
-          commit: auxiliaryCommit.slice(0, 12),
-        })
-      ).length,
-      1,
-    );
-    assert.equal(
-      (
-        await list('/artifacts', {
-          projectId: project.id,
-          recordId: savedImage,
-          repositoryId: dependencyRepo.id,
-          commit: successfulCommit,
-        })
-      ).length,
-      0,
-    );
-    assert.equal(
-      (
-        await list('/artifacts', {
-          projectId: project.id,
-          recordId: savedImage,
-          repositoryId: repo.id,
-          commit: successfulCommit,
-        })
-      ).length,
-      0,
-    );
-    const buildEnd = onlyBuild.detail.nodes.find(
-      (node: { nodeId: string }) => node.nodeId === 'build-end',
-    );
-    assert.deepEqual(
-      buildEnd.output.jar.instances.map(({ instanceId }: { instanceId: string }) => instanceId),
-      [artifactRows[1]!.id],
-    );
-    assert.deepEqual(
-      buildEnd.output.image.instances.map(({ instanceId }: { instanceId: string }) => instanceId),
-      [savedImage],
-    );
-    assert.equal(buildEnd.output.jar.artifactId, artifactRows[1]!.logical_artifact_id);
-    assert.equal(buildEnd.output.image.artifactId, artifactRows[0]!.logical_artifact_id);
-    const historicalRelease = await submit('release', { image: savedImage });
-    assert.equal(
-      historicalRelease.detail.status,
-      'SUCCESS',
-      JSON.stringify(historicalRelease.detail.nodes),
-    );
-    assert.equal(produced.physical.engineId, 'fixture-manager-engine');
-    assert.ok(
-      remoteCommands
-        .slice(beforePublish)
-        .some(
-          ({ serverId, command }) =>
-            serverId === serverIds[0] && command.includes('image load --input'),
-        ),
-    );
-    assert.deepEqual(historicalRelease.reviewed.deliveries[0].artifactIds, [savedImage]);
-    assert.deepEqual(
-      historicalRelease.reviewed.deliveries[0].artifactRefs[0].composeTemplate,
-      produced.composeTemplate,
-    );
-    const combined = await submit('composed');
-    assert.equal(combined.detail.status, 'SUCCESS', JSON.stringify(combined.detail.nodes));
-    const releaseNode = combined.detail.nodes.find(
-      (node: { nodeId: string }) => node.nodeId === 'release-end',
-    );
-    assert.equal(releaseNode.output.release.status, 'SUCCESS');
-    assert.notEqual(releaseNode.output.release.deployments[0].artifactId, savedImage);
-    const deploymentTask = combined.detail.nodes.find(
-      (node: { nodeId: string }) => node.nodeId === 'deploy-node',
-    ).taskId;
-    const [released] = await list('/deployments', {
-      projectId: project.id,
-      taskId: deploymentTask,
-    });
-    assert.equal(released.artifactId, releaseNode.output.release.deployments[0].artifactId);
-    assert.equal(released.graphRunId, combined.detail.id);
-    assert.equal(released.graphNodeName, '部署共享节点');
-    assert.equal(released.graphVersion, published.publishedVersion);
-    assert.equal(released.serverHost, 'host-first.test');
-    assert.deepEqual(released.composeRelease.template, produced.composeTemplate);
-    assert.equal(
-      released.composeRelease.imageReference,
-      (await list('/artifacts', { recordId: released.artifactId }))[0].storageKey,
-    );
-    assert.equal(released.composeRelease.imageId, imageId);
-    assert.equal(released.composeRelease.dockerEngineId, 'fixture-engine-' + serverIds[0]);
-    const implicitLatest = await submit('latest');
-    assert.equal(
-      implicitLatest.detail.status,
-      'SUCCESS',
-      JSON.stringify(implicitLatest.detail.nodes),
-    );
-    assert.deepEqual(implicitLatest.reviewed.deliveries[0].artifactIds, [
-      releaseNode.output.release.deployments[0].artifactId,
-    ]);
-
-    const releasesForService = async () =>
-      (
-        await api
-          .get(`/api/v1/projects/${project.id}/services/${service.id}/delivery-status`)
-          .expect(200)
-      ).body.data.filter(
-        ({ method, location }: { method?: string; location?: string }) =>
-          method === 'COMPOSE' && location?.startsWith('veyops-'),
-      );
-    const latestTaskId = implicitLatest.detail.nodes.find(
-      ({ nodeId }: { nodeId: string }) => nodeId === 'deploy-node',
-    ).taskId;
-    const initialServiceReleases = await releasesForService();
-    const previousRelease = initialServiceReleases.find(
-      ({ latestAttempt }: { latestAttempt: { releaseTaskId: string } }) =>
-        latestAttempt.releaseTaskId === latestTaskId,
-    );
-    assert.ok(previousRelease, JSON.stringify(initialServiceReleases));
-    assert.ok(previousRelease.current.id);
-    assert.equal(previousRelease.current.id, previousRelease.latestAttempt.deploymentRecordId);
-    failReleaseLockOnServer = serverIds[0];
-    try {
-      const prepFailure = await submit('release', { image: savedImage });
-      assert.equal(prepFailure.detail.status, 'FAILED', JSON.stringify(prepFailure.detail.nodes));
-      const failedNode = prepFailure.detail.nodes.find(
-        ({ nodeId }: { nodeId: string }) => nodeId === 'deploy-node',
-      );
-      const [attempt] = await list(`/tasks/${failedNode.taskId}/targets`, {});
-      const targetRows = await releasesForService();
-      const target = targetRows.find(
-        ({ scopeKey }: { scopeKey: string }) => scopeKey === previousRelease.scopeKey,
-      );
-      const targetSnapshot = await db
-        .selectFrom('task_targets')
-        .select(['release_scope_key', 'started_at', 'status', 'error_summary'])
-        .where('id', '=', attempt.id)
-        .executeTakeFirstOrThrow();
-      assert.equal(targetSnapshot.release_scope_key, previousRelease.scopeKey);
-      assert.equal(target.current.id, previousRelease.current.id);
-      assert.equal(target.latestAttempt.id, attempt.id, JSON.stringify({ target, targetSnapshot }));
-      assert.equal(target.latestAttempt.taskTargetId, attempt.id);
-      assert.equal(target.latestAttempt.deploymentRecordId, null);
-      assert.equal(target.latestAttempt.releaseTaskId, failedNode.taskId);
-      assert.equal(target.latestAttempt.releaseRunId, prepFailure.detail.id);
-      assert.equal(target.latestAttempt.releaseNodeId, 'deploy-node');
-      assert.equal(target.latestAttempt.phase, 'PREPARE');
-      assert.equal(target.latestAttempt.status, 'FAILED');
-      assert.match(target.latestAttempt.errorSummary, /发布锁目录或部署路径校验失败/);
-      assert.equal((await list('/deployments', { taskId: failedNode.taskId })).length, 0);
-      const portal = (await api.get(`/api/v1/portal?serviceId=${service.id}`).expect(200)).body
-        .data;
-      const scope = portal.projects[0].services[0].targets.find(
-        ({ at }: { at: number }) => at === target.latestAttempt.finishedAt,
-      );
-      assert.equal(scope.current, 'SUCCESS');
-      assert.equal(scope.lastAttempt, 'FAILED');
-      assert.equal(scope.errorSummary, undefined);
-
-      failReleaseLockOnServer = serverIds[1];
-      const mixedRelease = await submit('release', { image: savedImage, targets: { serverIds } });
-      const mixedTaskId = mixedRelease.detail.nodes.find(
-        ({ nodeId }: { nodeId: string }) => nodeId === 'deploy-node',
-      ).taskId;
-      const mixedAttempt = (await api.get(`/api/v1/tasks/${mixedTaskId}`).expect(200)).body.data;
-      assert.equal(
-        mixedAttempt.status,
-        'PARTIAL_FAILED',
-        JSON.stringify(mixedRelease.detail.nodes),
-      );
-      const mixedTargets = (await releasesForService()).filter(
-        ({ latestAttempt }: { latestAttempt: { releaseTaskId: string } }) =>
-          latestAttempt.releaseTaskId === mixedTaskId,
-      );
-      assert.equal(mixedTargets.length, 2);
-      const activated = mixedTargets.find(
-        ({ serverId }: { serverId: string }) => serverId === serverIds[0],
-      );
-      const rejected = mixedTargets.find(
-        ({ serverId }: { serverId: string }) => serverId === serverIds[1],
-      );
-      assert.equal(activated.latestAttempt.status, 'SUCCESS');
-      assert.equal(activated.current.id, activated.latestAttempt.deploymentRecordId);
-      assert.notEqual(activated.current.id, previousRelease.current.id);
-      assert.equal(rejected.latestAttempt.status, 'FAILED');
-      assert.equal(rejected.latestAttempt.deploymentRecordId, null);
-      assert.equal(rejected.current, null);
-    } finally {
-      failReleaseLockOnServer = undefined;
-    }
-    const historicalInput = args({ image: savedImage });
-    const reviewPreview = graphPath + '/flows/release/preview';
-    const guardedPlan = await create(graphPath + '/flows/guarded/preview', historicalInput);
-    assert.equal(
-      guardedPlan.gates.find(({ nodeId }: { nodeId: string }) => nodeId === 'approve-image')
-        ?.releaseNodeId,
-      'deploy-node',
-    );
-    assert.ok(
-      guardedPlan.gates.some(
-        ({ nodeId, kind }: { nodeId: string; kind: string }) =>
-          nodeId === 'review-image' && kind === 'SOURCE_REVIEW',
-      ),
-    );
-
-    const previousAutomaticKinds = process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
-    const previousBuildSocket = process.env.WEBHOOK_BUILD_DOCKER_SOCKET;
-    process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = 'API,WEBHOOK,CRON,UPSTREAM';
-    process.env.WEBHOOK_BUILD_DOCKER_SOCKET = '/run/user/1000/fixture-docker.sock';
-    const managerSocket = mock.method(
-      BuildsService,
-      'automaticManagerSocket',
-      async () => '/run/user/1000/fixture-docker.sock',
-    );
-    const grant = async (enabled: boolean) =>
-      (
-        await api
-          .patch('/api/v1/servers/' + serverIds[0] + '/automatic-execution')
-          .send({ enabled })
-          .expect(200)
-      ).body.data;
-    try {
-      assert.equal((await grant(true)).automaticExecutionEnabled, true);
-      const triggerPath = graphPath + '/triggers';
-      const triggers = app.get(GraphTriggersService);
-      const targetCron = await create(triggerPath, {
-        name: '目标端定时构建',
-        kind: 'CRON',
-        flowId: 'auto-target-start',
-        version: published.publishedVersion,
-        enabled: true,
-        cron: '0 2 * * *',
-        timeZone: 'Asia/Shanghai',
-      });
-      const beforeTarget = remoteCommands.length;
-      await triggers.tick(targetCron.nextAt);
-      const scheduled = await list(triggerPath + '/' + targetCron.id + '/events', {});
-      assert.equal(scheduled.length, 1);
-      const builtByCron = await waitGraph(scheduled[0].runId);
-      assert.equal(builtByCron.status, 'SUCCESS', JSON.stringify(builtByCron.nodes));
-      const automaticCommands = remoteCommands.slice(beforeTarget);
-      for (const marker of ['GRAPH_AUTOMATIC_TARGET_CHECK', 'GRAPH_AUTOMATIC_TARGET_BUILD']) {
-        const commands = automaticCommands.filter(({ command }) => command.includes(marker));
-        assert.equal(commands.length, 1);
-        assert.equal(commands[0].serverId, serverIds[0]);
-        assert.match(commands[0].command, /\/\.veyops\/workspace\/veyops-/);
-      }
-      await api
-        .patch('/api/v1' + triggerPath + '/' + targetCron.id)
-        .send({
-          name: '目标端定时构建',
-          kind: 'CRON',
-          flowId: 'auto-target-start',
-          version: published.publishedVersion,
-          enabled: false,
-          cron: '0 2 * * *',
-          timeZone: 'Asia/Shanghai',
-        })
-        .expect(200);
-      const releaseRule = {
-        name: 'Automatic archive release',
-        enabled: true,
-        version: published.publishedVersion,
-        flowId: 'guarded',
-        parameterMappings: { image: { source: 'VALUE', value: savedImage } },
-      };
-      const events = (ruleId: string) => list(triggerPath + '/' + ruleId + '/events', {});
-      const invoke = (ruleId: string, eventId: string) =>
-        post(triggerPath + '/' + ruleId + '/invoke', {
-          eventId,
-          repositoryId: repo.id,
-          commitSha: failingCommit,
-        }).expect(202);
-      const releaseTaskFor = async (ruleId: string, kind: string, guarded = true) => {
-        const rows = await events(ruleId);
-        assert.equal(rows.length, 1, JSON.stringify(rows));
-        const [event] = rows;
-        assert.equal(event.status, 'QUEUED', JSON.stringify(event));
-        const runPath = graphPath + '/runs/' + event.runId;
-        const graphRun = async () => (await api.get('/api/v1' + runPath).expect(200)).body.data;
-        let run = await graphRun();
-        assert.equal(run.triggerType, kind);
-        if (kind === 'API' || kind === 'WEBHOOK')
-          assert.equal(run.trigger.commitSha, failingCommit);
-        const releaseNode = () =>
-          run.nodes.find((item: { nodeId: string }) => item.nodeId === 'deploy-node');
-        const decide = async (nodeId: string, scopeHash: string) => {
-          const receipt = await create(runPath + '/nodes/' + nodeId + '/decision', {
-            decision: 'APPROVE',
-            expectedScopeHash: scopeHash,
-          });
-          assert.equal(
-            receipt.nodes.find((item: { nodeId: string }) => item.nodeId === nodeId).output
-              .decision,
-            'APPROVE',
-          );
-          run = await graphRun();
-        };
-        if (guarded) {
-          const gate = (nodeId: string) => {
-            const node = run.nodes.find((item: { nodeId: string }) => item.nodeId === nodeId);
-            assert.equal(node.status, 'WAITING', JSON.stringify(node));
-            assert.equal(releaseNode().taskId, null, 'publication never queues before its gates');
-            assert.match(node.output.scopeHash, /^[a-f0-9]{64}$/);
-            return node.output;
-          };
-          const review = gate('review-image');
-          assert.equal(review.scope.kind, 'SOURCE_REVIEW');
-          assert.deepEqual(review.scope.artifactIds, [savedImage]);
-          assert.deepEqual(
-            review.scope.sources
-              .map(
-                ({ repositoryId, commitSha }: { repositoryId: string; commitSha: string }) =>
-                  `${repositoryId}:${commitSha}`,
-              )
-              .sort(),
-            [
-              `${sharedRepo.id}:${successfulCommit}`,
-              `${dependencyRepo.id}:${auxiliaryCommit}`,
-            ].sort(),
-          );
-          await post(runPath + '/nodes/review-image/decision', {
-            decision: 'APPROVE',
-            expectedScopeHash: '0'.repeat(64),
-          }).expect(409);
-          await decide('review-image', review.scopeHash);
-          const approval = gate('approve-image');
-          assert.equal(approval.scope.kind, 'RELEASE');
-          assert.equal(approval.scope.releaseNodeId, 'deploy-node');
-          assert.equal(approval.scope.serviceId, service.id);
-          assert.deepEqual(approval.scope.serverIds, [serverIds[0]]);
-          assert.deepEqual(approval.scope.artifactIds, [savedImage]);
-          await decide('approve-image', approval.scopeHash);
-        }
-        const node = releaseNode();
-        assert.ok(node.taskId, JSON.stringify(node));
-        const task = await getTask(node.taskId);
-        assert.equal(task.triggerType, kind);
-        assert.equal(task.approvalStatus, null);
-        const row = await db
-          .selectFrom('tasks')
-          .select('payload_json')
-          .where('id', '=', task.id)
-          .executeTakeFirstOrThrow();
-        const payload = JSON.parse(row.payload_json) as {
-          pipeline: PipelineSnapshot;
-          targets: { id: string }[];
-        };
-        assert.equal(payload.pipeline.graphAutomation?.ruleId, ruleId);
-        assert.equal(
-          payload.pipeline.graphGate?.review?.nodeId,
-          guarded ? 'review-image' : undefined,
-        );
-        assert.equal(
-          payload.pipeline.graphGate?.approval?.nodeId,
-          guarded ? 'approve-image' : undefined,
-        );
-        assert.equal(payload.pipeline.commitSha, successfulCommit);
-        assert.deepEqual(
-          payload.pipeline.deploymentArtifacts?.map(({ id }) => id),
-          [savedImage],
-        );
-        assert.deepEqual(
-          payload.targets.map(({ id }) => id),
-          [serverIds[0]],
-        );
-        return task.id as string;
-      };
-      const previousRemoteCommands = remoteCommands.length;
-      const autoBuild = await create(triggerPath, {
-        ...releaseRule,
-        kind: 'API',
-        flowId: 'build',
-        parameterMappings: {},
-      });
-      const builder = mock.method(
-        app.get(BuildsService) as unknown as { configureWebhookDocker: () => Promise<void> },
-        'configureWebhookDocker',
-        async () => {},
-      );
-      try {
-        await invoke(autoBuild.id, 'native-api-build');
-        await triggers.tick();
-        const [buildEvent] = await events(autoBuild.id);
-        assert.equal(buildEvent.status, 'QUEUED', JSON.stringify(buildEvent));
-        const run = await waitGraph(buildEvent.runId);
-        assert.equal(run.status, 'SUCCESS', JSON.stringify(run.nodes));
-        assert.equal(run.trigger.commitSha, failingCommit);
-        const node = run.nodes.find((item: { nodeId: string }) => item.nodeId === 'build-node');
-        const task = await getTask(node.taskId);
-        assert.equal(task.triggerType, 'API');
-        assert.equal(task.deploymentTaskId, null);
-        assert.equal(builder.mock.callCount(), 1);
-        assert.ok(
-          run.deliveries[0].sourceSnapshot.some(
-            (source: { repositoryId: string; commitSha: string }) =>
-              source.repositoryId === sharedRepo.id && source.commitSha === successfulCommit,
-          ),
-        );
-      } finally {
-        builder.mock.restore();
-      }
-      assert.equal(remoteCommands.length, previousRemoteCommands);
-
-      const hookKey = randomBytes(32).toString('hex');
-      const hookCredential = await create('/credentials', {
-        name: 'Native archive release signature',
-        type: 'CUSTOM_SECRET',
-        secret: { value: hookKey },
-      });
-      const nativeApi = await create(triggerPath, { ...releaseRule, kind: 'API' });
-      const nativeHook = await create(triggerPath, {
-        ...releaseRule,
-        kind: 'WEBHOOK',
-        credentialId: hookCredential.id,
-        repositoryId: repo.id,
-        refPrefix: 'refs/heads/release/',
-      });
-      const nativeCron = await create(triggerPath, {
-        ...releaseRule,
-        kind: 'CRON',
-        cron: '15 9 * * *',
-        timeZone: 'Asia/Shanghai',
-      });
-      const nativeUpstream = await create(triggerPath, {
-        ...releaseRule,
-        kind: 'UPSTREAM',
-        upstreamFlowId: 'build',
-        upstreamStatus: 'SUCCESS',
-      });
-      const firstApiEvent = await invoke(nativeApi.id, 'native-api-archive');
-      assert.equal(
-        (await invoke(nativeApi.id, 'native-api-archive')).body.data.id,
-        firstApiEvent.body.data.id,
-      );
-      const body = JSON.stringify({
-        repositoryId: repo.id,
-        ref: 'refs/heads/release/fixture',
-        commitSha: failingCommit,
-      });
-      const timestamp = String(Math.floor(Date.now() / 1000));
-      const deliveryId = 'native-hook-archive';
-      const signature =
-        'sha256=' +
-        createHmac('sha256', hookKey)
-          .update(timestamp + '.' + deliveryId + '.' + body)
-          .digest('hex');
-      const sendHook = () =>
-        request(app.getHttpServer())
-          .post('/api/v1/graph-webhooks/' + nativeHook.id)
-          .set('X-Veyops-Timestamp', timestamp)
-          .set('X-Veyops-Delivery', deliveryId)
-          .set('X-Veyops-Signature', signature)
-          .type('json')
-          .send(body)
-          .expect(202);
-      assert.equal((await sendHook()).body.data.id, (await sendHook()).body.data.id);
-      assert.equal((await submit('build')).detail.status, 'SUCCESS');
-      await triggers.tick(nativeCron.nextAt);
-      await triggers.tick(nativeCron.nextAt);
-      assert.equal(remoteCommands.length, previousRemoteCommands);
-
-      for (const [rule, kind] of [
-        [nativeApi, 'API'],
-        [nativeHook, 'WEBHOOK'],
-        [nativeCron, 'CRON'],
-        [nativeUpstream, 'UPSTREAM'],
-      ] as const) {
-        const taskId = await releaseTaskFor(rule.id, kind);
-        const activated = activations().length;
-        const release = await runTask(taskId);
-        assert.equal(release.status, 'SUCCESS', release.errorSummary);
-        assert.equal(activations().length, activated + 1);
-        assert.equal(activations().at(-1)?.serverId, serverIds[0]);
-      }
-
-      const revokedRule = await create(triggerPath, { ...releaseRule, kind: 'API' });
-      await invoke(revokedRule.id, 'native-api-revoked-rule');
-      await triggers.tick();
-      const revokedTaskId = await releaseTaskFor(revokedRule.id, 'API');
-      await api
-        .patch('/api/v1' + triggerPath + '/' + revokedRule.id)
-        .send({ ...releaseRule, kind: 'API', enabled: false })
-        .expect(200);
-      const afterRuleDisabled = remoteCommands.length;
-      const revoked = await runTask(revokedTaskId);
-      assert.equal(remoteCommands.length, afterRuleDisabled);
-      assert.equal(revoked.status, 'FAILED', revoked.errorSummary);
-      assert.match(revoked.errorSummary, /触发器已停用/);
-
-      const ruleOwner = await create('/users', {
-        username: 'graph-release-admin',
-        role: 'ADMIN',
-        password: initialPassword,
-      });
-      const ownerApi = request.agent(app.getHttpServer());
-      await ownerApi
-        .post('/api/v1/auth/login')
-        .send({ username: ruleOwner.username, password: initialPassword })
-        .expect(201);
-      await ownerApi
-        .post('/api/v1/auth/change-password')
-        .send({ currentPassword: initialPassword, newPassword: password })
-        .expect(200);
-      await ownerApi
-        .post('/api/v1/auth/login')
-        .send({ username: ruleOwner.username, password })
-        .expect(201);
-      const ownerRule = (
-        await ownerApi
-          .post('/api/v1' + triggerPath)
-          .send({ ...releaseRule, kind: 'API' })
-          .expect(201)
-      ).body.data;
-      await invoke(ownerRule.id, 'native-api-revoked-owner');
-      await triggers.tick();
-      const ownerTaskId = await releaseTaskFor(ownerRule.id, 'API');
-      await api
-        .patch('/api/v1/users/' + ruleOwner.id)
-        .send({ role: 'VIEWER' })
-        .expect(200);
-      const afterRoleChanged = remoteCommands.length;
-      const ownerRevoked = await runTask(ownerTaskId);
-      assert.equal(remoteCommands.length, afterRoleChanged);
-      assert.equal(ownerRevoked.status, 'FAILED', ownerRevoked.errorSummary);
-      assert.match(ownerRevoked.errorSummary, /配置管理员已失效/);
-
-      const direct = await create(triggerPath, { ...releaseRule, kind: 'API', flowId: 'release' });
-      await invoke(direct.id, 'native-api-direct-release');
-      await triggers.tick();
-      const directTaskId = await releaseTaskFor(direct.id, 'API', false);
-      const activated = activations().length;
-      const directRelease = await runTask(directTaskId);
-      assert.equal(directRelease.status, 'SUCCESS', directRelease.errorSummary);
-      assert.equal(activations().length, activated + 1);
-
-      const targetEventId = (await invoke(direct.id, 'native-api-revoked-target')).body.data.id;
-      await triggers.tick();
-      const targetEvent = (await events(direct.id)).find(
-        (item: { id: string }) => item.id === targetEventId,
-      );
-      const targetRun = (
-        await api.get('/api/v1' + graphPath + '/runs/' + targetEvent.runId).expect(200)
-      ).body.data;
-      const affectedTask = targetRun.nodes.find(
-        ({ nodeId }: { nodeId: string }) => nodeId === 'deploy-node',
-      ).taskId;
-      assert.ok(affectedTask);
-      assert.notEqual(affectedTask, directTaskId);
-      const commandsBeforeRevoke = remoteCommands.length;
-      assert.equal((await grant(false)).automaticExecutionEnabled, false);
-      const targetRevoked = await runTask(affectedTask);
-      assert.equal(targetRevoked.status, 'FAILED', targetRevoked.errorSummary);
-      assert.equal(remoteCommands.length, commandsBeforeRevoke);
-      assert.match(targetRevoked.errorSummary, /缺少有效的自动执行授权/);
-    } finally {
-      managerSocket.mock.restore();
-      if (previousAutomaticKinds === undefined) delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
-      else process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = previousAutomaticKinds;
-      if (previousBuildSocket === undefined) delete process.env.WEBHOOK_BUILD_DOCKER_SOCKET;
-      else process.env.WEBHOOK_BUILD_DOCKER_SOCKET = previousBuildSocket;
-    }
-
-    const graphFailure = await submit('build', {
-      version: { kind: 'COMMIT', value: failingCommit },
-    });
-    assert.equal(graphFailure.detail.status, 'FAILED');
-    assert.equal(graphFailure.detail.nodes.at(-1).status, 'SKIPPED');
-    const buildTask = onlyBuild.detail.nodes.find(
-      (node: { nodeId: string }) => node.nodeId === 'build-node',
-    );
-    const { payload_json: payload } = await db
-      .selectFrom('tasks')
-      .select('payload_json')
-      .where('id', '=', buildTask.taskId)
-      .executeTakeFirstOrThrow();
-    const snapshot = (JSON.parse(payload) as { pipeline: PipelineSnapshot }).pipeline;
-    const importedSnapshot: PipelineSnapshot = {
-      ...snapshot,
-      definition: {
-        ...snapshot.definition,
-        artifacts: [
-          {
-            name: 'imported',
-            type: 'DOCKER_IMAGE',
-            imageReference: 'fixture/test@' + imageDigest,
-          },
-        ],
-      },
-    };
-    const imageArtifact = {
-      name: 'imported',
-      kind: 'DOCKER_IMAGE',
-      storageType: 'LOCAL_IMAGE',
-      imageReference: 'fixture/test:local',
-      imageId,
-      storageKey: produced.storageKey,
-      composeYaml: compose,
-    } as const;
-    const artifactsService = app.get(ArtifactsService);
-    const imported = await artifactsService.create(importedSnapshot, imageArtifact);
-    assert.equal((await artifactsService.create(importedSnapshot, imageArtifact)).id, imported.id);
-    for (const composeYaml of [undefined, compose + '# changed']) {
-      await assert.rejects(
-        artifactsService.create(importedSnapshot, { ...imageArtifact, composeYaml }),
-        /Compose 归档与本次恢复不一致/,
-      );
-    }
-    const [importedRecord] = await list('/artifacts', {
-      projectId: project.id,
-      recordId: imported.id,
-    });
-    assert.deepEqual(
-      importedRecord.sources,
-      [],
-      'an imported image cannot inherit the build checkout provenance',
-    );
-    const externalServerId = serverIds[0]!;
-    const externalServer = await db
-      .selectFrom('servers')
-      .select('host_key_fingerprint')
-      .where('id', '=', externalServerId)
-      .executeTakeFirstOrThrow();
-    const externalReference = 'fixture/script-image:1';
-    const external = await artifactsService.create(importedSnapshot, {
-      ...imageArtifact,
-      name: 'external-script-image',
-      storageType: 'REMOTE_IMAGE',
-      storageKey: externalReference,
-      imageReference: externalReference,
-      serverId: externalServerId,
-      physical: {
-        kind: 'DOCKER_IMAGE',
-        location: 'DOCKER_ENGINE',
-        owner: 'EXTERNAL',
-        serverId: externalServerId,
-        engineId: `fixture-engine-${externalServerId}`,
-        hostKeyFingerprint: externalServer.host_key_fingerprint ?? undefined,
-        platform: 'linux/amd64',
-        imageId,
-        imageReference: externalReference,
-      },
-    });
-    const eligibleExternal = () =>
-      artifactsService.deployableIn(db, snapshot.runId, true, false, undefined, [external.id]);
-    assert.deepEqual(
-      (await eligibleExternal()).map(({ id }) => id),
-      [external.id],
-    );
-    await db
-      .updateTable('artifacts')
-      .set({ storage_key: externalReference + '-unconfirmed' })
-      .where('id', '=', external.id)
-      .execute();
-    assert.deepEqual(await eligibleExternal(), []);
-    assert.ok(composeUploads.length > 0 && composeUploads.every((value) => value === compose));
     const managedPath = `/services/${service.id}/environments/${graphEnv.id}/compose-templates`;
     const managed = (content: string, expectedVersion = 0) => ({
       source: 'SERVICE_ENVIRONMENT',
@@ -2484,409 +1328,112 @@ async function checkDelivery(databaseUrl?: string) {
     const revision2 = await create(managedPath, managed(managedV2, 1));
     assert.equal(revision2.version, 2);
 
-    // Graph deployments require their declared Compose source even if a legacy template is active.
-    await db
-      .updateTable('artifacts')
-      .set({ compose_yaml: null, compose_checksum: null })
-      .where('id', '=', savedImage)
-      .execute();
-    await post(reviewPreview, historicalInput).expect(409);
-    const firstRepository = await submit('repository-template', { image: savedImage });
-    assert.equal(
-      firstRepository.detail.status,
-      'SUCCESS',
-      JSON.stringify(firstRepository.detail.nodes),
-    );
-    assert.equal(composeUploads.at(-1), repositoryCompose);
-    const repositoryDeployTask = firstRepository.detail.nodes.find(
-      (node: { nodeId: string }) => node.nodeId === 'deploy-repository',
-    ).taskId;
-    const [repositoryRecord] = await list('/deployments', { taskId: repositoryDeployTask });
-    const repositoryTemplate = {
-      source: 'REPOSITORY_FILE',
-      path: repositoryComposePath,
-      repositoryId: sharedRepo.id,
-      commitSha: successfulCommit,
-      checksum: createHash('sha256').update(repositoryCompose).digest('hex'),
-    };
-    assert.deepEqual(firstRepository.reviewed.deliveries[0].composeTemplate, repositoryTemplate);
-    const { composeProject, ...composeEvidence } = repositoryRecord.composeRelease;
-    assert.match(composeProject, /^veyops-[a-f0-9]{24}$/);
-    assert.deepEqual(composeEvidence, {
-      template: repositoryTemplate,
-      imageReference: produced.storageKey,
-      imageId,
-      dockerEngineId: 'fixture-engine-' + serverIds[0],
-    });
-
-    const repositoryFlow = graphPath + '/flows/repository-template';
-    const oldPlan = await create(repositoryFlow + '/preview', historicalInput);
-    const confirmRepository = {
-      ...historicalInput,
-      expectedConfigurationHash: oldPlan.configurationHash,
-    };
-    const changedRepository = repositoryCompose + '# Unexpected bytes for the same Git object\n';
-    repositoryComposeRead = changedRepository;
-    await post(repositoryFlow + '/run', {
-      ...confirmRepository,
-      idempotencyKey: randomUUID(),
-    }).expect(409);
-    repositoryComposeRead = repositoryCompose;
-    const queuedRepository = await create(repositoryFlow + '/run', {
-      ...confirmRepository,
-      idempotencyKey: randomUUID(),
-    });
-    const activationCount = activations().length;
-    repositoryComposeRead = changedRepository;
-    const changedRun = await waitGraph(queuedRepository.id);
-    assert.equal(changedRun.status, 'FAILED', JSON.stringify(changedRun.nodes));
-    assert.equal(activations().length, activationCount);
-    assert.equal(composeUploads.at(-1), repositoryCompose);
-    repositoryComposeRead = repositoryCompose;
-
-    const expanded = expandGraphTemplate('CD_DEPLOY', 'DOCKER_IMAGE');
-    const templateRelease = expanded.canvas.nodes.find(
-      ({ operation }) => operation === 'DEPLOY_ARTIFACT',
-    )!;
-    const templateApproval = expanded.canvas.nodes.find(
-      ({ operation }) => operation === 'APPROVAL',
-    )!;
-    templateApproval.approval!.timeoutSeconds = 60;
-    const templateProbe = expanded.canvas.nodes.find(
-      ({ operation }) => operation === 'HEALTH_CHECK',
-    )!;
-    templateRelease.deploy = {
-      method: 'COMPOSE',
-      deployPath: '/srv/veyops-graph-template',
-      composeSource: {
-        kind: 'REPOSITORY_FILE',
-        repositoryId: sharedRepo.id,
-        commitSha: successfulCommit,
-        path: repositoryComposePath,
-      },
-    };
-    templateProbe.healthCheck!.command = 'echo GRAPH_TEMPLATE_HEALTH_CHECK';
-    const cdDraft = (
-      await api
-        .put('/api/v1' + graphPath + '/draft')
-        .send({
-          expectedRevision: edited.revision,
-          definition: { canvas: expanded.canvas },
-        })
-        .expect(200)
-    ).body.data;
-    const publishReplacement = () =>
-      api.post('/api/v1' + graphPath + '/publish').send({ expectedRevision: cdDraft.revision });
-    const blockedReplacement = await publishReplacement().expect(400);
-    assert.ok(
-      ['build', 'guarded', 'release'].includes(blockedReplacement.body.error.planIssue.nodeId),
-    );
-    for (const rule of await list(graphPath + '/triggers', {})) {
-      if (!rule.enabled) continue;
-      const {
-        name,
-        kind,
-        flowId,
-        version,
-        cron,
-        timeZone,
-        credentialId,
-        upstreamFlowId,
-        upstreamStatus,
-        parameterMappings,
-        repositoryId,
-        refPrefix,
-      } = rule;
-      await api
-        .patch('/api/v1' + graphPath + '/triggers/' + rule.id)
-        .send({
-          enabled: false,
-          name,
-          kind,
-          flowId,
-          version,
-          cron,
-          timeZone,
-          credentialId,
-          upstreamFlowId,
-          upstreamStatus,
-          parameterMappings,
-          repositoryId,
-          refPrefix,
-        })
-        .expect(200);
-    }
-    const cdVersion = (await create(graphPath + '/publish', { expectedRevision: cdDraft.revision }))
-      .publishedVersion;
-    const cdFlow = `${graphPath}/flows/${expanded.startId}`;
-    const cdRequest = {
-      version: cdVersion,
-      inputs: {
-        parameters: {
-          artifact: { artifactId: savedImage },
-          service: { serviceId: service.id },
-          releaseTargets: { serverIds: [serverIds[0]!] },
-        },
-      },
-    };
-    const queueCd = async (
-      request:
-        | typeof cdRequest
-        | {
-            version: number;
-            inputs: { parameters: Omit<typeof cdRequest.inputs.parameters, 'service'> };
+    const defaults = expandGraphTemplate('MINIMAL_CI_CD', 'DIRECTORY', 'FLOW_V2');
+    const [start, checkoutNode, buildNode, deployNode, end] = defaults.canvas.nodes;
+    const buildFlow = {
+      ...start!,
+      start: {
+        sources: [
+          {
+            id: 'app',
+            repositoryId: repo.id,
+            ref: { kind: 'COMMIT' as const, value: successfulCommit },
+            allowRefOverride: true,
           },
-    ) => {
-      const plan = await create(cdFlow + '/preview', request);
-      const run = await create(cdFlow + '/run', {
-        ...request,
-        idempotencyKey: randomUUID(),
-        expectedConfigurationHash: plan.configurationHash,
-      });
-      const approval = run.nodes.find(
-        ({ nodeId }: { nodeId: string }) => nodeId === templateApproval.id,
-      );
-      assert.equal(approval.status, 'WAITING');
-      assert.equal(approval.output.scope.serviceId, service.id);
-      assert.deepEqual(approval.output.scope.artifactIds, [savedImage]);
-      const decide = (decision: 'APPROVE' | 'REJECT') =>
-        create(`${graphPath}/runs/${run.id}/nodes/${approval.nodeId}/decision`, {
-          decision,
-          expectedScopeHash: approval.output.scopeHash,
-        });
-      return { run, decide };
-    };
-    const rejected = await queueCd(cdRequest);
-    await rejected.decide('REJECT');
-    const refused = await waitGraph(rejected.run.id);
-    assert.equal(refused.status, 'FAILED');
-    assert.equal(
-      refused.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === templateRelease.id).taskId,
-      null,
-    );
-    const expired = await queueCd(cdRequest);
-    await db
-      .updateTable('execution_node_runs')
-      .set({ started_at: Date.now() - 61_000 })
-      .where('run_id', '=', expired.run.id)
-      .where('node_id', '=', templateApproval.id)
-      .execute();
-    const expiredApproval = expired.run.nodes.find(
-      ({ nodeId }: { nodeId: string }) => nodeId === templateApproval.id,
-    );
-    await api
-      .post(`/api/v1${graphPath}/runs/${expired.run.id}/nodes/${templateApproval.id}/decision`)
-      .send({ decision: 'APPROVE', expectedScopeHash: expiredApproval.output.scopeHash })
-      .expect(409);
-    const timedOut = await waitGraph(expired.run.id);
-    assert.equal(timedOut.status, 'TIMED_OUT');
-    assert.equal(
-      timedOut.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === templateRelease.id).taskId,
-      null,
-    );
-    for (const [code, status, health] of [
-      [0, 'SUCCESS', 'HEALTHY'],
-      [10, 'FAILED', 'UNHEALTHY'],
-      [127, 'NEEDS_ATTENTION', 'UNKNOWN'],
-    ] as const) {
-      strictGraphProbeExitCode = code;
-      const { run, decide } = await queueCd(cdRequest);
-      await decide('APPROVE');
-      const result = await waitGraph(run.id);
-      assert.equal(result.status, status, JSON.stringify(result.nodes));
-      const probe = result.nodes.find(
-        ({ nodeId }: { nodeId: string }) => nodeId === templateProbe.id,
-      );
-      assert.equal(probe.status, status);
-      assert.equal(probe.output.release.targets[0].health, health);
-      assert.equal(probe.output.release.targets[0].probeExitCode, code);
-      if (status === 'SUCCESS') assert.equal(result.outputs.healthStatus, health);
-    }
-
-    // The selected start group pins both the service and target for this release.
-    const fixed = structuredClone(expanded.canvas);
-    const [fixedStart] = fixed.nodes;
-    fixedStart!.inputs = fixedStart!.inputs!.map((field) => {
-      if (field.id === 'service')
-        return { ...field, defaultValue: { serviceId: service.id }, runtimeOverride: false };
-      if (field.id === 'releaseTargets')
-        return { ...field, defaultValue: { serverIds: [serverIds[1]!] } };
-      return field;
-    });
-    fixedStart!.inputs.push(
-      {
-        id: 'service-2',
-        name: '联调发布',
-        type: 'SERVICE',
-        defaultValue: { serviceId: service.id },
-        runtimeOverride: false,
+        ],
+        execution: { location: 'MANAGER' as const },
+        release: {
+          serviceId: service.id,
+          targets: { serverIds: [serverIds[0]!] },
+          deployPath: '/opt/current-veyops-flow',
+          contentPath: 'app/dist',
+        },
       },
-      {
-        id: 'releaseTargets-2',
-        name: '联调服务器',
-        type: 'TARGETS',
-        purpose: 'RELEASE_TARGETS',
-        defaultValue: { serverIds: [serverIds[0]!] },
-        runtimeOverride: false,
-      },
-    );
-    fixed.endpoints[0]!.inputBindings![templateRelease.id]!.service = {
-      kind: 'INPUT',
-      fieldId: 'service-2',
     };
-    const fixedDraft = (
+    const approve = {
+      id: 'confirm',
+      type: 'APPROVAL' as const,
+      name: 'Approve the frozen payload',
+    };
+    const buildAction = {
+      ...buildNode!,
+      build: { buildCommand: 'BUILD_FLOW_FIXTURE', repoPath: 'app' },
+    };
+    const flowNodes = [buildFlow, checkoutNode!, buildAction, approve, deployNode!, end!];
+    const current = (await api.get('/api/v1' + graphPath).expect(200)).body.data;
+    const edited = (
       await api
         .put('/api/v1' + graphPath + '/draft')
         .send({
-          expectedRevision: cdDraft.revision,
-          definition: { canvas: fixed },
+          expectedRevision: current.revision,
+          definition: {
+            canvas: {
+              ...defaults.canvas,
+              nodes: flowNodes,
+              edges: flowNodes
+                .slice(1)
+                .map(({ id: to }, index) => ({ from: flowNodes[index]!.id, to })),
+            },
+          },
         })
         .expect(200)
     ).body.data;
-    const fixedVersion = (
-      await create(graphPath + '/publish', { expectedRevision: fixedDraft.revision })
-    ).publishedVersion;
-    strictGraphProbeExitCode = 10;
-    const fixedCd = await queueCd({
-      version: fixedVersion,
-      inputs: {
-        parameters: {
-          artifact: { artifactId: savedImage },
-          releaseTargets: { serverIds: [serverIds[1]!] },
-        },
-      },
+    const { publishedVersion: graphVersion } = await create(graphPath + '/publish', {
+      expectedRevision: edited.revision,
     });
-    await fixedCd.decide('APPROVE');
-    const fixedFailure = await waitGraph(fixedCd.run.id);
-    assert.equal(fixedFailure.status, 'FAILED', JSON.stringify(fixedFailure.nodes));
-    assert.equal(
-      fixedFailure.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === templateProbe.id)
-        .output.status,
-      'UNHEALTHY',
-    );
-    assert.equal(
-      fixedFailure.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === templateRelease.id)
-        .targets[0].serverId,
-      serverIds[0],
-    );
-
-    const ci = expandGraphTemplate('CI_BUILD', 'FILE');
-    const ciStart = ci.canvas.nodes.find(({ id }) => id === ci.startId)!;
-    const ciCheck = ci.canvas.nodes.find(({ operation }) => operation === 'CHECK')!;
-    const ciBuild = ci.canvas.nodes.find(({ operation }) => operation === 'BUILD')!;
-    assert.equal(ciStart.buildLocation, 'INHERIT');
-    ciStart.buildLocation = 'MANAGER';
-    ciCheck.shell!.location = 'MANAGER';
-    ciCheck.shell!.command = 'echo GRAPH_TEMPLATE_CI_FAIL; exit 23';
-    ciBuild.build!.buildCommand = 'echo GRAPH_TEMPLATE_BUILD_BLOCKED';
-    ciBuild.build!.artifacts![0]!.path = 'app.jar';
-    const ciDraft = (
-      await api
-        .put('/api/v1' + graphPath + '/draft')
-        .send({ expectedRevision: fixedDraft.revision, definition: { canvas: ci.canvas } })
-        .expect(200)
-    ).body.data;
-    const ciVersion = (await create(graphPath + '/publish', { expectedRevision: ciDraft.revision }))
-      .publishedVersion;
-    const ciFlow = `${graphPath}/flows/${ci.startId}`;
-    const ciRequest = {
-      version: ciVersion,
-      inputs: {
-        parameters: {
-          repository: sharedRepo.id,
-          gitVersion: { kind: 'COMMIT', value: successfulCommit },
-        },
-      },
-    };
-    const assertBuildPlacement = (
-      plan: {
-        deliveries: { nodeId: string; serverIds: string[] }[];
-        executionPlan: {
-          settings: { nodeId: string; field: string; source: string; value: unknown }[];
-        };
-      },
-      location: 'MANAGER' | 'TARGET',
-      source: string,
-      targets: string[],
-    ) => {
-      const build = plan.deliveries.find(({ nodeId }) => nodeId === ciBuild.id)!;
-      assert.deepEqual(build.serverIds, targets);
-      const setting = plan.executionPlan.settings.find(
-        ({ nodeId, field }) => nodeId === ciBuild.id && field === 'buildLocation',
+    const fixtureBuilds = app.get(BuildsService);
+    fixtureBuilds.managerFlowCommand = async (_options, workspace, command, subdirectory) => {
+      assert.equal(command, 'BUILD_FLOW_FIXTURE');
+      assert.equal(subdirectory, 'app');
+      assert.equal(
+        await readFile(join(workspace, subdirectory, 'origin.txt'), 'utf8'),
+        successfulCommit,
       );
-      assert.equal(setting?.value, location);
-      assert.equal(setting?.source, source);
+      await mkdir(join(workspace, subdirectory, 'dist'));
+      await writeFile(join(workspace, subdirectory, 'dist', 'index.html'), 'verified release');
+      return { exitCode: 0, stdout: '', stderr: '' };
     };
-    const defaults = (await api.get(settingsPath).expect(200)).body.data;
-    assert.equal(defaults.effective.defaultBuildLocation, 'TARGET');
-    const ciPlan = await create(ciFlow + '/preview', ciRequest);
-    assertBuildPlacement(ciPlan, 'MANAGER', 'START', []);
-    const ciQueued = await create(ciFlow + '/run', {
-      ...ciRequest,
-      idempotencyKey: randomUUID(),
-      expectedConfigurationHash: ciPlan.configurationHash,
+    const flow = graphPath + '/flows/' + defaults.startId;
+    const submit = async (inputs: object = {}) => {
+      const args = { version: graphVersion, inputs };
+      const plan = await create(flow + '/preview', args);
+      return create(flow + '/run', {
+        ...args,
+        expectedConfigurationHash: plan.configurationHash,
+        idempotencyKey: randomUUID(),
+      });
+    };
+    const wait = async (id: string, states: string[]) => {
+      for (let attempt = 0; attempt < 120; attempt++) {
+        await worker.tick();
+        const current = (await api.get('/api/v1' + graphPath + '/runs/' + id).expect(200)).body
+          .data;
+        if (states.includes(current.status)) return current;
+        await delay(15);
+      }
+      assert.fail('Graph run did not reach ' + states.join('/'));
+    };
+    const initialActivations = activations().length;
+    const flowRun = await submit();
+    const pending = await wait(flowRun.id, ['WAITING', 'FAILED']);
+    assert.equal(pending.status, 'WAITING', JSON.stringify(pending.nodes));
+    assert.equal(activations().length, initialActivations);
+    assert.equal(flowArchives.length, 0);
+    await create(graphPath + '/runs/' + pending.id + '/nodes/' + approve.id + '/decision', {
+      decision: 'APPROVE',
     });
-    const ciFailed = await waitGraph(ciQueued.id);
-    const findCiNode = (id: string) =>
-      ciFailed.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === id);
-    assert.equal(ciFailed.status, 'FAILED');
-    assert.equal(findCiNode(ciCheck.id).status, 'FAILED');
-    assert.equal(findCiNode(ciBuild.id).status, 'SKIPPED');
-    assert.equal(findCiNode(ciBuild.id).taskId, null);
-    assert.deepEqual(ciFailed.artifactIds, []);
-    const ciLog = (
-      await api.get(`/api/v1${graphPath}/runs/${ciFailed.id}/nodes/${ciCheck.id}/logs`).expect(200)
-    ).body.data;
-    assert.match(ciLog.content, /fixture check failed/);
-    let latestRevision = ciDraft.revision;
-    const publishBuildPlacement = async (location: NonNullable<GraphNode['buildLocation']>) => {
-      ciStart.buildLocation = location;
-      const saved = (
-        await api
-          .put('/api/v1' + graphPath + '/draft')
-          .send({ expectedRevision: latestRevision, definition: { canvas: ci.canvas } })
-          .expect(200)
-      ).body.data;
-      latestRevision = saved.revision;
-      return (await create(graphPath + '/publish', { expectedRevision: latestRevision }))
-        .publishedVersion;
-    };
-    const inheritVersion = await publishBuildPlacement('INHERIT');
-    const inherited = { ...ciRequest, version: inheritVersion };
-    const targeted = {
-      parameters: { ...ciRequest.inputs.parameters, buildTargets: { serverIds: [serverIds[0]!] } },
-    };
-    const missingTarget = await post(ciFlow + '/preview', inherited).expect(400);
-    assert.equal(missingTarget.body.error.planIssue.fieldId, 'targets');
-    assertBuildPlacement(
-      await create(ciFlow + '/preview', { ...inherited, inputs: targeted }),
-      'TARGET',
-      'SYSTEM',
-      [serverIds[0]!],
-    );
-    await api.patch(settingsPath).send({ defaultBuildLocation: 'MANAGER' }).expect(200);
-    assertBuildPlacement(
-      await create(ciFlow + '/preview', { ...inherited, inputs: targeted }),
-      'MANAGER',
-      'PROJECT',
-      [],
-    );
-    const targetVersion = await publishBuildPlacement('TARGET');
-    await post(ciFlow + '/preview', { ...ciRequest, version: targetVersion }).expect(400);
-    assertBuildPlacement(
-      await create(ciFlow + '/preview', { version: targetVersion, inputs: targeted }),
-      'TARGET',
-      'START',
-      [serverIds[0]!],
-    );
-    await api
-      .patch(settingsPath)
-      .send({ defaultBuildLocation: defaults.overrides.defaultBuildLocation ?? null })
-      .expect(200);
-
-    const archiveRevision = await create(managedPath, { source: 'ARCHIVE', expectedVersion: 2 });
-    assert.equal(archiveRevision.version, 3);
-    await post(reviewPreview, historicalInput).expect(409);
+    const completed = await wait(flowRun.id, ['SUCCESS', 'FAILED']);
+    assert.equal(completed.status, 'SUCCESS', JSON.stringify(completed.nodes));
+    assert.deepEqual(flowArchives, [serverIds[0]]);
+    assert.equal(activations().length, initialActivations + 1);
+    assert.equal(completed.artifactIds.length, 1);
+    const failedRun = await submit({
+      parameters: { 'git:app': { kind: 'COMMIT', value: failingCommit } },
+    });
+    const failedCheckout = await wait(failedRun.id, ['SUCCESS', 'FAILED']);
+    assert.equal(failedCheckout.status, 'FAILED');
+    assert.equal(activations().length, initialActivations + 1);
+    assert.deepEqual(failedCheckout.artifactIds, []);
   } finally {
     await app.close();
   }
