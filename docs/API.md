@@ -206,7 +206,11 @@
 
 运行时 `inputs.parameters` 使用 `git:<sourceId>`、`var:<key>` 或 `artifactId` 覆盖开始节点明确放开的字段。仓库、执行位置、目标及凭据随发布版固定。开始节点设置了 `useUpstreamArtifact` 时，上游成功事件继承实际登记并符合条件的产物。模板或草稿出现所需资源缺失、旧端口、无效路径或当前版本尚未支持的动作时，发布检查返回定位诊断。
 
-`START.start.release.compose` 使用 `{sourceId?,path}`。省略 `sourceId` 时归档本次工作区里的 YAML，指定源码时从其已确认提交读取。历史镜像允许沿用随产物归档的 Compose。`BUILD.build.dockerfilePath` 启用内置镜像构建，并按此次构建的实际 Image ID 自动登记。自定义镜像由 `END.finish.image` 登记，设置 `registryId` 时 `reference` 须含固定 Digest。`ROLLBACK_ARTIFACT` 使用开始节点选定的历史产物和预览时各目标的当前版本，要求人工审批。
+`END.finish.saveWorkspace` 省略时默认保存实际使用过的工作区。`retention: "RUN"` 只保留本次临时快照。`saveWorkspace: false` 时，本次文件发布仍会固定临时实物。临时实例可在运行详情中识别，历史选择器仅提供持久实例。历史发布使用既有实例，本次另外生成的工作区按结束规则处理。
+
+`END.finish.images` 为 `{id,name,source,reference?,registryId?}[]`。每条流内登记名称规范化为小写且唯一，`id` 用于稳定引用。`BUILT_IN` 采用 `BUILD.build.dockerfilePath` 构建出的实际 Image ID。`WORKSPACE` 读取 `<name>:<VEYOPS_IMAGE_TAG>`，该保留变量由运行 ID 导出。`REGISTRY` 需要 `registryId` 和带固定 Digest 的完整 `reference`。`START.start.release.imageId` 选择本次 Compose 发布项，只有一项时可省略。启用 `useUpstreamArtifact` 后，可用 `upstreamArtifactName` 选定上游持久产物，实际实例 ID 在触发时固定。
+
+`START.start.release.compose` 使用 `{sourceId?,path}`。省略 `sourceId` 时，从工作区归档所选镜像的 Compose YAML。指定源码时从其已确认提交读取。历史镜像允许使用随产物归档的配置。`ROLLBACK_ARTIFACT` 使用开始节点选定的历史产物和预览时各目标的当前版本，要求人工审批。
 
 ### 历史执行图
 

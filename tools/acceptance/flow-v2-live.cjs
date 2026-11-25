@@ -145,6 +145,8 @@ async function verifyFlowV2({ api, fixture, execute }) {
       'printf "%s\\n" "exclude from snapshot" > scratch/private.txt',
     ].join('\n'),
   };
+  delete finish.finish.saveWorkspace;
+  delete finish.finish.retention;
   finish.finish.excludePaths = [sourceDirectory + '/scratch'];
   const version = await publish(api, graph, canvas);
   const built = await execute(
@@ -180,6 +182,30 @@ async function verifyFlowV2({ api, fixture, execute }) {
   );
   const initial = await verifyActivation(built, deliveryTarget, artifact.id, source.sha);
 
+  const transient = structuredClone(canvas);
+  transient.nodes.find(({ id }) => id === finish.id).finish.saveWorkspace = false;
+  const transientVersion = await publish(api, graph, transient);
+  const transientRun = await execute(
+    startId,
+    {},
+    { projectId: project.id, version: transientVersion, checkIdempotency: true },
+  );
+  assert.equal(transientRun.artifacts.length, 0, 'temporary release stays outside artifact lists');
+  const [temporary] = transientRun.detail.simplified.artifacts;
+  assert.equal(transientRun.detail.simplified.artifacts.length, 1);
+  assert.equal(temporary.name, 'workspace');
+  assert.equal(temporary.temporary, true);
+  const transientRelease = await verifyActivation(
+    transientRun,
+    deliveryTarget,
+    temporary.id,
+    source.sha,
+  );
+  const cleanup = await api.post('/artifact-retention/preview', {
+    artifacts: [{ artifactId: temporary.id }],
+  });
+  assert.equal(cleanup.eligibleCount, 0, 'active release protects the temporary snapshot');
+
   source.advance();
   const replayStart = 'historical-release';
   const replayDeploy = 'historical-deploy';
@@ -202,7 +228,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
       id: replayEnd,
       name: '核对激活',
       type: 'END',
-      finish: { saveWorkspace: false, requireRelease: 'ACTIVATED' },
+      finish: { requireRelease: 'ACTIVATED' },
     },
   );
   canvas.edges.push({ from: replayStart, to: replayDeploy }, { from: replayDeploy, to: replayEnd });
@@ -215,9 +241,24 @@ async function verifyFlowV2({ api, fixture, execute }) {
   );
   assert.equal(replay.detail.simplified.release.artifactId, artifact.id);
   assert.deepEqual(replay.detail.simplified.sources, []);
+  assert.equal(replay.detail.simplified.workspacePath, null);
   assert.deepEqual(replay.detail.outputs.artifactIds, [artifact.id]);
   const repeated = await verifyActivation(replay, deliveryTarget, artifact.id, source.sha);
   assert.notEqual(repeated.id, initial.id);
+
+  start.start.release.artifactId = artifact.id;
+  const mixedVersion = await publish(api, graph, canvas);
+  const mixed = await execute(startId, {}, { projectId: project.id, version: mixedVersion });
+  const [newSnapshot] = mixed.detail.simplified.artifacts;
+  assert.equal(mixed.detail.simplified.artifacts.length, 1);
+  assert.equal(newSnapshot.temporary, false);
+  assert.equal(newSnapshot.commitSha, source.nextSha);
+  assert.notEqual(newSnapshot.id, artifact.id);
+  assert.deepEqual(
+    new Set(mixed.detail.outputs.artifactIds),
+    new Set([newSnapshot.id, artifact.id]),
+  );
+  const mixedRelease = await verifyActivation(mixed, deliveryTarget, artifact.id, source.sha);
   return {
     projectId: project.id,
     sourceCommitSha: source.sha,
@@ -225,7 +266,13 @@ async function verifyFlowV2({ api, fixture, execute }) {
     sourceServerId: sourceTarget,
     destinationServerId: deliveryTarget,
     buildRunId: built.detail.id,
+    temporaryRunId: transientRun.detail.id,
+    temporaryArtifactId: temporary.id,
+    temporaryDeploymentId: transientRelease.id,
     replayRunId: replay.detail.id,
+    mixedRunId: mixed.detail.id,
+    mixedSnapshotId: newSnapshot.id,
+    mixedDeploymentId: mixedRelease.id,
     artifactId: artifact.id,
     initialDeploymentId: initial.id,
     replayDeploymentId: repeated.id,
@@ -296,6 +343,151 @@ async function rejectChangedImage(api, graph, flow, version, plan) {
   assert.fail('Historical replay did not finish after the image tag was changed');
 }
 
+async function verifyNamedImageTrigger({
+  api,
+  canvas,
+  graph,
+  execute,
+  startId,
+  associatedStart,
+  selectedName,
+  projectId,
+  serverId,
+}) {
+  const start = canvas.nodes.find(({ id }) => id === associatedStart);
+  delete start.start.release.artifactId;
+  start.start.release.useUpstreamArtifact = true;
+  start.start.release.upstreamArtifactName = selectedName;
+  const version = await publish(api, graph, canvas);
+  await api.call('PATCH', '/servers/' + serverId + '/automatic-execution', { enabled: true });
+  const rules = graph + '/triggers';
+  const rule = await api.post(rules, {
+    name: '按登记名称重发镜像',
+    kind: 'UPSTREAM',
+    version,
+    flowId: associatedStart,
+    upstreamFlowId: startId,
+    upstreamStatus: 'SUCCESS',
+    enabled: true,
+  });
+  const upstream = await execute(startId, {}, { projectId, version });
+  const selected = upstream.artifacts.find(({ name }) => name === selectedName);
+  assert.ok(selected);
+  assert.equal(upstream.artifacts.filter(({ kind }) => kind === 'DOCKER_IMAGE').length, 3);
+  const eventsPath = rules + '/' + rule.id + '/events';
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline) {
+    const events = await api.get(eventsPath);
+    const event = events.find(({ eventId }) => eventId === upstream.detail.id);
+    assert.notEqual(event?.status, 'REJECTED', JSON.stringify(event));
+    if (event?.runId) {
+      const detail = await api.get(graph + '/runs/' + event.runId);
+      if (!['QUEUED', 'RUNNING', 'WAITING'].includes(detail.status)) {
+        assert.equal(detail.status, 'SUCCESS', JSON.stringify(detail.nodes));
+        assert.equal(detail.triggerType, 'UPSTREAM');
+        assert.equal(detail.simplified.release.artifactId, selected.id);
+        assert.deepEqual(detail.outputs.artifactIds, [selected.id]);
+        const releases = await api.get('/deployments?projectId=' + projectId);
+        assert.equal(
+          releases.find(
+            ({ graphRunId, status }) => graphRunId === detail.id && status === 'SUCCESS',
+          )?.artifactId,
+          selected.id,
+        );
+        assert.equal((await api.get(eventsPath)).length, 1);
+        return { runId: detail.id, upstreamRunId: upstream.detail.id, artifactId: selected.id };
+      }
+    }
+    await sleep(750);
+  }
+  assert.fail('The upstream image trigger did not complete');
+}
+
+async function verifyManagerImageArchive({
+  api,
+  graph,
+  canvas,
+  execute,
+  docker,
+  projectId,
+  sources,
+  release,
+  serverId,
+}) {
+  const { canvas: manager, startId } = await api.post(graph + '/draft/templates/expand', {
+    templateId: 'MINIMAL_CI_CD',
+    model: 'FLOW_V2',
+    artifactType: 'DOCKER_IMAGE',
+  });
+  const start = manager.nodes.find(({ id }) => id === startId);
+  const build = manager.nodes.find(({ operation }) => operation === 'BUILD');
+  const delivery = {
+    ...release,
+    deployPath: '/srv/veyops-stage0/flow-v2-manager',
+  };
+  start.start = {
+    sources,
+    execution: { location: 'MANAGER' },
+    release: {
+      ...start.start.release,
+      ...delivery,
+      compose: { path: sourceDirectory + '/compose.yaml' },
+    },
+  };
+  build.build = { repoPath: sourceDirectory, dockerfilePath: 'Dockerfile' };
+  canvas.nodes.push(...manager.nodes);
+  canvas.edges.push(...manager.edges);
+  canvas.endpoints.push(...manager.endpoints);
+  const version = await publish(api, graph, canvas);
+  const built = await execute(startId, {}, { projectId, version });
+  assert.equal(built.detail.simplified.location, 'MANAGER');
+  const image = built.artifacts.find(({ kind }) => kind === 'DOCKER_IMAGE');
+  assert.ok(image);
+  assert.equal(image.storageType, 'LOCAL_IMAGE');
+  assert.equal(image.imageTag, 'run-' + built.detail.id);
+  const archive = await api.request('GET', '/artifacts/' + image.id + '/download');
+  assert.equal(archive.status, 200);
+  const checksum = createHash('sha256')
+    .update(Buffer.from(await archive.arrayBuffer()))
+    .digest('hex');
+  assert.equal(checksum, image.checksum);
+  assert.equal(archive.headers.get('x-artifact-sha256'), checksum);
+  const directory = '/accept/targets/test-a/deploy/flow-v2-manager';
+  const activated = await verifyComposeActivation(built, image, serverId, directory, docker);
+
+  const replay = 'manager-archive-replay';
+  const deploy = 'manager-archive-deploy';
+  const end = 'manager-archive-end';
+  canvas.nodes.push(
+    {
+      id: replay,
+      name: '重发管理端归档',
+      type: 'START',
+      start: { release: { ...delivery, artifactId: image.id } },
+    },
+    {
+      id: deploy,
+      name: '部署管理端镜像',
+      type: 'FUNCTION',
+      operation: 'DEPLOY_ARTIFACT',
+      deploy: { method: 'COMPOSE' },
+    },
+    { id: end, name: '核对激活', type: 'END', finish: { requireRelease: 'ACTIVATED' } },
+  );
+  canvas.edges.push({ from: replay, to: deploy }, { from: deploy, to: end });
+  canvas.endpoints.push({ startId: replay, endId: end });
+  const replayVersion = await publish(api, graph, canvas);
+  const replayed = await execute(replay, {}, { projectId, version: replayVersion });
+  const restored = await verifyComposeActivation(replayed, image, serverId, directory, docker);
+  assert.notEqual(restored.deployment.id, activated.deployment.id);
+  return {
+    runId: built.detail.id,
+    artifactId: image.id,
+    replayRunId: replayed.detail.id,
+    checksum,
+  };
+}
+
 async function verifyFlowV2Image({ api, fixture, execute, docker }) {
   const source = await repositoryFixture(true);
   const project = await api.post('/projects', {
@@ -339,30 +531,74 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
       },
     ],
     execution: { location: 'TARGET', serverId },
-    release: { ...release, compose: { path: sourceDirectory + '/compose.yaml' } },
+    release: {
+      ...release,
+      compose: { path: sourceDirectory + '/compose.yaml' },
+      imageId: 'chosen',
+    },
   };
-  build.build = { repoPath: sourceDirectory, dockerfilePath: 'Dockerfile' };
-  finish.finish = { saveWorkspace: true, retention: 'PERSISTENT', requireRelease: 'ACTIVATED' };
+  build.build = {
+    repoPath: sourceDirectory,
+    dockerfilePath: 'Dockerfile',
+    buildCommand: [
+      'test "$VEYOPS_IMAGE_TAG" = "run-$VEYOPS_FLOW_RUN_ID"',
+      'docker build --label fixture.variant=chosen -t "flow-v2-web:$VEYOPS_IMAGE_TAG" .',
+      'docker build --label fixture.variant=additional -t "flow-v2-worker:$VEYOPS_IMAGE_TAG" .',
+    ].join('\n'),
+  };
+  finish.finish = {
+    requireRelease: 'ACTIVATED',
+    images: [
+      { id: 'built-in', name: 'flow-v2-source', source: 'BUILT_IN' },
+      { id: 'chosen', name: 'flow-v2-web', source: 'WORKSPACE' },
+      { id: 'worker', name: 'flow-v2-worker', source: 'WORKSPACE' },
+    ],
+  };
+
+  const unregistered = structuredClone(canvas);
+  const deployment = unregistered.nodes.find(({ operation }) => operation === 'DEPLOY_ARTIFACT');
+  unregistered.nodes = unregistered.nodes.filter(({ id }) => id !== deployment.id);
+  unregistered.nodes.find(({ id }) => id === start.id).start.release = undefined;
+  delete unregistered.nodes.find(({ id }) => id === build.id).build.buildCommand;
+  delete unregistered.nodes.find(({ id }) => id === finish.id).finish;
+  unregistered.edges = [
+    ...unregistered.edges.filter(({ from, to }) => from !== deployment.id && to !== deployment.id),
+    { from: build.id, to: finish.id },
+  ];
+  const defaultVersion = await publish(api, graph, unregistered);
+  const defaultRun = await execute(startId, {}, { projectId: project.id, version: defaultVersion });
+  assert.equal(defaultRun.detail.nodes.find(({ nodeId }) => nodeId === build.id).status, 'SUCCESS');
+  assert.deepEqual(
+    defaultRun.artifacts.map(({ kind }) => kind),
+    ['DIRECTORY'],
+  );
+
   const version = await publish(api, graph, canvas);
   const initialRun = await execute(startId, {}, { projectId: project.id, version });
   assert.equal(initialRun.detail.simplified.sources[0].commitSha, source.sha);
   assert.deepEqual(initialRun.artifacts.map(({ kind }) => kind).sort(), [
     'DIRECTORY',
     'DOCKER_IMAGE',
+    'DOCKER_IMAGE',
+    'DOCKER_IMAGE',
   ]);
-  const image = initialRun.artifacts.find(({ kind }) => kind === 'DOCKER_IMAGE');
+  const images = initialRun.artifacts.filter(({ kind }) => kind === 'DOCKER_IMAGE');
+  const image = images.find(({ name }) => name === 'flow-v2-web');
+  const worker = images.find(({ name }) => name === 'flow-v2-worker');
   const workspace = initialRun.artifacts.find(({ kind }) => kind === 'DIRECTORY');
   assert.notEqual(image.id, workspace.id);
+  assert.notEqual(image.imageId, worker.imageId);
   assert.equal(workspace.physical.collection, 'WORK_DIRECTORY');
-  assert.equal(image.serverId, serverId);
-  assert.equal(image.sourceCommit, source.sha);
-  assert.equal(image.physical.location, 'DOCKER_ENGINE');
-  assert.equal(image.physical.owner, 'MANAGED');
-  assert.match(image.imageId, /^sha256:[a-f0-9]{64}$/);
-  const reference = image.physical.imageReference;
-  assert.match(reference, /^veyops-build\/[a-f0-9-]+:[a-f0-9-]+$/);
   const inspect = (ref) => docker('test-a', 'image', 'inspect', '--format', '{{.Id}}', ref);
-  assert.equal(inspect(reference), image.imageId);
+  for (const entry of images) {
+    assert.equal(entry.serverId, serverId);
+    assert.equal(entry.sourceCommit, source.sha);
+    assert.equal(entry.physical.location, 'DOCKER_ENGINE');
+    assert.match(entry.imageId, /^sha256:[a-f0-9]{64}$/);
+    assert.equal(entry.physical.imageReference, entry.name + ':run-' + initialRun.detail.id);
+    assert.equal(inspect(entry.physical.imageReference), entry.imageId);
+  }
+  const reference = image.physical.imageReference;
   const original = await verifyComposeActivation(initialRun, image, serverId, directory, docker);
 
   const replay = 'historical-image-release';
@@ -423,19 +659,45 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
   const restored = await verifyComposeActivation(replayed, image, serverId, directory, docker);
   assert.equal(restored.composeProject, original.composeProject);
   assert.notEqual(restored.deployment.id, original.deployment.id);
+  const namedTrigger = await verifyNamedImageTrigger({
+    api,
+    canvas,
+    graph,
+    execute,
+    startId,
+    associatedStart: replay,
+    selectedName: image.name,
+    projectId: project.id,
+    serverId,
+  });
+  const manager = await verifyManagerImageArchive({
+    api,
+    graph,
+    canvas,
+    execute,
+    docker,
+    projectId: project.id,
+    sources: start.start.sources,
+    release,
+    serverId,
+  });
   return {
     projectId: project.id,
     serverId,
     sourceCommitSha: source.sha,
+    unregisteredBuildRunId: defaultRun.detail.id,
     buildRunId: initialRun.detail.id,
     replayRunId: replayed.detail.id,
     imageArtifactId: image.id,
+    imageArtifacts: images.map(({ id, name, imageId }) => ({ id, name, imageId })),
     directoryArtifactId: workspace.id,
     imageId: image.imageId,
     composeChecksum: original.deployment.composeRelease.template.checksum,
     initialDeploymentId: original.deployment.id,
     replayDeploymentId: restored.deployment.id,
     changedImageAttempt: refused,
+    namedTrigger,
+    manager,
   };
 }
 

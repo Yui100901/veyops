@@ -209,6 +209,9 @@ fi
   printf 'ADMIN_PASSWORD=%s\n' "$(openssl rand -hex 24)"
   printf 'ENCRYPTION_KEY=%s\n' "$(openssl rand -hex 32)"
   printf 'DOCKER_HOST=unix:///accept/targets/test-a/docker.sock\nNODE_PATH=/app/apps/api/node_modules:/app/node_modules\n'
+  if [ "$mode" = flow-v2-image ]; then
+    printf 'VEYOPS_AUTO_DELIVERY_TRIGGERS=UPSTREAM\n'
+  fi
   printf 'BUILD_HELPER_IMAGE=%s\nVEYOPS_ACCEPT_BUILD_IMAGE=%s\n' "$target_image" "$target_image"
 } >"$work/bootstrap.env"
 {

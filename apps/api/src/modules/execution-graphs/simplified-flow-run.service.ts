@@ -391,6 +391,17 @@ export class SimplifiedFlowRunService {
       if (
         !artifact &&
         !upstreamPending &&
+        releaseNode.deploy?.method === 'COMPOSE' &&
+        !simplifiedReleaseImage(finish, release)
+      )
+        throw issue(
+          'CONFIGURATION',
+          'start.release.imageId',
+          '请在结束节点登记镜像，选择本次发布项后重新发布执行流',
+        );
+      if (
+        !artifact &&
+        !upstreamPending &&
         !hasWorkspaceActions &&
         releaseNode.deploy?.method !== 'COMPOSE'
       )
