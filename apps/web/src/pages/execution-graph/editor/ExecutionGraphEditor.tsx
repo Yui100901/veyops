@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import type { DragEvent, ReactNode } from 'react';
 import { Copy, Plus, Trash2, ArrowRight, ArrowLeft, ChevronDown } from 'lucide-react';
-import { post, useResource, type GraphIssueLocation } from '../../../api';
+import { useResource, type GraphIssueLocation } from '../../../api';
 import { ErrorBanner, Field } from '../../../components';
 import type { ProjectDetail, Server } from '../../../models';
 import { graphDragType, NodeMap } from './ExecutionGraphCanvas';
@@ -218,10 +218,6 @@ export function ProjectGraphEditor({
       ? templateType
       : 'FUNCTION';
   const selectedPath = pathHighlight(canvas, selectedPair?.startId);
-  const [catalogSnapshot, setCatalogSnapshot] = useState<{
-    canvas: GraphCanvas;
-    flows: GraphCatalog['flows'];
-  }>();
   const activePair =
     activeNode && selectedPath?.nodes.has(activeNode.id) ? selectedPair : undefined;
   const targetNames = useGraphTargetNames(canvas.nodes.some(isReleaseNode));
@@ -261,30 +257,6 @@ export function ProjectGraphEditor({
   );
   if (activeNode && focusRequest?.nodeId === activeNode.id)
     repairFieldIds.add(focusRequest.fieldId);
-  const hasActiveFlowNode = Boolean(activePair);
-  const catalogNodeId = activeNode?.id;
-  const catalogFlowId = selectedPair?.startId;
-  useEffect(() => {
-    if (simplified || !hasActiveFlowNode || !catalogNodeId || !catalogFlowId) return;
-    const query = new URLSearchParams({ flow: catalogFlowId, node: catalogNodeId });
-    let current = true;
-    const timer = window.setTimeout(() => {
-      void post<GraphCatalog>('/projects/' + project.id + '/execution-graph/catalog?' + query, {
-        definition: { canvas, flows: [] },
-      }).then(
-        ({ flows }) => {
-          if (current) setCatalogSnapshot({ canvas, flows });
-        },
-        () => {
-          if (current) setCatalogSnapshot({ canvas, flows: undefined });
-        },
-      );
-    }, 300);
-    return () => {
-      current = false;
-      window.clearTimeout(timer);
-    };
-  }, [project.id, canvas, hasActiveFlowNode, catalogFlowId, catalogNodeId, simplified]);
   const highlight = pathHighlight(canvas, hovered) ?? selectedPath;
   const diagnosticEdgeIndex = diagnosticEdge
     ? canvas.edges.findIndex(
@@ -801,14 +773,10 @@ export function ProjectGraphEditor({
   function actionSources(node: GraphNode, pair?: GraphEndpoint) {
     if (!pair) return [];
     const start = canvas.nodes.find(({ id }) => id === pair.startId);
-    const automatic =
-      catalogSnapshot?.canvas === canvas
-        ? catalogSnapshot.flows?.[pair.startId]?.nodes[node.id]?.automaticInputBindings
-        : undefined;
     return graphActionSources(
       start,
       canvas.nodes,
-      { ...automatic, ...pair.inputBindings?.[node.id] },
+      pair.inputBindings?.[node.id],
       node,
       project,
       targetNames,
@@ -1375,9 +1343,6 @@ export function ProjectGraphEditor({
                         endpoint={activePair}
                         flowEdgeIndexes={selectedPath?.edges}
                         catalog={catalog.data}
-                        directory={
-                          catalogSnapshot?.canvas === canvas ? catalogSnapshot.flows : undefined
-                        }
                         project={project}
                         canEdit={canEdit}
                         update={updatePair}
@@ -1532,9 +1497,6 @@ export function ProjectGraphEditor({
                     endpoint={activePair}
                     flowEdgeIndexes={selectedPath?.edges}
                     catalog={catalog.data}
-                    directory={
-                      catalogSnapshot?.canvas === canvas ? catalogSnapshot.flows : undefined
-                    }
                     project={project}
                     canEdit={canEdit}
                     update={updatePair}

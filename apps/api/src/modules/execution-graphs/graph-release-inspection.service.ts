@@ -302,6 +302,7 @@ export class GraphReleaseInspectionService {
         'node.node_type as type',
         'node.output_json',
         'run.created_by',
+        'run.inputs_json',
         'task.id as taskId',
         'task.status as taskStatus',
         'task.payload_json',
@@ -317,6 +318,8 @@ export class GraphReleaseInspectionService {
       .executeTakeFirst();
     if (!row) throw new NotFoundException('找不到该执行节点的发布目标');
     await this.assertOperator(user, row.created_by);
+    if (!JSON.parse(row.inputs_json).simplified)
+      throw new ConflictException('旧版执行流的发布记录仅供查看');
     if (!(terminalTaskStatuses as readonly string[]).includes(row.taskStatus))
       throw new ConflictException('请等待原任务结束后再核查发布');
     const output = JSON.parse(row.output_json ?? '{}') as { release?: GraphReleaseResult };

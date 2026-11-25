@@ -512,6 +512,13 @@ export class GraphRunnerService implements OnModuleInit {
     return flow;
   }
 
+  private currentFlow(definition: GraphDefinition, id: string) {
+    const flow = this.flow(definition, id);
+    if (definition.canvas?.model !== 'FLOW_V2' || flow.model !== 'FLOW_V2')
+      throw new ConflictException('此执行流使用旧版编排，请发布简化执行链后运行');
+    return flow;
+  }
+
   private async pinnedSource(
     projectId: string,
     repositoryId: string,
@@ -1673,7 +1680,7 @@ export class GraphRunnerService implements OnModuleInit {
     const { graphId, definition } =
       definitionOverride ??
       (await this.published(projectId, request.version, this.database.db, !allowRetired));
-    const flow = this.flow(definition, flowId);
+    const flow = rootId ? this.flow(definition, flowId) : this.currentFlow(definition, flowId);
     if (flow.model === 'FLOW_V2')
       return this.prepareSimplified(
         projectId,
@@ -2698,6 +2705,7 @@ export class GraphRunnerService implements OnModuleInit {
       .executeTakeFirst();
     if (previous) {
       checkRequest(previous, requestIdentity);
+      this.currentFlow((await this.published(projectId, request.version)).definition, flowId);
       await this.advance(previous.id);
       return { outcome: 'STARTED' as const, runId: previous.id, version: previous.version };
     }
@@ -2764,6 +2772,7 @@ export class GraphRunnerService implements OnModuleInit {
     const old = await previous();
     if (old) {
       checkRequest(old, requestHash);
+      this.currentFlow((await this.published(projectId, request.version)).definition, flowId);
       if (!control) await this.advance(old.id);
       return this.get(projectId, old.id);
     }

@@ -13,6 +13,8 @@ interface VersionDefinition {
 const nodeProperties: [keyof GraphNode, string][] = [
   ['type', '类型'],
   ['name', '名称'],
+  ['start', '开始资源配置'],
+  ['finish', '结束留档配置'],
   ['message', '日志'],
   ['condition', '判断条件'],
   ['switch', '匹配项'],

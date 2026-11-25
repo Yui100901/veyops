@@ -155,18 +155,17 @@
 | 产物     | `#/projects/:id/artifacts`。`artifactId` 定位产物，可按服务及源码筛选，验证、固定保留、提交清理或跳转到生产节点。部署、回滚和待审批事项从执行图运行详情查看。 |
 | 项目配置 | `#/projects/:id/configuration`。同页维护基本信息、执行默认值、项目公共变量和 AI 策略。                                                                        |
 
-`view` 和 `viewSearch` 保留返回的项目视图及筛选。平台服务器通过 `#/servers?serverId=:serverId` 或 `#/servers?groupId=:groupId` 打开详情。项目来的链接可附 `projectId` 和该项目的 `returnPath`。由服务链接传入的服务按已发布开始节点声明的输入预填，图中固定绑定继续随版本生效。
+`view` 和 `viewSearch` 保留返回的项目视图及筛选。平台服务器通过 `#/servers?serverId=:serverId` 或 `#/servers?groupId=:groupId` 打开详情。项目来的链接可附 `projectId` 和该项目的 `returnPath`。服务链接按照已发布开始节点配置的服务筛选执行流。
 
 ## 项目执行图
 
-以下路径使用前缀 `/projects/:projectId/execution-graph`。登录用户可查询，管理员和操作员可保存、发布和运行。
+以下路径使用前缀 `/projects/:projectId/execution-graph`。登录用户可查询。管理员和操作员可保存、发布和运行简化执行图 `FLOW_V2`。
 
 | 方法与相对路径                                                      | 请求与结果                                                                                                                                                                                                                          |
 | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /`                                                             | 查询项目图、草稿修订号和当前发布版本。                                                                                                                                                                                              |
 | `GET /catalog`                                                      | 返回 `flowTemplates[]`，各项含 `id`、`name`、`steps` 和 `artifactTypes`。现存版本的模块与端口元数据也通过此接口读取。                                                                                                               |
 | `POST /draft/templates/expand`                                      | 接收 `{templateId,artifactType?,model?}`，返回 `{canvas,startId}`。默认使用 `FLOW_V2` 和目录交付模板。管理员和操作员可通过草稿接口按修订号保存。                                                                                    |
-| `POST /catalog?flow=:flowId&node=:nodeId`                           | 提交 `{definition}`，返回所选草稿节点的端口、候选来源、类型、可用性和分支信息。                                                                                                                                                     |
 | `POST /validate`                                                    | 提交 `{definition}`。响应的 `issues` 用 `flowId`、`nodeId`、`fieldId` 和 `message` 定位发布问题。图结构检查通过后，汇总各流的绑定问题。已知问题分支可附 `branchId` 和 `edge:{from,to,when?}`。                                      |
 | `PUT /draft`                                                        | 提交 `{expectedRevision,definition:{canvas:{model:"FLOW_V2",nodes,edges,endpoints,templates:[]}}}`。可保存未配齐的定义。                                                                                                            |
 | `POST /publish`                                                     | 提交 `{expectedRevision}`，校验并固定已保存的图版本。                                                                                                                                                                               |
@@ -193,7 +192,7 @@
 
 `canvas.endpoints` 中每条记录保存 `{startId,endId}`。开始节点在 `start` 中集中选择资源。结束节点在 `finish` 中描述留档和验收。动作按连线共享当前运行的工作目录，运行详情用内置事实记录检出版本、工作目录、审批、发布及健康检查。
 
-向既有旧版画布追加简化执行链时，保留原画布及其定义，在新增链的节点上标记 `model:"FLOW_V2"`。保存和发布会按各条执行链的模型校验。开始与结束配对及连线的两端须使用同一模型。
+添加模板会生成一条独立的简化执行链。将返回的节点、连线和端点追加到现有 `FLOW_V2` 画布，再按草稿修订号保存。
 
 | 位置                                                    | 字段                                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -209,54 +208,11 @@
 
 `START.start.release.compose` 使用 `{sourceId?,path}`。省略 `sourceId` 时归档本次工作区里的 YAML，指定源码时从其已确认提交读取。历史镜像允许沿用随产物归档的 Compose。`BUILD.build.dockerfilePath` 启用内置镜像构建，并按此次构建的实际 Image ID 自动登记。自定义镜像由 `END.finish.image` 登记，设置 `registryId` 时 `reference` 须含固定 Digest。`ROLLBACK_ARTIFACT` 使用开始节点选定的历史产物和预览时各目标的当前版本，要求人工审批。
 
-### 已发布历史模型
+### 历史执行图
 
-以下旧版字段用于解释原有发布版本及其预览、运行记录。
+已有旧版发布定义、运行记录和日志保留为只读历史。草稿保存、发布、版本恢复、运行预览和启动使用 `FLOW_V2`。旧触发规则可暂停。需要重新编排时，在草稿画布确认清空历史草稿并建立简化执行图。
 
-开始节点 `inputs` 和结束节点 `outputs` 使用同一字段结构 `{id,name,type,required?,multiple?,defaultValue?,options?,artifactType?,selection?,source?}`。Git 版本值为 `{kind:"BRANCH"|"TAG"|"COMMIT",value}`。产物参数接受 `{artifactId,instanceId?}`，预览按目标固定实际实例。`LATEST_COMPATIBLE` 在预览中依次定位并验证目标匹配的记录，`CURRENT_RUN` 约束结束产物的来源。
-
-开始节点的 `environmentSet` 支持 `{mode:"NONE"}`、`{mode:"FIXED",environmentSetId}` 和 `{mode:"INPUT",fieldId}`。运行时选择的字段类型为单值 `ENVIRONMENT_SET`，值为集合 ID。响应的集合摘要是 `null` 或 `{id,name,revision}`，确认时复核修订和凭据版本。
-
-`LOAD_ENV.loadEnvironment` 可用 `envFile` 指定相对路径，或用 `pathRule:{key,paths}` 根据开始参数及集合中的普通值映射出相对路径。`required:false` 允许跳过未匹配或不存在的文件。节点从绑定的固定 Git 提交读取文件，消费者通过 `variables` 端口接入。文件的实际路径和覆盖来源随计划记录。
-
-画布的 `endpoints` 保存 `{startId,endId,serviceId?,edgeSelections?,inputBindings?,environmentBindings?,outputBindings?}`。端口可引用 `INPUT.fieldId`、`OUTPUT.nodeId` 和 `fieldId`、`CONTEXT.fieldId`、`VALUE.value`，或按顺序选择 `FIRST_AVAILABLE.sources`。`AS_GIT_REF` 可把普通文本明确转换成分支或 Tag。端口的 `onMissing` 可声明报告缺项、省略、使用字段默认值或 Git 仓库默认版本。分支候选存在尚未完成的前序生产者时等待，已确认无值时继续选择。
-
-构建、Shell 和检查节点可用 `environmentBindings[nodeId][key]` 选择固定值、开始参数、上游输出、节点输入 `NODE_INPUT.fieldId`、变量集合键 `ENVIRONMENT_KEY.key` 或凭据 `CREDENTIAL.credentialId`。构建先解析输入，再将节点变量应用于管理端或目标端。节点变量优先于仓库变量文件、项目公共变量和开始节点变量集合。预览固定可解析的值与凭据版本，尚无结果的上游值标为等待。运行详情记录来源和覆盖关系，敏感值保持掩码。`VEYOPS_*` 系统键禁止绑定。
-
-Shell 和检查脚本每执行单元可返回一条 `VEYOPS_OUTPUT=` JSON 对象，通过声明的输出名转成稳定字段 ID。未知键、重复键、类型错误、超限或敏感输出会阻止节点成功。原始结果行独立解析，节点日志保存普通输出。
-
-普通路径的 `edgeSelections` 按源节点 ID 写入允许的下游节点 ID。相同引用名只用于提示候选，确认后以节点和字段 ID 保存绑定。`FLOW_CALL` 的端口取子流的开始和结束字段 ID。子流预览可以固定同根构建的产物来源和目标限制，运行时再验证该根运行的实际实例。运行证据可区分已解析、默认值、等待上游、省略或错误。
-
-`BUILD.build.dependencies` 最多声明八个额外源码工作区别名。每个别名用小写字母开头，可包含小写字母、数字和连字符。流需将 Git 来源工作区绑定到主 `workspace` 和各 `dependency_<别名>` 端口。额外工作区复制到构建任务独立目录，命令可通过 `$VEYOPS_GRAPH_DEPENDENCY_ROOT/<别名>` 访问。镜像构建的 Dockerfile 需要使用依赖时，先在构建命令中将所需文件复制到主仓库的构建上下文。
-
-构建和登记的 `artifacts` 条目支持稳定端口 `id`、显示 `name`、`referenceName`、`type`、`path` 或 `imageReference`，以及 `required`、`composeFilePath` 和 `persist`。构建的目录产物还支持 `collection:"WORK_DIRECTORY"`，从 `build.repoPath` 对应的工作目录收集，可选 `excludePaths` 使用同一相对路径起点。`collection:"PATH"` 收集 `path` 指定的文件或目录。同一个具名端口返回一件逻辑产物。值包含 `artifactId`、`type`、`scope`、生产运行和 `instances[]`。逐实例提供 `instanceId`、`serverId` 和可查的路径、校验值或镜像身份。`persist:false` 额外记录 `rootRunId`，仅此根运行及其子流可引用。归档下载使用 `GET /artifacts/:id/download`。
-
-Shell 和检查的环境绑定可使用 `PROJECT_VALUE`，以 `source: {kind:"OUTPUT",nodeId,fieldId}` 指定结构化来源。可取当前挂载的 `WORKSPACE_PATH`、同一 SSH 目标的 `ARTIFACT_PATH` 或镜像的 `IMAGE_NAME`、`IMAGE_ID`、`IMAGE_DIGEST`。管理端读取多实例镜像属性时通过 `serverId` 指定实例所在目标。
-
-- `DEPLOY_ARTIFACT` 和 `ROLLBACK_ARTIFACT` 从 `artifact` 端口取得一件逻辑产物。发布方式 `FILE` 接受文件或目录，`deploy.artifactPath` 固定相对产物根的路径，工作目录快照须提供子路径或显式填 `.`。`COMPOSE` 接受 Docker 镜像。Compose 来源可为 `{kind:"ARTIFACT"}` 或 `{kind:"REPOSITORY_FILE",repositoryId,commitSha,path}`，随预览确认模板。
-- `CHECK` 和 `SHELL` 设置 `shell.artifactPath` 后，可从 `artifact` 端口取得一件文件或目录产物。未显式绑定时，编译器选择覆盖所有可达分支的唯一必需目录产物。预览返回所选子路径和已固定实例或上游输出，实际内容展开到 `VEYOPS_ARTIFACT_DIR`。节点的 `shell.directory` 仍相对该节点本身的工作区根。
-- `RELEASE.targets` 记录已确认的各个目标。失败目标可只有任务状态与 `errorSummary`。已确认的计划实例在 `plannedArtifactInstanceId`，实际使用的实例和发布记录分别在 `artifactInstanceId` 与 `deploymentId`。可以成对配置 `SUCCESS` 与 `PARTIAL_SUCCESS` 出边，部分成功分支只能使用有成功发布记录的目标。其他失败及待核查状态阻断后续。
-- `SOURCE_REVIEW` 可绑定单个固定 Git 来源 `source`，或含源码记录的 `artifact`。构建前审核也可设置 `approval.buildNodeId` 关联下游 `BUILD`，并将构建的 `review` 端口绑定到此审核节点的 `review` 输出。关联构建后，审核范围使用已确认计划中的主仓、依赖仓和异仓变量文件的仓库与 SHA。凭证只对所关联的本次构建有效，Worker 再核对执行快照中的完整源码列表。
-- `APPROVAL.approval.releaseNodeId` 绑定下游发布。等待时固定服务、逐目标成员、实物实例与指纹，回滚还固定被替代的发布记录。
-- `HEALTH_CHECK.healthCheck` 声明 `command` 和可选的 `timeoutSeconds`，从 `release` 端口接入同一服务成功激活的发布结果。消费部分成功的发布时，通过 `targets` 显式绑定预览确认的成功目标子集。退出码 `0` 表示健康，`10` 表示明确不健康。缺少命令、权限错误、超时、连接中断或其他不明确结果进入 `NEEDS_ATTENTION`。只有明确的 `UNHEALTHY` 可经条件进入绑定 `afterRelease` 的回滚。逐目标结果保留探针判定、退出码及已知原因。
-- 不绑定 `afterRelease` 的回滚在预览固定当前发布。新运行必须选择同一服务、目标和目的地曾成功使用的历史产物。发布前再次核对活动发布身份和实物。
-- 目标核查确认发布链接及受管目录。Compose 还需核对已登记的 Docker 引擎和实际容器。当远端与平台记录一致、未发现发布锁且无待核对的自定义发布命令时，`canReplan` 提供重新预览入口。核查不会重放发布或改写历史任务结果。
-
-### 执行图存量迁移
-
-以下路径以 `/projects/:projectId/execution-graph/migration` 为前缀。管理员和操作员可盘点和预演，管理员可准备草稿、切换及恢复触发器。
-
-| 方法与路径      | 行为                                                                                                                                                                             |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /`         | 返回计划摘要 `planHash`、图修订、可用版本、旧 Pipeline 和部署目标、触发绑定及待处理事件、历史产物与旧审核数量。                                                                  |
-| `POST /preview` | 接受 `environmentId`、`commitSha`、`artifactId`、`targetId`、`serverIds`、`groupIds` 和条件 `value` 样本。按相同输入对照新旧步骤、仓库、环境文件、变量键、目标、产物和发布保护。 |
-| `POST /stage`   | 接受 `{planHash,acknowledgements,comparison?}`。确认所有可处理差异后幂等补图或保存迁移草稿。返回 `{graphId,revision,changed}`，随后用执行图发布接口发布。                        |
-| `POST /cutover` | 接受 `{planHash,targetVersion,triggerIds,confirmed:true}`。使用最新盘点摘要及当前发布版，在事务中切换所选规则的固定版本。触发器 ID、配置和历史事件保持原样。                     |
-| `POST /restore` | 接受 `{cutoverId,confirmed:true}`。恢复最近一次切换的规则，返回 `suspendedTriggerIds` 供管理员核对需要保持停用的旧入口。                                                         |
-
-草稿、资源或规则在确认前变化，或候选规则仍有待处理事件时返回 409。旧 Pipeline Webhook 仍启用时需先单独停用。已确认的在途运行沿用原图版本和快照。预演返回变量键、来源和敏感状态。
-
-构建发布工作台使用 `GET /delivery-flows` 按项目读取执行流名称、关联服务、草稿和发布状态、触发类型及最近运行。带参数运行只接收开始节点允许覆盖的字段。配置为固定默认值的字段同样禁止触发器映射。
+构建发布工作台通过 `GET /delivery-flows` 读取简化执行图的草稿、发布状态、关联服务、触发类型及最近运行。
 
 ### 执行图触发器
 

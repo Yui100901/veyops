@@ -19,7 +19,6 @@ import { ExecutionGraphInputSummary } from './editor/ExecutionGraphInputSummary'
 import { actionCardText, graphActionSources, startCardText } from './editor/graph-action-sources';
 import { useGraphTargetNames } from './editor/graph-start-groups';
 import { ProjectGraphEditor } from './editor/ExecutionGraphEditor';
-import { ExecutionGraphMigration } from './ExecutionGraphMigration';
 import { PublishedNodeDetails, showSelectedNode } from './editor/ExecutionGraphNodeDetails';
 import { ExecutionGraphResourceLinks } from './ExecutionGraphResourceLinks';
 import {
@@ -87,10 +86,10 @@ const emptyCanvas: GraphCanvas = {
   templates: [],
 };
 
-function editableCanvas(canvas?: GraphCanvas): GraphCanvas {
-  return canvas && (canvas.model || canvas.nodes.length || canvas.templates.length)
-    ? canvas
-    : emptyCanvas;
+const emptyHistoricalCanvas: GraphCanvas = { ...emptyCanvas, model: undefined };
+
+function draftCanvas(canvas?: GraphCanvas): GraphCanvas {
+  return canvas ?? emptyHistoricalCanvas;
 }
 
 export default function ProjectExecutionGraph({
@@ -117,34 +116,18 @@ export default function ProjectExecutionGraph({
     providedProject ? null : base + '/delivery-context',
   );
   const project = providedProject ?? projectResource.data;
-  const params = new URLSearchParams(search);
-  const view = params.get('view') || undefined;
-  const canMigrate = user.role !== 'VIEWER' && !!project && !project.archived;
-  const showMigration = canMigrate && params.get('pane') === 'migration';
-  const graph = useResource<GraphDocument>(showMigration ? null : base + '/execution-graph');
+  const graph = useResource<GraphDocument>(base + '/execution-graph');
   if (!providedProject && projectResource.loading) return <Loading />;
-  if (showMigration && project)
-    return <ExecutionGraphMigration project={project} user={user} view={view} />;
   if (graph.loading) return <Loading />;
   if (!project || !graph.data)
     return (
-      <>
-        <ErrorBanner
-          error={projectResource.error || graph.error || '项目执行图不可用'}
-          retry={() => {
-            if (!providedProject) void projectResource.reload();
-            void graph.reload();
-          }}
-        />
-        {canMigrate && (
-          <a
-            className="button secondary"
-            href={'#' + graphWorkbenchPath(id, { view, pane: 'migration' })}
-          >
-            执行图迁移
-          </a>
-        )}
-      </>
+      <ErrorBanner
+        error={projectResource.error || graph.error || '项目执行图不可用'}
+        retry={() => {
+          if (!providedProject) void projectResource.reload();
+          void graph.reload();
+        }}
+      />
     );
   return (
     <GraphResourceContext.Provider
@@ -233,7 +216,7 @@ function Workspace({
     (scope.serviceId && !service) || (scope.environmentId && !environment),
   );
   const [graph, setGraph] = useState(initial);
-  const [canvas, setCanvasState] = useState(() => editableCanvas(initial.draft.canvas));
+  const [canvas, setCanvasState] = useState(() => draftCanvas(initial.draft.canvas));
   const latestCanvas = useRef(canvas);
   const [undo, setUndo] = useState<GraphCanvas[]>([]);
   const [redo, setRedo] = useState<GraphCanvas[]>([]);
@@ -254,10 +237,13 @@ function Workspace({
   const [busy, setBusy] = useState(false);
   const [leaving, setLeaving] = useState<RouteTransition | null>(null);
   const [templateOpen, setTemplateOpen] = useState(false);
+  const [resettingDraft, setResettingDraft] = useState(false);
   const [insertedStart, setInsertedStart] = useState<string>();
   const saving = useRef(false);
-  const dirty = canvas !== editableCanvas(graph.draft.canvas);
-  useRouteBlocker(canEdit && dirty, setLeaving);
+  const simplifiedDraft = canvas.model === simplifiedModel;
+  const canEditDraft = canEdit && simplifiedDraft;
+  const dirty = canvas !== draftCanvas(graph.draft.canvas);
+  useRouteBlocker(canEditDraft && dirty, setLeaving);
   const latest = useResource<PublishedGraph>(
     graph.publishedVersion ? path + '/versions/' + graph.publishedVersion : null,
   );
@@ -301,27 +287,48 @@ function Workspace({
     });
   }
 
-  async function persist(action: 'save' | 'publish' | 'reload' | 'validate', confirmed = false) {
-    if (saving.current) return;
+  async function persist(
+    action: 'save' | 'publish' | 'reload' | 'validate' | 'reset',
+    confirmed = false,
+  ) {
+    if (
+      saving.current ||
+      (action !== 'reload' && !(action === 'reset' ? canEdit && !simplifiedDraft : canEditDraft))
+    )
+      return;
     saving.current = true;
     setBusy(true);
     setError('');
     setNotice('');
     try {
       let draft = graph;
-      if (action === 'save' || (action === 'publish' && !confirmed && dirty)) {
+      if (
+        action === 'save' ||
+        action === 'reset' ||
+        (action === 'publish' && !confirmed && dirty)
+      ) {
         draft = await api(path + '/draft', {
           method: 'PUT',
           body: JSON.stringify({
             expectedRevision: graph.revision,
-            definition: { flows: [], canvas: latestCanvas.current },
+            definition: {
+              flows: [],
+              canvas: action === 'reset' ? emptyCanvas : latestCanvas.current,
+            },
           }),
         });
         setGraph(draft);
-        setCanvas(editableCanvas(draft.draft.canvas));
+        setCanvas(draftCanvas(draft.draft.canvas));
         setPublication(undefined);
         setIssues([]);
         setConflict(false);
+        if (action === 'reset') {
+          setUndo([]);
+          setRedo([]);
+          setResettingDraft(false);
+          setNotice('已建立简化执行图草稿');
+          return draft;
+        }
         setNotice('草稿已保存');
         if (action === 'save') return draft;
       }
@@ -330,8 +337,7 @@ function Workspace({
         const result = await post<{ issues: GraphIssue[] }>(path + '/validate', {
           definition: {
             flows: [],
-            canvas:
-              action === 'validate' ? latestCanvas.current : editableCanvas(draft.draft.canvas),
+            canvas: action === 'validate' ? latestCanvas.current : draftCanvas(draft.draft.canvas),
           },
         });
         setIssues(result.issues);
@@ -353,7 +359,7 @@ function Workspace({
       } else saved = await api(path);
       setGraph(saved);
       setPublication(undefined);
-      setCanvas(editableCanvas(saved.draft.canvas));
+      setCanvas(draftCanvas(saved.draft.canvas));
       setIssues([]);
       if (action === 'reload') {
         setUndo([]);
@@ -410,7 +416,7 @@ function Workspace({
     if (save) {
       if (!(await persist('save'))) return;
     } else {
-      setCanvas(editableCanvas(graph.draft.canvas));
+      setCanvas(draftCanvas(graph.draft.canvas));
       setUndo([]);
       setRedo([]);
       setIssues([]);
@@ -423,7 +429,7 @@ function Workspace({
 
   function edit(next: GraphCanvas) {
     const previous = latestCanvas.current;
-    if (next === previous || saving.current) return;
+    if (!canEditDraft || next === previous || saving.current) return;
     setUndo((history) => [...history.slice(-49), previous]);
     setRedo([]);
     setCanvas(next);
@@ -433,7 +439,7 @@ function Workspace({
   }
 
   function insertTemplate(expansion: GraphFlowExpansion) {
-    if (!canEdit || saving.current) throw new Error('此草稿暂时无法编辑，请稍后重试。');
+    if (!canEditDraft || saving.current) throw new Error('此草稿暂时无法编辑，请稍后重试。');
     const previous = latestCanvas.current;
     edit(appendFlowTemplate(previous, expansion));
     setInsertedStart(expansion.startId);
@@ -535,7 +541,7 @@ function Workspace({
         {(
           [
             ['run', '运行执行流'],
-            ['draft', canEdit ? '编辑草稿' : '查看草稿'],
+            ['draft', canEditDraft ? '编辑草稿' : '查看草稿'],
             ['published', '版本历史'],
             ['history', '运行记录'],
           ] as const
@@ -549,11 +555,6 @@ function Workspace({
             {label}
           </a>
         ))}
-        {canEdit && (
-          <a href={'#' + graphWorkbenchPath(project.id, { view: scope.view, pane: 'migration' })}>
-            执行图迁移
-          </a>
-        )}
       </nav>
       <ErrorBanner error={error} />
       {conflict && (
@@ -626,11 +627,15 @@ function Workspace({
                 published={publishedRun.data}
                 project={project}
                 path={path}
-                canRun={canEdit && !publishedRun.data.retiredAt}
+                canRun={
+                  canEdit &&
+                  !publishedRun.data.retiredAt &&
+                  publishedRun.data.definition.canvas?.model === simplifiedModel
+                }
                 showTriggers={
                   publishedRun.data.version === graph.publishedVersion && !project.archived
                 }
-                canManageTriggers={canEdit && isAdmin}
+                canManageTriggers={canEdit && isAdmin && !publishedRun.data.retiredAt}
                 triggerIssueHref={triggerIssueHref}
                 startId={linkedStart}
                 artifactId={linkedArtifactId}
@@ -664,7 +669,7 @@ function Workspace({
           title="草稿画布"
           subtitle={`修订 ${graph.revision} · ${dirty ? '有未保存的更改' : '已保存'} · ${graph.publishedVersion ? '最新发布 v' + graph.publishedVersion : '尚未发布'}`}
           action={
-            canEdit && (
+            canEditDraft && (
               <div className="heading-actions">
                 <button
                   type="button"
@@ -718,14 +723,43 @@ function Workspace({
             )
           }
         >
-          {canEdit && templateOpen && (
+          {!simplifiedDraft && (
+            <div className="graph-fields">
+              <p className="field-note">这是历史草稿。可查阅画布，后续编排使用简化执行图。</p>
+              {canEdit && (
+                <div className="row-actions">
+                  <button
+                    type="button"
+                    className="button secondary"
+                    disabled={busy || conflict}
+                    onClick={() => setResettingDraft(true)}
+                  >
+                    建立简化草稿
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+          {resettingDraft && canEdit && !simplifiedDraft && (
+            <Confirm
+              destructive
+              title="建立简化执行图草稿"
+              description="这会清空当前草稿的节点、连线和节点库。已发布版本与运行记录仍可在历史中查阅。"
+              label="清空草稿并建立"
+              busy={busy}
+              error={error}
+              onClose={() => !saving.current && setResettingDraft(false)}
+              onConfirm={() => void persist('reset')}
+            />
+          )}
+          {canEditDraft && templateOpen && (
             <ExecutionGraphTemplateDialog
               path={path}
               insert={insertTemplate}
               close={() => setTemplateOpen(false)}
             />
           )}
-          {returnStart && (
+          {canEditDraft && returnStart && (
             <div className="graph-fields graph-setup-return">
               <div className="heading-actions">
                 <a className="button secondary small" href={'#' + panePath('run')}>
@@ -739,7 +773,7 @@ function Workspace({
             key={`${linkedNode ?? ''}:${linkedFlow ?? ''}:${linkedField ?? ''}:${linkedFieldLocation.fieldSection ?? ''}:${linkedFieldLocation.artifactField ?? ''}`}
             project={project}
             canvas={canvas}
-            canEdit={canEdit && !busy}
+            canEdit={canEditDraft && !busy}
             onChange={edit}
             issues={issues}
             initialNodeId={linkedNode}
@@ -759,6 +793,7 @@ function Workspace({
               />
             )}
             renderStart={(startId) =>
+              simplifiedDraft &&
               !project.archived && (
                 <ExecutionGraphTriggers
                   key={startId}
@@ -772,8 +807,8 @@ function Workspace({
                       : null
                   }
                   flows={triggerFlows({ flows: [], canvas })}
-                  canInvoke={canEdit}
-                  canManage={canEdit && isAdmin}
+                  canInvoke={canEditDraft}
+                  canManage={canEditDraft && isAdmin}
                   onPrepareDraft={prepareTriggerDraft}
                   issueHref={triggerIssueHref}
                   manualHref={'#' + graphWorkbenchPath(project.id, { ...scope, start: startId })}
@@ -801,10 +836,10 @@ function Workspace({
             navigate(graphWorkbenchPath(project.id, { ...scope, pane: 'published', version }))
           }
           onRestored={(saved, restored) => {
-            setUndo((history) => [...history.slice(-49), canvas]);
+            setUndo((history) => (simplifiedDraft ? [...history.slice(-49), canvas] : []));
             setRedo([]);
             setGraph(saved);
-            setCanvas(editableCanvas(saved.draft.canvas));
+            setCanvas(draftCanvas(saved.draft.canvas));
             navigate(panePath('draft'));
             setError('');
             setNotice('已将 v' + restored + ' 恢复到草稿');
@@ -867,8 +902,12 @@ function PublishedRun({
 }) {
   const scoped = Boolean(scope.serviceId || scope.environmentId);
   const { flows } = published.definition;
+  const simplifiedVersion = published.definition.canvas?.model === simplifiedModel;
   const starts = new Map(
-    flows.map((entry) => [entry.id, graphStartReadiness(entry, scope, project)]),
+    (simplifiedVersion ? flows : []).map((entry) => [
+      entry.id,
+      graphStartReadiness(entry, scope, project),
+    ]),
   );
   const selected = flows.find(
     (item) =>
@@ -905,7 +944,7 @@ function PublishedRun({
       {invalidArtifact && (
         <ErrorBanner error="当前执行流没有唯一可覆盖且类型匹配的部署产物输入，请选择其他发布流程。" />
       )}
-      {scoped && (
+      {scoped && simplifiedVersion && (
         <div className="graph-fields graph-scoped-starts">
           <h3>关联的开始节点</h3>
           <ExecutionGraphStartList
@@ -928,6 +967,9 @@ function PublishedRun({
       )}
       {startId && !selected && <ErrorBanner error="当前发布版本中找不到此开始节点。" />}
       {published.retiredAt && <p className="field-note">此版本已停用，可查看节点配置。</p>}
+      {!simplifiedVersion && (
+        <p className="field-note">此版本供历史查阅。新运行使用已发布的简化执行图。</p>
+      )}
       <PublishedNodes
         definition={published.definition}
         path={path}
@@ -1002,7 +1044,8 @@ function PublishedRun({
                   latestVersion={published.version}
                   flows={triggerFlows(published.definition)}
                   canInvoke={canRun}
-                  canManage={canManageTriggers}
+                  canManage={canManageTriggers && simplifiedVersion}
+                  canPause={canManageTriggers}
                   issueHref={triggerIssueHref}
                   manualHref={
                     flow?.id !== inspectedFlow.id
@@ -1093,6 +1136,7 @@ function PublishedVersions({
     activeVersion ? path + '/versions/' + activeVersion : null,
   );
   const live = item.data?.version === activeVersion ? item.data : undefined;
+  const isSimplifiedVersion = live?.definition.canvas?.model === simplifiedModel;
   const retiredAt = list.data?.find((entry) => entry.version === activeVersion)?.retiredAt;
 
   async function retireVersion() {
@@ -1140,7 +1184,7 @@ function PublishedVersions({
                   live={live}
                   versions={list.data}
                   revision={revision}
-                  canRestore={canRestore}
+                  canRestore={canRestore && isSimplifiedVersion}
                   dirty={dirty}
                   onRestored={onRestored}
                   onConflict={onConflict}
@@ -1164,30 +1208,33 @@ function PublishedVersions({
                     </div>
                   )
                 )}
-                {!retiredAt && canRestore && !!live.definition.flows.length && (
-                  <details className="graph-field-card">
-                    <summary>从此版本发起运行</summary>
-                    <ul className="graph-edge-list">
-                      {live.definition.flows.map((flow) => (
-                        <li key={flow.id}>
-                          <a
-                            className="text-link"
-                            href={
-                              '#' +
-                              graphWorkbenchPath(project.id, {
-                                ...scope,
-                                start: flow.id,
-                                version: live.version,
-                              })
-                            }
-                          >
-                            {flow.name}
-                          </a>
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                )}
+                {!retiredAt &&
+                  canRestore &&
+                  isSimplifiedVersion &&
+                  !!live.definition.flows.length && (
+                    <details className="graph-field-card">
+                      <summary>从此版本发起运行</summary>
+                      <ul className="graph-edge-list">
+                        {live.definition.flows.map((flow) => (
+                          <li key={flow.id}>
+                            <a
+                              className="text-link"
+                              href={
+                                '#' +
+                                graphWorkbenchPath(project.id, {
+                                  ...scope,
+                                  start: flow.id,
+                                  version: live.version,
+                                })
+                              }
+                            >
+                              {flow.name}
+                            </a>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
                 <PublishedNodes
                   key={`${live.version}:${linkedNode ?? ''}:${linkedFlow ?? ''}`}
                   definition={live.definition}

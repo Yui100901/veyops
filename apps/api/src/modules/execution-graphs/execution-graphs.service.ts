@@ -1,4 +1,9 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Kysely, Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
@@ -7,21 +12,19 @@ import { AuditService } from '../audit/audit.service';
 import { lockProjectGraph, requireProject } from '../projects/project-guards';
 import { graphResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
-import {
-  canvasCatalog,
-  canvasIssues,
-  compileCanvas,
-  withDraftCanvas,
-} from './execution-graph-canvas';
-import {
-  type GraphDefinition,
-  type SaveGraphDraftDto,
-  validateGraphDefinition,
-} from './execution-graph-definition';
+import { canvasIssues, compileCanvas, withDraftCanvas } from './execution-graph-canvas';
+import { type GraphDefinition, type SaveGraphDraftDto } from './execution-graph-definition';
 import { GraphCompileError, type GraphDiagnostic } from './graph-fields';
 import { expandGraphTemplate, type ExpandGraphTemplateDto } from './graph-flow-templates';
 import { GraphTriggersService } from './graph-triggers.service';
 import { validateSimplifiedSourceDirectories } from './simplified-flow-definition';
+
+const unsupportedDraft = '执行图仅支持简化执行链，请使用 FLOW_V2 画布';
+
+function writableCanvas(definition: GraphDefinition) {
+  if (definition.canvas?.model !== 'FLOW_V2') throw new BadRequestException(unsupportedDraft);
+  return definition.canvas;
+}
 
 function graphResponse(row: Selectable<Database['execution_graphs']>) {
   return {
@@ -136,7 +139,7 @@ export class ExecutionGraphsService {
     definition: GraphDefinition,
   ): Promise<{ issues: GraphDiagnostic[] }> {
     await requireProject(this.database.db, projectId);
-    if (!definition.canvas) return { issues: [{ message: '请提交执行图画布' }] };
+    if (definition.canvas?.model !== 'FLOW_V2') return { issues: [{ message: unsupportedDraft }] };
     const issues = canvasIssues(definition.canvas);
     if (issues.length) return { issues };
     try {
@@ -156,26 +159,10 @@ export class ExecutionGraphsService {
     }
   }
 
-  async draftCatalog(
-    projectId: string,
-    definition: GraphDefinition,
-    flowId: string,
-    nodeId: string,
-  ) {
-    await requireProject(this.database.db, projectId);
-    return canvasCatalog(withDraftCanvas(definition).canvas, flowId, nodeId);
-  }
-
   async save(projectId: string, input: SaveGraphDraftDto, userId: string) {
     return this.database.db.transaction().execute(async (tx) => {
       const graph = await this.lockDraft(tx, projectId, input.expectedRevision);
-      const definition = input.definition.canvas
-        ? compileCanvas(input.definition.canvas, false)
-        : input.definition;
-      if (!definition.canvas) {
-        validateGraphDefinition(definition);
-        await this.validateReferences(tx, projectId, definition);
-      }
+      const definition = compileCanvas(writableCanvas(input.definition), false);
       const row = await this.updateDraft(tx, graph, definition);
       await this.audit.record(
         userId,
@@ -211,8 +198,7 @@ export class ExecutionGraphsService {
     const graph = await this.graph(projectId);
     this.checkRevision(graph.revision, expectedRevision);
     const draft = JSON.parse(graph.draft_json) as GraphDefinition;
-    const definition = draft.canvas ? compileCanvas(draft.canvas, true) : draft;
-    if (!definition.canvas) validateGraphDefinition(definition, { publication: true });
+    const definition = compileCanvas(writableCanvas(draft), true);
     const prior = graph.published_version
       ? (JSON.parse(
           (await this.publishedVersion(this.database.db, graph.id, graph.published_version))
@@ -263,11 +249,7 @@ export class ExecutionGraphsService {
       .where('source_revision', '=', expectedRevision)
       .executeTakeFirst();
     const draft = JSON.parse(candidate.draft_json) as GraphDefinition;
-    const definition = draft.canvas ? compileCanvas(draft.canvas, true) : draft;
-    if (!definition.canvas) {
-      const compiled = validateGraphDefinition(definition, { publication: true });
-      for (const flow of definition.flows) flow.compiled = compiled[flow.id];
-    }
+    const definition = compileCanvas(writableCanvas(draft), true);
     const version = (candidate.published_version ?? 0) + 1;
     const triggerChecks = priorPublication
       ? []
@@ -350,8 +332,8 @@ export class ExecutionGraphsService {
     return this.database.db.transaction().execute(async (tx) => {
       const graph = await this.lockDraft(tx, projectId, expectedRevision);
       const published = await this.publishedVersion(tx, graph.id, version);
-      const definition = JSON.parse(published.definition_json) as GraphDefinition;
-      validateGraphDefinition(definition);
+      const stored = JSON.parse(published.definition_json) as GraphDefinition;
+      const definition = compileCanvas(writableCanvas(stored), true);
       await this.validateReferences(tx, projectId, definition);
       const row = await this.updateDraft(tx, graph, definition);
       await this.audit.record(

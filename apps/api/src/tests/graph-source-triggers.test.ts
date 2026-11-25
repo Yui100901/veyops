@@ -131,6 +131,8 @@ async function verify(t: TestContext, databaseUrl?: string) {
     const graphPath = scope + '/execution-graph';
     const rules = graphPath + '/triggers';
     const graph = (await api.get(graphPath).expect(200)).body.data;
+    const { BuildsService } = await import('../modules/builds/builds.service.js');
+    t.mock.method(BuildsService, 'automaticManagerSocket', async () => '/tmp/fixture-build.sock');
     const draft = (
       await api
         .put(graphPath + '/draft')
@@ -138,83 +140,32 @@ async function verify(t: TestContext, databaseUrl?: string) {
           expectedRevision: graph.revision,
           definition: {
             canvas: {
+              model: 'FLOW_V2',
               nodes: [
                 {
                   id: 'flow',
                   type: 'START',
-                  contract: 'PRESET',
                   name: '开始',
-                  inputs: [
-                    {
-                      id: 'repository',
-                      type: 'REPOSITORY',
-                      name: '仓库',
-                      defaultValue: repository.id,
-                      runtimeOverride: false,
-                    },
-                    {
-                      id: 'gitVersion',
-                      type: 'GIT_REF',
-                      name: '版本',
-                      defaultValue: { kind: 'BRANCH', value: 'main' },
-                      runtimeOverride: false,
-                    },
-                    {
-                      id: 'repository-2',
-                      type: 'REPOSITORY',
-                      name: '同仓联调分支',
-                      defaultValue: repository.id,
-                      runtimeOverride: false,
-                    },
-                    {
-                      id: 'gitVersion-2',
-                      type: 'GIT_REF',
-                      name: '联调版本',
-                      defaultValue: { kind: 'BRANCH', value: 'review-alt' },
-                      runtimeOverride: false,
-                    },
-                    {
-                      id: 'repository-3',
-                      type: 'REPOSITORY',
-                      name: '其他仓库',
-                      defaultValue: secondary.id,
-                      runtimeOverride: false,
-                    },
-                    {
-                      id: 'gitVersion-3',
-                      type: 'GIT_REF',
-                      name: '其他版本',
-                      required: false,
-                    },
-                  ],
+                  start: {
+                    execution: { location: 'MANAGER' },
+                    sources: [
+                      { id: 'watched', repositoryId: repository.id, ref: { kind: 'BRANCH', value: 'review-alt' } },
+                      { id: 'secondary', repositoryId: secondary.id, ref: { kind: 'BRANCH', value: 'main' } },
+                    ],
+                  },
                 },
                 {
                   id: 'code',
                   type: 'CHECKOUT',
                   name: '主仓库',
                 },
-                {
-                  id: 'other',
-                  type: 'CHECKOUT',
-                  name: '其他仓库',
-                },
                 { id: 'end', type: 'END', name: '结束' },
               ],
               edges: [
                 { from: 'flow', to: 'code' },
-                { from: 'code', to: 'other' },
-                { from: 'other', to: 'end' },
+                { from: 'code', to: 'end' },
               ],
-              endpoints: [
-                {
-                  startId: 'flow',
-                  endId: 'end',
-                  inputBindings: {
-                    code: { repository: { kind: 'INPUT', fieldId: 'repository-2' } },
-                    other: { repository: { kind: 'INPUT', fieldId: 'repository-3' } },
-                  },
-                },
-              ],
+              endpoints: [{ startId: 'flow', endId: 'end' }],
               templates: [],
             },
           },
@@ -228,6 +179,7 @@ async function verify(t: TestContext, databaseUrl?: string) {
       enabled: false,
       webhookProtocol: 'BEARER',
       repositoryId: repository.id,
+      sourceId: 'watched',
       ref,
     });
     assert.match(draftHook.secret, /^[A-Za-z0-9_-]{40,}$/);
@@ -246,6 +198,7 @@ async function verify(t: TestContext, databaseUrl?: string) {
       version,
       enabled: true,
       repositoryId: repository.id,
+      sourceId: 'watched',
     };
     const poll = await make(rules, {
       ...common,
@@ -475,8 +428,6 @@ async function verify(t: TestContext, databaseUrl?: string) {
       credentialId: signatureCredential.id,
       version: simpleVersion,
     };
-    const { BuildsService } = await import('../modules/builds/builds.service.js');
-    t.mock.method(BuildsService, 'automaticManagerSocket', async () => '/tmp/fixture-build.sock');
     const missingSource = (
       await api
         .post(rules + '/preflight')

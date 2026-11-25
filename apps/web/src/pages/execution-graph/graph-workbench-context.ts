@@ -1,6 +1,6 @@
 import type { ProjectDetail } from '../../models';
 import type { GraphIssueLocation } from '../../api';
-import { effectiveNodeType, isReleaseNode } from './execution-graph-definition';
+import { isReleaseNode } from './execution-graph-definition';
 import type {
   GraphArtifactType,
   GraphBinding,
@@ -30,7 +30,7 @@ export type GraphWorkbenchScope = {
   viewSearch?: string;
   resourcePanel?: (typeof resourcePanels)[number];
 };
-export type GraphPane = 'run' | 'draft' | 'published' | 'history' | 'migration';
+export type GraphPane = 'run' | 'draft' | 'published' | 'history';
 export type GraphStartLocation = GraphWorkbenchScope & {
   start: string;
   version?: number;
@@ -69,27 +69,6 @@ export function graphWorkbenchPath(projectId: string, location: GraphLocation = 
 
 export function releaseArtifactInput(flow: GraphFlow, artifactType?: GraphArtifactType) {
   if (flow.model === simplifiedModel) return simplifiedReleaseInput(flow, artifactType);
-  const inputIds = new Set<string>();
-  const collect = (binding: GraphBinding | undefined) => {
-    if (binding?.kind === 'INPUT') inputIds.add(binding.fieldId);
-    else if (binding?.kind === 'FIRST_AVAILABLE') binding.sources.forEach(collect);
-  };
-  for (const node of flow.nodes.filter((item) => effectiveNodeType(item) === 'DEPLOY_ARTIFACT'))
-    collect(
-      flow.compiled?.nodes[node.id]?.inputBindings?.artifact ??
-        flow.inputBindings?.[node.id]?.artifact,
-    );
-  const candidates = flow.nodes
-    .find(({ type }) => type === 'START')
-    ?.inputs?.filter(
-      (field) =>
-        field.type === 'ARTIFACT' &&
-        !field.multiple &&
-        field.runtimeOverride !== false &&
-        inputIds.has(field.id) &&
-        (!field.artifactType || !artifactType || field.artifactType === artifactType),
-    );
-  return candidates?.length === 1 ? candidates[0] : undefined;
 }
 
 export function graphStartHref(

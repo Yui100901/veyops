@@ -18,6 +18,7 @@ import {
 import { deliveryPath, type DeliveryScope } from '../../delivery/delivery-route';
 import { ArtifactRetentionPolicy } from '../../delivery/ArtifactRetention';
 import { graphKey, type GraphDocument } from '../../execution-graph/execution-graph-definition';
+import { simplifiedModel } from '../../execution-graph/simplified-flow';
 import {
   graphStartReadiness,
   graphWorkbenchPath,
@@ -58,12 +59,17 @@ function ArtifactReleaseChoices({
     scope.serviceId ||
     (project.services.some(({ id }) => id === artifact.serviceId) ? artifact.serviceId : undefined);
   const graphScope = { serviceId: serviceId || undefined };
-  const flows = published.data?.definition.flows.flatMap((flow) => {
-    const field = releaseArtifactInput(flow, artifactType);
-    return field && graphStartReadiness(flow, graphScope, project).status !== 'CONTEXT_MISMATCH'
-      ? [{ flow, field }]
+  const definition = published.data?.definition;
+  const flows =
+    definition?.canvas?.model === simplifiedModel
+      ? definition.flows.flatMap((flow) => {
+          const field = releaseArtifactInput(flow, artifactType);
+          return field &&
+            graphStartReadiness(flow, graphScope, project).status !== 'CONTEXT_MISMATCH'
+            ? [{ flow, field }]
+            : [];
+        })
       : [];
-  });
   return (
     <details className="graph-field-card">
       <summary>使用此产物部署</summary>

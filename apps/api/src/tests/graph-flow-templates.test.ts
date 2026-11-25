@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +27,7 @@ async function checkTemplates(databaseUrl?: string) {
   const { configureApp } = await import('../bootstrap.js');
   const { DatabaseService } = await import('../core/database/database.service.js');
   const { AuditService } = await import('../modules/audit/audit.service.js');
+  const { compileCanvas } = await import('../modules/execution-graphs/execution-graph-canvas.js');
   const app = (
     await Test.createTestingModule({ imports: [AppModule] }).compile()
   ).createNestApplication<NestExpressApplication>({ logger: false });
@@ -231,38 +232,97 @@ async function checkTemplates(databaseUrl?: string) {
       ],
       templates: [],
     };
-    const duplicate = structuredClone(mixed);
-    duplicate.nodes
-      .find(({ model, type }) => model === 'FLOW_V2' && type === 'START')!
-      .start!.sources!.push({ id: 'duplicate', repositoryId: repository.id });
-    const duplicateCheck = (
+    const db = app.get(DatabaseService).db;
+    await save(mixed, ciPublished.revision).expect(400);
+    await api
+      .post(`${path}/catalog`)
+      .send({ definition: { canvas: mixed } })
+      .expect(404);
+    await api.get(`${path}/migration`).expect(404);
+    const validation = (
       await api
         .post(`${path}/validate`)
-        .send({ definition: { canvas: duplicate } })
+        .send({ definition: { canvas: mixed } })
         .expect(201)
     ).body.data;
-    assert.equal(duplicateCheck.issues[0].fieldId, 'start.sources.duplicate.parentDirectory');
-    const mixedDraft = (await save(mixed, ciPublished.revision).expect(200)).body.data;
-    const mixedPublished = (
-      await api.post(`${path}/publish`).send({ expectedRevision: mixedDraft.revision }).expect(201)
-    ).body.data;
-    const version = (
-      await api.get(`${path}/versions/${mixedPublished.publishedVersion}`).expect(200)
-    ).body.data;
+    assert.match(validation.issues[0].message, /FLOW_V2/);
+    const graph = await db
+      .selectFrom('execution_graphs')
+      .selectAll()
+      .where('project_id', '=', project.id)
+      .executeTakeFirstOrThrow();
+    const author = await db
+      .selectFrom('users')
+      .select('id')
+      .where('username', '=', 'root')
+      .executeTakeFirstOrThrow();
+    const oldVersion = ciPublished.publishedVersion + 1;
+    const oldDefinition = JSON.stringify(compileCanvas(mixed, true));
+    await db
+      .insertInto('execution_graph_versions')
+      .values({
+        id: randomUUID(),
+        graph_id: graph.id,
+        version: oldVersion,
+        source_revision: ciPublished.revision + 1,
+        definition_json: oldDefinition,
+        created_by: author.id,
+        created_at: Date.now(),
+      })
+      .execute();
+    await db
+      .updateTable('execution_graphs')
+      .set({ draft_json: oldDefinition, published_version: oldVersion })
+      .where('id', '=', graph.id)
+      .execute();
+    const historical = (await api.get(`${path}/versions/${oldVersion}`).expect(200)).body.data;
+    assert.equal(historical.definition.flows[0].serviceId, service.id);
+    assert.equal(historical.definition.flows[0].nodes[1].message, '原配置');
+    const delivery = (await api.get(`${root}/delivery-flows`).expect(200)).body.data;
     assert.deepEqual(
-      version.definition.flows.map(({ id, model }: { id: string; model?: string }) => ({
-        id,
-        model,
-      })),
-      [
-        { id: 'old-start', model: undefined },
-        { id: ci.endpoints[0]!.startId, model: 'FLOW_V2' },
-      ],
+      delivery.find(({ projectId }: { projectId: string }) => projectId === project.id).flows,
+      [],
     );
-    assert.equal(version.definition.flows[0].serviceId, service.id);
-    assert.equal(version.definition.flows[0].nodes[1].message, '原配置');
+    await api
+      .post(`${path}/publication-impact`)
+      .send({ expectedRevision: ciPublished.revision })
+      .expect(400);
+    await api.post(`${path}/publish`).send({ expectedRevision: ciPublished.revision }).expect(400);
+    await api
+      .post(`${path}/versions/${oldVersion}/restore`)
+      .send({ expectedRevision: ciPublished.revision })
+      .expect(400);
+    await api.post(`${path}/flows/old-start/preview`).send({ version: oldVersion }).expect(409);
+    await api
+      .post(`${path}/flows/${ci.endpoints[0]!.startId}/preview`)
+      .send({ version: oldVersion })
+      .expect(409);
+    await api
+      .post(`${path}/flows/old-start/run`)
+      .send({
+        version: oldVersion,
+        expectedConfigurationHash: 'a'.repeat(64),
+        idempotencyKey: 'old',
+      })
+      .expect(409);
+    await api
+      .post(`${path}/flows/old-start/run-defaults`)
+      .send({ version: oldVersion, idempotencyKey: 'old-defaults' })
+      .expect(409);
+    await api
+      .post(`${path}/triggers`)
+      .send({ kind: 'API', name: '旧触发器', flowId: 'old-start', enabled: true })
+      .expect(409);
+    await api
+      .post(`${path}/triggers`)
+      .send({ kind: 'API', name: '旧触发器草稿', flowId: 'old-start', enabled: false })
+      .expect(400);
+    await db
+      .updateTable('execution_graphs')
+      .set({ draft_json: graph.draft_json, published_version: graph.published_version })
+      .where('id', '=', graph.id)
+      .execute();
 
-    const db = app.get(DatabaseService).db;
     const audit = app.get(AuditService);
     const record = audit.record;
     audit.record = async (...args) => {

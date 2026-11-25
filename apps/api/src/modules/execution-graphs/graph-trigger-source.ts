@@ -3,21 +3,13 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { Kysely, Selectable, Transaction } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import { isGitBranchName } from '../projects/git-ref';
-import { resolveGraphRepositorySelector } from '../projects/graph-repository-selectors';
-import {
-  orderedFlowNodes,
-  type GraphDefinition,
-  type GraphFlow,
-} from './execution-graph-definition';
-import { flowCandidateCatalog } from './graph-binding-validation';
-import type { GraphBinding } from './graph-fields';
+import type { GraphFlow } from './execution-graph-definition';
 import {
   graphDeliveryId,
-  type GraphParameterMapping,
   type GraphWebhookProtocol,
   type SourceCronMode,
 } from './graph-trigger.dto';
-import { flowStart, nodeInputBinding } from './graph-run-bindings';
+import { flowStart } from './graph-run-bindings';
 
 export type TriggerSourceConfig = {
   cronMode?: SourceCronMode;
@@ -53,42 +45,14 @@ export const validBranchRef = (ref: string) =>
 export const validCommit = (sha: string) =>
   /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha) && !/^0+$/.test(sha);
 
-function staticBinding(
-  flow: GraphFlow,
-  binding: GraphBinding | undefined,
-  parameters?: Record<string, GraphParameterMapping>,
-): unknown {
-  if (binding?.kind === 'VALUE') return binding.value;
-  if (binding?.kind === 'INPUT') {
-    const mapping =
-      parameters && Object.hasOwn(parameters, binding.fieldId)
-        ? parameters[binding.fieldId]
-        : undefined;
-    if (mapping?.source === 'VALUE') return mapping.value;
-    if (mapping?.source === 'EVENT' && (mapping.field === 'ref' || mapping.field === 'commit'))
-      return { byEvent: true };
-    if (mapping) return { unresolved: true };
-    return flowStart(flow).inputs?.find(({ id }) => id === binding.fieldId)?.defaultValue;
-  }
-  if (binding?.kind === 'AS_GIT_REF') {
-    const value = staticBinding(flow, binding.source, parameters);
-    return typeof value === 'string' ? { kind: binding.refKind, value } : value;
-  }
-  if (binding?.kind === 'FIRST_AVAILABLE') {
-    for (const source of binding.sources) {
-      const value = staticBinding(flow, source, parameters);
-      if (value !== undefined) return value;
-    }
-  }
-  return binding !== undefined ? { unresolved: true } : undefined;
-}
-
-async function simplifiedTriggerSource(
+export async function resolveTriggerSource(
   db: Kysely<Database>,
   projectId: string,
   flow: GraphFlow,
   settings: TriggerSourceConfig,
 ): Promise<TriggerCheckoutScope> {
+  if (settings.ref && !validBranchRef(settings.ref))
+    throw new BadRequestException('请输入有效的分支完整引用，如 refs/heads/main');
   const node = flow.nodes.find(
     ({ type, operation }) => type === 'CHECKOUT' || operation === 'CHECKOUT',
   );
@@ -119,77 +83,6 @@ async function simplifiedTriggerSource(
   if (!row || !ref || !validBranchRef(ref) || (settings.ref && settings.ref !== ref))
     throw new BadRequestException('开始节点源码项需配置匹配的分支，使用默认分支时仓库需先同步');
   return { repositoryId: source.repositoryId, ref, nodeId: node.id, sourceId: source.id };
-}
-
-export async function resolveTriggerSource(
-  db: Kysely<Database>,
-  projectId: string,
-  flowId: string,
-  settings: TriggerSourceConfig & { parameterMappings?: Record<string, GraphParameterMapping> },
-  definition: GraphDefinition,
-): Promise<TriggerCheckoutScope> {
-  const flow = definition.flows.find(({ id }) => id === flowId);
-  if (!flow) throw new BadRequestException('已发布的图没有当前开始节点');
-  if (settings.ref && !validBranchRef(settings.ref))
-    throw new BadRequestException('请输入有效的分支完整引用，如 refs/heads/main');
-  if (flow.model === 'FLOW_V2') return simplifiedTriggerSource(db, projectId, flow, settings);
-  if (settings.sourceId) throw new BadRequestException('当前执行流不支持开始源码项');
-  const inferred =
-    !flow.compiled && flowStart(flow).contract === 'PRESET'
-      ? flowCandidateCatalog(flow, definition.flows, orderedFlowNodes(flow)).nodes
-      : undefined;
-  const checkouts = [];
-  for (const node of flow.nodes.filter(
-    ({ type, operation }) => type === 'CHECKOUT' || operation === 'CHECKOUT',
-  )) {
-    const checkoutBinding = (fieldId: string) =>
-      inferred
-        ? inferred[node.id]?.automaticInputBindings[fieldId]
-        : nodeInputBinding(flow, node, fieldId);
-    const input = checkoutBinding('repository');
-    const repository = staticBinding(flow, input, settings.parameterMappings);
-    const mapping = input?.kind === 'INPUT' && settings.parameterMappings?.[input.fieldId];
-    const eventRepository = mapping && mapping.source === 'EVENT' && mapping.field === 'repository';
-    const selector =
-      typeof repository === 'string'
-        ? repository
-        : eventRepository
-          ? settings.repositoryId
-          : undefined;
-    if (!selector) continue;
-    const repositoryId = await resolveGraphRepositorySelector(db, projectId, selector);
-    if (settings.repositoryId && settings.repositoryId !== repositoryId) continue;
-    const row = await db
-      .selectFrom('repositories')
-      .select('default_branch')
-      .where('id', '=', repositoryId)
-      .where('project_id', '=', projectId)
-      .where('archived_at', 'is', null)
-      .executeTakeFirst();
-    if (!row) continue;
-    const selected = staticBinding(flow, checkoutBinding('version'), settings.parameterMappings);
-    const version =
-      selected && typeof selected === 'object'
-        ? (selected as { kind?: string; value?: string; byEvent?: boolean })
-        : undefined;
-    const ref =
-      version?.kind === 'BRANCH' && typeof version.value === 'string'
-        ? branchPrefix + version.value
-        : version?.byEvent
-          ? settings.ref || (row.default_branch ? branchPrefix + row.default_branch : undefined)
-          : selected === undefined && row.default_branch
-            ? branchPrefix + row.default_branch
-            : undefined;
-    if (ref && validBranchRef(ref) && (!settings.ref || settings.ref === ref))
-      checkouts.push({ repositoryId, ref, nodeId: node.id });
-  }
-  if (checkouts.length !== 1)
-    throw new BadRequestException(
-      checkouts.length
-        ? '多个检出节点匹配该仓库和分支，请为触发规则选择唯一来源'
-        : '请为来源触发规则选择已有检出节点使用的仓库和分支，仓库默认分支需要先同步',
-    );
-  return checkouts[0]!;
 }
 
 export interface WebhookRequest {

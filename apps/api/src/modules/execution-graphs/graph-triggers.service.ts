@@ -329,7 +329,8 @@ export class GraphTriggersService implements OnModuleInit {
     definition: GraphDefinition,
     db = this.database.db,
   ) {
-    return resolveTriggerSource(db, projectId, source.flowId, source.settings, definition);
+    const flow = this.currentTriggerFlow(definition, source.flowId);
+    return resolveTriggerSource(db, projectId, flow, source.settings);
   }
 
   private async sourceRepository(projectId: string, repositoryId: string, db = this.database.db) {
@@ -454,10 +455,12 @@ export class GraphTriggersService implements OnModuleInit {
     return JSON.parse(row.definition_json) as GraphDefinition;
   }
 
-  private startFields(definition: GraphDefinition, flowId: string) {
-    const flow = definition.flows.find((candidate) => candidate.id === flowId);
+  private currentTriggerFlow(definition: GraphDefinition, flowId: string) {
+    const flow = definition.flows.find(({ id }) => id === flowId);
     if (!flow) throw new NotFoundException('该版本中不存在选中的执行流');
-    return flowStart(flow).inputs ?? [];
+    if (definition.canvas?.model !== 'FLOW_V2' || flow.model !== 'FLOW_V2')
+      throw new ConflictException('此触发器使用旧版编排，请改用已发布的简化执行链');
+    return flow;
   }
 
   private validateMappings(
@@ -695,15 +698,15 @@ export class GraphTriggersService implements OnModuleInit {
     settings: TriggerConfig,
     ruleId?: string,
   ) {
-    const fields = this.startFields(definition, input.flowId);
+    const flow = this.currentTriggerFlow(definition, input.flowId);
+    const fields = flowStart(flow).inputs ?? [];
     this.validateMappings(fields, this.mappingInput(input, version, settings), definition);
     if (
       settings.upstreamFlowId &&
       !definition.flows.some(({ id }) => id === settings.upstreamFlowId)
     )
       throw this.triggerPlanIssue(input.flowId, '发布版本中缺少上游执行流', 'upstreamFlowId');
-    const flow = definition.flows.find(({ id }) => id === input.flowId);
-    const start = flow?.model === 'FLOW_V2' ? flowStart(flow).start : undefined;
+    const start = flowStart(flow).start;
     const useUpstreamArtifact = start?.release?.useUpstreamArtifact;
     if (
       useUpstreamArtifact &&
@@ -930,17 +933,18 @@ export class GraphTriggersService implements OnModuleInit {
         ? await this.published(projectId, liveVersion, tx, input.enabled)
         : undefined;
       const sameFlow = previous?.flow_id === input.flowId;
-      const flowPublished = bound?.flows.some(({ id }) => id === input.flowId) ?? false;
+      const flowPublished =
+        bound?.canvas?.model === 'FLOW_V2' &&
+        bound.flows.some(({ id, model }) => id === input.flowId && model === 'FLOW_V2');
       if (!input.enabled && !flowPublished && !sameFlow) {
         const draft = JSON.parse(current.draft_json) as GraphDefinition;
         if (
-          !draft.flows.some(({ id }) => id === input.flowId) &&
-          !draft.canvas?.nodes.some(({ id, type }) => id === input.flowId && type === 'START')
+          draft.canvas?.model !== 'FLOW_V2' ||
+          !draft.canvas.nodes.some(({ id, type }) => id === input.flowId && type === 'START')
         )
           throw this.triggerPlanIssue(input.flowId, '请先保存包含该开始节点的画布草稿');
       }
       settings.unpublished = !flowPublished;
-      if (flowPublished && !bound?.canvas) settings.followLatest = false;
       const actor = input.enabled || !previous ? userId : previous.created_by;
       await this.requireAdmin(tx, userId);
       if (previous) {
@@ -1183,7 +1187,7 @@ export class GraphTriggersService implements OnModuleInit {
       throw new ConflictException('发布预检后触发器已变化，请重新校验后发布');
     for (const rule of live) {
       try {
-        await this.validateMigrationBinding(tx, rule, version, definition);
+        await this.validatePublicationBinding(tx, rule, version, definition);
       } catch (error) {
         if (!(error instanceof HttpException)) throw error;
         throw new GraphCompileError(this.publicationIssue(rule, error));
@@ -1219,7 +1223,7 @@ export class GraphTriggersService implements OnModuleInit {
     }
   }
 
-  async validateMigrationBinding(
+  private async validatePublicationBinding(
     tx: Transaction<Database>,
     rule: Rule,
     version: number,
@@ -1227,12 +1231,7 @@ export class GraphTriggersService implements OnModuleInit {
   ) {
     const settings = config(rule);
     const active = rule.enabled === 1;
-    const flow = definition.flows.find(({ id }) => id === rule.flow_id);
-    if (!flow)
-      throw this.triggerPlanIssue(
-        rule.flow_id,
-        '请先暂停触发器「' + rule.name + '」，或恢复关联开始节点',
-      );
+    const flow = this.currentTriggerFlow(definition, rule.flow_id);
     const fields = flowStart(flow).inputs ?? [];
     this.validateMappings(
       fields,
@@ -1340,6 +1339,7 @@ export class GraphTriggersService implements OnModuleInit {
       throw new NotFoundException('已启用的 API 触发器不存在');
     return this.database.db.transaction().execute(async (tx) => {
       await this.lockRule(tx, rule);
+      this.currentTriggerFlow(await this.published(projectId, rule.version, tx), rule.flow_id);
       const event = await this.recordEvent(tx, rule, input.eventId, {
         invokedBy: userId,
         value: plainValue(input.inputValue ?? config(rule).inputValue),
@@ -1375,6 +1375,10 @@ export class GraphTriggersService implements OnModuleInit {
       if (!rule) throw new NotFoundException('Webhook 规则不存在');
       await this.lockWebhook(tx, rule);
       const settings = config(rule);
+      const definition = settings.unpublished
+        ? (JSON.parse((await this.projectGraph(projectId, tx)).draft_json) as GraphDefinition)
+        : await this.published(projectId, rule.version, tx, false);
+      this.currentTriggerFlow(definition, rule.flow_id);
       const secret = randomBytes(32).toString('base64url');
       const stored = await this.credentials.storeWebhookSecret(
         tx,
@@ -1482,6 +1486,8 @@ export class GraphTriggersService implements OnModuleInit {
       ...(protocol === 'SIGNED' && { repositoryId: delivery.repositoryId }),
     };
     await requireProject(this.database.db, rule.project_id);
+    const definition = await this.sourceDefinition(rule, settings);
+    this.currentTriggerFlow(definition, rule.flow_id);
     const replay = await this.webhookReplay(rule, eventId, fields);
     if (replay) return this.eventResult(replay);
     const store = (status: string, error?: string) =>
@@ -1511,7 +1517,7 @@ export class GraphTriggersService implements OnModuleInit {
       scope = await this.resolveSourceScope(
         rule.project_id,
         { flowId: rule.flow_id, settings },
-        await this.sourceDefinition(rule, settings),
+        definition,
       );
       if (protocol === 'SIGNED' && delivery.repositoryId !== scope.repositoryId)
         return store('IGNORED', '推送仓库与规则中登记的仓库不匹配');
@@ -1617,10 +1623,12 @@ export class GraphTriggersService implements OnModuleInit {
     };
     let scope;
     try {
+      const definition = await this.published(rule.project_id, rule.version);
+      this.currentTriggerFlow(definition, rule.flow_id);
       scope = await this.resolveSourceScope(
         rule.project_id,
         { flowId: rule.flow_id, settings },
-        await this.published(rule.project_id, rule.version),
+        definition,
       );
     } catch (error) {
       if (!(error instanceof HttpException)) throw error;
@@ -1715,6 +1723,13 @@ export class GraphTriggersService implements OnModuleInit {
         await this.pollRepository(rule, now, nextAt);
         continue;
       }
+      let unsupported: string | undefined;
+      try {
+        this.currentTriggerFlow(await this.published(rule.project_id, rule.version), rule.flow_id);
+      } catch (error) {
+        if (!(error instanceof HttpException)) throw error;
+        unsupported = error.message;
+      }
       await this.database.db.transaction().execute(async (tx) => {
         const scheduled = await tx
           .updateTable('execution_graph_triggers')
@@ -1734,9 +1749,11 @@ export class GraphTriggersService implements OnModuleInit {
             rule,
             String(rule.next_at),
             { value: settings.inputValue, scheduledAt: rule.next_at! },
-            late
-              ? { status: 'SKIPPED', error: '错过计划时点，已跳过积压并恢复下一次计划', now }
-              : { now },
+            unsupported
+              ? { status: 'REJECTED', error: unsupported, now }
+              : late
+                ? { status: 'SKIPPED', error: '错过计划时点，已跳过积压并恢复下一次计划', now }
+                : { now },
           );
         }
       });
@@ -1787,9 +1804,9 @@ export class GraphTriggersService implements OnModuleInit {
         .execute(async (tx) => {
           await this.lockRule(tx, rule);
           const definition = await this.published(rule.project_id, rule.version, tx, false);
-          const flow = definition.flows.find(({ id }) => id === rule.flow_id);
-          const release = flow?.model === 'FLOW_V2' ? flowStart(flow).start?.release : undefined;
-          const deploy = flow?.nodes.find(({ type }) => type === 'DEPLOY_ARTIFACT');
+          const flow = this.currentTriggerFlow(definition, rule.flow_id);
+          const release = flowStart(flow).start?.release;
+          const deploy = flow.nodes.find(({ type }) => type === 'DEPLOY_ARTIFACT');
           const artifactType = deploy?.deploy?.method === 'COMPOSE' ? 'DOCKER_IMAGE' : 'FILE';
           for (const run of runs) {
             const fields = {
@@ -1858,9 +1875,10 @@ export class GraphTriggersService implements OnModuleInit {
       )
         throw new ConflictException('触发器已停用或配置已变更');
       const definition = await this.published(rule.project_id, version);
+      const flow = this.currentTriggerFlow(definition, flowId);
       const kind = rule.kind as GraphTriggerKind;
       const hasDelivery = assertAutomaticGraphFlow(definition, flowId, kind);
-      const fields = this.startFields(definition, flowId);
+      const fields = flowStart(flow).inputs ?? [];
       const { invokedBy, ...eventInput } = eventFields(event);
       const authorization = { kind, ruleId: rule.id, revision: settings.revision, invokedBy };
       const mappings = settings.parameterMappings ?? {};

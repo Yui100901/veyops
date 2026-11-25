@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Play } from 'lucide-react';
 import { ApiError, message, post, type ExecutionPlanIssue } from '../../../api';
 import { ErrorBanner } from '../../../components';
-import type { DeploymentSelection, ProjectDetail } from '../../../models';
+import type { ProjectDetail } from '../../../models';
 import {
   GraphFieldValue,
   useProjectEnvironmentSets,
@@ -21,14 +21,10 @@ import {
   graphNodeLabels,
   isReleaseNode,
 } from '../execution-graph-definition';
-import type { GraphBinding, GraphField, GraphFlow, GraphRun } from '../execution-graph-definition';
+import type { GraphField, GraphFlow, GraphRun } from '../execution-graph-definition';
 import { projectGraphPath, projectResourcePath } from '../../projects/project-workspace-route';
 import { graphStartReadiness, type GraphWorkbenchScope } from '../graph-workbench-context';
-import {
-  simplifiedConditionField,
-  simplifiedModel,
-  simplifiedRuntimeInputs,
-} from '../simplified-flow';
+import { simplifiedConditionField, simplifiedRuntimeInputs } from '../simplified-flow';
 
 export { ExecutionGraphHistory } from './ExecutionGraphHistory';
 
@@ -53,70 +49,6 @@ function focusRunField(field: HTMLElement | undefined) {
   );
   field.scrollIntoView({ block: 'center' });
   (input ?? field).focus({ preventScroll: true });
-}
-
-function serviceReferenceId(value: unknown) {
-  if (typeof value === 'string') return value;
-  if (
-    value &&
-    typeof value === 'object' &&
-    'serviceId' in value &&
-    typeof value.serviceId === 'string'
-  )
-    return value.serviceId;
-}
-
-function referencesInput(binding: GraphBinding | undefined, id: string): boolean {
-  if (binding?.kind === 'INPUT') return binding.fieldId === id;
-  return (
-    binding?.kind === 'FIRST_AVAILABLE' &&
-    binding.sources.some((source) => referencesInput(source, id))
-  );
-}
-
-function staticBinding(
-  binding: GraphBinding | undefined,
-  parameters: Record<string, unknown>,
-): unknown {
-  if (binding?.kind === 'VALUE') return binding.value;
-  if (binding?.kind === 'INPUT') return parameters[binding.fieldId];
-  return undefined;
-}
-
-function parameterFieldScope(
-  field: GraphField,
-  flow: GraphFlow,
-  parameters: Record<string, unknown>,
-  general: FieldScope,
-): FieldScope {
-  const bindingsAt = (id: string) =>
-    flow.compiled?.nodes[id]?.inputBindings ?? flow.inputBindings?.[id];
-  if (field.type === 'GIT_REF' && flow.compiled?.presetResourceGroups) {
-    const source = flow.nodes
-      .map(({ id }) => bindingsAt(id))
-      .find((bindings) => referencesInput(bindings?.version, field.id));
-    const repository = staticBinding(source?.repository, parameters);
-    return {
-      ...general,
-      repositoryId: typeof repository === 'string' ? repository : general.repositoryId,
-    };
-  }
-  if (field.type !== 'ARTIFACT') return general;
-  const consumer = flow.nodes.find(
-    (node) => isReleaseNode(node) && referencesInput(bindingsAt(node.id)?.artifact, field.id),
-  );
-  if (!consumer) return general;
-  const bindings = bindingsAt(consumer.id);
-  const targets = staticBinding(bindings?.targets, parameters);
-  const serviceId = serviceReferenceId(staticBinding(bindings?.service, parameters));
-  return {
-    ...general,
-    deliveryMethod: consumer.deploy?.method,
-    serviceId: serviceId ?? general.serviceId,
-    targets:
-      (targets && typeof targets === 'object' ? (targets as DeploymentSelection) : undefined) ??
-      general.targets,
-  };
 }
 
 function PlanIssueBanner({
@@ -182,18 +114,13 @@ export function ExecutionGraphStart({
   onRun: (id: string) => void;
 }) {
   const startNode = flow.nodes.find(({ type }) => type === 'START');
-  const simplified = flow.model === simplifiedModel;
-  const start = simplified ? startNode?.start : undefined;
-  const setConfiguration = startNode?.environmentSet;
-  const fixedSetId =
-    start?.environmentSetId ??
-    (setConfiguration?.mode === 'FIXED' ? setConfiguration.environmentSetId : undefined);
+  const start = startNode?.start;
+  const fixedSetId = start?.environmentSetId;
   const fixedSets = useProjectEnvironmentSets(project.id, !!fixedSetId);
   const fixedSet = fixedSets.data?.find(({ id }) => id === fixedSetId);
-  const fields = simplified ? simplifiedRuntimeInputs(flow, project) : (startNode?.inputs ?? []);
-  const runtimeFields = fields.filter(({ runtimeOverride }) => runtimeOverride !== false);
+  const fields = simplifiedRuntimeInputs(flow, project);
   const runtimePresets = Object.fromEntries(
-    runtimeFields.flatMap(({ id }) =>
+    fields.flatMap(({ id }) =>
       initialInputs && Object.hasOwn(initialInputs, id) ? [[id, initialInputs[id]]] : [],
     ),
   );
@@ -207,10 +134,7 @@ export function ExecutionGraphStart({
   const parameters: Record<string, unknown> = {
     ...Object.fromEntries(
       fields.map((field) => {
-        const edit =
-          field.runtimeOverride !== false && Object.hasOwn(edits, field.id)
-            ? edits[field.id]
-            : undefined;
+        const edit = edits[field.id];
         return [
           field.id,
           edit?.schema === parameterSchema(field) ? edit.value : field.defaultValue,
@@ -221,22 +145,10 @@ export function ExecutionGraphStart({
   };
   const readiness = graphStartReadiness(flow, workbenchScope, project, parameters);
   const fieldRefs = useRef(new Map<string, HTMLElement>());
-  const scopedValue = (type: NonNullable<(typeof fields)[number]>['type']) => {
-    const candidates = fields.filter((field) => field.type === type && !field.multiple);
-    const field =
-      candidates.find(({ id }) => initialInputs && Object.hasOwn(initialInputs, id)) ??
-      (candidates.length === 1 ? candidates[0] : undefined);
-    return field ? parameters[field.id] : undefined;
-  };
   const scope: FieldScope = {
-    repositoryId: scopedValue('REPOSITORY') as string | undefined,
-    environmentId: scopedValue('ENVIRONMENT') as string | undefined,
-    serviceId:
-      start?.release?.serviceId ??
-      (flow.compiled?.presetResourceGroups ? undefined : flow.serviceId) ??
-      serviceReferenceId(scopedValue('SERVICE')),
-    targets: start?.release?.targets ?? (scopedValue('TARGETS') as DeploymentSelection | undefined),
-    deliveryMethod: simplified ? flow.nodes.find(isReleaseNode)?.deploy?.method : undefined,
+    serviceId: start?.release?.serviceId,
+    targets: start?.release?.targets,
+    deliveryMethod: flow.nodes.find(isReleaseNode)?.deploy?.method,
   };
   const [preview, setPreview] = useState<Preview>();
   const [revision, setRevision] = useState<{ previous: Preview; sections: string[] }>();
@@ -264,7 +176,6 @@ export function ExecutionGraphStart({
   }, [focusFieldId]);
   const base = path + '/flows/' + encodeURIComponent(flow.id);
   const useDefaults =
-    (simplified || startNode?.contract === 'PRESET') &&
     !start?.release?.useUpstreamArtifact &&
     !preview &&
     !revision &&
@@ -351,38 +262,19 @@ export function ExecutionGraphStart({
     }
   }
   function runtimeInputs(): Inputs {
-    if (simplified) {
-      const value = parameters[simplifiedConditionField];
-      return {
-        value: typeof value === 'string' && value !== '' ? value : undefined,
-        parameters: Object.fromEntries(
-          runtimeFields.flatMap((field) => {
-            const edit = edits[field.id];
-            if (field.id === simplifiedConditionField) return [];
-            if (!Object.hasOwn(runtimePresets, field.id) && edit?.schema !== parameterSchema(field))
-              return [];
-            const value = parameters[field.id];
-            return value === undefined || (value === '' && field.type !== 'TEXT')
-              ? []
-              : [[field.id, value]];
-          }),
-        ),
-      };
-    }
+    const condition = parameters[simplifiedConditionField];
     return {
+      value: typeof condition === 'string' && condition !== '' ? condition : undefined,
       parameters: Object.fromEntries(
-        runtimeFields.flatMap((field) => {
+        fields.flatMap((field) => {
+          const edit = edits[field.id];
+          if (field.id === simplifiedConditionField) return [];
+          if (!Object.hasOwn(runtimePresets, field.id) && edit?.schema !== parameterSchema(field))
+            return [];
           const value = parameters[field.id];
-          if (value === undefined) return [];
-          const serviceValue = (item: unknown) =>
-            typeof item === 'string' ? { serviceId: item } : item;
-          const serialized =
-            field.type === 'SERVICE'
-              ? Array.isArray(value)
-                ? value.map(serviceValue)
-                : serviceValue(value)
-              : value;
-          return [[field.id, serialized]];
+          return value === undefined || (value === '' && field.type !== 'TEXT')
+            ? []
+            : [[field.id, value]];
         }),
       ),
     };
@@ -392,13 +284,6 @@ export function ExecutionGraphStart({
       ...(drafts?.get(draftKey) ?? edits),
       [field.id]: { schema: parameterSchema(field), value },
     };
-    if (field.type === 'SERVICE') {
-      for (const candidate of runtimeFields) {
-        if (candidate.type === 'ARTIFACT') {
-          next[candidate.id] = { schema: parameterSchema(candidate), value: undefined };
-        }
-      }
-    }
     drafts?.set(draftKey, next);
     setEdits(next);
     if (planIssue) {
@@ -457,8 +342,8 @@ export function ExecutionGraphStart({
             </a>
           </p>
         )}
-        {runtimeFields.length ? (
-          runtimeFields.map((field) => (
+        {fields.length ? (
+          fields.map((field) => (
             <div
               key={field.id}
               className="graph-run-field"
@@ -471,22 +356,17 @@ export function ExecutionGraphStart({
               <GraphFieldValue
                 field={field}
                 project={project}
-                scope={
-                  simplified
-                    ? {
-                        ...scope,
-                        repositoryId:
-                          field.type === 'GIT_REF'
-                            ? start?.sources?.find(({ id }) => 'git:' + id === field.id)
-                                ?.repositoryId
-                            : scope.repositoryId,
-                      }
-                    : parameterFieldScope(field, flow, parameters, scope)
-                }
+                scope={{
+                  ...scope,
+                  repositoryId:
+                    field.type === 'GIT_REF'
+                      ? start?.sources?.find(({ id }) => 'git:' + id === field.id)?.repositoryId
+                      : undefined,
+                }}
                 disabled={Object.hasOwn(runtimePresets, field.id)}
                 checkRequired
                 canManageProjectResources
-                artifactInstancesOnly={simplified}
+                artifactInstancesOnly
                 value={parameters[field.id]}
                 change={(value) => updateParameter(field, value)}
               />

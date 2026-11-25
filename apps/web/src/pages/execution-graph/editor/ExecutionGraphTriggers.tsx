@@ -25,6 +25,7 @@ export function ExecutionGraphTriggers({
   flows,
   canManage,
   canInvoke,
+  canPause = canManage,
   manualHref,
   onPrepareDraft,
   issueHref,
@@ -37,6 +38,7 @@ export function ExecutionGraphTriggers({
   flows: TriggerFlow[];
   canManage: boolean;
   canInvoke: boolean;
+  canPause?: boolean;
   manualHref?: string;
   onPrepareDraft?: () => Promise<number>;
   issueHref?: (issue: NonNullable<TriggerPreflight['issue']>) => string;
@@ -93,19 +95,21 @@ export function ExecutionGraphTriggers({
           )}
         </div>
       </div>
-      <div className="graph-trigger-manual">
-        <div>
-          <strong>手动运行</strong>
-          <small className="cell-detail">
-            {latestVersion ? '当前发布版 v' + latestVersion : '发布可运行的执行流后可手动运行。'}
-          </small>
+      {(canManage || canInvoke) && (
+        <div className="graph-trigger-manual">
+          <div>
+            <strong>手动运行</strong>
+            <small className="cell-detail">
+              {latestVersion ? '当前发布版 v' + latestVersion : '发布可运行的执行流后可手动运行。'}
+            </small>
+          </div>
+          {canInvoke && latestVersion && manualHref && (
+            <a className="button secondary small" href={manualHref}>
+              <Play size={15} /> 前往运行
+            </a>
+          )}
         </div>
-        {canInvoke && latestVersion && manualHref && (
-          <a className="button secondary small" href={manualHref}>
-            <Play size={15} /> 前往运行
-          </a>
-        )}
-      </div>
+      )}
       <ErrorBanner error={rules.error || error} />
       {!latestVersion && canManage && (
         <p className="field-note">可以先保存触发规则草稿。发布执行流后再预检并启用。</p>
@@ -180,25 +184,23 @@ export function ExecutionGraphTriggers({
                   {selected === item.id ? '收起事件' : '接收设置与事件'}
                 </button>
                 {canManage && (
-                  <>
-                    <button
-                      type="button"
-                      className="button secondary small"
-                      onClick={() => setEditing(item)}
-                    >
-                      {item.enabled ? '编辑' : '配置与启用'}
-                    </button>
-                    {item.enabled && (
-                      <button
-                        type="button"
-                        className="button secondary small"
-                        disabled={Boolean(pausing)}
-                        onClick={() => void pause(item)}
-                      >
-                        {pausing === item.id ? '暂停中…' : '暂停'}
-                      </button>
-                    )}
-                  </>
+                  <button
+                    type="button"
+                    className="button secondary small"
+                    onClick={() => setEditing(item)}
+                  >
+                    {item.enabled ? '编辑' : '配置与启用'}
+                  </button>
+                )}
+                {canPause && item.enabled && (
+                  <button
+                    type="button"
+                    className="button secondary small"
+                    disabled={Boolean(pausing)}
+                    onClick={() => void pause(item)}
+                  >
+                    {pausing === item.id ? '暂停中…' : '暂停'}
+                  </button>
                 )}
               </div>
             </li>

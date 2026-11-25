@@ -5,6 +5,7 @@ import { Confirm, ErrorBanner, Loading, Section, Status } from '../../components
 import type { ProjectDetail, Repository, Service, User } from '../../models';
 import { RepositoryBinding } from './repositories/RepositoryBinding';
 import { ExecutionGraphStartList } from '../execution-graph/run/ExecutionGraphStartStatus';
+import { simplifiedModel } from '../execution-graph/simplified-flow';
 import { ProjectEnvironment } from './environments/ProjectEnvironment';
 import { ProjectEnvironmentSets } from './environments/ProjectEnvironmentSets';
 import { ProjectAccessLinks } from './ProjectAccessLinks';
@@ -550,7 +551,7 @@ function ServiceDetails({
           <ErrorBanner error={graphError} retry={graph.error ? graph.reload : published.reload} />
         ) : graph.loading || (version && !activePublished) ? (
           <Loading />
-        ) : activePublished ? (
+        ) : activePublished?.definition.canvas?.model === simplifiedModel ? (
           <ExecutionGraphStartList
             project={project}
             scope={graphScope}
@@ -559,6 +560,8 @@ function ServiceDetails({
             canRepair={user.role !== 'VIEWER' && !project.archived}
             href={(flow) => graphStartHref(id, flow.id, graphScope)}
           />
+        ) : activePublished ? (
+          <p className="mini-empty">当前发布版供历史查阅。发布简化执行图后可从此处运行。</p>
         ) : (
           <p className="mini-empty">项目尚未发布执行图。</p>
         )}

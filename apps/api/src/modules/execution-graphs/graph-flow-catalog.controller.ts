@@ -1,36 +1,8 @@
 import { Controller, Get } from '@nestjs/common';
 import { sql } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
-import {
-  orderedFlowNodes,
-  type GraphDefinition,
-  type GraphFlow,
-} from './execution-graph-definition';
-import { flowCandidateCatalog } from './graph-binding-validation';
-import { flowStart, presetReleaseServiceIds, referenceId } from './graph-run-bindings';
-import { isSimplifiedCanvasNode } from './simplified-flow-definition';
-
-function belongsToServices(flow: GraphFlow, definition: GraphDefinition) {
-  const start = flowStart(flow);
-  if (flow.model === 'FLOW_V2')
-    return start.start?.release?.serviceId ? [start.start.release.serviceId] : [];
-  if (
-    start.contract === 'PRESET' &&
-    flow.nodes.some(({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT')
-  ) {
-    if (flow.compiled) return presetReleaseServiceIds(flow);
-    const candidates = flowCandidateCatalog(flow, definition.flows, orderedFlowNodes(flow)).nodes;
-    return presetReleaseServiceIds(
-      flow,
-      undefined,
-      (node) => candidates[node.id]?.automaticInputBindings.service,
-    );
-  }
-  const service =
-    flow.serviceId ??
-    referenceId(start.inputs?.find(({ type }) => type === 'SERVICE')?.defaultValue);
-  return service ? [service] : [];
-}
+import type { GraphDefinition } from './execution-graph-definition';
+import { flowStart } from './graph-run-bindings';
 
 @Controller('delivery-flows')
 export class GraphFlowCatalogController {
@@ -125,12 +97,9 @@ export class GraphFlowCatalogController {
         string,
         { id: string; name: string; serviceIds: string[]; version?: number }
       >();
-      for (const node of draft.canvas?.nodes ?? []) {
+      for (const node of draft.canvas?.model === 'FLOW_V2' ? draft.canvas.nodes : []) {
         if (node.type === 'START') {
-          const serviceId =
-            draft.canvas && isSimplifiedCanvasNode(draft.canvas, node)
-              ? node.start?.release?.serviceId
-              : referenceId(node.inputs?.find(({ type }) => type === 'SERVICE')?.defaultValue);
+          const serviceId = node.start?.release?.serviceId;
           notes.set(node.id, {
             id: node.id,
             name: node.name,
@@ -138,19 +107,16 @@ export class GraphFlowCatalogController {
           });
         }
       }
-      for (const flow of draft.flows)
+      for (const flow of current?.canvas?.model === 'FLOW_V2' ? current.flows : []) {
+        if (flow.model !== 'FLOW_V2') continue;
+        const serviceId = flowStart(flow).start?.release?.serviceId;
         notes.set(flow.id, {
           id: flow.id,
           name: flow.name,
-          serviceIds: belongsToServices(flow, draft),
-        });
-      for (const flow of current?.flows ?? [])
-        notes.set(flow.id, {
-          id: flow.id,
-          name: flow.name,
-          serviceIds: belongsToServices(flow, current!),
+          serviceIds: serviceId ? [serviceId] : [],
           version: project.published_version!,
         });
+      }
       return {
         projectId: project.id,
         projectName: project.name,

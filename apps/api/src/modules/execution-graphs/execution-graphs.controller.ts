@@ -1,5 +1,4 @@
 import {
-  BadRequestException,
   Body,
   Controller,
   Get,
@@ -8,7 +7,6 @@ import {
   ParseUUIDPipe,
   Post,
   Put,
-  Query,
   Req,
 } from '@nestjs/common';
 import { Roles } from '../auth/auth.decorators';
@@ -19,7 +17,7 @@ import {
   ValidateGraphDraftDto,
 } from './execution-graph-definition';
 import { ExecutionGraphsService } from './execution-graphs.service';
-import { GraphCompileError, graphCatalog, safeGraphId } from './graph-fields';
+import { GraphCompileError, graphCatalog } from './graph-fields';
 import { ExecutionPlanIssueError } from '../../core/execution-plan-issue';
 import { ExpandGraphTemplateDto, simplifiedFlowTemplates } from './graph-flow-templates';
 
@@ -53,21 +51,6 @@ export class ExecutionGraphsController {
     @Body() input: ExpandGraphTemplateDto,
   ) {
     return this.graphs.expandTemplate(projectId, input);
-  }
-  @Post('catalog')
-  @Roles('ADMIN', 'OPERATOR')
-  async draftCatalog(
-    @Param('projectId', ParseUUIDPipe) projectId: string,
-    @Query('flow') flowId: string,
-    @Query('node') nodeId: string,
-    @Body() input: ValidateGraphDraftDto,
-  ) {
-    if (!safeGraphId(flowId) || !safeGraphId(nodeId))
-      throw new BadRequestException('请选择要查看的开始节点与功能节点');
-    return {
-      ...graphCatalog,
-      flows: await this.graphs.draftCatalog(projectId, input.definition, flowId, nodeId),
-    };
   }
   @Post('validate')
   @Roles('ADMIN', 'OPERATOR')

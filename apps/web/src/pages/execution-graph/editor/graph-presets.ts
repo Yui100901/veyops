@@ -5,6 +5,7 @@ import {
   graphNodeFamily,
   graphNodeLabels,
 } from '../execution-graph-definition';
+import { simplifiedModel } from '../simplified-flow';
 import type {
   GraphArtifactOutput,
   GraphArtifactType,
@@ -72,7 +73,8 @@ export function appendFlowTemplate(
   expansion: GraphFlowExpansion,
 ): GraphCanvas {
   const { canvas: fragment, startId } = expansion;
-  if (canvas.model && canvas.model !== fragment.model) throw new Error('请选择简化流程模板。');
+  if (canvas.model !== simplifiedModel || fragment.model !== simplifiedModel)
+    throw new Error('请在简化执行图草稿中添加模板。');
   if (
     canvas.nodes.length + fragment.nodes.length > 500 ||
     canvas.edges.length + fragment.edges.length > 1500 ||
@@ -94,19 +96,14 @@ export function appendFlowTemplate(
   let name = start.name;
   for (let suffix = 2; names.has(name); suffix++) name = start.name + '（' + suffix + '）';
   const nodes = placeFlowTemplate(canvas, fragment);
-  const model =
-    canvas.model ?? (!canvas.nodes.length && !canvas.templates.length ? fragment.model : undefined);
-  const markModel = (node: GraphNode) =>
-    !model && fragment.model ? { ...node, model: fragment.model } : node;
   return {
     ...canvas,
-    model,
     nodes: [
       ...canvas.nodes,
-      ...nodes.map(markModel).map((node) => (node.id === startId ? { ...node, name } : node)),
+      ...nodes.map((node) => (node.id === startId ? { ...node, name } : node)),
     ],
     edges: [...canvas.edges, ...fragment.edges],
     endpoints: [...canvas.endpoints, ...fragment.endpoints],
-    templates: [...canvas.templates, ...fragment.templates.map(markModel)],
+    templates: [...canvas.templates, ...fragment.templates],
   };
 }
