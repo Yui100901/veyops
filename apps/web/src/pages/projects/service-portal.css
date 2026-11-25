@@ -1,29 +1,38 @@
 .portal-filters {
-  display: grid;
-  grid-template-columns: minmax(11rem, 2fr) minmax(8rem, 1fr) auto auto;
-  gap: 0.85rem;
-  align-items: end;
-  padding: 1rem;
-  margin-bottom: 1rem;
+  grid-template-columns: minmax(10rem, 2fr) auto minmax(8rem, 1fr) auto;
+  grid-template-areas: 'keyword actions tag abnormal';
 }
 
-.portal-filters .checkbox-row {
-  min-height: 36px;
+.portal-filter-keyword {
+  grid-area: keyword;
+}
+
+.portal-filter-tag {
+  grid-area: tag;
+}
+
+.portal-filter-actions {
+  grid-area: actions;
+  align-items: stretch;
+  flex-wrap: nowrap;
   white-space: nowrap;
 }
 
-.portal-projects,
+.portal-filter-abnormal {
+  grid-area: abnormal;
+  white-space: nowrap;
+}
+
 .portal-services {
   display: grid;
-  gap: 0.9rem;
-  min-width: 0;
+  gap: var(--section-gap);
 }
 
 .portal-service {
-  padding: 0.9rem 1rem;
-  min-width: 0;
-  border: 1px solid var(--border);
-  border-radius: 0.55rem;
+  min-inline-size: 0;
+  padding: var(--surface-inset);
+  border-radius: var(--control-radius);
+  background: #f6f8fa;
 }
 
 .portal-service-header {
@@ -53,6 +62,21 @@
 
 @media (max-width: 800px) {
   .portal-filters {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'keyword actions'
+      'tag abnormal';
+  }
+
+  .portal-filter-actions {
+    justify-content: flex-end;
+  }
+
+  .portal-filter-abnormal {
+    justify-self: end;
+  }
+
+  .portal-clear-filters span {
+    display: none;
   }
 }

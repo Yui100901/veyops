@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react';
-import { Search } from 'lucide-react';
+import { Search, X } from 'lucide-react';
 import { formatTime, navigate, useResource } from '../../api';
-import { workspaceOrigin } from '../../workspace-navigation';
+import { portalFilterParams, workspaceOrigin } from '../../workspace-navigation';
 import {
   Empty,
   ErrorBanner,
@@ -81,73 +81,87 @@ function DeliveryStatus({ targets }: { targets: PortalTarget[] }) {
 }
 
 export function ServicePortal({ search }: { search?: string }) {
-  const filters = new URLSearchParams(search);
-  const [keyword, setKeyword] = useState(filters.get('q') ?? '');
-  const [tag, setTag] = useState(filters.get('tag') ?? '');
-  const abnormal = filters.get('abnormal') === 'true';
-  const query = new URLSearchParams();
-  for (const field of ['q', 'tag', 'projectId', 'serviceId', 'abnormal']) {
-    const value = filters.get(field);
-    if (value) query.set(field, value);
-  }
+  const query = portalFilterParams(search);
+  const [keyword, setKeyword] = useState(query.get('q') ?? '');
+  const [tag, setTag] = useState(query.get('tag') ?? '');
+  const [abnormal, setAbnormal] = useState(query.get('abnormal') === 'true');
   const resource = useResource<PortalResult>(`/portal${query.size ? '?' + query : ''}`);
   const source = workspaceOrigin('portal', query.toString());
+
   function applyFilters(onlyAbnormal: boolean) {
     const next = new URLSearchParams(query);
-    next.delete('q');
-    next.delete('tag');
-    next.delete('abnormal');
-    if (keyword.trim()) next.set('q', keyword.trim());
-    if (tag) next.set('tag', tag);
-    if (onlyAbnormal) next.set('abnormal', 'true');
-    navigate(`/portal${next.size ? '?' + next : ''}`);
+    next.set('q', keyword);
+    next.set('tag', tag);
+    next.set('abnormal', String(onlyAbnormal));
+    const filters = portalFilterParams(next.toString());
+    navigate(`/portal${filters.size ? '?' + filters : ''}`);
   }
+
   function searchServices(event: FormEvent) {
     event.preventDefault();
     applyFilters(abnormal);
   }
+
   return (
-    <>
+    <div className="workbench-stack">
       <PageHeader
         title="服务门户"
-        description=""
+        description={
+          query.has('serviceId') ? '仅显示所选服务' : query.has('projectId') ? '仅显示所选项目' : ''
+        }
         action={<RefreshButton onClick={resource.reload} />}
       />
-      <form className="portal-filters panel" onSubmit={searchServices}>
-        <Field label="搜索服务">
-          <input
-            type="search"
-            value={keyword}
-            maxLength={160}
-            onChange={(event) => setKeyword(event.target.value)}
-            placeholder="项目、服务、地址名称或标签"
-          />
-        </Field>
-        <Field label="项目标签">
-          <select value={tag} onChange={(event) => setTag(event.target.value)}>
-            <option value="">全部标签</option>
-            {resource.data?.tags.map((value) => (
-              <option key={value}>{value}</option>
-            ))}
-          </select>
-        </Field>
-        <label className="checkbox-row">
-          <input
-            type="checkbox"
-            checked={abnormal}
-            onChange={(event) => applyFilters(event.target.checked)}
-          />
-          仅看异常
-        </label>
-        <div className="row-actions">
-          <button type="submit" className="primary">
+      <form className="panel workbench-filterbar portal-filters" onSubmit={searchServices}>
+        <div className="portal-filter-keyword">
+          <Field label="搜索服务">
+            <input
+              type="search"
+              value={keyword}
+              maxLength={160}
+              onChange={(event) => setKeyword(event.target.value)}
+              placeholder="项目、服务、地址名称或标签"
+            />
+          </Field>
+        </div>
+        <div className="workbench-actions portal-filter-actions">
+          <button type="submit" className="button primary">
             <Search size={16} aria-hidden="true" /> 搜索
           </button>
           {!!query.size && (
-            <a className="button secondary" href="#/portal">
-              清除筛选
+            <a
+              className="button secondary portal-clear-filters"
+              href="#/portal"
+              title="清除筛选"
+              aria-label="清除筛选"
+            >
+              <X size={16} aria-hidden="true" />
+              <span>清除筛选</span>
             </a>
           )}
+        </div>
+        <div className="portal-filter-tag">
+          <Field label="项目标签">
+            <select value={tag} onChange={(event) => setTag(event.target.value)}>
+              <option value="">全部标签</option>
+              {tag && !resource.data?.tags.includes(tag) && <option>{tag}</option>}
+              {resource.data?.tags.map((value) => (
+                <option key={value}>{value}</option>
+              ))}
+            </select>
+          </Field>
+        </div>
+        <div className="portal-filter-abnormal">
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={abnormal}
+              onChange={(event) => {
+                setAbnormal(event.target.checked);
+                applyFilters(event.target.checked);
+              }}
+            />
+            仅看异常
+          </label>
         </div>
       </form>
       <ErrorBanner error={resource.error} retry={resource.reload} />
@@ -156,11 +170,12 @@ export function ServicePortal({ search }: { search?: string }) {
       ) : (
         !resource.error &&
         (resource.data?.projects.length ? (
-          <div className="portal-projects">
+          <div className="workbench-stack">
             {resource.data.projects.map((project) => (
               <Section
                 key={project.id}
                 title={project.name}
+                body="regular"
                 subtitle={project.tags.length ? project.tags.join(' · ') : undefined}
                 action={
                   <a className="text-link" href={'#' + projectResourcePath(project.id, source)}>
@@ -190,7 +205,7 @@ export function ServicePortal({ search }: { search?: string }) {
                           </h3>
                           <DeliveryStatus targets={service.targets} />
                         </div>
-                        <ProjectAccessLinks addresses={service.addresses} showEmpty />
+                        <ProjectAccessLinks addresses={service.addresses} density="compact" showEmpty />
                       </div>
                     ))}
                   </div>
@@ -209,6 +224,6 @@ export function ServicePortal({ search }: { search?: string }) {
           />
         ))
       )}
-    </>
+    </div>
   );
 }
