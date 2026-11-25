@@ -81,8 +81,9 @@ test(
     try {
       await exec('git', ['init', '--initial-branch=main', worktree]);
       await writeFile(join(worktree, 'input.txt'), 'content from the confirmed Git commit\n');
+      await writeFile(join(worktree, 'private.vars'), 'FLOW_PRIVATE=fixture-private-value\n');
       await writeFile(join(worktree, '.gitattributes'), '*.txt text eol=lf\n');
-      await exec('git', ['-C', worktree, 'add', 'input.txt', '.gitattributes']);
+      await exec('git', ['-C', worktree, 'add', 'input.txt', 'private.vars', '.gitattributes']);
       await exec('git', [
         '-C',
         worktree,
@@ -213,7 +214,15 @@ test(
       const start = canvas.nodes[0]!;
       start.start = {
         ...start.start,
-        sources: [{ id: 'repo', repositoryId: repo.id, ref: { kind: 'BRANCH', value: 'main' } }],
+        sources: [
+          { id: 'repo', repositoryId: repo.id, ref: { kind: 'BRANCH', value: 'main' } },
+          {
+            id: 'alternate',
+            repositoryId: repo.id,
+            ref: { kind: 'BRANCH', value: 'main' },
+            parentDirectory: 'alternate',
+          },
+        ],
         execution: { location: 'MANAGER' },
         release: {
           serviceId: service.id,
@@ -222,11 +231,12 @@ test(
           contentPath: 'fixture/dist',
         },
         variables: [{ key: 'FIXTURE_VALUE', value: 'configured' }],
+        dotenv: { sourceId: 'alternate', path: 'private.vars' },
       };
       canvas.nodes[2]!.build = {
         repoPath: 'fixture',
         buildCommand:
-          'mkdir dist; cat input.txt > dist/built.txt; printf "%s\\n" "$FIXTURE_VALUE" >> dist/built.txt; echo built-fixture',
+          'test -n "$FLOW_PRIVATE"; mkdir dist; cat input.txt > dist/built.txt; printf "%s\\n" "$FIXTURE_VALUE" >> dist/built.txt; echo built-fixture',
       };
       const publish = async (definition: GraphCanvas) => {
         const { revision } = (await api.get(graphPath).expect(200)).body.data;
@@ -303,6 +313,10 @@ test(
       ).body.data;
       assert.equal(artifacts.length, 1);
       assert.equal(artifacts[0].graphRunId, run.id);
+      const snapshotPath = artifacts[0].physical.path as string;
+      const entries = await exec('tar', ['-tzf', artifacts[0].storageKey]);
+      assert.ok(snapshotPath && entries.stdout.includes('alternate/fixture/input.txt'));
+      assert.ok(!entries.stdout.includes('private.vars'));
 
       const current = releases.get('/srv/fixture-flow/current');
       const failing = structuredClone(canvas);
@@ -320,6 +334,7 @@ test(
       const replay = structuredClone(canvas);
       const releaseStart = replay.nodes[0]!;
       releaseStart.start!.sources = [];
+      delete releaseStart.start!.dotenv;
       releaseStart.start!.release!.artifactId = artifacts[0].id;
       const deploy = replay.nodes[3]!;
       const end = replay.nodes[4]!;

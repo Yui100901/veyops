@@ -865,22 +865,20 @@ export class SimplifiedFlowRunService {
     const persistent = plan.finish.retention !== 'RUN';
     if (plan.finish.saveWorkspace || plan.release?.method === 'FILE') {
       const identity = artifactIdentity(snapshot, workspaceArtifact, target?.id);
-      const dotenvDirectory =
-        plan.dotenv &&
-        plan.sources.find(
-          ({ source }) =>
-            source.repositoryId === plan.dotenv!.repositoryId &&
-            source.commitSha === plan.dotenv!.commitSha,
-        )?.directory;
+      const dotenv = plan.dotenv;
+      const dotenvPaths = dotenv
+        ? plan.sources.flatMap(({ source, directory }) =>
+            source.repositoryId === dotenv.repositoryId && source.commitSha === dotenv.commitSha
+              ? [directory + '/' + dotenv.path]
+              : [],
+          )
+        : [];
       const input = {
         workspace,
         relativePath: '.',
         kind: 'DIRECTORY' as const,
         collection: 'WORK_DIRECTORY' as const,
-        excludePaths: [
-          ...(plan.finish.excludePaths ?? []),
-          ...(dotenvDirectory ? [dotenvDirectory + '/' + plan.dotenv!.path] : []),
-        ],
+        excludePaths: [...(plan.finish.excludePaths ?? []), ...dotenvPaths],
         instanceId: identity.instanceId,
         signal: ctx.signal,
       };
