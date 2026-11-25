@@ -53,6 +53,9 @@ export function taskDto(task: Selectable<TasksTable>) {
 
 function presentTask(task: Selectable<TasksTable>, payload: TaskPayload) {
   const pipeline = task.task_type === 'PIPELINE' ? payload.pipeline : undefined;
+  const flowRunId =
+    payload.simplifiedAction?.runId ?? pipeline?.graphGate?.runId ?? payload.pipeline?.graph?.runId;
+  const flowNodeId = payload.simplifiedAction?.nodeId ?? pipeline?.graphGate?.nodeId;
   const result = task.result_json ? JSON.parse(task.result_json) : null;
   return {
     id: task.id,
@@ -71,6 +74,7 @@ function presentTask(task: Selectable<TasksTable>, payload: TaskPayload) {
     operationPlanVersionId: task.operation_plan_version_id,
     commandTemplate: payload.commandTemplate ?? null,
     retryOf: payload.retryOf ?? null,
+    ...(task.project_id && flowRunId && { flowRunId, flowNodeId }),
     ...(task.task_type === 'PIPELINE'
       ? {
           executionMode: pipeline?.deployAfterBuild ? 'DEPLOY' : (pipeline?.mode ?? 'DEPLOY'),
@@ -326,8 +330,24 @@ export class TasksService {
     const task = await this.row(id);
     const payload = JSON.parse(task.payload_json) as TaskPayload;
     const definition = task.task_type === 'PIPELINE' ? payload.pipeline?.definition : undefined;
+    const dto = presentTask(task, payload);
+    const linkedNode =
+      !dto.flowRunId &&
+      task.project_id &&
+      task.task_type === 'GRAPH_MODULE' &&
+      task.idempotency_key?.startsWith(graphTaskKeyPrefix)
+        ? await this.database.db
+            .selectFrom('execution_node_runs as node')
+            .innerJoin('execution_flow_runs as run', 'run.id', 'node.run_id')
+            .select(['node.run_id as flowRunId', 'node.node_id as flowNodeId'])
+            .where('node.id', '=', task.idempotency_key.slice(graphTaskKeyPrefix.length))
+            .where('node.task_id', '=', task.id)
+            .where('run.project_id', '=', task.project_id)
+            .executeTakeFirst()
+        : undefined;
     return {
-      ...presentTask(task, payload),
+      ...dto,
+      ...linkedNode,
       ...(this.reusableCommand(task.task_type, payload) && { canReuseCommand: true as const }),
       ...(definition?.nodes?.length && {
         pipelineGraph: {

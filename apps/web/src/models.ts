@@ -262,6 +262,8 @@ export interface DeliveryStepNode {
 export interface Task {
   id: string;
   canReuseCommand?: boolean;
+  flowRunId?: string;
+  flowNodeId?: string;
   createdBy?: string | null;
   projectId?: string | null;
   serviceId?: string | null;

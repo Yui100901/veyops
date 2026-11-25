@@ -279,7 +279,13 @@ test(
                 lifecycleState: string;
               }[];
             };
-            nodes: { nodeId: string; status: string; output?: unknown; snapshotTaskId?: string }[];
+            nodes: {
+              nodeId: string;
+              status: string;
+              output?: unknown;
+              taskId?: string;
+              snapshotTaskId?: string;
+            }[];
           };
           if (run.status === expected) return run;
           if (['SUCCESS', 'FAILED', 'NEEDS_ATTENTION', 'CANCELLED'].includes(run.status)) {
@@ -310,6 +316,14 @@ test(
       };
       const run = await runVersion(version, preview.configurationHash);
       assert.equal(run.nodes.filter(({ status }) => status === 'SUCCESS').length, 5);
+      for (const nodeId of [canvas.nodes[2]!.id, canvas.nodes[3]!.id]) {
+        const taskId = run.nodes.find((node) => node.nodeId === nodeId)?.taskId;
+        assert.ok(taskId);
+        const task = (await api.get(root + '/tasks/' + taskId).expect(200)).body.data;
+        assert.equal(task.flowRunId, run.id);
+        assert.equal(task.flowNodeId, nodeId);
+        assert.equal(task.payload, undefined);
+      }
       assert.ok(
         JSON.stringify(
           run.nodes.find(({ nodeId }) => nodeId === canvas.nodes[1]!.id)?.output,

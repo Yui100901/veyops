@@ -30,8 +30,10 @@ import {
   Status,
 } from '../../components';
 import type { Task, TaskTarget, User } from '../../models';
+import { workspaceOrigin } from '../../workspace-navigation';
 import { TaskTable, taskTypeLabel } from './TaskTable';
 import { deliveryPath, deliveryTaskReturn, readDeliveryScope } from '../delivery/delivery-route';
+import { graphWorkbenchPath } from '../execution-graph/graph-workbench-context';
 import { ContextAIButton } from '../ai/AI';
 import { FailureHandling } from '../delivery/FailureHandling';
 import { RunArtifacts } from '../delivery/Delivery';
@@ -209,6 +211,21 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
     originQuery: scope.originQuery,
   };
   const returnToDelivery = value.projectId && deliveryTaskReturn(value.projectId, search);
+  const flowHref =
+    value.projectId &&
+    value.flowRunId &&
+    '#' +
+      graphWorkbenchPath(value.projectId, {
+      ...workspaceOrigin(scope.origin, scope.originQuery ?? undefined),
+      serviceId: value.serviceId ?? undefined,
+      environmentId: value.environmentId ?? undefined,
+        pane: 'history',
+        run: value.flowRunId,
+        node: value.flowNodeId,
+      });
+  const canReuseCommand =
+    value.canReuseCommand &&
+    (user.role === 'ADMIN' || (user.role === 'OPERATOR' && value.createdBy === user.id));
   const analysis = value.result?.aiAnalysis;
   const failed = ['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION'].includes(
     value.status,
@@ -233,7 +250,7 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
         href={
           returnToDelivery
             ? '#' + returnToDelivery
-            : value.type === 'PIPELINE' && value.projectId
+            : value.type === 'PIPELINE' && value.projectId && !flowHref
               ? '#' + `/projects/${value.projectId}/execution-graph?pane=history`
               : '#/tasks'
         }
@@ -242,7 +259,7 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
         <ArrowLeft size={14} />
         {returnToDelivery
           ? '返回交付记录'
-          : value.type === 'PIPELINE' && value.projectId
+          : value.type === 'PIPELINE' && value.projectId && !flowHref
             ? '返回项目执行记录'
             : '返回任务中心'}
       </a>
@@ -257,13 +274,28 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
             ) : (
               <Status value={value.status} />
             )}
-            {value.canReuseCommand &&
-              (user.role === 'ADMIN' ||
-                (user.role === 'OPERATOR' && value.createdBy === user.id)) && (
-                <a className="button secondary" href={`#/operations/commands?reuse=${id}`}>
-                  沿用目标和命令
-                </a>
-              )}
+            {flowHref && (
+              <a className="button secondary" href={flowHref}>
+                查看执行流运行
+              </a>
+            )}
+            {value.type === 'COMMAND' && !flowHref && (
+              <a
+                className="button secondary"
+                href={
+                  canReuseCommand
+                    ? `#/operations/commands?reuse=${encodeURIComponent(id)}`
+                    : '#/operations/commands'
+                }
+              >
+                {canReuseCommand ? '沿用目标和命令' : '查看临时命令'}
+              </a>
+            )}
+            {value.type === 'OPERATION_PLAN' && (
+              <a className="button secondary" href="#/operations/plans">
+                查看运维方案
+              </a>
+            )}
             {failed && canInspectFailure && (
               <ContextAIButton
                 user={user}
