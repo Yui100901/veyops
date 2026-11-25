@@ -7,6 +7,7 @@ const { setTimeout: sleep } = require('node:timers/promises');
 const { verifyArtifactRecovery, verifyWorkerRecovery } = require('./p1-recovery.cjs');
 const { verifySharedDelivery } = require('./p1-shared-delivery.cjs');
 const { prepareP2Repository, verifyP2Contract } = require('./p2-contract.cjs');
+const { verifyWorkDirectory } = require('./work-directory-live.cjs');
 const {
   initializeDemo,
   loadDemo,
@@ -348,14 +349,15 @@ async function verifyArtifact(api, artifact) {
   assert.ok(instances.every(({ verificationStatus }) => verificationStatus === 'AVAILABLE'));
 }
 
-async function verifyFileRelease(fixture, release, artifact, names, html, nodeId) {
+async function verifyFileRelease(fixture, release, artifact, names, html, nodeId, distributed) {
   for (const target of names) {
     assert.ok(targetNames.includes(target), '文件发布需使用专用验收目标');
     const serverId = fixture.serverIds[target];
     const row = deploymentOn(release, serverId, nodeId);
     const instance =
       artifact.instances.find((item) => item.serverId === serverId) ??
-      artifact.instances.find((item) => item.serverId === null);
+      artifact.instances.find((item) => item.serverId === null) ??
+      (distributed && artifact.instances.length === 1 ? artifact.instances[0] : undefined);
     assert.ok(instance);
     assert.equal(row.isCurrent, true);
     assert.equal(row.status, 'SUCCESS');
@@ -878,7 +880,31 @@ async function run() {
         instanceIds: directory.instances.map(({ id }) => id),
       };
       if (names.length === 1) {
-        const missingTarget = fixture.serverIds['test-b'];
+        const crossHost = fixture.serverIds['test-b'];
+        const transferred = await execute(
+          'deploy-existing',
+          {
+            artifact: { artifactId: directory.artifactId },
+            releaseTargets: { serverIds: [crossHost] },
+          },
+          { plan: { releaseTargets: [crossHost] } },
+        );
+        await verifyFileRelease(
+          fixture,
+          transferred,
+          directory,
+          ['test-b'],
+          html,
+          'deploy-files',
+          true,
+        );
+        result.distributed = {
+          releaseRunId: transferred.detail.id,
+          sourceServerId: directory.instances[0].serverId,
+          serverId: crossHost,
+        };
+      } else {
+        const missingTarget = fixture.serverIds['production-b'];
         const response = await api.request('POST', graph + '/flows/deploy-existing/preview', {
           version: fixture.version,
           inputs: {
@@ -945,6 +971,8 @@ async function run() {
       html,
     });
     console.log('VEYOPS_ACCEPTANCE_PRESET_CONTRACT ' + JSON.stringify(evidence.presetContract));
+    evidence.workDirectory = await verifyWorkDirectory({ api, fixture, execute });
+    console.log('VEYOPS_ACCEPTANCE_WORK_DIRECTORY ' + JSON.stringify(evidence.workDirectory));
     const {
       TaskWorkerService,
     } = require('/app/apps/api/dist/modules/tasks/task-worker.service.js');

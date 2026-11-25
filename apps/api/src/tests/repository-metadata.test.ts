@@ -654,7 +654,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
       })
       .expect(201)
   ).body.data;
-  assert.equal(changedRef.checkouts[0].commitSha, second);
+  assert.equal(changedRef.checkouts[0].commitSha, main);
   const missingRef = await admin
     .post(namedPath + '/preview')
     .send({

@@ -2738,6 +2738,7 @@ async function checkDelivery(databaseUrl?: string) {
     const ci = expandGraphTemplate('CI_BUILD', 'FILE');
     const ciCheck = ci.canvas.nodes.find(({ operation }) => operation === 'CHECK')!;
     const ciBuild = ci.canvas.nodes.find(({ operation }) => operation === 'BUILD')!;
+    ciCheck.shell!.location = 'MANAGER';
     ciCheck.shell!.command = 'echo GRAPH_TEMPLATE_CI_FAIL; exit 23';
     ciBuild.build!.buildCommand = 'echo GRAPH_TEMPLATE_BUILD_BLOCKED';
     ciBuild.build!.artifacts![0]!.path = 'app.jar';
@@ -2756,6 +2757,7 @@ async function checkDelivery(databaseUrl?: string) {
         parameters: {
           repository: sharedRepo.id,
           gitVersion: { kind: 'COMMIT', value: successfulCommit },
+          buildTargets: { serverIds: [serverIds[0]!] },
         },
       },
     };
