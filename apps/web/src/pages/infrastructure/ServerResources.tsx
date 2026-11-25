@@ -313,7 +313,7 @@ function ServerDeployedServices({
     );
   }
   return (
-    <section>
+    <section className="workbench-stack">
       <h3 className="field-title">已部署服务</h3>
       {rows.length ? (
         <div className="table-scroll">

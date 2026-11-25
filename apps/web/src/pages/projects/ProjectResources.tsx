@@ -164,7 +164,7 @@ export function ProjectResources({
           {graphPane === 'run' && graphStart ? '← 返回运行参数' : '← 返回执行图'}
         </a>
       )}
-      <nav className="resource-section-switcher" aria-label="项目资源分类">
+      <nav className="resource-section-switcher workbench-tabs" aria-label="项目资源分类">
         <a href={resourceHref()} aria-current={!resource ? 'page' : undefined}>
           全部资源
         </a>
@@ -531,19 +531,20 @@ function ServiceDetails({
         subtitle={service.description || service.slug}
         action={actions}
         className="project-service-detail"
+        body="compact"
       >
-        <div className="project-service-detail-addresses">
+        <div className="workbench-stack">
           <ProjectAccessLinks addresses={service.addresses ?? []} showEmpty />
-        </div>
-        <div className="row-actions">
-          <a className="button secondary small" href={'#' + deliveryPath(id, 'artifacts', scope)}>
-            {user.role === 'VIEWER' || project.archived ? '查看服务产物' : '选择历史产物部署'}
-          </a>
+          <div className="workbench-actions">
+            <a className="button secondary small" href={'#' + deliveryPath(id, 'artifacts', scope)}>
+              {user.role === 'VIEWER' || project.archived ? '查看服务产物' : '选择历史产物部署'}
+            </a>
+          </div>
         </div>
       </Section>
       <Section
         title="已发布执行流"
-        className="project-service-starts"
+        body="regular"
         action={
           <a className="text-link" href={'#' + projectGraphPath(id, scope)}>
             查看执行图 →

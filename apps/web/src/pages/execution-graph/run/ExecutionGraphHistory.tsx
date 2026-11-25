@@ -541,7 +541,7 @@ function RunDetails({
   return (
     <Section
       title="运行详情与节点日志"
-      className="graph-history-detail"
+      className="graph-history-detail graph-pane-panel"
       action={
         <div className="heading-actions">
           <a

@@ -467,12 +467,13 @@ function Workspace({
   }
 
   return (
-    <div className="project-workspace execution-graph">
+    <div className="execution-graph workbench-stack">
       {leaving && (
         <Modal
           title="草稿有未保存的更改"
           description="可以保存当前草稿后离开，放弃本次更改，或返回画布继续编辑。"
           onClose={stayInDraft}
+          busy={busy}
         >
           {error && (
             <div className="form-body">
@@ -526,35 +527,37 @@ function Workspace({
           />
         </>
       )}
-      {scoped && (
-        <div className="heading-actions graph-scope-links">
-          <a className="button secondary small" href={graphScopeBackHref(project.id, scope)}>
-            ← {service ? (environment ? '返回服务环境' : '返回服务详情') : '返回环境详情'}
-          </a>
-          <span className="field-note">
-            {[service?.name, environment?.name].filter(Boolean).join(' · ')}
-          </span>
-        </div>
-      )}
-      <nav className="record-tabs" aria-label="执行图视图">
-        {(
-          [
-            ['run', '运行执行流'],
-            ['draft', canEditDraft ? '编辑草稿' : '查看草稿'],
-            ['published', '版本历史'],
-            ['history', '运行记录'],
-          ] as const
-        ).map(([key, label]) => (
-          <a
-            className={pane === key ? 'active' : undefined}
-            key={key}
-            aria-current={pane === key ? 'page' : undefined}
-            href={'#' + panePath(key)}
-          >
-            {label}
-          </a>
-        ))}
-      </nav>
+      <div className="graph-view-bar">
+        <nav className="record-tabs workbench-tabs" aria-label="执行图视图">
+          {(
+            [
+              ['run', '运行执行流'],
+              ['draft', canEditDraft ? '编辑草稿' : '查看草稿'],
+              ['published', '版本历史'],
+              ['history', '运行记录'],
+            ] as const
+          ).map(([key, label]) => (
+            <a
+              className={pane === key ? 'active' : undefined}
+              key={key}
+              aria-current={pane === key ? 'page' : undefined}
+              href={'#' + panePath(key)}
+            >
+              {label}
+            </a>
+          ))}
+        </nav>
+        {scoped && (
+          <div className="workbench-actions graph-scope-links">
+            <a className="button secondary small" href={graphScopeBackHref(project.id, scope)}>
+              ← {service ? (environment ? '返回服务环境' : '返回服务详情') : '返回环境详情'}
+            </a>
+            <span className="field-note">
+              {[service?.name, environment?.name].filter(Boolean).join(' · ')}
+            </span>
+          </div>
+        )}
+      </div>
       <ErrorBanner error={error} />
       {conflict && (
         <button className="button secondary" disabled={busy} onClick={() => void persist('reload')}>
@@ -610,7 +613,7 @@ function Workspace({
       )}
       {pane === 'run' && (
         <Section
-          className="graph-run-section"
+          className="graph-run-section graph-pane-panel"
           title="已发布执行图"
           subtitle={runVersion ? '版本 v' + runVersion : undefined}
         >
@@ -665,6 +668,7 @@ function Workspace({
       )}
       {pane === 'draft' && (
         <Section
+          className="graph-pane-panel"
           title="草稿画布"
           subtitle={`修订 ${graph.revision} · ${dirty ? '有未保存的更改' : '已保存'} · ${graph.publishedVersion ? '最新发布 v' + graph.publishedVersion : '尚未发布'}`}
           action={
@@ -943,27 +947,6 @@ function PublishedRun({
       {invalidArtifact && (
         <ErrorBanner error="当前执行流没有唯一可覆盖且类型匹配的部署产物输入，请选择其他发布流程。" />
       )}
-      {scoped && simplifiedVersion && (
-        <div className="graph-fields graph-scoped-starts">
-          <h3>关联的开始节点</h3>
-          <ExecutionGraphStartList
-            flows={flows}
-            project={project}
-            scope={scope}
-            href={(entry) =>
-              '#' +
-              graphWorkbenchPath(project.id, {
-                ...scope,
-                start: entry.id,
-                version: published.version,
-              })
-            }
-            selectedId={selected?.id}
-            canRepair={canRun}
-            version={published.version}
-          />
-        </div>
-      )}
       {startId && !selected && <ErrorBanner error="当前发布版本中找不到此开始节点。" />}
       {published.retiredAt && <p className="field-note">此版本已停用，可查看节点配置。</p>}
       {!simplifiedVersion && (
@@ -1091,6 +1074,27 @@ function PublishedRun({
           </div>
         )}
       </PublishedNodes>
+      {scoped && simplifiedVersion && (
+        <section className="graph-fields">
+          <h3>关联的开始节点</h3>
+          <ExecutionGraphStartList
+            flows={flows}
+            project={project}
+            scope={scope}
+            href={(entry) =>
+              '#' +
+              graphWorkbenchPath(project.id, {
+                ...scope,
+                start: entry.id,
+                version: published.version,
+              })
+            }
+            selectedId={selected?.id}
+            canRepair={canRun}
+            version={published.version}
+          />
+        </section>
+      )}
     </>
   );
 }

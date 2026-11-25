@@ -1,18 +1,31 @@
 .project-workspace {
-  min-width: 0;
+  --workbench-gap: max(9px, calc(var(--section-gap) * 0.75));
 }
 
-.project-workspace > .back-link {
-  min-height: 26px;
-  margin-block-end: 4px;
+.project-workspace-header {
+  --workbench-gap: 6px;
 }
 
-.project-workspace > .page-heading {
-  margin-block-end: 8px;
+.project-workspace-header > .page-heading {
+  align-items: center;
+  gap: 6px 12px;
 }
 
-.project-workspace .page-heading p:empty {
-  display: none;
+.project-workspace-header > .page-heading > div:first-child {
+  flex-basis: min(45%, 16rem);
+}
+
+.project-workspace-header .page-heading h1 {
+  font-size: clamp(1.25rem, 2vw, 1.6rem);
+  line-height: 1.25;
+}
+
+.project-workspace-header .page-heading p {
+  margin-block-start: 2px;
+}
+
+.project-workspace-back {
+  white-space: nowrap;
 }
 
 .project-workspace td:has(> a.text-link) {
@@ -36,7 +49,6 @@
 .project-workspace .project-entry-nav {
   width: 100%;
   gap: 4px 12px;
-  margin-block-end: var(--section-gap);
   padding: 0;
   border-bottom: 1px solid var(--border);
   border-radius: 0;
@@ -44,7 +56,6 @@
 }
 
 .project-workspace .project-entry-nav a {
-  min-height: 36px;
   gap: 6px;
   padding: 4px 10px;
   border-width: 0 0 2px;
@@ -80,11 +91,8 @@
   padding-inline: var(--surface-inset);
 }
 
-.project-service-detail > .row-actions {
-  margin: 0 var(--surface-inset) 12px;
-}
-.project-service-detail-addresses {
-  padding: 12px var(--surface-inset);
+.project-service-detail .workbench-stack {
+  --workbench-gap: 10px;
 }
 .project-resources .resource-list > .project-service-card {
   flex-wrap: wrap;

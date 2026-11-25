@@ -1,7 +1,3 @@
-.graph-scope-links {
-  margin-bottom: 12px;
-}
-
 .graph-plan-issue {
   align-items: flex-start;
   margin: 0;
@@ -16,10 +12,6 @@
 
 .graph-plan-issue p {
   margin: 0;
-}
-
-.project-service-starts .execution-start-options {
-  margin: 0 var(--surface-inset) var(--section-gap, 16px);
 }
 
 .execution-start-options,

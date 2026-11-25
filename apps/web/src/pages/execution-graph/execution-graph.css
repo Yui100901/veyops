@@ -1,5 +1,35 @@
-.execution-graph {
-  min-width: 0;
+.graph-view-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  min-inline-size: 0;
+}
+.graph-view-bar .record-tabs a {
+  white-space: nowrap;
+}
+.graph-scope-links .field-note {
+  overflow-wrap: anywhere;
+}
+.graph-pane-panel > .panel-header {
+  padding-block: 8px;
+}
+.graph-pane-panel > .graph-fields {
+  padding-block-start: max(8px, calc(var(--surface-inset) * 0.6));
+}
+@media (max-width: 480px) {
+  .graph-view-bar .record-tabs {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    width: 100%;
+    gap: 2px;
+  }
+  .graph-view-bar .record-tabs a {
+    justify-content: center;
+    padding-inline: 1px;
+    font-size: 13px;
+  }
 }
 .graph-pagination {
   display: flex;

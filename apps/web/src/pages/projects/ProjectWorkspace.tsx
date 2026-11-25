@@ -1,6 +1,6 @@
 import './project-workspace.css';
 import { lazy, Suspense, useRef } from 'react';
-import { Boxes, FolderGit2, GitFork, Settings2 } from 'lucide-react';
+import { ArrowLeft, Boxes, FolderGit2, GitFork, Settings2 } from 'lucide-react';
 import { useResource } from '../../api';
 import { ErrorBanner, Loading, PageHeader } from '../../components';
 import type { ProjectDetail, User } from '../../models';
@@ -36,30 +36,37 @@ export function ProjectWorkspace({
   };
   const title = project?.name || '项目工作台';
   return (
-    <div className="project-workspace">
-      <a href={'#' + back.path} className="back-link">
-        ← 返回{back.label}
-      </a>
-      <PageHeader
-        eyebrow={project?.slug.toUpperCase() ?? '项目'}
-        title={title}
-        description={project?.description ?? ''}
-      />
-      <nav className="resource-section-switcher project-entry-nav" aria-label="项目工作台">
-        {(Object.keys(projectEntries) as (keyof typeof projectEntries)[]).map((key) => {
-          const Icon = icons[key];
-          return (
-            <a
-              key={key}
-              aria-current={key === entry ? 'page' : undefined}
-              href={'#' + projectEntryPath(id, key, scope)}
-            >
-              <Icon size={17} aria-hidden="true" />
-              {projectEntries[key]}
+    <div className="project-workspace workbench-stack">
+      <header className="project-workspace-header workbench-stack">
+        <PageHeader
+          eyebrow={project?.slug.toUpperCase() ?? '项目'}
+          title={title}
+          description={project?.description ?? ''}
+          action={
+            <a href={'#' + back.path} className="button secondary small project-workspace-back">
+              <ArrowLeft size={15} aria-hidden="true" /> 返回{back.label}
             </a>
-          );
-        })}
-      </nav>
+          }
+        />
+        <nav
+          className="resource-section-switcher workbench-tabs project-entry-nav"
+          aria-label="项目工作台"
+        >
+          {(Object.keys(projectEntries) as (keyof typeof projectEntries)[]).map((key) => {
+            const Icon = icons[key];
+            return (
+              <a
+                key={key}
+                aria-current={key === entry ? 'page' : undefined}
+                href={'#' + projectEntryPath(id, key, scope)}
+              >
+                <Icon size={16} aria-hidden="true" />
+                {projectEntries[key]}
+              </a>
+            );
+          })}
+        </nav>
+      </header>
       <ErrorBanner error={projectResource.error} retry={projectResource.reload} />
       {!project ? (
         projectResource.loading && <Loading />
