@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { ArrowUpRight, Copy } from 'lucide-react';
-import './project-cards.css';
+import './project-access-links.css';
 
 export interface ProjectAccessLink {
   id: string;
@@ -97,11 +97,13 @@ function AccessLinkList({ links }: { links: AccessLink[] }) {
 export function ProjectAccessLinks({
   addresses,
   serviceHref,
+  density,
   showEmpty = false,
   title = '访问地址',
 }: {
   addresses: ProjectAccessLink[];
   serviceHref?: (serviceId: string) => string;
+  density?: 'compact';
   showEmpty?: boolean;
   title?: string;
 }) {
@@ -120,7 +122,11 @@ export function ProjectAccessLinks({
     }
   }
   return (
-    <div className="project-access">
+    <div
+      className={
+        density === 'compact' ? 'project-access project-access--compact' : 'project-access'
+      }
+    >
       <h4>{title}</h4>
       {!links.length ? (
         <div className="project-access-empty">暂无访问地址</div>

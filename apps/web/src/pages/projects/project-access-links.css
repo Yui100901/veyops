@@ -1,0 +1,114 @@
+.project-access {
+  --access-item-height: 36px;
+  --access-item-padding: 0.45rem 0.55rem;
+  min-width: 0;
+}
+.project-access--compact {
+  --access-item-height: 32px;
+  --access-item-padding: 0.3rem 0.5rem;
+}
+.project-access > h4 {
+  color: #3c5361;
+  font-size: 0.84rem;
+  font-weight: 600;
+  margin: 0 0 0.4rem;
+}
+.project-access :is(.project-access-services, .project-access-links) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.project-access-service {
+  flex: 1 1 14rem;
+  min-width: 0;
+  max-inline-size: 24rem;
+  padding: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f7f9fa;
+}
+.project-access--compact .project-access-services {
+  display: grid;
+  gap: 0.65rem;
+}
+.project-access--compact .project-access-service {
+  max-inline-size: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.project-access-service > h5 {
+  margin: 0 0 0.45rem;
+  font-size: 0.87rem;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.project-access-actions {
+  flex: 1 1 13rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+  max-inline-size: 22rem;
+  border: 1px solid #b4d6c9;
+  border-radius: 7px;
+  background: #fff;
+}
+.project-access-link,
+.project-access-copy {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-block-size: var(--access-item-height);
+  padding: var(--access-item-padding);
+  color: #10604e;
+  background: transparent;
+  font-size: 0.86rem;
+}
+.project-access-link > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.project-access-link > svg {
+  flex-shrink: 0;
+}
+.project-access-link {
+  justify-content: space-between;
+  border-radius: 6px 0 0 6px;
+}
+.project-access-copy {
+  justify-content: center;
+  border: 0;
+  border-inline-start: 1px solid #b4d6c9;
+  border-radius: 0 6px 6px 0;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.project-access-actions :is(.project-access-link, .project-access-copy):hover {
+  background: #e9f5f0;
+}
+.project-access-actions :is(.project-access-link, .project-access-copy):focus-visible {
+  outline-offset: -3px;
+}
+.project-access-url {
+  grid-column: 1 / -1;
+  padding: 0.35rem 0.55rem;
+  border-top: 1px solid #b4d6c9;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.project-access--compact .project-access-url {
+  padding: 0.25rem 0.5rem;
+}
+.project-access-feedback,
+.project-access-empty {
+  color: #526675;
+  font-size: 0.85rem;
+  margin: 0.5rem 0 0;
+}

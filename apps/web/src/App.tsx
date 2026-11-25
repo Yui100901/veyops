@@ -25,7 +25,6 @@ import { ErrorBanner, Loading, PageHeader, Section } from './components';
 import { AIPage } from './pages/ai/AI';
 import { DashboardPage } from './pages/dashboard/Dashboard';
 import { CredentialsPage } from './pages/infrastructure/Credentials';
-import { ProjectsPage } from './pages/projects/Projects';
 import { TaskPage, TasksPage } from './pages/operations/Operations';
 import { operationsTabForPath } from './pages/operations/operation-routes';
 import { AuditPage } from './pages/settings/Audit';
@@ -44,6 +43,9 @@ import type { User } from './models';
 
 const ServersPage = lazy(() =>
   import('./pages/infrastructure/Servers').then(({ ServersPage }) => ({ default: ServersPage })),
+);
+const ProjectsPage = lazy(() =>
+  import('./pages/projects/Projects').then(({ ProjectsPage }) => ({ default: ProjectsPage })),
 );
 const ProjectWorkspace = lazy(() =>
   import('./pages/projects/ProjectWorkspace').then(({ ProjectWorkspace }) => ({
