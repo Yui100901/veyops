@@ -1,0 +1,75 @@
+.modal {
+  width: min(520px, calc(100vw - 2 * var(--page-inset)));
+  max-block-size: calc(100dvh - 2 * var(--page-inset));
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: inherit;
+  box-shadow: 0 25px 100px #15283028;
+  overflow: auto;
+}
+.modal[open] {
+  display: flex;
+  flex-direction: column;
+}
+.modal.wide {
+  width: min(740px, calc(100vw - 2 * var(--page-inset)));
+}
+.modal::backdrop {
+  background: #0f1d2b65;
+  backdrop-filter: blur(3px);
+}
+.modal-header {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px var(--surface-inset);
+  border-bottom: 1px solid var(--border);
+}
+.modal-header:has(+ .modal-footer) {
+  border-bottom: 0;
+}
+.modal-header > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  overflow-wrap: anywhere;
+}
+.modal-header h2 {
+  margin: 0;
+  font-size: 1.15rem;
+  line-height: 1.35;
+  font-weight: 600;
+}
+.modal-header p {
+  margin: 0;
+  font-size: 0.87rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.modal-header > button {
+  flex: none;
+}
+.modal-footer {
+  display: flex;
+  flex: none;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 9px;
+  padding: 10px var(--surface-inset);
+  border-top: 1px solid var(--border);
+  background: #fafbfc;
+}
+.modal > form:has(> .form-body) {
+  display: flex;
+  flex-direction: column;
+  min-block-size: 0;
+}
+.modal > :is(.form-body, .section-body),
+.modal > form > .form-body {
+  min-block-size: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}

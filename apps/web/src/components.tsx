@@ -1,6 +1,7 @@
-import { useEffect, useId, useRef } from 'react';
+import { Children, useId, useLayoutEffect, useRef } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { AlertCircle, ArrowUpRight, Check, LoaderCircle, Plus, RefreshCw, X } from 'lucide-react';
+import './dialog.css';
 
 export function ErrorBanner({ error, retry }: { error?: string; retry?: () => void }) {
   return error ? (
@@ -136,22 +137,25 @@ export function Modal({
   onClose,
   children,
   wide = false,
+  busy = false,
 }: {
   title: string;
   description?: string;
   onClose: () => void;
   children: ReactNode;
   wide?: boolean;
+  busy?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const backdropStart = useRef<{ x: number; y: number } | null>(null);
   const titleId = useId();
   const descriptionId = useId();
-  useEffect(() => {
+  useLayoutEffect(() => {
     const dialog = ref.current;
-    dialog?.showModal();
+    if (!dialog) return;
+    dialog.showModal();
     return () => {
-      dialog?.close();
+      dialog.close();
     };
   }, []);
   return (
@@ -160,9 +164,10 @@ export function Modal({
       className={`modal ${wide ? 'wide' : ''}`}
       aria-labelledby={titleId}
       aria-describedby={description ? descriptionId : undefined}
+      aria-busy={busy || undefined}
       onCancel={(event) => {
         event.preventDefault();
-        onClose();
+        if (!busy) onClose();
       }}
       onPointerDownCapture={(event) => {
         backdropStart.current =
@@ -180,6 +185,7 @@ export function Modal({
         const start = backdropStart.current;
         backdropStart.current = null;
         if (
+          !busy &&
           start &&
           event.target === event.currentTarget &&
           event.detail > 0 &&
@@ -194,7 +200,13 @@ export function Modal({
           <h2 id={titleId}>{title}</h2>
           {description && <p id={descriptionId}>{description}</p>}
         </div>
-        <button className="icon-button bare" type="button" onClick={onClose} aria-label="关闭">
+        <button
+          className="icon-button bare"
+          type="button"
+          disabled={busy}
+          onClick={onClose}
+          aria-label="关闭"
+        >
           <X size={20} />
         </button>
       </div>
@@ -244,7 +256,7 @@ export function Form({
   error?: string;
 }) {
   return (
-    <form id={id} onSubmit={onSubmit}>
+    <form id={id} onSubmit={onSubmit} aria-busy={busy || undefined}>
       <div className="form-body">
         {children}
         <ErrorBanner error={error} />
@@ -284,18 +296,22 @@ export function Confirm({
   destructive?: boolean;
   label?: string;
 }) {
+  const hasBody = Boolean(error) || Children.toArray(detail).some((child) => child !== '');
   return (
-    <Modal title={title} description={description} onClose={onClose}>
-      <div className="form-body">
-        {detail}
-        <ErrorBanner error={error} />
-      </div>
+    <Modal title={title} description={description} onClose={onClose} busy={busy}>
+      {hasBody && (
+        <div className="form-body">
+          {detail}
+          <ErrorBanner error={error} />
+        </div>
+      )}
       <div className="modal-footer">
-        <button className="button secondary" onClick={onClose} disabled={busy}>
+        <button className="button secondary" type="button" onClick={onClose} disabled={busy}>
           取消
         </button>
         <button
           className={`button ${destructive ? 'danger' : 'primary'}`}
+          type="button"
           onClick={onConfirm}
           disabled={busy}
         >
@@ -320,12 +336,14 @@ export function Section({
   action,
   children,
   className = '',
+  body,
 }: {
   title: string;
   subtitle?: string;
   action?: ReactNode;
   children: ReactNode;
   className?: string;
+  body?: 'regular' | 'compact';
 }) {
   return (
     <section className={`panel ${className}`}>
@@ -336,7 +354,19 @@ export function Section({
         </div>
         {action}
       </div>
-      {children}
+      {body ? (
+        <div
+          className={
+            body === 'compact'
+              ? 'workbench-section-body workbench-section-body--compact'
+              : 'workbench-section-body'
+          }
+        >
+          {children}
+        </div>
+      ) : (
+        children
+      )}
     </section>
   );
 }

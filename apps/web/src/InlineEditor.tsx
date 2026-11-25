@@ -7,9 +7,10 @@ import './inline-editor.css';
 export function useInlineEditor<T>(initial?: T) {
   const [value, setValue] = useState<T | undefined>(initial);
   const opener = useRef<HTMLElement | null>(null);
-  const change = useCallback((next: T | undefined) => {
+  const change = useCallback((next: T | undefined, trigger?: HTMLElement) => {
     if (next !== undefined) {
-      if (document.activeElement instanceof HTMLElement) opener.current = document.activeElement;
+      const active = trigger ?? document.activeElement;
+      if (active instanceof HTMLElement) opener.current = active;
     }
     setValue(next);
   }, []);
@@ -38,13 +39,16 @@ export function InlineEditor({
   wide?: boolean;
 }) {
   const titleId = useId();
+  const editor = useRef<HTMLElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   useLayoutEffect(() => {
-    heading.current?.focus({ preventScroll: true });
-    heading.current?.closest('section')?.scrollIntoView({ block: 'nearest' });
+    if (!editor.current?.contains(document.activeElement))
+      heading.current?.focus({ preventScroll: true });
+    editor.current?.scrollIntoView({ block: 'nearest' });
   }, []);
   return (
     <section
+      ref={editor}
       className={`panel inline-editor${wide ? ' inline-editor-wide' : ''}`}
       aria-labelledby={titleId}
     >

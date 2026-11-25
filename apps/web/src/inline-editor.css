@@ -9,6 +9,9 @@
   margin-block: var(--section-gap) 0;
   scroll-margin-block: var(--section-gap);
 }
+.workbench-stack > .inline-editor {
+  margin-block: 0;
+}
 .inline-editor > .panel-header {
   align-items: flex-start;
 }

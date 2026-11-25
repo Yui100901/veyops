@@ -1,0 +1,62 @@
+.workbench-stack {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: var(--workbench-gap, var(--section-gap));
+  min-inline-size: 0;
+}
+
+.workbench-stack > * {
+  margin-block: 0;
+  min-inline-size: 0;
+}
+
+.workbench-stack > .panel + .panel {
+  margin-block-start: 0;
+}
+
+.workbench-section-body {
+  min-inline-size: 0;
+  padding: var(--surface-inset);
+}
+
+.workbench-section-body--compact {
+  padding-block: max(8px, calc(var(--surface-inset) * 0.65));
+}
+
+.workbench-filterbar {
+  --workbench-control-height: 36px;
+  display: grid;
+  align-items: end;
+  gap: 8px 12px;
+  min-inline-size: 0;
+  padding: var(--surface-inset);
+}
+
+.workbench-filterbar :is(.field, .checkbox-row) {
+  min-inline-size: 0;
+  margin: 0;
+}
+
+.workbench-filterbar :is(input:not([type='checkbox']), select, .button, .checkbox-row) {
+  min-block-size: var(--workbench-control-height);
+}
+
+.workbench-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-inline-size: 0;
+}
+
+.workbench-tabs {
+  margin-block: 0;
+  padding: 3px;
+}
+
+.workbench-tabs > :is(a, button) {
+  min-block-size: 34px;
+  gap: 6px;
+  padding: 4px 9px;
+}

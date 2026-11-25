@@ -1300,51 +1300,6 @@ tbody tr:hover {
 .dashboard-task-compact th:last-child {
   width: 100px;
 }
-.modal {
-  padding: 0;
-  border: 1px solid #e4e9ed;
-  border-radius: 12px;
-  width: min(520px, calc(100vw - 2 * var(--page-inset)));
-  max-height: calc(100dvh - 2 * var(--page-inset));
-  color: inherit;
-  box-shadow: 0 25px 100px #15283028;
-  overflow: auto;
-}
-.modal.wide {
-  width: min(740px, calc(100vw - 2 * var(--page-inset)));
-}
-.modal::backdrop {
-  background: #0f1d2b65;
-  backdrop-filter: blur(3px);
-}
-.modal-header {
-  display: flex;
-  align-items: flex-start;
-  gap: 15px;
-  justify-content: space-between;
-  padding: 14px var(--surface-inset);
-  border-bottom: 1px solid var(--border);
-}
-.modal-header h2 {
-  font-size: 18px;
-  font-weight: 600;
-  margin: 0 0 5px;
-}
-.modal-header p {
-  font-size: 11px;
-  color: #99a6af;
-  margin: 0;
-  line-height: 1.8;
-}
-.modal-footer {
-  display: flex;
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  gap: 9px;
-  background: #fafbfc;
-  border-top: 1px solid var(--border);
-  padding: 12px var(--surface-inset);
-}
 .form-body {
   min-width: 0;
   padding: var(--surface-inset);
@@ -2858,9 +2813,6 @@ tbody tr:hover {
   }
   .table-name {
     font-size: 11px;
-  }
-  .modal-header h2 {
-    font-size: 17px;
   }
   .filter-tabs {
     gap: 2px;
