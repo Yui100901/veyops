@@ -144,9 +144,12 @@ import {
 } from './graph-artifact-values';
 import { normalizeRelativePath } from '../pipelines/pipeline.validation';
 import {
+  flowImageTag,
+  flowImageTagVariable,
   SimplifiedFlowRunService,
   type SimplifiedRunPlan,
   type SimplifiedSnapshotRequest,
+  workspaceRetention,
 } from './simplified-flow-run.service';
 import {
   activeFlowStatuses,
@@ -270,6 +273,7 @@ interface NodeEvidence {
 }
 
 type SimplifiedStage = 'ACTION' | 'SNAPSHOT' | 'RELEASE' | 'HEALTH';
+const workspaceActions = new Set(['CHECKOUT', 'SHELL', 'CHECK', 'BUILD']);
 
 interface CheckoutProvenance {
   versionSource: string;
@@ -1497,6 +1501,16 @@ export class GraphRunnerService implements OnModuleInit {
     const release = plan.release;
     const inputs: GraphInputsDto = { value: plan.value, parameters: plan.environment.variables };
     const selection = flowSelection(flow, inputs);
+    const workspaceDisposition = selection.ordered.some(
+      ({ id, type }) => workspaceActions.has(type) && selection.selected.has(id),
+    )
+      ? workspaceRetention(
+          plan.finish,
+          release?.method === 'FILE' &&
+            !release.artifactId &&
+            selection.selected.has(release.nodeId),
+        )
+      : 'OFF';
     if (release && selection.selected.has(release.nodeId)) {
       const required = [
         [
@@ -1627,6 +1641,10 @@ export class GraphRunnerService implements OnModuleInit {
         serverName: target?.name,
         sources,
         finish: plan.finish,
+        imageTagVariable: plan.finish.images?.some(({ source }) => source !== 'REGISTRY')
+          ? flowImageTagVariable
+          : undefined,
+        workspaceRetention: workspaceDisposition,
         release: release && {
           serviceId: release.serviceId,
           serverIds: release.serverIds,
@@ -1634,6 +1652,13 @@ export class GraphRunnerService implements OnModuleInit {
           deployPath: release.deployPath,
           contentPath: release.path,
           method: release.method,
+          image: release.image,
+          compose:
+            release.profile.delivery?.composeSource?.kind === 'REPOSITORY_FILE'
+              ? { path: release.profile.delivery.composeSource.path }
+              : release.workspaceComposePath
+                ? { path: release.workspaceComposePath }
+                : undefined,
         },
       },
     };
@@ -3517,37 +3542,72 @@ export class GraphRunnerService implements OnModuleInit {
           const expectedImageId = builtImage
             ? stringValue(outputs.get(dockerBuild.id)?.imageId)
             : undefined;
-          const collectWorkspace =
-            !historicalArtifactId &&
-            (plan.finish.saveWorkspace || (preparingRelease && selectedRelease.method === 'FILE'));
-          const collectImage =
-            !historicalArtifactId && (builtImage || plan.finish.image?.reference);
-          if (
-            needsArtifactFacts &&
-            !historicalArtifactId &&
-            ((builtImage && !expectedImageId) ||
-              (preparingRelease && selectedRelease.method === 'COMPOSE' && !collectImage))
-          ) {
-            await this.terminalNode(tx, row, 'FAILED', '本次运行未取得可验证的 Docker 镜像身份。');
+          const currentFileRelease = Boolean(preparingRelease && selectedRelease.method === 'FILE');
+          const workspaceSnapshot = artifacts.some(
+            ({ artifact_type, artifact_name }) =>
+              artifact_type === 'FILE' && artifact_name === 'workspace',
+          );
+          const workspaceUsed =
+            Boolean(workspacePath) &&
+            rows.some(
+              ({ node_id, node_type }) => workspaceActions.has(node_type) && outputs.has(node_id),
+            );
+          if (currentFileRelease && !workspaceUsed && !workspaceSnapshot) {
+            await this.terminalNode(tx, row, 'FAILED', '本次文件发布前没有已完成的工作区动作。');
             continue;
           }
+          const collectWorkspace =
+            (currentFileRelease || node.type === 'END') &&
+            workspaceUsed &&
+            workspaceRetention(plan.finish, currentFileRelease) !== 'OFF' &&
+            !workspaceSnapshot;
+          const checkoutCompleted = rows.some(
+            ({ node_id, node_type }) => node_type === 'CHECKOUT' && outputs.has(node_id),
+          );
+          const images = plan.finish.images ?? [];
+          const releaseImage =
+            preparingRelease && selectedRelease.method === 'COMPOSE'
+              ? images.find(({ id }) => id === selectedRelease.image?.id)
+              : undefined;
+          if (
+            preparingRelease &&
+            selectedRelease.method === 'COMPOSE' &&
+            (!releaseImage || (releaseImage.source === 'BUILT_IN' && !builtImage))
+          ) {
+            await this.terminalNode(
+              tx,
+              row,
+              'FAILED',
+              releaseImage
+                ? `镜像「${releaseImage.name}」的 Docker 构建未执行，无法发布。`
+                : '未找到本次发布所选的镜像登记项。',
+            );
+            continue;
+          }
+          const imageIds = (node.type === 'END' ? images : releaseImage ? [releaseImage] : [])
+            .filter(
+              ({ name, source }) =>
+                (source !== 'BUILT_IN' || builtImage) &&
+                !artifacts.some(
+                  ({ artifact_type, artifact_name }) =>
+                    artifact_type === 'DOCKER_IMAGE' && artifact_name === name,
+                ),
+            )
+            .map(({ id }) => id);
           const capture = needsArtifactFacts
             ? {
-                workspace:
-                  Boolean(collectWorkspace) &&
-                  !artifacts.some(({ artifact_type }) => artifact_type === 'FILE'),
-                image:
-                  Boolean(collectImage) &&
-                  !artifacts.some(({ artifact_type }) => artifact_type === 'DOCKER_IMAGE'),
+                workspace: collectWorkspace,
+                imageIds,
                 expectedImageId,
+                checkoutCompleted,
               }
             : undefined;
-          const shouldSnapshot = capture?.workspace || capture?.image;
+          const shouldSnapshot = capture?.workspace || Boolean(capture?.imageIds.length);
           if (shouldSnapshot && snapshotReady.has(node.id)) {
             await this.terminalNode(tx, row, 'FAILED', '未找到本次已登记的交付产物。');
             continue;
           }
-          const script = ['CHECKOUT', 'SHELL', 'CHECK', 'BUILD'].includes(node.type);
+          const script = workspaceActions.has(node.type);
           const release = selectedRelease && outputs.get(selectedRelease.nodeId)?.release;
           const stage = shouldSnapshot
             ? 'SNAPSHOT'
@@ -3611,6 +3671,8 @@ export class GraphRunnerService implements OnModuleInit {
               if (plan.finish.requireRelease) {
                 const expected = selectedRelease;
                 const result = graphReleaseResult(release);
+                const scope =
+                  expected && (await this.simplifiedRuns.releaseScope(tx, run.id, expected));
                 if (
                   !expected ||
                   result.status !== 'SUCCESS' ||
@@ -3623,7 +3685,7 @@ export class GraphRunnerService implements OnModuleInit {
                     (target) =>
                       target.status !== 'SUCCESS' ||
                       !target.artifactInstanceId ||
-                      !artifactIds.includes(target.artifactInstanceId),
+                      target.artifactInstanceId !== scope?.artifactIds[0],
                   )
                 )
                   throw new ConflictException('结束节点缺少计划内全部目标的激活及产物证据');
@@ -4955,8 +5017,18 @@ export class GraphRunnerService implements OnModuleInit {
     );
     const snapshots =
       simplified && this.simplifiedRuns
-        ? await this.simplifiedRuns.snapshotArtifacts(this.database.db, id)
+        ? await this.simplifiedRuns.snapshotArtifacts(this.database.db, id, true)
         : [];
+    const releaseAction =
+      simplified?.release && nodes.find(({ nodeId }) => nodeId === simplified.release!.nodeId);
+    const releaseFact = (
+      releaseAction?.output as
+        { release?: { targets?: { artifactInstanceId?: string }[] } } | undefined
+    )?.release;
+    const releaseArtifactId =
+      simplified?.release?.artifactId ??
+      releaseFact?.targets?.find(({ artifactInstanceId }) => artifactInstanceId)
+        ?.artifactInstanceId;
     const artifacts = [
       ...new Set([
         ...deliveries.flatMap((d) => d.artifactIds),
@@ -5008,13 +5080,17 @@ export class GraphRunnerService implements OnModuleInit {
           tag: source.tag,
         })),
         finish: simplified.finish,
+        imageTag: simplified.finish.images?.some(({ source }) => source !== 'REGISTRY')
+          ? flowImageTag(id)
+          : undefined,
         release: simplified.release && {
           serviceId: simplified.release.serviceId,
           serverIds: simplified.release.serverIds,
-          artifactId: simplified.release.artifactId,
+          artifactId: releaseArtifactId,
           deployPath: simplified.release.deployPath,
           contentPath: simplified.release.path,
           method: simplified.release.method,
+          image: simplified.release.image,
         },
         workspacePath: row.workspacePath,
         artifacts: snapshots.map((artifact) => ({
@@ -5024,6 +5100,10 @@ export class GraphRunnerService implements OnModuleInit {
           checksum: artifact.checksum,
           digest: artifact.image_digest,
           commitSha: artifact.source_commit,
+          temporary: Boolean(artifact.temporary_root_id),
+          imageReference:
+            artifact.artifact_type === 'DOCKER_IMAGE' ? artifact.storage_key : undefined,
+          lifecycleState: artifact.lifecycle_state,
         })),
       },
       nodes,

@@ -71,6 +71,8 @@ import {
   type GraphGateScope,
 } from './graph-release-gates';
 import {
+  simplifiedImageName,
+  simplifiedReleaseImage,
   simplifiedSourceDirectory,
   type SimplifiedFinish,
   type SimplifiedStart,
@@ -82,7 +84,11 @@ import {
 } from './graph-workspace';
 
 const workspaceArtifact = 'workspace';
-const imageArtifact = 'image';
+export const flowImageTagVariable = 'VEYOPS_IMAGE_TAG';
+
+export function flowImageTag(runId: string) {
+  return `run-${runId}`;
+}
 
 type FlowRunIdentity = {
   id: string;
@@ -102,6 +108,7 @@ type FixedRelease = {
   knownHash?: string;
   planHash: string;
   method: 'FILE' | 'COMPOSE';
+  image?: { id: string; name: string };
   path: string;
   deployPath: string;
   workspaceComposePath?: string;
@@ -125,10 +132,16 @@ export type SimplifiedRunPlan = {
   trigger?: Record<string, unknown>;
 };
 
+export function workspaceRetention(finish: SimplifiedFinish, currentFileRelease: boolean) {
+  if (finish.saveWorkspace === false) return currentFileRelease ? 'RUN' : 'OFF';
+  return finish.retention ?? 'PERSISTENT';
+}
+
 export type SimplifiedSnapshotRequest = {
   workspace: boolean;
-  image: boolean;
+  imageIds: string[];
   expectedImageId?: string;
+  checkoutCompleted: boolean;
 };
 
 export type SimplifiedActionPayload = {
@@ -139,7 +152,6 @@ export type SimplifiedActionPayload = {
   stage: 'ACTION' | 'SNAPSHOT';
   priorWorkspacePath?: string;
   snapshot?: SimplifiedSnapshotRequest;
-  expectedImageId?: string;
   plan: SimplifiedRunPlan;
 };
 
@@ -192,7 +204,14 @@ export class SimplifiedFlowRunService {
       dotenv,
       release,
     } = start.start ?? {};
-    const finish = flow.nodes.find(({ type }) => type === 'END')?.finish ?? {};
+    const configuredFinish = flow.nodes.find(({ type }) => type === 'END')?.finish ?? {};
+    const finish: SimplifiedFinish = {
+      ...configuredFinish,
+      images: configuredFinish.images?.map((image) => ({
+        ...image,
+        name: simplifiedImageName(image.name)!,
+      })),
+    };
     const releaseNode = flow.nodes.find(
       ({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT',
     );
@@ -293,12 +312,7 @@ export class SimplifiedFlowRunService {
     const hasWorkspaceActions = flow.nodes.some(({ type }) =>
       ['CHECKOUT', 'BUILD', 'CHECK', 'SHELL'].includes(type),
     );
-    const needsWorkspace =
-      hasWorkspaceActions ||
-      Boolean(
-        (!artifact && !upstreamPending && (finish.saveWorkspace || finish.image)) ||
-        release?.reuseExecutionServer,
-      );
+    const needsWorkspace = hasWorkspaceActions || Boolean(release?.reuseExecutionServer);
     const location =
       execution?.location && execution.location !== 'INHERIT'
         ? execution.location
@@ -374,7 +388,12 @@ export class SimplifiedFlowRunService {
       if (!targets) throw issue('RELEASE_TARGET', 'release', '请选择发布服务器或分组');
       if (releaseNode.type === 'ROLLBACK_ARTIFACT' && !artifact)
         throw issue('RELEASE_TARGET', 'release', '请选择已成功发布的回滚产物');
-      if (!artifact && !upstreamPending && !hasWorkspaceActions)
+      if (
+        !artifact &&
+        !upstreamPending &&
+        !hasWorkspaceActions &&
+        releaseNode.deploy?.method !== 'COMPOSE'
+      )
         throw issue('RELEASE_TARGET', 'release', '请指定已有产物或先配置生成发布内容的动作');
       fixedRelease = await this.planRelease({
         projectId,
@@ -496,6 +515,8 @@ export class SimplifiedFlowRunService {
         ])
       : undefined;
     const method = node.deploy?.method ?? 'FILE';
+    const image =
+      method === 'COMPOSE' && !artifactId ? simplifiedReleaseImage(finish, release) : undefined;
     const path = normalizeRelativePath(release.contentPath || '.');
     const compose =
       release.compose?.sourceId && sources.find(({ id }) => id === release.compose!.sourceId);
@@ -508,7 +529,7 @@ export class SimplifiedFlowRunService {
         unversionedArtifactRepository,
       artifactType: method === 'FILE' ? 'FILE' : 'DOCKER_IMAGE',
       ...(method === 'COMPOSE' && {
-        registryId: historical?.definition.registryId ?? finish.image?.registryId,
+        registryId: historical?.definition.registryId ?? image?.registryId,
       }),
       deployPath: release.deployPath,
       ...(node.deploy && {
@@ -575,6 +596,7 @@ export class SimplifiedFlowRunService {
       deployPath: release.deployPath!,
       path,
       method,
+      image: image && { id: image.id, name: image.name },
       profile,
       workspaceComposePath: method === 'COMPOSE' && !compose ? release.compose?.path : undefined,
       rollbackBaseline: upcoming.rollbackBaseline,
@@ -634,13 +656,13 @@ export class SimplifiedFlowRunService {
       },
     };
     if (stage !== 'SNAPSHOT') return task;
-    const source = plan.sources[0]?.source;
+    const actualSources = snapshot?.checkoutCompleted ? plan.sources : [];
+    const source = actualSources[0]?.source;
     const commitSha = source?.commitSha ?? unversionedArtifactCommit;
     const definition = Object.assign(new PipelineDefinitionDto(), {
       repositoryId: source?.repositoryId ?? unversionedArtifactRepository,
       buildLocation: plan.placement.location,
       artifactType: 'FILE',
-      registryId: plan.finish.image?.registryId,
     });
     const profile = deliveryExecutionProfile(
       run.project_id,
@@ -653,7 +675,7 @@ export class SimplifiedFlowRunService {
     );
     const pipeline: PipelineSnapshot = {
       graph: { runId: run.id, rootRunId: run.id, nodeRunId: row.id },
-      artifactSources: plan.sources.map(({ source, directory }) => ({
+      artifactSources: actualSources.map(({ source, directory }) => ({
         repositoryId: source.repositoryId,
         commitSha: source.commitSha,
         ref: source.ref,
@@ -726,8 +748,19 @@ export class SimplifiedFlowRunService {
   }
 
   private async executeAction(task: TaskRecord, context: TaskExecutionContext): Promise<Facts> {
-    const { runId, projectId, node, stage, plan, priorWorkspacePath, snapshot, expectedImageId } =
+    const { runId, projectId, node, stage, plan, priorWorkspacePath, snapshot } =
       task.payload.simplifiedAction!;
+    const requiresWorkspace =
+      stage !== 'SNAPSHOT' ||
+      snapshot?.workspace ||
+      Boolean(priorWorkspacePath) ||
+      (plan.release?.image &&
+        snapshot?.imageIds.includes(plan.release.image.id) &&
+        Boolean(plan.release.workspaceComposePath));
+    if (!requiresWorkspace && snapshot) {
+      await this.capture(this.captureSession(task, context, plan), plan, undefined, snapshot);
+      return { snapshotReady: true, location: plan.placement.location };
+    }
     const workspace = await this.workspaces.open(
       runId,
       plan.placement,
@@ -748,23 +781,8 @@ export class SimplifiedFlowRunService {
     }
     const facts: Facts = { workspacePath: workspace.path, location: plan.placement.location };
     if (stage === 'SNAPSHOT') {
-      const session: BuildSession = {
-        taskId: task.id,
-        context,
-        variables: {},
-        secrets: [],
-        snapshot: { ...task.payload.pipeline!, graphAutomation: plan.automation },
-      };
-      await this.capture(
-        session,
-        plan,
-        workspace.path,
-        snapshot ?? {
-          workspace: Boolean(plan.finish.saveWorkspace || plan.release?.method === 'FILE'),
-          image: Boolean(expectedImageId || plan.finish.image?.reference),
-          expectedImageId,
-        },
-      );
+      if (!snapshot) throw new ConflictException('缺少已确认的留档请求');
+      await this.capture(this.captureSession(task, context, plan), plan, workspace.path, snapshot);
       return { ...facts, snapshotReady: true };
     }
     if (node.type === 'CHECKOUT') {
@@ -787,6 +805,7 @@ export class SimplifiedFlowRunService {
         ...values,
         ...graphTriggerVariables(plan.trigger),
         VEYOPS_FLOW_RUN_ID: runId,
+        [flowImageTagVariable]: flowImageTag(runId),
         VEYOPS_PROJECT_ID: projectId,
         ...(plan.serviceId && { VEYOPS_SERVICE_ID: plan.serviceId }),
         ...(plan.sources[0] && { VEYOPS_GIT_COMMIT_SHA: plan.sources[0].source.commitSha }),
@@ -859,6 +878,20 @@ export class SimplifiedFlowRunService {
     return `veyops-build/${runId}:${unversionedArtifactCommit}-${runId}`;
   }
 
+  private captureSession(
+    task: TaskRecord,
+    context: TaskExecutionContext,
+    plan: SimplifiedRunPlan,
+  ): BuildSession {
+    return {
+      taskId: task.id,
+      context,
+      variables: {},
+      secrets: [],
+      snapshot: { ...task.payload.pipeline!, graphAutomation: plan.automation },
+    };
+  }
+
   async cleanup(runId: string, plan: SimplifiedRunPlan, path: string) {
     await this.workspaces.cleanup({ runId, placement: plan.placement, path }).catch(() => {
       this.logger.warn(`执行流 ${runId} 的工作区清理失败`);
@@ -868,13 +901,13 @@ export class SimplifiedFlowRunService {
   private async capture(
     session: BuildSession,
     plan: SimplifiedRunPlan,
-    workspace: string,
+    workspace: string | undefined,
     capture: SimplifiedSnapshotRequest,
   ) {
     const { snapshot, context: ctx } = session;
     const target = plan.placement.location === 'TARGET' ? plan.placement.target : undefined;
-    const persistent = plan.finish.retention !== 'RUN';
     if (capture.workspace) {
+      if (!workspace) throw new ConflictException('工作区快照缺少实际目录');
       const identity = artifactIdentity(snapshot, workspaceArtifact, target?.id);
       const dotenv = plan.dotenv;
       const dotenvPaths = dotenv
@@ -924,39 +957,71 @@ export class SimplifiedFlowRunService {
         checksum: archive?.checksum ?? physical.sha256,
         sizeBytes: archive?.sizeBytes ?? physical.sizeBytes,
         physical,
-        persist: persistent,
+        persist: workspaceRetention(plan.finish, true) === 'PERSISTENT',
       });
       ctx.log('工作区快照已校验并登记。\n', target?.id);
     }
-    if (capture.image) {
-      const { expectedImageId } = capture;
-      const reference = expectedImageId
-        ? this.nativeImageReference(snapshot.graph!.runId)
-        : plan.finish.image?.reference;
-      if (!reference) throw new ConflictException('本次运行未取得可登记的镜像引用');
-      const registryId = plan.finish.image?.registryId;
-      const composePath = plan.release?.workspaceComposePath;
-      const composeYaml = composePath
-        ? await this.builds.flowComposeSnapshot(session, workspace, composePath, target)
-        : undefined;
-      if (composePath && (!composeYaml || redactTaskLog(composeYaml) !== composeYaml))
-        throw new BadRequestException('Compose 文件缺失或包含应使用凭据引用的内容');
-      if (composeYaml) assertGraphCompose(composeYaml);
-      if (registryId) {
-        const digest = reference.match(/@(sha256:[a-f0-9]{64})$/)?.[1];
-        if (!digest) throw new BadRequestException('Registry 镜像需要使用固定 Digest');
-        const physical: ArtifactPhysical = {
-          kind: 'DOCKER_IMAGE',
-          location: 'REGISTRY',
-          owner: 'EXTERNAL',
-          registryId,
-          imageReference: reference,
-          digest,
-        };
-        if ((await this.physical.verify(physical, undefined, ctx.signal)).status !== 'AVAILABLE')
-          throw new ConflictException('Registry 无法验证指定的镜像 Digest');
-        await this.artifacts.create(snapshot, {
-          name: imageArtifact,
+    for (const id of capture.imageIds) {
+      const image = plan.finish.images?.find((entry) => entry.id === id);
+      if (!image) throw new ConflictException('留档请求引用了未确认的镜像登记项');
+      try {
+        await this.captureImage(session, plan, image, workspace, capture.expectedImageId);
+      } catch (error) {
+        if (ctx.signal.aborted) throw error;
+        const reason = error instanceof Error ? redactTaskLog(error.message) : '无法核对镜像实物';
+        throw new ConflictException(`镜像「${image.name}」登记失败。${reason}`);
+      }
+    }
+  }
+
+  private async captureImage(
+    session: BuildSession,
+    plan: SimplifiedRunPlan,
+    entry: NonNullable<SimplifiedFinish['images']>[number],
+    workspace: string | undefined,
+    expectedImageId?: string,
+  ) {
+    const { snapshot, context: ctx } = session;
+    const target = plan.placement.location === 'TARGET' ? plan.placement.target : undefined;
+    const runId = snapshot.graph!.runId;
+    const identity = artifactIdentity(
+      snapshot,
+      entry.name,
+      entry.source === 'REGISTRY' ? undefined : target?.id,
+      entry.id,
+    );
+    if (await this.artifacts.requireFlowInstance(identity.instanceId, runId)) return;
+    const composePath =
+      plan.release?.image?.id === entry.id ? plan.release.workspaceComposePath : undefined;
+    const composeYaml = composePath
+      ? workspace &&
+        (await this.builds.flowComposeSnapshot(session, workspace, composePath, target))
+      : undefined;
+    if (composePath && (!composeYaml || redactTaskLog(composeYaml) !== composeYaml))
+      throw new BadRequestException('Compose 文件缺失或包含应使用凭据引用的内容');
+    if (composeYaml) assertGraphCompose(composeYaml);
+    if (entry.source === 'REGISTRY') {
+      const reference = entry.reference!;
+      const digest = reference.match(/@(sha256:[a-f0-9]{64})$/)?.[1];
+      if (!digest) throw new BadRequestException('Registry 镜像需要使用固定 Digest');
+      const physical: ArtifactPhysical = {
+        kind: 'DOCKER_IMAGE',
+        location: 'REGISTRY',
+        owner: 'EXTERNAL',
+        registryId: entry.registryId,
+        imageReference: reference,
+        digest,
+      };
+      if ((await this.physical.verify(physical, undefined, ctx.signal)).status !== 'AVAILABLE')
+        throw new ConflictException('Registry 无法验证指定的镜像 Digest');
+      const registrySnapshot = {
+        ...snapshot,
+        definition: { ...snapshot.definition, registryId: entry.registryId },
+      };
+      await this.artifacts.create(
+        registrySnapshot,
+        {
+          name: entry.name,
           kind: 'DOCKER_IMAGE',
           storageType: 'REGISTRY_IMAGE',
           storageKey: reference,
@@ -964,24 +1029,33 @@ export class SimplifiedFlowRunService {
           imageDigest: digest,
           physical,
           composeYaml,
-          persist: persistent,
-        });
-        return;
-      }
-      const image = await this.physical.describeImage({
-        target,
-        reference,
-        owner: expectedImageId ? 'MANAGED' : 'EXTERNAL',
-        builderId: plan.automation ? 'manager-webhook' : 'manager',
-        signal: ctx.signal,
-      });
-      if (expectedImageId && image.imageId !== expectedImageId)
-        throw new ConflictException('镜像 ID 与本次 Docker 构建完成时不一致');
-      const archive = target
-        ? undefined
-        : await this.builds.archiveFlowImage(session, image.imageId!);
-      await this.artifacts.create(snapshot, {
-        name: imageArtifact,
+        },
+        entry.id,
+      );
+      return;
+    }
+    const reference = `${entry.name}:${flowImageTag(runId)}`;
+    if (entry.source === 'BUILT_IN' && !expectedImageId)
+      throw new ConflictException('本次未取得内置 Docker 构建的镜像 ID');
+    const image = await this.physical.describeFlowImage(
+      reference,
+      plan.automation ? 'manager-webhook' : 'manager',
+      target,
+      ctx.signal,
+      entry.source === 'BUILT_IN'
+        ? {
+            reference: this.nativeImageReference(runId),
+            id: expectedImageId!,
+          }
+        : undefined,
+    );
+    const archive = target
+      ? undefined
+      : await this.builds.archiveFlowImage(session, image.imageId!, reference, identity.instanceId);
+    await this.artifacts.create(
+      snapshot,
+      {
+        name: entry.name,
         kind: 'DOCKER_IMAGE',
         storageType: target ? 'REMOTE_IMAGE' : 'LOCAL_IMAGE',
         storageKey: archive?.imageReference ?? image.imageReference!,
@@ -989,25 +1063,26 @@ export class SimplifiedFlowRunService {
         imageId: image.imageId,
         serverId: target?.id,
         physical: target ? image : undefined,
-        persist: persistent,
         composeYaml,
         archiveKey: archive?.archiveKey,
         checksum: archive?.checksum,
         sizeBytes: archive?.sizeBytes,
-      });
-    }
+      },
+      entry.id,
+    );
+    ctx.log(`镜像 ${reference} 已校验并登记。\n`, target?.id);
   }
 
-  private artifactRows(db: Kysely<Database>, runId: string) {
+  private artifactRows(db: Kysely<Database>, runId: string, includeInactive = false) {
     return db
       .selectFrom('artifacts')
       .selectAll()
       .where('graph_run_id', '=', runId)
-      .where('lifecycle_state', '=', 'ACTIVE');
+      .$if(!includeInactive, (query) => query.where('lifecycle_state', '=', 'ACTIVE'));
   }
 
-  async snapshotArtifacts(db: Kysely<Database>, runId: string) {
-    return this.artifactRows(db, runId).orderBy('artifact_name').execute();
+  async snapshotArtifacts(db: Kysely<Database>, runId: string, includeInactive = false) {
+    return this.artifactRows(db, runId, includeInactive).orderBy('artifact_name').execute();
   }
 
   private async releaseArtifact(db: Kysely<Database>, runId: string, release: FixedRelease) {
@@ -1017,15 +1092,19 @@ export class SimplifiedFlowRunService {
           .selectAll()
           .where('id', '=', release.artifactId)
           .where('service_id', '=', release.serviceId)
+          .where('temporary_root_id', 'is', null)
           .where('lifecycle_state', '=', 'ACTIVE')
           .executeTakeFirst()
-      : this.artifactRows(db, runId)
-          .where(
-            'artifact_name',
-            '=',
-            release.method === 'FILE' ? workspaceArtifact : imageArtifact,
-          )
-          .executeTakeFirst();
+      : release.method === 'COMPOSE' && !release.image
+        ? undefined
+        : this.artifactRows(db, runId)
+            .where('artifact_type', '=', release.method === 'FILE' ? 'FILE' : 'DOCKER_IMAGE')
+            .where(
+              'artifact_name',
+              '=',
+              release.method === 'FILE' ? workspaceArtifact : release.image!.name,
+            )
+            .executeTakeFirst();
   }
 
   async releaseScope(

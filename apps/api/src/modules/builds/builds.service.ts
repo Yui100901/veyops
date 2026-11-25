@@ -1212,22 +1212,47 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     }
   }
 
-  async archiveFlowImage(session: BuildSession, imageId: string) {
+  async archiveFlowImage(
+    session: BuildSession,
+    imageId: string,
+    reference: string,
+    instanceId: string,
+  ) {
     if (!/^sha256:[a-f0-9]{64}$/.test(imageId))
       throw new ConflictException('执行流镜像缺少有效的 Image ID');
     const builds = join(dataDirectory, 'builds');
     await mkdir(builds, { recursive: true, mode: 0o700 });
     const root = await mkdtemp(join(builds, 'flow-image-'));
-    const reference = localImageTag(session);
+    const capture = { ...session, taskId: instanceId };
     try {
-      if (session.snapshot.graphAutomation) await this.configureWebhookDocker(session, root);
-      await this.local(session, ['image', 'tag', imageId, reference], 30, '已确认的镜像 ID 不可用');
-      const archive = await this.retainManagerImageArchive(session, root, reference);
+      if (capture.snapshot.graphAutomation) await this.configureWebhookDocker(capture, root);
+      const archive = await this.retainManagerImageArchive(
+        capture,
+        root,
+        reference,
+        undefined,
+        async (path) => this.verifyFlowImageArchive(path, imageId, session.context.signal),
+      );
       return { imageReference: reference, ...archive };
     } finally {
-      await this.runDocker(session, ['image', 'rm', reference], 30).catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }
+  }
+
+  private async verifyFlowImageArchive(path: string, imageId: string, signal: AbortSignal) {
+    const options = { timeout: 90, signal };
+    const manifest = await this.runner.run('tar', ['-xOzf', path, 'manifest.json'], options);
+    const entries: unknown = manifest.exitCode === 0 ? JSON.parse(manifest.stdout) : undefined;
+    const config = Array.isArray(entries) && entries.length === 1 ? entries[0]?.Config : undefined;
+    const hash = imageId.slice('sha256:'.length);
+    if (config !== `${hash}.json` && config !== `blobs/sha256/${hash}`)
+      throw new ConflictException('归档里的镜像 ID 与已确认内容不一致');
+    const content = await this.runner.run('tar', ['-xOzf', path, config], options);
+    if (
+      content.exitCode !== 0 ||
+      createHash('sha256').update(content.stdout).digest('hex') !== hash
+    )
+      throw new ConflictException('归档里的镜像配置未通过摘要核对');
   }
 
   async buildFlowImage(
@@ -1588,6 +1613,7 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     root: string,
     image: string,
     dockerConfig?: string,
+    verifyBeforePublish?: (path: string) => Promise<void>,
   ) {
     const archive = join(root, 'image.tar.gz');
     const options = dockerConfig ? ['--config', dockerConfig] : [];
@@ -1598,6 +1624,7 @@ test -s ${q(path)} && test "$(wc -c < ${q(path)})" -le ${maxComposeBytes} || exi
     });
     if (exported.exitCode !== 0)
       throw new BuildCommandError(exported.exitCode, 'Docker镜像导出失败');
+    await verifyBeforePublish?.(archive);
     const archiveKey = `${session.taskId}.tar.gz`;
     const { checksum, sizeBytes } = await this.retainManagerArchive(archive, archiveKey, session);
     return { archiveKey, checksum, sizeBytes };

@@ -44,6 +44,7 @@ import {
   type UpstreamResult,
 } from './graph-trigger.dto';
 import { GraphRunnerService } from './graph-runner.service';
+import { simplifiedImageName } from './simplified-flow-definition';
 import {
   branchPrefix,
   compareSourceObservation,
@@ -1808,6 +1809,8 @@ export class GraphTriggersService implements OnModuleInit {
           const release = flowStart(flow).start?.release;
           const deploy = flow.nodes.find(({ type }) => type === 'DEPLOY_ARTIFACT');
           const artifactType = deploy?.deploy?.method === 'COMPOSE' ? 'DOCKER_IMAGE' : 'FILE';
+          const artifactName =
+            release?.upstreamArtifactName && simplifiedImageName(release.upstreamArtifactName);
           for (const run of runs) {
             const fields = {
               value: settings.inputValue,
@@ -1832,6 +1835,9 @@ export class GraphTriggersService implements OnModuleInit {
                     .where('lifecycle_state', '=', 'ACTIVE')
                     .where('pruned_at', 'is', null)
                     .where('verification_status', '=', 'AVAILABLE')
+                    .$if(Boolean(artifactName), (query) =>
+                      query.where('artifact_name', '=', artifactName!),
+                    )
                     .limit(2)
                     .execute()
                 : [];
@@ -1844,8 +1850,10 @@ export class GraphTriggersService implements OnModuleInit {
               await this.recordEvent(tx, rule, run.id, fields, {
                 status: 'REJECTED',
                 error: artifacts.length
-                  ? '上游有多个可用产物，无法确定主产物'
-                  : '上游缺少该服务可重发的已登记产物',
+                  ? '上游有多个可用产物，请在开始节点指定登记名称'
+                  : artifactName
+                    ? `上游缺少该服务已登记的可重发产物「${artifactName}」`
+                    : '上游缺少该服务可重发的已登记产物',
               });
           }
         })

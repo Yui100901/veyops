@@ -589,6 +589,49 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
     };
   }
 
+  async describeFlowImage(
+    reference: string,
+    builderId: 'manager' | 'manager-webhook',
+    target?: SshTarget,
+    signal?: AbortSignal,
+    built?: { reference: string; id: string },
+  ) {
+    if (!isDockerImageReference(reference)) throw new BadRequestException('镜像引用无效');
+    if (built) {
+      const original = await this.describeImage({
+        target,
+        reference: built.reference,
+        owner: 'MANAGED',
+        builderId,
+        signal,
+      });
+      if (!imageDigest.test(built.id) || original.imageId !== built.id)
+        throw new ConflictException('镜像 ID 与本次 Docker 构建完成时不一致');
+      const existing = await this.image(reference, target, builderId, signal);
+      if (existing && existing.imageId !== built.id)
+        throw new ConflictException('本次镜像 Tag 已指向其他镜像 ID');
+      if (!existing) {
+        const tagged = await this.docker(
+          ['image', 'tag', built.id, reference],
+          target,
+          builderId,
+          signal,
+        );
+        if (tagged.exitCode !== 0) throw new ConflictException('无法设置本次镜像 Tag');
+      }
+    }
+    const image = await this.describeImage({
+      target,
+      reference,
+      owner: 'EXTERNAL',
+      builderId,
+      signal,
+    });
+    if (built && image.imageId !== built.id)
+      throw new ConflictException('镜像 Tag 与确认的 Image ID 不一致');
+    return image;
+  }
+
   async verify(
     physical: ArtifactPhysical,
     target?: SshTarget,

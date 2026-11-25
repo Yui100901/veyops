@@ -6,9 +6,20 @@ function stableUuid(parts: readonly unknown[]) {
   return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-8${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
 }
 
-export function artifactIdentity(snapshot: PipelineSnapshot, name?: string, serverId?: string) {
-  const producer = snapshot.graph?.nodeRunId ?? snapshot.runId;
-  const artifactId = stableUuid(['artifact', snapshot.projectId, producer, name ?? 'artifact']);
+export function artifactIdentity(
+  snapshot: PipelineSnapshot,
+  name?: string,
+  serverId?: string,
+  flowItemId?: string,
+) {
+  const producer = flowItemId ? snapshot.graph?.runId : snapshot.graph?.nodeRunId;
+  const identity = flowItemId ? ['flow-image', flowItemId] : (name ?? 'artifact');
+  const artifactId = stableUuid([
+    'artifact',
+    snapshot.projectId,
+    producer ?? snapshot.runId,
+    identity,
+  ]);
   return {
     artifactId,
     instanceId: stableUuid(['instance', artifactId, serverId ?? 'manager']),

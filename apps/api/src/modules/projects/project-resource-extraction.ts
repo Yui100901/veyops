@@ -325,7 +325,9 @@ function simplifiedNodeReferences(source: ReferenceSource, node: GraphNode) {
       ? []
       : selectionReferences(field('start.release.targets'), config?.release?.targets)),
     ...referenceRows(field('start.release.artifactId'), 'ARTIFACT', config?.release?.artifactId),
-    ...referenceRows(field('finish.image.registryId'), 'REGISTRY', node.finish?.image?.registryId),
+    ...(node.finish?.images ?? []).flatMap(({ registryId }, index) =>
+      referenceRows(field(`finish.images.${index}.registryId`), 'REGISTRY', registryId),
+    ),
   ];
 }
 

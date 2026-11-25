@@ -18,7 +18,7 @@ const exec = promisify(execFile);
 
 test(
   'SQLite default FLOW_V2 builds a real Git commit and activates verified file content',
-  { timeout: 90_000 },
+  { timeout: 240_000 },
   async () => {
     const directory = await mkdtemp(join(tmpdir(), 'veyops-simplified-run-'));
     const worktree = join(directory, 'source');
@@ -110,6 +110,8 @@ test(
       const { BuildsService } = await import('../modules/builds/builds.service.js');
       const { SshService } = await import('../infrastructure/ssh/ssh.service.js');
       const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
+      const { ArtifactCleanupService } =
+        await import('../modules/artifacts/artifact-cleanup.service.js');
       const { ArtifactPhysicalService } =
         await import('../modules/artifacts/artifact-physical.service.js');
       const releases = new Map<string, string>();
@@ -213,6 +215,7 @@ test(
       const graph = (await api.get(graphPath).expect(200)).body.data;
       const canvas: GraphCanvas = graph.draft.canvas;
       assert.equal(canvas.model, 'FLOW_V2');
+      delete canvas.nodes.find(({ type }) => type === 'END')!.finish!.saveWorkspace;
       const start = canvas.nodes[0]!;
       start.start = {
         ...start.start,
@@ -256,6 +259,7 @@ test(
       const version = await publish(canvas);
       const preview = await create(flow + '/preview', { version });
       assert.ok(JSON.stringify(preview).includes(sha), 'preview pins the actual Git SHA');
+      assert.equal(preview.simplified.workspaceRetention, 'PERSISTENT');
       const worker = app.get(TaskWorkerService);
       const waitRun = async (id: string, expected: string) => {
         const deadline = Date.now() + 25_000;
@@ -265,7 +269,16 @@ test(
             id: string;
             status: string;
             artifactIds: string[];
-            simplified?: { workspacePath?: string | null };
+            simplified?: {
+              workspacePath?: string | null;
+              artifacts: {
+                id: string;
+                name: string;
+                kind: string;
+                temporary: boolean;
+                lifecycleState: string;
+              }[];
+            };
             nodes: { nodeId: string; status: string; output?: unknown; snapshotTaskId?: string }[];
           };
           if (run.status === expected) return run;
@@ -350,6 +363,7 @@ test(
       ];
       const replayVersion = await publish(replay);
       const replayPreview = await create(flow + '/preview', { version: replayVersion });
+      assert.equal(replayPreview.simplified.workspaceRetention, 'OFF');
       const replayed = await runVersion(replayVersion, replayPreview.configurationHash);
       assert.deepEqual(replayed.artifactIds, [artifacts[0].id]);
       assert.equal(replayed.simplified?.workspacePath, null);
@@ -400,7 +414,67 @@ test(
         'content from the confirmed Git commit\n',
       );
 
+      const transient = structuredClone(canvas);
+      transient.nodes.find(({ id }) => id === end.id)!.finish = {
+        saveWorkspace: false,
+        retention: 'PERSISTENT',
+        requireRelease: 'ACTIVATED',
+      };
+      const transientVersion = await publish(transient);
+      const transientPreview = await create(flow + '/preview', { version: transientVersion });
+      assert.equal(transientPreview.simplified.workspaceRetention, 'RUN');
+      const transientRun = await runVersion(transientVersion, transientPreview.configurationHash);
+      assert.equal(transientRun.artifactIds.length, 1);
+      const transientId = transientRun.artifactIds[0]!;
+      assert.deepEqual(
+        transientRun.simplified?.artifacts.map(({ id, name, temporary }) => ({
+          id,
+          name,
+          temporary,
+        })),
+        [{ id: transientId, name: 'workspace', temporary: true }],
+      );
+      const listedAfterTransient = (
+        await api
+          .get(root + '/artifacts')
+          .query({ projectId: project.id })
+          .expect(200)
+      ).body.data;
+      assert.ok(!listedAfterTransient.some(({ id }: { id: string }) => id === transientId));
+      const cleanup = await create(root + '/artifact-retention/preview', {
+        artifacts: [{ artifactId: transientId }],
+      });
+      assert.equal(cleanup.eligibleCount, 0, 'active deployment protects its temporary snapshot');
+
+      const replayWithBuild = structuredClone(canvas);
+      replayWithBuild.nodes[0]!.start!.release!.artifactId = artifacts[0].id;
+      replayWithBuild.nodes[2]!.build!.buildCommand =
+        'mkdir dist; printf "new build data\\n" > dist/built.txt';
+      const replayWithBuildVersion = await publish(replayWithBuild);
+      const replayWithBuildPreview = await create(flow + '/preview', {
+        version: replayWithBuildVersion,
+      });
+      const replayWithBuildRun = await runVersion(
+        replayWithBuildVersion,
+        replayWithBuildPreview.configurationHash,
+      );
+      const [newSnapshot] = replayWithBuildRun.simplified!.artifacts;
+      assert.equal(newSnapshot?.temporary, false);
+      assert.notEqual(newSnapshot?.id, artifacts[0].id);
+      assert.deepEqual(
+        new Set(replayWithBuildRun.artifactIds),
+        new Set([newSnapshot?.id, artifacts[0].id]),
+      );
+      assert.equal(
+        deployedContent.at(-1),
+        'content from the confirmed Git commit\nconfigured\n',
+        'historical deployment continues to use the pinned instance',
+      );
+
       const branched = structuredClone(canvas);
+      branched.nodes.find(({ id }) => id === end.id)!.finish!.images = [
+        { id: 'fixture', name: 'fixture', source: 'BUILT_IN' },
+      ];
       branched.nodes.push(
         {
           id: 'variant',
@@ -451,21 +525,25 @@ test(
           engineId: 'fixture-engine',
         };
       };
-      builds.archiveFlowImage = async (session, expectedImageId) => {
+      physical.describeFlowImage = async (reference, _builder, _target, _signal, built) => {
+        assert.equal(built?.id, imageId);
+        return physical.describeImage({ reference, owner: 'EXTERNAL' });
+      };
+      builds.archiveFlowImage = async (_session, expectedImageId, reference, instanceId) => {
         assert.equal(expectedImageId, imageId);
         return {
-          imageReference: `veyops-build/${session.snapshot.pipelineId}:${session.snapshot.commitSha}-${session.taskId}`,
-          archiveKey: session.taskId + '.tar.gz',
+          imageReference: reference,
+          archiveKey: instanceId + '.tar.gz',
           checksum: 'e'.repeat(64),
           sizeBytes: 1024,
         };
       };
       const branchVersion = await publish(branched);
-      const runBranch = async (value: string) => {
+      const runBranch = async (value: string, version = branchVersion) => {
         const inputs = { value };
-        const plan = await create(flow + '/preview', { version: branchVersion, inputs });
+        const plan = await create(flow + '/preview', { version, inputs });
         const { id } = await create(flow + '/run', {
-          version: branchVersion,
+          version,
           inputs,
           expectedConfigurationHash: plan.configurationHash,
           idempotencyKey: randomUUID(),
@@ -492,8 +570,23 @@ test(
         'DIRECTORY',
         'DOCKER_IMAGE',
       ]);
+      const recordedImage = dockerArtifacts.find(
+        ({ kind }: { kind: string }) => kind === 'DOCKER_IMAGE',
+      );
+      assert.equal(recordedImage.name, 'fixture');
+      assert.equal(recordedImage.storageKey, `fixture:run-${docker.id}`);
       assert.equal(dockerBuilds, 1);
       assert.equal(imageInspections, 2);
+
+      const noRegistration = structuredClone(branched);
+      noRegistration.nodes.find(({ id }) => id === end.id)!.finish!.images = undefined;
+      const noRegistrationRun = await runBranch('docker', await publish(noRegistration));
+      assert.equal(dockerBuilds, 2);
+      assert.equal(imageInspections, 3, 'native build checked its image without registering it');
+      assert.deepEqual(
+        noRegistrationRun.simplified?.artifacts.map(({ kind }) => kind),
+        ['DIRECTORY'],
+      );
 
       const unscoped = structuredClone(canvas);
       delete unscoped.nodes[0]!.start!.release;
@@ -505,7 +598,7 @@ test(
         operation: 'CHECK',
         shell: { directory: 'fixture', command: 'test -s dist/built.txt' },
       });
-      unscoped.nodes.find(({ id }) => id === end.id)!.finish = { saveWorkspace: true };
+      unscoped.nodes.find(({ id }) => id === end.id)!.finish = undefined;
       unscoped.edges = [
         ...unscoped.edges.filter(({ from, to }) => from !== deploy.id && to !== deploy.id),
         { from: canvas.nodes[2]!.id, to: 'build-check' },
@@ -526,6 +619,69 @@ test(
       assert.equal(projectArtifacts.length, 1);
       assert.equal(projectArtifacts[0].kind, 'DIRECTORY');
       assert.equal(projectArtifacts[0].serviceId, null);
+
+      unscoped.nodes.find(({ id }) => id === end.id)!.finish = { retention: 'RUN' };
+      const runRetentionVersion = await publish(unscoped);
+      const runRetentionPreview = await create(flow + '/preview', { version: runRetentionVersion });
+      assert.equal(runRetentionPreview.simplified.workspaceRetention, 'RUN');
+      const runRetention = await runVersion(
+        runRetentionVersion,
+        runRetentionPreview.configurationHash,
+      );
+      assert.deepEqual(
+        runRetention.simplified?.artifacts.map(({ temporary }) => temporary),
+        [true],
+      );
+      const refs = [{ artifactId: runRetention.artifactIds[0]! }];
+      const eligible = await create(root + '/artifact-retention/preview', { artifacts: refs });
+      assert.equal(eligible.eligibleCount, 1);
+      await create(root + '/artifact-retention/prune', {
+        artifacts: refs,
+        planDigest: eligible.planDigest,
+        idempotencyKey: randomUUID(),
+      });
+      await app.get(ArtifactCleanupService).tick(new AbortController().signal);
+      const cleaned = (await api.get(graphPath + '/runs/' + runRetention.id).expect(200)).body.data;
+      assert.deepEqual(
+        cleaned.simplified.artifacts.map(
+          ({ lifecycleState }: { lifecycleState: string }) => lifecycleState,
+        ),
+        ['DELETED'],
+      );
+
+      unscoped.nodes.find(({ id }) => id === end.id)!.finish = { saveWorkspace: false };
+      const noRetentionVersion = await publish(unscoped);
+      const noRetentionPreview = await create(flow + '/preview', { version: noRetentionVersion });
+      assert.equal(noRetentionPreview.simplified.workspaceRetention, 'OFF');
+      const noRetention = await runVersion(
+        noRetentionVersion,
+        noRetentionPreview.configurationHash,
+      );
+      assert.ok(noRetention.simplified?.workspacePath);
+      assert.deepEqual(noRetention.artifactIds, []);
+
+      const conditionId = 'use-workspace';
+      unscoped.nodes.find(({ id }) => id === end.id)!.finish = undefined;
+      unscoped.nodes.push({
+        id: conditionId,
+        name: '是否执行构建',
+        type: 'CONDITION',
+        condition: { key: 'input', value: 'build' },
+      });
+      const checkout = unscoped.nodes.find(({ operation }) => operation === 'CHECKOUT')!;
+      unscoped.edges = [
+        ...unscoped.edges.filter(({ from }) => from !== start.id),
+        { from: start.id, to: conditionId },
+        { from: conditionId, to: checkout.id, when: 'TRUE' },
+        { from: conditionId, to: end.id, when: 'FALSE' },
+      ];
+      const skippedVersion = await publish(unscoped);
+      const skippedPreview = await create(flow + '/preview', { version: skippedVersion });
+      assert.equal(skippedPreview.simplified.workspaceRetention, 'OFF');
+      const skipped = await runVersion(skippedVersion, skippedPreview.configurationHash);
+      assert.equal(skipped.nodes.find(({ nodeId }) => nodeId === checkout.id)?.status, 'SKIPPED');
+      assert.equal(skipped.simplified?.workspacePath, null);
+      assert.deepEqual(skipped.artifactIds, []);
     } finally {
       await app?.close();
       if (git.listening) await new Promise<void>((resolve) => git.close(() => resolve()));

@@ -249,7 +249,9 @@ function expandSimplifiedTemplate(
         sources: [{ id: 'source' }],
         execution: { location: 'INHERIT' },
       }),
-      ...(deploys && { release: image && builds ? { compose: { path: 'compose.yaml' } } : {} }),
+      ...(deploys && {
+        release: image && builds ? { compose: { path: 'compose.yaml' }, imageId: 'app' } : {},
+      }),
     },
   };
   const end: GraphNode = {
@@ -258,6 +260,11 @@ function expandSimplifiedTemplate(
     type: 'END',
     finish: {
       saveWorkspace: builds,
+      ...(image &&
+        builds &&
+        deploys && {
+          images: [{ id: 'app', name: 'app', source: 'BUILT_IN' as const }],
+        }),
       ...(builds && { retention: 'PERSISTENT' }),
       ...(deploys && { requireRelease: template.id === 'CD_DEPLOY' ? 'HEALTHY' : 'ACTIVATED' }),
     },

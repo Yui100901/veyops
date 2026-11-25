@@ -96,21 +96,32 @@ export function archivedComposeTemplate(
   checksum: string | null,
 ): Extract<ComposeTemplateReference, { source: 'ARCHIVE' }> | undefined {
   if (!checksum) return undefined;
-  const definition = value ? (JSON.parse(value) as TaskPayload).pipeline?.definition : undefined;
+  const payload = value ? (JSON.parse(value) as TaskPayload) : undefined;
+  const definition = payload?.pipeline?.definition;
+  const release = payload?.simplifiedAction?.plan.release;
   const path =
     definition?.artifacts?.find((declaration) => declaration.name === name)?.composeFilePath ??
     definition?.composeFilePath;
   return {
     source: 'ARCHIVE',
-    path: path ? posix.join(definition?.repoPath ?? '.', path) : undefined,
+    path: path
+      ? posix.join(definition?.repoPath ?? '.', path)
+      : release?.image?.name === name
+        ? release?.workspaceComposePath
+        : undefined,
     checksum,
   };
 }
 
 function declaredImageReference(value: string | null, name: string | null) {
   if (!value || !name) return undefined;
-  const definition = (JSON.parse(value) as TaskPayload).pipeline?.definition;
-  return definition?.artifacts?.find((artifact) => artifact.name === name)?.imageReference;
+  const payload = JSON.parse(value) as TaskPayload;
+  return (
+    payload.simplifiedAction?.plan.finish.images?.find(({ name: entry }) => entry === name)
+      ?.reference ??
+    payload.pipeline?.definition.artifacts?.find((artifact) => artifact.name === name)
+      ?.imageReference
+  );
 }
 const digest = /^sha256:[a-f0-9]{64}$/;
 const registryReference = /^[a-zA-Z0-9._:/-]+@sha256:[a-f0-9]{64}$/;
@@ -190,6 +201,14 @@ function hasDeployableMetadata(row: Selectable<ArtifactsTable>, managedCompose: 
       registryReference.test(row.storage_key) && row.storage_key.endsWith(`@${row.image_digest}`)
     );
   if (
+    row.storage_type === 'LOCAL_IMAGE' &&
+    hasArchive &&
+    row.graph_run_id &&
+    row.storage_key.endsWith(`:run-${row.graph_run_id}`) &&
+    isDockerImageReference(row.storage_key)
+  )
+    return true;
+  if (
     row.storage_type === 'REMOTE_IMAGE' &&
     physical?.kind === 'DOCKER_IMAGE' &&
     physical.location === 'DOCKER_ENGINE' &&
@@ -248,9 +267,13 @@ export class ArtifactsService {
     @Optional() private readonly physical?: ArtifactPhysicalService,
     @Optional() private readonly audit?: AuditService,
   ) {}
-  async create(snapshot: PipelineSnapshot, artifact: Omit<PipelineArtifact, 'id'>) {
+  async create(
+    snapshot: PipelineSnapshot,
+    artifact: Omit<PipelineArtifact, 'id'>,
+    flowItemId?: string,
+  ) {
     const grouped = snapshot.graph
-      ? artifactIdentity(snapshot, artifact.name, artifact.serverId)
+      ? artifactIdentity(snapshot, artifact.name, artifact.serverId, flowItemId)
       : undefined;
     const id = grouped?.instanceId ?? randomUUID();
     const temporaryRootId =
@@ -348,8 +371,9 @@ export class ArtifactsService {
           physical_key: locationKey,
           temporary_root_id: temporaryRootId ?? null,
           environment_set_id: artifactEnvironmentSet(origin?.inputs_json ?? null)?.id ?? null,
-          verification_status: artifact.physical ? 'AVAILABLE' : null,
-          verified_at: artifact.physical ? Date.now() : null,
+          verification_status:
+            artifact.physical || (localImage && artifact.archiveKey) ? 'AVAILABLE' : null,
+          verified_at: artifact.physical || (localImage && artifact.archiveKey) ? Date.now() : null,
           project_id: snapshot.projectId,
           service_id: snapshot.serviceId,
           pipeline_run_id: snapshot.runId,
@@ -367,7 +391,7 @@ export class ArtifactsService {
           registry_id: storageType === 'REGISTRY_IMAGE' ? (d.registryId ?? null) : null,
           image_repository: localImage
             ? artifact.imageReference!.slice(0, imageTagPosition)
-            : (d.imageRepository ?? null),
+            : (artifact.imageReference?.split('@')[0] ?? d.imageRepository ?? null),
           image_tag: localImage
             ? artifact.imageReference!.slice(imageTagPosition + 1)
             : (artifact.imageTag ?? null),
@@ -677,6 +701,21 @@ export class ArtifactsService {
       if (error instanceof ConflictException) return { status: 'CHANGED', reason: error.message };
       return { status: 'UNVERIFIABLE', reason: '产物归档无法读取' };
     }
+  }
+
+  async requireFlowInstance(id: string, runId: string) {
+    const instance = await this.database.db
+      .selectFrom('artifacts')
+      .selectAll()
+      .where('id', '=', id)
+      .where('graph_run_id', '=', runId)
+      .where('lifecycle_state', '=', 'ACTIVE')
+      .executeTakeFirst();
+    if (!instance) return false;
+    const verification = await this.check(instance);
+    if (verification.status !== 'AVAILABLE')
+      throw new ConflictException(verification.reason ?? '已登记的镜像实例不可用');
+    return true;
   }
 
   private async recordCheck(row: Instance, check: Verification, userId?: string) {
