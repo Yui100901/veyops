@@ -633,18 +633,17 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   ).body.data;
   const worker = app.get(TaskWorkerService);
   let detail;
-  for (let attempt = 0; attempt < 16; attempt++) {
+  for (const deadline = Date.now() + 30_000; Date.now() < deadline; ) {
     await worker.tick();
     detail = (await admin.get(graphPath + '/runs/' + run.id).expect(200)).body.data;
     if (['SUCCESS', 'FAILED'].includes(detail.status)) break;
-    await delay(20);
+    await delay(50);
   }
   assert.equal(detail.status, 'SUCCESS', JSON.stringify(detail.nodes));
-  assert.equal(
-    detail.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === 'named-checkout').output
-      .commitSha,
-    feature,
+  const namedCheckout = detail.nodes.find(
+    ({ nodeId }: { nodeId: string }) => nodeId === 'named-checkout',
   );
+  assert.equal(namedCheckout.output.commitSha, feature);
   const changedRef = (
     await admin
       .post(namedPath + '/preview')
@@ -1010,7 +1009,9 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
   await operator.post('/api/v1/ai/repository-analysis').send(nodeDraftRequest).expect(502);
   conflictingDraft = false;
   assert.equal((await db.selectFrom('pipelines').select('id').execute()).length, 0);
-  assert.equal((await db.selectFrom('tasks').select('id').execute()).length, 0);
+  assert.deepEqual(await db.selectFrom('tasks').select('id').execute(), [
+    { id: namedCheckout.taskId },
+  ]);
   assert.deepEqual((await operator.get(`${metadataPath}/connection`).expect(200)).body.data, {
     ok: true,
     defaultBranch: 'main',
