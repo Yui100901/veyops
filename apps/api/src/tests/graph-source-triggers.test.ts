@@ -149,8 +149,16 @@ async function verify(t: TestContext, databaseUrl?: string) {
                   start: {
                     execution: { location: 'MANAGER' },
                     sources: [
-                      { id: 'watched', repositoryId: repository.id, ref: { kind: 'BRANCH', value: 'review-alt' } },
-                      { id: 'secondary', repositoryId: secondary.id, ref: { kind: 'BRANCH', value: 'main' } },
+                      {
+                        id: 'watched',
+                        repositoryId: repository.id,
+                        ref: { kind: 'BRANCH', value: 'review-alt' },
+                      },
+                      {
+                        id: 'secondary',
+                        repositoryId: secondary.id,
+                        ref: { kind: 'BRANCH', value: 'main' },
+                      },
                     ],
                   },
                 },
