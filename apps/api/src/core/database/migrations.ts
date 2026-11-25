@@ -2138,6 +2138,19 @@ export const migrationProvider: MigrationProvider = {
           await db.schema.alterTable('task_targets').dropColumn('release_scope_key').execute();
         },
       } satisfies Migration,
+      '042_remove_project_views': {
+        async up(db) {
+          await db.schema.dropTable('view_projects').execute();
+          await db.schema.dropTable('views').execute();
+        },
+        async down(db) {
+          await createTables(
+            db,
+            tables.filter(({ name }) => name === 'views' || name === 'view_projects'),
+            [],
+          );
+        },
+      } satisfies Migration,
     };
   },
 };

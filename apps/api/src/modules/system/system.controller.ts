@@ -40,7 +40,6 @@ class SystemController {
         commands: true,
         operationPlans: true,
         projects: true,
-        views: true,
         pipelines: true,
         deployments: true,
         ai: true,

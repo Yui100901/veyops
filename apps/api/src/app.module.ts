@@ -24,7 +24,6 @@ import { ComposeTemplatesModule } from './modules/service-configs/compose-templa
 import { PipelinesModule } from './modules/pipelines/pipelines.module';
 import { AiModule } from './modules/ai/ai.module';
 import { InitialConfigurationModule } from './core/initial-configuration';
-import { ViewsModule } from './modules/views/views.module';
 import { PortalModule } from './modules/portal/portal.module';
 import { OperationSchedulesModule } from './modules/operation-schedules/operation-schedules.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
@@ -42,7 +41,6 @@ import { SourceReviewModule } from './modules/deployments/source-review.service'
     ServerGroupsModule,
     ProjectsModule,
     EnvironmentSetsModule,
-    ViewsModule,
     PortalModule,
     DeploymentTargetsModule,
     ServiceConfigsModule,

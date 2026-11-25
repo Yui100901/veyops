@@ -231,7 +231,7 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
   assert.ifError(upgrade.error);
   await sql`insert into service_environment_variables (id, config_id, key, value_text)
     values ('legacy-variable', 'legacy-config', 'LEGACY_VALUE', 'kept')`.execute(db);
-  const graphUpgrade = await migrator.migrateToLatest();
+  const graphUpgrade = await migrator.migrateTo('041_execution_flow_workspace');
   assert.ifError(graphUpgrade.error);
   assert.equal(
     (await db.introspection.getTables()).some(({ name }) => name === 'project_dependencies'),
@@ -410,6 +410,39 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
     /check constraint/i,
   );
 
+  await sql`insert into views (id, name, created_by, is_default, created_at)
+    values ('legacy-view', 'Legacy view', 'existing-user', 1, ${now})`.execute(db);
+  await sql`insert into view_projects (view_id, project_id, sort_order)
+    values ('legacy-view', 'project', 0)`.execute(db);
+  const address = {
+    id: 'active-service-link',
+    service_id: 'service',
+    name: 'Application',
+    url: 'https://example.test/application',
+    position: 0,
+  };
+  await db.insertInto('service_addresses').values(address).execute();
+  const cleanup = await migrator.migrateToLatest();
+  assert.ifError(cleanup.error);
+  assert.ok(
+    cleanup.results?.some(
+      ({ migrationName, status }) =>
+        migrationName === '042_remove_project_views' && status === 'Success',
+    ),
+  );
+  assert.equal(
+    (await db.introspection.getTables()).some(
+      ({ name }) => name === 'views' || name === 'view_projects',
+    ),
+    false,
+  );
+  assert.deepEqual(await db.selectFrom('service_addresses').selectAll().execute(), [address]);
+  assert.deepEqual(await db.selectFrom('services').select('id').execute(), [{ id: 'service' }]);
+  assert.deepEqual(
+    await db.selectFrom('execution_flow_runs').select('id').orderBy('id').execute(),
+    [{ id: 'nested-run' }, { id: 'run-published' }],
+  );
+
   const repeat = await migrator.migrateToLatest();
   assert.ifError(repeat.error);
   assert.deepEqual(repeat.results, []);
@@ -522,6 +555,8 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
   const rollback = await migrator.migrateTo('001_initial');
   assert.ifError(rollback.error);
   assert.deepEqual((await sql`select id from project_dependencies`.execute(db)).rows, []);
+  assert.deepEqual((await sql`select id from views`.execute(db)).rows, []);
+  assert.deepEqual((await sql`select view_id from view_projects`.execute(db)).rows, []);
   assert.deepEqual(await db.selectFrom('tasks').select(['id', 'status']).orderBy('id').execute(), [
     { id: 'DEPLOY', status: 'PENDING' },
     { id: 'DEPLOY_ARTIFACT', status: 'CANCELLED' },

@@ -15,31 +15,6 @@ const apiBase = '/api/v1';
 const postgres = process.env.VEYOPS_TEST_POSTGRES_URL;
 
 type Api = ReturnType<typeof request.agent>;
-type Summary = {
-  id: string;
-  kind: string;
-  name: string;
-  description: string;
-  projectIds: string[];
-  isDefault: boolean;
-};
-type ViewIndex = { views: Summary[]; defaultViewId: string };
-type ViewProject = {
-  id: string;
-  deploymentStatus: string;
-  addresses: { id: string; url: string; serviceId: string }[];
-  recentDeployments: {
-    id: string;
-    taskId: string;
-    environmentId: string;
-    serverId: string;
-    serviceId: string;
-    status: string;
-    healthStatus: string;
-  }[];
-};
-type ViewDetail = Summary & { projects: ViewProject[] };
-
 async function get<T>(api: Api, path: string): Promise<T> {
   return (await api.get(apiBase + path).expect(200)).body.data;
 }
@@ -53,189 +28,31 @@ async function create<T>(api: Api, path: string, input: object): Promise<T> {
   ).body.data;
 }
 
-async function edit(api: Api, id: string, input: object): Promise<Summary> {
-  return (
-    await api
-      .patch(apiBase + '/views/' + id)
-      .send(input)
-      .expect(200)
-  ).body.data;
-}
+const project = (api: Api, name: string, slug: string, tags?: string[]) =>
+  create<{ id: string }>(api, '/projects', { name, slug, tags });
 
-const project = (api: Api, name: string, slug: string) =>
-  create<{ id: string }>(api, '/projects', { name, slug });
-
-async function checkCustomViews(
-  admin: Api,
-  operator: Api,
-  viewer: Api,
-  database: Kysely<Database>,
-  adminId: string,
-) {
-  const alpha = await project(admin, 'Alpha', 'alpha');
-  const beta = await project(admin, 'Beta', 'beta');
-  const removed = await project(admin, 'Archived', 'archived');
-  const initial = { name: 'My deployments', projectIds: [beta.id, alpha.id, removed.id] };
-  assert.equal((await get<ViewIndex>(admin, '/views')).defaultViewId, 'all');
-  const privateView = await create<Summary>(admin, '/views', { ...initial, isDefault: true });
-  assert.equal(privateView.kind, 'CUSTOM');
-  assert.equal(privateView.isDefault, true);
-  assert.deepEqual(privateView.projectIds, initial.projectIds);
-
-  const index = await get<ViewIndex>(admin, '/views');
-  assert.equal(index.defaultViewId, privateView.id);
-  assert.equal(index.views.find(({ id }) => id === 'all')?.isDefault, false);
-  assert.deepEqual(
-    index.views.filter(({ kind }) => kind !== 'CUSTOM').map(({ id }) => id),
-    ['all', 'abnormal'],
-  );
-  assert.deepEqual(
-    (await get<ViewDetail>(admin, '/views/' + privateView.id)).projects.map(({ id }) => id),
-    initial.projectIds,
-  );
-
-  await operator.get(apiBase + '/views/' + privateView.id).expect(404);
-  await operator
-    .patch(apiBase + '/views/' + privateView.id)
-    .send(initial)
-    .expect(404);
-  await operator.delete(apiBase + '/views/' + privateView.id).expect(404);
-  assert.equal((await get<ViewIndex>(operator, '/views')).defaultViewId, 'all');
-  const operatorView = await create<Summary>(operator, '/views', {
-    name: 'Operator view',
-    projectIds: [alpha.id],
-    isDefault: true,
-  });
-  await admin.get(apiBase + '/views/' + operatorView.id).expect(404);
-  assert.deepEqual(
-    (await get<ViewIndex>(viewer, '/views')).views.map(({ id }) => id),
-    ['all', 'abnormal'],
-  );
-  await viewer.get(apiBase + '/views/all').expect(200);
-  await viewer.get(apiBase + '/views/' + privateView.id).expect(404);
-  await viewer
-    .post(apiBase + '/views')
-    .send(initial)
-    .expect(403);
-  await viewer
-    .patch(apiBase + '/views/' + privateView.id)
-    .send(initial)
-    .expect(403);
-  await viewer.delete(apiBase + '/views/' + privateView.id).expect(403);
-  await admin
-    .patch(apiBase + '/views/abnormal')
-    .send(initial)
-    .expect(403);
-  await admin.delete(apiBase + '/views/all').expect(403);
-
-  const amended = {
-    name: 'Release order',
-    description: 'Shown in order',
-    projectIds: [alpha.id, removed.id, beta.id],
-  };
-  const changed = await edit(admin, privateView.id, amended);
-  assert.equal(changed.name, amended.name);
-  assert.equal(changed.description, amended.description);
-  assert.equal(changed.isDefault, true);
-  assert.deepEqual(changed.projectIds, amended.projectIds);
-  const editedPath = apiBase + '/views/' + privateView.id;
-  for (const projectIds of [[beta.id, beta.id], [randomUUID()], ['not-a-uuid']]) {
-    await admin
-      .patch(editedPath)
-      .send({ ...amended, projectIds, isDefault: false })
-      .expect(400);
-  }
-  assert.deepEqual(
-    (await get<ViewDetail>(admin, '/views/' + privateView.id)).projects.map(({ id }) => id),
-    amended.projectIds,
-  );
-  assert.equal((await get<ViewIndex>(admin, '/views')).defaultViewId, privateView.id);
-
-  await admin.delete(apiBase + '/projects/' + removed.id).expect(200);
-  const afterRemoval = await get<ViewDetail>(admin, '/views/' + privateView.id);
-  assert.deepEqual(afterRemoval.projectIds, [alpha.id, beta.id]);
-  assert.deepEqual(
-    afterRemoval.projects.map(({ id }) => id),
-    [alpha.id, beta.id],
-  );
-  assert.ok(!(await get<ViewDetail>(admin, '/views/all')).projectIds.includes(removed.id));
-  await admin
-    .post(apiBase + '/views')
-    .send({ ...initial, projectIds: [removed.id] })
-    .expect(400);
-
-  const concurrent = await Promise.all(
-    ['First default', 'Second default'].map((name) =>
-      create<Summary>(admin, '/views', {
-        name,
-        projectIds: [],
-        isDefault: true,
-      }),
-    ),
-  );
-  const afterSwitch = await get<ViewIndex>(admin, '/views');
-  const defaults = afterSwitch.views.filter(({ isDefault }) => isDefault);
-  assert.equal(defaults.length, 1);
-  assert.equal(defaults[0]?.id, afterSwitch.defaultViewId);
-  assert.ok(concurrent.some(({ id }) => id === afterSwitch.defaultViewId));
-  assert.equal((await get<ViewIndex>(operator, '/views')).defaultViewId, operatorView.id);
-  await admin.delete(apiBase + '/views/' + afterSwitch.defaultViewId).expect(200);
-  assert.equal((await get<ViewIndex>(admin, '/views')).defaultViewId, 'all');
-  await edit(admin, privateView.id, {
-    name: 'Restored default',
-    projectIds: [alpha.id],
-    isDefault: true,
-  });
-  await edit(admin, privateView.id, {
-    name: 'Cleared default',
-    projectIds: [alpha.id],
-    isDefault: false,
-  });
-  assert.equal((await get<ViewIndex>(admin, '/views')).defaultViewId, 'all');
-  await admin.delete(editedPath).expect(200);
-  await admin.get(editedPath).expect(404);
-  await admin.get(apiBase + '/projects/' + alpha.id).expect(200);
-  assert.equal(
-    (
-      await database
-        .selectFrom('view_projects')
-        .select('project_id')
-        .where('view_id', '=', privateView.id)
-        .execute()
-    ).length,
-    0,
-  );
-  const audit = await database
-    .selectFrom('audit_logs')
-    .select('action')
-    .where('user_id', '=', adminId)
-    .where('resource_id', '=', privateView.id)
-    .execute();
-  assert.deepEqual(
-    new Set(audit.map(({ action }) => action)),
-    new Set(['view.create', 'view.update', 'view.delete']),
-  );
-}
-
-async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId: string) {
-  const [mixed, unchecked, running, empty, inactive] = await Promise.all([
-    project(api, 'Mixed targets', 'mixed'),
-    project(api, 'Unchecked', 'unchecked'),
-    project(api, 'Running', 'running'),
-    project(api, 'Empty', 'empty'),
-    project(api, 'Inactive target', 'inactive'),
-  ]);
+async function checkPortal(api: Api, viewer: Api, db: Kysely<Database>, userId: string) {
+  const [mixed, unchecked, running, empty, inactive, cancelled, firstFailure, uncertain] =
+    await Promise.all([
+      project(api, 'Mixed targets', 'mixed', ['Customer apps']),
+      project(api, 'Unchecked', 'unchecked'),
+      project(api, 'Running', 'running'),
+      project(api, 'Empty', 'empty'),
+      project(api, 'Inactive target', 'inactive'),
+      project(api, 'Cancelled only', 'cancelled'),
+      project(api, 'First failed release', 'first-failure', ['Internal apps']),
+      project(api, 'Health needs checking', 'needs-checking'),
+    ]);
   const now = Date.now();
   const timestamps = { created_at: now, updated_at: now };
   const [firstServer, secondServer, inactiveServer] = [randomUUID(), randomUUID(), randomUUID()];
-  const groupId = randomUUID();
   const targetId = randomUUID();
   await db
     .insertInto('servers')
     .values(
       [firstServer, secondServer, inactiveServer].map((id, index) => ({
         id,
-        name: `View fixture server ${index + 1}`,
+        name: `Portal fixture server ${index + 1}`,
         host: '127.0.0.1',
         username: 'fixture',
         is_active: id === inactiveServer ? 0 : 1,
@@ -244,22 +61,8 @@ async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId:
     )
     .execute();
   await db
-    .insertInto('server_groups')
-    .values({ id: groupId, name: 'View fixture group', created_at: now })
-    .execute();
-  await db
-    .insertInto('server_group_members')
-    .values(
-      [firstServer, inactiveServer].map((id) => ({
-        group_id: groupId,
-        server_id: id,
-        created_at: now,
-      })),
-    )
-    .execute();
-  await db
     .insertInto('deployment_targets')
-    .values({ id: targetId, name: 'View targets', ...timestamps })
+    .values({ id: targetId, name: 'Portal targets', ...timestamps })
     .execute();
 
   const environment = (id: string, name: string, environmentType: 'PRODUCTION' | 'TESTING') =>
@@ -395,26 +198,23 @@ async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId:
   }
 
   const mixedDeploy = await deploymentHistory(mixed.id, web.id);
-  const superseded = await mixedDeploy(production.id, firstServer, now + 10, 'FAILED', 'FAILED');
+  await mixedDeploy(production.id, firstServer, now + 10, 'FAILED', 'FAILED');
   for (const offset of [20, 30, 40, 50]) {
     await mixedDeploy(production.id, secondServer, now + offset, 'SUCCESS', 'HEALTHY');
   }
   const failed = await mixedDeploy(production.id, secondServer, now + 55, 'FAILED', 'FAILED');
   const tested = await mixedDeploy(testing.id, firstServer, now + 60, 'SUCCESS', 'HEALTHY');
   const backendDeploy = await deploymentHistory(mixed.id, backend.id);
-  const backendRelease = await backendDeploy(
-    production.id,
-    secondServer,
-    now + 65,
-    'SUCCESS',
-    'HEALTHY',
-  );
+  await backendDeploy(production.id, secondServer, now + 65, 'SUCCESS', 'HEALTHY');
   const uncheckedDeploy = await deploymentHistory(
     unchecked.id,
-    (await service(unchecked.id, 'web')).id,
+    (await service(unchecked.id, 'web', ['unchecked-service'])).id,
   );
   await uncheckedDeploy(uncheckedEnv.id, firstServer, now + 20, 'SUCCESS', 'NOT_CHECKED');
-  const runningDeploy = await deploymentHistory(running.id, (await service(running.id, 'web')).id);
+  const runningDeploy = await deploymentHistory(
+    running.id,
+    (await service(running.id, 'web', ['running-service'])).id,
+  );
   await runningDeploy(runningEnv.id, firstServer, now + 20, 'RUNNING', 'PENDING');
   const inactiveDeploy = await deploymentHistory(
     inactive.id,
@@ -422,16 +222,41 @@ async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId:
   );
   await inactiveDeploy(inactiveEnv.id, inactiveServer, now + 20, 'SUCCESS', 'HEALTHY');
 
+  const cancelledService = await service(cancelled.id, 'cancelled-service', ['cancelled']);
+  const cancelledEnv = await environment(cancelled.id, 'Testing', 'TESTING');
+  const cancelledDeploy = await deploymentHistory(cancelled.id, cancelledService.id);
+  await cancelledDeploy(cancelledEnv.id, firstServer, now + 24, 'CANCELLED', 'NOT_CHECKED');
+
+  const scope = (projectId: string, serviceId: string, serverId: string, path: string) =>
+    JSON.stringify([projectId, serviceId, serverId, 'FILE', path]);
+  const firstFailureService = await service(firstFailure.id, 'first-failure', ['first-failure']);
+  const firstFailureEnv = await environment(firstFailure.id, 'Testing', 'TESTING');
+  const firstFailedDeploy = await deploymentHistory(firstFailure.id, firstFailureService.id);
+  await firstFailedDeploy(firstFailureEnv.id, firstServer, now + 25, 'FAILED', 'NOT_CHECKED', {
+    scopeKey: scope(firstFailure.id, firstFailureService.id, firstServer, '/opt/failed'),
+    record: false,
+  });
+
+  const uncertainService = await service(uncertain.id, 'needs-checking', ['needs-checking']);
+  const uncertainEnv = await environment(uncertain.id, 'Testing', 'TESTING');
+  const uncertainDeploy = await deploymentHistory(uncertain.id, uncertainService.id);
+  await uncertainDeploy(uncertainEnv.id, firstServer, now + 26, 'SUCCESS', 'UNKNOWN', {
+    scopeKey: scope(uncertain.id, uncertainService.id, firstServer, '/opt/uncertain'),
+    activated: true,
+  });
+
   const portal = await get<{
+    tags: string[];
     projects: {
       id: string;
       services: {
         id: string;
+        abnormal: boolean;
         addresses: { name: string; url: string }[];
         targets: {
-          current: string;
-          health: string;
-          healthObservedAt: number;
+          current: string | null;
+          health: string | null;
+          healthObservedAt: number | null;
           lastAttempt: string;
         }[];
       }[];
@@ -479,65 +304,53 @@ async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId:
   await api.delete(`${apiBase}/projects/${mixed.id}/services/${archivedService.id}`).expect(200);
   assert.deepEqual((await get<typeof portal>(viewer, '/portal?q=archive-only')).projects, []);
 
-  const all = await get<ViewDetail>(api, '/views/all');
-  assert.equal(all.projects.find(({ id }) => id === empty.id)?.deploymentStatus, 'NOT_DEPLOYED');
-  assert.equal(all.projects.find(({ id }) => id === mixed.id)?.deploymentStatus, 'ABNORMAL');
-  assert.equal(all.projects.find(({ id }) => id === unchecked.id)?.deploymentStatus, 'UNVERIFIED');
-  assert.equal(all.projects.find(({ id }) => id === running.id)?.deploymentStatus, 'RUNNING');
-  assert.deepEqual((await get<ViewDetail>(api, '/views/abnormal')).projectIds, [mixed.id]);
-
-  const mixedProject = all.projects.find(({ id }) => id === mixed.id)!;
+  assert.deepEqual(portal.tags, ['Customer apps', 'Internal apps']);
+  assert.equal(portalService.abnormal, true);
+  const abnormal = (q?: string) =>
+    get<typeof portal>(viewer, '/portal?abnormal=true' + (q ? '&' + q : ''));
   assert.deepEqual(
-    mixedProject.recentDeployments.map(({ id }) => id),
-    [backendRelease.recordId, tested.recordId, failed.recordId],
-  );
-  const healthyTarget = await get<ViewDetail>(
-    api,
-    `/views/all?serviceId=${web.id}&serverId=${firstServer}`,
-  );
-  assert.deepEqual(healthyTarget.projectIds, [mixed.id]);
-  const [healthyProject] = healthyTarget.projects;
-  assert.equal(healthyProject?.deploymentStatus, 'HEALTHY');
-  assert.deepEqual(
-    healthyProject?.addresses.map(({ id, serviceId }) => ({ id, serviceId })),
-    web.addresses.map(({ id }) => ({ id, serviceId: web.id })),
+    new Set((await abnormal()).projects.map(({ id }) => id)),
+    new Set([mixed.id, firstFailure.id, uncertain.id]),
   );
   assert.deepEqual(
-    healthyProject?.recentDeployments.map(({ id, serverId, serviceId }) => ({
+    (await abnormal('q=docs&tag=Customer%20apps')).projects.map(({ id, services }) => ({
       id,
-      serverId,
-      serviceId,
+      services: services.map(({ id: serviceId }) => serviceId),
     })),
-    [tested, superseded].map(({ recordId }) => ({
-      id: recordId,
-      serverId: firstServer,
-      serviceId: web.id,
-    })),
+    [{ id: mixed.id, services: [web.id] }],
   );
-
-  const failingTarget = await get<ViewDetail>(api, `/views/all?serverId=${secondServer}`);
-  assert.deepEqual(failingTarget.projectIds, [mixed.id]);
-  assert.equal(failingTarget.projects[0]?.deploymentStatus, 'ABNORMAL');
-  const backendView = await get<ViewDetail>(api, `/views/all?serviceId=${backend.id}`);
-  assert.deepEqual(backendView.projectIds, [mixed.id]);
-  assert.equal(backendView.projects[0]?.deploymentStatus, 'HEALTHY');
-  assert.deepEqual(
-    backendView.projects[0]?.recentDeployments.map(({ id }) => id),
-    [backendRelease.recordId],
-  );
-
-  const group = await get<ViewDetail>(api, `/views/all?groupId=${groupId}`);
-  assert.deepEqual(new Set(group.projectIds), new Set([mixed.id, unchecked.id, running.id]));
-  assert.ok(
-    group.projects.every(({ recentDeployments }) =>
-      recentDeployments.every(({ serverId }) => serverId === firstServer),
-    ),
-  );
-  await api.get(`${apiBase}/views/all?serverId=${firstServer}&groupId=${groupId}`).expect(400);
-  await api.get(`${apiBase}/views/all?groupId=${randomUUID()}`).expect(404);
-  await api.get(`${apiBase}/views/all?serverId=${randomUUID()}`).expect(404);
-  await api.get(apiBase + '/views/production').expect(404);
-  await api.get(apiBase + '/views/testing').expect(404);
+  assert.deepEqual((await abnormal('q=docs&tag=Internal%20apps')).projects, []);
+  assert.deepEqual((await abnormal('serviceId=' + backend.id)).projects, []);
+  assert.equal((await abnormal('projectId=' + mixed.id)).projects[0]?.services[0]?.id, web.id);
+  for (const id of [unchecked.id, running.id, empty.id, cancelled.id])
+    assert.deepEqual((await abnormal('projectId=' + id)).projects, []);
+  const firstRejectedTarget = (await abnormal('projectId=' + firstFailure.id)).projects[0]
+    ?.services[0]?.targets[0];
+  assert.equal(firstRejectedTarget?.current, null);
+  assert.equal(firstRejectedTarget?.lastAttempt, 'FAILED');
+  const uncertainTarget = (await abnormal('projectId=' + uncertain.id)).projects[0]?.services[0]
+    ?.targets[0];
+  assert.equal(uncertainTarget?.current, 'SUCCESS');
+  assert.equal(uncertainTarget?.health, 'UNKNOWN');
+  const uncheckedTarget = (
+    await get<typeof portal>(viewer, '/portal?abnormal=false&projectId=' + unchecked.id)
+  ).projects[0]?.services[0]?.targets[0];
+  assert.equal(uncheckedTarget?.health, 'NOT_CHECKED');
+  const runningTarget = (await get<typeof portal>(viewer, '/portal?projectId=' + running.id))
+    .projects[0]?.services[0]?.targets[0];
+  const cancelledTarget = (await get<typeof portal>(viewer, '/portal?projectId=' + cancelled.id))
+    .projects[0]?.services[0]?.targets[0];
+  assert.equal(runningTarget?.lastAttempt, 'RUNNING');
+  assert.equal(cancelledTarget?.lastAttempt, 'CANCELLED');
+  await viewer.get(apiBase + '/portal?abnormal=yes').expect(400);
+  const retiredProject = await project(api, 'Archived project', 'archived-project', [
+    'Archived tag',
+  ]);
+  await service(retiredProject.id, 'archived-project-service', ['archived-project-link']);
+  await api.delete(apiBase + '/projects/' + retiredProject.id).expect(200);
+  const archived = await get<typeof portal>(viewer, '/portal?q=archived-project');
+  assert.deepEqual(archived.projects, []);
+  assert.ok(!archived.tags.includes('Archived tag'));
 
   const recent = `/projects/${mixed.id}/services/${tested.serviceId}/recent-deployments`;
   const rows = await get<{ id: string; serviceId: string }[]>(api, recent);
@@ -552,11 +365,9 @@ async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId:
   await api.get(`${apiBase}${recent}?environmentId=${uncheckedEnv.id}`).expect(404);
   await api.get(apiBase + recent.replace(mixed.id, unchecked.id)).expect(404);
 
-  const fix = await mixedDeploy(production.id, secondServer, now + 70, 'SUCCESS', 'HEALTHY');
-  assert.deepEqual((await get<ViewDetail>(api, '/views/abnormal')).projectIds, []);
-  const repaired = (await get<ViewDetail>(api, `/views/all?serviceId=${web.id}`)).projects[0]!;
-  assert.equal(repaired.deploymentStatus, 'HEALTHY');
-  assert.equal(repaired.recentDeployments[0]?.taskId, fix.taskId);
+  await mixedDeploy(production.id, secondServer, now + 70, 'SUCCESS', 'HEALTHY');
+  await mixedDeploy(production.id, firstServer, now + 72, 'SUCCESS', 'HEALTHY');
+  assert.deepEqual((await abnormal('projectId=' + mixed.id)).projects, []);
 
   const scopeKey = (serverId: string, location: string) =>
     JSON.stringify([mixed.id, web.id, serverId, 'FILE', location]);
@@ -655,10 +466,10 @@ async function checkPresets(api: Api, viewer: Api, db: Kysely<Database>, userId:
   assert.equal(restoredHead.latestAttempt.status, 'FAILED');
 }
 
-async function checkViews(databaseUrl?: string) {
-  const directory = await mkdtemp(join(tmpdir(), 'veyops-views-'));
-  const bootstrapPassword = 'views-fixture-bootstrap';
-  const password = 'views-fixture-updated';
+async function checkPortalAccess(databaseUrl?: string) {
+  const directory = await mkdtemp(join(tmpdir(), 'veyops-portal-'));
+  const bootstrapPassword = 'portal-fixture-bootstrap';
+  const password = 'portal-fixture-updated';
   const environment = {
     DATABASE_CLIENT: databaseUrl ? 'postgres' : 'sqlite',
     DATABASE_URL: databaseUrl,
@@ -731,13 +542,19 @@ async function checkViews(databaseUrl?: string) {
       .send({ username: 'viewer', password })
       .expect(201);
     await request(server)
-      .get(apiBase + '/views')
-      .expect(401);
-    await request(server)
       .get(apiBase + '/portal')
       .expect(401);
-    await checkCustomViews(admin, operator, viewer, db, current.id);
-    await checkPresets(admin, viewer, db, current.id);
+    await admin.get(apiBase + '/views').expect(404);
+    await admin
+      .post(apiBase + '/views')
+      .send({ name: 'Retired view' })
+      .expect(404);
+    const system = await get<{ features: Record<string, boolean> }>(admin, '/system');
+    assert.equal(system.features.views, undefined);
+    await checkPortal(admin, viewer, db, current.id);
+    const fixture = await get(viewer, '/portal?tag=Customer%20apps&abnormal=true');
+    assert.deepEqual(await get(operator, '/portal?tag=Customer%20apps&abnormal=true'), fixture);
+    assert.deepEqual(await get(admin, '/portal?tag=Customer%20apps&abnormal=true'), fixture);
   } finally {
     try {
       await app?.close();
@@ -751,13 +568,13 @@ async function checkViews(databaseUrl?: string) {
   }
 }
 
-test('SQLite project views persist private ordered collections and scope deployment health', () =>
-  checkViews());
+test('SQLite portal filters and reports deployment facts for authorized members', () =>
+  checkPortalAccess());
 test(
-  'PostgreSQL project views persist private ordered collections and scope deployment health',
+  'PostgreSQL portal filters and reports deployment facts for authorized members',
   { skip: !postgres },
   async () => {
     const { withIsolatedPostgres } = await import('./helpers/isolated-postgres.js');
-    await withIsolatedPostgres(postgres!, checkViews);
+    await withIsolatedPostgres(postgres!, checkPortalAccess);
   },
 );

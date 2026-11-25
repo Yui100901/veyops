@@ -613,21 +613,6 @@ export interface AiMessagesTable {
   created_at: number;
 }
 
-export interface ViewsTable {
-  id: string;
-  name: string;
-  description: Generated<string>;
-  created_by: string;
-  is_default: Generated<number>;
-  created_at: number;
-}
-
-export interface ViewProjectsTable {
-  view_id: string;
-  project_id: string;
-  sort_order: Generated<number>;
-}
-
 export interface AuditLogsTable {
   id: string;
   actor_type: string;
@@ -990,8 +975,6 @@ export interface Database {
   ai_action_proposals: AiActionProposalsTable;
   ai_conversations: AiConversationsTable;
   ai_messages: AiMessagesTable;
-  views: ViewsTable;
-  view_projects: ViewProjectsTable;
   audit_logs: AuditLogsTable;
   operation_schedules: OperationSchedulesTable;
   operation_schedule_runs: OperationScheduleRunsTable;
