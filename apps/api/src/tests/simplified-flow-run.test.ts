@@ -676,9 +676,16 @@ test(
         { from: conditionId, to: end.id, when: 'FALSE' },
       ];
       const skippedVersion = await publish(unscoped);
-      const skippedPreview = await create(flow + '/preview', { version: skippedVersion });
+      const inputs = { value: 'skip' };
+      const skippedPreview = await create(flow + '/preview', { version: skippedVersion, inputs });
       assert.equal(skippedPreview.simplified.workspaceRetention, 'OFF');
-      const skipped = await runVersion(skippedVersion, skippedPreview.configurationHash);
+      const { id: skippedId } = await create(flow + '/run', {
+        version: skippedVersion,
+        inputs,
+        expectedConfigurationHash: skippedPreview.configurationHash,
+        idempotencyKey: randomUUID(),
+      });
+      const skipped = await waitRun(skippedId, 'SUCCESS');
       assert.equal(skipped.nodes.find(({ nodeId }) => nodeId === checkout.id)?.status, 'SKIPPED');
       assert.equal(skipped.simplified?.workspacePath, null);
       assert.deepEqual(skipped.artifactIds, []);
