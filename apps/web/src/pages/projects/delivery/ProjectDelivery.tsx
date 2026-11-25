@@ -4,6 +4,7 @@ import type { FormEvent } from 'react';
 import { navigate, useResource } from '../../../api';
 import { ErrorBanner, Loading, Section } from '../../../components';
 import type { ProjectDetail, User } from '../../../models';
+import { workspaceBackLink } from '../../../workspace-navigation';
 import { DeliveryRecordsPage } from '../../delivery/Delivery';
 import { ProjectArtifacts } from './ProjectArtifacts';
 import {
@@ -126,12 +127,16 @@ export function ProjectDelivery({
   const activeEnvironment =
     !environmentId || project.environments.some((item) => item.id === environmentId);
   const hasLocator = Boolean(recordId || pipelineRunId || taskId);
+  const back = workspaceBackLink(scope);
   return (
     <div className={embedded ? 'project-delivery' : 'project-workspace'}>
       {!embedded && (
         <>
-          <a className="back-link" href={project.archived ? '#/projects' : `#/projects/${id}`}>
-            ← {project.archived ? '返回项目列表' : project.name}
+          <a
+            className="back-link"
+            href={'#' + (origin || project.archived ? back.path : projectResourcePath(id))}
+          >
+            ← {origin || project.archived ? '返回' + back.label : project.name}
           </a>
           <h1>{service ? service.name : project.name} · 交付记录</h1>
         </>
