@@ -40,6 +40,10 @@ async function checkTemplates(databaseUrl?: string) {
     const createProject = (slug: string) => api.post(`${root}/projects`).send({ name: slug, slug });
     const project = (await createProject('template-fixture').expect(201)).body.data;
     const path = `${root}/projects/${project.id}/execution-graph`;
+    async function projectCatalog() {
+      const { body } = await api.get(`${root}/delivery-flows`).expect(200);
+      return body.data.find(({ projectId }: { projectId: string }) => projectId === project.id);
+    }
     const draft = (await api.get(path).expect(200)).body.data;
     assert.equal(draft.revision, 1);
     assert.equal(draft.publishedVersion, null);
@@ -58,6 +62,18 @@ async function checkTemplates(databaseUrl?: string) {
       seed.nodes.every(({ inputs, outputs }) => inputs === undefined && outputs === undefined),
     );
     assert.equal(seed.endpoints[0]?.inputBindings, undefined);
+    const initialCatalog = await projectCatalog();
+    assert.equal(initialCatalog.hasDraftChanges, true);
+    assert.deepEqual(
+      initialCatalog.flows.map(
+        ({ id, inDraft, version }: { id: string; inDraft: boolean; version?: number }) => [
+          id,
+          inDraft,
+          version,
+        ],
+      ),
+      [[seed.nodes[0]!.id, true, undefined]],
+    );
     assert.deepEqual((await api.get(path).expect(200)).body.data, draft);
     assert.deepEqual((await api.get(`${path}/runs`).expect(200)).body.data, []);
     const { flowTemplates } = (await api.get(`${path}/catalog`).expect(200)).body.data;
@@ -211,9 +227,25 @@ async function checkTemplates(databaseUrl?: string) {
       .expect(201);
     assert.deepEqual(ciValidated.body.data.issues, []);
     const ciDraft = (await save(ci, published.revision).expect(200)).body.data;
+    const pendingCatalog = await projectCatalog();
+    assert.equal(pendingCatalog.hasDraftChanges, true);
+    assert.equal(pendingCatalog.flows.length, 2);
+    const active = pendingCatalog.flows.find(({ id }: { id: string }) => id === seed.nodes[0]!.id);
+    assert.equal(active.version, published.publishedVersion);
+    assert.equal(active.inDraft, false);
+    const ciStartId = ci.endpoints[0]!.startId;
+    const draftOnly = pendingCatalog.flows.find(({ id }: { id: string }) => id === ciStartId);
+    assert.equal(draftOnly.inDraft, true);
+    assert.equal(draftOnly.version, undefined);
     const ciPublished = (
       await api.post(`${path}/publish`).send({ expectedRevision: ciDraft.revision }).expect(201)
     ).body.data;
+    const ciCatalog = await projectCatalog();
+    assert.equal(ciCatalog.hasDraftChanges, false);
+    assert.equal(ciCatalog.flows.length, 1);
+    assert.equal(ciCatalog.flows[0].id, ciStartId);
+    assert.equal(ciCatalog.flows[0].version, ciPublished.publishedVersion);
+    assert.equal(ciCatalog.flows[0].inDraft, true);
     const mixed: GraphCanvas = {
       nodes: [
         { id: 'old-start', name: '已有流程', type: 'START' },

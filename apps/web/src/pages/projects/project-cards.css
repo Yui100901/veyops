@@ -1,6 +1,6 @@
 .project-grid.project-catalog {
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
-  align-items: stretch;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 32rem), 1fr));
+  align-items: start;
   gap: var(--section-gap);
 }
 .project-catalog .project-card {
@@ -13,6 +13,7 @@
 .project-catalog .project-card-top {
   margin-bottom: 0;
   align-items: center;
+  flex-wrap: wrap;
 }
 .project-catalog .project-avatar {
   flex-shrink: 0;
@@ -21,31 +22,71 @@
   min-width: 0;
 }
 .project-catalog .project-card-top h2,
-.project-catalog .project-card > p,
 .project-catalog .project-card > .tags {
   min-height: 0;
   margin: 0;
   overflow-wrap: anywhere;
-}
-.project-catalog .project-card > p {
-  font-size: 0.9rem;
-}
-.project-catalog .project-card-footer {
-  align-items: center;
-  flex-wrap: wrap;
-  margin-top: auto;
-  padding: 10px 0 0;
-  color: #526675;
-  font-size: 0.85rem;
-}
-.project-catalog .project-card-footer > a {
-  margin-inline-start: auto;
 }
 .project-catalog .project-slug {
   display: block;
   color: #526675;
   font-size: 0.82rem;
   overflow-wrap: anywhere;
+}
+.project-catalog .project-card-heading {
+  flex: 1 1 12rem;
+}
+.project-card-flows {
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--border);
+}
+.project-card-flows h3 {
+  margin: 0 0 0.4rem;
+  color: #3c5361;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+.project-flow-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.project-flow-list > li,
+.project-flow-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.9rem;
+  padding-block: 0.45rem;
+  overflow-wrap: anywhere;
+}
+.project-flow-list > li + li {
+  border-top: 1px solid var(--border);
+}
+.project-flow-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.55rem;
+  min-width: 0;
+  font-size: 0.9rem;
+}
+.project-flow-result {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  border-radius: 5px;
+  font-size: 0.82rem;
+  color: #35565f;
+}
+.project-flow-result:hover {
+  text-decoration: underline;
+}
+.project-flow-empty {
+  color: var(--muted);
+  font-size: 0.86rem;
 }
 .project-access {
   min-width: 0;
@@ -55,14 +96,6 @@
   font-size: 0.84rem;
   font-weight: 600;
   margin: 0 0 0.4rem;
-}
-.project-view-card > .project-access {
-  margin-top: 10px;
-}
-
-.project-views-layout .project-views-grid {
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr));
-  gap: var(--section-gap);
 }
 .project-access :is(.project-access-services, .project-access-links) {
   display: flex;
@@ -148,12 +181,28 @@
   overflow-wrap: anywhere;
   user-select: text;
 }
+.project-access-address {
+  grid-column: 1 / -1;
+  min-width: 0;
+  border-top: 1px solid #b4d6c9;
+}
+.project-access-address > summary {
+  min-height: 30px;
+  padding: 0.35rem 0.55rem;
+  cursor: pointer;
+  color: #35565f;
+  font-size: 0.82rem;
+}
+.project-access-address[open] .project-access-expand,
+.project-access-address:not([open]) .project-access-collapse {
+  display: none;
+}
+.project-access-address > .project-access-url {
+  display: block;
+}
 .project-access-feedback,
 .project-access-empty {
   color: #526675;
   font-size: 0.85rem;
   margin: 0.5rem 0 0;
-}
-.project-view-server-link {
-  margin-left: 0.6rem;
 }

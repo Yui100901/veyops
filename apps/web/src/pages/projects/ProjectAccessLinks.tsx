@@ -49,12 +49,12 @@ async function copyUrl(url: string) {
   }
 }
 
-function AccessLinkList({ links }: { links: AccessLink[] }) {
+function AccessLinkList({ links, compact }: { links: AccessLink[]; compact: boolean }) {
   const [feedback, setFeedback] = useState('');
 
   async function copyAddress(link: AccessLink) {
     const copied = await copyUrl(link.url);
-    setFeedback(copied ? `已复制「${link.name}」的地址` : '复制失败，可选中完整地址手动复制。');
+    setFeedback(copied ? `已复制「${link.name}」的地址` : '复制失败，可手动选择完整地址并复制。');
   }
 
   return (
@@ -81,7 +81,17 @@ function AccessLinkList({ links }: { links: AccessLink[] }) {
               <Copy size={15} aria-hidden="true" />
               复制
             </button>
-            <code className="project-access-url">{link.url}</code>
+            {compact ? (
+              <details className="project-access-address">
+                <summary>
+                  <span className="project-access-expand">显示地址</span>
+                  <span className="project-access-collapse">隐藏地址</span>
+                </summary>
+                <code className="project-access-url">{link.url}</code>
+              </details>
+            ) : (
+              <code className="project-access-url">{link.url}</code>
+            )}
           </li>
         ))}
       </ul>
@@ -98,16 +108,20 @@ export function ProjectAccessLinks({
   addresses,
   serviceHref,
   showEmpty = false,
+  compact = false,
+  title = '访问地址',
 }: {
   addresses: ProjectAccessLink[];
   serviceHref?: (serviceId: string) => string;
   showEmpty?: boolean;
+  compact?: boolean;
+  title?: string;
 }) {
   const links = addresses.flatMap((address) => {
     const href = projectAccessUrl(address.url);
     return href ? [{ ...address, href }] : [];
   });
-  if (!links.length) return showEmpty ? <p className="project-access-empty">暂无访问地址</p> : null;
+  if (!links.length && !showEmpty) return null;
   const services = new Map<string | null, AccessLink[]>();
   if (serviceHref) {
     for (const link of links) {
@@ -119,8 +133,10 @@ export function ProjectAccessLinks({
   }
   return (
     <div className="project-access">
-      <h4>访问地址</h4>
-      {serviceHref ? (
+      <h4>{title}</h4>
+      {!links.length ? (
+        <div className="project-access-empty">暂无访问地址</div>
+      ) : serviceHref ? (
         <ul className="project-access-services">
           {[...services].map(([id, group]) => (
             <li className="project-access-service" key={id ?? ''}>
@@ -133,12 +149,12 @@ export function ProjectAccessLinks({
                   '其他地址'
                 )}
               </h5>
-              <AccessLinkList links={group} />
+              <AccessLinkList links={group} compact={compact} />
             </li>
           ))}
         </ul>
       ) : (
-        <AccessLinkList links={links} />
+        <AccessLinkList links={links} compact={compact} />
       )}
     </div>
   );

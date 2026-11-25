@@ -93,33 +93,65 @@ export class GraphFlowCatalogController {
         project.definition_json && project.retired_at === null
           ? (JSON.parse(project.definition_json) as GraphDefinition)
           : undefined;
+      const draftCanvas = draft.canvas?.model === 'FLOW_V2' ? draft.canvas : undefined;
+      const currentFlows = current?.canvas?.model === 'FLOW_V2' ? current.flows : [];
+      const hasDraftChanges = Boolean(
+        draftCanvas &&
+        (current ? project.source_revision !== project.revision : draftCanvas.nodes.length),
+      );
       const notes = new Map<
         string,
-        { id: string; name: string; serviceIds: string[]; version?: number }
+        {
+          id: string;
+          name: string;
+          serviceIds: string[];
+          inDraft: boolean;
+          version?: number;
+          hasRuntimeInputs?: boolean;
+          needsArtifactInput?: boolean;
+        }
       >();
-      for (const node of draft.canvas?.model === 'FLOW_V2' ? draft.canvas.nodes : []) {
+      for (const node of draftCanvas?.nodes ?? []) {
         if (node.type === 'START') {
           const serviceId = node.start?.release?.serviceId;
           notes.set(node.id, {
             id: node.id,
             name: node.name,
             serviceIds: serviceId ? [serviceId] : [],
+            inDraft: true,
           });
         }
       }
-      for (const flow of current?.canvas?.model === 'FLOW_V2' ? current.flows : []) {
+      for (const flow of currentFlows) {
         if (flow.model !== 'FLOW_V2') continue;
-        const serviceId = flowStart(flow).start?.release?.serviceId;
+        const start = flowStart(flow).start;
+        const serviceId = start?.release?.serviceId;
+        const artifactOverride = Boolean(start?.release?.allowArtifactOverride);
         notes.set(flow.id, {
           id: flow.id,
           name: flow.name,
           serviceIds: serviceId ? [serviceId] : [],
           version: project.published_version!,
+          inDraft: notes.has(flow.id),
+          hasRuntimeInputs: Boolean(
+            artifactOverride ||
+            start?.sources?.some(({ allowRefOverride }) => allowRefOverride) ||
+            start?.variables?.some(
+              ({ allowOverride, credentialId }) => allowOverride && !credentialId,
+            ) ||
+            flow.nodes.some(
+              ({ type, condition, branch, switch: choice }) =>
+                (type === 'CONDITION' || type === 'SWITCH') &&
+                !(condition ?? branch ?? choice)?.parameterKey,
+            ),
+          ),
+          needsArtifactInput: artifactOverride && Boolean(start?.release?.useUpstreamArtifact),
         });
       }
       return {
         projectId: project.id,
         projectName: project.name,
+        hasDraftChanges,
         flows: [...notes.values()].map((flow) => {
           const serviceIds = flow.serviceIds.filter((id) => names.has(id));
           const serviceId = serviceIds.length === 1 ? serviceIds[0] : undefined;
