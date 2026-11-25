@@ -191,6 +191,7 @@ graph:
         environmentSet: &fixed_test { mode: FIXED, environmentSetId: test-config }
         parameters:
           - &service { id: service, type: SERVICE, required: true, defaultValue: { serviceId: storefront } }
+          - &source_repo { id: repository, type: REPOSITORY, defaultValue: web-repo, runtimeOverride: false }
           - id: gitVersion
             type: GIT_REF
             required: false
@@ -198,7 +199,7 @@ graph:
       path: [checkout, load-files, build-manager]
       bindings:
         checkout: &checkout_inputs
-          repository: { kind: VALUE, value: web-repo }
+          repository: { kind: INPUT, fieldId: repository }
           version: { kind: INPUT, fieldId: gitVersion, onMissing: REPOSITORY_DEFAULT }
         load-files: &load_inputs
           workspace: { kind: OUTPUT, nodeId: checkout, fieldId: workspace }
@@ -219,6 +220,7 @@ graph:
         environmentSet: *fixed_test
         parameters:
           - *service
+          - *source_repo
           - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
       path: [checkout, load-files, review-source, build-manager]
       bindings:
@@ -242,6 +244,7 @@ graph:
         environmentSet: { mode: INPUT, fieldId: environmentSet }
         parameters:
           - *service
+          - *source_repo
           - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
           - id: environmentSet
             type: ENVIRONMENT_SET
@@ -276,6 +279,7 @@ graph:
         environmentSet: &fixed_production { mode: FIXED, environmentSetId: production-config }
         parameters:
           - *service
+          - *source_repo
           - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
           - &production_build_targets { id: buildTargets, type: TARGETS, required: true, defaultValue: { groupIds: [web-production-group] } }
       path: [checkout, load-files, build-image]
@@ -296,6 +300,7 @@ graph:
         environmentSet: *fixed_test
         parameters:
           - *service
+          - *source_repo
           - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
           - *test_build_targets
           - &test_release_targets
@@ -409,6 +414,7 @@ graph:
         environmentSet: *fixed_production
         parameters:
           - *service
+          - *source_repo
           - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
           - *production_build_targets
           - *production_release_targets
@@ -430,6 +436,7 @@ graph:
         environmentSet: *fixed_production
         parameters:
           - *service
+          - *source_repo
           - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
           - *production_build_targets
       path: [checkout, load-files, review-image-source, build-image]
@@ -452,6 +459,7 @@ graph:
         environmentSet: *fixed_test
         parameters:
           - *service
+          - *source_repo
           - { id: gitVersion, type: GIT_REF, required: false, defaultValue: *fixed_commit }
           - { id: artifactDir, type: PATH, referenceName: ARTIFACT_DIR, required: true, defaultValue: dist-shell }
       path: [checkout, prepare-shell]

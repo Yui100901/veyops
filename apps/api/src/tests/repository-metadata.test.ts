@@ -499,7 +499,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     flows: [],
     canvas: {
       nodes: [
-        { id: 'default', name: '默认仓库', type: 'START' },
+        { id: 'default', name: '默认仓库', type: 'START', inputs: [repoInput] },
         {
           id: 'supplied',
           name: '上游指定仓库',
@@ -511,7 +511,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
           name: '手工配置检出节点',
           type: 'FUNCTION',
           operation: 'CHECKOUT',
-          inputs: [repoInput],
+          inputs: [{ ...repoInput, defaultValue: undefined }],
         },
         {
           id: 'named',
@@ -552,7 +552,11 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
         { id: 'end', name: '完成检出', type: 'END' },
       ],
       endpoints: [
-        { startId: 'default', endId: 'end' },
+        {
+          startId: 'default',
+          endId: 'end',
+          inputBindings: { checkout: { repository: { kind: 'INPUT', fieldId: 'repository' } } },
+        },
         {
           startId: 'supplied',
           endId: 'end',
@@ -576,6 +580,36 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
       templates: [],
     },
   };
+  const legacy = structuredClone(graph);
+  Object.assign(
+    legacy.canvas.nodes.find(({ id }) => id === 'checkout')!,
+    { checkout: { repositoryId: id } },
+  );
+  const legacyCheck = await admin
+    .post(graphPath + '/validate')
+    .send({ definition: legacy })
+    .expect(201);
+  assert.ok(
+    legacyCheck.body.data.issues.some(
+      ({ flowId, nodeId, fieldId, fieldSection, sourceNodeId }: Record<string, string>) =>
+        flowId === 'default' &&
+        nodeId === 'checkout' &&
+        fieldId === 'repository' &&
+        fieldSection === 'execution' &&
+        sourceNodeId === 'default',
+    ),
+  );
+  const legacyBefore = (await admin.get(graphPath).expect(200)).body.data;
+  const legacyDraft = (
+    await admin
+      .put(graphPath + '/draft')
+      .send({ expectedRevision: legacyBefore.revision, definition: legacy })
+      .expect(200)
+  ).body.data;
+  await admin
+    .post(graphPath + '/publish')
+    .send({ expectedRevision: legacyDraft.revision })
+    .expect(400);
   const currentGraph = (await admin.get(graphPath).expect(200)).body.data;
   const savedGraph = (
     await admin

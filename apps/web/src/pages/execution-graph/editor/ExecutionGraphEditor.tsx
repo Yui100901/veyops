@@ -1174,13 +1174,12 @@ export function ProjectGraphEditor({
                 <div className="graph-inspector-panel" key={inspected.id + ':' + tab}>
                   {tab === 'execution' ? (
                     <>
-                      {useStartDefaults && (
-                        <ExecutionGraphLegacyResources
-                          node={inspected}
-                          canEdit={canEdit}
-                          patch={patch}
-                        />
-                      )}
+                      <ExecutionGraphLegacyResources
+                        node={inspected}
+                        canEdit={canEdit}
+                        patch={patch}
+                        includeExecutionLocation={useStartDefaults}
+                      />
                       <NodeOperationFields
                         project={project}
                         node={inspected}

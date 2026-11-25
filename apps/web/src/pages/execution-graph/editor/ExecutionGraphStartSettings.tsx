@@ -24,7 +24,7 @@ const standardFields = {
   gitVersion: { id: 'gitVersion', name: 'Git 版本', type: 'GIT_REF', required: false },
   buildTargets: {
     id: 'buildTargets',
-    name: '构建位置',
+    name: '构建服务器或分组',
     type: 'TARGETS',
     required: false,
     purpose: 'BUILD_TARGETS',
@@ -39,6 +39,12 @@ const standardFields = {
   },
   artifact: { id: 'artifact', name: '已登记产物', type: 'ARTIFACT', required: true },
 } as const satisfies Record<string, GraphField>;
+
+const buildLocationLabels = {
+  INHERIT: '沿用平台设置',
+  MANAGER: '管理端',
+  TARGET: '目标端',
+} as const satisfies Record<NonNullable<GraphNode['buildLocation']>, string>;
 
 function isRepositoryField({ id, type }: GraphField) {
   return type === 'REPOSITORY' && (id === 'repository' || id.startsWith('repository-'));
@@ -81,7 +87,7 @@ export function ExecutionGraphStartSettings({
   change: (
     fields: GraphField[],
     endpoint?: GraphEndpoint,
-    patch?: Pick<GraphNode, 'sameHostRelease'>,
+    patch?: Pick<GraphNode, 'buildLocation' | 'sameHostRelease'>,
   ) => void;
   selectStep?: (nodeId: string) => void;
 }) {
@@ -114,7 +120,22 @@ export function ExecutionGraphStartSettings({
   const commonTargetBinding =
     releases.length === 1 && (node.sameHostRelease || usesLegacySharedTarget);
   const targetSelection = buildTargets.defaultValue as DeploymentSelection | undefined;
+  const hasBuildTargets = Boolean(
+    targetSelection?.serverIds?.length || targetSelection?.groupIds?.length,
+  );
   const singleHost = targetSelection?.serverIds?.length === 1 && !targetSelection.groupIds?.length;
+  const buildLocation =
+    node.buildLocation ?? (hasBuildTargets || commonTargetBinding ? 'TARGET' : 'INHERIT');
+  const showsBuildMode = hasBuild && node.contract === 'PRESET';
+  const scriptsUseBuildTargets = flowNodes.some((step) => {
+    if (!['SHELL', 'CHECK'].includes(effectiveNodeType(step)) || step.shell?.location === 'MANAGER')
+      return false;
+    const binding = endpoint?.inputBindings?.[step.id]?.targets;
+    return binding
+      ? bindingUsesInput(binding, buildTargets.id)
+      : !step.shell?.serverId && (step.shell?.location === 'TARGET' || hasBuildTargets);
+  });
+  const usesManagerBuild = showsBuildMode && buildLocation === 'MANAGER';
   const artifactBinding = release ? endpoint?.inputBindings?.[release.id]?.artifact : undefined;
   const externalArtifact =
     fields.some(({ id }) => id === 'artifact') ||
@@ -190,6 +211,20 @@ export function ExecutionGraphStartSettings({
   function setSharedTarget(share: boolean) {
     const next = sharedTargetTransition(share);
     change(next.inputs, next.endpoint, { sameHostRelease: share || undefined });
+  }
+
+  function setBuildLocation(buildLocation: NonNullable<GraphNode['buildLocation']>) {
+    if (buildLocation === 'MANAGER' && (node.sameHostRelease || usesLegacySharedTarget)) {
+      const { inputs, endpoint } = sharedTargetTransition(false);
+      change(inputs, endpoint, { buildLocation, sameHostRelease: undefined });
+    } else {
+      const inputs =
+        buildLocation === 'TARGET' &&
+        !fields.some(({ id, purpose }) => id === buildTargets.id || purpose === 'BUILD_TARGETS')
+          ? [...fields, buildTargets]
+          : fields;
+      change(inputs, undefined, { buildLocation });
+    }
   }
 
   function groupCompanion(group: GraphStartGroup, kind: GraphStartGroupKind): GraphField {
@@ -415,7 +450,7 @@ export function ExecutionGraphStartSettings({
           undefined,
           commonTargetBinding ? undefined : targets,
         )}
-        {releases.length === 1 && hasBuild && endpoint && node.contract === 'PRESET' && (
+        {releases.length === 1 && showsBuildMode && endpoint && !usesManagerBuild && (
           <label className="checkbox-row">
             <input
               type="checkbox"
@@ -464,8 +499,43 @@ export function ExecutionGraphStartSettings({
       )}
       {showsBuild && (
         <div className="graph-start-resource-group">
-          {input({ ...buildTargets, purpose: 'BUILD_TARGETS' })}
-          <p className="field-note">留空采用平台配置的执行位置。</p>
+          {showsBuildMode && (
+            <div data-graph-node-field="buildLocation">
+              <Field
+                label="构建位置"
+                hint={buildLocation === 'INHERIT' ? '预览使用当前项目生效的构建位置。' : undefined}
+              >
+                <select
+                  aria-label="构建位置"
+                  disabled={!canEdit}
+                  value={node.buildLocation ?? ''}
+                  onChange={(event) =>
+                    setBuildLocation(event.target.value as NonNullable<GraphNode['buildLocation']>)
+                  }
+                >
+                  {node.buildLocation === undefined && (
+                    <option disabled value="">
+                      原设置 · {buildLocationLabels[buildLocation]}
+                    </option>
+                  )}
+                  {Object.entries(buildLocationLabels).map(([mode, label]) => (
+                    <option key={mode} value={mode}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+          )}
+          {(!usesManagerBuild || scriptsUseBuildTargets) &&
+            input({
+              ...buildTargets,
+              name: usesManagerBuild ? '检查与脚本执行目标' : standardFields.buildTargets.name,
+              purpose: 'BUILD_TARGETS',
+            })}
+          {showsBuildMode && buildLocation === 'TARGET' && !hasBuildTargets && (
+            <p className="field-note">目标端构建需要配置服务器或分组，也可在运行时填写。</p>
+          )}
         </div>
       )}
       {hasBuild && !releaseNodes.length && (

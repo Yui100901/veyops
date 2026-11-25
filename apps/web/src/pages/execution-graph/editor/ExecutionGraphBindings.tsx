@@ -462,10 +462,12 @@ export function ExecutionGraphLegacyResources({
   node,
   canEdit,
   patch,
+  includeExecutionLocation,
 }: {
   node: GraphNode;
   canEdit: boolean;
   patch: (changes: Partial<GraphNode>) => void;
+  includeExecutionLocation: boolean;
 }) {
   const checkout = node.checkout;
   const build = node.build;
@@ -486,15 +488,16 @@ export function ExecutionGraphLegacyResources({
       label: 'Git 版本',
       remove: () => patch(patchInputDefault(node, 'version', undefined)),
     },
-    (build?.buildLocation !== undefined || shell?.serverId !== undefined) && {
-      id: 'targets',
-      label: '执行位置',
-      remove: () =>
-        patch({
-          ...(build && { build: { ...build, buildLocation: undefined } }),
-          ...(shell && { shell: { ...shell, serverId: undefined } }),
-        }),
-    },
+    includeExecutionLocation &&
+      (build?.buildLocation !== undefined || shell?.serverId !== undefined) && {
+        id: 'targets',
+        label: '执行位置',
+        remove: () =>
+          patch({
+            ...(build && { build: { ...build, buildLocation: undefined } }),
+            ...(shell && { shell: { ...shell, serverId: undefined } }),
+          }),
+      },
   ];
   return corrections.map((entry) =>
     entry ? (
@@ -759,10 +762,14 @@ export function ExecutionGraphBindings({
   const groupConfig = groupKind && graphStartGroupFields[groupKind];
   const catalogGroups = groupKind === 'source' ? compiled?.sourceGroups : compiled?.releaseGroups;
   const externalInput = (field: GraphField) =>
-    preset &&
-    operation !== 'FLOW_CALL' &&
-    ['repository', 'version', 'service', 'targets', 'environment', 'artifact'].includes(field.id) &&
-    nativeInputs.some(({ id }) => id === field.id);
+    nativeInputs.some(({ id }) => id === field.id) &&
+    (((operation === 'CHECKOUT' || operation === 'BUILD') &&
+      (field.id === 'repository' || field.id === 'version')) ||
+      (preset &&
+        operation !== 'FLOW_CALL' &&
+        ['repository', 'version', 'service', 'targets', 'environment', 'artifact'].includes(
+          field.id,
+        )));
   const groupBindings = (fieldId?: string) => {
     if (!endpoint || !groupConfig || !groupKind) return;
     const next = { ...bindings };
@@ -1127,6 +1134,13 @@ export function ExecutionGraphBindings({
               ? undefined
               : configuredFallback(node, field, start, endpoint, startResource);
           const legacyFixedBinding = startResource && hasFixedResourceBinding(bound);
+          const legacyDefault =
+            startResource &&
+            (node.inputDefaults?.[field.id] !== undefined ||
+              (declared &&
+                node.inputs?.some(
+                  ({ id, defaultValue }) => id === field.id && defaultValue !== undefined,
+                )));
           const implicitHint = bound
             ? bound.onMissing === 'USE_DEFAULT' ||
               (!bound.onMissing && declared && nodeFixedInputValue(node, field) !== undefined)
@@ -1152,9 +1166,11 @@ export function ExecutionGraphBindings({
             start &&
             !isEnd &&
             !review &&
-            !startResource &&
+            (!startResource || !preset) &&
             canCreateStartParameter(field) &&
             (repairFieldIds?.has(field.id) ||
+              legacyFixedBinding ||
+              legacyDefault ||
               (bound && hasMissingGraphBindingSource(bound, choices)) ||
               (unbound && field.required !== false));
           const changeBinding = (value?: GraphBinding) => {
@@ -1263,6 +1279,29 @@ export function ExecutionGraphBindings({
                       onClick={() => changeBinding()}
                     >
                       清除原有固定来源
+                    </button>
+                  )}
+                </div>
+              )}
+              {legacyDefault && (
+                <div className="row-actions">
+                  <p className="field-note">此端口仍有旧的节点默认值。请移到开始配置。</p>
+                  {canEdit && patchNode && (
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      onClick={() =>
+                        patchNode({
+                          ...patchInputDefault(node, field.id, undefined),
+                          ...(declared && {
+                            inputs: node.inputs?.map((input) =>
+                              input.id === field.id ? { ...input, defaultValue: undefined } : input,
+                            ),
+                          }),
+                        })
+                      }
+                    >
+                      清除原有默认值
                     </button>
                   )}
                 </div>

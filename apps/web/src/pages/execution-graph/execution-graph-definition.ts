@@ -257,6 +257,7 @@ export interface GraphNode {
   id: string;
   type: keyof typeof graphNodeLabels;
   contract?: 'PRESET';
+  buildLocation?: 'INHERIT' | 'MANAGER' | 'TARGET';
   sameHostRelease?: boolean;
   operation?: GraphOperation;
   inputDefaults?: Record<string, unknown>;

@@ -6,16 +6,16 @@ const { Client } = require('ssh2');
 
 const output = (nodeId, fieldId) => ({ kind: 'OUTPUT', nodeId, fieldId });
 const value = (entry) => ({ kind: 'VALUE', value: entry });
+const input = (fieldId) => ({ kind: 'INPUT', fieldId });
 const node = (id, type, configuration = {}) => ({ id, name: id, type, ...configuration });
 const targets = (...serverIds) => value({ serverIds });
 const edge = (from, to) => ({ from, to });
-const commit = (sha) => value({ kind: 'COMMIT', value: sha });
 const location = '/srv/veyops-stage0/contract-work-snapshot';
 const contents = '<main>Acceptance work folder</main>\n';
 
-function addFlow(canvas, start, end, nodes, edges, inputBindings, outputBindings) {
+function addFlow(canvas, startNode, end, nodes, edges, inputBindings, outputBindings) {
   canvas.nodes.push(
-    node(start, 'START'),
+    startNode,
     ...nodes,
     node(end, 'END', {
       outputs: Object.entries(outputBindings).map(([id, { type, artifactType }]) => ({
@@ -28,7 +28,7 @@ function addFlow(canvas, start, end, nodes, edges, inputBindings, outputBindings
   );
   canvas.edges.push(...edges);
   canvas.endpoints.push({
-    startId: start,
+    startId: startNode.id,
     endId: end,
     inputBindings,
     outputBindings: Object.fromEntries(
@@ -154,7 +154,24 @@ async function verifyWorkDirectory({ api, fixture, execute }) {
     canvas.endpoints = [];
     addFlow(
       canvas,
-      start,
+      node(start, 'START', {
+        inputs: [
+          {
+            id: 'repository',
+            name: '仓库',
+            type: 'REPOSITORY',
+            defaultValue: repository.id,
+            runtimeOverride: false,
+          },
+          {
+            id: 'gitVersion',
+            name: '版本',
+            type: 'GIT_REF',
+            defaultValue: { kind: 'COMMIT', value: sha },
+            runtimeOverride: false,
+          },
+        ],
+      }),
       end,
       [
         node(checkout, 'CHECKOUT'),
@@ -193,7 +210,7 @@ async function verifyWorkDirectory({ api, fixture, execute }) {
               'set -eu; test -f index.html; test "$(cat "$VEYOPS_ARTIFACT_DIR/commit.txt")" = "$VEYOPS_GIT_COMMIT_SHA"; test ! -e "$VEYOPS_ARTIFACT_DIR/dist"',
           },
         }),
-        node(inspect, 'CHECK', {
+        node(inspect, 'SHELL', {
           shell: {
             location: 'TARGET',
             artifactPath: '.',
@@ -212,7 +229,7 @@ async function verifyWorkDirectory({ api, fixture, execute }) {
         edge(deploy, end),
       ],
       {
-        [checkout]: { repository: value(repository.id), version: commit(sha) },
+        [checkout]: { repository: input('repository'), version: input('gitVersion') },
         [build]: {
           workspace: output(checkout, 'workspace'),
           service: value({ serviceId: service.id }),
@@ -220,10 +237,9 @@ async function verifyWorkDirectory({ api, fixture, execute }) {
         },
         [check]: {
           workspace: output(checkout, 'workspace'),
-          artifact: output(build, 'snapshot'),
           targets: targets(testB),
         },
-        [inspect]: { artifact: output(build, 'snapshot'), targets: targets(testB) },
+        [inspect]: { targets: targets(testB) },
         [deploy]: {
           service: value({ serviceId: service.id }),
           artifact: output(build, 'snapshot'),
@@ -253,7 +269,15 @@ async function verifyWorkDirectory({ api, fixture, execute }) {
   assert.equal(report.passed, true);
   assert.equal(released.targets[0].serverId, testB);
   assert.equal(released.targets[0].artifactInstanceId, instance.instanceId);
-  assert.equal(run.entry.scripts.find(({ nodeId }) => nodeId === check).artifact.path, 'reports');
+  for (const [id, path] of [
+    [check, 'reports'],
+    [inspect, '.'],
+  ]) {
+    assert.deepEqual(run.entry.scripts.find(({ nodeId }) => nodeId === id).artifact, {
+      path,
+      producers: [{ nodeId: build, fieldId: 'snapshot' }],
+    });
+  }
   const releasePath = '/accept/targets/test-b/deploy/contract-work-snapshot/current';
   const activation = await readlink(releasePath);
   assert.equal(await readFile(releasePath + '/index.html', 'utf8'), contents);
@@ -263,7 +287,7 @@ async function verifyWorkDirectory({ api, fixture, execute }) {
   const replay = await publish(api, graph, (canvas) => {
     addFlow(
       canvas,
-      buildHistory,
+      node(buildHistory, 'START'),
       'snapshot-history-end',
       [release(historyDeploy)],
       [edge(buildHistory, historyDeploy), edge(historyDeploy, 'snapshot-history-end')],

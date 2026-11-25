@@ -242,6 +242,7 @@ const sourceNames: Record<string, string> = {
   AS_GIT_REF: '转换为 Git 版本',
   REPOSITORY_DEFAULT: '仓库默认分支',
   NODE: '节点配置',
+  START: '开始节点配置',
   SYSTEM: '系统默认',
   SYSTEM_DEFAULT: '系统默认',
   PROJECT: '项目配置',

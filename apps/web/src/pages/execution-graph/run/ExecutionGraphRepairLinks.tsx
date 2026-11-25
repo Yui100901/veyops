@@ -6,7 +6,10 @@ import {
   graphWorkbenchPath,
   type GraphStartLocation,
 } from '../graph-workbench-context';
-import { graphSetupResourceHref, type ResourceLocation } from '../../projects/project-workspace-route';
+import {
+  graphSetupResourceHref,
+  type ResourceLocation,
+} from '../../projects/project-workspace-route';
 
 export type GraphSetupIssue = GraphIssueLocation &
   Pick<
@@ -25,7 +28,7 @@ const parameterTypes: Record<GraphSetupIssue['kind'], GraphField['type']> = {
 
 const parameterLabels = {
   REPOSITORY: '选择仓库',
-  BUILD_TARGET: '选择构建服务器',
+  BUILD_TARGET: '选择构建目标',
   DEPLOY_TARGET: '选择发布目标',
   ARTIFACT: '选择历史制品',
 };
@@ -77,7 +80,7 @@ export function ExecutionGraphRepairLinks({
   if (!parameter) {
     const label = {
       REPOSITORY: '编辑仓库绑定',
-      BUILD_TARGET: '编辑构建目标',
+      BUILD_TARGET: issue.fieldId === 'buildLocation' ? '编辑构建位置' : '编辑构建目标',
       DEPLOY_TARGET: '编辑发布目标绑定',
       ARTIFACT: issue.fieldSection === 'output' ? '编辑产物配置' : '编辑产物绑定',
     }[issue.kind];

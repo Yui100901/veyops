@@ -312,6 +312,7 @@ async function checkMigration(url?: string) {
     assert.equal(plan.legacyTargets[0].id, oldTargetId);
     assert.deepEqual(plan.comparison[0].before.serverIds, [server.id]);
     assert.deepEqual(plan.comparison[0].after.serverIds, [server.id]);
+    assert.equal(plan.comparison[0].after.repositoryId, repositoryId);
     assert.equal(plan.comparison[0].after.commitSha, commitSha);
     assert.equal(
       plan.issues.some(({ blocking }: { blocking: boolean }) => blocking),

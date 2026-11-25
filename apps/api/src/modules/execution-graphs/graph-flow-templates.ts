@@ -133,6 +133,7 @@ export function expandGraphTemplate(
   // A service is optional for a standalone build and required when its artefact is deployed.
   startInputs.push({ id: 'service', name: '项目服务', type: 'SERVICE', required: Boolean(deploy) });
   if (build && workspace) {
+    start.buildLocation = 'INHERIT';
     startInputs.push({
       id: 'buildTargets',
       name: '构建目标',

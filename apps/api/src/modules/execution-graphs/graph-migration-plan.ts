@@ -10,6 +10,8 @@ import { resolveDeliveryTargets } from '../pipelines/delivery-targets';
 import { branchCache } from '../projects/repository-metadata.service';
 import { redactTaskLog } from '../tasks/task-log.service';
 import { orderedFlowNodes, type GraphFlow } from './execution-graph-definition';
+import { graphRecord } from './graph-fields';
+import { bindingValue, nodeInputBinding } from './graph-run-bindings';
 import { flowSelection } from './graph-run-lifecycle';
 import { legacyPreset, migrationIssue, type MigrationIssue } from './graph-migration-mapping';
 
@@ -293,7 +295,25 @@ export async function migrationComparisons(
       );
     const compatible =
       artifact && artifact.service_id === serviceId && artifact.environment_id === environment?.id;
-    const repository = build?.repositoryId
+    const start = flow.nodes.find(({ type }) => type === 'START');
+    const parameters = Object.fromEntries(
+      (start?.inputs ?? []).map(({ id, defaultValue }) => [id, defaultValue]),
+    );
+    const sourceDefault = (port: string) =>
+      buildNode &&
+      bindingValue(nodeInputBinding(flow, buildNode, port), { parameters, context: {} });
+    const repositoryDefault = sourceDefault('repository');
+    const repositoryId =
+      build?.repositoryId ??
+      (typeof repositoryDefault === 'string' ? repositoryDefault : undefined);
+    const sourceVersion = sourceDefault('version');
+    const version = graphRecord(sourceVersion) ? sourceVersion : undefined;
+    const configuredVersion = typeof version?.value === 'string' ? version.value : undefined;
+    const pinnedCommit =
+      build?.commitSha ?? (version?.kind === 'COMMIT' ? configuredVersion : undefined);
+    const configuredBranch =
+      build?.branch ?? (version?.kind === 'BRANCH' ? configuredVersion : undefined);
+    const repository = repositoryId
       ? await db
           .selectFrom('repositories')
           .select([
@@ -303,12 +323,12 @@ export async function migrationComparisons(
             'branch_checked_at',
             'branch_error',
           ])
-          .where('id', '=', build.repositoryId)
+          .where('id', '=', repositoryId)
           .where('project_id', '=', projectId)
           .where('archived_at', 'is', null)
           .executeTakeFirst()
       : undefined;
-    if (build?.repositoryId && !repository)
+    if (repositoryId && !repository)
       issues.push(
         migrationIssue(
           'UNAVAILABLE_REPOSITORY',
@@ -319,13 +339,11 @@ export async function migrationComparisons(
       );
     const cache = repository ? branchCache(repository) : undefined;
     const branch =
-      build && !build.commitSha && !input.commitSha
-        ? build.branch || cache?.defaultBranch || undefined
+      build && !pinnedCommit && !input.commitSha
+        ? configuredBranch || cache?.defaultBranch || undefined
         : undefined;
     const commitSha = build
-      ? build.commitSha ||
-        input.commitSha ||
-        cache?.branches.find(({ name }) => name === branch)?.sha
+      ? pinnedCommit || input.commitSha || cache?.branches.find(({ name }) => name === branch)?.sha
       : compatible
         ? (artifact.source_commit ?? undefined)
         : undefined;

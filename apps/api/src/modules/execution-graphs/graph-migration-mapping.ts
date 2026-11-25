@@ -168,7 +168,7 @@ export function migrateLegacyDefinition(definition: GraphDefinition) {
     }
     function conflicts(node: GraphNode | undefined, field: 'build' | 'deploy') {
       if (!node) return false;
-      const current = nodes.get(node.id)!;
+      const current = node as LegacyNode;
       const desired = preset![field] ?? {};
       if (current.pipelineId || (current[field] && !isDeepStrictEqual(current[field], desired)))
         return true;
@@ -245,7 +245,32 @@ export function migrateLegacyDefinition(definition: GraphDefinition) {
         });
       binding[node.id]!.targets = { kind: 'INPUT', fieldId: target.id };
     }
-    if (build) nodes.get(build.id)!.build = { ...preset.build };
+    if (build && preset.build) {
+      const { repositoryId, branch, commitSha, ...settings } = preset.build;
+      nodes.get(build.id)!.build = settings;
+      const buildBindings = binding[build.id]!;
+      if (!buildBindings.repository) {
+        const repository = addStartField(start, {
+          id: 'repository',
+          name: '项目仓库',
+          type: 'REPOSITORY',
+          defaultValue: repositoryId,
+          runtimeOverride: false,
+        });
+        buildBindings.repository = { kind: 'INPUT', fieldId: repository.id };
+      }
+      const ref = commitSha ?? branch;
+      if (ref && !buildBindings.version) {
+        const version = addStartField(start, {
+          id: 'gitVersion',
+          name: 'Git 版本',
+          type: 'GIT_REF',
+          defaultValue: { kind: commitSha ? 'COMMIT' : 'BRANCH', value: ref },
+          runtimeOverride: false,
+        });
+        buildBindings.version = { kind: 'INPUT', fieldId: version.id };
+      }
+    }
     if (deploy) {
       nodes.get(deploy.id)!.deploy = { ...preset.deploy };
       if (!binding[deploy.id]!.artifact) {

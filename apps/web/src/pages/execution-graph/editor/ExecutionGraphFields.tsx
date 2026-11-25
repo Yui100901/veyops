@@ -7,7 +7,6 @@ import type {
   DeploymentSelection,
   ProjectDetail,
   Repository,
-  Server,
   Service,
 } from '../../../models';
 import {
@@ -440,29 +439,47 @@ function ArtifactValue({
 
 function TargetsValue({ project, field, value, change, disabled, checkRequired }: ValueProps) {
   const single = field.purpose === 'BUILD_TARGETS';
-  const inventory = useDeploymentInventory(!single);
-  const constructionServers = useResource<Server[]>(single ? '/servers' : null);
+  const inventory = useDeploymentInventory();
   if (single) {
     const selection = value as DeploymentSelection | undefined;
+    const { servers, groups } = inventory;
+    const groupPrefix = 'group:';
     const selected =
       selection?.serverIds?.length === 1 && !selection.groupIds?.length
         ? selection.serverIds[0]
-        : undefined;
+        : selection?.groupIds?.length === 1 && !selection.serverIds?.length
+          ? groupPrefix + selection.groupIds[0]
+          : undefined;
     return (
       <>
         <ResourceSelect
           label={field.name}
-          options={constructionServers.data ?? []}
+          options={[
+            ...(servers.data ?? []),
+            ...(groups.data ?? []).map(({ id, name }) => ({
+              id: groupPrefix + id,
+              name: '分组 · ' + name,
+            })),
+          ]}
           value={selected}
-          change={(id) => change(id ? { serverIds: [id] } : undefined)}
-          disabled={disabled || constructionServers.loading}
+          change={(id) =>
+            change(
+              id
+                ? id.startsWith(groupPrefix)
+                  ? { groupIds: [id.slice(groupPrefix.length)] }
+                  : { serverIds: [id] }
+                : undefined,
+            )
+          }
+          disabled={disabled || servers.loading || groups.loading}
           required={checkRequired && field.required}
-          empty="采用平台执行配置"
+          empty="选择服务器或分组"
         />
         {!selected && Boolean(selection?.serverIds?.length || selection?.groupIds?.length) && (
-          <p className="field-note">原有构建目标含多台服务器或分组，可改为一台服务器。</p>
+          <p className="field-note">原有构建目标包含多项。可改选一台服务器或一个分组。</p>
         )}
-        <ErrorBanner error={constructionServers.error} retry={constructionServers.reload} />
+        <ErrorBanner error={servers.error} retry={servers.reload} />
+        <ErrorBanner error={groups.error} retry={groups.reload} />
       </>
     );
   }

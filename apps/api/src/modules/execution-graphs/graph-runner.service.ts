@@ -931,6 +931,7 @@ export class GraphRunnerService implements OnModuleInit {
     parameterProduction: ReadonlyMap<string, PreparedProduction[]> = new Map(),
     automation?: GraphAutomation,
   ): Promise<Delivery> {
+    const start = flowStart(flow);
     const scope = declaredScope(flow, inputs);
     const serviceId =
       referenceId(values.service) ??
@@ -959,6 +960,13 @@ export class GraphRunnerService implements OnModuleInit {
     ): DeliveryConfiguration | undefined =>
       configuration && {
         ...configuration,
+        settings: configuration.settings.map((setting) =>
+          node.type === 'BUILD' &&
+          setting.field === 'buildLocation' &&
+          (start.buildLocation === 'MANAGER' || start.buildLocation === 'TARGET')
+            ? { ...setting, source: 'START' }
+            : setting,
+        ),
         targets: {
           ...configuration.targets,
           source:
@@ -1086,12 +1094,14 @@ export class GraphRunnerService implements OnModuleInit {
             }),
           );
       const startSelectedTarget =
-        flowStart(flow).contract === 'PRESET' &&
-        Boolean(base.serverIds?.length || base.groupIds?.length);
+        start.contract === 'PRESET' && Boolean(base.serverIds?.length || base.groupIds?.length);
+      const location =
+        start.buildLocation ??
+        (startSelectedTarget ? 'TARGET' : (settings.buildLocation ?? 'INHERIT'));
       const definition = Object.assign(new PipelineDefinitionDto(), settings, {
         repositoryId,
-        ...(startSelectedTarget && { buildLocation: 'TARGET' }),
-        inheritBuildLocation: !settings.buildLocation && !startSelectedTarget,
+        ...(location !== 'INHERIT' && { buildLocation: location }),
+        inheritBuildLocation: location === 'INHERIT',
         ...(settings.artifacts && { artifacts: graphArtifactDefinitions(settings.artifacts) }),
       });
       const variableBinding = values.variables as GraphEnvironmentRef | undefined;
@@ -1107,6 +1117,17 @@ export class GraphRunnerService implements OnModuleInit {
         undefined,
         profile,
       );
+      if (start.sameHostRelease && preview.definition.buildLocation === 'MANAGER')
+        throw new ExecutionPlanIssueError({
+          code: 'BUILD_TARGET',
+          flowId: flow.id,
+          flowName: flow.name,
+          nodeId: start.id,
+          nodeName: start.name,
+          fieldId: 'buildLocation',
+          fieldSection: 'execution',
+          message: '当前使用管理端构建。请在开始节点选择目标端构建，或取消构建与发布同机',
+        });
       if (automation)
         await this.pipelines
           .assertGraphAutomaticBuild(preview, preview.serverIds)
@@ -1208,7 +1229,6 @@ export class GraphRunnerService implements OnModuleInit {
       flow.inputBindings?.[node.id]?.artifact;
     const plans: Delivery[] = [];
     const requested = artifactBindingRefs(values.artifact ?? inputs.artifactIds);
-    const start = flowStart(flow);
     const inputField =
       binding?.kind === 'INPUT'
         ? start.inputs?.find((field) => field.id === binding.fieldId)

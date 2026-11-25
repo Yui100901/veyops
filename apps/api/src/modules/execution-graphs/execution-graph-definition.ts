@@ -276,6 +276,9 @@ export class GraphNode {
   @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) referenceName?: string;
   @IsIn([...nodeTypes, 'FUNCTION']) type!: (typeof nodeTypes)[number] | 'FUNCTION';
   @ValidateIf((_o, v) => v !== undefined) @IsIn(['PRESET']) contract?: 'PRESET';
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsIn(['INHERIT', 'MANAGER', 'TARGET'])
+  buildLocation?: 'INHERIT' | 'MANAGER' | 'TARGET';
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() sameHostRelease?: boolean;
   @ValidateIf((node, value) => node.type === 'FUNCTION' || value !== undefined)
   @IsIn(functionOperations)
@@ -726,7 +729,10 @@ function missingNodeConfiguration(node: GraphNode): GraphDiagnostic[] {
   return [];
 }
 
-export function validateGraphDefinition(definition: GraphDefinition) {
+export function validateGraphDefinition(
+  definition: GraphDefinition,
+  { publication = false }: { publication?: boolean } = {},
+) {
   if (!definition.flows.length || definition.flows.length > maxFlows)
     throw new BadRequestException(`每张图须包含 1 到 ${maxFlows} 个执行流`);
   const calls = new Map<string, { nodeCount: number; children: string[] }>();
@@ -782,6 +788,11 @@ export function validateGraphDefinition(definition: GraphDefinition) {
             message: `「${flow.name}」 → 「${node.name}」 · ${issue.message}`,
           });
         validateAdvancedNode(node);
+        if (
+          node.buildLocation !== undefined &&
+          (node.type !== 'START' || node.contract !== 'PRESET')
+        )
+          throw new BadRequestException('预设流程的构建位置须在开始节点配置');
         if ('delivery' in node || 'pipelineId' in node || 'pipelineVersion' in node)
           throw new BadRequestException('请使用功能节点配置构建和部署');
         if (
@@ -879,7 +890,10 @@ export function validateGraphDefinition(definition: GraphDefinition) {
   const compiled = new Map<string, GraphCompiledFlow>();
   for (const flow of definition.flows) {
     try {
-      compiled.set(flow.id, validateFlowBindings(flow, definition.flows, orderedFlowNodes(flow)));
+      compiled.set(
+        flow.id,
+        validateFlowBindings(flow, definition.flows, orderedFlowNodes(flow), publication),
+      );
     } catch (error) {
       if (!(error instanceof GraphCompileError)) throw error;
       issues.push(...error.issues);

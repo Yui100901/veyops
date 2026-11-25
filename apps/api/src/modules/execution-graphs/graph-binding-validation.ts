@@ -328,6 +328,12 @@ function resourceGroupBinding(
     bindings: {},
     issue: { message, fieldId, sourceFieldId },
   });
+  if (sameHost && context.start.buildLocation === 'MANAGER')
+    return invalid(
+      '构建与发布同机需要在开始节点选择目标端构建',
+      spec.companionPort,
+      'buildLocation',
+    );
   const selected =
     primary?.kind === 'INPUT'
       ? groups.find(({ id }) => id === primary.fieldId)
@@ -449,8 +455,24 @@ const legacyResourceDefaults = [
 ] as const;
 
 const startConfigIssue = '预设节点的固定资源必须移到开始节点的对应配置';
+const gitSourceIssue = '请将节点固定的 Git 来源移到开始节点，或绑定上游源码';
 
-function presetBinding(
+function isGitSourcePort(node: GraphNode, id: string) {
+  return (
+    (node.type === 'CHECKOUT' || node.type === 'BUILD') && (id === 'repository' || id === 'version')
+  );
+}
+
+function isScriptArtifactInput(node: GraphNode, field: GraphField) {
+  return (
+    field.id === 'artifact' &&
+    field.type === 'ARTIFACT' &&
+    (node.type === 'SHELL' || node.type === 'CHECK') &&
+    Boolean(node.shell?.artifactPath?.trim())
+  );
+}
+
+function inferInputBinding(
   context: BindingContext,
   node: GraphNode,
   field: GraphField,
@@ -481,7 +503,7 @@ function presetBinding(
       const artifact = context.nodeInputs.get(release.id)?.find(({ id }) => id === 'artifact');
       const artifactSource =
         authoredBinding(flow, release, 'artifact') ??
-        (artifact && presetBinding(context, release, artifact, paths).binding);
+        (artifact && inferInputBinding(context, release, artifact, paths).binding);
       if (
         !artifactSource ||
         !producerBindings(artifactSource).some(({ nodeId }) => nodeId === node.id)
@@ -531,6 +553,9 @@ function presetBinding(
   } else if (field.id === 'release' && node.type === 'HEALTH_CHECK') {
     producerMatches = (producer, port) =>
       ['DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT'].includes(producer.type) && port.id === 'release';
+  } else if (isScriptArtifactInput(node, field)) {
+    producerMatches = (_producer, port) =>
+      port.type === 'ARTIFACT' && port.artifactType === 'DIRECTORY' && !port.multiple;
   } else if (field.id === 'artifact' && isRelease) {
     producerMatches = (producer, port) =>
       (producer.type === 'BUILD' ||
@@ -1000,6 +1025,7 @@ export function validateFlowBindings(
   flow: GraphFlow,
   definitions: GraphFlow[],
   ordered: GraphNode[],
+  publication: boolean,
 ) {
   const start = ordered[0]!;
   const end = ordered.at(-1)!;
@@ -1137,15 +1163,32 @@ export function validateFlowBindings(
           '预设动作使用系统定义的固定端口，自定义命令可声明自己的脚本字段',
           forbidden,
         );
-      for (const { section, key, port } of legacyResourceDefaults) {
-        const settings = node[section];
-        if (!settings || Reflect.get(settings, key) === undefined) continue;
-        const field = ports?.inputs.find(({ id }) => id === port);
-        fail(flow, node, `${startConfigIssue}（${section}.${key}）`, field, {
+    }
+    for (const { section, key, port } of legacyResourceDefaults) {
+      if (!preset && !(publication && isGitSourcePort(node, port))) continue;
+      const settings = node[section];
+      if (!settings || Reflect.get(settings, key) === undefined) continue;
+      const field = ports?.inputs.find(({ id }) => id === port);
+      fail(
+        flow,
+        node,
+        `${preset ? startConfigIssue : gitSourceIssue}（${section}.${key}）`,
+        field,
+        {
           fieldSection: 'execution',
           sourceNodeId: start.id,
+        },
+      );
+    }
+    if (publication && !preset && node.declaredPorts) {
+      const field = node.inputs?.find(
+        ({ id, defaultValue }) => defaultValue !== undefined && isGitSourcePort(node, id),
+      );
+      if (field)
+        fail(flow, node, gitSourceIssue, field, {
+          fieldSection: 'input',
+          sourceNodeId: start.id,
         });
-      }
     }
     if (node.declaredPorts)
       validateFunctionalDeclarations(flow, node, flows.get(node.flowId ?? ''));
@@ -1154,11 +1197,20 @@ export function validateFlowBindings(
         fail(flow, node, '仅功能节点可以配置固定输入');
       for (const [id, value] of Object.entries(node.inputDefaults)) {
         const field = ports.inputs.find((port) => port.id === id);
-        if (preset && graphPresetStartPort(node, id))
-          fail(flow, node, `${startConfigIssue}（inputDefaults.${id}）`, field, {
-            fieldSection: 'input',
-            sourceNodeId: start.id,
-          });
+        if (
+          (preset && graphPresetStartPort(node, id)) ||
+          (publication && isGitSourcePort(node, id))
+        )
+          fail(
+            flow,
+            node,
+            `${preset ? startConfigIssue : gitSourceIssue}（inputDefaults.${id}）`,
+            field,
+            {
+              fieldSection: 'input',
+              sourceNodeId: start.id,
+            },
+          );
         if (!field || !validatesLiteral(field, value, node))
           fail(
             flow,
@@ -1305,12 +1357,12 @@ export function validateFlowBindings(
           return [field.id, groups.release.bindings[field.id]];
         const explicit = authoredBinding(flow, node, field.id);
         if (
-          preset &&
           explicit &&
-          graphPresetStartPort(node, field.id) &&
+          ((preset && graphPresetStartPort(node, field.id)) ||
+            (publication && isGitSourcePort(node, field.id))) &&
           fixedPresetResource(explicit)
         )
-          fail(flow, node, startConfigIssue, field, {
+          fail(flow, node, preset ? startConfigIssue : gitSourceIssue, field, {
             fieldSection: 'input',
             sourceNodeId: start.id,
           });
@@ -1319,7 +1371,9 @@ export function validateFlowBindings(
           node.inputs?.some(({ id }) => id === field.id) &&
           field.defaultValue !== undefined;
         const inferred =
-          preset && !explicit ? presetBinding(context, node, field, pathOrders) : undefined;
+          !explicit && (preset || isScriptArtifactInput(node, field))
+            ? inferInputBinding(context, node, field, pathOrders)
+            : undefined;
         if (inferred?.issue) fail(flow, node, inferred.issue, field, { fieldSection: 'input' });
         const binding = explicit
           ? declaredDefault && explicit.onMissing === undefined
@@ -1739,8 +1793,8 @@ export function flowCandidateCatalog(
                       ? groups.source.bindings[field.id]
                       : groups?.release && ['service', 'targets'].includes(field.id)
                         ? groups.release.bindings[field.id]
-                        : start.contract === 'PRESET'
-                          ? presetBinding(context, node, field, paths).binding
+                        : start.contract === 'PRESET' || isScriptArtifactInput(node, field)
+                          ? inferInputBinding(context, node, field, paths).binding
                           : suggestedInputBinding(context, node, field, staticOrder, paths);
                   return binding ? [[field.id, binding]] : [];
                 }),

@@ -130,6 +130,23 @@ async function checkPlan(t: TestContext, url?: string) {
     const snapshots = t.mock.method(app.get(ServersService), 'snapshot');
     const path = scope + '/execution-graph';
     const draft = (await api.get(base + path).expect(200)).body.data;
+    const sourceInputs = (
+      repositoryId: string,
+      ref: { kind: string; value: string },
+      suffix = '',
+    ) => [
+      {
+        id: 'repository' + suffix,
+        name: '项目仓库' + suffix,
+        type: 'REPOSITORY',
+        defaultValue: repositoryId,
+      },
+      { id: 'gitVersion' + suffix, name: 'Git 版本' + suffix, type: 'GIT_REF', defaultValue: ref },
+    ];
+    const sourceBindings = (suffix = '') => ({
+      repository: { kind: 'INPUT', fieldId: 'repository' + suffix },
+      version: { kind: 'INPUT', fieldId: 'gitVersion' + suffix },
+    });
     const start = (id: string, extra: object[] = []) => ({
       id,
       name: id,
@@ -137,6 +154,7 @@ async function checkPlan(t: TestContext, url?: string) {
       inputs: [
         { id: 'environmentSet', name: '变量集合', type: 'ENVIRONMENT_SET', required: true },
         { id: 'configuration', name: '配置', type: 'TEXT', required: true },
+        ...sourceInputs(repo.id, { kind: 'COMMIT', value: pin }),
         ...extra,
       ],
       environmentSet: { mode: 'INPUT', fieldId: 'environmentSet' },
@@ -147,8 +165,6 @@ async function checkPlan(t: TestContext, url?: string) {
       name: id,
       type: 'BUILD',
       build: {
-        repositoryId: repo.id,
-        commitSha: pin,
         buildLocation,
         buildCommand: 'npm run build',
         artifacts: [{ name: 'output', type: 'FILE', path: 'dist/file.zip' }],
@@ -169,7 +185,6 @@ async function checkPlan(t: TestContext, url?: string) {
                   id: 'checkout',
                   name: '检出固定源码',
                   type: 'CHECKOUT',
-                  checkout: { repositoryId: repo.id, mode: 'COMMIT', commitSha: pin },
                 },
                 {
                   id: 'load',
@@ -234,8 +249,10 @@ async function checkPlan(t: TestContext, url?: string) {
                   endId: 'end-build',
                   serviceId: service.id,
                   inputBindings: {
+                    checkout: sourceBindings(),
                     load: { source: { kind: 'OUTPUT', nodeId: 'checkout', fieldId: 'source' } },
                     manager: {
+                      ...sourceBindings(),
                       variables: { kind: 'OUTPUT', nodeId: 'load', fieldId: 'variables' },
                     },
                   },
@@ -245,6 +262,7 @@ async function checkPlan(t: TestContext, url?: string) {
                   endId: 'end-release',
                   serviceId: service.id,
                   inputBindings: {
+                    'combined-build': sourceBindings(),
                     release: {
                       artifact: { kind: 'OUTPUT', nodeId: 'combined-build', fieldId: 'output' },
                       targets: { kind: 'INPUT', fieldId: 'releaseTargets' },
@@ -254,7 +272,12 @@ async function checkPlan(t: TestContext, url?: string) {
                     released: { kind: 'OUTPUT', nodeId: 'release', fieldId: 'release' },
                   },
                 },
-                { startId: 'target-only', endId: 'end-target', serviceId: service.id },
+                {
+                  startId: 'target-only',
+                  endId: 'end-target',
+                  serviceId: service.id,
+                  inputBindings: { target: sourceBindings() },
+                },
               ],
               templates: [],
             },
@@ -416,11 +439,10 @@ async function checkPlan(t: TestContext, url?: string) {
       kind: 'FIRST_AVAILABLE',
       sources: [output('checkout-a', fieldId), output('checkout-b', fieldId)],
     });
-    const checkout = (suffix: string, repositoryId: string) => ({
+    const checkout = (suffix: string) => ({
       id: 'checkout-' + suffix,
       name: '检出 ' + suffix,
       type: 'CHECKOUT',
-      checkout: { repositoryId, mode: 'BRANCH', branch: 'main' },
     });
     const branches = (
       await api
@@ -431,7 +453,15 @@ async function checkPlan(t: TestContext, url?: string) {
             flows: [],
             canvas: {
               nodes: [
-                { id: 'branch-test', name: '分支验证', type: 'START' },
+                {
+                  id: 'branch-test',
+                  name: '分支验证',
+                  type: 'START',
+                  inputs: [
+                    ...sourceInputs(repo.id, { kind: 'BRANCH', value: 'main' }, '-a'),
+                    ...sourceInputs(alternateRepo.id, { kind: 'BRANCH', value: 'main' }, '-b'),
+                  ],
+                },
                 {
                   id: 'choice',
                   name: '运行时输出',
@@ -445,8 +475,8 @@ async function checkPlan(t: TestContext, url?: string) {
                   type: 'CONDITION',
                   condition: { key: 'input', value: 'a' },
                 },
-                checkout('a', repo.id),
-                checkout('b', alternateRepo.id),
+                checkout('a'),
+                checkout('b'),
                 {
                   id: 'merge-check',
                   name: '汇合检查',
@@ -474,6 +504,8 @@ async function checkPlan(t: TestContext, url?: string) {
                   endId: 'branch-end',
                   inputBindings: {
                     condition: { value: output('choice', 'choice') },
+                    'checkout-a': sourceBindings('-a'),
+                    'checkout-b': sourceBindings('-b'),
                     'merge-check': {
                       workspace: firstChoice('workspace'),
                       source: firstChoice('source'),

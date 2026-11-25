@@ -5,6 +5,7 @@ const { readFile, writeFile } = require('node:fs/promises');
 const { join } = require('node:path');
 
 const output = (nodeId, fieldId) => ({ kind: 'OUTPUT', nodeId, fieldId });
+const startInput = (fieldId) => ({ kind: 'INPUT', fieldId });
 const value = (entry) => ({ kind: 'VALUE', value: entry });
 const node = (id, type, configuration = {}) => ({ id, name: id, type, ...configuration });
 const edge = (from, to, when) => ({ from, to, ...(when && { when }) });
@@ -30,9 +31,9 @@ function prepareP2Repository(root, source) {
   ]);
 }
 
-function addFlow(canvas, start, end, nodes, edges, inputBindings, outputBindings) {
+function addFlow(canvas, start, end, nodes, edges, inputBindings, outputBindings, inputs = []) {
   canvas.nodes.push(
-    node(start, 'START'),
+    node(start, 'START', { inputs }),
     ...nodes,
     node(end, 'END', {
       outputs: Object.entries(outputBindings).map(([id, { type, artifactType }]) => ({
@@ -52,6 +53,30 @@ function addFlow(canvas, start, end, nodes, edges, inputBindings, outputBindings
       Object.entries(outputBindings).map(([id, spec]) => [id, spec.binding]),
     ),
   });
+}
+
+function startGitSource(inputs, id, repository, version) {
+  const repositoryField = id + '-repository';
+  const versionField = id + '-version';
+  inputs.push({
+    id: repositoryField,
+    name: repositoryField,
+    type: 'REPOSITORY',
+    defaultValue: repository,
+    runtimeOverride: false,
+  });
+  if (version)
+    inputs.push({
+      id: versionField,
+      name: versionField,
+      type: 'GIT_REF',
+      defaultValue: version,
+      runtimeOverride: false,
+    });
+  return {
+    repository: startInput(repositoryField),
+    ...(version && { version: startInput(versionField) }),
+  };
 }
 
 async function publish(api, path, extend) {
@@ -100,6 +125,7 @@ async function verifyAlternativeCheck({
     sources: candidates.map(({ nodeId }) => output(nodeId, fieldId)),
   });
   const version = await publish(api, graph, (canvas) => {
+    const sourceInputs = [];
     addFlow(
       canvas,
       start,
@@ -141,10 +167,10 @@ async function verifyAlternativeCheck({
         ...Object.fromEntries(
           candidates.map(({ nodeId, repositoryId, commitSha }) => [
             nodeId,
-            {
-              repository: value(repositoryId),
-              version: value({ kind: 'COMMIT', value: commitSha }),
-            },
+            startGitSource(sourceInputs, nodeId, repositoryId, {
+              kind: 'COMMIT',
+              value: commitSha,
+            }),
           ]),
         ),
         [check]: {
@@ -154,6 +180,7 @@ async function verifyAlternativeCheck({
         },
       },
       { report: { type: 'REPORT', binding: output(check, 'report') } },
+      sourceInputs,
     );
   });
   const run = await execute(start, {}, { version });
@@ -428,6 +455,7 @@ async function verifyScriptCompose({
   ].join('\n');
   const checksum = createHash('sha256').update(template).digest('hex');
   const version = await publish(api, graph, (canvas) => {
+    const sourceInputs = [];
     addFlow(
       canvas,
       start,
@@ -481,10 +509,10 @@ async function verifyScriptCompose({
         edge(health, end),
       ],
       {
-        [checkout]: {
-          repository: value(repositoryId),
-          version: value({ kind: 'COMMIT', value: source.commitSha }),
-        },
+        [checkout]: startGitSource(sourceInputs, checkout, repositoryId, {
+          kind: 'COMMIT',
+          value: source.commitSha,
+        }),
         [script]: {
           workspace: output(checkout, 'workspace'),
           source: output(checkout, 'source'),
@@ -499,6 +527,7 @@ async function verifyScriptCompose({
         [health]: { release: output(deploy, 'release') },
       },
       { release: { type: 'RELEASE', binding: output(health, 'release') } },
+      sourceInputs,
     );
   });
   const result = await execute(start, {}, { version });
@@ -538,6 +567,7 @@ async function verifyP2Contract({ api, fixture, execute, source, shellArtifactId
 
   const build = 'candidate-build-api';
   const version = await publish(api, graph, (canvas) => {
+    const sourceInputs = [];
     addFlow(
       canvas,
       'candidate-multi-source',
@@ -576,16 +606,16 @@ async function verifyP2Contract({ api, fixture, execute, source, shellArtifactId
         edge(build, 'candidate-api-output'),
       ],
       {
-        'candidate-main': { repository: value(baseRepository) },
-        'candidate-next': {
-          repository: value(baseRepository),
-          version: value({ kind: 'BRANCH', value: 'acceptance-next' }),
-        },
-        'candidate-tag': {
-          repository: value(baseRepository),
-          version: value({ kind: 'TAG', value: 'acceptance-next' }),
-        },
-        'candidate-dependency': { repository: value(apiRepository.id) },
+        'candidate-main': startGitSource(sourceInputs, 'main', baseRepository),
+        'candidate-next': startGitSource(sourceInputs, 'next', baseRepository, {
+          kind: 'BRANCH',
+          value: 'acceptance-next',
+        }),
+        'candidate-tag': startGitSource(sourceInputs, 'tag', baseRepository, {
+          kind: 'TAG',
+          value: 'acceptance-next',
+        }),
+        'candidate-dependency': startGitSource(sourceInputs, 'dependency', apiRepository.id),
         [build]: {
           workspace: output('candidate-main', 'workspace'),
           'dependency_web-next': output('candidate-next', 'workspace'),
@@ -601,6 +631,7 @@ async function verifyP2Contract({ api, fixture, execute, source, shellArtifactId
           binding: output(build, 'apiBundle'),
         },
       },
+      sourceInputs,
     );
   });
   const built = await execute('candidate-multi-source', {}, { version, checkIdempotency: true });
@@ -740,6 +771,7 @@ async function verifyP2Contract({ api, fixture, execute, source, shellArtifactId
         required: true,
       },
     ];
+    const temporaryInputs = [];
     addFlow(
       canvas,
       temporary,
@@ -762,7 +794,7 @@ async function verifyP2Contract({ api, fixture, execute, source, shellArtifactId
         edge('candidate-temp-call', 'candidate-temp-output'),
       ],
       {
-        'candidate-temp-checkout': { repository: value(baseRepository) },
+        'candidate-temp-checkout': startGitSource(temporaryInputs, 'temporary', baseRepository),
         'candidate-temp-build': {
           workspace: output('candidate-temp-checkout', 'workspace'),
           service: value({ serviceId: webService }),
@@ -771,6 +803,7 @@ async function verifyP2Contract({ api, fixture, execute, source, shellArtifactId
         'candidate-temp-call': { directory: output('candidate-temp-build', 'temporary') },
       },
       { release: { type: 'RELEASE', binding: output('candidate-temp-call', 'release') } },
+      temporaryInputs,
     );
   });
   const paired = await execute(pair, {}, { version: versionWithRelease, checkIdempotency: true });

@@ -191,9 +191,10 @@ function serveDemoGit(gitRoot) {
     if (typeof req.url !== 'string' || !req.url.startsWith('/') || req.url.startsWith('//'))
       return res.writeHead(404).end();
     const url = new URL(req.url, 'http://localhost');
-    const allowed = /^\/(?:storefront|dependency|work-snapshot)\.git\/(info\/refs|git-upload-pack)$/.exec(
-      url.pathname,
-    );
+    const allowed =
+      /^\/(?:storefront|dependency|work-snapshot)\.git\/(info\/refs|git-upload-pack)$/.exec(
+        url.pathname,
+      );
     const discovery =
       req.method === 'GET' &&
       allowed?.[1] === 'info/refs' &&
@@ -288,12 +289,9 @@ const modules = {
 
 function compileDemoGraph(demo, references, options) {
   const { repositoryIds, serviceIds, environmentSetIds, groupIds, serverIds } = references;
-  const configBinding = (bind, port) =>
-    bind.kind === 'VALUE' && port === 'repository'
-      ? { ...bind, value: mapped(repositoryIds, bind.value, '仓库') }
-      : structuredClone(bind);
   const param = ({ id, type, defaultValue, options: choices, ...attributes }) => {
     const convert = (value) => {
+      if (type === 'REPOSITORY') return mapped(repositoryIds, value, '仓库');
       if (type === 'SERVICE') return { serviceId: mapped(serviceIds, value.serviceId, '服务') };
       if (type === 'ENVIRONMENT_SET') return mapped(environmentSetIds, value, '变量集合');
       if (type === 'TARGETS')
@@ -341,7 +339,11 @@ function compileDemoGraph(demo, references, options) {
             ...config,
             params: (config.params ?? []).map(param),
             ...(outputs?.length && {
-              artifacts: outputs.map(({ id, ...declaration }) => ({ ...declaration, id, name: id })),
+              artifacts: outputs.map(({ id, ...declaration }) => ({
+                ...declaration,
+                id,
+                name: id,
+              })),
             }),
           },
         };
@@ -485,7 +487,7 @@ function compileDemoGraph(demo, references, options) {
         Object.entries(flow.bindings ?? {}).map(([nodeId, entries]) => [
           nodeId,
           Object.fromEntries(
-            Object.entries(entries).map(([port, bind]) => [port, configBinding(bind, port)]),
+            Object.entries(entries).map(([port, bind]) => [port, structuredClone(bind)]),
           ),
         ]),
       ),

@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import type { GraphNode } from '../modules/execution-graphs/execution-graph-definition';
 import type { PipelineSnapshot } from '../modules/pipelines/pipeline.types';
 
 let testDirectory: Promise<string> | undefined;
@@ -1395,6 +1396,20 @@ async function checkDelivery(databaseUrl?: string) {
         source: 'CURRENT_RUN',
       },
     ];
+    const fixedGit = (id: string, type: 'REPOSITORY' | 'GIT_REF', defaultValue: unknown) => ({
+      id,
+      name: id,
+      type,
+      defaultValue,
+      runtimeOverride: false,
+    });
+    const checkoutInputs = [
+      fixedGit('actualRepo', 'REPOSITORY', sharedRepo.id),
+      fixedGit('schemaRepo', 'REPOSITORY', dependencyRepo.id),
+      fixedGit('schemaVersion', 'GIT_REF', { kind: 'COMMIT', value: auxiliaryCommit }),
+      fixedGit('unusedRepo', 'REPOSITORY', repo.id),
+      fixedGit('unusedVersion', 'GIT_REF', { kind: 'COMMIT', value: successfulCommit }),
+    ];
     const typedNodes = [
       {
         id: 'custom',
@@ -1447,8 +1462,18 @@ async function checkDelivery(databaseUrl?: string) {
           },
         ],
       },
-      { id: 'build', type: 'START', name: '仅构建', inputs: [...scoped, version] },
-      { id: 'composed', type: 'START', name: '构建并部署', inputs: [...scoped, version, targets] },
+      {
+        id: 'build',
+        type: 'START',
+        name: '仅构建',
+        inputs: [...scoped, version, ...checkoutInputs],
+      },
+      {
+        id: 'composed',
+        type: 'START',
+        name: '构建并部署',
+        inputs: [...scoped, version, targets, ...checkoutInputs],
+      },
       {
         id: 'release',
         type: 'START',
@@ -1484,19 +1509,16 @@ async function checkDelivery(databaseUrl?: string) {
         id: 'git-actual',
         type: 'CHECKOUT',
         name: '实际服务源码',
-        checkout: { repositoryId: sharedRepo.id, mode: 'COMMIT', commitSha: successfulCommit },
       },
       {
         id: 'git-schema',
         type: 'CHECKOUT',
         name: '实际构建依赖',
-        checkout: { repositoryId: dependencyRepo.id, mode: 'COMMIT', commitSha: auxiliaryCommit },
       },
       {
         id: 'git-unused',
         type: 'CHECKOUT',
         name: '未绑定的源码',
-        checkout: { repositoryId: repo.id, mode: 'COMMIT', commitSha: successfulCommit },
       },
       {
         id: 'build-node',
@@ -1512,7 +1534,16 @@ async function checkDelivery(databaseUrl?: string) {
           ],
         },
       },
-      { id: 'auto-target-start', type: 'START', name: '目标端定时构建', inputs: [targets] },
+      {
+        id: 'auto-target-start',
+        type: 'START',
+        name: '目标端定时构建',
+        inputs: [
+          targets,
+          fixedGit('repository', 'REPOSITORY', repo.id),
+          fixedGit('gitVersion', 'GIT_REF', { kind: 'BRANCH', value: 'main' }),
+        ],
+      },
       {
         id: 'auto-target-check',
         type: 'CHECK',
@@ -1524,8 +1555,6 @@ async function checkDelivery(databaseUrl?: string) {
         type: 'BUILD',
         name: '目标端构建文件',
         build: {
-          repositoryId: repo.id,
-          branch: 'main',
           buildLocation: 'TARGET',
           buildCommand: 'echo GRAPH_AUTOMATIC_TARGET_BUILD',
           artifacts: [{ name: 'jar', type: 'FILE', path: 'app.jar' }],
@@ -1589,7 +1618,9 @@ async function checkDelivery(databaseUrl?: string) {
       ['deploy-repository', 'release-end'],
     ].map(([from, to]) => ({ from, to }));
     const buildBindings = {
-      'git-actual': { version: input('version') },
+      'git-actual': { repository: input('actualRepo'), version: input('version') },
+      'git-schema': { repository: input('schemaRepo'), version: input('schemaVersion') },
+      'git-unused': { repository: input('unusedRepo'), version: input('unusedVersion') },
       'build-node': {
         workspace: from('git-actual', 'workspace'),
         dependency_schema: from('git-schema', 'workspace'),
@@ -1635,7 +1666,11 @@ async function checkDelivery(databaseUrl?: string) {
             endId: 'auto-target-end',
             inputBindings: {
               'auto-target-check': { targets: input('targets') },
-              'auto-target-build': { targets: input('targets') },
+              'auto-target-build': {
+                targets: input('targets'),
+                repository: input('repository'),
+                version: input('gitVersion'),
+              },
             },
           },
           releaseEndpoint('composed', from('build-node', 'image')),
@@ -2736,8 +2771,11 @@ async function checkDelivery(databaseUrl?: string) {
     );
 
     const ci = expandGraphTemplate('CI_BUILD', 'FILE');
+    const ciStart = ci.canvas.nodes.find(({ id }) => id === ci.startId)!;
     const ciCheck = ci.canvas.nodes.find(({ operation }) => operation === 'CHECK')!;
     const ciBuild = ci.canvas.nodes.find(({ operation }) => operation === 'BUILD')!;
+    assert.equal(ciStart.buildLocation, 'INHERIT');
+    ciStart.buildLocation = 'MANAGER';
     ciCheck.shell!.location = 'MANAGER';
     ciCheck.shell!.command = 'echo GRAPH_TEMPLATE_CI_FAIL; exit 23';
     ciBuild.build!.buildCommand = 'echo GRAPH_TEMPLATE_BUILD_BLOCKED';
@@ -2757,11 +2795,32 @@ async function checkDelivery(databaseUrl?: string) {
         parameters: {
           repository: sharedRepo.id,
           gitVersion: { kind: 'COMMIT', value: successfulCommit },
-          buildTargets: { serverIds: [serverIds[0]!] },
         },
       },
     };
+    const assertBuildPlacement = (
+      plan: {
+        deliveries: { nodeId: string; serverIds: string[] }[];
+        executionPlan: {
+          settings: { nodeId: string; field: string; source: string; value: unknown }[];
+        };
+      },
+      location: 'MANAGER' | 'TARGET',
+      source: string,
+      targets: string[],
+    ) => {
+      const build = plan.deliveries.find(({ nodeId }) => nodeId === ciBuild.id)!;
+      assert.deepEqual(build.serverIds, targets);
+      const setting = plan.executionPlan.settings.find(
+        ({ nodeId, field }) => nodeId === ciBuild.id && field === 'buildLocation',
+      );
+      assert.equal(setting?.value, location);
+      assert.equal(setting?.source, source);
+    };
+    const defaults = (await api.get(settingsPath).expect(200)).body.data;
+    assert.equal(defaults.effective.defaultBuildLocation, 'TARGET');
     const ciPlan = await create(ciFlow + '/preview', ciRequest);
+    assertBuildPlacement(ciPlan, 'MANAGER', 'START', []);
     const ciQueued = await create(ciFlow + '/run', {
       ...ciRequest,
       idempotencyKey: randomUUID(),
@@ -2779,6 +2838,51 @@ async function checkDelivery(databaseUrl?: string) {
       await api.get(`/api/v1${graphPath}/runs/${ciFailed.id}/nodes/${ciCheck.id}/logs`).expect(200)
     ).body.data;
     assert.match(ciLog.content, /fixture check failed/);
+    let latestRevision = ciDraft.revision;
+    const publishBuildPlacement = async (location: NonNullable<GraphNode['buildLocation']>) => {
+      ciStart.buildLocation = location;
+      const saved = (
+        await api
+          .put('/api/v1' + graphPath + '/draft')
+          .send({ expectedRevision: latestRevision, definition: { canvas: ci.canvas } })
+          .expect(200)
+      ).body.data;
+      latestRevision = saved.revision;
+      return (await create(graphPath + '/publish', { expectedRevision: latestRevision }))
+        .publishedVersion;
+    };
+    const inheritVersion = await publishBuildPlacement('INHERIT');
+    const inherited = { ...ciRequest, version: inheritVersion };
+    const targeted = {
+      parameters: { ...ciRequest.inputs.parameters, buildTargets: { serverIds: [serverIds[0]!] } },
+    };
+    const missingTarget = await post(ciFlow + '/preview', inherited).expect(400);
+    assert.equal(missingTarget.body.error.planIssue.fieldId, 'targets');
+    assertBuildPlacement(
+      await create(ciFlow + '/preview', { ...inherited, inputs: targeted }),
+      'TARGET',
+      'SYSTEM',
+      [serverIds[0]!],
+    );
+    await api.patch(settingsPath).send({ defaultBuildLocation: 'MANAGER' }).expect(200);
+    assertBuildPlacement(
+      await create(ciFlow + '/preview', { ...inherited, inputs: targeted }),
+      'MANAGER',
+      'PROJECT',
+      [],
+    );
+    const targetVersion = await publishBuildPlacement('TARGET');
+    await post(ciFlow + '/preview', { ...ciRequest, version: targetVersion }).expect(400);
+    assertBuildPlacement(
+      await create(ciFlow + '/preview', { version: targetVersion, inputs: targeted }),
+      'TARGET',
+      'START',
+      [serverIds[0]!],
+    );
+    await api
+      .patch(settingsPath)
+      .send({ defaultBuildLocation: defaults.overrides.defaultBuildLocation ?? null })
+      .expect(200);
 
     const archiveRevision = await create(managedPath, { source: 'ARCHIVE', expectedVersion: 2 });
     assert.equal(archiveRevision.version, 3);

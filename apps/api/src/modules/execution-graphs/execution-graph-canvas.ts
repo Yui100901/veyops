@@ -289,7 +289,7 @@ export function compileCanvas(input: GraphCanvas, publish: boolean): GraphDefini
   const definition = { canvas, flows };
   if (publish) {
     validateNodeReferences(canvas, flows);
-    const compiled = validateGraphDefinition(definition);
+    const compiled = validateGraphDefinition(definition, { publication: true });
     for (const flow of flows) {
       flow.compiled = compiled[flow.id];
       flow.nodes = flow.nodes.map((node) => {

@@ -186,6 +186,7 @@ export class ExecutionGraphsService {
     this.checkRevision(graph.revision, expectedRevision);
     const draft = JSON.parse(graph.draft_json) as GraphDefinition;
     const definition = draft.canvas ? compileCanvas(draft.canvas, true) : draft;
+    if (!definition.canvas) validateGraphDefinition(definition, { publication: true });
     const prior = graph.published_version
       ? (JSON.parse(
           (await this.publishedVersion(this.database.db, graph.id, graph.published_version))
@@ -238,7 +239,7 @@ export class ExecutionGraphsService {
     const draft = JSON.parse(candidate.draft_json) as GraphDefinition;
     const definition = draft.canvas ? compileCanvas(draft.canvas, true) : draft;
     if (!definition.canvas) {
-      const compiled = validateGraphDefinition(definition);
+      const compiled = validateGraphDefinition(definition, { publication: true });
       for (const flow of definition.flows) flow.compiled = compiled[flow.id];
     }
     const version = (candidate.published_version ?? 0) + 1;

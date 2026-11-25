@@ -43,7 +43,7 @@
 
 | 字段 | 所属配置与顺序 |
 | --- | --- |
-| 构建位置、并发、工作区根目录、日志保留 | 系统默认，项目可覆盖。构建节点可选择执行位置，已声明且允许调整的运行参数可指定并发。 |
+| 构建位置、并发、工作区根目录、日志保留 | 系统默认，项目可覆盖。预设的开始节点可设置 `buildLocation` 为 `INHERIT`、`MANAGER` 或 `TARGET`。已声明且允许调整的运行参数可指定并发。 |
 | 代码与构建产物 | Git 节点固定仓库、ref 和实际 SHA。构建节点声明工作目录、命令及具名产物，部署节点绑定已登记产物。 |
 | 环境文件和变量 | 执行图通过加载节点选择明确路径或映射。变量由低到高为绑定的仓库文件、项目公共变量、开始节点的变量集合、节点绑定。平台保留键由系统赋值。 |
 | 构建和发布目标 | 功能节点各自绑定平台服务器或分组。发布目录及启停配置由部署节点声明。 |
@@ -210,7 +210,7 @@ Shell 和检查脚本每执行单元可返回一条 `VEYOPS_OUTPUT=` JSON 对象
 Shell 和检查的环境绑定可使用 `PROJECT_VALUE`，以 `source: {kind:"OUTPUT",nodeId,fieldId}` 指定结构化来源。可取当前挂载的 `WORKSPACE_PATH`、同一 SSH 目标的 `ARTIFACT_PATH` 或镜像的 `IMAGE_NAME`、`IMAGE_ID`、`IMAGE_DIGEST`。管理端读取多实例镜像属性时通过 `serverId` 指定实例所在目标。
 
 - `DEPLOY_ARTIFACT` 和 `ROLLBACK_ARTIFACT` 从 `artifact` 端口取得一件逻辑产物。发布方式 `FILE` 接受文件或目录，`deploy.artifactPath` 固定相对产物根的路径，工作目录快照须提供子路径或显式填 `.`。`COMPOSE` 接受 Docker 镜像。Compose 来源可为 `{kind:"ARTIFACT"}` 或 `{kind:"REPOSITORY_FILE",repositoryId,commitSha,path}`，随预览确认模板。
-- `CHECK` 和 `SHELL` 设置 `shell.artifactPath` 后，可从 `artifact` 端口取得一件文件或目录产物。预览返回所选子路径和已固定实例或上游输出，实际内容展开到 `VEYOPS_ARTIFACT_DIR`。节点的 `shell.directory` 仍相对该节点本身的工作区根。
+- `CHECK` 和 `SHELL` 设置 `shell.artifactPath` 后，可从 `artifact` 端口取得一件文件或目录产物。未显式绑定时，编译器选择覆盖所有可达分支的唯一必需目录产物。预览返回所选子路径和已固定实例或上游输出，实际内容展开到 `VEYOPS_ARTIFACT_DIR`。节点的 `shell.directory` 仍相对该节点本身的工作区根。
 - `RELEASE.targets` 记录已确认的各个目标。失败目标可只有任务状态与 `errorSummary`。已确认的计划实例在 `plannedArtifactInstanceId`，实际使用的实例和发布记录分别在 `artifactInstanceId` 与 `deploymentId`。可以成对配置 `SUCCESS` 与 `PARTIAL_SUCCESS` 出边，部分成功分支只能使用有成功发布记录的目标。其他失败及待核查状态阻断后续。
 - `SOURCE_REVIEW` 可绑定单个固定 Git 来源 `source`，或含源码记录的 `artifact`。构建前审核也可设置 `approval.buildNodeId` 关联下游 `BUILD`，并将构建的 `review` 端口绑定到此审核节点的 `review` 输出。关联构建后，审核范围使用已确认计划中的主仓、依赖仓和异仓变量文件的仓库与 SHA。凭证只对所关联的本次构建有效，Worker 再核对执行快照中的完整源码列表。
 - `APPROVAL.approval.releaseNodeId` 绑定下游发布。等待时固定服务、逐目标成员、实物实例与指纹，回滚还固定被替代的发布记录。
