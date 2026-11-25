@@ -3,10 +3,10 @@ import { message, post, useResource } from '../../../api';
 import { ErrorBanner, Field, Loading, Modal } from '../../../components';
 import type {
   GraphArtifactType,
-  GraphCanvas,
   GraphCatalog,
   GraphFlowExpansion,
 } from '../execution-graph-definition';
+import { simplifiedModel } from '../simplified-flow';
 
 const artifactNames: Record<GraphArtifactType, string> = {
   FILE: '文件',
@@ -16,14 +16,10 @@ const artifactNames: Record<GraphArtifactType, string> = {
 
 export function ExecutionGraphTemplateDialog({
   path,
-  model,
-  replaceDraft,
   insert,
   close,
 }: {
   path: string;
-  model?: GraphCanvas['model'];
-  replaceDraft?: boolean;
   insert: (expansion: GraphFlowExpansion) => void;
   close: () => void;
 }) {
@@ -47,7 +43,7 @@ export function ExecutionGraphTemplateDialog({
         await post<GraphFlowExpansion>(path + '/draft/templates/expand', {
           templateId,
           artifactType: artifact,
-          ...(model && { model }),
+          model: simplifiedModel,
         }),
       );
       close();
@@ -61,12 +57,8 @@ export function ExecutionGraphTemplateDialog({
 
   return (
     <Modal
-      title={replaceDraft ? '用简化模板重建草稿' : '插入流程模板'}
-      description={
-        replaceDraft
-          ? '替换当前草稿中的执行流和节点。已发布版本可继续查看，保存前可撤销本次替换。'
-          : '从模板创建一条新执行流。'
-      }
+      title="添加模板执行链"
+      description="在当前草稿增加一条独立的执行链。"
       onClose={() => {
         if (!pending.current) close();
       }}
@@ -107,7 +99,7 @@ export function ExecutionGraphTemplateDialog({
             </fieldset>
           )}
           {template && template.artifactTypes.length > 1 && (
-            <Field label={model ? '交付类型' : '主产物类型'}>
+            <Field label="交付类型">
               <select
                 disabled={busy}
                 value={artifact}
@@ -127,7 +119,7 @@ export function ExecutionGraphTemplateDialog({
             取消
           </button>
           <button type="submit" className="button primary" disabled={!template || busy}>
-            {busy ? '正在生成…' : replaceDraft ? '替换当前草稿' : '插入此流程'}
+            {busy ? '正在生成…' : '添加执行链'}
           </button>
         </div>
       </form>

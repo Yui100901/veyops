@@ -210,7 +210,57 @@ async function checkTemplates(databaseUrl?: string) {
       .expect(201);
     assert.deepEqual(ciValidated.body.data.issues, []);
     const ciDraft = (await save(ci, published.revision).expect(200)).body.data;
-    await api.post(`${path}/publish`).send({ expectedRevision: ciDraft.revision }).expect(201);
+    const ciPublished = (
+      await api.post(`${path}/publish`).send({ expectedRevision: ciDraft.revision }).expect(201)
+    ).body.data;
+    const mixed: GraphCanvas = {
+      nodes: [
+        { id: 'old-start', name: '已有流程', type: 'START' },
+        { id: 'old-log', name: '原节点', type: 'LOG', message: '原配置' },
+        { id: 'old-end', name: '原结束', type: 'END' },
+        ...ci.nodes.map((node) => ({ ...node, model: 'FLOW_V2' as const })),
+      ],
+      edges: [
+        { from: 'old-start', to: 'old-log' },
+        { from: 'old-log', to: 'old-end' },
+        ...ci.edges,
+      ],
+      endpoints: [
+        { startId: 'old-start', endId: 'old-end', serviceId: service.id },
+        ...ci.endpoints,
+      ],
+      templates: [],
+    };
+    const duplicate = structuredClone(mixed);
+    duplicate.nodes
+      .find(({ model, type }) => model === 'FLOW_V2' && type === 'START')!
+      .start!.sources!.push({ id: 'duplicate', repositoryId: repository.id });
+    const duplicateCheck = (
+      await api
+        .post(`${path}/validate`)
+        .send({ definition: { canvas: duplicate } })
+        .expect(201)
+    ).body.data;
+    assert.equal(duplicateCheck.issues[0].fieldId, 'start.sources.duplicate.parentDirectory');
+    const mixedDraft = (await save(mixed, ciPublished.revision).expect(200)).body.data;
+    const mixedPublished = (
+      await api.post(`${path}/publish`).send({ expectedRevision: mixedDraft.revision }).expect(201)
+    ).body.data;
+    const version = (
+      await api.get(`${path}/versions/${mixedPublished.publishedVersion}`).expect(200)
+    ).body.data;
+    assert.deepEqual(
+      version.definition.flows.map(({ id, model }: { id: string; model?: string }) => ({
+        id,
+        model,
+      })),
+      [
+        { id: 'old-start', model: undefined },
+        { id: ci.endpoints[0]!.startId, model: 'FLOW_V2' },
+      ],
+    );
+    assert.equal(version.definition.flows[0].serviceId, service.id);
+    assert.equal(version.definition.flows[0].nodes[1].message, '原配置');
 
     const db = app.get(DatabaseService).db;
     const audit = app.get(AuditService);

@@ -186,6 +186,7 @@ export function NodeMap({
   connecting,
   onConnectSource,
   onConnectTarget,
+  isConnectTarget,
   isRunnableStart,
   nodeSummary,
 }: {
@@ -208,6 +209,7 @@ export function NodeMap({
   connecting?: string;
   onConnectSource?: (id: string) => void;
   onConnectTarget?: (id: string) => void;
+  isConnectTarget?: (id: string) => boolean;
   isRunnableStart?: (id: string) => boolean;
   nodeSummary?: (node: GraphNode) => string | undefined;
 }) {
@@ -643,6 +645,7 @@ export function NodeMap({
                   {onConnectTarget &&
                     connecting &&
                     connecting !== node.id &&
+                    (!isConnectTarget || isConnectTarget(node.id)) &&
                     node.type !== 'START' && (
                       <button
                         type="button"

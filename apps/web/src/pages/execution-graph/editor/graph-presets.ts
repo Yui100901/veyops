@@ -23,6 +23,7 @@ export function makeNode(type: GraphNode['type'], model?: GraphCanvas['model']):
     id: graphKey('node'),
     type,
     name,
+    ...(simple && { model }),
     ...(type === 'START' &&
       (simple
         ? { start: { execution: { location: 'INHERIT' as const } } }
@@ -71,15 +72,17 @@ export function appendFlowTemplate(
   expansion: GraphFlowExpansion,
 ): GraphCanvas {
   const { canvas: fragment, startId } = expansion;
-  if (canvas.model !== fragment.model && (canvas.nodes.length || canvas.templates.length))
-    throw new Error('请使用相同定义的流程模板。');
+  if (canvas.model && canvas.model !== fragment.model) throw new Error('请选择简化流程模板。');
   if (
     canvas.nodes.length + fragment.nodes.length > 500 ||
     canvas.edges.length + fragment.edges.length > 1500 ||
-    canvas.endpoints.length + fragment.endpoints.length > 50
+    canvas.endpoints.length + fragment.endpoints.length > 50 ||
+    canvas.templates.length + fragment.templates.length > 100
   )
     throw new Error('草稿已接近容量上限，请移除不用的节点或执行流后重试。');
-  const ids = [...canvas.nodes, ...canvas.templates, ...fragment.nodes].map(({ id }) => id);
+  const ids = [...canvas.nodes, ...canvas.templates, ...fragment.nodes, ...fragment.templates].map(
+    ({ id }) => id,
+  );
   if (new Set(ids).size !== ids.length) throw new Error('生成的节点 ID 与草稿重复，请重新插入。');
   const start = fragment.nodes.find(({ id, type }) => id === startId && type === 'START');
   if (!start || !fragment.endpoints.some(({ startId: id }) => id === startId))
@@ -91,14 +94,19 @@ export function appendFlowTemplate(
   let name = start.name;
   for (let suffix = 2; names.has(name); suffix++) name = start.name + '（' + suffix + '）';
   const nodes = placeFlowTemplate(canvas, fragment);
+  const model =
+    canvas.model ?? (!canvas.nodes.length && !canvas.templates.length ? fragment.model : undefined);
+  const markModel = (node: GraphNode) =>
+    !model && fragment.model ? { ...node, model: fragment.model } : node;
   return {
     ...canvas,
-    model: fragment.model ?? canvas.model,
+    model,
     nodes: [
       ...canvas.nodes,
-      ...nodes.map((node) => (node.id === startId ? { ...node, name } : node)),
+      ...nodes.map(markModel).map((node) => (node.id === startId ? { ...node, name } : node)),
     ],
     edges: [...canvas.edges, ...fragment.edges],
     endpoints: [...canvas.endpoints, ...fragment.endpoints],
+    templates: [...canvas.templates, ...fragment.templates.map(markModel)],
   };
 }

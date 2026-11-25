@@ -208,6 +208,10 @@ export function simplifiedGitRefValid(ref: SimplifiedGitRef) {
   }
 }
 
+export function isSimplifiedCanvasNode(canvas: GraphCanvas, node?: GraphNode) {
+  return (canvas.model ?? node?.model) === 'FLOW_V2';
+}
+
 const obsoleteFields = [
   'contract',
   'buildLocation',
@@ -255,6 +259,7 @@ function nodeIssue(node: GraphNode, fieldId: string, message: string, flowId?: s
 
 export function validateSimplifiedCanvas(canvas: GraphCanvas) {
   for (const node of [...canvas.nodes, ...canvas.templates]) {
+    if (!isSimplifiedCanvasNode(canvas, node)) continue;
     for (const field of obsoleteFields) {
       if (node[field] !== undefined)
         nodeIssue(node, field, '新流程使用开始配置和结尾核对规则，请移除旧字段');
@@ -272,6 +277,8 @@ export function validateSimplifiedCanvas(canvas: GraphCanvas) {
       nodeIssue(node, 'finish', '仅结束节点可配置交付结果');
   }
   for (const endpoint of canvas.endpoints) {
+    const start = canvas.nodes.find(({ id }) => id === endpoint.startId);
+    if (!start || !isSimplifiedCanvasNode(canvas, start)) continue;
     for (const field of [
       'inputBindings',
       'outputBindings',
@@ -280,8 +287,7 @@ export function validateSimplifiedCanvas(canvas: GraphCanvas) {
       'edgeSelections',
     ] as const) {
       if (endpoint[field] === undefined) continue;
-      const start = canvas.nodes.find(({ id }) => id === endpoint.startId);
-      if (start) nodeIssue(start, field, '执行流通过控制连线决定步骤顺序，请移除旧绑定');
+      nodeIssue(start, field, '执行流通过控制连线决定步骤顺序，请移除旧绑定');
     }
   }
 }

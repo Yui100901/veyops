@@ -2,7 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { redactTaskLog } from '../tasks/task-log.service';
 import { flowCandidateCatalog } from './graph-binding-validation';
-import { validateSimplifiedCanvas } from './simplified-flow-definition';
+import { isSimplifiedCanvasNode, validateSimplifiedCanvas } from './simplified-flow-definition';
 import {
   annotateGraphIssue,
   graphDynamicOutlets,
@@ -22,6 +22,7 @@ import {
   graphRecord,
   safeGraphId,
   safeGraphReference,
+  type GraphBinding,
   type GraphDiagnostic,
 } from './graph-fields';
 
@@ -89,22 +90,70 @@ export function withDraftCanvas(
         taken.add(id);
       }
       ids.set(node.id, id);
+    }
+    const nodeId = (id: string) => ids.get(id) ?? id;
+    const binding = (value: GraphBinding): GraphBinding => {
+      switch (value.kind) {
+        case 'OUTPUT':
+          return { ...value, nodeId: nodeId(value.nodeId) };
+        case 'FIRST_AVAILABLE':
+          return { ...value, sources: value.sources.map(binding) };
+        case 'AS_GIT_REF':
+          return { ...value, source: binding(value.source) };
+        case 'PROJECT_VALUE':
+          return { ...value, source: { ...value.source, nodeId: nodeId(value.source.nodeId) } };
+        default:
+          return value;
+      }
+    };
+    const bindings = (fields: Record<string, GraphBinding>) =>
+      Object.fromEntries(Object.entries(fields).map(([field, value]) => [field, binding(value)]));
+    const nodeBindings = (nodes: Record<string, Record<string, GraphBinding>>) =>
+      Object.fromEntries(
+        Object.entries(nodes).map(([id, fields]) => [nodeId(id), bindings(fields)]),
+      );
+    for (const node of flow.nodes) {
+      const id = nodeId(node.id);
+      const { releaseNodeId, buildNodeId } = node.approval ?? {};
       canvas.nodes.push({
         ...node,
         id,
         name: node.type === 'START' ? flow.name : node.name,
+        ...(node.approval && {
+          approval: {
+            ...node.approval,
+            ...(releaseNodeId !== undefined && { releaseNodeId: nodeId(releaseNodeId) }),
+            ...(buildNodeId !== undefined && { buildNodeId: nodeId(buildNodeId) }),
+          },
+        }),
       });
-      if (node.type === 'END') canvas.endpoints.push({ startId: flow.id, endId: id });
+      if (node.type !== 'END') continue;
+      canvas.endpoints.push({
+        startId: flow.id,
+        endId: id,
+        ...(flow.serviceId !== undefined && { serviceId: flow.serviceId }),
+        ...(flow.inputBindings && { inputBindings: nodeBindings(flow.inputBindings) }),
+        ...(flow.outputBindings && { outputBindings: bindings(flow.outputBindings) }),
+        ...(flow.environmentBindings && {
+          environmentBindings: nodeBindings(flow.environmentBindings),
+        }),
+        ...(flow.edgeSelections && {
+          edgeSelections: Object.fromEntries(
+            Object.entries(flow.edgeSelections).map(([from, to]) => [nodeId(from), to.map(nodeId)]),
+          ),
+        }),
+      });
     }
     for (const edge of flow.edges)
-      canvas.edges.push({ ...edge, from: ids.get(edge.from)!, to: ids.get(edge.to)! });
+      canvas.edges.push({ ...edge, from: nodeId(edge.from), to: nodeId(edge.to) });
   }
   return { ...definition, canvas: withNodeReferences(canvas) };
 }
 
 function validateCanvas(canvas: GraphCanvas) {
-  const simplified = canvas.model === 'FLOW_V2';
-  const byId = new Map(canvas.nodes.map((node) => [node.id, runtimeGraphNode(node, simplified)]));
+  const runtimeNode = (node: GraphNode) =>
+    runtimeGraphNode(node, isSimplifiedCanvasNode(canvas, node));
+  const byId = new Map(canvas.nodes.map((node) => [node.id, runtimeNode(node)]));
   const ids = new Set([...canvas.nodes, ...canvas.templates].map(({ id }) => id));
   if (ids.size !== canvas.nodes.length + canvas.templates.length)
     throw new BadRequestException('画布节点和功能节点库中的 ID 必须唯一');
@@ -114,6 +163,12 @@ function validateCanvas(canvas: GraphCanvas) {
     const to = byId.get(edge.to);
     if (!from || !to || from.id === to.id)
       throw new BadRequestException('连线必须连接画布中两个不同的节点');
+    if (isSimplifiedCanvasNode(canvas, from) !== isSimplifiedCanvasNode(canvas, to))
+      throw new GraphCompileError({
+        nodeId: from.id,
+        edge,
+        message: '同一条连线的节点须使用相同的编排类型',
+      });
     if (to.type === 'START' || from.type === 'END')
       throw new BadRequestException('开始节点只允许出线，结束节点只允许入线');
     const outgoing = edges.get(from.id) ?? [];
@@ -128,8 +183,15 @@ function validateCanvas(canvas: GraphCanvas) {
   }
   const starts = new Set<string>();
   for (const { startId, endId } of canvas.endpoints) {
-    if (byId.get(startId)?.type !== 'START' || byId.get(endId)?.type !== 'END')
+    const start = byId.get(startId);
+    const end = byId.get(endId);
+    if (start?.type !== 'START' || end?.type !== 'END')
       throw new BadRequestException('执行流必须配对画布中的开始节点和结束节点');
+    if (isSimplifiedCanvasNode(canvas, start) !== isSimplifiedCanvasNode(canvas, end))
+      throw new GraphCompileError({
+        nodeId: startId,
+        message: '开始节点和结束节点须使用相同的编排类型',
+      });
     if (starts.has(startId)) throw new BadRequestException('一个开始节点只能配对一个结束节点');
     starts.add(startId);
   }
@@ -156,7 +218,7 @@ function validateCanvas(canvas: GraphCanvas) {
     if (text.some((value) => value && redactTaskLog(value) !== value))
       throw new BadRequestException('节点配置包含明文凭据，请移除敏感值');
   }
-  canvas.templates.forEach((node) => runtimeGraphNode(node, simplified));
+  canvas.templates.forEach(runtimeNode);
   return { byId, edges };
 }
 
@@ -275,25 +337,22 @@ function deriveFlow(
 /** Derive runnable projections from canvas data without trusting client-supplied flows. */
 export function compileCanvas(input: GraphCanvas, publish: boolean): GraphDefinition {
   const canvas = withNodeReferences(input);
-  if (canvas.model === 'FLOW_V2') validateSimplifiedCanvas(canvas);
+  validateSimplifiedCanvas(canvas);
   const { byId, edges } = validateCanvas(canvas);
   const scopes = canvas.endpoints.map((endpoint) => flowScope(endpoint, edges));
   const owners = new Set(scopes.flatMap(({ included }) => [...included]));
   const flows: GraphFlow[] = [];
   for (const [index, endpoint] of canvas.endpoints.entries()) {
     try {
-      flows.push(
-        deriveFlow(byId.get(endpoint.startId)!, endpoint, byId, edges, scopes[index]!, owners),
-      );
+      const start = byId.get(endpoint.startId)!;
+      const flow = deriveFlow(start, endpoint, byId, edges, scopes[index]!, owners);
+      if (isSimplifiedCanvasNode(canvas, start)) flow.model = 'FLOW_V2';
+      flows.push(flow);
     } catch (error) {
       if (publish || !(error instanceof BadRequestException)) throw error;
     }
   }
   const definition = { canvas, flows };
-  if (canvas.model === 'FLOW_V2')
-    flows.forEach((flow) => {
-      flow.model = 'FLOW_V2';
-    });
   if (publish) {
     validateNodeReferences(canvas, flows);
     const compiled = validateGraphDefinition(definition, { publication: true });
@@ -310,7 +369,13 @@ export function compileCanvas(input: GraphCanvas, publish: boolean): GraphDefini
 }
 
 export function canvasCatalog(canvas: GraphCanvas, flowId: string, nodeId: string) {
-  if (canvas.model === 'FLOW_V2') return {};
+  if (
+    isSimplifiedCanvasNode(
+      canvas,
+      canvas.nodes.find(({ id }) => id === flowId),
+    )
+  )
+    return {};
   const { flows } = compileCanvas(canvas, false);
   const flow = flows.find(({ id }) => id === flowId);
   return flow

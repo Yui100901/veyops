@@ -1,5 +1,7 @@
 import type { GraphIssueLocation } from '../../../api';
+import { graphCanvasNodeModel } from '../execution-graph-definition';
 import type { GraphDocument, GraphField } from '../execution-graph-definition';
+import { simplifiedModel } from '../simplified-flow';
 import type { SimplifiedSource } from '../simplified-flow';
 
 export const triggerChoices = {
@@ -122,16 +124,24 @@ export function triggerChoice(rule: TriggerConfig): TriggerChoice {
 }
 
 export function triggerFlows(definition: GraphDocument['draft']): TriggerFlow[] {
-  if (!definition.canvas)
-    return definition.flows.map(({ id, name, nodes }) => ({
-      id,
-      name,
-      inputs: nodes.find(({ type }) => type === 'START')?.inputs ?? [],
-      outputs: nodes.find(({ type }) => type === 'END')?.outputs ?? [],
-    }));
-  const nodes = new Map(definition.canvas.nodes.map((node) => [node.id, node]));
-  const ends = new Map(definition.canvas.endpoints.map(({ startId, endId }) => [startId, endId]));
-  return definition.canvas.nodes.flatMap((start) => {
+  const { canvas } = definition;
+  if (!canvas)
+    return definition.flows.map(({ id, name, model, nodes }) => {
+      const start = nodes.find(({ type }) => type === 'START');
+      return {
+        id,
+        name,
+        inputs: start?.inputs ?? [],
+        outputs: nodes.find(({ type }) => type === 'END')?.outputs ?? [],
+        ...(model === simplifiedModel && {
+          sources: start?.start?.sources ?? [],
+          useUpstreamArtifact: start?.start?.release?.useUpstreamArtifact,
+        }),
+      };
+    });
+  const nodes = new Map(canvas.nodes.map((node) => [node.id, node]));
+  const ends = new Map(canvas.endpoints.map(({ startId, endId }) => [startId, endId]));
+  return canvas.nodes.flatMap((start) => {
     if (start.type !== 'START') return [];
     const endId = ends.get(start.id);
     return [
@@ -140,7 +150,7 @@ export function triggerFlows(definition: GraphDocument['draft']): TriggerFlow[] 
         name: start.name,
         inputs: start.inputs ?? [],
         outputs: (endId ? nodes.get(endId)?.outputs : undefined) ?? [],
-        ...(definition.canvas?.model === 'FLOW_V2' && {
+        ...(graphCanvasNodeModel(canvas, start) === simplifiedModel && {
           sources: start.start?.sources ?? [],
           useUpstreamArtifact: start.start?.release?.useUpstreamArtifact,
         }),

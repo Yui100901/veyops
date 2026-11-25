@@ -36,6 +36,7 @@ import {
 } from './graph-fields';
 import { validateFlowBindings, type GraphCompiledFlow } from './graph-binding-validation';
 import {
+  isSimplifiedCanvasNode,
   SimplifiedFinish,
   SimplifiedStart,
   validateSimplifiedFlow,
@@ -286,6 +287,7 @@ export class GraphDeploySettings {
 }
 
 export class GraphNode {
+  @ValidateIf((_o, v) => v !== undefined) @IsIn(['FLOW_V2']) model?: 'FLOW_V2';
   @Matches(idFormat) id!: string;
   @IsString() @Length(1, 100) @Matches(/\S/) name!: string;
   @ValidateIf((_o, v) => v !== undefined) @Matches(graphReferenceFormat) referenceName?: string;
@@ -763,6 +765,7 @@ export function validateGraphDefinition(
   if (!definition.flows.length || definition.flows.length > maxFlows)
     throw new BadRequestException(`每张图须包含 1 到 ${maxFlows} 个执行流`);
   const calls = new Map<string, { nodeCount: number; children: string[] }>();
+  const models = new Map(definition.flows.map((flow) => [flow.id, flow.model] as const));
   const nodeIds = new Set<string>();
   const issues: GraphDiagnostic[] = [];
   for (const flow of definition.flows) {
@@ -875,6 +878,8 @@ export function validateGraphDefinition(
         }
         if (node.type === 'FLOW_CALL') {
           if (!node.flowId) throw new BadRequestException('调用节点须选择同图中的执行流');
+          if (models.has(node.flowId) && models.get(node.flowId) !== flow.model)
+            throw new BadRequestException('调用节点须选择相同编排类型的执行流');
           references.children.push(node.flowId);
         } else if (node.flowId !== undefined) {
           throw new BadRequestException('仅调用节点可引用其他执行流');
@@ -922,7 +927,9 @@ export function validateGraphDefinition(
   for (const flow of definition.flows) {
     try {
       if (flow.model === 'FLOW_V2') {
-        if (definition.canvas?.model !== 'FLOW_V2')
+        const canvas = definition.canvas;
+        const start = canvas?.nodes.find(({ id, type }) => id === flow.id && type === 'START');
+        if (!canvas || !start || !isSimplifiedCanvasNode(canvas, start))
           throw new GraphCompileError({ flowId: flow.id, message: '简化流程需要提交画布' });
         validateSimplifiedFlow(flow, orderedFlowNodes(flow));
         continue;

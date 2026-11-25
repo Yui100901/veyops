@@ -21,6 +21,7 @@ import {
 import {
   branchOptions,
   effectiveNodeType,
+  graphCanvasNodeModel,
   graphKey,
   graphNodeLabels,
   graphNodeFamily,
@@ -146,7 +147,6 @@ export function ProjectGraphEditor({
   initialFieldLocation?: GraphIssueLocation;
   insertedStartId?: string;
 }) {
-  const simplified = canvas.model === simplifiedModel;
   const [selection, select] = useState<Selection | undefined>(
     initialNodeId ? { kind: 'node', id: initialNodeId } : undefined,
   );
@@ -182,7 +182,9 @@ export function ProjectGraphEditor({
     setFocusRequest(undefined);
   }, [insertedStartId]);
   const catalog = useResource<GraphCatalog>(
-    simplified ? null : '/projects/' + project.id + '/execution-graph/catalog',
+    canvas.model === simplifiedModel
+      ? null
+      : '/projects/' + project.id + '/execution-graph/catalog',
   );
   const triggers = useResource<{ flowId: string; enabled: boolean }[]>(
     project.archived ? null : '/projects/' + project.id + '/execution-graph/triggers',
@@ -198,9 +200,23 @@ export function ProjectGraphEditor({
       ? canvas.templates.find(({ id }) => id === selection.id)
       : undefined;
   const inspected = activeNode ?? template;
+  const inspectedModel = graphCanvasNodeModel(canvas, inspected);
+  const simplified = inspectedModel === simplifiedModel;
   const isFunction = inspected && graphNodeFamily(inspected) === 'function';
   const activeEdge = selection?.kind === 'edge' ? canvas.edges[selection.index] : undefined;
   const selectedPair = canvas.endpoints.find((pair) => pair.startId === startId);
+  const selectedStart = canvas.nodes.find(({ id }) => id === selectedPair?.startId);
+  const connectionSource = canvas.nodes.find(({ id }) => id === source);
+  const paletteModel = graphCanvasNodeModel(
+    canvas,
+    template ?? connectionSource ?? selectedStart ?? activeNode,
+  );
+  const simplifiedPalette = paletteModel === simplifiedModel;
+  const paletteOperations = simplifiedPalette ? simplifiedActions : graphOperations;
+  const availableTemplateType =
+    templateType === 'FUNCTION' || paletteOperations.some((type) => type === templateType)
+      ? templateType
+      : 'FUNCTION';
   const selectedPath = pathHighlight(canvas, selectedPair?.startId);
   const [catalogSnapshot, setCatalogSnapshot] = useState<{
     canvas: GraphCanvas;
@@ -217,7 +233,10 @@ export function ProjectGraphEditor({
     simplified && activeNode
       ? (canvas.nodes.find((node) => node.id === activePair?.startId) ??
         canvas.nodes.find(
-          (node) => node.type === 'START' && reachable(canvas, node.id).has(activeNode.id),
+          (node) =>
+            node.type === 'START' &&
+            graphCanvasNodeModel(canvas, node) === simplifiedModel &&
+            reachable(canvas, node.id).has(activeNode.id),
         ))
       : undefined;
   const useStartDefaults = Boolean(
@@ -285,7 +304,7 @@ export function ProjectGraphEditor({
       selectedPair?.inputBindings?.[focusRequest.nodeId]?.[focusRequest.fieldId]),
   );
   const pendingBindings = Boolean(
-    activeNode && selectedPath?.nodes.has(activeNode.id) && catalog.loading,
+    !simplified && activeNode && selectedPath?.nodes.has(activeNode.id) && catalog.loading,
   );
   useEffect(() => {
     if (!focusRequest || focusRequest === handledFocus.current) return;
@@ -335,6 +354,13 @@ export function ProjectGraphEditor({
         id,
     }));
     setImpact(flows.length ? { canvas: next, message, flows, nodeId } : undefined);
+  }
+
+  function endpointModel(pair: GraphEndpoint) {
+    return graphCanvasNodeModel(
+      canvas,
+      canvas.nodes.find(({ id }) => id === pair.startId),
+    );
   }
 
   function patch(fields: Partial<GraphNode>) {
@@ -388,7 +414,7 @@ export function ProjectGraphEditor({
       return authoredNode(next);
     }
     const endpoints = canvas.endpoints.map((pair) => {
-      if (simplified) return pair;
+      if (simplified || endpointModel(pair) === simplifiedModel) return pair;
       if (nextOutputs && pair.endId === inspected.id)
         return {
           ...pair,
@@ -476,13 +502,24 @@ export function ProjectGraphEditor({
     const kind = payload.startsWith('type:') ? (payload.slice(5) as NodeType) : undefined;
     const node =
       kind && Object.hasOwn(graphNodeLabels, kind)
-        ? makeNode(kind, canvas.model)
+        ? makeNode(kind, paletteModel)
         : canvas.templates.find(({ id }) => payload === 'template:' + id);
     if (node) addNode(node, position);
   }
   function assignEnd(startId: string, endId?: string) {
     if (!canEdit) return;
-    if (endId && !reachable(canvas, startId).has(endId)) return;
+    const start = canvas.nodes.find(({ id, type }) => id === startId && type === 'START');
+    if (!start) return;
+    const model = graphCanvasNodeModel(canvas, start);
+    if (endId) {
+      const end = canvas.nodes.find(({ id, type }) => id === endId && type === 'END');
+      if (
+        !end ||
+        graphCanvasNodeModel(canvas, end) !== model ||
+        !reachable(canvas, startId).has(endId)
+      )
+        return;
+    }
     const previous = canvas.endpoints.find((pair) => pair.startId === startId);
     const retained =
       previous?.endId === endId
@@ -496,7 +533,9 @@ export function ProjectGraphEditor({
       ...canvas,
       endpoints: [
         ...canvas.endpoints.filter((pair) => pair.startId !== startId),
-        ...(endId ? [simplified ? { startId, endId } : { ...retained, startId, endId }] : []),
+        ...(endId
+          ? [model === simplifiedModel ? { startId, endId } : { ...retained, startId, endId }]
+          : []),
       ],
     };
     recordImpact(next, '开始与结束节点的配对已更新。', changedTopologyFlows(canvas, next), startId);
@@ -603,6 +642,7 @@ export function ProjectGraphEditor({
       endpoints: canvas.endpoints
         .filter((pair) => pair.startId !== id && pair.endId !== id)
         .map((pair) => {
+          if (endpointModel(pair) === simplifiedModel) return pair;
           const inputBindings = { ...pair.inputBindings };
           delete inputBindings[id];
           const environmentBindings = { ...pair.environmentBindings };
@@ -613,9 +653,7 @@ export function ProjectGraphEditor({
               return from !== id && remaining.length ? [[from, remaining]] : [];
             }),
           );
-          return simplified
-            ? { ...pair, edgeSelections }
-            : { ...pair, inputBindings, environmentBindings, edgeSelections };
+          return { ...pair, inputBindings, environmentBindings, edgeSelections };
         }),
     };
     recordImpact(next, '节点已删除，请复核以下执行流。', [
@@ -659,6 +697,10 @@ export function ProjectGraphEditor({
   function connect(target: string) {
     if (!source || !canEdit) return;
     setSource(undefined);
+    if (!compatibleConnection(source, target)) {
+      setError('请选择同一类型执行流中的节点连线。');
+      return;
+    }
     if (reachable(canvas, target, false, false).has(source)) {
       setError('这条连线会形成循环。');
       return;
@@ -685,7 +727,20 @@ export function ProjectGraphEditor({
     }
     addEdge({ from: source, to: target, ...(options[0] && { when: options[0].value }) });
   }
+  function compatibleConnection(from: string, to: string) {
+    const first = canvas.nodes.find(({ id }) => id === from);
+    const second = canvas.nodes.find(({ id }) => id === to);
+    return Boolean(
+      first &&
+      second &&
+      graphCanvasNodeModel(canvas, first) === graphCanvasNodeModel(canvas, second),
+    );
+  }
   function addEdge(edge: GraphEdge, index?: number) {
+    if (!compatibleConnection(edge.from, edge.to)) {
+      setError('请选择同一类型执行流中的节点连线。');
+      return;
+    }
     const next: GraphCanvas = {
       ...canvas,
       edges:
@@ -703,10 +758,15 @@ export function ProjectGraphEditor({
     }
     const paired = new Set(next.endpoints.map(({ startId }) => startId));
     const ends = next.nodes.filter(({ type }) => type === 'END');
-    const endpoints = next.nodes.flatMap(({ id, type }) => {
+    const endpoints = next.nodes.flatMap((node) => {
+      const { id, type } = node;
       if (type !== 'START' || paired.has(id)) return [];
       const available = reachable(next, id);
-      const reached = ends.filter((end) => available.has(end.id));
+      const reached = ends.filter(
+        (end) =>
+          available.has(end.id) &&
+          graphCanvasNodeModel(canvas, end) === graphCanvasNodeModel(canvas, node),
+      );
       const end = reached.length === 1 ? reached[0] : undefined;
       return end && !reachable(canvas, id).has(end.id) ? [{ startId: id, endId: end.id }] : [];
     });
@@ -760,7 +820,7 @@ export function ProjectGraphEditor({
     setFocusRequest({ nodeId, fieldId, fieldSection: 'input' });
   }
   function summarizeNode(node: GraphNode) {
-    if (simplified) {
+    if (graphCanvasNodeModel(canvas, node) === simplifiedModel) {
       if (node.type === 'START')
         return (
           node.start?.sources
@@ -865,7 +925,7 @@ export function ProjectGraphEditor({
         draggable
         className="graph-palette-node"
         onDragStart={(event) => drag(event, 'type:' + type)}
-        onClick={() => addNode(makeNode(type, canvas.model))}
+        onClick={() => addNode(makeNode(type, paletteModel))}
       >
         <Plus size={14} />
         {label}
@@ -920,18 +980,18 @@ export function ProjectGraphEditor({
               {paletteButton('END')}
             </div>
             <div className="graph-palette-group">
-              <h4>{simplified ? '执行动作' : '功能节点'}</h4>
-              {paletteButton('FUNCTION', simplified ? '执行命令' : '新建自定义节点')}
+              <h4>{simplifiedPalette ? '执行动作' : '功能节点'}</h4>
+              {paletteButton('FUNCTION', simplifiedPalette ? '执行命令' : '新建自定义节点')}
               <details className="graph-palette-templates">
                 <summary>系统模板</summary>
                 <div className="graph-palette-group">
-                  {(simplified
+                  {(simplifiedPalette
                     ? simplifiedActions.filter((action) => action !== 'SHELL')
                     : systemNodePresets
                   ).map((operation) => paletteButton(operation))}
                 </div>
               </details>
-              {!simplified && (
+              {!simplifiedPalette && (
                 <details className="graph-palette-templates">
                   <summary>高级节点</summary>
                   <div className="graph-palette-group">{paletteButton('DELAY')}</div>
@@ -963,11 +1023,11 @@ export function ProjectGraphEditor({
                   ))}
                   <Field label="起始模板">
                     <select
-                      value={templateType}
+                      value={availableTemplateType}
                       onChange={(event) => setTemplateType(event.target.value as NodeType)}
                     >
                       <option value="FUNCTION">空白功能节点</option>
-                      {(simplified ? simplifiedActions : graphOperations).map((type) => (
+                      {paletteOperations.map((type) => (
                         <option key={type} value={type}>
                           {graphNodeLabels[type]}
                         </option>
@@ -977,7 +1037,7 @@ export function ProjectGraphEditor({
                   <button
                     type="button"
                     className="button secondary small"
-                    onClick={() => createTemplate(makeNode(templateType, canvas.model))}
+                    onClick={() => createTemplate(makeNode(availableTemplateType, paletteModel))}
                   >
                     <Plus size={15} />
                     新建项目模板
@@ -1111,6 +1171,7 @@ export function ProjectGraphEditor({
             connecting={source}
             onConnectSource={canEdit ? beginConnection : undefined}
             onConnectTarget={canEdit ? connect : undefined}
+            isConnectTarget={source ? (id) => compatibleConnection(source, id) : undefined}
           />
           <div className="graph-canvas-actions heading-actions">
             {canEdit && canvas.nodes.some(({ position }) => position) && (
@@ -1200,7 +1261,7 @@ export function ProjectGraphEditor({
                     patch={patch}
                     sources={inspectedActionStart?.start?.sources ?? []}
                     selectOperation={(operation) =>
-                      patch(changeOperation(inspected, operation, canvas.model))
+                      patch(changeOperation(inspected, operation, inspectedModel))
                     }
                   />
                 ) : inspected.type === 'START' ? (
@@ -1253,7 +1314,6 @@ export function ProjectGraphEditor({
                     simplifiedStart={inspectedActionStart?.start ?? {}}
                   />
                 )}
-                {activeNode && activePair && renderBranches(activeNode, activePair)}
               </>
             ) : isFunction ? (
               <>
@@ -1545,9 +1605,13 @@ export function ProjectGraphEditor({
 
 function StartPair({ node, canvas, canEdit, assign }: PairProps) {
   const valid = reachable(canvas, node.id);
-  const ends = canvas.nodes.filter((item) => item.type === 'END' && valid.has(item.id));
+  const model = graphCanvasNodeModel(canvas, node);
+  const ends = canvas.nodes.filter(
+    (item) =>
+      item.type === 'END' && valid.has(item.id) && graphCanvasNodeModel(canvas, item) === model,
+  );
   const selected = canvas.endpoints.find(({ startId }) => startId === node.id)?.endId ?? '';
-  const stale = selected && !valid.has(selected);
+  const stale = selected && !ends.some(({ id }) => id === selected);
   return (
     <Field
       label="对应结束节点"
@@ -1587,11 +1651,17 @@ function EndPairs({ node, canvas, canEdit, assign }: PairProps) {
   const [candidate, setCandidate] = useState('');
   const [existing, setExisting] = useState('');
   const reachableStarts = reachable(canvas, node.id, true);
+  const model = graphCanvasNodeModel(canvas, node);
   const starts = canvas.nodes.filter(({ type }) => type === 'START');
   const chosen = new Set(
     canvas.endpoints.filter(({ endId }) => endId === node.id).map(({ startId }) => startId),
   );
-  const available = starts.filter(({ id }) => reachableStarts.has(id) && !chosen.has(id));
+  const available = starts.filter(
+    (start) =>
+      reachableStarts.has(start.id) &&
+      !chosen.has(start.id) &&
+      graphCanvasNodeModel(canvas, start) === model,
+  );
   const configured = starts.filter(({ id }) => chosen.has(id));
   return (
     <div className="graph-end-pairs">
@@ -2330,6 +2400,7 @@ function NodeOperationFields({
               .filter(
                 (item) =>
                   item.type === 'START' &&
+                  graphCanvasNodeModel(canvas, item) === graphCanvasNodeModel(canvas, node) &&
                   canvas.endpoints.some(({ startId }) => startId === item.id),
               )
               .map(({ id, name }) => (

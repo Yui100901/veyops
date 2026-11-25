@@ -258,6 +258,7 @@ export type GraphEnvironmentSetSummary = { id: string; name: string; revision: n
 export interface GraphNode {
   id: string;
   type: keyof typeof graphNodeLabels;
+  model?: typeof simplifiedModel;
   contract?: 'PRESET';
   buildLocation?: 'INHERIT' | 'MANAGER' | 'TARGET';
   sameHostRelease?: boolean;
@@ -343,6 +344,12 @@ export interface GraphCanvas {
   edges: GraphEdge[];
   endpoints: GraphEndpoint[];
   templates: GraphNode[];
+}
+export function graphCanvasNodeModel(
+  canvas: Pick<GraphCanvas, 'model'>,
+  node?: Pick<GraphNode, 'model'>,
+) {
+  return canvas.model ?? node?.model;
 }
 export interface GraphDocument {
   revision: number;

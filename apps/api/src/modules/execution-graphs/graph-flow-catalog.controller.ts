@@ -8,6 +8,7 @@ import {
 } from './execution-graph-definition';
 import { flowCandidateCatalog } from './graph-binding-validation';
 import { flowStart, presetReleaseServiceIds, referenceId } from './graph-run-bindings';
+import { isSimplifiedCanvasNode } from './simplified-flow-definition';
 
 function belongsToServices(flow: GraphFlow, definition: GraphDefinition) {
   const start = flowStart(flow);
@@ -127,7 +128,7 @@ export class GraphFlowCatalogController {
       for (const node of draft.canvas?.nodes ?? []) {
         if (node.type === 'START') {
           const serviceId =
-            draft.canvas?.model === 'FLOW_V2'
+            draft.canvas && isSimplifiedCanvasNode(draft.canvas, node)
               ? node.start?.release?.serviceId
               : referenceId(node.inputs?.find(({ type }) => type === 'SERVICE')?.defaultValue);
           notes.set(node.id, {

@@ -87,12 +87,10 @@ const emptyCanvas: GraphCanvas = {
   templates: [],
 };
 
-function isLegacyDraft(canvas: GraphCanvas) {
-  return !canvas.model && Boolean(canvas.nodes.length || canvas.templates.length);
-}
-
 function editableCanvas(canvas?: GraphCanvas): GraphCanvas {
-  return canvas && (canvas.model || isLegacyDraft(canvas)) ? canvas : emptyCanvas;
+  return canvas && (canvas.model || canvas.nodes.length || canvas.templates.length)
+    ? canvas
+    : emptyCanvas;
 }
 
 export default function ProjectExecutionGraph({
@@ -437,7 +435,7 @@ function Workspace({
   function insertTemplate(expansion: GraphFlowExpansion) {
     if (!canEdit || saving.current) throw new Error('此草稿暂时无法编辑，请稍后重试。');
     const previous = latestCanvas.current;
-    edit(appendFlowTemplate(isLegacyDraft(previous) ? emptyCanvas : previous, expansion));
+    edit(appendFlowTemplate(previous, expansion));
     setInsertedStart(expansion.startId);
   }
 
@@ -674,7 +672,7 @@ function Workspace({
                   disabled={busy}
                   onClick={() => setTemplateOpen(true)}
                 >
-                  <ListPlus size={16} /> {isLegacyDraft(canvas) ? '用简化模板重建' : '插入流程模板'}
+                  <ListPlus size={16} /> 添加模板执行链
                 </button>
                 <button
                   type="button"
@@ -723,8 +721,6 @@ function Workspace({
           {canEdit && templateOpen && (
             <ExecutionGraphTemplateDialog
               path={path}
-              model={simplifiedModel}
-              replaceDraft={isLegacyDraft(canvas)}
               insert={insertTemplate}
               close={() => setTemplateOpen(false)}
             />
@@ -1269,8 +1265,9 @@ function PublishedNodes({
   renderResources?: (node: GraphNode, flow?: GraphFlow) => React.ReactNode;
   children?: React.ReactNode;
 }) {
-  const simplified = definition.canvas?.model === simplifiedModel;
-  const catalog = useResource<GraphCatalog>(simplified ? null : path + '/catalog');
+  const catalog = useResource<GraphCatalog>(
+    definition.canvas?.model === simplifiedModel ? null : path + '/catalog',
+  );
   const targetNames = useGraphTargetNames(
     definition.flows.some(({ nodes }) => nodes.some(isReleaseNode)),
   );
@@ -1314,6 +1311,8 @@ function PublishedNodes({
     flowsWithNode.find(({ id }) => id === (definition.canvas ? inspectionFlowId : flow.id)) ??
     flowsWithNode[0];
   const inspectedNode = inspectedFlow?.nodes.find(({ id }) => id === selected) ?? node;
+  const simplified =
+    (inspectedFlow?.model ?? definition.canvas?.model ?? inspectedNode?.model) === simplifiedModel;
   const highlight = (hovered && flowsByStart.get(hovered)) || flowsByStart.get(selected);
   const highlightedEdges = new Set(highlight?.edges.map(edgeKey));
   function actionSources(item: GraphNode, selectedFlow: GraphFlow | undefined) {
@@ -1447,7 +1446,9 @@ function PublishedNodes({
                   inspectedFlow && <p className="field-note">所属执行流 · {inspectedFlow.name}</p>
                 )}
                 {renderResources?.(inspectedNode, inspectedFlow)}
-                {catalog.error && <ErrorBanner error={catalog.error} retry={catalog.reload} />}
+                {!simplified && catalog.error && (
+                  <ErrorBanner error={catalog.error} retry={catalog.reload} />
+                )}
                 {simplified && inspectedNode.type === 'START' ? (
                   <SimplifiedStartSettings
                     node={inspectedNode}

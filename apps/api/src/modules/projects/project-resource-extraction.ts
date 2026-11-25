@@ -7,6 +7,7 @@ import { graphModulePorts } from '../execution-graphs/graph-fields';
 import type { GraphBinding, GraphField } from '../execution-graphs/graph-fields';
 import type { TaskPayload } from '../tasks/tasks.types';
 import { unversionedArtifactRepository } from '../execution-graphs/graph-workspace';
+import { isSimplifiedCanvasNode } from '../execution-graphs/simplified-flow-definition';
 
 export const projectResourceTypes = [
   'SERVER',
@@ -336,32 +337,32 @@ export function graphResourceReferences(
   const context = { ...source, sourceKind: 'GRAPH' } as const;
   const flows = new Map((definition.flows ?? []).map((flow) => [flow.id, flow]));
   const rows = [...flows.values()].flatMap((flow) => flowReferences(context, flow, flows));
-  if (source.state !== 'DRAFT' || !definition.canvas) return rows;
+  const { canvas } = definition;
+  if (source.state !== 'DRAFT' || !canvas) return rows;
   const compiledNodeIds = new Set(
     [...flows.values()].flatMap((flow) => flow.nodes.map((node) => node.id)),
   );
   const rawNodes = [
-    ...definition.canvas.nodes.filter(({ id }) => !compiledNodeIds.has(id)),
-    ...(definition.canvas.templates ?? []),
+    ...canvas.nodes.filter(({ id }) => !compiledNodeIds.has(id)),
+    ...(canvas.templates ?? []),
   ];
-  if (definition.canvas.model === 'FLOW_V2') {
-    rows.push(...rawNodes.flatMap((node) => simplifiedNodeReferences(context, node)));
-    return rows;
-  }
   rows.push(
     ...rawNodes.flatMap((node) =>
-      nodeReferences(
-        { ...context, nodeId: node.id, nodeName: node.name },
-        node,
-        graphModulePorts(node, flows.get(node.flowId ?? ''))?.inputs ?? [],
-      ),
+      isSimplifiedCanvasNode(canvas, node)
+        ? simplifiedNodeReferences(context, node)
+        : nodeReferences(
+            { ...context, nodeId: node.id, nodeName: node.name },
+            node,
+            graphModulePorts(node, flows.get(node.flowId ?? ''))?.inputs ?? [],
+          ),
     ),
   );
   // Drafts may keep endpoint bindings whose control path is temporarily incomplete.
-  const byId = new Map(definition.canvas.nodes.map((node) => [node.id, node]));
-  for (const endpoint of definition.canvas.endpoints) {
+  const byId = new Map(canvas.nodes.map((node) => [node.id, node]));
+  for (const endpoint of canvas.endpoints) {
     if (flows.has(endpoint.startId)) continue;
     const start = byId.get(endpoint.startId);
+    if (isSimplifiedCanvasNode(canvas, start)) continue;
     const end = byId.get(endpoint.endId);
     const boundNodes = Object.keys(endpoint.inputBindings ?? {}).flatMap((id) => {
       const node = byId.get(id);

@@ -108,10 +108,10 @@ export class ExecutionGraphsService {
         message: (path ? path + ' · ' : '') + '引用的资源不存在、已停用或不属于当前项目',
       });
     }
-    if (definition.canvas?.model !== 'FLOW_V2') return;
+    const simplifiedFlows = definition.flows.filter(({ model }) => model === 'FLOW_V2');
     const ids = [
       ...new Set(
-        definition.flows.flatMap(({ nodes }) =>
+        simplifiedFlows.flatMap(({ nodes }) =>
           nodes.flatMap(
             ({ start }) =>
               start?.sources?.flatMap(({ repositoryId }) => (repositoryId ? [repositoryId] : [])) ??
@@ -128,7 +128,7 @@ export class ExecutionGraphsService {
       .where('id', 'in', ids)
       .execute();
     const urls = new Map(rows.map(({ id, clone_url }) => [id, clone_url]));
-    for (const flow of definition.flows) validateSimplifiedSourceDirectories(flow, urls);
+    for (const flow of simplifiedFlows) validateSimplifiedSourceDirectories(flow, urls);
   }
 
   async validate(

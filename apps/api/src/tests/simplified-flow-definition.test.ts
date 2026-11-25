@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
-import { canvasIssues, compileCanvas } from '../modules/execution-graphs/execution-graph-canvas';
+import {
+  canvasIssues,
+  compileCanvas,
+  withDraftCanvas,
+} from '../modules/execution-graphs/execution-graph-canvas';
 import { SaveGraphDraftDto } from '../modules/execution-graphs/execution-graph-definition';
 import type { GraphCanvas } from '../modules/execution-graphs/execution-graph-definition';
 import {
@@ -90,6 +94,154 @@ test('a V2 canvas publishes actions and resource references without generic bind
       ['SERVER', serverId, 'start.release.targets'],
     ],
   );
+});
+
+function existingCanvas(): GraphCanvas {
+  return {
+    nodes: [
+      {
+        id: 'old-start',
+        name: '原开始',
+        type: 'START',
+        inputs: [{ id: 'name', name: '原参数', type: 'TEXT' }],
+      },
+      { id: 'old-log', name: '原日志', type: 'LOG', message: 'existing' },
+      { id: 'old-end', name: '原结束', type: 'END' },
+    ],
+    edges: [
+      { from: 'old-start', to: 'old-log' },
+      { from: 'old-log', to: 'old-end' },
+    ],
+    endpoints: [{ startId: 'old-start', endId: 'old-end', serviceId }],
+    templates: [
+      {
+        id: 'old-library',
+        name: '原节点模板',
+        type: 'FUNCTION',
+        operation: 'CHECKOUT',
+        inputDefaults: { repository: repositoryId },
+      },
+    ],
+  };
+}
+
+function combinedCanvas(legacy = existingCanvas()): GraphCanvas {
+  const added = deployment();
+  return {
+    nodes: [
+      ...legacy.nodes,
+      ...added.nodes.map((node) => ({ ...node, model: 'FLOW_V2' as const })),
+    ],
+    edges: [...legacy.edges, ...added.edges],
+    endpoints: [...legacy.endpoints, ...added.endpoints],
+    templates: [...legacy.templates, ...added.templates],
+  };
+}
+
+test('an appended V2 chain preserves the legacy projection, resources, and draft nodes', () => {
+  const legacy = existingCanvas();
+  const old = compileCanvas(legacy, true);
+  const mixed = combinedCanvas(legacy);
+  const accepted = plainToInstance(SaveGraphDraftDto, {
+    expectedRevision: 1,
+    definition: { canvas: mixed },
+  });
+  assert.deepEqual(validateSync(accepted, { whitelist: true, forbidNonWhitelisted: true }), []);
+  const published = compileCanvas(accepted.definition.canvas!, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(published.flows[0])), old.flows[0]);
+  assert.equal(published.flows[1]?.model, 'FLOW_V2');
+  assert.equal(published.flows[1]?.nodes[1]?.declaredPorts, undefined);
+  assert.equal(published.canvas?.templates[0]?.inputDefaults?.repository, repositoryId);
+
+  const references = graphResourceReferences(published, { state: 'RUNNABLE', sourceId: 'mixed' });
+  assert.ok(
+    references.some(
+      (reference) =>
+        reference.flowId === 'old-start' &&
+        reference.resourceType === 'SERVICE' &&
+        reference.resourceId === serviceId,
+    ),
+  );
+  assert.ok(
+    references.some(
+      (reference) =>
+        reference.flowId === 'start' &&
+        reference.resourceType === 'REPOSITORY' &&
+        reference.resourceId === repositoryId,
+    ),
+  );
+
+  mixed.endpoints.pop();
+  const draft = compileCanvas(mixed, false);
+  const draftReferences = graphResourceReferences(draft, { state: 'DRAFT', sourceId: 'mixed' });
+  assert.ok(
+    draftReferences.some(
+      (reference) =>
+        reference.nodeId === 'start' &&
+        reference.resourceType === 'REPOSITORY' &&
+        reference.resourceId === repositoryId,
+    ),
+  );
+});
+
+test('mixed canvases reject cross-model links and legacy fields on new V2 nodes', () => {
+  const mixed = combinedCanvas();
+  const edge = { from: 'old-log', to: 'checkout' };
+  mixed.edges.push(edge);
+  assert.deepEqual(canvasIssues(mixed)[0]?.edge, edge);
+  mixed.edges.pop();
+
+  mixed.endpoints[0]!.endId = 'end';
+  assert.equal(canvasIssues(mixed)[0]?.nodeId, 'old-start');
+  mixed.endpoints[0]!.endId = 'old-end';
+
+  mixed.nodes.find(({ id }) => id === 'checkout')!.inputs = [];
+  assert.equal(canvasIssues(mixed)[0]?.fieldId, 'inputs');
+  delete mixed.nodes.find(({ id }) => id === 'checkout')!.inputs;
+
+  mixed.nodes[1] = { id: 'old-log', name: '调用', type: 'FLOW_CALL', flowId: 'start' };
+  assert.match(canvasIssues(mixed)[0]!.message, /相同编排类型/);
+});
+
+test('older flow-only drafts preserve endpoint settings and remap references when converted', () => {
+  const legacy = existingCanvas();
+  const flow = {
+    id: 'old-log',
+    name: '原流程',
+    nodes: legacy.nodes,
+    edges: legacy.edges,
+    serviceId,
+    inputBindings: {
+      'old-log': { source: { kind: 'OUTPUT' as const, nodeId: 'old-start', fieldId: 'name' } },
+    },
+    environmentBindings: { 'old-end': { SETTING: { kind: 'INPUT' as const, fieldId: 'name' } } },
+    outputBindings: {
+      result: {
+        kind: 'FIRST_AVAILABLE' as const,
+        sources: [{ kind: 'OUTPUT' as const, nodeId: 'old-log', fieldId: 'result' }],
+      },
+    },
+    edgeSelections: { 'old-start': ['old-log'], 'old-log': ['old-end'] },
+  };
+  const { canvas } = withDraftCanvas({ flows: [flow] });
+  const newActionId = canvas.nodes[1]!.id;
+  assert.notEqual(newActionId, 'old-log');
+  assert.deepEqual(canvas.endpoints[0], {
+    startId: flow.id,
+    endId: 'old-end',
+    serviceId,
+    inputBindings: {
+      [newActionId]: { source: { kind: 'OUTPUT', nodeId: flow.id, fieldId: 'name' } },
+    },
+    environmentBindings: flow.environmentBindings,
+    outputBindings: {
+      result: {
+        kind: 'FIRST_AVAILABLE',
+        sources: [{ kind: 'OUTPUT', nodeId: newActionId, fieldId: 'result' }],
+      },
+    },
+    edgeSelections: { [flow.id]: [newActionId], [newActionId]: ['old-end'] },
+  });
 });
 
 test('V2 rejects legacy writes and still permits saving incomplete configurations', () => {
