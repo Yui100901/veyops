@@ -2,11 +2,20 @@ import 'reflect-metadata';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { randomUUID, createHash } from 'node:crypto';
+import { Test } from '@nestjs/testing';
 import { DatabaseService } from '../core/database/database.service';
 import { TaskHandlerRegistry } from '../modules/tasks/task-handler.registry';
 import { TaskLogService } from '../modules/tasks/task-log.service';
 import { TasksService } from '../modules/tasks/tasks.service';
 import { TaskWorkerService, aggregateStatus } from '../modules/tasks/task-worker.service';
+import {
+  SimplifiedFlowRunService,
+  type SimplifiedRunPlan,
+} from '../modules/execution-graphs/simplified-flow-run.service';
+import {
+  ensureGraphDeliveryEnvironment,
+  ensureGraphUnscopedArtifactService,
+} from '../modules/pipelines/delivery-execution-profile';
 import { MultiTargetExecutor } from '../infrastructure/ssh/multi-target.executor';
 import {
   fingerprintMatches,
@@ -81,6 +90,74 @@ async function databaseFixture() {
   const tasks = new TasksService(database, logs);
   return { database, userId, logs, tasks };
 }
+
+test('standalone simplified actions enqueue without a service and still reject archived services', async (t) => {
+  const { database, userId, tasks } = await databaseFixture();
+  try {
+    const projectId = randomUUID();
+    const archivedServiceId = randomUUID();
+    const now = Date.now();
+    await database.db.transaction().execute(async (tx) => {
+      await tx
+        .insertInto('projects')
+        .values({
+          id: projectId,
+          name: 'Standalone build',
+          slug: 'standalone-build',
+          created_by: userId,
+          created_at: now,
+          updated_at: now,
+        })
+        .execute();
+      await ensureGraphDeliveryEnvironment(tx, projectId);
+      await ensureGraphUnscopedArtifactService(tx, projectId);
+      await tx
+        .insertInto('services')
+        .values({
+          id: archivedServiceId,
+          project_id: projectId,
+          name: 'Archived service',
+          slug: 'archived-service',
+          archived_at: now,
+          created_at: now,
+          updated_at: now,
+        })
+        .execute();
+    });
+    const module = await Test.createTestingModule({ providers: [SimplifiedFlowRunService] })
+      .useMocker(() => ({}))
+      .compile();
+    t.after(() => module.close());
+    const runService = module.get(SimplifiedFlowRunService);
+    const run = {
+      id: randomUUID(),
+      project_id: projectId,
+      flow_id: 'start',
+      version: 1,
+      created_by: userId,
+      configuration_hash: 'fixture',
+    };
+    const node = { id: 'checkout', name: 'Checkout', type: 'CHECKOUT' } as const;
+    const plan: SimplifiedRunPlan = {
+      placement: { location: 'MANAGER' },
+      sources: [],
+      environment: { variables: {}, secretVariables: {}, variableSources: [] },
+      finish: { saveWorkspace: true },
+    };
+    const action = (options: SimplifiedRunPlan) =>
+      runService.task(run, { id: randomUUID(), node_id: node.id }, node, options, 'ACTION');
+    const task = await tasks.create(action(plan), userId);
+    assert.equal(task.status, 'PENDING');
+    assert.equal(task.projectId, projectId);
+    assert.equal(task.serviceId, null);
+    await assert.rejects(
+      tasks.create(action({ ...plan, serviceId: archivedServiceId }), userId),
+      /任务引用的资源已变化/,
+    );
+  } finally {
+    await database.onApplicationShutdown();
+  }
+});
 
 test('SSH verifies SHA256 base64 and hex fingerprints and rejects changed host keys', () => {
   const key = Buffer.from('public-host-key');

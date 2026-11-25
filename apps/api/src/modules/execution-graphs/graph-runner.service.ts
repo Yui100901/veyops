@@ -143,7 +143,11 @@ import {
   graphArtifactPortId,
 } from './graph-artifact-values';
 import { normalizeRelativePath } from '../pipelines/pipeline.validation';
-import { SimplifiedFlowRunService, type SimplifiedRunPlan } from './simplified-flow-run.service';
+import {
+  SimplifiedFlowRunService,
+  type SimplifiedRunPlan,
+  type SimplifiedSnapshotRequest,
+} from './simplified-flow-run.service';
 import {
   activeFlowStatuses,
   branchMatch,
@@ -3230,6 +3234,8 @@ export class GraphRunnerService implements OnModuleInit {
       const flow = this.flow(definition, run.flow_id);
       const snapshot = JSON.parse(run.inputs_json) as RunSnapshot;
       const plan = snapshot.simplified;
+      const dockerBuild =
+        plan && flow.nodes.find(({ type, build }) => type === 'BUILD' && build?.dockerfilePath);
       const rows = await tx
         .selectFrom('execution_node_runs')
         .selectAll()
@@ -3308,6 +3314,7 @@ export class GraphRunnerService implements OnModuleInit {
         environment: ReturnType<typeof inspectNodeEnvironment>;
         stage?: SimplifiedStage;
         workspacePath?: string;
+        capture?: SimplifiedSnapshotRequest;
       }[] = [];
       const cancel: string[] = [];
       const now = Date.now();
@@ -3484,15 +3491,55 @@ export class GraphRunnerService implements OnModuleInit {
         }
         if (parents.some(({ from }) => !isNodeTerminal(byId.get(from)!.status))) continue;
         if (plan && this.simplifiedRuns) {
-          const ownSnapshot = plan.release && !plan.release.artifactId;
-          const shouldSnapshot =
-            snapshotReady.size === 0 &&
-            ((ownSnapshot && (node.type === 'APPROVAL' || node.type === 'DEPLOY_ARTIFACT')) ||
-              (node.type === 'END' &&
-                (plan.finish.saveWorkspace || plan.finish.image || plan.nativeDocker) &&
-                !plan.release?.artifactId));
+          const selectedRelease =
+            plan.release && selection.selected.has(plan.release.nodeId) ? plan.release : undefined;
+          const historicalArtifactId = selectedRelease?.artifactId;
+          const preparingRelease =
+            selectedRelease &&
+            !historicalArtifactId &&
+            ((node.type === 'APPROVAL' && row.status !== 'WAITING') ||
+              node.id === selectedRelease.nodeId);
+          const needsArtifactFacts = Boolean(preparingRelease) || node.type === 'END';
+          if (needsArtifactFacts && busy) continue;
+          const artifacts = needsArtifactFacts
+            ? await this.simplifiedRuns.snapshotArtifacts(tx, run.id)
+            : [];
+          const builtImage = dockerBuild && byId.get(dockerBuild.id)?.status === 'SUCCESS';
+          const expectedImageId = builtImage
+            ? stringValue(outputs.get(dockerBuild.id)?.imageId)
+            : undefined;
+          const collectWorkspace =
+            !historicalArtifactId &&
+            (plan.finish.saveWorkspace || (preparingRelease && selectedRelease.method === 'FILE'));
+          const collectImage =
+            !historicalArtifactId && (builtImage || plan.finish.image?.reference);
+          if (
+            needsArtifactFacts &&
+            !historicalArtifactId &&
+            ((builtImage && !expectedImageId) ||
+              (preparingRelease && selectedRelease.method === 'COMPOSE' && !collectImage))
+          ) {
+            await this.terminalNode(tx, row, 'FAILED', '本次运行未取得可验证的 Docker 镜像身份。');
+            continue;
+          }
+          const capture = needsArtifactFacts
+            ? {
+                workspace:
+                  Boolean(collectWorkspace) &&
+                  !artifacts.some(({ artifact_type }) => artifact_type === 'FILE'),
+                image:
+                  Boolean(collectImage) &&
+                  !artifacts.some(({ artifact_type }) => artifact_type === 'DOCKER_IMAGE'),
+                expectedImageId,
+              }
+            : undefined;
+          const shouldSnapshot = capture?.workspace || capture?.image;
+          if (shouldSnapshot && snapshotReady.has(node.id)) {
+            await this.terminalNode(tx, row, 'FAILED', '未找到本次已登记的交付产物。');
+            continue;
+          }
           const script = ['CHECKOUT', 'SHELL', 'CHECK', 'BUILD'].includes(node.type);
-          const release = plan.release && outputs.get(plan.release.nodeId)?.release;
+          const release = selectedRelease && outputs.get(selectedRelease.nodeId)?.release;
           const stage = shouldSnapshot
             ? 'SNAPSHOT'
             : script
@@ -3514,18 +3561,10 @@ export class GraphRunnerService implements OnModuleInit {
               ready.push({
                 node: row,
                 action: node,
-                values:
-                  stage === 'HEALTH'
-                    ? { release }
-                    : stage === 'SNAPSHOT'
-                      ? {
-                          imageId: [...outputs.values()].find(
-                            (entry) => typeof entry.imageId === 'string',
-                          )?.imageId,
-                        }
-                      : {},
+                values: stage === 'HEALTH' ? { release } : {},
                 stage,
                 workspacePath,
+                capture,
                 environment: { variables: plan.environment, sources: [], evidence: [] },
               });
             }
@@ -3535,10 +3574,10 @@ export class GraphRunnerService implements OnModuleInit {
             try {
               let scope: GraphGateScope | undefined;
               if (row.status !== 'WAITING') {
-                if (node.type === 'APPROVAL' && plan.release)
-                  scope = await this.simplifiedRuns.releaseScope(tx, run.id, plan.release);
+                if (node.type === 'APPROVAL' && selectedRelease)
+                  scope = await this.simplifiedRuns.releaseScope(tx, run.id, selectedRelease);
                 if (node.type === 'SOURCE_REVIEW') {
-                  const artifactIds = plan.release?.artifactId ? [plan.release.artifactId] : [];
+                  const artifactIds = historicalArtifactId ? [historicalArtifactId] : [];
                   const sources = artifactIds.length
                     ? await artifactReviewSources(tx, artifactIds)
                     : reviewSources(plan.sources.map(({ source }) => source));
@@ -3555,24 +3594,13 @@ export class GraphRunnerService implements OnModuleInit {
           }
           if (node.type === 'END') {
             try {
-              const artifacts = await this.simplifiedRuns.snapshotArtifacts(tx, run.id);
               const artifactIds = artifacts.map(({ id }) => id);
-              if (plan.release?.artifactId) artifactIds.push(plan.release.artifactId);
-              if (
-                plan.finish.saveWorkspace &&
-                !artifacts.some(({ artifact_type }) => artifact_type === 'FILE')
-              )
-                throw new ConflictException('结束节点未收到已验证的工作区快照');
-              if (
-                (plan.finish.image || plan.nativeDocker) &&
-                !artifacts.some(({ artifact_type }) => artifact_type === 'DOCKER_IMAGE')
-              )
-                throw new ConflictException('结束节点未收到已验证的镜像');
+              if (historicalArtifactId && release) artifactIds.push(historicalArtifactId);
               const health = [...outputs.values()]
                 .map((output) => output.release as { operation?: string } | undefined)
                 .find((result) => result?.operation === 'CHECK');
               if (plan.finish.requireRelease) {
-                const expected = plan.release;
+                const expected = selectedRelease;
                 const result = graphReleaseResult(release);
                 if (
                   !expected ||
@@ -4398,7 +4426,15 @@ export class GraphRunnerService implements OnModuleInit {
     if (this.tasks)
       for (const taskId of state.cancel)
         await this.tasks.cancel(taskId, false).catch(() => undefined);
-    for (const { node, action, values, environment, stage, workspacePath } of state.ready) {
+    for (const {
+      node,
+      action,
+      values,
+      environment,
+      stage,
+      workspacePath,
+      capture,
+    } of state.ready) {
       try {
         const automatic =
           isGraphTriggerKind(state.run.trigger_type) ||
@@ -4432,7 +4468,7 @@ export class GraphRunnerService implements OnModuleInit {
                 delivery,
                 stage,
                 workspacePath,
-                stringValue(values.imageId),
+                capture,
               ),
               state.run.created_by,
               (tx) => this.simplifiedRuns!.verifyTask(state.run, delivery, tx),

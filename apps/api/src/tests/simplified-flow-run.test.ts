@@ -18,7 +18,7 @@ const exec = promisify(execFile);
 
 test(
   'SQLite default FLOW_V2 builds a real Git commit and activates verified file content',
-  { timeout: 60_000 },
+  { timeout: 90_000 },
   async () => {
     const directory = await mkdtemp(join(tmpdir(), 'veyops-simplified-run-'));
     const worktree = join(directory, 'source');
@@ -110,6 +110,8 @@ test(
       const { BuildsService } = await import('../modules/builds/builds.service.js');
       const { SshService } = await import('../infrastructure/ssh/ssh.service.js');
       const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
+      const { ArtifactPhysicalService } =
+        await import('../modules/artifacts/artifact-physical.service.js');
       const releases = new Map<string, string>();
       const deployedContent: string[] = [];
       let probeCount = 0;
@@ -263,7 +265,8 @@ test(
             id: string;
             status: string;
             artifactIds: string[];
-            nodes: { nodeId: string; status: string; output?: unknown }[];
+            simplified?: { workspacePath?: string | null };
+            nodes: { nodeId: string; status: string; output?: unknown; snapshotTaskId?: string }[];
           };
           if (run.status === expected) return run;
           if (['SUCCESS', 'FAILED', 'NEEDS_ATTENTION', 'CANCELLED'].includes(run.status)) {
@@ -334,11 +337,12 @@ test(
       const replay = structuredClone(canvas);
       const releaseStart = replay.nodes[0]!;
       releaseStart.start!.sources = [];
+      releaseStart.start!.execution = { location: 'INHERIT' };
       delete releaseStart.start!.dotenv;
       releaseStart.start!.release!.artifactId = artifacts[0].id;
       const deploy = replay.nodes[3]!;
       const end = replay.nodes[4]!;
-      end.finish = { requireRelease: 'ACTIVATED' };
+      end.finish = { saveWorkspace: true, requireRelease: 'ACTIVATED' };
       replay.nodes = [releaseStart, deploy, end];
       replay.edges = [
         { from: releaseStart.id, to: deploy.id },
@@ -348,6 +352,11 @@ test(
       const replayPreview = await create(flow + '/preview', { version: replayVersion });
       const replayed = await runVersion(replayVersion, replayPreview.configurationHash);
       assert.deepEqual(replayed.artifactIds, [artifacts[0].id]);
+      assert.equal(replayed.simplified?.workspacePath, null);
+      assert.equal(
+        replayed.nodes.find(({ nodeId }) => nodeId === end.id)?.snapshotTaskId,
+        undefined,
+      );
       assert.deepEqual(
         deployedContent,
         Array<string>(2).fill('content from the confirmed Git commit\nconfigured\n'),
@@ -390,6 +399,133 @@ test(
         await readFile(join(worktree, 'input.txt'), 'utf8'),
         'content from the confirmed Git commit\n',
       );
+
+      const branched = structuredClone(canvas);
+      branched.nodes.push(
+        {
+          id: 'variant',
+          name: '构建类型',
+          type: 'CONDITION',
+          condition: { key: 'input', value: 'docker' },
+        },
+        {
+          id: 'docker-build',
+          name: '构建镜像',
+          type: 'FUNCTION',
+          operation: 'BUILD',
+          build: { repoPath: 'fixture', dockerfilePath: 'Dockerfile' },
+        },
+        {
+          id: 'file-check',
+          name: '检查文件',
+          type: 'FUNCTION',
+          operation: 'CHECK',
+          shell: { directory: 'fixture', command: 'test -s dist/built.txt' },
+        },
+      );
+      branched.edges = [
+        ...branched.edges.filter(({ to }) => to !== end.id),
+        { from: deploy.id, to: 'variant' },
+        { from: 'variant', to: 'docker-build', when: 'TRUE' },
+        { from: 'variant', to: 'file-check', when: 'FALSE' },
+        { from: 'docker-build', to: end.id },
+        { from: 'file-check', to: end.id },
+      ];
+      const physical = app.get(ArtifactPhysicalService);
+      const imageId = 'sha256:' + 'd'.repeat(64);
+      let dockerBuilds = 0;
+      let imageInspections = 0;
+      builds.buildFlowImage = async () => {
+        dockerBuilds++;
+      };
+      physical.describeImage = async ({ reference, owner }) => {
+        imageInspections++;
+        return {
+          imageId,
+          imageReference: reference,
+          owner,
+          kind: 'DOCKER_IMAGE',
+          location: 'DOCKER_ENGINE',
+          platform: 'linux/amd64',
+          builderId: 'manager',
+          engineId: 'fixture-engine',
+        };
+      };
+      builds.archiveFlowImage = async (session, expectedImageId) => {
+        assert.equal(expectedImageId, imageId);
+        return {
+          imageReference: `veyops-build/${session.snapshot.pipelineId}:${session.snapshot.commitSha}-${session.taskId}`,
+          archiveKey: session.taskId + '.tar.gz',
+          checksum: 'e'.repeat(64),
+          sizeBytes: 1024,
+        };
+      };
+      const branchVersion = await publish(branched);
+      const runBranch = async (value: string) => {
+        const inputs = { value };
+        const plan = await create(flow + '/preview', { version: branchVersion, inputs });
+        const { id } = await create(flow + '/run', {
+          version: branchVersion,
+          inputs,
+          expectedConfigurationHash: plan.configurationHash,
+          idempotencyKey: randomUUID(),
+        });
+        return waitRun(id, 'SUCCESS');
+      };
+      const file = await runBranch('file');
+      assert.equal(file.nodes.find(({ nodeId }) => nodeId === 'docker-build')?.status, 'SKIPPED');
+      assert.equal(file.nodes.find(({ nodeId }) => nodeId === 'file-check')?.status, 'SUCCESS');
+      assert.equal(file.artifactIds.length, 1);
+      assert.equal(dockerBuilds, 0);
+      assert.equal(imageInspections, 0);
+
+      const docker = await runBranch('docker');
+      assert.equal(docker.nodes.find(({ nodeId }) => nodeId === 'docker-build')?.status, 'SUCCESS');
+      assert.equal(docker.nodes.find(({ nodeId }) => nodeId === 'file-check')?.status, 'SKIPPED');
+      const dockerArtifacts = (
+        await api
+          .get(root + '/artifacts')
+          .query({ projectId: project.id })
+          .expect(200)
+      ).body.data.filter(({ graphRunId }: { graphRunId: string }) => graphRunId === docker.id);
+      assert.deepEqual(dockerArtifacts.map(({ kind }: { kind: string }) => kind).sort(), [
+        'DIRECTORY',
+        'DOCKER_IMAGE',
+      ]);
+      assert.equal(dockerBuilds, 1);
+      assert.equal(imageInspections, 2);
+
+      const unscoped = structuredClone(canvas);
+      delete unscoped.nodes[0]!.start!.release;
+      unscoped.nodes = unscoped.nodes.filter(({ id }) => id !== deploy.id);
+      unscoped.nodes.push({
+        id: 'build-check',
+        name: '验证构建目录',
+        type: 'FUNCTION',
+        operation: 'CHECK',
+        shell: { directory: 'fixture', command: 'test -s dist/built.txt' },
+      });
+      unscoped.nodes.find(({ id }) => id === end.id)!.finish = { saveWorkspace: true };
+      unscoped.edges = [
+        ...unscoped.edges.filter(({ from, to }) => from !== deploy.id && to !== deploy.id),
+        { from: canvas.nodes[2]!.id, to: 'build-check' },
+        { from: 'build-check', to: end.id },
+      ];
+      const buildVersion = await publish(unscoped);
+      const buildPreview = await create(flow + '/preview', { version: buildVersion });
+      const projectBuild = await runVersion(buildVersion, buildPreview.configurationHash);
+      assert.ok(projectBuild.nodes.every(({ status }) => status === 'SUCCESS'));
+      const projectArtifacts = (
+        await api
+          .get(root + '/artifacts')
+          .query({ projectId: project.id })
+          .expect(200)
+      ).body.data.filter(
+        ({ graphRunId }: { graphRunId: string }) => graphRunId === projectBuild.id,
+      );
+      assert.equal(projectArtifacts.length, 1);
+      assert.equal(projectArtifacts[0].kind, 'DIRECTORY');
+      assert.equal(projectArtifacts[0].serviceId, null);
     } finally {
       await app?.close();
       if (git.listening) await new Promise<void>((resolve) => git.close(() => resolve()));

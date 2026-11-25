@@ -114,7 +114,6 @@ type FixedRelease = {
 export type SimplifiedRunPlan = {
   placement: FlowWorkspacePlacement;
   serviceId?: string;
-  nativeDocker?: boolean;
   buildSelection?: DeploymentSelection;
   sources: (FlowCheckout & { id: string })[];
   environment: GraphVariableSnapshot;
@@ -126,6 +125,12 @@ export type SimplifiedRunPlan = {
   trigger?: Record<string, unknown>;
 };
 
+export type SimplifiedSnapshotRequest = {
+  workspace: boolean;
+  image: boolean;
+  expectedImageId?: string;
+};
+
 export type SimplifiedActionPayload = {
   runId: string;
   projectId: string;
@@ -133,6 +138,7 @@ export type SimplifiedActionPayload = {
   node: GraphNode;
   stage: 'ACTION' | 'SNAPSHOT';
   priorWorkspacePath?: string;
+  snapshot?: SimplifiedSnapshotRequest;
   expectedImageId?: string;
   plan: SimplifiedRunPlan;
 };
@@ -187,8 +193,8 @@ export class SimplifiedFlowRunService {
       release,
     } = start.start ?? {};
     const finish = flow.nodes.find(({ type }) => type === 'END')?.finish ?? {};
-    const nativeDocker = flow.nodes.some(
-      (node) => node.type === 'BUILD' && node.build?.dockerfilePath,
+    const releaseNode = flow.nodes.find(
+      ({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT',
     );
     const issue = (
       code: 'REPOSITORY' | 'BUILD_TARGET' | 'RELEASE_TARGET' | 'CONFIGURATION',
@@ -218,6 +224,20 @@ export class SimplifiedFlowRunService {
       )
     )
       throw issue('CONFIGURATION', 'start', '请使用开始节点允许临时覆盖的运行参数');
+    const useUpstreamArtifact =
+      releaseNode && automation?.kind === 'UPSTREAM' && release?.useUpstreamArtifact;
+    const upstreamArtifact = useUpstreamArtifact ? trigger?.upstreamArtifactId : undefined;
+    const upstreamPending = useUpstreamArtifact && trigger?.upstreamArtifactPending === true;
+    const artifact = releaseNode
+      ? (upstreamArtifact ?? overrides.artifactId ?? release?.artifactId)
+      : undefined;
+    if (useUpstreamArtifact && !upstreamArtifact && !upstreamPending)
+      throw issue('RELEASE_TARGET', 'release', '关联运行未提供可重发的已登记产物');
+    if (
+      artifact !== undefined &&
+      (typeof artifact !== 'string' || !/^[0-9a-f-]{36}$/i.test(artifact))
+    )
+      throw issue('RELEASE_TARGET', 'release', '请选择有效的历史产物实例');
     const event = graphCheckoutEvent(trigger);
     const fixedSources = await Promise.all(
       sources.map(async (entry) => {
@@ -270,9 +290,15 @@ export class SimplifiedFlowRunService {
     )
       throw issue('REPOSITORY', 'sources', '源码目录重名或互相包含');
     const defaults = await this.settings.get(projectId);
+    const hasWorkspaceActions = flow.nodes.some(({ type }) =>
+      ['CHECKOUT', 'BUILD', 'CHECK', 'SHELL'].includes(type),
+    );
     const needsWorkspace =
-      flow.nodes.some(({ type }) => ['CHECKOUT', 'BUILD', 'CHECK', 'SHELL'].includes(type)) ||
-      Boolean(finish.saveWorkspace || finish.image || release?.reuseExecutionServer);
+      hasWorkspaceActions ||
+      Boolean(
+        (!artifact && !upstreamPending && (finish.saveWorkspace || finish.image)) ||
+        release?.reuseExecutionServer,
+      );
     const location =
       execution?.location && execution.location !== 'INHERIT'
         ? execution.location
@@ -333,9 +359,6 @@ export class SimplifiedFlowRunService {
         !(await this.metadata.inspectGraphEnvironmentFile(projectId, dotenvPin, [dotenvPin.path])))
     )
       throw issue('CONFIGURATION', 'dotenv', '已确认的源码缺少指定的变量文件');
-    const releaseNode = flow.nodes.find(
-      ({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT',
-    );
     let fixedRelease: FixedRelease | undefined;
     if (releaseNode) {
       if (!release?.serviceId || !release.deployPath)
@@ -349,34 +372,9 @@ export class SimplifiedFlowRunService {
       const targets =
         selection && directDeploymentSelection(selection, defaults.defaultMaxParallelTargets);
       if (!targets) throw issue('RELEASE_TARGET', 'release', '请选择发布服务器或分组');
-      const upstreamArtifact =
-        automation?.kind === 'UPSTREAM' && release.useUpstreamArtifact
-          ? trigger?.upstreamArtifactId
-          : undefined;
-      const upstreamPending =
-        automation?.kind === 'UPSTREAM' &&
-        release.useUpstreamArtifact &&
-        trigger?.upstreamArtifactPending === true;
-      if (
-        automation?.kind === 'UPSTREAM' &&
-        release.useUpstreamArtifact &&
-        !upstreamArtifact &&
-        !upstreamPending
-      )
-        throw issue('RELEASE_TARGET', 'release', '关联运行未提供可重发的已登记产物');
-      const artifact = upstreamArtifact ?? overrides.artifactId ?? release.artifactId;
-      if (
-        artifact !== undefined &&
-        (typeof artifact !== 'string' || !/^[0-9a-f-]{36}$/i.test(artifact))
-      )
-        throw issue('RELEASE_TARGET', 'release', '请选择有效的历史产物实例');
       if (releaseNode.type === 'ROLLBACK_ARTIFACT' && !artifact)
         throw issue('RELEASE_TARGET', 'release', '请选择已成功发布的回滚产物');
-      if (
-        !artifact &&
-        !upstreamPending &&
-        !flow.nodes.some(({ type }) => ['BUILD', 'SHELL', 'CHECK', 'CHECKOUT'].includes(type))
-      )
+      if (!artifact && !upstreamPending && !hasWorkspaceActions)
         throw issue('RELEASE_TARGET', 'release', '请指定已有产物或先配置生成发布内容的动作');
       fixedRelease = await this.planRelease({
         projectId,
@@ -399,7 +397,6 @@ export class SimplifiedFlowRunService {
       buildSelection,
       sources: fixedSources,
       serviceId: release?.serviceId,
-      nativeDocker,
       environment,
       dotenv: dotenvPin,
       finish,
@@ -600,7 +597,7 @@ export class SimplifiedFlowRunService {
     plan: SimplifiedRunPlan,
     stage: SimplifiedActionPayload['stage'],
     priorWorkspacePath?: string,
-    expectedImageId?: string,
+    snapshot?: SimplifiedSnapshotRequest,
   ): CreateTaskInput {
     const target = plan.placement.location === 'TARGET' ? plan.placement.target : undefined;
     const timeout =
@@ -614,7 +611,7 @@ export class SimplifiedFlowRunService {
         plan,
         stage,
         priorWorkspacePath,
-        expectedImageId,
+        snapshot,
       },
       targets: target ? [target] : [],
       steps: [],
@@ -630,7 +627,11 @@ export class SimplifiedFlowRunService {
       name: node.name + (stage === 'SNAPSHOT' ? ' · 固化交付' : ''),
       idempotencyKey: 'execution-flow:' + row.id + (stage === 'SNAPSHOT' ? ':snapshot' : ''),
       payload,
-      scope: { projectId: run.project_id, serviceId, environmentId },
+      scope: {
+        projectId: run.project_id,
+        serviceId: stage === 'SNAPSHOT' ? serviceId : plan.serviceId,
+        environmentId,
+      },
     };
     if (stage !== 'SNAPSHOT') return task;
     const source = plan.sources[0]?.source;
@@ -725,7 +726,7 @@ export class SimplifiedFlowRunService {
   }
 
   private async executeAction(task: TaskRecord, context: TaskExecutionContext): Promise<Facts> {
-    const { runId, projectId, node, stage, plan, priorWorkspacePath, expectedImageId } =
+    const { runId, projectId, node, stage, plan, priorWorkspacePath, snapshot, expectedImageId } =
       task.payload.simplifiedAction!;
     const workspace = await this.workspaces.open(
       runId,
@@ -754,7 +755,16 @@ export class SimplifiedFlowRunService {
         secrets: [],
         snapshot: { ...task.payload.pipeline!, graphAutomation: plan.automation },
       };
-      await this.capture(session, plan, workspace.path, expectedImageId);
+      await this.capture(
+        session,
+        plan,
+        workspace.path,
+        snapshot ?? {
+          workspace: Boolean(plan.finish.saveWorkspace || plan.release?.method === 'FILE'),
+          image: Boolean(expectedImageId || plan.finish.image?.reference),
+          expectedImageId,
+        },
+      );
       return { ...facts, snapshotReady: true };
     }
     if (node.type === 'CHECKOUT') {
@@ -839,6 +849,7 @@ export class SimplifiedFlowRunService {
         builderId: plan.automation ? 'manager-webhook' : 'manager',
         signal: context.signal,
       });
+      if (!image.imageId) throw new ConflictException('Docker 构建未返回可验证的镜像 ID');
       return { ...facts, directory, exitCode: 0, imageId: image.imageId };
     }
     return { ...facts, directory, exitCode: 0 };
@@ -858,12 +869,12 @@ export class SimplifiedFlowRunService {
     session: BuildSession,
     plan: SimplifiedRunPlan,
     workspace: string,
-    expectedImageId?: string,
+    capture: SimplifiedSnapshotRequest,
   ) {
     const { snapshot, context: ctx } = session;
     const target = plan.placement.location === 'TARGET' ? plan.placement.target : undefined;
     const persistent = plan.finish.retention !== 'RUN';
-    if (plan.finish.saveWorkspace || plan.release?.method === 'FILE') {
+    if (capture.workspace) {
       const identity = artifactIdentity(snapshot, workspaceArtifact, target?.id);
       const dotenv = plan.dotenv;
       const dotenvPaths = dotenv
@@ -917,10 +928,12 @@ export class SimplifiedFlowRunService {
       });
       ctx.log('工作区快照已校验并登记。\n', target?.id);
     }
-    if (plan.nativeDocker || plan.finish.image?.reference) {
-      const reference = plan.nativeDocker
+    if (capture.image) {
+      const { expectedImageId } = capture;
+      const reference = expectedImageId
         ? this.nativeImageReference(snapshot.graph!.runId)
-        : plan.finish.image!.reference!;
+        : plan.finish.image?.reference;
+      if (!reference) throw new ConflictException('本次运行未取得可登记的镜像引用');
       const registryId = plan.finish.image?.registryId;
       const composePath = plan.release?.workspaceComposePath;
       const composeYaml = composePath
@@ -958,11 +971,11 @@ export class SimplifiedFlowRunService {
       const image = await this.physical.describeImage({
         target,
         reference,
-        owner: plan.nativeDocker ? 'MANAGED' : 'EXTERNAL',
+        owner: expectedImageId ? 'MANAGED' : 'EXTERNAL',
         builderId: plan.automation ? 'manager-webhook' : 'manager',
         signal: ctx.signal,
       });
-      if (plan.nativeDocker && (!expectedImageId || image.imageId !== expectedImageId))
+      if (expectedImageId && image.imageId !== expectedImageId)
         throw new ConflictException('镜像 ID 与本次 Docker 构建完成时不一致');
       const archive = target
         ? undefined
