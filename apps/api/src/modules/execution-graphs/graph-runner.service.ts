@@ -279,6 +279,19 @@ interface NodeEvidence {
 type SimplifiedStage = 'ACTION' | 'SNAPSHOT' | 'RELEASE' | 'HEALTH';
 const workspaceActions = new Set(['CHECKOUT', 'SHELL', 'CHECK', 'BUILD']);
 
+function parallelBuildDirectory(node?: GraphNode) {
+  if (node?.type !== 'BUILD') return undefined;
+  const directory = normalizeRelativePath(node.build?.repoPath || '.');
+  return directory === '.' ? undefined : directory;
+}
+
+function separateBuildDirectories(first?: string, second?: string) {
+  return Boolean(
+    first && second && first !== second &&
+    !first.startsWith(second + '/') && !second.startsWith(first + '/'),
+  );
+}
+
 interface CheckoutProvenance {
   versionSource: string;
   requestedVersion?: GitRefValue;
@@ -3363,13 +3376,6 @@ export class GraphRunnerService implements OnModuleInit {
             : [],
         ),
       );
-      const expectedImageIds = Object.fromEntries(
-        dockerBuilds.flatMap(({ id }) => {
-          const imageId = stringValue(outputs.get(id)?.imageId);
-          return imageId ? [[id, imageId]] : [];
-        }),
-      );
-      const expectedImageId = dockerBuilds.length === 1 ? expectedImageIds[dockerBuilds[0]!.id] : undefined;
       const trigger = snapshot.trigger ?? { triggeredAt: run.created_at };
       const bindings = plan
         ? { context: {}, outputs }
@@ -3431,15 +3437,6 @@ export class GraphRunnerService implements OnModuleInit {
           ? [action]
           : [];
       });
-      const disjointBuild = (node: GraphNode, others: GraphNode[]) => {
-        if (node.type !== 'BUILD' || others.some(({ type }) => type !== 'BUILD')) return false;
-        const directory = normalizeRelativePath(node.build?.repoPath || '.');
-        return directory !== '.' && others.every(({ build }) => {
-          const other = normalizeRelativePath(build?.repoPath || '.');
-          return other !== '.' && other !== directory &&
-            !other.startsWith(directory + '/') && !directory.startsWith(other + '/');
-        });
-      };
       const ready: {
         node: NodeRun;
         action: GraphNode;
@@ -3660,6 +3657,15 @@ export class GraphRunnerService implements OnModuleInit {
             ({ node_id, node_type }) => node_type === 'CHECKOUT' && outputs.has(node_id),
           );
           const images = plan.finish.images ?? [];
+          // A parallel build task can settle earlier in this same pass.
+          const expectedImageIds = Object.fromEntries(
+            (needsArtifactFacts ? dockerBuilds : []).flatMap(({ id }) => {
+              const imageId = stringValue(outputs.get(id)?.imageId);
+              return imageId ? [[id, imageId]] : [];
+            }),
+          );
+          const expectedImageId =
+            dockerBuilds.length === 1 ? expectedImageIds[dockerBuilds[0]!.id] : undefined;
           const releaseImages =
             preparingRelease && selectedRelease.method === 'COMPOSE'
               ? (selectedRelease.images ?? (selectedRelease.image ? [selectedRelease.image] : []))
@@ -3720,6 +3726,7 @@ export class GraphRunnerService implements OnModuleInit {
                   ? 'HEALTH'
                   : undefined;
           if (stage) {
+            const directory = stage === 'ACTION' ? parallelBuildDirectory(node) : undefined;
             if (rows.some((entry) => entry.status === 'NEEDS_ATTENTION')) {
               await this.terminalNode(
                 tx,
@@ -3727,9 +3734,17 @@ export class GraphRunnerService implements OnModuleInit {
                 'SKIPPED',
                 '同次运行存在状态未确认的动作，停止派发后续任务。',
               );
-            } else if ((!busy && !ready.length) ||
-              (stage === 'ACTION' && ready.every((entry) => entry.stage === 'ACTION') &&
-                disjointBuild(node, [...busyActions, ...ready.map(({ action }) => action)]))) {
+            } else if (
+              (!busy && !ready.length) ||
+              (directory &&
+                busyActions.every((action) =>
+                  separateBuildDirectories(directory, parallelBuildDirectory(action)),
+                ) &&
+                ready.every((entry) =>
+                  entry.stage === 'ACTION' &&
+                  separateBuildDirectories(directory, parallelBuildDirectory(entry.action)),
+                ))
+            ) {
               ready.push({
                 node: row,
                 action: node,
@@ -4147,7 +4162,7 @@ export class GraphRunnerService implements OnModuleInit {
     node: NodeRun,
     taskId: string,
     pipelineId?: string,
-    serialized = false,
+    workspace?: { buildDirectory?: string },
   ) {
     await this.lockProject(tx, run.project_id);
     const locked = await this.lockRun(tx, run.id);
@@ -4180,19 +4195,26 @@ export class GraphRunnerService implements OnModuleInit {
       .executeTakeFirstOrThrow();
     if (current.task_id === taskId) return;
     if (current.status !== 'PENDING') {
-      if (serialized) throw new FlowWorkspaceBusy();
+      if (workspace) throw new FlowWorkspaceBusy();
       throw new ConflictException('节点已停止等待');
     }
-    if (serialized) {
+    if (workspace) {
       const outstanding = await tx
         .selectFrom('execution_node_runs as n')
         .innerJoin('tasks as t', 't.id', 'n.task_id')
-        .select('n.id')
+        .select('t.payload_json')
         .where('n.run_id', '=', run.id)
         .where('n.id', '!=', node.id)
         .where('t.status', 'not in', terminalTaskStatuses)
-        .executeTakeFirst();
-      if (outstanding) throw new FlowWorkspaceBusy();
+        .execute();
+      // Recheck under the run lock because another scheduler may have linked work since settle.
+      const conflicts = outstanding.some(({ payload_json }) => {
+        if (!workspace.buildDirectory) return true;
+        const action = (JSON.parse(payload_json) as TaskPayload).simplifiedAction;
+        return action?.stage !== 'ACTION' ||
+          !separateBuildDirectories(workspace.buildDirectory, parallelBuildDirectory(action.node));
+      });
+      if (conflicts) throw new FlowWorkspaceBusy();
     }
     await tx
       .updateTable('execution_node_runs')
@@ -4301,7 +4323,7 @@ export class GraphRunnerService implements OnModuleInit {
             }
           }
         : undefined,
-      (tx, id) => this.linkTask(tx, run, row, id, undefined, Boolean(snapshot.simplified)),
+      (tx, id) => this.linkTask(tx, run, row, id, undefined, snapshot.simplified ? {} : undefined),
     );
   }
 
@@ -4630,7 +4652,9 @@ export class GraphRunnerService implements OnModuleInit {
           if (!this.simplifiedRuns || !this.tasks)
             throw new ConflictException('运行工作区服务不可用');
           const link = (tx: Transaction<Database>, id: string) =>
-            this.linkTask(tx, state.run, node, id, undefined, true);
+            this.linkTask(tx, state.run, node, id, undefined, {
+              buildDirectory: stage === 'ACTION' ? parallelBuildDirectory(action) : undefined,
+            });
           if (stage === 'RELEASE')
             await this.simplifiedRuns.deploy(state.run, node, delivery, link);
           else
