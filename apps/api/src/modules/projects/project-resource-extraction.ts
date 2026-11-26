@@ -7,7 +7,10 @@ import { graphModulePorts } from '../execution-graphs/graph-fields';
 import type { GraphBinding, GraphField } from '../execution-graphs/graph-fields';
 import type { TaskPayload } from '../tasks/tasks.types';
 import { unversionedArtifactRepository } from '../execution-graphs/graph-workspace';
-import { isSimplifiedCanvasNode } from '../execution-graphs/simplified-flow-definition';
+import {
+  isSimplifiedCanvasNode,
+  simplifiedTriggerArtifactInput,
+} from '../execution-graphs/simplified-flow-definition';
 
 export const projectResourceTypes = [
   'SERVER',
@@ -391,10 +394,9 @@ export function graphResourceReferences(
 }
 
 function startFields(definition: GraphDefinition | undefined, flowId: string) {
-  return (
-    definition?.flows?.find(({ id }) => id === flowId)?.nodes.find(({ type }) => type === 'START')
-      ?.inputs ?? []
-  );
+  const flow = definition?.flows?.find(({ id }) => id === flowId);
+  const artifact = simplifiedTriggerArtifactInput(flow);
+  return artifact ? [artifact] : (flow?.nodes.find(({ type }) => type === 'START')?.inputs ?? []);
 }
 
 export function graphTriggerReferences(

@@ -27,7 +27,7 @@ import { unavailableReference } from '../projects/project-resource-protection';
 import { RepositoryMetadataService } from '../projects/repository-metadata.service';
 import { TaskHandlerRegistry } from '../tasks/task-handler.registry';
 import { redactTaskLog } from '../tasks/task-log.service';
-import type { GraphDefinition } from './execution-graph-definition';
+import type { GraphDefinition, GraphFlow } from './execution-graph-definition';
 import { flowEnd, flowStart, type GraphFieldSource, type Values } from './graph-run-bindings';
 import {
   compatibleGraphFields,
@@ -44,7 +44,7 @@ import {
   type UpstreamResult,
 } from './graph-trigger.dto';
 import { GraphRunnerService } from './graph-runner.service';
-import { simplifiedImageName } from './simplified-flow-definition';
+import { simplifiedImageName, simplifiedTriggerArtifactInput } from './simplified-flow-definition';
 import {
   branchPrefix,
   compareSourceObservation,
@@ -106,6 +106,11 @@ function eventFields(row: Event): TriggerEventInput {
   if (!row.input_value) return {};
   const input = JSON.parse(row.input_value) as TriggerEventInput;
   return input;
+}
+
+function triggerFields(flow: GraphFlow): GraphField[] {
+  const artifact = simplifiedTriggerArtifactInput(flow);
+  return artifact ? [artifact] : (flowStart(flow).inputs ?? []);
 }
 
 function mappedValue(
@@ -700,7 +705,7 @@ export class GraphTriggersService implements OnModuleInit {
     ruleId?: string,
   ) {
     const flow = this.currentTriggerFlow(definition, input.flowId);
-    const fields = flowStart(flow).inputs ?? [];
+    const fields = triggerFields(flow);
     this.validateMappings(fields, this.mappingInput(input, version, settings), definition);
     if (
       settings.upstreamFlowId &&
@@ -1233,7 +1238,7 @@ export class GraphTriggersService implements OnModuleInit {
     const settings = config(rule);
     const active = rule.enabled === 1;
     const flow = this.currentTriggerFlow(definition, rule.flow_id);
-    const fields = flowStart(flow).inputs ?? [];
+    const fields = triggerFields(flow);
     this.validateMappings(
       fields,
       {
@@ -1886,7 +1891,7 @@ export class GraphTriggersService implements OnModuleInit {
       const flow = this.currentTriggerFlow(definition, flowId);
       const kind = rule.kind as GraphTriggerKind;
       const hasDelivery = assertAutomaticGraphFlow(definition, flowId, kind);
-      const fields = flowStart(flow).inputs ?? [];
+      const fields = triggerFields(flow);
       const { invokedBy, ...eventInput } = eventFields(event);
       const authorization = { kind, ruleId: rule.id, revision: settings.revision, invokedBy };
       const mappings = settings.parameterMappings ?? {};

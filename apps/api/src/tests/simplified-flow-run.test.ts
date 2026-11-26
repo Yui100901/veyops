@@ -18,7 +18,7 @@ const exec = promisify(execFile);
 
 test(
   'SQLite default FLOW_V2 builds a real Git commit and activates verified file content',
-  { timeout: 240_000 },
+  { timeout: 300_000 },
   async () => {
     const directory = await mkdtemp(join(tmpdir(), 'veyops-simplified-run-'));
     const worktree = join(directory, 'source');
@@ -82,8 +82,18 @@ test(
       await exec('git', ['init', '--initial-branch=main', worktree]);
       await writeFile(join(worktree, 'input.txt'), 'content from the confirmed Git commit\n');
       await writeFile(join(worktree, 'private.vars'), 'FLOW_PRIVATE=fixture-private-value\n');
+      const compose = 'services:\n  app:\n    image: ${VEYOPS_IMAGE}\n';
+      await writeFile(join(worktree, 'compose.yaml'), compose);
       await writeFile(join(worktree, '.gitattributes'), '*.txt text eol=lf\n');
-      await exec('git', ['-C', worktree, 'add', 'input.txt', 'private.vars', '.gitattributes']);
+      await exec('git', [
+        '-C',
+        worktree,
+        'add',
+        'input.txt',
+        'private.vars',
+        'compose.yaml',
+        '.gitattributes',
+      ]);
       await exec('git', [
         '-C',
         worktree,
@@ -108,6 +118,7 @@ test(
       const { AppModule } = await import('../app.module.js');
       const { configureApp } = await import('../bootstrap.js');
       const { BuildsService } = await import('../modules/builds/builds.service.js');
+      const { DatabaseService } = await import('../core/database/database.service.js');
       const { SshService } = await import('../infrastructure/ssh/ssh.service.js');
       const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
       const { ArtifactCleanupService } =
@@ -214,7 +225,13 @@ test(
       });
 
       const graph = (await api.get(graphPath).expect(200)).body.data;
-      const canvas: GraphCanvas = graph.draft.canvas;
+      const sharedDefaults: GraphCanvas = graph.draft.canvas;
+      assert.equal(sharedDefaults.endpoints.length, 3);
+      // Later tests replace the main path independently to exercise old published topology.
+      const canvas = structuredClone(sharedDefaults);
+      canvas.nodes = canvas.nodes.slice(0, 5);
+      canvas.edges = canvas.edges.slice(0, 4);
+      canvas.endpoints = canvas.endpoints.slice(0, 1);
       assert.equal(canvas.model, 'FLOW_V2');
       delete canvas.nodes.find(({ type }) => type === 'END')!.finish!.saveWorkspace;
       const start = canvas.nodes[0]!;
@@ -256,7 +273,26 @@ test(
         ).publishedVersion as number;
       };
       const flow = graphPath + '/flows/' + start.id;
-      const version = await publish(canvas);
+      const withEntries = (template: GraphCanvas) => {
+        const mainStart = template.nodes.find(({ id }) => id === template.endpoints[0]!.startId)!;
+        const onlyBuild = template.nodes.find(({ id }) => id === template.endpoints[1]!.startId)!;
+        const onlyRelease = template.nodes.find(({ id }) => id === template.endpoints[2]!.startId)!;
+        mainStart.start = structuredClone(start.start!);
+        onlyBuild.start = {
+          ...structuredClone(start.start!),
+          release: { serviceId: service.id },
+        };
+        onlyRelease.start!.release = {
+          ...structuredClone(start.start!.release!),
+          artifactSource: 'RUN_PARAMETER',
+        };
+        const build = template.nodes.find(({ operation }) => operation === 'BUILD')!;
+        build.build = structuredClone(canvas.nodes[2]!.build!);
+        return { mainStart, onlyBuild, onlyRelease };
+      };
+      const shared = structuredClone(sharedDefaults);
+      const { onlyBuild, onlyRelease } = withEntries(shared);
+      const version = await publish(shared);
       const preview = await create(flow + '/preview', { version });
       assert.ok(JSON.stringify(preview).includes(sha), 'preview pins the actual Git SHA');
       assert.equal(preview.simplified.workspaceRetention, 'PERSISTENT');
@@ -451,19 +487,25 @@ test(
 
       const approvalTemplate: GraphCanvas = (
         await create(graphPath + '/draft/templates/expand', {
-          templateId: 'CD_DEPLOY',
+          templateId: 'COMPLETE_CI_CD',
         })
       ).canvas;
-      const approvalStart = approvalTemplate.nodes.find(({ type }) => type === 'START')!;
-      approvalStart.start = { ...releaseStart.start };
+      const { onlyRelease: approvalStart } = withEntries(approvalTemplate);
+      const check = approvalTemplate.nodes.find(({ operation }) => operation === 'CHECK')!;
+      check.shell = { command: 'test -f input.txt', directory: 'fixture' };
       const approval = approvalTemplate.nodes.find(({ operation }) => operation === 'APPROVAL')!;
       const health = approvalTemplate.nodes.find(({ operation }) => operation === 'HEALTH_CHECK')!;
       health.healthCheck!.command = 'echo fixture-health-probe';
       const approvalVersion = await publish(approvalTemplate);
       const approvalFlow = graphPath + '/flows/' + approvalStart.id;
-      const approvalPreview = await create(approvalFlow + '/preview', { version: approvalVersion });
+      const approvalInputs = { parameters: { artifactId: artifacts[0].id } };
+      const approvalPreview = await create(approvalFlow + '/preview', {
+        version: approvalVersion,
+        inputs: approvalInputs,
+      });
       const approvalRun = await create(approvalFlow + '/run', {
         version: approvalVersion,
+        inputs: approvalInputs,
         expectedConfigurationHash: approvalPreview.configurationHash,
         idempotencyKey: randomUUID(),
       });
@@ -780,6 +822,86 @@ test(
       assert.deepEqual(bothRun.artifactIds, [artifacts[0].id]);
       assert.notEqual(releases.get(currentPath), previousRelease);
       assert.ok(releases.has(nextPath), 'a new server uses the new project workspace root');
+
+      const sharedVersion = await publish(shared);
+      const buildFlow = graphPath + '/flows/' + onlyBuild.id;
+      const previousPublications = deployedContent.length;
+      const sharedBuildPlan = await create(buildFlow + '/preview', { version: sharedVersion });
+      const sharedBuildRequest = await create(buildFlow + '/run', {
+        version: sharedVersion,
+        expectedConfigurationHash: sharedBuildPlan.configurationHash,
+        idempotencyKey: randomUUID(),
+      });
+      const sharedBuild = await waitRun(sharedBuildRequest.id, 'SUCCESS');
+      assert.deepEqual(
+        sharedBuild.nodes.map(({ nodeId }) => nodeId),
+        [onlyBuild.id, canvas.nodes[1]!.id, canvas.nodes[2]!.id, shared.endpoints[1]!.endId],
+      );
+      assert.equal(deployedContent.length, previousPublications);
+      assert.ok(sharedBuild.simplified?.workspacePath);
+      assert.ok(sharedBuild.artifactIds[0]);
+      const releaseFlow = graphPath + '/flows/' + onlyRelease.id;
+      const missingArtifact = await api
+        .post(releaseFlow + '/preview')
+        .send({ version: sharedVersion })
+        .expect(400);
+      assert.match(JSON.stringify(missingArtifact.body), /请选择该服务的历史产物/);
+      const sharedInputs = { parameters: { artifactId: sharedBuild.artifactIds[0] } };
+      const sharedReleasePlan = await create(releaseFlow + '/preview', {
+        version: sharedVersion,
+        inputs: sharedInputs,
+      });
+      assert.equal(sharedReleasePlan.simplified.workspaceRetention, 'OFF');
+      const sharedReleaseRequest = await create(releaseFlow + '/run', {
+        version: sharedVersion,
+        inputs: sharedInputs,
+        expectedConfigurationHash: sharedReleasePlan.configurationHash,
+        idempotencyKey: randomUUID(),
+      });
+      const sharedRelease = await waitRun(sharedReleaseRequest.id, 'SUCCESS');
+      assert.deepEqual(
+        sharedRelease.nodes.map(({ nodeId }) => nodeId),
+        [onlyRelease.id, canvas.nodes[3]!.id, shared.endpoints[2]!.endId],
+      );
+      assert.equal(sharedRelease.simplified?.workspacePath, null);
+      assert.deepEqual(sharedRelease.artifactIds, sharedBuild.artifactIds);
+
+      const dockerTemplate: GraphCanvas = (
+        await create(graphPath + '/draft/templates/expand', {
+          templateId: 'MINIMAL_CI_CD',
+          artifactType: 'DOCKER_IMAGE',
+        })
+      ).canvas;
+      const { mainStart: dockerMain, onlyBuild: dockerBuild } = withEntries(dockerTemplate);
+      dockerMain.start!.release!.compose = { path: 'fixture/compose.yaml' };
+      dockerTemplate.nodes.find(({ operation }) => operation === 'BUILD')!.build = {
+        repoPath: 'fixture',
+        dockerfilePath: 'Dockerfile',
+      };
+      const buildEnd = dockerTemplate.nodes.find(
+        ({ id }) => id === dockerTemplate.endpoints[1]!.endId,
+      )!;
+      buildEnd.finish!.images![0]!.composePath = 'fixture/compose.yaml';
+      const dockerVersion = await publish(dockerTemplate);
+      const dockerBuildFlow = graphPath + '/flows/' + dockerBuild.id;
+      const dockerBuildPlan = await create(dockerBuildFlow + '/preview', {
+        version: dockerVersion,
+      });
+      const dockerBuildRequest = await create(dockerBuildFlow + '/run', {
+        version: dockerVersion,
+        expectedConfigurationHash: dockerBuildPlan.configurationHash,
+        idempotencyKey: randomUUID(),
+      });
+      const dockerBuildRun = await waitRun(dockerBuildRequest.id, 'SUCCESS');
+      const composeArchive = await app
+        .get(DatabaseService)
+        .db.selectFrom('artifacts')
+        .select(['compose_yaml', 'compose_checksum'])
+        .where('graph_run_id', '=', dockerBuildRun.id)
+        .where('artifact_type', '=', 'DOCKER_IMAGE')
+        .executeTakeFirstOrThrow();
+      assert.equal(composeArchive.compose_yaml, compose);
+      assert.match(composeArchive.compose_checksum ?? '', /^[a-f0-9]{64}$/);
     } finally {
       await app?.close();
       if (git.listening) await new Promise<void>((resolve) => git.close(() => resolve()));

@@ -126,6 +126,7 @@ export class GraphFlowCatalogController {
         if (flow.model !== 'FLOW_V2') continue;
         const start = flowStart(flow).start;
         const serviceId = start?.release?.serviceId;
+        const requiresArtifact = start?.release?.artifactSource === 'RUN_PARAMETER';
         const artifactOverride = Boolean(start?.release?.allowArtifactOverride);
         notes.set(flow.id, {
           id: flow.id,
@@ -134,6 +135,7 @@ export class GraphFlowCatalogController {
           version: project.published_version!,
           inDraft: notes.has(flow.id),
           hasRuntimeInputs: Boolean(
+            requiresArtifact ||
             artifactOverride ||
             start?.sources?.some(({ allowRefOverride }) => allowRefOverride) ||
             start?.variables?.some(
@@ -145,7 +147,8 @@ export class GraphFlowCatalogController {
                 !(condition ?? branch ?? choice)?.parameterKey,
             ),
           ),
-          needsArtifactInput: artifactOverride && Boolean(start?.release?.useUpstreamArtifact),
+          needsArtifactInput:
+            requiresArtifact || (artifactOverride && Boolean(start?.release?.useUpstreamArtifact)),
         });
       }
       return {

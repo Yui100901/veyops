@@ -25,7 +25,7 @@ import { httpCloneUrl } from '../projects/http-clone-url';
 import { redactTaskLog } from '../tasks/task-log.service';
 import type { GraphCanvas, GraphFlow, GraphNode } from './execution-graph-definition';
 import { graphBranchPaths } from './graph-binding-validation';
-import { GraphCompileError, safeGraphEnvironmentKey } from './graph-fields';
+import { GraphCompileError, safeGraphEnvironmentKey, type GraphField } from './graph-fields';
 
 const idFormat = /^[A-Za-z0-9_-]{1,64}$/;
 const variableFormat = /^[a-zA-Z_][a-zA-Z0-9_]{0,127}$/;
@@ -91,6 +91,7 @@ export class SimplifiedRelease {
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() reuseExecutionServer?: boolean;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) contentPath?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() artifactId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsIn(['RUN_PARAMETER']) artifactSource?: 'RUN_PARAMETER';
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() useUpstreamArtifact?: boolean;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() allowArtifactOverride?: boolean;
   @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) imageId?: string;
@@ -153,6 +154,7 @@ export class SimplifiedFinishImage {
   @IsIn(['BUILT_IN', 'WORKSPACE', 'REGISTRY']) source!: 'BUILT_IN' | 'WORKSPACE' | 'REGISTRY';
   @ValidateIf((_o, v) => v !== undefined) @IsString() @Length(1, 512) reference?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() registryId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @IsString() @Length(1, 1024) composePath?: string;
 }
 
 export class SimplifiedFinish {
@@ -372,6 +374,30 @@ export function validateSimplifiedSourceDirectories(
 }
 
 const workspaceActions = new Set(['CHECKOUT', 'SHELL', 'CHECK', 'BUILD']);
+
+export function simplifiedUsesWorkspace(nodes: readonly GraphNode[]) {
+  return nodes.some(({ type }) => workspaceActions.has(type));
+}
+
+export function simplifiedEffectiveFinish(
+  nodes: readonly GraphNode[],
+  finish: SimplifiedFinish,
+  usesExistingArtifact: boolean,
+): SimplifiedFinish {
+  return usesExistingArtifact && !simplifiedUsesWorkspace(nodes)
+    ? { saveWorkspace: false, requireRelease: finish.requireRelease }
+    : finish;
+}
+
+export function simplifiedTriggerArtifactInput(flow?: GraphFlow): GraphField | undefined {
+  if (
+    flow?.model !== 'FLOW_V2' ||
+    flow.nodes.find(({ type }) => type === 'START')?.start?.release?.artifactSource !==
+      'RUN_PARAMETER'
+  )
+    return undefined;
+  return { id: 'artifactId', name: '发布产物', type: 'ARTIFACT', required: true };
+}
 const simpleActions = new Set([
   'START',
   'END',
@@ -450,6 +476,13 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
   const deploys = ordered.filter(
     ({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT',
   );
+  const releaseConfig = config.release;
+  const existingArtifact = Boolean(
+    releaseConfig?.artifactId ||
+    releaseConfig?.useUpstreamArtifact ||
+    releaseConfig?.artifactSource === 'RUN_PARAMETER',
+  );
+  const activeFinish = simplifiedEffectiveFinish(ordered, finish.finish ?? {}, existingArtifact);
   if (deploys.length > 1)
     nodeIssue(deploys[1]!, 'operation', '一条流程配置一个受管发布动作', flow.id);
   if (!deploys.length) {
@@ -463,6 +496,11 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
     if (deploys[0]!.type === 'ROLLBACK_ARTIFACT' && !release?.artifactId)
       report('start.release.artifactId', '按产物回滚需要在开始节点指定曾成功发布的实例');
     if (!release?.serviceId) report('start.release.serviceId', '请选择发布的项目服务');
+    if (
+      release?.artifactSource === 'RUN_PARAMETER' &&
+      (release.artifactId || release.useUpstreamArtifact || release.imageId)
+    )
+      report('start.release.artifactSource', '运行时选择产物不能与其他产物来源同时设置');
     if (release?.useUpstreamArtifact && release.artifactId)
       report('start.release.artifactId', '请在固定历史产物与接收上游产物之间选择一种来源');
     if (release?.upstreamArtifactName && !release.useUpstreamArtifact)
@@ -480,7 +518,7 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
       safeRelative(start, 'start.release.contentPath', release?.contentPath, flow.id);
     }
   }
-  if (finish.finish?.requireRelease && !deploys.length)
+  if (activeFinish.requireRelease && !deploys.length)
     nodeIssue(finish, 'finish.requireRelease', '核对发布结果需要受管发布动作', flow.id);
 
   const dockerBuilds = ordered.filter(
@@ -495,7 +533,7 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
     );
   const imageIds = new Set<string>();
   const imageNames = new Set<string>();
-  const images = finish.finish?.images ?? [];
+  const images = activeFinish.images ?? [];
   for (const [index, image] of images.entries()) {
     const field = 'finish.images.' + index;
     const name = simplifiedImageName(image.name);
@@ -508,6 +546,16 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
         flow.id,
       );
     if (imageIds.has(image.id)) nodeIssue(finish, field + '.id', '镜像登记项标识重复', flow.id);
+    if (image.composePath) {
+      safeRelative(finish, field + '.composePath', image.composePath, flow.id);
+      if (!/\.ya?ml$/i.test(image.composePath) || !simplifiedUsesWorkspace(ordered))
+        nodeIssue(
+          finish,
+          field + '.composePath',
+          '请选择本次工作区内的 Compose YAML 文件',
+          flow.id,
+        );
+    }
     if (image.source === 'BUILT_IN' && !dockerBuilds.length)
       nodeIssue(finish, field + '.source', '请添加内置 Dockerfile 构建或选择其他镜像来源', flow.id);
     if (
@@ -539,15 +587,14 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
       node.deploy?.method === 'COMPOSE'
     ) {
       const compose = config.release?.compose;
-      const existing = config.release?.artifactId || config.release?.useUpstreamArtifact;
-      const image = simplifiedReleaseImage(finish.finish ?? {}, config.release ?? {});
-      if (config.release?.imageId && !image)
+      const image = simplifiedReleaseImage(activeFinish, config.release ?? {});
+      if (!existingArtifact && config.release?.imageId && !image)
         report('start.release.imageId', '找不到已选的镜像登记项');
-      if (!existing && !image) {
+      if (!existingArtifact && !image) {
         if (images.length > 1) report('start.release.imageId', '请选择本次要发布的镜像登记项');
         nodeIssue(finish, 'finish.images', '从本次构建发布时请登记一个镜像', flow.id);
       }
-      if (!existing && !compose)
+      if (!existingArtifact && !compose && !image?.composePath)
         report('start.release.compose', '从本次构建发布时请选择 Compose 文件');
       if (compose) {
         safeRelative(start, 'start.release.compose.path', compose.path, flow.id);
@@ -555,7 +602,7 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
           report('start.release.compose.path', '请选择 YAML 文件');
         if (compose.sourceId && !sources.some(({ id }) => id === compose.sourceId))
           report('start.release.compose.sourceId', '请选择此流开始节点中的源码');
-        if (existing && !compose.sourceId)
+        if (existingArtifact && !compose.sourceId)
           report(
             'start.release.compose.sourceId',
             '历史发布请选择固定提交中的 Compose 文件，或沿用产物内的文件',
@@ -602,7 +649,7 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
       nodeIssue(node, 'operation', '源码审核需要开始节点的仓库', flow.id);
   }
   if (
-    finish.finish?.requireRelease === 'HEALTHY' &&
+    activeFinish.requireRelease === 'HEALTHY' &&
     !ordered.some(({ type }) => type === 'HEALTH_CHECK')
   )
     nodeIssue(finish, 'finish.requireRelease', '请在发布后添加健康检查', flow.id);
@@ -611,7 +658,7 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
   const approvals = ordered.filter(({ type }) => type === 'APPROVAL');
   for (const path of graphBranchPaths(flow, ordered)) {
     if (!path.active.has(release.id)) {
-      if (finish.finish?.requireRelease)
+      if (activeFinish.requireRelease)
         nodeIssue(
           finish,
           'finish.requireRelease',
@@ -622,17 +669,14 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
     }
     if (release.type === 'ROLLBACK_ARTIFACT' && !approvals.some(({ id }) => path.active.has(id)))
       nodeIssue(release, 'operation', '每条回滚分支都须先完成人工审批', flow.id);
-    if (
-      finish.finish?.requireRelease === 'HEALTHY' &&
-      !probes.some(({ id }) => path.active.has(id))
-    )
+    if (activeFinish.requireRelease === 'HEALTHY' && !probes.some(({ id }) => path.active.has(id)))
       nodeIssue(
         finish,
         'finish.requireRelease',
         '要求健康时，每条发布分支均须执行健康检查',
         flow.id,
       );
-    if (config.release?.artifactId || config.release?.useUpstreamArtifact) continue;
+    if (existingArtifact) continue;
     const happensBefore = new Map<string, Set<string>>();
     for (const node of ordered) {
       const direct = path.edges.filter(({ to }) => to === node.id).map(({ from }) => from);
@@ -645,7 +689,7 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
     const before = happensBefore.get(stage.id)!;
     const compose = release.deploy?.method === 'COMPOSE';
     const releaseImage = compose
-      ? simplifiedReleaseImage(finish.finish ?? {}, config.release!)
+      ? simplifiedReleaseImage(activeFinish, config.release!)
       : undefined;
     if (releaseImage?.source === 'BUILT_IN' && !before.has(dockerBuilds[0]!.id))
       report(

@@ -28,6 +28,52 @@ async function checkTemplates(databaseUrl?: string) {
   const { DatabaseService } = await import('../core/database/database.service.js');
   const { AuditService } = await import('../modules/audit/audit.service.js');
   const { compileCanvas } = await import('../modules/execution-graphs/execution-graph-canvas.js');
+  const { flowSelection } = await import('../modules/execution-graphs/graph-run-lifecycle.js');
+  const entryNames = ['构建并部署', '仅构建', '仅部署'];
+  const assertSharedCanvas = (canvas: GraphCanvas, startId: string, complete: boolean) => {
+    assert.equal(canvas.model, 'FLOW_V2');
+    assert.equal(canvas.nodes.length, complete ? 11 : 8);
+    assert.equal(canvas.edges.length, complete ? 10 : 7);
+    assert.equal(canvas.endpoints.length, 3);
+    assert.equal(canvas.endpoints[0]?.startId, startId);
+    assert.equal(canvas.endpoints[0]?.endId, canvas.endpoints[2]?.endId);
+    assert.notEqual(canvas.endpoints[0]?.endId, canvas.endpoints[1]?.endId);
+    const { flows } = compileCanvas(canvas, false);
+    assert.deepEqual(
+      flows.map(({ name }) => name),
+      entryNames,
+    );
+    const build = ['CHECKOUT', ...(complete ? ['CHECK'] : []), 'BUILD'];
+    const release = [
+      ...(complete ? ['APPROVAL'] : []),
+      'DEPLOY_ARTIFACT',
+      ...(complete ? ['HEALTH_CHECK'] : []),
+    ];
+    assert.deepEqual(
+      flows.map((flow) => {
+        const { ordered, selected, incoming } = flowSelection(flow, {});
+        assert.equal(ordered.length, selected.size);
+        for (const [index, node] of ordered.slice(1).entries()) {
+          assert.deepEqual(
+            incoming.get(node.id)?.map(({ from }) => from),
+            [ordered[index]!.id],
+          );
+        }
+        return ordered.map(({ type }) => type);
+      }),
+      [
+        ['START', ...build, ...release, 'END'],
+        ['START', ...build, 'END'],
+        ['START', ...release, 'END'],
+      ],
+    );
+    const [delivery, buildOnly, releaseOnly] = flows;
+    assert.equal(delivery?.nodes.at(-1)?.name, '发布结束');
+    assert.equal(buildOnly?.nodes.at(-1)?.name, '构建结束');
+    assert.equal(releaseOnly?.nodes.at(-1)?.name, '发布结束');
+    assert.equal(releaseOnly?.nodes[0]?.start?.release?.artifactSource, 'RUN_PARAMETER');
+    assert.equal(releaseOnly?.nodes[0]?.start?.release?.artifactId, undefined);
+  };
   const app = (
     await Test.createTestingModule({ imports: [AppModule] }).compile()
   ).createNestApplication<NestExpressApplication>({ logger: false });
@@ -48,13 +94,7 @@ async function checkTemplates(databaseUrl?: string) {
     assert.equal(draft.revision, 1);
     assert.equal(draft.publishedVersion, null);
     const seed: GraphCanvas = draft.draft.canvas;
-    assert.equal(seed.model, 'FLOW_V2');
-    assert.equal(seed.endpoints.length, 1);
-    assert.deepEqual(
-      seed.nodes.map((node) => node.operation ?? node.type),
-      ['START', 'CHECKOUT', 'BUILD', 'DEPLOY_ARTIFACT', 'END'],
-    );
-    assert.equal(seed.edges.length, 4);
+    assertSharedCanvas(seed, seed.nodes[0]!.id, false);
     assert.equal(seed.nodes[0]?.start?.execution?.location, 'INHERIT');
     assert.equal(seed.nodes[4]?.finish?.saveWorkspace, true);
     assert.equal(seed.nodes[4]?.finish?.requireRelease, 'ACTIVATED');
@@ -72,24 +112,41 @@ async function checkTemplates(databaseUrl?: string) {
           version,
         ],
       ),
-      [[seed.nodes[0]!.id, true, undefined]],
+      seed.endpoints.map(({ startId }) => [startId, true, undefined]),
     );
     assert.deepEqual((await api.get(path).expect(200)).body.data, draft);
     assert.deepEqual((await api.get(`${path}/runs`).expect(200)).body.data, []);
     const { flowTemplates } = (await api.get(`${path}/catalog`).expect(200)).body.data;
     assert.deepEqual(
       flowTemplates.map(({ id }: { id: string }) => id),
-      ['MINIMAL_CI_CD', 'CI_BUILD', 'CD_DEPLOY'],
+      ['MINIMAL_CI_CD', 'COMPLETE_CI_CD'],
     );
+    for (const template of flowTemplates) {
+      assert.deepEqual(
+        template.entries.map(({ name }: { name: string }) => name),
+        entryNames,
+      );
+      assert.deepEqual(template.artifactTypes, ['DIRECTORY', 'DOCKER_IMAGE']);
+    }
 
     const expand = `${path}/draft/templates/expand`;
-    const payload = { templateId: 'CD_DEPLOY' };
+    const payload = { templateId: 'COMPLETE_CI_CD' };
+    const minimal = (await api.post(expand).send({ templateId: 'MINIMAL_CI_CD' }).expect(201)).body
+      .data;
+    assertSharedCanvas(minimal.canvas, minimal.startId, false);
+    const seedIds = new Set(seed.nodes.map(({ id }) => id));
+    assert.ok(minimal.canvas.nodes.every(({ id }: { id: string }) => !seedIds.has(id)));
     const [left, right] = await Promise.all([
       api.post(expand).send(payload).expect(201),
       api.post(expand).send(payload).expect(201),
     ]);
-    assert.equal(left.body.data.canvas.model, 'FLOW_V2');
-    assert.equal(left.body.data.canvas.nodes.at(-1).finish.requireRelease, 'HEALTHY');
+    const complete = left.body.data.canvas as GraphCanvas;
+    assertSharedCanvas(complete, left.body.data.startId, true);
+    assertSharedCanvas(right.body.data.canvas, right.body.data.startId, true);
+    assert.equal(
+      complete.nodes.find(({ name }) => name === '发布结束')?.finish?.requireRelease,
+      'HEALTHY',
+    );
     assert.notEqual(left.body.data.startId, right.body.data.startId);
     assert.ok(
       left.body.data.canvas.nodes.some(
@@ -98,6 +155,30 @@ async function checkTemplates(databaseUrl?: string) {
     );
     const leftIds = new Set(left.body.data.canvas.nodes.map((node: { id: string }) => node.id));
     assert.ok(right.body.data.canvas.nodes.every((node: { id: string }) => !leftIds.has(node.id)));
+    const dockerVariants = await Promise.all(
+      ['MINIMAL_CI_CD', 'COMPLETE_CI_CD'].map(async (templateId) => {
+        const { body } = await api
+          .post(expand)
+          .send({ templateId, artifactType: 'DOCKER_IMAGE' })
+          .expect(201);
+        const canvas = body.data.canvas as GraphCanvas;
+        assertSharedCanvas(canvas, body.data.startId, templateId === 'COMPLETE_CI_CD');
+        assert.equal(
+          canvas.nodes.find(({ operation }) => operation === 'BUILD')?.build?.dockerfilePath,
+          'Dockerfile',
+        );
+        assert.equal(
+          canvas.nodes.find(({ operation }) => operation === 'DEPLOY_ARTIFACT')?.deploy?.method,
+          'COMPOSE',
+        );
+        assert.ok(
+          canvas.nodes
+            .filter(({ type }) => type === 'END')
+            .every(({ finish }) => finish?.images?.some(({ source }) => source === 'BUILT_IN')),
+        );
+        return canvas;
+      }),
+    );
     const invalidId = await api
       .post(expand)
       .send({ ...payload, templateId: 'INVALID' })
@@ -108,6 +189,11 @@ async function checkTemplates(databaseUrl?: string) {
       .expect(400);
     assert.equal(invalidId.body.error.details.fieldErrors[0].path[0], 'templateId');
     assert.equal(invalidType.body.error.details.fieldErrors[0].path[0], 'artifactType');
+    await api
+      .post(expand)
+      .send({ ...payload, artifactType: 'FILE' })
+      .expect(400);
+    await api.post(expand).send({ templateId: 'CD_DEPLOY' }).expect(400);
     assert.deepEqual((await api.get(path).expect(200)).body.data, draft);
     assert.deepEqual((await api.get(`${path}/runs`).expect(200)).body.data, []);
 
@@ -151,13 +237,11 @@ async function checkTemplates(databaseUrl?: string) {
           fieldId,
         }),
       ),
-      [
-        {
-          flowId: seed.nodes[0]!.id,
-          nodeId: seed.nodes[0]!.id,
-          fieldId: 'start.sources.source.repositoryId',
-        },
-      ],
+      seed.endpoints.map(({ startId }, index) => ({
+        flowId: startId,
+        nodeId: startId,
+        fieldId: index === 2 ? 'start.release.serviceId' : 'start.sources.source.repositoryId',
+      })),
     );
     await api.post(`${path}/publish`).send({ expectedRevision: saved.revision }).expect(400);
 
@@ -192,34 +276,66 @@ async function checkTemplates(databaseUrl?: string) {
         })
         .expect(201)
     ).body.data;
-    const ready = structuredClone(seed);
-    const start = ready.nodes[0]!.start!;
-    start.sources![0]!.repositoryId = repository.id;
-    ready.nodes[2]!.build = { repoPath: 'project', buildCommand: 'mkdir -p dist' };
-    start.release = {
-      serviceId: service.id,
-      targets: { serverIds: [target.id] },
+    const configured = (candidate: GraphCanvas) => {
+      const canvas = structuredClone(candidate);
+      for (const node of canvas.nodes) {
+        if (node.start) {
+          for (const source of node.start.sources ?? []) source.repositoryId = repository.id;
+          node.start.release = node.start.release
+            ? { ...node.start.release, serviceId: service.id, targets: { serverIds: [target.id] } }
+            : { serviceId: service.id };
+        }
+        if (node.operation === 'BUILD')
+          node.build = node.build?.dockerfilePath
+            ? { ...node.build, repoPath: 'project' }
+            : { repoPath: 'project', buildCommand: 'mkdir -p dist' };
+        if (node.operation === 'CHECK')
+          node.shell = { ...node.shell, directory: 'project', command: 'test -d .' };
+        if (node.operation === 'HEALTH_CHECK')
+          node.healthCheck = { ...node.healthCheck, command: 'test -f .veyops-managed' };
+      }
+      return canvas;
     };
+    const ready = configured(seed);
     const wholeWorkspace = await api
       .post(`${path}/validate`)
       .send({ definition: { canvas: ready } })
       .expect(201);
     assert.deepEqual(wholeWorkspace.body.data.issues, []);
-    start.release.contentPath = 'project/dist/';
+    ready.nodes[0]!.start!.release!.contentPath = 'project/dist/';
     const readyDraft = (await save(ready, saved.revision).expect(200)).body.data;
     const published = (
       await api.post(`${path}/publish`).send({ expectedRevision: readyDraft.revision }).expect(201)
     ).body.data;
     assert.equal(published.publishedVersion, 1);
+    const releaseOnlyId = ready.endpoints[2]!.startId;
+    const requiresArtifact = await api
+      .post(`${path}/flows/${releaseOnlyId}/preview`)
+      .send({ version: published.publishedVersion })
+      .expect(400);
+    assert.match(requiresArtifact.body.error.message, /历史产物/);
 
-    const ci: GraphCanvas = (
-      await api.post(expand).send({ templateId: 'CI_BUILD', artifactType: 'DIRECTORY' }).expect(201)
-    ).body.data.canvas;
-    const check = ci.nodes.find(({ operation }) => operation === 'CHECK')!;
-    const build = ci.nodes.find(({ operation }) => operation === 'BUILD')!;
-    ci.nodes.find(({ type }) => type === 'START')!.start!.sources![0]!.repositoryId = repository.id;
-    check.shell = { ...check.shell, directory: 'project', command: 'test -d .' };
-    build.build = { repoPath: 'project', buildCommand: 'mkdir -p dist' };
+    const disconnected = structuredClone(ready);
+    const buildOnlyId = disconnected.endpoints[1]!.startId;
+    disconnected.nodes = disconnected.nodes.filter(({ id }) => id !== buildOnlyId);
+    disconnected.edges = disconnected.edges.filter(({ from }) => from !== buildOnlyId);
+    disconnected.endpoints = disconnected.endpoints.filter(
+      ({ startId }) => startId !== buildOnlyId,
+    );
+    const unresolvedExit = await api
+      .post(`${path}/validate`)
+      .send({ definition: { canvas: disconnected } })
+      .expect(201);
+    assert.match(unresolvedExit.body.data.issues[0].message, /构建结束/);
+
+    const ci = configured(complete);
+    for (const docker of dockerVariants) {
+      const validated = await api
+        .post(`${path}/validate`)
+        .send({ definition: { canvas: configured(docker) } })
+        .expect(201);
+      assert.deepEqual(validated.body.data.issues, []);
+    }
     const ciValidated = await api
       .post(`${path}/validate`)
       .send({ definition: { canvas: ci } })
@@ -228,7 +344,7 @@ async function checkTemplates(databaseUrl?: string) {
     const ciDraft = (await save(ci, published.revision).expect(200)).body.data;
     const pendingCatalog = await projectCatalog();
     assert.equal(pendingCatalog.hasDraftChanges, true);
-    assert.equal(pendingCatalog.flows.length, 2);
+    assert.equal(pendingCatalog.flows.length, 6);
     const active = pendingCatalog.flows.find(({ id }: { id: string }) => id === seed.nodes[0]!.id);
     assert.equal(active.version, published.publishedVersion);
     assert.equal(active.inDraft, false);
@@ -241,7 +357,7 @@ async function checkTemplates(databaseUrl?: string) {
     ).body.data;
     const ciCatalog = await projectCatalog();
     assert.equal(ciCatalog.hasDraftChanges, false);
-    assert.equal(ciCatalog.flows.length, 1);
+    assert.equal(ciCatalog.flows.length, 3);
     assert.equal(ciCatalog.flows[0].id, ciStartId);
     assert.equal(ciCatalog.flows[0].version, ciPublished.publishedVersion);
     assert.equal(ciCatalog.flows[0].inDraft, true);

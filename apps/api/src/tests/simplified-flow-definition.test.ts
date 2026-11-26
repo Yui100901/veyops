@@ -95,6 +95,27 @@ test('a V2 canvas publishes actions and resource references without generic bind
   );
 });
 
+test('a historical Compose-only route shares its end with a build without registering another image', () => {
+  const canvas = deployment();
+  const [start, , , deploy, end] = canvas.nodes;
+  delete start!.start!.sources;
+  start!.start!.release!.artifactSource = 'RUN_PARAMETER';
+  deploy!.deploy = { method: 'COMPOSE' };
+  end!.finish!.images = [{ id: 'image', name: 'fixture/image', source: 'BUILT_IN' }];
+  canvas.nodes = [start!, deploy!, end!];
+  canvas.edges = [
+    { from: start!.id, to: deploy!.id },
+    { from: deploy!.id, to: end!.id },
+  ];
+
+  assert.doesNotThrow(() => compileCanvas(canvas, true));
+  start!.start!.release!.artifactId = '3e09e540-0d0b-41b8-96bc-98eb47fac029';
+  assert.equal(canvasIssues(canvas)[0]?.fieldId, 'start.release.artifactSource');
+  delete start!.start!.release!.artifactId;
+  start!.start!.release!.compose = { path: 'compose.yaml' };
+  assert.equal(canvasIssues(canvas)[0]?.fieldId, 'start.release.compose.sourceId');
+});
+
 function existingCanvas(): GraphCanvas {
   return {
     nodes: [

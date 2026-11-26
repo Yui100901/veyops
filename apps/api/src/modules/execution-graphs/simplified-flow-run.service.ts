@@ -1,5 +1,6 @@
 import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { isUUID } from 'class-validator';
 import { chmod, link, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Kysely, Transaction } from 'kysely';
@@ -71,9 +72,11 @@ import {
   type GraphGateScope,
 } from './graph-release-gates';
 import {
+  simplifiedEffectiveFinish,
   simplifiedImageName,
   simplifiedReleaseImage,
   simplifiedSourceDirectory,
+  simplifiedUsesWorkspace,
   type SimplifiedFinish,
   type SimplifiedStart,
 } from './simplified-flow-definition';
@@ -203,36 +206,30 @@ export class SimplifiedFlowRunService {
       dotenv,
       release,
     } = start.start ?? {};
-    const configuredFinish = flow.nodes.find(({ type }) => type === 'END')?.finish ?? {};
-    const finish: SimplifiedFinish = {
-      ...configuredFinish,
-      images: configuredFinish.images?.map((image) => ({
-        ...image,
-        name: simplifiedImageName(image.name)!,
-      })),
-    };
     const releaseNode = flow.nodes.find(
       ({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT',
     );
     const issue = (
-      code: 'REPOSITORY' | 'BUILD_TARGET' | 'RELEASE_TARGET' | 'CONFIGURATION',
+      code: 'REPOSITORY' | 'BUILD_TARGET' | 'RELEASE_TARGET' | 'CONFIGURATION' | 'ARTIFACT',
       fieldId: string,
       message: string,
     ) =>
       new ExecutionPlanIssueError({
         code,
         fieldId,
+        parameterId: code === 'ARTIFACT' ? 'artifactId' : undefined,
         message,
         nodeId: start.id,
         nodeName: start.name,
         flowId: flow.id,
       });
+    const requiresArtifact = release?.artifactSource === 'RUN_PARAMETER';
     const allowed = new Set([
       ...sources.filter((entry) => entry.allowRefOverride).map(({ id }) => 'git:' + id),
       ...variables
         .filter((entry) => entry.allowOverride && !entry.credentialId)
         .map(({ key }) => 'var:' + key),
-      ...(release?.allowArtifactOverride ? ['artifactId'] : []),
+      ...(requiresArtifact || release?.allowArtifactOverride ? ['artifactId'] : []),
     ]);
     const overrides = input.parameters ?? {};
     if (
@@ -251,11 +248,22 @@ export class SimplifiedFlowRunService {
       : undefined;
     if (useUpstreamArtifact && !upstreamArtifact && !upstreamPending)
       throw issue('RELEASE_TARGET', 'release', '关联运行未提供可重发的已登记产物');
-    if (
-      artifact !== undefined &&
-      (typeof artifact !== 'string' || !/^[0-9a-f-]{36}$/i.test(artifact))
-    )
-      throw issue('RELEASE_TARGET', 'release', '请选择有效的历史产物实例');
+    if (requiresArtifact && overrides.artifactId === undefined)
+      throw issue('ARTIFACT', 'artifact', '请选择该服务的历史产物。没有可选产物时，请先运行构建');
+    if (artifact !== undefined && (typeof artifact !== 'string' || !isUUID(artifact)))
+      throw issue('ARTIFACT', 'artifact', '请选择有效的历史产物实例');
+    const configuredFinish = simplifiedEffectiveFinish(
+      flow.nodes,
+      flow.nodes.find(({ type }) => type === 'END')?.finish ?? {},
+      Boolean(artifact || upstreamPending),
+    );
+    const finish: SimplifiedFinish = {
+      ...configuredFinish,
+      images: configuredFinish.images?.map((image) => ({
+        ...image,
+        name: simplifiedImageName(image.name)!,
+      })),
+    };
     const event = graphCheckoutEvent(trigger);
     const fixedSources = await Promise.all(
       sources.map(async (entry) => {
@@ -314,9 +322,7 @@ export class SimplifiedFlowRunService {
       .where('id', '=', projectId)
       .where('deleted_at', 'is', null)
       .executeTakeFirstOrThrow();
-    const hasWorkspaceActions = flow.nodes.some(({ type }) =>
-      ['CHECKOUT', 'BUILD', 'CHECK', 'SHELL'].includes(type),
-    );
+    const hasWorkspaceActions = simplifiedUsesWorkspace(flow.nodes);
     const needsWorkspace = hasWorkspaceActions || Boolean(release?.reuseExecutionServer);
     const location =
       execution?.location && execution.location !== 'INHERIT'
@@ -616,7 +622,10 @@ export class SimplifiedFlowRunService {
       method,
       image: image && { id: image.id, name: image.name },
       profile,
-      workspaceComposePath: method === 'COMPOSE' && !compose ? release.compose?.path : undefined,
+      workspaceComposePath:
+        method === 'COMPOSE' && !artifactId && !compose
+          ? (release.compose?.path ?? image?.composePath)
+          : undefined,
       rollbackBaseline: upcoming.rollbackBaseline,
       requireApproval: upcoming.requireApproval,
       requireCodeReview: upcoming.requireCodeReview,
@@ -772,6 +781,9 @@ export class SimplifiedFlowRunService {
       stage !== 'SNAPSHOT' ||
       snapshot?.workspace ||
       Boolean(priorWorkspacePath) ||
+      plan.finish.images?.some(
+        (image) => Boolean(image.composePath) && snapshot?.imageIds.includes(image.id),
+      ) ||
       (plan.release?.image &&
         snapshot?.imageIds.includes(plan.release.image.id) &&
         Boolean(plan.release.workspaceComposePath));
@@ -1011,7 +1023,8 @@ export class SimplifiedFlowRunService {
     );
     if (await this.artifacts.requireFlowInstance(identity.instanceId, runId)) return;
     const composePath =
-      plan.release?.image?.id === entry.id ? plan.release.workspaceComposePath : undefined;
+      (plan.release?.image?.id === entry.id ? plan.release.workspaceComposePath : undefined) ??
+      entry.composePath;
     const composeYaml = composePath
       ? workspace &&
         (await this.builds.flowComposeSnapshot(session, workspace, composePath, target))

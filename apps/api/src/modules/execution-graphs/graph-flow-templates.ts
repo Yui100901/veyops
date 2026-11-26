@@ -9,7 +9,7 @@ import {
   type GraphField,
 } from './graph-fields';
 
-const templates = [
+const legacyTemplates = [
   {
     id: 'MINIMAL_CI_CD',
     name: '最小构建并部署',
@@ -30,30 +30,59 @@ const templates = [
   },
 ] as const;
 
-type TemplateId = (typeof templates)[number]['id'];
-type TemplateOperation = (typeof templates)[number]['operations'][number];
+const simplifiedTemplates = [
+  {
+    id: 'MINIMAL_CI_CD',
+    name: '最小构建并部署',
+    description: '适合首次交付，也可以单独构建或部署已有产物。',
+    build: ['CHECKOUT', 'BUILD'],
+    release: ['DEPLOY_ARTIFACT'],
+    requireRelease: 'ACTIVATED',
+  },
+  {
+    id: 'COMPLETE_CI_CD',
+    name: '较完整的构建并部署',
+    description: '构建前检查与测试，发布前审批，部署后检查健康状态。',
+    build: ['CHECKOUT', 'CHECK', 'BUILD'],
+    release: ['APPROVAL', 'DEPLOY_ARTIFACT', 'HEALTH_CHECK'],
+    requireRelease: 'HEALTHY',
+  },
+] as const;
+
+type SimplifiedTemplate = (typeof simplifiedTemplates)[number];
+type TemplateId = (typeof legacyTemplates)[number]['id'] | SimplifiedTemplate['id'];
+type TemplateOperation =
+  SimplifiedTemplate['build'][number] | SimplifiedTemplate['release'][number];
 
 const labels: Record<TemplateOperation, string> = {
   CHECKOUT: '代码拉取',
   CHECK: '检查与测试',
   BUILD: '构建',
-  APPROVAL: '人工审批',
+  APPROVAL: '发布审批',
   DEPLOY_ARTIFACT: '部署',
   HEALTH_CHECK: '发布健康检查',
 };
 
-export const graphFlowTemplates = templates.map(({ id, name, description, operations }) => ({
-  id,
-  name,
-  description,
-  steps: ['开始', ...operations.map((operation) => labels[operation]), '结束'],
-  artifactTypes: graphArtifactTypes,
-}));
+const entryNames = { delivery: '构建并部署', build: '仅构建', release: '仅部署' };
+const endNames = { build: '构建结束', release: '发布结束' };
 
-export const simplifiedFlowTemplates = graphFlowTemplates.map((template) => ({
-  ...template,
-  artifactTypes: ['DIRECTORY', 'DOCKER_IMAGE'] as const,
-}));
+export const simplifiedFlowTemplates = simplifiedTemplates.map((template) => {
+  const build = template.build.map((operation) => labels[operation]);
+  const release = template.release.map((operation) => labels[operation]);
+  const steps = [entryNames.delivery, ...build, ...release, endNames.release];
+  return {
+    id: template.id,
+    name: template.name,
+    description: template.description,
+    steps,
+    entries: [
+      { name: entryNames.delivery, steps },
+      { name: entryNames.build, steps: [entryNames.build, ...build, endNames.build] },
+      { name: entryNames.release, steps: [entryNames.release, ...release, endNames.release] },
+    ],
+    artifactTypes: ['DIRECTORY', 'DOCKER_IMAGE'] as const,
+  };
+});
 
 export class ExpandGraphTemplateDto {
   @Allow() templateId!: TemplateId;
@@ -87,13 +116,19 @@ export function expandGraphTemplate(
   artifactType: GraphArtifactType = 'DIRECTORY',
   model?: 'FLOW_V2',
 ): { canvas: GraphCanvas; startId: string } {
-  const template = templates.find(({ id }) => id === templateId);
+  if (model !== undefined && model !== 'FLOW_V2')
+    invalidTemplateField('model', '请选择有效的执行流定义');
+  if (model === 'FLOW_V2') {
+    const template = simplifiedTemplates.find(({ id }) => id === templateId);
+    if (!template) invalidTemplateField('templateId', '请选择有效的流程模板');
+    if (artifactType !== 'DIRECTORY' && artifactType !== 'DOCKER_IMAGE')
+      invalidTemplateField('artifactType', '请选择目录或 Docker 镜像');
+    return expandSimplifiedTemplate(template, artifactType);
+  }
+  const template = legacyTemplates.find(({ id }) => id === templateId);
   if (!template) invalidTemplateField('templateId', '请选择有效的流程模板');
   if (!graphArtifactTypes.includes(artifactType))
     invalidTemplateField('artifactType', '请选择文件、目录或 Docker 镜像');
-  if (model !== undefined && model !== 'FLOW_V2')
-    invalidTemplateField('model', '请选择有效的执行流定义');
-  if (model === 'FLOW_V2') return expandSimplifiedTemplate(template, artifactType);
   const startInputs: GraphField[] = [];
   const endOutputs: GraphField[] = [];
   const inputBindings: NonNullable<GraphEndpoint['inputBindings']> = {};
@@ -238,63 +273,95 @@ export function expandGraphTemplate(
 }
 
 function expandSimplifiedTemplate(
-  template: (typeof templates)[number],
-  artifactType: GraphArtifactType,
-) {
-  const builds = template.id !== 'CD_DEPLOY';
-  const deploys = template.id !== 'CI_BUILD';
+  template: SimplifiedTemplate,
+  artifactType: 'DIRECTORY' | 'DOCKER_IMAGE',
+): { canvas: GraphCanvas; startId: string } {
   const image = artifactType === 'DOCKER_IMAGE';
-  const start: GraphNode = {
+  const column = (index: number) => 48 + index * 220;
+  const start = (name: string, config: GraphNode['start'], x: number, y: number): GraphNode => ({
     id: `start-${randomUUID()}`,
-    name: template.name,
+    name,
     type: 'START',
-    start: {
-      ...(builds && {
-        sources: [{ id: 'source' }],
-        execution: { location: 'INHERIT' },
-      }),
-      ...(deploys && {
-        release: image && builds ? { compose: { path: 'compose.yaml' }, imageId: 'app' } : {},
-      }),
-    },
-  };
-  const end: GraphNode = {
+    start: config,
+    position: { x, y },
+  });
+  const buildInput = (): NonNullable<GraphNode['start']> => ({
+    sources: [{ id: 'source' }],
+    execution: { location: 'INHERIT' },
+  });
+  const end = (
+    name: string,
+    x: number,
+    y: number,
+    requireRelease?: SimplifiedTemplate['requireRelease'],
+  ): GraphNode => ({
     id: `end-${randomUUID()}`,
-    name: '结束',
+    name,
     type: 'END',
+    position: { x, y },
     finish: {
-      saveWorkspace: builds,
-      ...(image &&
-        builds &&
-        deploys && {
-          images: [{ id: 'app', name: 'app', source: 'BUILT_IN' as const }],
-        }),
-      ...(builds && { retention: 'PERSISTENT' }),
-      ...(deploys && { requireRelease: template.id === 'CD_DEPLOY' ? 'HEALTHY' : 'ACTIVATED' }),
+      saveWorkspace: true,
+      retention: 'PERSISTENT',
+      ...(image && { images: [{ id: 'app', name: 'app', source: 'BUILT_IN' }] }),
+      ...(requireRelease && { requireRelease }),
     },
-  };
-  const actions: GraphNode[] = template.operations.map((operation) => ({
+  });
+  const action = (operation: TemplateOperation, index: number): GraphNode => ({
     id: `node-${randomUUID()}`,
     name: labels[operation],
     type: 'FUNCTION',
     operation,
+    position: { x: column(index + 1), y: 148 },
     ...(operation === 'CHECK' && { shell: { timeout: 180 } }),
     ...(operation === 'BUILD' && image && { build: { dockerfilePath: 'Dockerfile' } }),
     ...(operation === 'DEPLOY_ARTIFACT' && { deploy: { method: image ? 'COMPOSE' : 'FILE' } }),
     ...(operation === 'HEALTH_CHECK' && {
       healthCheck: { timeoutSeconds: 30, requireHealthy: true },
     }),
-  }));
-  const nodes = [start, ...actions, end].map((node, index) => ({
-    ...node,
-    position: { x: 48 + index * 244, y: 64 },
-  }));
-  const canvas: GraphCanvas = {
-    model: 'FLOW_V2',
-    nodes,
-    edges: nodes.slice(1).map(({ id }, index) => ({ from: nodes[index]!.id, to: id })),
-    endpoints: [{ startId: start.id, endId: end.id }],
-    templates: [],
+  });
+  const operations = [...template.build, ...template.release].map(action);
+  const firstRelease = template.build.length;
+  const deliveryStart = start(
+    entryNames.delivery,
+    {
+      ...buildInput(),
+      release: image ? { compose: { path: 'compose.yaml' }, imageId: 'app' } : {},
+    },
+    column(0),
+    148,
+  );
+  const buildStart = start(entryNames.build, buildInput(), column(0), 292);
+  const releaseStart = start(
+    entryNames.release,
+    { release: { artifactSource: 'RUN_PARAMETER' } },
+    column(firstRelease),
+    12,
+  );
+  const releaseEnd = end(
+    endNames.release,
+    column(operations.length + 1),
+    148,
+    template.requireRelease,
+  );
+  const buildEnd = end(endNames.build, column(firstRelease + 1), 292);
+  const mainRoute = [deliveryStart, ...operations, releaseEnd];
+  return {
+    startId: deliveryStart.id,
+    canvas: {
+      model: 'FLOW_V2',
+      nodes: [...mainRoute, buildStart, buildEnd, releaseStart],
+      edges: [
+        ...mainRoute.slice(1).map(({ id }, index) => ({ from: mainRoute[index]!.id, to: id })),
+        { from: buildStart.id, to: operations[0]!.id },
+        { from: operations[firstRelease - 1]!.id, to: buildEnd.id },
+        { from: releaseStart.id, to: operations[firstRelease]!.id },
+      ],
+      endpoints: [
+        { startId: deliveryStart.id, endId: releaseEnd.id },
+        { startId: buildStart.id, endId: buildEnd.id },
+        { startId: releaseStart.id, endId: releaseEnd.id },
+      ],
+      templates: [],
+    },
   };
-  return { startId: start.id, canvas };
 }

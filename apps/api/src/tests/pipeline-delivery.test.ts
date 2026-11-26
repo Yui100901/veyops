@@ -1376,6 +1376,7 @@ async function checkDelivery(databaseUrl?: string) {
             canvas: {
               ...defaults.canvas,
               nodes: flowNodes,
+              endpoints: [defaults.canvas.endpoints[0]!],
               edges: flowNodes
                 .slice(1)
                 .map(({ id: to }, index) => ({ from: flowNodes[index]!.id, to })),

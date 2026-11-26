@@ -152,6 +152,7 @@ import {
   type SimplifiedSnapshotRequest,
   workspaceRetention,
 } from './simplified-flow-run.service';
+import { simplifiedEffectiveFinish, simplifiedUsesWorkspace } from './simplified-flow-definition';
 import {
   activeFlowStatuses,
   branchMatch,
@@ -1502,9 +1503,13 @@ export class GraphRunnerService implements OnModuleInit {
     const release = plan.release;
     const inputs: GraphInputsDto = { value: plan.value, parameters: plan.environment.variables };
     const selection = flowSelection(flow, inputs);
-    const workspaceDisposition = selection.ordered.some(
-      ({ id, type }) => workspaceActions.has(type) && selection.selected.has(id),
-    )
+    const selectedNodes = selection.ordered.filter(({ id }) => selection.selected.has(id));
+    plan.finish = simplifiedEffectiveFinish(
+      selectedNodes,
+      plan.finish,
+      Boolean(release?.artifactId || plan.trigger?.upstreamArtifactPending),
+    );
+    const workspaceDisposition = simplifiedUsesWorkspace(selectedNodes)
       ? workspaceRetention(
           plan.finish,
           release?.method === 'FILE' &&
