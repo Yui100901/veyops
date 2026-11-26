@@ -112,6 +112,10 @@ export function ExecutionGraphTriggerEditor({
 
   async function act(action: 'check' | 'save' | 'enable') {
     if (busy || !valid) return;
+    if (start?.requiresHistoryDirectory && (action !== 'save' || rule?.enabled)) {
+      setError('此入口需要在运行时手动选择历史目录。配置源码后可启用自动触发。');
+      return;
+    }
     setBusy(true);
     setError('');
     setResult(undefined);
@@ -176,6 +180,9 @@ export function ExecutionGraphTriggerEditor({
   return (
     <form className="graph-properties graph-trigger-editor" onSubmit={submit}>
       <h4>{rule ? '编辑触发规则' : '添加触发规则'}</h4>
+      {start?.requiresHistoryDirectory && (
+        <p className="field-note">此入口需要在运行时手动选择历史目录。配置源码后可启用自动触发。</p>
+      )}
       <ErrorBanner error={error || (signed ? credentials.error : '')} />
       <fieldset disabled={busy}>
         <div className="form-grid">

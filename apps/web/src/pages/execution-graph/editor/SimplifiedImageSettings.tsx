@@ -31,7 +31,7 @@ export function SimplifiedImageSettings({
   for (const start of flowNodes.filter(({ type }) => type === 'START')) {
     for (const source of start.start?.sources ?? []) {
       const repo = project.repositories.find(({ id }) => id === source.repositoryId);
-      const path = repo && simplifiedSourceDirectory(repo.cloneUrl, source.parentDirectory);
+      const path = repo && simplifiedSourceDirectory(repo.cloneUrl);
       const name = path?.split('/').at(-1)?.toLowerCase();
       if (name && repo)
         suggestions.set(repo.id + ':' + path, { name, label: `${repo.name} · ./${path}` });

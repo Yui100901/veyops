@@ -217,6 +217,7 @@ function Workspace({
   const [graph, setGraph] = useState(initial);
   const [canvas, setCanvasState] = useState(() => draftCanvas(initial.draft.canvas));
   const latestCanvas = useRef(canvas);
+  const editRevision = useRef(0);
   const [undo, setUndo] = useState<GraphCanvas[]>([]);
   const [redo, setRedo] = useState<GraphCanvas[]>([]);
   const [error, setError] = useState('');
@@ -233,15 +234,31 @@ function Workspace({
   }>();
   const [issues, setIssues] = useState<GraphIssue[]>([]);
   const [conflict, setConflict] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [pendingAction, setPendingAction] = useState<
+    'save' | 'publish' | 'reload' | 'validate' | 'reset'
+  >();
+  const busy = pendingAction !== undefined;
   const [leaving, setLeaving] = useState<RouteTransition | null>(null);
   const [templateOpen, setTemplateOpen] = useState(false);
   const [resettingDraft, setResettingDraft] = useState(false);
+  const [reloadingDraft, setReloadingDraft] = useState(false);
   const [insertedStart, setInsertedStart] = useState<string>();
   const saving = useRef(false);
   const simplifiedDraft = canvas.model === simplifiedModel;
   const canEditDraft = canEdit && simplifiedDraft;
   const dirty = canvas !== draftCanvas(graph.draft.canvas);
+  const requiresSave = dirty || graph.draftReviewRequired;
+  const failedCheck = issues.some(({ severity }) => severity !== 'WARNING' && severity !== 'INFO');
+  const draftStatus =
+    pendingAction === 'save' ||
+    pendingAction === 'reset' ||
+    (pendingAction === 'publish' && requiresSave)
+      ? '正在保存…'
+      : pendingAction === 'validate' || pendingAction === 'publish'
+        ? '正在核对发布…'
+        : [requiresSave ? '有未保存的更改' : '草稿已保存', failedCheck && '发布检查未通过']
+            .filter(Boolean)
+            .join(' · ');
   useRouteBlocker(canEditDraft && dirty, setLeaving);
   const latest = useResource<PublishedGraph>(
     graph.publishedVersion ? path + '/versions/' + graph.publishedVersion : null,
@@ -296,7 +313,9 @@ function Workspace({
     )
       return;
     saving.current = true;
-    setBusy(true);
+    setPendingAction(action);
+    const submittedRevision = editRevision.current;
+    const submittedCanvas = latestCanvas.current;
     setError('');
     setNotice('');
     try {
@@ -304,7 +323,7 @@ function Workspace({
       if (
         action === 'save' ||
         action === 'reset' ||
-        (action === 'publish' && !confirmed && dirty)
+        (action === 'publish' && !confirmed && requiresSave)
       ) {
         draft = await api(path + '/draft', {
           method: 'PUT',
@@ -312,15 +331,19 @@ function Workspace({
             expectedRevision: graph.revision,
             definition: {
               flows: [],
-              canvas: action === 'reset' ? emptyCanvas : latestCanvas.current,
+              canvas: action === 'reset' ? emptyCanvas : submittedCanvas,
             },
           }),
         });
         setGraph(draft);
+        setConflict(false);
+        if (submittedRevision !== editRevision.current) {
+          setNotice('本次提交的草稿已保存，较新的修改待保存。');
+          return;
+        }
         setCanvas(draftCanvas(draft.draft.canvas));
         setPublication(undefined);
         setIssues([]);
-        setConflict(false);
         if (action === 'reset') {
           setUndo([]);
           setRedo([]);
@@ -336,9 +359,10 @@ function Workspace({
         const result = await post<{ issues: GraphIssue[] }>(path + '/validate', {
           definition: {
             flows: [],
-            canvas: action === 'validate' ? latestCanvas.current : draftCanvas(draft.draft.canvas),
+            canvas: action === 'validate' ? submittedCanvas : draftCanvas(draft.draft.canvas),
           },
         });
+        if (submittedRevision !== editRevision.current) return;
         setIssues(result.issues);
         if (result.issues.some(({ severity }) => severity !== 'WARNING' && severity !== 'INFO'))
           return;
@@ -346,23 +370,30 @@ function Workspace({
           setNotice('发布检查通过');
           return;
         }
-        setPublication(
-          await post(path + '/publication-impact', { expectedRevision: draft.revision }),
-        );
+        const impact = await post<NonNullable<typeof publication>>(path + '/publication-impact', {
+          expectedRevision: draft.revision,
+        });
+        if (submittedRevision === editRevision.current) setPublication(impact);
         return;
       }
       let saved: GraphDocument;
       if (action === 'publish') {
-        if (dirty || publication?.revision !== graph.revision) return;
+        if (
+          requiresSave ||
+          submittedCanvas !== draftCanvas(graph.draft.canvas) ||
+          publication?.revision !== graph.revision
+        )
+          return;
         saved = await post(path + '/publish', { expectedRevision: publication.revision });
       } else saved = await api(path);
       setGraph(saved);
       setPublication(undefined);
-      setCanvas(draftCanvas(saved.draft.canvas));
+      if (submittedRevision === editRevision.current) setCanvas(draftCanvas(saved.draft.canvas));
       setIssues([]);
       if (action === 'reload') {
         setUndo([]);
         setRedo([]);
+        setReloadingDraft(false);
       }
       setConflict(false);
       setNotice(action === 'publish' ? '已发布 v' + saved.publishedVersion : '已载入服务器草稿');
@@ -373,17 +404,18 @@ function Workspace({
       if (
         err instanceof ApiError &&
         err.planIssue &&
-        (action === 'publish' || action === 'validate')
+        (action === 'publish' || action === 'validate') &&
+        submittedRevision === editRevision.current
       )
         setIssues([{ ...err.planIssue, severity: 'ERROR' }]);
     } finally {
       saving.current = false;
-      setBusy(false);
+      setPendingAction(undefined);
     }
   }
 
   async function prepareTriggerDraft() {
-    if (!dirty) return graph.revision;
+    if (!requiresSave) return graph.revision;
     const saved = await persist('save');
     if (!saved) throw new Error('请先解决画布草稿的保存问题。');
     return saved.revision;
@@ -426,9 +458,12 @@ function Workspace({
     setLeaving(null);
   }
 
-  function edit(next: GraphCanvas) {
+  function edit(update: GraphCanvas | ((latest: GraphCanvas) => GraphCanvas)) {
+    if (!canEditDraft) return;
     const previous = latestCanvas.current;
-    if (!canEditDraft || next === previous || saving.current) return;
+    const next = typeof update === 'function' ? update(previous) : update;
+    if (next === previous) return;
+    editRevision.current += 1;
     setUndo((history) => [...history.slice(-49), previous]);
     setRedo([]);
     setCanvas(next);
@@ -448,6 +483,7 @@ function Workspace({
     const history = direction === 'undo' ? undo : redo;
     const next = history.at(-1);
     if (!next || saving.current) return;
+    editRevision.current += 1;
     setCanvas(next);
     setPublication(undefined);
     setIssues([]);
@@ -560,16 +596,35 @@ function Workspace({
       </div>
       <ErrorBanner error={error} />
       {conflict && (
-        <button className="button secondary" disabled={busy} onClick={() => void persist('reload')}>
-          放弃本地更改，载入服务器草稿
-        </button>
+        <div className="heading-actions">
+          <p className="field-note">服务器草稿版本已变化。本地输入已保留，请核对当前入口配置。</p>
+          <button
+            type="button"
+            className="button secondary"
+            disabled={busy}
+            onClick={() => setReloadingDraft(true)}
+          >
+            刷新服务器草稿
+          </button>
+        </div>
+      )}
+      {reloadingDraft && (
+        <Confirm
+          title="刷新服务器草稿"
+          description="将载入服务器最新草稿。请先记录要保留的本地输入，再对照当前入口重新填写。"
+          label="载入最新草稿"
+          busy={busy}
+          error={error}
+          onClose={() => !saving.current && setReloadingDraft(false)}
+          onConfirm={() => void persist('reload')}
+        />
       )}
       {notice && (
         <p className="graph-notice" role="status">
           {notice}
         </p>
       )}
-      {pane === 'draft' && !dirty && publication?.revision === graph.revision && (
+      {pane === 'draft' && !requiresSave && publication?.revision === graph.revision && (
         <Section
           title={`确认发布 v${publication.version}`}
           subtitle="发布后，新的运行和兼容的触发规则将使用此版本。"
@@ -670,7 +725,7 @@ function Workspace({
         <Section
           className="graph-pane-panel"
           title="草稿画布"
-          subtitle={`修订 ${graph.revision} · ${dirty ? '有未保存的更改' : '已保存'} · ${graph.publishedVersion ? '最新发布 v' + graph.publishedVersion : '尚未发布'}`}
+          subtitle={`草稿修订 ${graph.revision} · ${draftStatus} · ${graph.publishedVersion ? '当前运行版本 v' + graph.publishedVersion : '尚未发布'}`}
           action={
             canEditDraft && (
               <div className="heading-actions">
@@ -701,10 +756,10 @@ function Workspace({
                 <button
                   type="button"
                   className="button secondary"
-                  disabled={!dirty || busy || conflict}
+                  disabled={!requiresSave || busy || conflict}
                   onClick={() => void persist('save')}
                 >
-                  <Save size={16} /> 保存草稿
+                  <Save size={16} /> {pendingAction === 'save' ? '正在保存…' : '保存草稿'}
                 </button>
                 <button
                   type="button"
@@ -726,6 +781,22 @@ function Workspace({
             )
           }
         >
+          {busy && (
+            <p className="field-note" role="status">
+              {draftStatus}，暂时锁定画布编辑。
+            </p>
+          )}
+          {graph.draftReviewRequired && (
+            <p className="graph-notice" role="status">
+              旧草稿使用了已移除的配置。请核对各入口的发布目标、工作目录、Compose
+              路径和启动命令，再保存草稿。
+            </p>
+          )}
+          {!canEdit && simplifiedDraft && (
+            <p className="field-note">
+              {project.archived ? '项目已归档，草稿供查阅。' : '当前角色拥有草稿查阅权限。'}
+            </p>
+          )}
           {!simplifiedDraft && (
             <div className="graph-fields">
               <p className="field-note">这是历史草稿。可查阅画布，后续编排使用简化执行图。</p>
@@ -773,14 +844,14 @@ function Workspace({
             </div>
           )}
           <ProjectGraphEditor
-            key={`${linkedNode ?? ''}:${linkedFlow ?? ''}:${linkedField ?? ''}:${linkedFieldLocation.fieldSection ?? ''}:${linkedFieldLocation.artifactField ?? ''}`}
+            key={`${linkedNode ?? ''}:${linkedFlow ?? linkedStart ?? ''}:${linkedField ?? ''}:${linkedFieldLocation.fieldSection ?? ''}:${linkedFieldLocation.artifactField ?? ''}`}
             project={project}
             canvas={canvas}
             canEdit={canEditDraft && !busy}
             onChange={edit}
             issues={issues}
             initialNodeId={linkedNode}
-            initialFlowId={linkedFlow}
+            initialFlowId={linkedFlow ?? linkedStart}
             initialFieldId={linkedField}
             initialFieldLocation={linkedFieldLocation}
             insertedStartId={insertedStart}
@@ -798,25 +869,27 @@ function Workspace({
             renderStart={(startId) =>
               simplifiedDraft &&
               !project.archived && (
-                <ExecutionGraphTriggers
-                  key={startId}
-                  startId={startId}
-                  path={path}
-                  project={project}
-                  latestVersion={
-                    latest.data?.version === graph.publishedVersion &&
-                    latest.data.definition.flows.some(({ id }) => id === startId)
-                      ? graph.publishedVersion
-                      : null
-                  }
-                  flows={triggerFlows({ flows: [], canvas })}
-                  canInvoke={canEditDraft}
-                  canManage={canEditDraft && isAdmin}
-                  onPrepareDraft={prepareTriggerDraft}
-                  issueHref={triggerIssueHref}
-                  manualHref={'#' + graphWorkbenchPath(project.id, { ...scope, start: startId })}
-                  onRun={openRun}
-                />
+                <fieldset className="graph-trigger-editor-lock" disabled={busy}>
+                  <ExecutionGraphTriggers
+                    key={startId}
+                    startId={startId}
+                    path={path}
+                    project={project}
+                    latestVersion={
+                      latest.data?.version === graph.publishedVersion &&
+                      latest.data.definition.flows.some(({ id }) => id === startId)
+                        ? graph.publishedVersion
+                        : null
+                    }
+                    flows={triggerFlows({ flows: [], canvas })}
+                    canInvoke={canEditDraft}
+                    canManage={canEditDraft && isAdmin}
+                    onPrepareDraft={prepareTriggerDraft}
+                    issueHref={triggerIssueHref}
+                    manualHref={'#' + graphWorkbenchPath(project.id, { ...scope, start: startId })}
+                    onRun={openRun}
+                  />
+                </fieldset>
               )
             }
           />
@@ -829,7 +902,7 @@ function Workspace({
           canRestore={canEdit}
           latestVersion={graph.publishedVersion}
           linkedNode={linkedNode}
-          linkedFlow={linkedFlow}
+          linkedFlow={linkedFlow ?? linkedStart}
           project={project}
           scope={scope}
           revision={graph.revision}
@@ -1181,6 +1254,26 @@ function PublishedVersions({
             </Field>
             {live && (
               <>
+                <div className="heading-actions">
+                  <p className="field-note">
+                    发布版本 v{live.version} 供查阅。入口配置在草稿中编辑。
+                  </p>
+                  {canRestore && (
+                    <a
+                      className="button secondary small"
+                      href={
+                        '#' +
+                        graphWorkbenchPath(project.id, {
+                          ...scope,
+                          pane: 'draft',
+                          flow: linkedFlow,
+                        })
+                      }
+                    >
+                      去编辑草稿
+                    </a>
+                  )}
+                </div>
                 <GraphVersionTools
                   key={live.version}
                   path={path}
@@ -1516,7 +1609,7 @@ function PublishedNodes({
                     canEdit={false}
                     patch={() => {}}
                     flowNodes={inspectedFlow?.nodes ?? []}
-                    shared={flowsWithNode.length > 1}
+                    sharedFlows={flowsWithNode.map(({ name }) => name)}
                   />
                 ) : simplified &&
                   simplifiedActions.some(

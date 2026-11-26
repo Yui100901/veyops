@@ -115,6 +115,8 @@ export function SimplifiedStartSettings({
   const releaseAction = flowNodes.find(isReleaseNode);
   const rollback = releaseAction && effectiveNodeType(releaseAction) === 'ROLLBACK_ARTIFACT';
   const producesFiles = flowNodes.some(producesWorkspace);
+  const hasCheckout = flowNodes.some((item) => effectiveNodeType(item) === 'CHECKOUT');
+  const hasWorkspace = producesFiles || !releaseAction;
   const [sourceChoice, setSourceChoice] = useState<'FIXED'>();
   const artifactMode =
     rollback || release.artifactId
@@ -136,7 +138,9 @@ export function SimplifiedStartSettings({
   const images = flowNodes.find(({ type }) => type === 'END')?.finish?.images ?? [];
   const historical = artifactMode !== 'CURRENT';
   const runtime = useResource<ProjectExecutionSettings>(
-    execution.location === 'INHERIT' ? '/projects/' + project.id + '/execution-settings' : null,
+    hasWorkspace && execution.location !== 'MANAGER'
+      ? '/projects/' + project.id + '/execution-settings'
+      : null,
   );
   const effectiveLocation =
     execution.location === 'INHERIT'
@@ -177,6 +181,7 @@ export function SimplifiedStartSettings({
           value={value}
           change={(next) => change(kind === 'SERVICE' ? referenceId(next) || undefined : next)}
           disabled={!canEdit}
+          compactTargets
         />
       </div>
     );
@@ -185,139 +190,168 @@ export function SimplifiedStartSettings({
     ...(execution.serverId && { serverIds: [execution.serverId] }),
     ...(execution.groupId && { groupIds: [execution.groupId] }),
   };
+  const selectedTargets =
+    !canEdit && 'reuseExecutionServer' in release && release.reuseExecutionServer
+      ? locationTarget
+      : release.targets;
+  const targetControl = () =>
+    control('start.release.targets', '发布服务器／分组', 'TARGETS', selectedTargets, (value) =>
+      changeRelease({ targets: value as DeploymentSelection | undefined }),
+    );
+  const projectWorkspace =
+    effectiveLocation === 'TARGET'
+      ? (runtime.data?.effective.targetWorkspaceRoot ?? '~/.veyops/workspace').replace(/\/+$/, '') +
+        '/' +
+        project.slug
+      : effectiveLocation === 'MANAGER'
+        ? 'flow-workspaces/' + project.slug
+        : undefined;
   return (
     <>
-      <fieldset className="graph-fields" data-graph-node-field="start.sources">
-        <legend>源码</legend>
-        {sources.map((source, index) => {
-          const sourcePath = 'start.sources.' + source.id + '.';
-          const repo = project.repositories.find(({ id }) => source.repositoryId === id);
-          const directory =
-            repo && simplifiedSourceDirectory(repo.cloneUrl, source.parentDirectory);
-          return (
-            <div className="graph-field-card graph-fields" key={source.id}>
-              <div className="form-grid">
-                {control(
-                  sourcePath + 'repositoryId',
-                  '项目仓库',
-                  'REPOSITORY',
-                  source.repositoryId,
-                  (value) =>
-                    sourceChange(source.id, {
-                      repositoryId: value as string | undefined,
-                      ref: undefined,
-                    }),
-                )}
-                <div data-graph-node-field={sourcePath + 'ref'}>
-                  <GraphFieldValue
-                    project={project}
-                    field={{ id: source.id, name: 'Git 版本', type: 'GIT_REF', required: false }}
-                    value={source.ref}
-                    change={(value) =>
-                      sourceChange(source.id, { ref: value as SimplifiedGitRef | undefined })
-                    }
-                    disabled={!canEdit}
-                    scope={{ repositoryId: source.repositoryId }}
-                  />
-                </div>
-                <SimplifiedText
-                  id={sourcePath + 'parentDirectory'}
-                  label="检出父目录"
-                  value={source.parentDirectory}
-                  placeholder="."
-                  hint={
-                    directory ? '源码目录 · ./' + directory : '留空使用工作区根目录作为父目录。'
-                  }
-                  canEdit={canEdit}
-                  change={(value) => sourceChange(source.id, { parentDirectory: value })}
-                />
-              </div>
-              <div className="heading-actions">
-                <Check
-                  id={sourcePath + 'allowRefOverride'}
-                  label="允许运行时更换 Git 版本"
-                  value={source.allowRefOverride}
-                  canEdit={canEdit}
-                  change={(value) => sourceChange(source.id, { allowRefOverride: value })}
-                />
-                {canEdit && (
-                  <button
-                    type="button"
-                    className="button secondary small"
-                    aria-label={'移除源码 ' + (repo?.name ?? index + 1)}
-                    onClick={() => updateSources(sources.filter(({ id }) => id !== source.id))}
-                  >
-                    <Trash2 size={14} /> 移除源码
-                  </button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-        {canEdit && sources.length < 12 && (
-          <div className="heading-actions">
-            <button
-              type="button"
-              className="button secondary small"
-              onClick={() => updateSources([...sources, { id: graphKey('source') }])}
+      {hasWorkspace ? (
+        <div className="graph-fields" data-graph-node-field="start.execution">
+          <div className="graph-location-grid">
+            <Field
+              label="执行位置"
+              hint={
+                execution.location === 'INHERIT' && effectiveLocation
+                  ? '当前生效 · ' + (effectiveLocation === 'TARGET' ? '目标端' : '管理端')
+                  : undefined
+              }
             >
-              <Plus size={14} /> 添加源码
-            </button>
-          </div>
-        )}
-      </fieldset>
-      <fieldset className="graph-fields" data-graph-node-field="start.execution">
-        <legend>执行位置</legend>
-        <Field
-          label="执行位置"
-          hint={
-            execution.location === 'INHERIT' && effectiveLocation
-              ? '项目生效位置 · ' + (effectiveLocation === 'TARGET' ? '目标端' : '管理端')
-              : undefined
-          }
-        >
-          <select
-            data-graph-node-field="start.execution.location"
-            value={execution.location}
-            disabled={!canEdit}
-            onChange={(event) => {
-              const location = event.target.value as typeof execution.location;
-              patchStart({
-                execution: location === 'MANAGER' ? { location } : { ...execution, location },
-                ...(location === 'MANAGER' &&
-                  release.reuseExecutionServer && {
-                    release: { ...release, reuseExecutionServer: false },
-                  }),
-              });
-            }}
-          >
-            <option value="INHERIT">沿用平台设置</option>
-            <option value="MANAGER">管理端</option>
-            <option value="TARGET">目标端</option>
-          </select>
-        </Field>
-        {execution.location !== 'MANAGER' && (
-          <div data-graph-node-field="start.execution.serverId">
-            {control(
-              'start.execution.groupId',
-              '执行服务器或分组',
-              'TARGETS',
-              locationTarget,
-              (value) => {
-                const selected = value as DeploymentSelection | undefined;
-                patchStart({
-                  execution: {
-                    location: execution.location,
-                    serverId: selected?.serverIds?.[0],
-                    groupId: selected?.groupIds?.[0],
+              <select
+                data-graph-node-field="start.execution.location"
+                value={execution.location}
+                disabled={!canEdit}
+                onChange={(event) => {
+                  const location = event.target.value as typeof execution.location;
+                  patchStart({
+                    execution: location === 'MANAGER' ? { location } : { ...execution, location },
+                  });
+                }}
+              >
+                <option value="INHERIT">沿用项目设置</option>
+                <option value="MANAGER">管理端</option>
+                <option value="TARGET">目标端</option>
+              </select>
+            </Field>
+            {effectiveLocation === 'TARGET' && (
+              <div data-graph-node-field="start.execution.serverId">
+                {control(
+                  'start.execution.groupId',
+                  '执行服务器／分组',
+                  'TARGETS',
+                  locationTarget,
+                  (value) => {
+                    const selected = value as DeploymentSelection | undefined;
+                    patchStart({
+                      execution: {
+                        location: execution.location,
+                        serverId: selected?.serverIds?.[0],
+                        groupId: selected?.groupIds?.[0],
+                      },
+                    });
                   },
-                });
-              },
-              { purpose: 'BUILD_TARGETS', required: effectiveLocation === 'TARGET' },
+                  { purpose: 'BUILD_TARGETS', required: true },
+                )}
+              </div>
             )}
           </div>
-        )}
-      </fieldset>
+          {projectWorkspace && (
+            <p className="field-note graph-workspace-path">
+              工作区 · <code>{projectWorkspace}/&lt;执行 ID&gt;</code>
+            </p>
+          )}
+        </div>
+      ) : (
+        targetControl()
+      )}
+      {(hasCheckout || sources.length > 0) && (
+        <fieldset className="graph-fields" data-graph-node-field="start.sources">
+          <legend>源码</legend>
+          {hasCheckout && !sources.length && !releaseAction && (
+            <p className="field-note">未配置源码时，手动运行需选择同项目的历史目录。</p>
+          )}
+          {sources.map((source, index) => {
+            const sourcePath = 'start.sources.' + source.id + '.';
+            const repo = project.repositories.find(({ id }) => source.repositoryId === id);
+            const legacy = !canEdit
+              ? (source as SimplifiedSource & {
+                  parentDirectory?: string;
+                  allowRefOverride?: boolean;
+                })
+              : undefined;
+            const directory = repo && simplifiedSourceDirectory(repo.cloneUrl);
+            return (
+              <div className="graph-field-card graph-fields" key={source.id}>
+                <div className="form-grid">
+                  {control(
+                    sourcePath + 'repositoryId',
+                    '项目仓库',
+                    'REPOSITORY',
+                    source.repositoryId,
+                    (value) =>
+                      sourceChange(source.id, {
+                        repositoryId: value as string | undefined,
+                        ref: undefined,
+                      }),
+                  )}
+                  <div data-graph-node-field={sourcePath + 'ref'}>
+                    <GraphFieldValue
+                      project={project}
+                      field={{ id: source.id, name: 'Git 版本', type: 'GIT_REF', required: false }}
+                      value={source.ref}
+                      change={(value) =>
+                        sourceChange(source.id, { ref: value as SimplifiedGitRef | undefined })
+                      }
+                      disabled={!canEdit}
+                      scope={{ repositoryId: source.repositoryId }}
+                    />
+                  </div>
+                </div>
+                <div className="heading-actions">
+                  {directory && (
+                    <span className="field-note graph-workspace-path">
+                      源码目录 ·{' '}
+                      <code>
+                        ./
+                        {legacy?.parentDirectory && legacy.parentDirectory !== '.'
+                          ? `${legacy.parentDirectory}/`
+                          : ''}
+                        {directory}
+                      </code>
+                    </span>
+                  )}
+                  {legacy?.allowRefOverride && (
+                    <span className="field-note">此发布版本允许运行时更换 Git 版本。</span>
+                  )}
+                  {canEdit && (
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      aria-label={'移除源码 ' + (repo?.name ?? index + 1)}
+                      onClick={() => updateSources(sources.filter(({ id }) => id !== source.id))}
+                    >
+                      <Trash2 size={14} /> 移除源码
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {canEdit && hasCheckout && sources.length < 12 && (
+            <div className="heading-actions">
+              <button
+                type="button"
+                className="button secondary small"
+                onClick={() => updateSources([...sources, { id: graphKey('source') }])}
+              >
+                <Plus size={14} /> 添加源码
+              </button>
+            </div>
+          )}
+        </fieldset>
+      )}
       {staleRelease && (
         <div className="graph-field-card" data-graph-node-field="start.release">
           <p className="field-note">
@@ -350,35 +384,18 @@ export function SimplifiedStartSettings({
       {releaseAction && (
         <fieldset className="graph-fields" data-graph-node-field="start.release">
           <legend>发布设置</legend>
-          <div className="form-grid">
-            {control('start.release.serviceId', '项目服务', 'SERVICE', release.serviceId, (value) =>
-              changeRelease({ serviceId: value as string | undefined, artifactId: undefined }),
+          {control('start.release.serviceId', '项目服务', 'SERVICE', release.serviceId, (value) =>
+            changeRelease({ serviceId: value as string | undefined, artifactId: undefined }),
+          )}
+          {hasWorkspace && targetControl()}
+          {!canEdit &&
+            'contentPath' in release &&
+            typeof release.contentPath === 'string' &&
+            release.contentPath !== '.' && (
+              <p className="field-note graph-workspace-path">
+                此发布版本使用子路径 · <code>{release.contentPath}</code>
+              </p>
             )}
-            {!composeRelease && (
-              <div className="graph-fields">
-                <SimplifiedText
-                  id="start.release.contentPath"
-                  label="发布内容子路径（可选）"
-                  placeholder="example/dist/"
-                  value={release.contentPath}
-                  canEdit={canEdit}
-                  change={(contentPath) => changeRelease({ contentPath })}
-                  hint="相对交付产物根目录。留空发布整个目录。"
-                />
-                {canEdit && release.contentPath && release.contentPath !== '.' && (
-                  <div className="heading-actions">
-                    <button
-                      type="button"
-                      className="button secondary small"
-                      onClick={() => changeRelease({ contentPath: '.' })}
-                    >
-                      发布整个快照
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
           {composeRelease && (
             <div className="form-grid" data-graph-node-field="start.release.compose">
               {!historical && (
@@ -455,23 +472,6 @@ export function SimplifiedStartSettings({
               )}
             </div>
           )}
-          {execution.location !== 'MANAGER' && (
-            <Check
-              id="start.release.reuseExecutionServer"
-              label="复用执行服务器作为发布目标"
-              value={release.reuseExecutionServer}
-              canEdit={canEdit}
-              change={(reuseExecutionServer) => changeRelease({ reuseExecutionServer })}
-            />
-          )}
-          {!release.reuseExecutionServer &&
-            control(
-              'start.release.targets',
-              '发布服务器和分组',
-              'TARGETS',
-              release.targets,
-              (value) => changeRelease({ targets: value as DeploymentSelection | undefined }),
-            )}
           <details className="graph-field-card" open={historical ? true : undefined}>
             <summary>交付产物来源</summary>
             <div className="graph-fields" data-graph-node-field="start.release.artifactId">
@@ -546,7 +546,7 @@ export function SimplifiedStartSettings({
                   scope={{
                     serviceId: release.serviceId,
                     deliveryMethod: releaseAction?.deploy?.method,
-                    targets: release.reuseExecutionServer ? locationTarget : release.targets,
+                    targets: selectedTargets,
                   }}
                 />
               )}
@@ -721,17 +721,16 @@ export function SimplifiedEndSettings({
   patch,
   flowNodes,
   hasReleaseOnAllFlows = flowNodes.some(isReleaseNode),
-  shared = false,
-}: NodeSettings & { flowNodes: GraphNode[]; hasReleaseOnAllFlows?: boolean; shared?: boolean }) {
+  sharedFlows = [],
+}: NodeSettings & {
+  flowNodes: GraphNode[];
+  hasReleaseOnAllFlows?: boolean;
+  sharedFlows?: string[];
+}) {
   const finish = node.finish ?? {};
   const saveWorkspace = finish.saveWorkspace !== false;
   const startRelease = flowNodes.find((item) => item.type === 'START')?.start?.release;
-  const historicalOnly = Boolean(
-    (startRelease?.artifactId ||
-      startRelease?.artifactSource === 'RUN_PARAMETER' ||
-      startRelease?.useUpstreamArtifact) &&
-    !flowNodes.some(producesWorkspace),
-  );
+  const hasWorkspace = flowNodes.some(producesWorkspace);
   const requiresFileSnapshot =
     !startRelease?.artifactId &&
     startRelease?.artifactSource !== 'RUN_PARAMETER' &&
@@ -743,9 +742,7 @@ export function SimplifiedEndSettings({
   return (
     <fieldset className="graph-fields" data-graph-node-field="finish">
       <legend>交付结果</legend>
-      {historicalOnly ? (
-        <p className="field-note">沿用本次选定的产物实例，结束时核对发布结果。</p>
-      ) : (
+      {hasWorkspace && (
         <>
           <Check
             label="保留整个执行目录"
@@ -785,10 +782,13 @@ export function SimplifiedEndSettings({
         </>
       )}
       {hasReleaseOnAllFlows ? (
-        <Field label="发布结果核对">
+        <Field
+          label="发布结果核对"
+          hint={sharedFlows.length > 1 ? sharedFlows.join('、') + '共用此设置。' : undefined}
+        >
           <select
             data-graph-node-field="finish.requireRelease"
-            disabled={!canEdit || (historicalOnly && shared)}
+            disabled={!canEdit}
             value={finish.requireRelease ?? ''}
             onChange={(event) =>
               change({
@@ -836,11 +836,11 @@ function WorkingDirectory({
   change: (value: string | undefined) => void;
 }) {
   const listId = useId();
-  const options = new Map<string, string>();
+  const options = new Set<string>();
   for (const source of sources) {
     const repo = project.repositories.find(({ id }) => id === source.repositoryId);
-    const directory = repo && simplifiedSourceDirectory(repo.cloneUrl, source.parentDirectory);
-    if (repo && directory) options.set(directory, repo.name);
+    const directory = repo && simplifiedSourceDirectory(repo.cloneUrl);
+    if (directory) options.add(directory);
   }
   const hint =
     value &&
@@ -869,8 +869,8 @@ function WorkingDirectory({
       />
       <datalist id={listId}>
         <option value="." label="工作区根" />
-        {[...options].map(([path, label]) => (
-          <option key={path} value={path} label={label} />
+        {[...options].map((path) => (
+          <option key={path} value={path} />
         ))}
       </datalist>
     </Field>
@@ -972,18 +972,7 @@ export function SimplifiedActionSettings({
       </div>
       {operation === 'CHECKOUT' && (
         <>
-          {!!sources.length && (
-            <ul className="graph-edge-list" aria-label="当前执行流的源码">
-              {sources.map(({ id, repositoryId, ref }) => (
-                <li key={id}>
-                  {project.repositories.find((repo) => repo.id === repositoryId)?.name ??
-                    '未选择仓库'}
-                  {' · '}
-                  {ref?.value ?? '仓库默认分支'}
-                </li>
-              ))}
-            </ul>
-          )}
+          <p className="field-note">按开始节点配置拉取。</p>
           <Check
             id="checkout.fullClone"
             label="拉取完整 Git 历史"
@@ -1072,6 +1061,7 @@ export function SimplifiedActionSettings({
       )}
       {(operation === 'DEPLOY_ARTIFACT' || operation === 'ROLLBACK_ARTIFACT') && (
         <>
+          <p className="field-note">服务、目标和产物来源在开始节点配置。</p>
           <Field label="发布方式">
             <select
               data-graph-node-field="deploy.method"

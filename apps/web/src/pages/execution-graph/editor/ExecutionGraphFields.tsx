@@ -11,6 +11,7 @@ import type {
 } from '../../../models';
 import {
   DeploymentSelectionPicker,
+  selectedDeploymentServers,
   useDeploymentInventory,
 } from '../../delivery/DeploymentSelection';
 import {
@@ -65,6 +66,7 @@ interface ValueProps {
   repositoryAddress?: boolean;
   artifactInstancesOnly?: boolean;
   credentialTypes?: readonly string[];
+  compactTargets?: boolean;
 }
 
 function stringValue(value: unknown) {
@@ -455,11 +457,24 @@ function ArtifactValue({
   );
 }
 
-function TargetsValue({ project, field, value, change, disabled, checkRequired }: ValueProps) {
+function TargetsValue({
+  project,
+  field,
+  value,
+  change,
+  disabled,
+  checkRequired,
+  compactTargets,
+}: ValueProps) {
   const single = field.purpose === 'BUILD_TARGETS';
   const inventory = useDeploymentInventory();
+  const selection = (value ?? {}) as DeploymentSelection;
+  const serverNames = new Map((inventory.servers.data ?? []).map(({ id, name }) => [id, name]));
+  const groupNames = new Map((inventory.groups.data ?? []).map(({ id, name }) => [id, name]));
+  const memberNames = selectedDeploymentServers(selection, inventory.groups.data ?? []).map(
+    (id) => serverNames.get(id) ?? id,
+  );
   if (single) {
-    const selection = value as DeploymentSelection | undefined;
     const { servers, groups } = inventory;
     const groupPrefix = 'group:';
     const selected =
@@ -474,10 +489,12 @@ function TargetsValue({ project, field, value, change, disabled, checkRequired }
           label={field.name}
           options={[
             ...(servers.data ?? []),
-            ...(groups.data ?? []).map(({ id, name }) => ({
-              id: groupPrefix + id,
-              name: '分组 · ' + name,
-            })),
+            ...(groups.data ?? [])
+              .filter(({ serverIds }) => !compactTargets || serverIds.length === 1)
+              .map(({ id, name }) => ({
+                id: groupPrefix + id,
+                name: '分组 · ' + name + (compactTargets ? '（1 台）' : ''),
+              })),
           ]}
           value={selected}
           change={(id) =>
@@ -491,8 +508,14 @@ function TargetsValue({ project, field, value, change, disabled, checkRequired }
           }
           disabled={disabled || servers.loading || groups.loading}
           required={checkRequired && field.required}
-          empty="选择服务器或分组"
+          empty={compactTargets ? '选择服务器或单机分组' : '选择服务器或分组'}
         />
+        {compactTargets && selected?.startsWith(groupPrefix) && memberNames.length > 0 && (
+          <details className="graph-target-members">
+            <summary>查看分组成员 · {memberNames.length} 台</summary>
+            <p className="field-note">{memberNames.join('、')}</p>
+          </details>
+        )}
         {!selected && Boolean(selection?.serverIds?.length || selection?.groupIds?.length) && (
           <p className="field-note">原有构建目标包含多项。可改选一台服务器或一个分组。</p>
         )}
@@ -501,13 +524,38 @@ function TargetsValue({ project, field, value, change, disabled, checkRequired }
       </>
     );
   }
+  if (compactTargets) {
+    const selectedNames = [
+      ...(selection.serverIds ?? []).map((id) => serverNames.get(id) ?? id),
+      ...(selection.groupIds ?? []).map((id) => groupNames.get(id) ?? id),
+    ];
+    return (
+      <details className="graph-field-card graph-target-members">
+        <summary>
+          <strong>{field.name}</strong>
+          <span className="field-note">
+            {selectedNames.length
+              ? `${selectedNames.join('、')} · ${memberNames.length} 台`
+              : '选择目标'}
+          </span>
+        </summary>
+        <DeploymentSelectionPicker
+          projectId={project.id}
+          inventory={inventory}
+          value={selection}
+          onChange={change}
+          disabled={disabled}
+        />
+      </details>
+    );
+  }
   return (
     <>
       <strong>{field.name}</strong>
       <DeploymentSelectionPicker
         projectId={project.id}
         inventory={inventory}
-        value={(value ?? {}) as DeploymentSelection}
+        value={selection}
         onChange={change}
         disabled={disabled}
       />

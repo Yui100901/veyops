@@ -356,6 +356,7 @@ export function graphCanvasNodeModel(
 export interface GraphDocument {
   revision: number;
   publishedVersion: number | null;
+  draftReviewRequired?: boolean;
   draft: { flows: GraphFlow[]; canvas?: GraphCanvas };
 }
 export interface GraphRun {

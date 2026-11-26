@@ -2,7 +2,11 @@ import type { GraphIssueLocation } from '../../../api';
 import type { DeploymentSelection } from '../../../models';
 import { graphCanvasNodeModel, isReleaseNode, type GraphNode } from '../execution-graph-definition';
 import type { GraphDocument, GraphField } from '../execution-graph-definition';
-import { simplifiedModel, simplifiedReleaseKinds } from '../simplified-flow';
+import {
+  simplifiedModel,
+  simplifiedReleaseKinds,
+  simplifiedWorkspaceInput,
+} from '../simplified-flow';
 import type { SimplifiedSource } from '../simplified-flow';
 import { pathHighlight } from './execution-graph-draft-impact';
 
@@ -119,6 +123,7 @@ export interface TriggerFlow {
   outputs: GraphField[];
   sources?: SimplifiedSource[];
   useUpstreamArtifact?: boolean;
+  requiresHistoryDirectory?: boolean;
   requiredArtifact?: {
     field: GraphField;
     serviceId?: string;
@@ -131,7 +136,6 @@ function requiredArtifact(start: GraphNode | undefined, path: GraphNode[]) {
   const release = start?.start?.release;
   if (release?.artifactSource !== 'RUN_PARAMETER') return;
   const deliveryMethod = path.find(isReleaseNode)?.deploy?.method;
-  const execution = start?.start?.execution;
   return {
     field: {
       id: 'artifactId',
@@ -141,12 +145,7 @@ function requiredArtifact(start: GraphNode | undefined, path: GraphNode[]) {
       acceptedArtifactTypes: simplifiedReleaseKinds(deliveryMethod),
     },
     serviceId: release.serviceId,
-    targets: release.reuseExecutionServer
-      ? {
-          serverIds: execution?.serverId ? [execution.serverId] : undefined,
-          groupIds: execution?.groupId ? [execution.groupId] : undefined,
-        }
-      : release.targets,
+    targets: release.targets,
     deliveryMethod,
   };
 }
@@ -169,6 +168,8 @@ export function triggerFlows(definition: GraphDocument['draft']): TriggerFlow[] 
           sources: start?.start?.sources ?? [],
           useUpstreamArtifact: start?.start?.release?.useUpstreamArtifact,
           requiredArtifact: requiredArtifact(start, nodes),
+          requiresHistoryDirectory: simplifiedWorkspaceInput({ id, name, model, nodes, edges: [] })
+            ?.required,
         }),
       };
     });
@@ -177,24 +178,26 @@ export function triggerFlows(definition: GraphDocument['draft']): TriggerFlow[] 
   return canvas.nodes.flatMap((start) => {
     if (start.type !== 'START') return [];
     const endId = ends.get(start.id);
+    const path = pathHighlight(canvas, start.id)?.nodes;
+    const flowNodes = path ? canvas.nodes.filter(({ id }) => path.has(id)) : [];
+    const model = graphCanvasNodeModel(canvas, start);
     return [
       {
         id: start.id,
         name: start.name,
         inputs: start.inputs ?? [],
         outputs: (endId ? nodes.get(endId)?.outputs : undefined) ?? [],
-        ...(graphCanvasNodeModel(canvas, start) === simplifiedModel && {
+        ...(model === simplifiedModel && {
           sources: start.start?.sources ?? [],
           useUpstreamArtifact: start.start?.release?.useUpstreamArtifact,
-          requiredArtifact: requiredArtifact(
-            start,
-            start.start?.release?.artifactSource === 'RUN_PARAMETER'
-              ? [...(pathHighlight(canvas, start.id)?.nodes ?? [])].flatMap((id) => {
-                  const item = nodes.get(id);
-                  return item ? [item] : [];
-                })
-              : [],
-          ),
+          requiredArtifact: requiredArtifact(start, flowNodes),
+          requiresHistoryDirectory: simplifiedWorkspaceInput({
+            id: start.id,
+            name: start.name,
+            model,
+            nodes: flowNodes,
+            edges: [],
+          })?.required,
         }),
       },
     ];

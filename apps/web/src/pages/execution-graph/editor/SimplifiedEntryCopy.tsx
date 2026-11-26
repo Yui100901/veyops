@@ -41,21 +41,14 @@ export function SimplifiedEntryCopy({
   const sharedBuild = mainNodes.find((node) => effectiveNodeType(node) === 'BUILD');
   if (!releaseAction || !sharedBuild) return null;
 
+  const included = (item: Change) => selected[item.id] ?? !item.overwrite;
   const release = start.release ?? {};
-  const buildTarget = start.execution?.serverId
-    ? { serverIds: [start.execution.serverId] }
-    : start.execution?.groupId
-      ? { groupIds: [start.execution.groupId] }
-      : undefined;
-  const targets = release.reuseExecutionServer ? buildTarget : release.targets;
+  const targets = release.targets;
   const compose = release.compose;
-  const composeSource = start.sources?.find(({ id }) => id === compose?.sourceId);
-  const composeRepo = project.repositories.find(({ id }) => id === composeSource?.repositoryId);
-  const composeDirectory =
-    composeRepo && simplifiedSourceDirectory(composeRepo.cloneUrl, composeSource?.parentDirectory);
-  const composePath =
-    compose?.path &&
-    (compose.sourceId ? composeDirectory && `${composeDirectory}/${compose.path}` : compose.path);
+  function sourceDirectory(repositoryId?: string) {
+    const repo = project.repositories.find(({ id }) => id === repositoryId);
+    return repo && simplifiedSourceDirectory(repo.cloneUrl);
+  }
   const destinations = canvas.endpoints.flatMap(({ startId, endId }) => {
     if (startId === source.id) return [];
     const entry = canvas.nodes.find(({ id }) => id === startId);
@@ -94,15 +87,9 @@ export function SimplifiedEntryCopy({
     if (builds && start.sources?.some(({ repositoryId }) => repositoryId))
       add(
         'sources',
-        '仓库、版本、检出父目录及变量文件',
+        '仓库、版本和变量文件',
         Boolean(draft.sources?.some(({ repositoryId }) => repositoryId)),
-        {
-          sources: start.sources.map((source) => ({
-            ...source,
-            allowRefOverride: draft.sources?.find(({ id }) => id === source.id)?.allowRefOverride,
-          })),
-          dotenv: start.dotenv,
-        },
+        { sources: start.sources, dotenv: start.dotenv },
       );
     if (builds && start.execution)
       add(
@@ -140,21 +127,33 @@ export function SimplifiedEntryCopy({
     if (deploys && (targets?.serverIds?.length || targets?.groupIds?.length))
       addRelease(
         'targets',
-        release.reuseExecutionServer ? '发布目标（来自执行服务器或分组）' : '发布服务器和分组',
+        '发布服务器和分组',
         Boolean(
-          draft.release?.targets?.serverIds?.length ||
-          draft.release?.targets?.groupIds?.length ||
-          draft.release?.reuseExecutionServer,
+          draft.release?.targets?.serverIds?.length || draft.release?.targets?.groupIds?.length,
         ),
-        { targets, reuseExecutionServer: undefined },
+        { targets },
       );
-    if (deploys && releaseAction.deploy?.method !== 'COMPOSE' && release.contentPath !== undefined)
-      addRelease(
-        'contentPath',
-        '发布内容子路径 · ' + release.contentPath,
-        Boolean(draft.release?.contentPath && draft.release.contentPath !== release.contentPath),
-        { contentPath: release.contentPath },
-      );
+    const sourceChange = changes.find(({ id }) => id === entry.id + ':sources');
+    const receivingSources = sourceChange && included(sourceChange) ? start.sources : draft.sources;
+    const workspaceComposePath = compose?.path.replace(/^\.\//, '');
+    const composeSource = compose?.sourceId
+      ? start.sources?.find(({ id }) => id === compose.sourceId)
+      : start.sources?.find(({ repositoryId }) => {
+          const directory = sourceDirectory(repositoryId);
+          return directory && workspaceComposePath?.startsWith(directory + '/');
+        });
+    const receivingSource = receivingSources?.find(
+      ({ repositoryId }) => repositoryId && repositoryId === composeSource?.repositoryId,
+    );
+    const receivingDirectory = sourceDirectory(receivingSource?.repositoryId);
+    const composePath =
+      !workspaceComposePath || (compose?.sourceId && !receivingDirectory)
+        ? undefined
+        : compose?.sourceId
+          ? `${receivingDirectory}/${workspaceComposePath}`
+          : !composeSource || receivingDirectory
+            ? workspaceComposePath
+            : undefined;
     const images = end?.finish?.images ?? [];
     const image =
       images.find(({ id }) => id === release.imageId) ??
@@ -177,7 +176,6 @@ export function SimplifiedEntryCopy({
     return changes.length ? [{ entry, end, changes }] : [];
   });
   if (!destinations.length) return null;
-  const included = (item: Change) => selected[item.id] ?? !item.overwrite;
   return (
     <details className="graph-field-card">
       <summary>复制配置到其他入口</summary>

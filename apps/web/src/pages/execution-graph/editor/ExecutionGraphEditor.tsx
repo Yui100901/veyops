@@ -91,6 +91,8 @@ function focusInspectorField(inspector: HTMLElement, focus: FieldFocus, bound: b
       `[data-graph-node-field="${CSS.escape(path.join('.'))}"]`,
     );
   }
+  configured =
+    configured?.querySelector<HTMLElement>(':scope > .graph-target-members') ?? configured;
   const declaration = section.querySelector<HTMLDetailsElement>(
     `details[data-graph-field="${escaped}"]`,
   );
@@ -138,7 +140,7 @@ export function ProjectGraphEditor({
   canvas: GraphCanvas;
   project: ProjectDetail;
   canEdit: boolean;
-  onChange: (canvas: GraphCanvas) => void;
+  onChange: (next: GraphCanvas | ((latest: GraphCanvas) => GraphCanvas)) => void;
   renderStart?: (startId: string) => ReactNode;
   renderResources?: (node: GraphNode, endpoint?: GraphEndpoint) => ReactNode;
   issues?: GraphIssue[];
@@ -179,8 +181,8 @@ export function ProjectGraphEditor({
   );
   const [diagnosticEdge, setDiagnosticEdge] = useState<GraphEdge>();
   const [focusRequest, setFocusRequest] = useState<FieldFocus | undefined>(() =>
-    initialNodeId && initialFieldId
-      ? { nodeId: initialNodeId, fieldId: initialFieldId, ...initialFieldLocation }
+    initialSelection && initialFieldId
+      ? { nodeId: initialSelection, fieldId: initialFieldId, ...initialFieldLocation }
       : undefined,
   );
   const handledFocus = useRef<FieldFocus>(undefined);
@@ -360,6 +362,26 @@ export function ProjectGraphEditor({
 
   function patch(fields: Partial<GraphNode>) {
     if (!inspected || !canEdit) return;
+    if (simplified && !template && inspected.type === 'START') {
+      onChange((latest) => {
+        if (!latest.nodes.some(({ id }) => id === inspected.id)) return latest;
+        return {
+          ...latest,
+          nodes: latest.nodes.map((item) => {
+            if (item.id !== inspected.id) return item;
+            const next = { ...item, ...fields };
+            if (fields.start && item.start !== inspected.start) {
+              const changed = Object.entries(fields.start).filter(
+                ([key, value]) => inspected.start?.[key as keyof typeof fields.start] !== value,
+              );
+              next.start = { ...item.start, ...Object.fromEntries(changed) };
+            }
+            return authoredNode(next);
+          }),
+        };
+      });
+      return;
+    }
     const operationChanged = fields.operation && fields.operation !== effectiveNodeType(inspected);
     const nextOutputs =
       inspected.type === 'END' && fields.outputs
@@ -1078,10 +1100,16 @@ export function ProjectGraphEditor({
                 <select
                   value={selectedPair?.startId ?? ''}
                   onChange={(event) => {
-                    setStartId(event.target.value || undefined);
-                    setFocusRequest(undefined);
-                    setDiagnosticEdge(undefined);
-                    setReveal(undefined);
+                    const id = event.target.value;
+                    if (id) {
+                      selectNode(id);
+                      setReveal({ nodeId: id });
+                    } else {
+                      setStartId(undefined);
+                      setFocusRequest(undefined);
+                      setDiagnosticEdge(undefined);
+                      setReveal(undefined);
+                    }
                   }}
                 >
                   <option value="">查看完整执行图</option>
@@ -1159,12 +1187,12 @@ export function ProjectGraphEditor({
             onMove={
               canEdit
                 ? (id, position) =>
-                    onChange({
-                      ...canvas,
-                      nodes: canvas.nodes.map((item) =>
+                    onChange((latest) => ({
+                      ...latest,
+                      nodes: latest.nodes.map((item) =>
                         item.id === id ? { ...item, position } : item,
                       ),
-                    })
+                    }))
                 : undefined
             }
             onDropNode={canEdit ? drop : undefined}
@@ -1244,7 +1272,9 @@ export function ProjectGraphEditor({
               (inspectedPaths.length > 1 ? (
                 <Field
                   label="所属执行流"
-                  hint="此节点由以下执行流共享。所选入口决定显示的源码目录和结果设置。"
+                  hint={
+                    inspectedPaths.map(({ start }) => start.name).join('、') + '共用此节点的配置。'
+                  }
                 >
                   <select
                     value={inspection.start.id}
@@ -1304,9 +1334,8 @@ export function ProjectGraphEditor({
                     }
                   />
                 ) : inspected.type === 'START' ? (
-                  <>
+                  <div className="graph-fields" key={inspected.id}>
                     <SimplifiedStartSettings
-                      key={inspected.id}
                       node={inspected}
                       project={project}
                       canEdit={canEdit}
@@ -1333,7 +1362,7 @@ export function ProjectGraphEditor({
                         assign={assignEnd}
                       />
                     </details>
-                  </>
+                  </div>
                 ) : inspected.type === 'END' ? (
                   <>
                     <SimplifiedEndSettings
@@ -1342,7 +1371,7 @@ export function ProjectGraphEditor({
                       canEdit={canEdit}
                       patch={patch}
                       flowNodes={canvas.nodes.filter(({ id }) => inspectedEndScope?.has(id))}
-                      shared={inspectedEndPaths.length > 1}
+                      sharedFlows={inspectedEndPaths.map(({ start }) => start.name)}
                       hasReleaseOnAllFlows={
                         inspectedEndPaths.length
                           ? inspectedEndPaths.every(({ path }) =>

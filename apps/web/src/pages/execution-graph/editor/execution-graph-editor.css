@@ -234,6 +234,35 @@
   padding-top: 0.15rem;
 }
 
+.graph-location-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+  gap: 0.55rem 0.8rem;
+  align-items: start;
+}
+
+.graph-location-grid > *,
+.graph-workspace-path,
+.graph-target-members {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.graph-target-members > summary {
+  cursor: pointer;
+}
+
+.graph-target-members > summary > .field-note {
+  margin-inline-start: 0.55rem;
+}
+
+.graph-trigger-editor-lock {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
 .graph-inspector-tabs {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
