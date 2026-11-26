@@ -1,5 +1,6 @@
 import type { Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
+import type { ComposeReleaseEvidence } from '../service-configs/compose-template-reference';
 import { redactTaskLog } from '../tasks/task-log.service';
 import type { TaskPayload } from '../tasks/tasks.types';
 import type { GraphReleaseResult } from './graph-release-gates';
@@ -49,6 +50,7 @@ export async function readReleaseOutput(
         'status',
         'health_status',
         'rollback_of_deployment_id',
+        'compose_release_json',
       ])
       .where('pipeline_run_id', '=', run.id)
       .orderBy('started_at')
@@ -56,8 +58,11 @@ export async function readReleaseOutput(
       .execute(),
   ]);
   const snapshot = (JSON.parse(run.payload_json) as TaskPayload).pipeline;
+  const primaryName = Object.values(snapshot?.graphDeployment?.imageBindings ?? {})[0];
   const planned = new Map(
-    (snapshot?.deploymentArtifacts ?? []).map(({ id, serverId }) => [serverId, id]),
+    (snapshot?.deploymentArtifacts ?? [])
+      .filter(({ name }) => !primaryName || name === primaryName)
+      .map(({ id, serverId }) => [serverId, id]),
   );
   const byTarget = new Map(records.map((record) => [record.task_target_id, record]));
   const targets: GraphReleaseResult['targets'] = taskTargets.flatMap((target) => {
@@ -65,6 +70,9 @@ export async function readReleaseOutput(
     const record = byTarget.get(target.id);
     const status = targetStatus(target.status, record?.status);
     const healthStatus = record?.health_status;
+    const images = record?.compose_release_json
+      ? (JSON.parse(record.compose_release_json) as ComposeReleaseEvidence).images
+      : undefined;
     const error = target.error_summary
       ? redactTaskLog(target.error_summary)
       : !record && target.status === 'SUCCESS'
@@ -87,7 +95,9 @@ export async function readReleaseOutput(
                 ? 'UNKNOWN'
                 : 'NOT_CHECKED',
         errorSummary: error,
-        consumedArtifacts: record?.artifact_id ? [{ artifactId: record.artifact_id }] : [],
+        consumedArtifacts:
+          images?.map(({ artifactId }) => ({ artifactId })) ??
+          (record?.artifact_id ? [{ artifactId: record.artifact_id }] : []),
       },
     ];
   });

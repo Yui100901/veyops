@@ -55,6 +55,7 @@ export interface GraphReleaseResult {
     deploymentId?: string;
     artifactInstanceId?: string;
     plannedArtifactInstanceId?: string;
+    consumedArtifacts?: { artifactId: string }[];
     errorSummary?: string;
     status: string;
     health?: string;

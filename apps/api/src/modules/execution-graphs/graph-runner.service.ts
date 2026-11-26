@@ -3793,6 +3793,7 @@ export class GraphRunnerService implements OnModuleInit {
                   expected && (await this.simplifiedRuns.releaseScope(tx, run.id, expected));
                 if (
                   !expected ||
+                  !scope ||
                   result.status !== 'SUCCESS' ||
                   result.serviceId !== expected.serviceId ||
                   !sameIds(
@@ -3803,7 +3804,12 @@ export class GraphRunnerService implements OnModuleInit {
                     (target) =>
                       target.status !== 'SUCCESS' ||
                       !target.artifactInstanceId ||
-                      target.artifactInstanceId !== scope?.artifactIds[0],
+                      !scope.artifactIds.includes(target.artifactInstanceId) ||
+                      !sameIds(
+                        scope.artifactIds,
+                        target.consumedArtifacts?.map(({ artifactId }) => artifactId) ??
+                          [target.artifactInstanceId],
+                      ),
                   )
                 )
                   throw new ConflictException('结束节点缺少计划内全部目标的激活及产物证据');
