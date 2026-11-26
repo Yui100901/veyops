@@ -13,7 +13,10 @@ import { SshService, type SshTarget } from '../../infrastructure/ssh/ssh.service
 import { AuditService } from '../audit/audit.service';
 import type { CurrentUser } from '../auth/auth.decorators';
 import { deploymentLock } from '../deployments/deployment-lock';
-import { normalizeReleasePath as snapshotPath } from '../deployments/deployment-scope';
+import {
+  normalizeReleasePath as snapshotPath,
+  releaseScopeForTarget,
+} from '../deployments/deployment-scope';
 import { DeploymentsService } from '../deployments/deployments.service';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
 import { shellQuote as q, shellWorkspacePath } from '../pipelines/pipeline.validation';
@@ -345,7 +348,7 @@ export class GraphReleaseInspectionService {
     );
     const scope = attemptRow?.release_snapshot_json
       ? (JSON.parse(attemptRow.release_snapshot_json) as PipelineSnapshot)
-      : payload.pipeline;
+      : payload.pipeline && releaseScopeForTarget(payload.pipeline, serverId);
     let result: Omit<GraphReleaseInspection, 'serverId' | 'checkedAt'> = {
       status: 'UNKNOWN',
       canReplan: false,

@@ -103,7 +103,7 @@ import { lockProjectGraph } from '../projects/project-guards';
 import type { GraphReleaseGate } from '../execution-graphs/graph-release-gates';
 import { graphComposeProject, graphRollbackBaselines } from './graph-release-context';
 import { assertGraphCompose } from './graph-compose';
-import { normalizeReleasePath } from '../deployments/deployment-scope';
+import { assignedReleasePaths, normalizeReleasePath } from '../deployments/deployment-scope';
 
 @Injectable()
 export class PipelinesService implements OnModuleInit {
@@ -688,6 +688,17 @@ export class PipelinesService implements OnModuleInit {
         new BadRequestException('执行目标必须配置SSH凭据和已确认指纹'),
         graphTargets?.source,
       );
+    if (graphDeployment && isProjectReleasePath(definition.deployPath)) {
+      const assigned = await assignedReleasePaths(
+        this.database.db,
+        { serviceId: pipeline.serviceId, environmentId: environment.id },
+        members,
+      );
+      const overrides = Object.entries(assigned).filter(
+        ([, path]) => path !== definition.deployPath,
+      );
+      if (overrides.length) graphDeployment.targetPaths = Object.fromEntries(overrides);
+    }
     const rollbackBaseline =
       profile?.delivery?.rollback === 'CURRENT'
         ? await graphRollbackBaselines(

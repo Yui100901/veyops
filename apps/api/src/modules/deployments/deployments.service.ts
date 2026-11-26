@@ -18,7 +18,13 @@ import { DeliveryRecordFilters } from '../projects/delivery-filters';
 import { SourceReviewService } from './source-review.service';
 import type { ComposeReleaseEvidence } from '../service-configs/compose-template-reference';
 import { assertGraphReleaseGate } from '../execution-graphs/graph-release-gates';
-import { deploymentScopeKey, normalizeReleasePath, type ReleaseScope } from './deployment-scope';
+import {
+  assignedReleasePaths,
+  deploymentScopeKey,
+  normalizeReleasePath,
+  releaseScopeForTarget,
+  type ReleaseScope,
+} from './deployment-scope';
 
 export type DeploymentHealth = 'NOT_CHECKED' | 'HEALTHY' | 'FAILED' | 'UNKNOWN';
 @Injectable()
@@ -49,12 +55,14 @@ export class DeploymentsService {
   }
 
   async assertGraphReleasePath(db: Kysely<Database>, scope: ReleaseScope, serverId: string) {
+    scope = releaseScopeForTarget(scope, serverId);
     if (!scope.graphDeployment) return;
+    const path = normalizeReleasePath(scope.definition.deployPath);
     const occupied = await db
       .selectFrom('deployment_records')
       .select('release_scope_key')
       .where('server_id', '=', serverId)
-      .where('release_path_key', '=', normalizeReleasePath(scope.definition.deployPath))
+      .where('release_path_key', '=', path)
       .where((eb) => eb.or([eb('activated_at', 'is not', null), eb('status', '=', 'SUCCESS')]))
       .orderBy(
         (eb) => eb.fn.coalesce('activated_at', 'started_at'),
@@ -64,19 +72,10 @@ export class DeploymentsService {
       .executeTakeFirst();
     if (occupied && occupied.release_scope_key !== deploymentScopeKey(scope, serverId))
       throw new ConflictException('部署目录已有其他发布，请先核查当前部署方式及归属');
-    if (isProjectReleasePath(scope.definition.deployPath)) {
-      const previous = await db
-        .selectFrom('deployment_records')
-        .select('deploy_path')
-        .where('service_id', '=', scope.serviceId)
-        .where('environment_id', '=', scope.environmentId)
-        .where('server_id', '=', serverId)
-        .where((eb) => eb.or([eb('activated_at', 'is not', null), eb('status', '=', 'SUCCESS')]))
-        .orderBy((eb) => eb.fn.coalesce('activated_at', 'started_at'), 'desc')
-        .orderBy('id', 'desc')
-        .executeTakeFirst();
-      if (previous?.deploy_path && previous.deploy_path !== scope.definition.deployPath)
-        throw new ConflictException('该服务在当前服务器已有其他位置的发布，请先核查现有实例');
+    if (scope.graphDeployment.targetPaths || isProjectReleasePath(path)) {
+      const assigned = await assignedReleasePaths(db, scope, [serverId]);
+      if (assigned[serverId] && assigned[serverId] !== path)
+        throw new ConflictException('该服务的发布位置已变化，请重新预览发布计划');
     }
   }
 
@@ -171,6 +170,7 @@ export class DeploymentsService {
     snapshot: PipelineSnapshot,
     serverId: string,
   ): Promise<(PipelineSnapshot & { composeRelease?: ComposeReleaseEvidence }) | undefined> {
+    snapshot = releaseScopeForTarget(snapshot, serverId);
     await this.assertGraphReleasePath(this.database.db, snapshot, serverId);
     const current = await this.currentSnapshot(this.database.db, snapshot, serverId);
     if (snapshot.graphDeployment && current && current.status !== 'SUCCESS')
@@ -258,6 +258,7 @@ export class DeploymentsService {
     lease?: { taskId: string; owner: string },
     artifactId?: string,
   ) {
+    s = releaseScopeForTarget(s, serverId);
     const id = randomUUID();
     await this.database.db.transaction().execute(async (tx) => {
       if (artifactId) await lockAvailableArtifacts(tx, [artifactId]);

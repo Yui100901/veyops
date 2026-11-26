@@ -104,6 +104,7 @@ export interface PipelineSnapshot {
     method: 'FILE' | 'COMPOSE';
     artifactPath?: string;
     composeProject?: string;
+    targetPaths?: Record<string, string>;
     template?: Extract<
       import('../service-configs/compose-template-reference').ComposeTemplateReference,
       { source: 'REPOSITORY_FILE' }

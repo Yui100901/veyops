@@ -366,6 +366,13 @@ test(
       assert.deepEqual(failed.artifactIds, []);
       assert.equal(releases.get(currentPath), current);
 
+      await api
+        .patch(projectPath + '/execution-settings')
+        .send({ targetWorkspaceRoot: '/srv/changed-workspace' })
+        .expect(200);
+      const updatedSlug = 'fixture-renamed';
+      await api.patch(projectPath).send({ name: project.name, slug: updatedSlug }).expect(200);
+
       const replay = structuredClone(canvas);
       const releaseStart = replay.nodes[0]!;
       releaseStart.start!.sources = [];
@@ -395,6 +402,7 @@ test(
         Array<string>(2).fill('content from the confirmed Git commit\nconfigured\n'),
       );
       assert.notEqual(releases.get(currentPath), current);
+      assert.ok(!releases.has(`/srv/changed-workspace/${updatedSlug}/.deployments/${service.id}/current`));
 
       const approvalTemplate: GraphCanvas = (
         await create(graphPath + '/draft/templates/expand', {
@@ -708,6 +716,25 @@ test(
       assert.equal(skipped.nodes.find(({ nodeId }) => nodeId === checkout.id)?.status, 'SKIPPED');
       assert.equal(skipped.simplified?.workspacePath, null);
       assert.deepEqual(skipped.artifactIds, []);
+
+      const secondServer = await create(root + '/servers', {
+        name: 'New fixture target',
+        host: '127.0.0.2',
+        port: 22,
+        username: 'fixture',
+        credentialId: credential.id,
+        hostKeyFingerprint: 'b'.repeat(64),
+      });
+      const both = structuredClone(replay);
+      both.nodes[0]!.start!.release!.targets = { serverIds: [server.id, secondServer.id] };
+      const bothVersion = await publish(both);
+      const bothPreview = await create(flow + '/preview', { version: bothVersion });
+      const previousRelease = releases.get(currentPath);
+      const bothRun = await runVersion(bothVersion, bothPreview.configurationHash);
+      const nextPath = `/srv/changed-workspace/${updatedSlug}/.deployments/${service.id}/current`;
+      assert.deepEqual(bothRun.artifactIds, [artifacts[0].id]);
+      assert.notEqual(releases.get(currentPath), previousRelease);
+      assert.ok(releases.has(nextPath), 'a new server uses the new project workspace root');
     } finally {
       await app?.close();
       if (git.listening) await new Promise<void>((resolve) => git.close(() => resolve()));

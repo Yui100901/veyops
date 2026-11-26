@@ -32,6 +32,7 @@ import {
 import { artifactIdentity } from '../artifacts/artifact-identities';
 import { RepositoryMetadataService } from '../projects/repository-metadata.service';
 import { DeploymentHealth, DeploymentsService } from '../deployments/deployments.service';
+import { releaseScopeForTarget } from '../deployments/deployment-scope';
 import { deploymentLock } from '../deployments/deployment-lock';
 import type { TaskExecutionContext, TaskRecord, TaskStatus } from '../tasks/tasks.types';
 import { TaskLeaseUnavailableError } from '../tasks/task-lease';
@@ -409,12 +410,18 @@ export class PipelineExecutor {
           return;
         }
       }
+      const sessionForTarget = (serverId: string): BuildSession => {
+        const scoped = releaseScopeForTarget(snapshot, serverId);
+        return scoped === snapshot ? session : { ...session, snapshot: scoped };
+      };
       let position = 0,
         failed = false;
       const runner = async () => {
         while (!context.signal.aborted && !(failed && task.payload.failurePolicy === 'STOP')) {
           const target = task.payload.targets[position++];
           if (!target) return;
+          const session = sessionForTarget(target.id);
+          const { snapshot } = session;
           const managerBuilt = managerTarget?.serverId === target.id;
           const preparedTargetId = preparingTargets.get(target.id);
           preparingTargets.delete(target.id);

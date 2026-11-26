@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
+import type { Kysely } from 'kysely';
+import type { Database } from '../../core/database/schema';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
 import { releasePath } from '../pipelines/pipeline.validation';
 
@@ -23,13 +25,69 @@ export function graphComposeProject({
     .slice(0, 24)}`;
 }
 
+export async function assignedReleasePaths(
+  db: Kysely<Database>,
+  { serviceId, environmentId }: Pick<ReleaseScope, 'serviceId' | 'environmentId'>,
+  serverIds: readonly string[],
+): Promise<Record<string, string>> {
+  if (!serverIds.length) return {};
+  // A preparation failure leaves the first publication path available for re-planning.
+  const ranked = db
+    .selectFrom('deployment_records')
+    .select(['server_id', 'deploy_path'])
+    .select((eb) =>
+      eb.fn
+        .agg<number>('row_number', [])
+        .over((window) =>
+          window
+            .partitionBy('server_id')
+            .orderBy(eb.fn.coalesce('activated_at', 'started_at'), (order) =>
+              order.desc().nullsLast(),
+            )
+            .orderBy('id', 'desc'),
+        )
+        .as('rank'),
+    )
+    .where('service_id', '=', serviceId)
+    .where('environment_id', '=', environmentId)
+    .where('server_id', 'in', serverIds)
+    .where('deploy_path', 'is not', null)
+    .where((eb) => eb.or([eb('activated_at', 'is not', null), eb('status', '=', 'SUCCESS')]));
+  const rows = await db
+    .selectFrom(ranked.as('assignment'))
+    .select(['server_id', 'deploy_path'])
+    .where('rank', '=', 1)
+    .execute();
+  return Object.fromEntries(
+    rows.map(({ server_id, deploy_path }) => [server_id!, normalizeReleasePath(deploy_path!)]),
+  );
+}
+
+export function releaseScopeForTarget<T extends ReleaseScope>(scope: T, serverId: string): T {
+  const graphDeployment = scope.graphDeployment;
+  const path = graphDeployment?.targetPaths?.[serverId];
+  if (!path || !graphDeployment || path === scope.definition.deployPath) return scope;
+  const definition = { ...scope.definition, deployPath: path };
+  return {
+    ...scope,
+    definition,
+    graphDeployment: {
+      ...graphDeployment,
+      ...(graphDeployment.method === 'COMPOSE' && {
+        composeProject: graphComposeProject({ ...scope, definition }),
+      }),
+    },
+  };
+}
+
 export function deploymentScopeKey(scope: ReleaseScope, serverId: string) {
-  const { definition, projectId, serviceId, environmentId, graphDeployment } = scope;
+  const resolved = releaseScopeForTarget(scope, serverId);
+  const { definition, projectId, serviceId, environmentId, graphDeployment } = resolved;
   const compose = (graphDeployment?.method ?? definition.artifactType) !== 'FILE';
   const location = compose
     ? (graphDeployment?.composeProject ??
       (graphDeployment
-        ? graphComposeProject(scope)
+        ? graphComposeProject(resolved)
         : `veyops-${serviceId.slice(0, 8)}-${environmentId.slice(0, 8)}`))
     : normalizeReleasePath(definition.deployPath);
   return JSON.stringify([projectId, serviceId, serverId, compose ? 'COMPOSE' : 'FILE', location]);
