@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, Injectable } from '@nestjs/common';
 import { createHash, createHmac } from 'node:crypto';
 import {
+  copyFile,
   cp,
   lstat,
   mkdir,
@@ -11,6 +12,7 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { dataDirectory, encryptionKey } from '../../core/config';
 import { ProcessRunnerService } from '../../infrastructure/build-runner/process-runner.service';
@@ -64,6 +66,12 @@ export type ArtifactVerification = {
   reason?: string;
 };
 export type ArtifactRemoval = { status: 'DELETED' | 'RETAINED' | 'RETRY'; reason?: string };
+
+export type WorkspaceDeploymentArchive = {
+  localArchive: string;
+  checksum: string;
+  sizeBytes: number;
+};
 
 interface CollectPathInput {
   workspace: string;
@@ -961,6 +969,102 @@ printf '%s:%s\n' "$(checksum "$archive")" "$(stat -c '%s' -- "$archive")"
     } finally {
       if (workspaceStage) await rm(workspaceStage, { recursive: true, force: true });
     }
+  }
+
+  private async withArchivedWorkspaceSelection<T>(
+    physical: ArtifactPhysical,
+    archive: WorkspaceDeploymentArchive,
+    path: string,
+    recursive: boolean,
+    use: (source: string, directory: boolean) => Promise<T>,
+    signal?: AbortSignal,
+  ) {
+    const temporary = await mkdtemp(join(await realpath(tmpdir()), 'veyops-archive-select-'));
+    try {
+      if (!physical.workspace) throw new InvalidArtifactObject();
+      checkWorkspaceSelection(path, physical.workspace);
+      const input = join(temporary, 'archive.tar.gz');
+      await copyFile(archive.localArchive, input);
+      // Read and extract the same private copy so a change to the original cannot affect extraction.
+      const digest = await artifactPathDigest(input, 'FILE', signal);
+      if (digest.sha256 !== archive.checksum || digest.sizeBytes !== archive.sizeBytes)
+        throw new InvalidArtifactObject();
+      const root = join(temporary, 'payload');
+      await mkdir(root);
+      const extracted = await this.process.run(
+        'tar',
+        [
+          '-xzf',
+          input,
+          '-C',
+          root,
+          '--no-same-owner',
+          '--no-same-permissions',
+          ...(recursive ? [] : ['--no-recursion']),
+          '--',
+          './' + path,
+        ],
+        { timeout: 180, signal },
+      );
+      if (extracted.exitCode !== 0) throw new InvalidArtifactObject();
+      const source = await this.builderSelection(root, path, true);
+      const details = await lstat(source);
+      if (!details.isDirectory() && !details.isFile()) throw new InvalidArtifactObject();
+      return await use(source, details.isDirectory());
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (!(error instanceof InvalidArtifactObject) && !hasErrno(error, 'ENOENT')) throw error;
+      throw new ConflictException('归档或所选子路径缺失、已变化或无法读取');
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+  }
+
+  async verifyArchivedWorkspaceSelection(
+    physical: ArtifactPhysical,
+    archive: WorkspaceDeploymentArchive,
+    configuredPath?: string,
+  ) {
+    const path = artifactSelection(physical, configuredPath ?? '.');
+    if (path !== '.')
+      await this.withArchivedWorkspaceSelection(physical, archive, path, false, async () => {});
+  }
+
+  async stageArchivedWorkspace(
+    physical: ArtifactPhysical,
+    archive: WorkspaceDeploymentArchive,
+    destination: string,
+    configuredPath: string,
+    signal?: AbortSignal,
+  ) {
+    const path = artifactSelection(physical, configuredPath);
+    return this.withArchivedWorkspaceSelection(
+      physical,
+      archive,
+      path,
+      true,
+      async (source, directory) => {
+        const packaged = await this.process.run(
+          'tar',
+          [
+            '-czf',
+            destination,
+            '-C',
+            directory ? source : dirname(source),
+            directory ? '.' : './' + basename(source),
+          ],
+          { timeout: 180, signal },
+        );
+        if (packaged.exitCode !== 0) throw new InvalidArtifactObject();
+        const { sha256: checksum, sizeBytes } = await artifactPathDigest(
+          destination,
+          'FILE',
+          signal,
+        );
+        return { checksum, sizeBytes };
+      },
+      signal,
+    );
   }
 
   async stageLocalPathArchive(

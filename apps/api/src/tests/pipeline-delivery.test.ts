@@ -82,8 +82,7 @@ async function checkDelivery(databaseUrl?: string) {
     .overrideProvider(ProcessRunnerService)
     .useValue({
       run: async (command: string, args: string[], options: ProcessOptions) => {
-        if (command === 'tar' && args[0] === '-czf')
-          return processRunner.run(command, args, options);
+        if (command === 'tar') return processRunner.run(command, args, options);
         const script = args.at(-1) ?? '';
         const checkout = script.includes('fetch --no-recurse-submodules --no-tags --depth=1');
         if (checkout || script.includes("printf 'VEYOPS_ARTIFACT")) {
@@ -1410,12 +1409,19 @@ async function checkDelivery(databaseUrl?: string) {
         idempotencyKey: randomUUID(),
       });
     };
-    const wait = async (id: string, states: string[]) => {
+    const wait = async (id: string, states: string[], approvalNodeId?: string) => {
       for (let attempt = 0; attempt < 120; attempt++) {
         await worker.tick();
         const current = (await api.get('/api/v1' + graphPath + '/runs/' + id).expect(200)).body
           .data;
-        if (states.includes(current.status)) return current;
+        const approvalReady =
+          !approvalNodeId ||
+          current.status !== 'WAITING' ||
+          current.nodes.some(
+            (node: { nodeId: string; output?: { scopeHash?: string } }) =>
+              node.nodeId === approvalNodeId && node.output?.scopeHash,
+          );
+        if (states.includes(current.status) && approvalReady) return current;
         await delay(15);
       }
       assert.fail('Graph run did not reach ' + states.join('/'));
@@ -1423,7 +1429,7 @@ async function checkDelivery(databaseUrl?: string) {
     const initialActivations = activations().length;
     captureFlowUpload = true;
     const flowRun = await submit();
-    const pending = await wait(flowRun.id, ['WAITING', 'FAILED']);
+    const pending = await wait(flowRun.id, ['WAITING', 'FAILED'], approve.id);
     if (pending.status !== 'WAITING') {
       const node = pending.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === approve.id);
       const failedTask = node?.taskId && (await getTask(node.taskId));

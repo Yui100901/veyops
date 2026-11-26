@@ -2,10 +2,10 @@ import 'reflect-metadata';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { delimiter, dirname, join } from 'node:path';
+import { basename, delimiter, dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import test from 'node:test';
@@ -387,6 +387,49 @@ test(
         { from: releaseStart.id, to: deploy.id },
         { from: deploy.id, to: end.id },
       ];
+      const missingSubpath = structuredClone(replay);
+      missingSubpath.nodes[0]!.start!.release!.contentPath = 'fixture/missing-subpath';
+      const missingVersion = await publish(missingSubpath);
+      const { createBackup, restoreBackup } = await import('../core/database/backup.js');
+      const key = Buffer.from(process.env.ENCRYPTION_KEY!, 'hex');
+      const backup = join(directory, 'replay-backup');
+      const restored = join(directory, 'replay-restored');
+      const manifest = await createBackup(
+        {
+          dataDir: directory,
+          key,
+          database: { client: 'sqlite', path: join(directory, 'test.db') },
+        },
+        backup,
+      );
+      const archiveName = basename(artifacts[0].storageKey);
+      assert.ok(manifest.files.some(({ path }) => path === 'artifacts/' + archiveName));
+      assert.ok(manifest.files.every(({ path }) => !path.startsWith('flow-workspaces/')));
+      await restoreBackup(
+        { dataDir: restored, key, database: { client: 'sqlite', path: join(restored, 'test.db') } },
+        backup,
+      );
+      const { default: Sqlite } = await import('better-sqlite3');
+      const restoredDatabase = new Sqlite(join(restored, 'test.db'), { readonly: true });
+      try {
+        assert.deepEqual(
+          restoredDatabase
+            .prepare('select storage_key, checksum from artifacts where id = ?')
+            .get(artifacts[0].id),
+          { storage_key: artifacts[0].storageKey, checksum: artifacts[0].checksum },
+        );
+      } finally {
+        restoredDatabase.close();
+      }
+      await rename(snapshotPath, join(directory, 'replay-original-workspace'));
+      await assert.rejects(stat(snapshotPath), { code: 'ENOENT' });
+      await rename(artifacts[0].storageKey, join(directory, 'replay-original-archive.tar.gz'));
+      await copyFile(join(restored, 'artifacts', archiveName), artifacts[0].storageKey);
+      const missingPreview = await api
+        .post(flow + '/preview')
+        .send({ version: missingVersion })
+        .expect(409);
+      assert.match(JSON.stringify(missingPreview.body), /所选子路径缺失/);
       const replayVersion = await publish(replay);
       const replayPreview = await create(flow + '/preview', { version: replayVersion });
       assert.equal(replayPreview.simplified.workspaceRetention, 'OFF');
@@ -402,7 +445,9 @@ test(
         Array<string>(2).fill('content from the confirmed Git commit\nconfigured\n'),
       );
       assert.notEqual(releases.get(currentPath), current);
-      assert.ok(!releases.has(`/srv/changed-workspace/${updatedSlug}/.deployments/${service.id}/current`));
+      assert.ok(
+        !releases.has(`/srv/changed-workspace/${updatedSlug}/.deployments/${service.id}/current`),
+      );
 
       const approvalTemplate: GraphCanvas = (
         await create(graphPath + '/draft/templates/expand', {

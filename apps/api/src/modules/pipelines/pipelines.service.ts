@@ -1456,6 +1456,8 @@ export class PipelinesService implements OnModuleInit {
         'artifacts.image_digest',
         'artifacts.image_repository',
         'artifacts.storage_key',
+        'artifacts.archive_key',
+        'artifacts.size_bytes',
         'artifacts.server_id',
         'artifacts.storage_type',
         'artifacts.physical_json',
@@ -1553,7 +1555,7 @@ export class PipelinesService implements OnModuleInit {
       try {
         await Promise.all(
           rows.map((row) =>
-            this.artifacts.verifyFileSelection(row.physical_json, p.graphDeployment!.artifactPath),
+            this.artifacts.verifyDeploymentFileSelection(row, p.graphDeployment!.artifactPath),
           ),
         );
       } catch (error) {

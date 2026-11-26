@@ -42,6 +42,7 @@ import {
   isDockerImageReference,
   physicalKey,
   type ArtifactPhysical,
+  type WorkspaceDeploymentArchive,
 } from './artifact-physical.service';
 import { artifactIdentity } from './artifact-identities';
 import { graphUnscopedArtifactService } from '../pipelines/delivery-execution-profile';
@@ -137,6 +138,7 @@ export interface DeploymentArtifact {
   imageReference?: string;
   imageId?: string;
   physical?: ArtifactPhysical;
+  workspaceArchive?: WorkspaceDeploymentArchive;
   composeYaml?: string;
   composeTemplate?: ComposeTemplateReference;
   offlineImage?: {
@@ -148,6 +150,12 @@ export interface DeploymentArtifact {
 }
 
 type Instance = Selectable<ArtifactsTable>;
+type ArchiveRow = Pick<Instance, 'checksum' | 'size_bytes'>;
+type FileSelectionRow = Pick<
+  Instance,
+  'physical_json' | 'storage_type' | 'archive_key' | 'storage_key'
+> &
+  ArchiveRow;
 type Verification = {
   status: 'AVAILABLE' | 'MISSING' | 'CHANGED' | 'UNVERIFIABLE';
   reason?: string;
@@ -155,6 +163,15 @@ type Verification = {
 
 function physicalOf(row: Pick<Instance, 'physical_json'>) {
   return row.physical_json ? (JSON.parse(row.physical_json) as ArtifactPhysical) : undefined;
+}
+
+function archivedWorkspace(physical: ArtifactPhysical | undefined, storageType: string) {
+  return storageType === 'LOCAL_FILE' &&
+    physical?.location === 'BUILDER_PATH' &&
+    physical.kind === 'DIRECTORY' &&
+    physical.workspace
+    ? physical
+    : undefined;
 }
 
 function applicationServer(row: Pick<Instance, 'physical_json' | 'server_id'>) {
@@ -684,7 +701,7 @@ export class ArtifactsService {
 
   private async check(row: Instance, target?: SshTarget): Promise<Verification> {
     const physical = physicalOf(row);
-    if (physical)
+    if (physical && !archivedWorkspace(physical, row.storage_type))
       return this.physical
         ? this.physical.verify(physical, target)
         : {
@@ -791,6 +808,24 @@ export class ArtifactsService {
     else if (path) throw new ConflictException('文件产物校验适配器不可用');
   }
 
+  async verifyDeploymentFileSelection(row: FileSelectionRow, path?: string) {
+    const workspace = archivedWorkspace(physicalOf(row), row.storage_type);
+    if (!workspace) return this.verifyFileSelection(row.physical_json, path);
+    if (!path || path === '.') return; // The whole archive was verified during instance selection.
+    const key = archiveKey(row);
+    if (!key || !this.physical) throw new ConflictException('缺少可验证的工作目录归档');
+    try {
+      await this.physical.verifyArchivedWorkspaceSelection(
+        workspace,
+        await this.archiveReceipt(key, row),
+        path,
+      );
+    } catch (error) {
+      if (!(error instanceof NotFoundException)) throw error;
+      throw new ConflictException(error.message);
+    }
+  }
+
   async forDeployment(
     snapshot: PipelineSnapshot,
     serverId: string,
@@ -837,9 +872,10 @@ export class ArtifactsService {
     if (candidate.fingerprint && candidate.fingerprint !== deploymentFingerprint(row))
       throw new ConflictException('已确认的构建产物校验信息发生变化');
     const physical = physicalOf(row);
-    if (snapshot.graphDeployment?.method === 'FILE')
+    const workspace = archivedWorkspace(physical, row.storage_type);
+    if (!workspace && snapshot.graphDeployment?.method === 'FILE')
       await this.verifyFileSelection(row.physical_json, snapshot.graphDeployment.artifactPath);
-    if (physical) {
+    if (physical && !workspace) {
       const check = await this.check(row, physical.serverId === target?.id ? target : undefined);
       await this.recordCheck(row, check);
       if (check.status !== 'AVAILABLE')
@@ -885,6 +921,7 @@ export class ArtifactsService {
       id: row.id,
       physical,
       ...archive,
+      ...(workspace && archive && { workspaceArchive: archive }),
       offlineImage,
       composeYaml: row.compose_yaml ?? undefined,
       composeTemplate: archivedComposeTemplate(
@@ -897,7 +934,7 @@ export class ArtifactsService {
     };
   }
 
-  private async verifiedArchive(key: string, row: Selectable<ArtifactsTable>) {
+  private async archiveReceipt(key: string, row: ArchiveRow): Promise<WorkspaceDeploymentArchive> {
     if (
       !row.checksum ||
       !sha256.test(row.checksum) ||
@@ -906,13 +943,19 @@ export class ArtifactsService {
     )
       throw new ConflictException('缺少有效的归档校验信息');
     const localArchive = await this.resolveArchive(key);
+    return { localArchive, checksum: row.checksum, sizeBytes: row.size_bytes };
+  }
+
+  private async verifiedArchive(key: string, row: ArchiveRow) {
+    const archive = await this.archiveReceipt(key, row);
+    const { localArchive, checksum, sizeBytes } = archive;
     const file = await open(localArchive, constants.O_RDONLY | (constants.O_NOFOLLOW || 0)).catch(
       () => null,
     );
     if (!file) throw new NotFoundException('产物归档不存在或无法读取');
     try {
       const stat = await file.stat();
-      if (!stat.isFile() || stat.size !== row.size_bytes)
+      if (!stat.isFile() || stat.size !== sizeBytes)
         throw new ConflictException('产物归档大小与记录不一致');
       const hash = createHash('sha256');
       try {
@@ -921,9 +964,8 @@ export class ArtifactsService {
       } catch {
         throw new ConflictException('产物归档读取失败');
       }
-      if (hash.digest('hex') !== row.checksum)
-        throw new ConflictException('产物归档未通过完整性校验');
-      return { localArchive, checksum: row.checksum };
+      if (hash.digest('hex') !== checksum) throw new ConflictException('产物归档未通过完整性校验');
+      return archive;
     } finally {
       await file.close();
     }

@@ -1649,15 +1649,23 @@ test "$(${docker} image inspect --format ${q(inspect)} ${q(imageReference)})" = 
     if (!artifact.physical || !this.physical) throw new ConflictException('文件产物适配器不可用');
     if (artifact.physical.location === 'SERVER_PATH' && artifact.physical.serverId === target.id)
       return this.physical.stageServerArchive(artifact.physical, target, archive, signal, path);
+    if (artifact.workspaceArchive && (!path || path === '.')) {
+      const { localArchive, checksum, sizeBytes } = artifact.workspaceArchive;
+      await this.ssh.upload(target, localArchive, archive, { timeout: 300, signal });
+      return { checksum, sizeBytes };
+    }
     const directory = await mkdtemp(join(tmpdir(), 'veyops-artifact-'));
     try {
       const local = join(directory, 'artifact.tar.gz');
-      const receipt = await this.physical.stageLocalPathArchive(
-        artifact.physical,
-        local,
-        path,
-        signal,
-      );
+      const receipt = artifact.workspaceArchive
+        ? await this.physical.stageArchivedWorkspace(
+            artifact.physical,
+            artifact.workspaceArchive,
+            local,
+            path!,
+            signal,
+          )
+        : await this.physical.stageLocalPathArchive(artifact.physical, local, path, signal);
       await this.ssh.upload(target, local, archive, { timeout: 300, signal });
       return receipt;
     } finally {
