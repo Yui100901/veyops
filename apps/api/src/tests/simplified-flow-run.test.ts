@@ -84,7 +84,7 @@ test(
       await writeFile(join(worktree, 'private.vars'), 'FLOW_PRIVATE=fixture-private-value\n');
       const compose = 'services:\n  app:\n    image: ${VEYOPS_IMAGE}\n';
       await writeFile(join(worktree, 'compose.yaml'), compose);
-      await writeFile(join(worktree, '.gitattributes'), '*.txt text eol=lf\n');
+      await writeFile(join(worktree, '.gitattributes'), '*.txt text eol=lf\n*.yaml text eol=lf\n');
       await exec('git', [
         '-C',
         worktree,

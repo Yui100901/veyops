@@ -173,7 +173,6 @@ done
 # Save before loading so a failed save cannot be masked by a pipeline.
 case "$mode" in
   flow-v2) ;;
-  flow-v2-image) docker image save -o "$work/images.tar" "$site_image" ;;
   *) docker image save -o "$work/images.tar" "$site_image" "$target_image" ;;
 esac
 if [ "$mode" != flow-v2 ]; then
