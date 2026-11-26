@@ -210,7 +210,7 @@
 
 目标端按 `<工作根目录>/<项目标识>/<执行 ID>` 创建工作区，默认工作根目录是 `~/.veyops/workspace`。`END.finish.saveWorkspace` 省略时默认直接保留实际使用的整个执行目录。`retention: "RUN"` 只保留本次临时快照。`saveWorkspace: false` 时，本次文件发布仍会固定临时实物。临时实例可在运行详情中识别，历史选择器仅提供持久实例。历史发布使用既有实例，本次另外生成的工作区按结束规则处理。
 
-`END.finish.images` 为 `{id,name,source,reference?,registryId?}[]`。每条流内登记名称规范化为小写且唯一，`id` 用于稳定引用。`BUILT_IN` 采用 `BUILD.build.dockerfilePath` 构建出的实际 Image ID。`WORKSPACE` 读取 `<name>:<VEYOPS_IMAGE_TAG>`，该保留变量由运行 ID 导出。`REGISTRY` 需要 `registryId` 和带固定 Digest 的完整 `reference`。`START.start.release.imageId` 选择本次 Compose 发布项，只有一项时可省略。启用 `useUpstreamArtifact` 后，可用 `upstreamArtifactName` 选定上游持久产物，实际实例 ID 在触发时固定。
+`END.finish.images` 为 `{id,name,source,buildNodeId?,reference?,registryId?,composePath?}[]`。每条流内登记名称规范化为小写且唯一，`id` 用于稳定引用。`BUILT_IN` 采用 `BUILD.build.dockerfilePath` 构建出的实际 Image ID，存在多个 Dockerfile 构建节点时用 `buildNodeId` 指定来源。`WORKSPACE` 读取 `<name>:<VEYOPS_IMAGE_TAG>`，该保留变量由运行 ID 导出。`REGISTRY` 需要 `registryId` 和带固定 Digest 的完整 `reference`。`START.start.release.imageId` 选择单镜像，只有一项时可省略。本次多个内置构建镜像可用 `imageIds` 选择，并在 Compose 中用 `VEYOPS_IMAGE_<ID>` 引用各项。启用 `useUpstreamArtifact` 后，可用 `upstreamArtifactName` 选定上游持久产物，实际实例 ID 在触发时固定。
 
 `START.start.release.compose` 使用 `{sourceId?,path}`。省略 `sourceId` 时，从工作区归档所选镜像的 Compose YAML。指定源码时从其已确认提交读取。历史镜像允许使用随产物归档的配置。`ROLLBACK_ARTIFACT` 使用开始节点选定的历史产物和预览时各目标的当前版本，要求人工审批。
 
@@ -372,12 +372,12 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
 
 ## 交付记录与保护
 
-执行流的目标参数或节点目标绑定可提交 `serverIds` 或 `groupIds`，可同时使用两者，并配置 `strategy`、`maxParallel` 和 `failurePolicy`。执行预览返回去重后的目标和配置摘要，成员变化后需重新预览。
+执行预览固定开始节点所选服务器、关联服务及配置摘要。每次执行流使用一台服务器。跨服务器交付可在同一项目内拆成两条执行流，通过上游成功事件关联。命令中心及运维方案继续使用各自的批量目标配置。
 
 | 方法与路径                                                                                                                                                                  | 说明                                                                                                                                                                                        |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /services/:serviceId/repositories`、`PUT /services/:serviceId/repositories`                                                                                            | 查询或保存服务与仓库关联，传入 `{repositories:[{repositoryId,repoPath,isPrimary}]}`。                                                                                                       |
-| `GET /deployment-targets`、`GET /deployment-targets/:id`                                                                                                                    | 查询历史独立部署目标。新计划直接引用服务器和分组。                                                                                                                                          |
+| `GET /deployment-targets`、`GET /deployment-targets/:id`                                                                                                                    | 查询历史独立部署目标。新执行流在开始节点选择执行服务器。                                                                                                                                    |
 | `GET /services/:serviceId/environments/:envId/config`                                                                                                                       | 读取历史服务环境配置。                                                                                                                                                                      |
 | `GET /projects/:projectId/variables`、`PUT /projects/:projectId/variables`                                                                                                  | 查询或保存项目公共变量。                                                                                                                                                                    |
 | `GET /environments/:envId/variables`                                                                                                                                        | 查询旧环境的本地变量。                                                                                                                                                                      |
