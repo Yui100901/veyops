@@ -1,4 +1,5 @@
 import type { ProjectDetail } from '../../../models';
+import { formatTime } from '../../../api';
 import { graphNodeLabels } from '../execution-graph-definition';
 import type {
   GraphEdge,
@@ -739,20 +740,86 @@ export function SimplifiedPlanDetails({
 }) {
   const release = plan.release;
   const finish = plan.finish;
+  const source = plan.workspaceSource;
+  const historical = source?.kind === 'HISTORICAL' ? source : undefined;
+  const hasWorkspace = Boolean(
+    source || plan.workspacePath || plan.workspaceRetention || plan.sources?.length,
+  );
   return (
     <>
-      <section>
-        <h4>执行工作区</h4>
-        <div className="execution-plan-row">
-          <span>
-            {plan.location === 'MANAGER'
-              ? '管理端'
-              : '目标端 · ' + (plan.serverName ?? plan.serverId ?? '—')}
-          </span>
-          {plan.workspacePath && <code>{plan.workspacePath}</code>}
-        </div>
-      </section>
-      {showSources && Boolean(plan.sources?.length) && (
+      {hasWorkspace && (
+        <section>
+          <h4>执行工作区</h4>
+          <div className="execution-plan-row">
+            <span>
+              {plan.location === 'MANAGER'
+                ? '管理端'
+                : '目标端 · ' + (plan.serverName ?? plan.serverId ?? '—')}
+            </span>
+            {plan.workspacePath ? (
+              <code>{plan.workspacePath}</code>
+            ) : (
+              source && <small>启动后分配本次独立执行目录</small>
+            )}
+            {historical && (
+              <>
+                <div>
+                  从运行{' '}
+                  <a
+                    className="text-link"
+                    href={
+                      '#' +
+                      graphWorkbenchPath(project.id, {
+                        pane: 'history',
+                        run: historical.runId,
+                        origin,
+                        originQuery,
+                      })
+                    }
+                  >
+                    {historical.runId.slice(0, 8)}
+                  </a>{' '}
+                  的目录构建
+                </div>
+                <small>
+                  <a
+                    className="text-link"
+                    href={
+                      '#' +
+                      deliveryPath(project.id, 'artifacts', {
+                        recordId: historical.artifactId,
+                        origin,
+                        originQuery,
+                      })
+                    }
+                  >
+                    来源目录产物
+                  </a>
+                  {' · '}
+                  {formatTime(historical.createdAt)}
+                  {historical.sizeBytes != null &&
+                    ` · ${(historical.sizeBytes / 1024).toFixed(1)} KiB`}
+                </small>
+                {historical.sources.map(({ repositoryId, commitSha, checkoutPath }, index) => (
+                  <small key={`${repositoryId}:${index}`}>
+                    {project.repositories.find(({ id }) => id === repositoryId)?.name ??
+                      repositoryId}
+                    {' · '}
+                    <code>{commitSha}</code>
+                    {checkoutPath && (
+                      <>
+                        {' '}
+                        · <code>{checkoutPath}</code>
+                      </>
+                    )}
+                  </small>
+                ))}
+              </>
+            )}
+          </div>
+        </section>
+      )}
+      {showSources && !historical && Boolean(plan.sources?.length) && (
         <section>
           <h4>实际源码与提交</h4>
           {plan.sources.map((source) => (
@@ -915,29 +982,35 @@ export function ExecutionPlan({
           project={project}
           origin={origin}
           originQuery={originQuery}
+          showSources={!preview.checkouts?.length}
         />
       )}
-      <section>
-        <h4>入口变量集合</h4>
-        {preview.environmentSet ? (
-          <a
-            className="text-link"
-            href={
-              '#' +
-              projectResourcePath(project.id, {
-                resource: 'environment-sets',
-                environmentSetId: preview.environmentSet.id,
-                origin,
-                originQuery,
-              })
-            }
-          >
-            {preview.environmentSet.name} · 修订 {preview.environmentSet.revision}
-          </a>
-        ) : (
-          <span>使用项目公共变量</span>
-        )}
-      </section>
+      {(!preview.simplified?.release ||
+        preview.simplified.workspaceSource ||
+        preview.simplified.sources?.length ||
+        preview.environmentSet) && (
+        <section>
+          <h4>入口变量集合</h4>
+          {preview.environmentSet ? (
+            <a
+              className="text-link"
+              href={
+                '#' +
+                projectResourcePath(project.id, {
+                  resource: 'environment-sets',
+                  environmentSetId: preview.environmentSet.id,
+                  origin,
+                  originQuery,
+                })
+              }
+            >
+              {preview.environmentSet.name} · 修订 {preview.environmentSet.revision}
+            </a>
+          ) : (
+            <span>使用项目公共变量</span>
+          )}
+        </section>
+      )}
       {!!releaseSteps.length && (
         <section>
           <h4>审核与发布步骤</h4>
@@ -1025,32 +1098,33 @@ export function ExecutionPlan({
           </dl>
         </details>
       )}
-      {preview.nodes
-        .filter(
-          (node) =>
-            node.selected !== false &&
-            (node.inputs?.length || node.environment?.length || node.outputFields?.length),
-        )
-        .map((node) => (
-          <section key={node.nodeId}>
-            <h4>{node.name}</h4>
-            <FieldEvidenceList
-              title="节点输入"
-              fields={node.inputs}
-              nameSource={(id) => preview.nodes.find(({ nodeId }) => id === nodeId)?.name}
-            />
-            <FieldEvidenceList
-              title="节点环境绑定"
-              fields={node.environment}
-              nameSource={(id) => preview.nodes.find(({ nodeId }) => id === nodeId)?.name}
-            />
-            <FieldEvidenceList
-              title="最终输出"
-              fields={node.outputFields}
-              nameSource={(id) => preview.nodes.find(({ nodeId }) => id === nodeId)?.name}
-            />
-          </section>
-        ))}
+      {!preview.simplified &&
+        preview.nodes
+          .filter(
+            (node) =>
+              node.selected !== false &&
+              (node.inputs?.length || node.environment?.length || node.outputFields?.length),
+          )
+          .map((node) => (
+            <section key={node.nodeId}>
+              <h4>{node.name}</h4>
+              <FieldEvidenceList
+                title="节点输入"
+                fields={node.inputs}
+                nameSource={(id) => preview.nodes.find(({ nodeId }) => id === nodeId)?.name}
+              />
+              <FieldEvidenceList
+                title="节点环境绑定"
+                fields={node.environment}
+                nameSource={(id) => preview.nodes.find(({ nodeId }) => id === nodeId)?.name}
+              />
+              <FieldEvidenceList
+                title="最终输出"
+                fields={node.outputFields}
+                nameSource={(id) => preview.nodes.find(({ nodeId }) => id === nodeId)?.name}
+              />
+            </section>
+          ))}
       {plan &&
         plan.targets.length > 0 &&
         (['BUILD', 'RELEASE'] as const).map((purpose) => (
@@ -1339,6 +1413,18 @@ function reviewRows(preview: Preview, project: ProjectDetail) {
     const existing = rows.get(key);
     rows.set(key, { title, value: existing ? `${existing.value}\n${value}` : value });
   };
+  const workspace = preview.simplified?.workspaceSource;
+  if (workspace) {
+    add(
+      'artifacts',
+      {},
+      'workspaceArtifactId',
+      '工作区来源',
+      workspace.kind === 'NEW'
+        ? '新工作区'
+        : `历史目录 · ${workspace.artifactId} · 运行 ${workspace.runId}`,
+    );
+  }
   add(
     'variables',
     {},

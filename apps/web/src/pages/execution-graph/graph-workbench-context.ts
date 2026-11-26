@@ -9,7 +9,11 @@ import type {
   GraphNode,
 } from './execution-graph-definition';
 import type { DeliveryScope, DeliveryTab } from '../delivery/delivery-route';
-import { simplifiedModel, simplifiedReleaseInput } from './simplified-flow';
+import {
+  simplifiedModel,
+  simplifiedReleaseInput,
+  simplifiedWorkspaceInput,
+} from './simplified-flow';
 
 const resourcePanels = [
   'settings',
@@ -272,6 +276,7 @@ export function graphStartReadiness(
   scope: GraphWorkbenchScope,
   project?: ReadinessProject,
   inputs?: Readonly<Record<string, unknown>>,
+  options?: { historicalWorkspace?: boolean },
 ): GraphStartReadiness {
   const result = inspectGraphScope(flow, scope);
   if (!('parameters' in result)) return result;
@@ -281,18 +286,28 @@ export function graphStartReadiness(
   const issues: GraphStartConfigurationIssue[] = [];
   const missingFields: GraphField[] = [];
   if (flow.model === simplifiedModel && start?.start) {
-    for (const source of start.start.sources ?? []) {
-      if (source.repositoryId && project?.repositories.some(({ id }) => id === source.repositoryId))
-        continue;
-      if (source.repositoryId && !project) continue;
-      issues.push({
-        reason: source.repositoryId ? 'RESOURCE_UNAVAILABLE' : 'FIXED_INPUT_MISSING',
-        nodeId: start.id,
-        fieldId: 'start.sources.' + source.id + '.repositoryId',
-        fieldName: '项目仓库',
-        resourceType: 'REPOSITORY',
-        resourceId: source.repositoryId,
-      });
+    const workspace = simplifiedWorkspaceInput(flow);
+    const historical =
+      workspace && (workspace.required || options?.historicalWorkspace || inputs?.[workspace.id]);
+    if (historical) {
+      if (!inputs?.[workspace.id]) missingFields.push(workspace);
+    } else {
+      for (const source of start.start.sources ?? []) {
+        if (
+          source.repositoryId &&
+          project?.repositories.some(({ id }) => id === source.repositoryId)
+        )
+          continue;
+        if (source.repositoryId && !project) continue;
+        issues.push({
+          reason: source.repositoryId ? 'RESOURCE_UNAVAILABLE' : 'FIXED_INPUT_MISSING',
+          nodeId: start.id,
+          fieldId: 'start.sources.' + source.id + '.repositoryId',
+          fieldName: '项目仓库',
+          resourceType: 'REPOSITORY',
+          resourceId: source.repositoryId,
+        });
+      }
     }
     const serviceId = start.start.release?.serviceId;
     if (serviceId && project && !project.services.some(({ id }) => id === serviceId)) {

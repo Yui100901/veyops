@@ -85,6 +85,34 @@
   scroll-margin: 1rem;
 }
 
+.workspace-history-setup {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+  gap: 0.5rem 0.75rem;
+  align-items: start;
+}
+
+.workspace-history-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 0.65rem;
+  grid-column: 1 / -1;
+}
+
+.workspace-history-picker {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.workspace-history-note {
+  overflow-wrap: anywhere;
+}
+
+.workspace-history-note p {
+  margin: 0;
+}
+
 .graph-run-layout .graph-node-detail > .field {
   max-inline-size: 30rem;
 }

@@ -20,6 +20,7 @@ import type { SimplifiedPublicPlan } from '../simplified-flow';
 import {
   ExecutionGraphParameterLink,
   ExecutionGraphRepairLinks,
+  runParameterFields,
 } from './ExecutionGraphRepairLinks';
 import {
   artifactOutput,
@@ -95,6 +96,9 @@ interface RunNode {
     overriddenSources?: string[];
   }[];
   output?: Record<string, unknown> & {
+    sources?: { repositoryId: string; commitSha: string; directory: string }[];
+    checkoutSkipped?: 'HISTORICAL_WORKSPACE';
+    workspaceArtifactId?: string;
     wakeAt?: number;
     expiresAt?: number;
     decision?: 'APPROVE' | 'REJECT' | 'EXPIRED';
@@ -117,6 +121,13 @@ interface RunDetail extends GraphRun {
 
 function failedRunStatus(status: string) {
   return ['FAILED', 'PARTIAL_FAILED', 'TIMED_OUT', 'NEEDS_ATTENTION'].includes(status);
+}
+
+function nodeInputs(node: RunNode, simplified: boolean) {
+  if (!simplified || ['START', 'CHECKOUT', 'SOURCE_REVIEW'].includes(node.type)) return node.inputs;
+  return node.inputs?.filter(
+    ({ type }) => !['REPOSITORY', 'GIT_REF', 'VARIABLES', 'ENVIRONMENT_SET'].includes(type),
+  );
 }
 
 function RunNodeRecovery({
@@ -146,7 +157,7 @@ function RunNodeRecovery({
   const startNode = flow.nodes.find(({ type }) => type === 'START');
   const inputId =
     issue?.parameterId ?? (node.nodeId === startNode?.id ? issue?.fieldId : undefined);
-  const field = currentFlow ? startNode?.inputs?.find(({ id }) => id === inputId) : undefined;
+  const field = currentFlow ? runParameterFields(flow).find(({ id }) => id === inputId) : undefined;
   const start = { ...scope, start: flow.id, version, field: field?.id };
   const source = flow.nodes.find(({ id }) => id === issue?.sourceNodeId);
   const missingSource = currentFlow && source?.id !== node.nodeId ? source : undefined;
@@ -182,7 +193,7 @@ function RunNodeRecovery({
         </strong>
         {issue && (
           <p>
-            {[issue.fieldName ?? issue.fieldId, issue.branchId, issue.message]
+            {[issue.fieldName ?? field?.name ?? issue.fieldId, issue.branchId, issue.message]
               .filter(Boolean)
               .join(' · ')}
           </p>
@@ -818,7 +829,7 @@ function RunDetails({
                       )}
                     <FieldEvidenceList
                       title="节点输入"
-                      fields={n.inputs}
+                      fields={nodeInputs(n, Boolean(item.simplified))}
                       expanded
                       repositoryName={releaseContext.repositoryName}
                       nameSource={(id) => item.nodes.find(({ nodeId }) => id === nodeId)?.name}
@@ -836,6 +847,48 @@ function RunDetails({
                           : undefined
                       }
                     />
+                    {n.type === 'CHECKOUT' &&
+                      n.output?.checkoutSkipped === 'HISTORICAL_WORKSPACE' && (
+                        <p className="field-note">
+                          历史工作区已准备，跳过 Git 拉取。
+                          {n.output.workspaceArtifactId && (
+                            <a
+                              className="text-link"
+                              href={
+                                '#' +
+                                deliveryPath(projectId, 'artifacts', {
+                                  ...deliveryScope,
+                                  recordId: n.output.workspaceArtifactId,
+                                })
+                              }
+                            >
+                              查看来源目录
+                            </a>
+                          )}
+                        </p>
+                      )}
+                    {item.simplified &&
+                      n.type === 'CHECKOUT' &&
+                      Array.isArray(n.output?.sources) && (
+                        <dl className="graph-field-values">
+                          {n.output.sources.map(({ repositoryId, commitSha, directory }, index) => (
+                            <div key={`${repositoryId}:${index}`}>
+                              <dt>
+                                {releaseContext.repositoryName?.(repositoryId) ?? repositoryId}
+                              </dt>
+                              <dd>
+                                <code>{commitSha}</code>
+                                {directory && (
+                                  <>
+                                    {' '}
+                                    · <code>{directory}</code>
+                                  </>
+                                )}
+                              </dd>
+                            </div>
+                          ))}
+                        </dl>
+                      )}
                     {n.checkout && (
                       <p className="field-note">
                         检出版本来源 · {sourceName(n.checkout.versionSource)}
@@ -864,6 +917,9 @@ function RunDetails({
                       omit={[
                         ...(n.output?.scope ? ['scope', 'scopeHash', 'review', 'actorId'] : []),
                         ...(isReleaseNode(n) || n.type === 'HEALTH_CHECK' ? ['release'] : []),
+                        ...(item.simplified && n.type === 'CHECKOUT'
+                          ? ['sources', 'checkoutSkipped', 'workspaceArtifactId']
+                          : []),
                       ]}
                       title="节点输出"
                       expanded
@@ -877,7 +933,7 @@ function RunDetails({
                     <FieldEvidenceList
                       title="实际注入的环境绑定"
                       fields={n.environment}
-                      expanded
+                      expanded={!item.simplified || n.type === 'START'}
                       nameSource={(id) => item.nodes.find(({ nodeId }) => id === nodeId)?.name}
                     />
                     <FieldEvidenceList

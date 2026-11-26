@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Play } from 'lucide-react';
-import { ApiError, message, post, type ExecutionPlanIssue } from '../../../api';
-import { ErrorBanner } from '../../../components';
-import type { ProjectDetail } from '../../../models';
+import { ApiError, message, post, useResource, type ExecutionPlanIssue } from '../../../api';
+import { ErrorBanner, Field } from '../../../components';
+import type { ProjectDetail, ProjectExecutionSettings } from '../../../models';
 import {
   GraphFieldValue,
   useProjectEnvironmentSets,
@@ -12,9 +12,11 @@ import { ExecutionPlan, ExecutionPlanChanges, type Preview } from './ExecutionGr
 import {
   ExecutionGraphParameterLink,
   ExecutionGraphRepairLinks,
+  runParameterFields,
 } from './ExecutionGraphRepairLinks';
 import { GraphRunResults, planIssueLabels, repairKind } from './ExecutionGraphRunEvidence';
 import { ExecutionGraphStartStatus } from './ExecutionGraphStartStatus';
+import { WorkspaceHistoryInput } from './WorkspaceHistoryInput';
 import {
   branchLabel,
   graphKey,
@@ -24,7 +26,11 @@ import {
 import type { GraphField, GraphFlow, GraphRun } from '../execution-graph-definition';
 import { projectGraphPath, projectResourcePath } from '../../projects/project-workspace-route';
 import { graphStartReadiness, type GraphWorkbenchScope } from '../graph-workbench-context';
-import { simplifiedConditionField, simplifiedRuntimeInputs } from '../simplified-flow';
+import {
+  simplifiedConditionField,
+  simplifiedRuntimeInputs,
+  simplifiedWorkspaceArtifactField,
+} from '../simplified-flow';
 
 export { ExecutionGraphHistory } from './ExecutionGraphHistory';
 
@@ -62,7 +68,9 @@ function PlanIssueBanner({
 }) {
   const currentFlow = !issue.flowId || issue.flowId === flow.id;
   const node = currentFlow ? flow.nodes.find(({ id }) => id === issue.nodeId) : undefined;
-  const field = node?.inputs?.find(({ id }) => id === issue.fieldId)?.name;
+  const field =
+    runParameterFields(flow).find(({ id }) => id === issue.parameterId)?.name ??
+    node?.inputs?.find(({ id }) => id === issue.fieldId)?.name;
   const location = [
     issue.flowName ?? (issue.flowId ? (currentFlow ? flow.name : issue.flowId) : undefined),
     issue.nodeName ?? node?.name ?? issue.nodeId,
@@ -118,7 +126,19 @@ export function ExecutionGraphStart({
   const fixedSetId = start?.environmentSetId;
   const fixedSets = useProjectEnvironmentSets(project.id, !!fixedSetId);
   const fixedSet = fixedSets.data?.find(({ id }) => id === fixedSetId);
-  const fields = simplifiedRuntimeInputs(flow, project);
+  const fields = simplifiedRuntimeInputs(flow);
+  const workspaceField = fields.find(({ id }) => id === simplifiedWorkspaceArtifactField);
+  const entryFields = fields.filter(({ id }) => id !== simplifiedWorkspaceArtifactField);
+  const configuredLocation = start?.execution?.location ?? 'INHERIT';
+  const projectExecution = useResource<ProjectExecutionSettings>(
+    workspaceField && configuredLocation === 'INHERIT'
+      ? '/projects/' + project.id + '/execution-settings'
+      : null,
+  );
+  const location =
+    configuredLocation === 'INHERIT'
+      ? projectExecution.data?.effective.defaultBuildLocation
+      : configuredLocation;
   const runtimePresets = Object.fromEntries(
     fields.flatMap(({ id }) =>
       initialInputs && Object.hasOwn(initialInputs, id) ? [[id, initialInputs[id]]] : [],
@@ -143,7 +163,18 @@ export function ExecutionGraphStart({
     ),
     ...runtimePresets,
   };
-  const readiness = graphStartReadiness(flow, workbenchScope, project, parameters);
+  const [workspaceMode, setWorkspaceMode] = useState<'NEW' | 'HISTORICAL'>(() =>
+    focusFieldId === simplifiedWorkspaceArtifactField ||
+    parameters[simplifiedWorkspaceArtifactField]
+      ? 'HISTORICAL'
+      : 'NEW',
+  );
+  const historicalWorkspace = Boolean(
+    workspaceField && (workspaceField.required || workspaceMode === 'HISTORICAL'),
+  );
+  const readiness = graphStartReadiness(flow, workbenchScope, project, parameters, {
+    historicalWorkspace,
+  });
   const fieldRefs = useRef(new Map<string, HTMLElement>());
   const scope: FieldScope = {
     serviceId: start?.release?.serviceId,
@@ -167,6 +198,7 @@ export function ExecutionGraphStart({
   const runLocation = { ...workbenchScope, start: flow.id, version, field: focusFieldId };
   useEffect(() => {
     if (!focusFieldId) return;
+    if (focusFieldId === simplifiedWorkspaceArtifactField) setWorkspaceMode('HISTORICAL');
     setPreview(undefined);
     setRevision(undefined);
     const frame = window.requestAnimationFrame(() =>
@@ -176,6 +208,7 @@ export function ExecutionGraphStart({
   }, [focusFieldId]);
   const base = path + '/flows/' + encodeURIComponent(flow.id);
   const useDefaults =
+    !historicalWorkspace &&
     !start?.release?.useUpstreamArtifact &&
     start?.release?.artifactSource !== 'RUN_PARAMETER' &&
     !preview &&
@@ -270,6 +303,7 @@ export function ExecutionGraphStart({
         fields.flatMap((field) => {
           const edit = edits[field.id];
           if (field.id === simplifiedConditionField) return [];
+          if (field.id === simplifiedWorkspaceArtifactField && !historicalWorkspace) return [];
           if (!Object.hasOwn(runtimePresets, field.id) && edit?.schema !== parameterSchema(field))
             return [];
           const value = parameters[field.id];
@@ -281,10 +315,9 @@ export function ExecutionGraphStart({
     };
   }
   function updateParameter(field: GraphField, value: unknown) {
-    const next = {
-      ...(drafts?.get(draftKey) ?? edits),
-      [field.id]: { schema: parameterSchema(field), value },
-    };
+    const next = { ...(drafts?.get(draftKey) ?? edits) };
+    if (value === undefined) delete next[field.id];
+    else next[field.id] = { schema: parameterSchema(field), value };
     drafts?.set(draftKey, next);
     setEdits(next);
     if (planIssue) {
@@ -295,6 +328,7 @@ export function ExecutionGraphStart({
   function openParameter(fieldId: string) {
     setPreview(undefined);
     setRevision(undefined);
+    if (fieldId === simplifiedWorkspaceArtifactField) setWorkspaceMode('HISTORICAL');
     window.requestAnimationFrame(() => focusRunField(fieldRefs.current.get(fieldId)));
   }
   return (
@@ -325,6 +359,51 @@ export function ExecutionGraphStart({
         disabled={busy || Boolean(preview || revision)}
         hidden={Boolean(preview || revision)}
       >
+        {workspaceField && (
+          <div className="workspace-history-setup">
+            <div className="workspace-history-heading">
+              <strong>执行位置</strong>
+              <span className="field-note">
+                {location === 'TARGET'
+                  ? '目标端'
+                  : location === 'MANAGER'
+                    ? '管理端'
+                    : '沿用项目设置'}
+              </span>
+            </div>
+            {!workspaceField.required && (
+              <Field label="工作区来源">
+                <select
+                  value={workspaceMode}
+                  onChange={(event) => {
+                    const mode = event.target.value === 'NEW' ? 'NEW' : 'HISTORICAL';
+                    setWorkspaceMode(mode);
+                    if (mode === 'NEW') updateParameter(workspaceField, undefined);
+                  }}
+                >
+                  <option value="NEW">使用新工作区</option>
+                  <option value="HISTORICAL">使用历史目录</option>
+                </select>
+              </Field>
+            )}
+            {historicalWorkspace && (
+              <div
+                className="graph-run-field workspace-history-picker"
+                tabIndex={-1}
+                ref={(element) => {
+                  if (element) fieldRefs.current.set(workspaceField.id, element);
+                  else fieldRefs.current.delete(workspaceField.id);
+                }}
+              >
+                <WorkspaceHistoryInput
+                  projectId={project.id}
+                  value={parameters[workspaceField.id]}
+                  change={(id) => updateParameter(workspaceField, id)}
+                />
+              </div>
+            )}
+          </div>
+        )}
         {fixedSetId && (
           <p className="field-note">
             固定变量集合 ·{' '}
@@ -345,7 +424,7 @@ export function ExecutionGraphStart({
           </p>
         )}
         {fields.length ? (
-          fields.map((field) => (
+          entryFields.map((field) => (
             <div
               key={field.id}
               className="graph-run-field"
@@ -358,13 +437,7 @@ export function ExecutionGraphStart({
               <GraphFieldValue
                 field={field}
                 project={project}
-                scope={{
-                  ...scope,
-                  repositoryId:
-                    field.type === 'GIT_REF'
-                      ? start?.sources?.find(({ id }) => 'git:' + id === field.id)?.repositoryId
-                      : undefined,
-                }}
+                scope={scope}
                 disabled={Object.hasOwn(runtimePresets, field.id)}
                 checkRequired
                 canManageProjectResources
@@ -434,6 +507,7 @@ export function ExecutionGraphStart({
                 .filter(
                   ({ type, id }) =>
                     !['VARIABLES', 'CREDENTIAL'].includes(type) &&
+                    id !== simplifiedWorkspaceArtifactField &&
                     preview.parameters?.[id] !== undefined,
                 )
                 .map(({ id }) => [id, preview.parameters?.[id]]),
@@ -516,6 +590,7 @@ export function ExecutionGraphStart({
           className={`button ${useDefaults ? 'secondary' : 'primary'}`}
           disabled={
             busy ||
+            (!preview && historicalWorkspace && !parameters[simplifiedWorkspaceArtifactField]) ||
             Boolean(start?.release?.useUpstreamArtifact && !start.release.allowArtifactOverride)
           }
         >

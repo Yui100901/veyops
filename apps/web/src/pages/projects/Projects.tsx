@@ -9,6 +9,7 @@ import type { Project, User } from '../../models';
 import { workspaceOrigin, type EntryOrigin } from '../../workspace-navigation';
 import { graphKey } from '../execution-graph/execution-graph-definition';
 import { graphWorkbenchPath } from '../execution-graph/graph-workbench-context';
+import { simplifiedWorkspaceArtifactField } from '../execution-graph/simplified-flow';
 import { ProjectAccessLinks, type ProjectAccessLink } from './ProjectAccessLinks';
 import { projectResourcePath } from './project-workspace-route';
 import { ProjectBasicsFields, projectBasicsValues } from './settings/ProjectConfiguration';
@@ -22,6 +23,8 @@ type Flow = {
   inDraft: boolean;
   hasRuntimeInputs?: boolean;
   needsArtifactInput?: boolean;
+  needsWorkspaceInput?: boolean;
+  supportsWorkspaceInput?: boolean;
   latestRun?: { id: string; status: string; createdAt: number };
 };
 type ProjectFlows = { projectId: string; hasDraftChanges: boolean; flows: Flow[] };
@@ -83,8 +86,16 @@ function ProjectFlowRow({
   const href = (options: Parameters<typeof graphWorkbenchPath>[1]) =>
     '#' + graphWorkbenchPath(projectId, { ...origin, ...options });
   const draftHref = href({ pane: 'draft', start: id, node: id });
+  const workspaceHref = href({
+    pane: 'run',
+    start: id,
+    version,
+    field: simplifiedWorkspaceArtifactField,
+  });
   const secondary = [];
-  if (version && flow.hasRuntimeInputs && !flow.needsArtifactInput)
+  if (version && flow.supportsWorkspaceInput && !flow.needsWorkspaceInput)
+    secondary.push({ label: '从历史目录构建', href: workspaceHref });
+  if (version && flow.hasRuntimeInputs && !flow.needsArtifactInput && !flow.needsWorkspaceInput)
     secondary.push({ label: '带参数运行', href: href({ pane: 'run', start: id, version }) });
   if (version && inDraft) secondary.push({ label: '配置画布', href: draftHref });
 
@@ -121,6 +132,10 @@ function ProjectFlowRow({
               href={href({ pane: 'run', start: id, version, field: 'artifactId' })}
             >
               <Play size={15} aria-hidden="true" /> 选择产物
+            </a>
+          ) : version && flow.needsWorkspaceInput ? (
+            <a className="button primary small" href={workspaceHref}>
+              <Play size={15} aria-hidden="true" /> 选择历史目录
             </a>
           ) : version ? (
             <button
@@ -231,6 +246,7 @@ export function ProjectsPage({ user, search }: { user: User; search?: string }) 
       const issue = err instanceof ApiError ? err.planIssue : undefined;
       if (
         issue?.code === 'INPUT' ||
+        issue?.parameterId === simplifiedWorkspaceArtifactField ||
         (flow.needsArtifactInput && issue?.code === 'RELEASE_TARGET')
       ) {
         const field = issue.parameterId ?? (flow.needsArtifactInput ? 'artifactId' : issue.fieldId);

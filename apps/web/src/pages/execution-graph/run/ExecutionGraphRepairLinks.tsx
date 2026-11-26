@@ -2,6 +2,11 @@ import type { ExecutionPlanIssue, GraphIssueLocation } from '../../../api';
 import type { ProjectDetail } from '../../../models';
 import type { GraphField, GraphFlow } from '../execution-graph-definition';
 import {
+  simplifiedModel,
+  simplifiedRuntimeInputs,
+  simplifiedWorkspaceArtifactField,
+} from '../simplified-flow';
+import {
   graphDraftSetupHref,
   graphWorkbenchPath,
   type GraphStartLocation,
@@ -33,8 +38,10 @@ const parameterLabels = {
   ARTIFACT: '选择历史制品',
 };
 
-function runFields(flow: GraphFlow) {
-  return flow.nodes.find(({ type }) => type === 'START')?.inputs ?? [];
+export function runParameterFields(flow: GraphFlow) {
+  return flow.model === simplifiedModel
+    ? simplifiedRuntimeInputs(flow)
+    : (flow.nodes.find(({ type }) => type === 'START')?.inputs ?? []);
 }
 
 export function ExecutionGraphRepairLinks({
@@ -50,7 +57,7 @@ export function ExecutionGraphRepairLinks({
   issue: GraphSetupIssue;
   onFocusParameter?: (fieldId: string) => void;
 }) {
-  const fields = runFields(flow);
+  const fields = runParameterFields(flow);
   const parameter = fields.find(
     ({ id, type }) => id === issue.parameterId && type === parameterTypes[issue.kind],
   );
@@ -95,7 +102,11 @@ export function ExecutionGraphRepairLinks({
           projectId={project.id}
           start={start}
           fieldId={parameter.id}
-          label={parameterLabels[issue.kind]}
+          label={
+            parameter.id === simplifiedWorkspaceArtifactField
+              ? '重新选择历史目录'
+              : parameterLabels[issue.kind]
+          }
           onFocus={onFocusParameter}
         />
       )}

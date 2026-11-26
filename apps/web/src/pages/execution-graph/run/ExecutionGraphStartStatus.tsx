@@ -1,5 +1,6 @@
 import type { ProjectDetail } from '../../../models';
 import type { GraphFlow } from '../execution-graph-definition';
+import { simplifiedWorkspaceArtifactField } from '../simplified-flow';
 import {
   ExecutionGraphParameterLink,
   ExecutionGraphRepairLinks,
@@ -131,7 +132,10 @@ export function ExecutionGraphStartStatus({
                   start={repairStart}
                   fieldId={field.id}
                   label={
-                    missingLabels[field.type as keyof typeof missingLabels] ?? `填写${field.name}`
+                    field.id === simplifiedWorkspaceArtifactField
+                      ? '选择历史目录'
+                      : (missingLabels[field.type as keyof typeof missingLabels] ??
+                        `填写${field.name}`)
                   }
                   onFocus={onFocusParameter}
                 />
