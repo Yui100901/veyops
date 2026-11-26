@@ -7,7 +7,7 @@ const { setTimeout: sleep } = require('node:timers/promises');
 const { testTarget } = require('./work-directory-live.cjs');
 
 const originalContent = '<main>VeyOps shared-workspace delivery</main>\n';
-const sourceDirectory = 'nested/flow-v2-source';
+const sourceDirectory = 'flow-v2-source';
 const targetWorkspaceRoot = '/srv/veyops-stage0';
 const composeSource = ['services:', '  web:', '    image: ${VEYOPS_IMAGE}', ''].join('\n');
 
@@ -42,7 +42,10 @@ async function repositoryFixture(nativeImage = false) {
   };
   await writeFile(worktree + '/index.html', originalContent);
   await writeFile(worktree + '/.env.test', 'FIXTURE_ONLY=sample\n');
-  await writeFile(worktree + '/source-note.txt', 'Source file outside the release subdirectory\n');
+  await writeFile(
+    worktree + '/source-note.txt',
+    'Source file included in the whole directory release\n',
+  );
   if (nativeImage) {
     await writeFile(
       worktree + '/Dockerfile',
@@ -93,7 +96,9 @@ function configureTemplateEntries(canvas, start, release, composePath) {
   if (check) check.shell = { directory: sourceDirectory, command: 'test -s index.html' };
   const health = canvas.nodes.find(({ operation }) => operation === 'HEALTH_CHECK');
   if (health)
-    health.healthCheck.command = composePath ? 'test -s compose.yaml' : 'test -s index.html';
+    health.healthCheck.command = composePath
+      ? 'test -s compose.yaml'
+      : 'test -s ' + sourceDirectory + '/dist/index.html';
   const approval = canvas.nodes.find(({ operation }) => operation === 'APPROVAL');
   const decision = approval && {
     releaseNodeId: canvas.nodes.find(({ operation }) => operation === 'DEPLOY_ARTIFACT').id,
@@ -125,11 +130,14 @@ async function verifyActivation(run, serverId, artifactId, sha, activation) {
   assert.equal(release.artifactId, artifactId);
   assert.equal(release.isCurrent, true);
   assert.equal(await readlink(activation), 'releases/' + release.taskId);
-  assert.equal(await readFile(activation + '/index.html', 'utf8'), originalContent);
-  assert.equal((await readFile(activation + '/source-sha.txt', 'utf8')).trim(), sha);
-  assert.equal((await readFile(activation + '/environment.txt', 'utf8')).trim(), 'flow-v2');
-  for (const omitted of ['.git', '.env.test', 'source-note.txt', 'scratch'])
-    await assert.rejects(readFile(activation + '/' + omitted), { code: 'ENOENT' });
+  const delivered = activation + '/' + sourceDirectory;
+  assert.equal(await readFile(delivered + '/dist/index.html', 'utf8'), originalContent);
+  assert.equal((await readFile(delivered + '/dist/source-sha.txt', 'utf8')).trim(), sha);
+  assert.equal((await readFile(delivered + '/dist/environment.txt', 'utf8')).trim(), 'flow-v2');
+  assert.match(await readFile(delivered + '/source-note.txt', 'utf8'), /whole directory/);
+  assert.match(await readFile(delivered + '/scratch/retained.txt', 'utf8'), /retained fixture/);
+  for (const omitted of ['.git/HEAD', '.env.test', 'dist/.git/HEAD', 'dist/.env.test'])
+    await assert.rejects(readFile(delivered + '/' + omitted), { code: 'ENOENT' });
   return release;
 }
 
@@ -168,7 +176,6 @@ async function verifyFlowV2({ api, fixture, execute }) {
   const release = {
     serviceId: service.id,
     targets: { serverIds: [deliveryTarget] },
-    contentPath: sourceDirectory + '/dist',
   };
   start.start = {
     sources: [
@@ -176,7 +183,6 @@ async function verifyFlowV2({ api, fixture, execute }) {
         id: 'source',
         repositoryId: repository.id,
         ref: { kind: 'BRANCH', value: 'main' },
-        parentDirectory: 'nested',
       },
     ],
     execution: { location: 'TARGET', serverId: sourceTarget },
@@ -188,8 +194,8 @@ async function verifyFlowV2({ api, fixture, execute }) {
     buildCommand: [
       'mkdir -p dist/.git scratch',
       'cp index.html dist/index.html',
-      'cp .env.test dist/.env.test',
-      'cp .git/HEAD dist/.git/HEAD',
+      'if [ -f .env.test ]; then cp .env.test dist/.env.test; fi',
+      'if [ -f .git/HEAD ]; then cp .git/HEAD dist/.git/HEAD; fi',
       'printf "%s\\n" "$VEYOPS_GIT_COMMIT_SHA" > dist/source-sha.txt',
       'printf "%s\\n" "$FLOW_FIXTURE_ENV" > dist/environment.txt',
       'printf "%s\\n" "retained fixture" > scratch/retained.txt',
@@ -267,6 +273,40 @@ async function verifyFlowV2({ api, fixture, execute }) {
     source.sha,
     activation,
   );
+
+  for (const [name, serverId] of [
+    ['test-a', sourceTarget],
+    ['test-b', deliveryTarget],
+  ]) {
+    const historicalBuild = structuredClone(canvas);
+    const historyStart = historicalBuild.nodes.find(({ id }) => id === onlyBuild.id);
+    historyStart.start.sources = [];
+    historyStart.start.execution = { location: 'TARGET', serverId };
+    const historicalVersion = await publish(api, graph, historicalBuild);
+    const fromHistory = await execute(
+      onlyBuild.id,
+      { workspaceArtifactId: onlyBuildArtifact.id },
+      { projectId: project.id, version: historicalVersion },
+    );
+    assert.equal(fromHistory.detail.simplified.workspaceSource.kind, 'HISTORICAL');
+    assert.equal(fromHistory.detail.simplified.workspaceSource.artifactId, onlyBuildArtifact.id);
+    assert.equal(fromHistory.detail.simplified.workspaceSource.sources[0].commitSha, source.sha);
+    assert.equal(fromHistory.detail.simplified.serverId, serverId);
+    const checkout = fromHistory.detail.nodes.find(({ type }) => type === 'CHECKOUT');
+    assert.equal(checkout.status, 'SUCCESS');
+    assert.equal(checkout.output.checkoutSkipped, 'HISTORICAL_WORKSPACE');
+    const [generated] = fromHistory.artifacts;
+    assert.notEqual(generated.id, onlyBuildArtifact.id);
+    assert.notEqual(generated.physical.path, onlyBuildArtifact.physical.path);
+    await testTarget(
+      [
+        'set -eu',
+        `test -s '${generated.physical.path}/${sourceDirectory}/dist/index.html'`,
+        `test ! -e '${generated.physical.path}/${sourceDirectory}/.git'`,
+      ].join('\n'),
+      name,
+    );
+  }
 
   const transient = structuredClone(canvas);
   transient.nodes.find(({ id }) => id === finish.id).finish.saveWorkspace = false;
@@ -664,7 +704,6 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
         id: 'source',
         repositoryId: repository.id,
         ref: { kind: 'BRANCH', value: 'main' },
-        parentDirectory: 'nested',
       },
     ],
     execution: { location: 'TARGET', serverId },
