@@ -8,9 +8,13 @@ const { testTarget } = require('./work-directory-live.cjs');
 
 const originalContent = '<main>VeyOps shared-workspace delivery</main>\n';
 const sourceDirectory = 'nested/flow-v2-source';
-const targetDirectory = '/srv/veyops-stage0/flow-v2';
-const activation = '/accept/targets/test-b/deploy/flow-v2/current';
+const targetWorkspaceRoot = '/srv/veyops-stage0';
 const composeSource = ['services:', '  web:', '    image: ${VEYOPS_IMAGE}', ''].join('\n');
+
+function fixtureReleaseDirectory(target, project, service) {
+  // The fixture binds each target's workspace root under its own /accept directory.
+  return `/accept/targets/${target}/deploy/${project.slug}/.deployments/${service.id}`;
+}
 
 function git(...args) {
   return execFileSync('git', args, { encoding: 'utf8', timeout: 15_000 }).trim();
@@ -73,7 +77,7 @@ async function publish(api, graph, canvas) {
     .publishedVersion;
 }
 
-async function verifyActivation(run, serverId, artifactId, sha) {
+async function verifyActivation(run, serverId, artifactId, sha, activation) {
   assert.equal(run.releases.length, 1);
   const [release] = run.releases;
   assert.equal(release.status, 'SUCCESS');
@@ -94,6 +98,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
   const project = await api.post('/projects', { name: '简化执行流验收', slug: 'flow-v2-live' });
   const projectPath = '/projects/' + project.id;
   const graph = projectPath + '/execution-graph';
+  await api.call('PATCH', projectPath + '/execution-settings', { targetWorkspaceRoot });
   const repository = await api.post(projectPath + '/repositories', {
     name: 'Flow V2 source',
     cloneUrl: 'http://manager:8088/flow-v2-source.git',
@@ -106,6 +111,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
   const sourceTarget = fixture.serverIds['test-a'];
   const deliveryTarget = fixture.serverIds['test-b'];
   assert.ok(sourceTarget && deliveryTarget && sourceTarget !== deliveryTarget);
+  const activation = fixtureReleaseDirectory('test-b', project, service) + '/current';
   const { canvas, startId } = await api.post(graph + '/draft/templates/expand', {
     templateId: 'MINIMAL_CI_CD',
     model: 'FLOW_V2',
@@ -119,7 +125,6 @@ async function verifyFlowV2({ api, fixture, execute }) {
   const release = {
     serviceId: service.id,
     targets: { serverIds: [deliveryTarget] },
-    deployPath: targetDirectory,
     contentPath: sourceDirectory + '/dist',
   };
   start.start = {
@@ -138,16 +143,17 @@ async function verifyFlowV2({ api, fixture, execute }) {
   build.build = {
     repoPath: sourceDirectory,
     buildCommand: [
-      'mkdir -p dist scratch',
+      'mkdir -p dist/.git scratch',
       'cp index.html dist/index.html',
+      'cp .env.test dist/.env.test',
+      'cp .git/HEAD dist/.git/HEAD',
       'printf "%s\\n" "$VEYOPS_GIT_COMMIT_SHA" > dist/source-sha.txt',
       'printf "%s\\n" "$FLOW_FIXTURE_ENV" > dist/environment.txt',
-      'printf "%s\\n" "exclude from snapshot" > scratch/private.txt',
+      'printf "%s\\n" "retained fixture" > scratch/retained.txt',
     ].join('\n'),
   };
   delete finish.finish.saveWorkspace;
   delete finish.finish.retention;
-  finish.finish.excludePaths = [sourceDirectory + '/scratch'];
   const version = await publish(api, graph, canvas);
   const built = await execute(
     startId,
@@ -167,6 +173,8 @@ async function verifyFlowV2({ api, fixture, execute }) {
   assert.equal(artifact.verificationStatus, 'AVAILABLE');
   assert.equal(artifact.physical.collection, 'WORK_DIRECTORY');
   assert.ok(built.detail.outputs.artifactIds.includes(artifact.id));
+  assert.equal(artifact.physical.path, built.detail.simplified.workspacePath);
+  assert.equal(artifact.physical.path, `${targetWorkspaceRoot}/${project.slug}/${built.detail.id}`);
   assert.match(artifact.physical.path, /^\/[0-9A-Za-z._/-]+$/);
   const physical = artifact.physical.path + '/' + sourceDirectory;
   await testTarget(
@@ -174,13 +182,22 @@ async function verifyFlowV2({ api, fixture, execute }) {
       'set -eu',
       `test -f '${physical}/source-note.txt'`,
       `test -f '${physical}/dist/index.html'`,
-      `test ! -e '${physical}/.git'`,
-      `test ! -e '${physical}/.env.test'`,
-      `test ! -e '${physical}/scratch'`,
+      `test -d '${physical}/.git'`,
+      `test -f '${physical}/.env.test'`,
+      `test -f '${physical}/dist/.git/HEAD'`,
+      `test -f '${physical}/dist/.env.test'`,
+      `test -f '${physical}/scratch/retained.txt'`,
     ].join('\n'),
     'test-a',
   );
-  const initial = await verifyActivation(built, deliveryTarget, artifact.id, source.sha);
+  assert.equal(artifact.downloadAvailable, false);
+  const initial = await verifyActivation(
+    built,
+    deliveryTarget,
+    artifact.id,
+    source.sha,
+    activation,
+  );
 
   const transient = structuredClone(canvas);
   transient.nodes.find(({ id }) => id === finish.id).finish.saveWorkspace = false;
@@ -200,6 +217,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
     deliveryTarget,
     temporary.id,
     source.sha,
+    activation,
   );
   const cleanup = await api.post('/artifact-retention/preview', {
     artifacts: [{ artifactId: temporary.id }],
@@ -243,7 +261,13 @@ async function verifyFlowV2({ api, fixture, execute }) {
   assert.deepEqual(replay.detail.simplified.sources, []);
   assert.equal(replay.detail.simplified.workspacePath, null);
   assert.deepEqual(replay.detail.outputs.artifactIds, [artifact.id]);
-  const repeated = await verifyActivation(replay, deliveryTarget, artifact.id, source.sha);
+  const repeated = await verifyActivation(
+    replay,
+    deliveryTarget,
+    artifact.id,
+    source.sha,
+    activation,
+  );
   assert.notEqual(repeated.id, initial.id);
 
   start.start.release.artifactId = artifact.id;
@@ -258,7 +282,13 @@ async function verifyFlowV2({ api, fixture, execute }) {
     new Set(mixed.detail.outputs.artifactIds),
     new Set([newSnapshot.id, artifact.id]),
   );
-  const mixedRelease = await verifyActivation(mixed, deliveryTarget, artifact.id, source.sha);
+  const mixedRelease = await verifyActivation(
+    mixed,
+    deliveryTarget,
+    artifact.id,
+    source.sha,
+    activation,
+  );
   return {
     projectId: project.id,
     sourceCommitSha: source.sha,
@@ -413,6 +443,7 @@ async function verifyManagerImageArchive({
   sources,
   release,
   serverId,
+  directory,
 }) {
   const { canvas: manager, startId } = await api.post(graph + '/draft/templates/expand', {
     templateId: 'MINIMAL_CI_CD',
@@ -421,16 +452,12 @@ async function verifyManagerImageArchive({
   });
   const start = manager.nodes.find(({ id }) => id === startId);
   const build = manager.nodes.find(({ operation }) => operation === 'BUILD');
-  const delivery = {
-    ...release,
-    deployPath: '/srv/veyops-stage0/flow-v2-manager',
-  };
   start.start = {
     sources,
     execution: { location: 'MANAGER' },
     release: {
       ...start.start.release,
-      ...delivery,
+      ...release,
       compose: { path: sourceDirectory + '/compose.yaml' },
     },
   };
@@ -441,6 +468,22 @@ async function verifyManagerImageArchive({
   const version = await publish(api, graph, canvas);
   const built = await execute(startId, {}, { projectId, version });
   assert.equal(built.detail.simplified.location, 'MANAGER');
+  const workspace = built.artifacts.find(({ kind }) => kind === 'DIRECTORY');
+  assert.ok(workspace);
+  assert.equal(workspace.physical.path, built.detail.simplified.workspacePath);
+  const exported = await api.request('GET', '/artifacts/' + workspace.id + '/download');
+  assert.equal(exported.status, 200);
+  const entries = execFileSync('tar', ['-tzf', '-'], {
+    input: Buffer.from(await exported.arrayBuffer()),
+    encoding: 'utf8',
+    timeout: 15_000,
+  })
+    .trim()
+    .split('\n');
+  assert.ok(entries.some((entry) => entry.endsWith(sourceDirectory + '/Dockerfile')));
+  assert.ok(
+    entries.every((entry) => !entry.split('/').some((part) => /^\.git$|^\.env\./.test(part))),
+  );
   const image = built.artifacts.find(({ kind }) => kind === 'DOCKER_IMAGE');
   assert.ok(image);
   assert.equal(image.storageType, 'LOCAL_IMAGE');
@@ -452,7 +495,6 @@ async function verifyManagerImageArchive({
     .digest('hex');
   assert.equal(checksum, image.checksum);
   assert.equal(archive.headers.get('x-artifact-sha256'), checksum);
-  const directory = '/accept/targets/test-a/deploy/flow-v2-manager';
   const activated = await verifyComposeActivation(built, image, serverId, directory, docker);
 
   const replay = 'manager-archive-replay';
@@ -463,7 +505,7 @@ async function verifyManagerImageArchive({
       id: replay,
       name: '重发管理端归档',
       type: 'START',
-      start: { release: { ...delivery, artifactId: image.id } },
+      start: { release: { ...release, artifactId: image.id } },
     },
     {
       id: deploy,
@@ -496,6 +538,7 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
   });
   const projectPath = '/projects/' + project.id;
   const graph = projectPath + '/execution-graph';
+  await api.call('PATCH', projectPath + '/execution-settings', { targetWorkspaceRoot });
   const repository = await api.post(projectPath + '/repositories', {
     name: 'Docker fixture source',
     cloneUrl: 'http://manager:8088/flow-v2-source.git',
@@ -507,11 +550,10 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
   });
   const serverId = fixture.serverIds['test-a'];
   assert.ok(serverId);
-  const directory = '/accept/targets/test-a/deploy/flow-v2-image';
+  const directory = fixtureReleaseDirectory('test-a', project, service);
   const release = {
     serviceId: service.id,
     targets: { serverIds: [serverId] },
-    deployPath: '/srv/veyops-stage0/flow-v2-image',
   };
   const { canvas, startId } = await api.post(graph + '/draft/templates/expand', {
     templateId: 'MINIMAL_CI_CD',
@@ -589,6 +631,11 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
   assert.notEqual(image.id, workspace.id);
   assert.notEqual(image.imageId, worker.imageId);
   assert.equal(workspace.physical.collection, 'WORK_DIRECTORY');
+  assert.equal(workspace.physical.path, initialRun.detail.simplified.workspacePath);
+  assert.equal(
+    workspace.physical.path,
+    `${targetWorkspaceRoot}/${project.slug}/${initialRun.detail.id}`,
+  );
   const inspect = (ref) => docker('test-a', 'image', 'inspect', '--format', '{{.Id}}', ref);
   for (const entry of images) {
     assert.equal(entry.serverId, serverId);
@@ -680,6 +727,7 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
     sources: start.start.sources,
     release,
     serverId,
+    directory,
   });
   return {
     projectId: project.id,

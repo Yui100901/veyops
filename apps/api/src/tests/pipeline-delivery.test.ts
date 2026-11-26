@@ -1353,7 +1353,6 @@ async function checkDelivery(databaseUrl?: string) {
         release: {
           serviceId: service.id,
           targets: { serverIds: [serverIds[0]!] },
-          deployPath: '/opt/current-veyops-flow',
           contentPath: 'app/dist',
         },
       },

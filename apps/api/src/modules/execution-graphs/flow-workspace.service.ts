@@ -1,8 +1,8 @@
 import { ConflictException, Injectable } from '@nestjs/common';
-import { createHmac, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, posix } from 'node:path';
-import { dataDirectory, encryptionKey } from '../../core/config';
+import { basename, join, posix } from 'node:path';
+import { dataDirectory } from '../../core/config';
 import { ProcessRunnerService } from '../../infrastructure/build-runner/process-runner.service';
 import { executionVariableName } from '../../infrastructure/execution-variables';
 import { SshService, type SshOptions, type SshTarget } from '../../infrastructure/ssh/ssh.service';
@@ -14,16 +14,22 @@ import {
 } from '../projects/repository-metadata.service';
 import { validateWorkspaceRoot } from '../system/system-settings.service';
 import type { TaskExecutionContext } from '../tasks/tasks.types';
+import {
+  localWorkspaceControl,
+  managerWorkspaceDirectory,
+  remoteWorkspaceControl,
+  runControlsDirectory as controlsLeaf,
+  validWorkspaceNames,
+  workspaceOwner,
+  workspaceOwnerFile as markerLeaf,
+  workspaceIdentityFile as identityLeaf,
+  workspaceLockFile as lockLeaf,
+  type FlowWorkspace,
+  type FlowWorkspacePlacement,
+} from './flow-workspace-paths';
 import type { GraphAutomation } from './graph-automatic-delivery';
 
-export type FlowWorkspacePlacement =
-  { location: 'MANAGER' } | { location: 'TARGET'; target: SshTarget; root: string };
-
-export type FlowWorkspace = {
-  runId: string;
-  path: string;
-  placement: FlowWorkspacePlacement;
-};
+export type { FlowWorkspace, FlowWorkspacePlacement } from './flow-workspace-paths';
 
 export type FlowCheckout = { directory: string; source: GraphCheckoutSnapshot };
 
@@ -37,28 +43,14 @@ type FlowCommand = {
   automation?: boolean | GraphAutomation;
 };
 
-const workLeaf = 'workspace';
-const markerLeaf = 'owner';
-const lockLeaf = 'lock';
 const maxArchiveBytes = 1024 ** 3;
 
-function runDirectoryName(runId: string) {
-  if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(runId))
-    throw new ConflictException('执行流工作区的运行标识无效');
-  return 'veyops-flow-' + runId;
-}
-
 function ownership(runId: string, placement: FlowWorkspacePlacement) {
-  return createHmac('sha256', encryptionKey())
-    .update(
-      JSON.stringify([
-        'execution-workspace',
-        runId,
-        placement.location,
-        placement.location === 'MANAGER' ? null : [placement.target.id, placement.root],
-      ]),
-    )
-    .digest('hex');
+  return workspaceOwner(
+    runId,
+    placement.projectSlug,
+    placement.location === 'TARGET' ? { id: placement.target.id, root: placement.root } : undefined,
+  );
 }
 
 async function entry(path: string) {
@@ -85,7 +77,7 @@ async function makeDirectory(path: string) {
   return checkedDirectory(path);
 }
 
-function verifyRemoteControl(owner: string) {
+function remoteControlChecks(owner: string) {
   return [
     'test -d "$control"',
     'test ! -L "$control"',
@@ -95,13 +87,24 @@ function verifyRemoteControl(owner: string) {
     `test "$(cat -- "$control/${markerLeaf}")" = ${q(owner)}`,
     `test -f "$control/${lockLeaf}"`,
     `test ! -L "$control/${lockLeaf}"`,
-    `test -d "$control/${workLeaf}"`,
-    `test ! -L "$control/${workLeaf}"`,
+  ].join('\n');
+}
+
+function remoteWorkspaceChecks() {
+  return [
+    'test -d "$workspace"',
+    'test ! -L "$workspace"',
+    'test "$(realpath -e -- "$workspace")" = "$workspace"',
+    `test -f "$control/${identityLeaf}"`,
+    `test ! -L "$control/${identityLeaf}"`,
+    `test "$(cat -- "$control/${identityLeaf}")" = "$(stat -c '%d:%i' -- "$workspace")"`,
   ].join('\n');
 }
 
 @Injectable()
 export class FlowWorkspaceService {
+  private readonly localOpen = new Map<string, Promise<string>>();
+
   constructor(
     private readonly ssh: SshService,
     private readonly builds: BuildsService,
@@ -117,10 +120,21 @@ export class FlowWorkspaceService {
     priorPath?: string,
   ): Promise<FlowWorkspace> {
     signal?.throwIfAborted();
-    const name = runDirectoryName(runId);
+    if (!validWorkspaceNames(runId, placement.projectSlug))
+      throw new ConflictException('执行流工作区的项目或运行标识无效');
     const owner = ownership(runId, placement);
     if (placement.location === 'MANAGER') {
-      const path = await this.localWorkspace(name, owner, priorPath);
+      const pending = this.localOpen.get(owner);
+      const work = pending ?? this.localWorkspace(runId, placement.projectSlug, owner, priorPath);
+      if (!pending) this.localOpen.set(owner, work);
+      let path: string;
+      try {
+        path = await work;
+      } finally {
+        if (this.localOpen.get(owner) === work) this.localOpen.delete(owner);
+      }
+      if (priorPath !== undefined && priorPath !== path)
+        throw new ConflictException('执行流的管理端工作目录已变化');
       return { runId, placement, path };
     }
     const configured = validateWorkspaceRoot(placement.root);
@@ -137,21 +151,36 @@ export class FlowWorkspaceService {
         'test "$(realpath -m -- "$root")" = "$root"',
         ...(priorPath ? [] : ['mkdir -p -- "$root"']),
         'test "$(cd -P -- "$root" && pwd -P)" = "$root"',
-        `control="$root"/${q(name)}`,
+        `project="$root"/${q(placement.projectSlug)}`,
+        `controls="$project"/${controlsLeaf}`,
+        `control="$controls"/${q(runId)}`,
+        `workspace="$project"/${q(runId)}`,
         ...(priorPath
-          ? [`test "$control/${workLeaf}" = ${q(priorPath)}`]
+          ? [`test "$workspace" = ${q(priorPath)}`]
           : [
+              'test "$(realpath -m -- "$controls")" = "$controls"',
+              'mkdir -p -- "$controls"',
               'if test ! -e "$control" && test ! -L "$control"; then',
-              '  next=$(mktemp -d -- "$root/.veyops-flow-XXXXXXXX")',
+              '  next=$(mktemp -d -- "$controls/.new-XXXXXXXX")',
               '  trap \'rm -rf -- "$next"\' EXIT',
-              `  mkdir -- "$next/${workLeaf}"`,
               `  printf '%s\\n' ${q(owner)} > "$next/${markerLeaf}"`,
               `  : > "$next/${lockLeaf}"`,
               '  mv -T -n -- "$next" "$control"',
               'fi',
             ]),
-        verifyRemoteControl(owner),
-        `printf 'VEYOPS_FLOW_WORKSPACE=%s/${workLeaf}\\n' "$control"`,
+        remoteControlChecks(owner),
+        `exec 9<"$control/${lockLeaf}"`,
+        'flock -x 9',
+        ...(priorPath
+          ? []
+          : [
+              `if test ! -e "$control/${identityLeaf}" && test ! -L "$control/${identityLeaf}"; then`,
+              '  mkdir -- "$workspace"',
+              `  stat -c '%d:%i' -- "$workspace" > "$control/${identityLeaf}"`,
+              'fi',
+            ]),
+        remoteWorkspaceChecks(),
+        'printf \'VEYOPS_FLOW_WORKSPACE=%s\\n\' "$workspace"',
       ].join('\n'),
       {
         timeout: 30,
@@ -165,9 +194,10 @@ export class FlowWorkspaceService {
       .split(/\r?\n/)
       .filter((line) => line.startsWith('VEYOPS_FLOW_WORKSPACE='));
     const path = receipt.length === 1 ? receipt[0]!.slice('VEYOPS_FLOW_WORKSPACE='.length) : '';
+    const suffix = '/' + placement.projectSlug + '/' + runId;
     const receivedAtRoot = configured.startsWith('~/')
-      ? path.endsWith('/' + configured.slice(2) + '/' + name + '/' + workLeaf)
-      : path === configured + '/' + name + '/' + workLeaf;
+      ? path.endsWith('/' + configured.slice(2) + suffix)
+      : path === configured + suffix;
     if (
       result.exitCode !== 0 ||
       !path.startsWith('/') ||
@@ -179,20 +209,24 @@ export class FlowWorkspaceService {
     return { runId, placement, path };
   }
 
-  private async localWorkspace(name: string, owner: string, priorPath?: string) {
+  private async localWorkspace(
+    runId: string,
+    projectSlug: string,
+    owner: string,
+    priorPath?: string,
+  ) {
     if (!priorPath) await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
-    const base = join(await realpath(dataDirectory), 'flow-workspaces');
-    const control = join(
-      priorPath ? await checkedDirectory(base) : await makeDirectory(base),
-      name,
-    );
-    const workspace = join(control, workLeaf);
+    const base = join(await realpath(dataDirectory), managerWorkspaceDirectory);
+    const prepare = priorPath ? checkedDirectory : makeDirectory;
+    const project = await prepare(join(await prepare(base), projectSlug));
+    const controls = await prepare(join(project, controlsLeaf));
+    const control = join(controls, runId);
+    const workspace = join(project, runId);
     if (priorPath !== undefined && priorPath !== workspace)
       throw new ConflictException('执行流的管理端工作目录已变化');
     if (!priorPath && !(await entry(control))) {
-      const next = await mkdtemp(join(base, 'new-'));
+      const next = await mkdtemp(join(controls, '.new-'));
       try {
-        await mkdir(join(next, workLeaf), { mode: 0o700 });
         await writeFile(join(next, markerLeaf), owner + '\n', { mode: 0o600 });
         try {
           await rename(next, control);
@@ -206,6 +240,18 @@ export class FlowWorkspaceService {
     await checkedDirectory(control);
     const marker = join(control, markerLeaf);
     if (!(await entry(marker))?.isFile() || (await readFile(marker, 'utf8')) !== owner + '\n')
+      throw new ConflictException('执行流工作目录的归属无法确认');
+    const identity = join(control, identityLeaf);
+    if (!priorPath && !(await entry(identity))) {
+      await mkdir(workspace, { mode: 0o700 });
+      const details = await lstat(workspace, { bigint: true });
+      await writeFile(identity, `${details.dev}:${details.ino}\n`, { mode: 0o600, flag: 'wx' });
+    }
+    const details = await lstat(workspace, { bigint: true });
+    if (
+      !(await entry(identity))?.isFile() ||
+      (await readFile(identity, 'utf8')) !== `${details.dev}:${details.ino}\n`
+    )
       throw new ConflictException('执行流工作目录的归属无法确认');
     return checkedDirectory(workspace);
   }
@@ -303,7 +349,7 @@ export class FlowWorkspaceService {
     const size = (await lstat(archive)).size;
     if (packed.exitCode !== 0 || size === 0 || size > maxArchiveBytes)
       throw new ConflictException('源码检出打包失败或超过 1 GiB');
-    const control = posix.dirname(workspace.path);
+    const control = remoteWorkspaceControl(workspace.path, workspace.runId);
     const remote = control + '/checkout-' + randomUUID();
     const payload = remote + '/source.tar.gz';
     const destination = posix.join(workspace.path, directory);
@@ -398,9 +444,13 @@ export class FlowWorkspaceService {
       target,
       [
         'set -eu',
-        `control=${q(posix.dirname(workspace.path))}`,
-        verifyRemoteControl(ownership(workspace.runId, workspace.placement)),
-        `exec flock -n "$control/${lockLeaf}" /bin/sh -eu -c ${q(command)}`,
+        `workspace=${q(workspace.path)}`,
+        `control=${q(remoteWorkspaceControl(workspace.path, workspace.runId))}`,
+        remoteControlChecks(ownership(workspace.runId, workspace.placement)),
+        `exec 9<"$control/${lockLeaf}"`,
+        'flock -n 9',
+        remoteWorkspaceChecks(),
+        `( exec 9<&-; exec /bin/sh -eu -c ${q(command)} )`,
       ].join('\n'),
       options,
     );
@@ -412,15 +462,16 @@ export class FlowWorkspaceService {
   async cleanup(workspace: FlowWorkspace, signal?: AbortSignal) {
     await this.open(workspace.runId, workspace.placement, signal, workspace.path);
     if (workspace.placement.location === 'MANAGER') {
-      const control = dirname(workspace.path);
-      if (basename(control) !== runDirectoryName(workspace.runId))
+      if (basename(workspace.path) !== workspace.runId)
         throw new ConflictException('拒绝清理未经确认的执行流工作目录');
+      await rm(workspace.path, { recursive: true, force: true });
+      const control = localWorkspaceControl(workspace.path, workspace.runId);
       await rm(control, { recursive: true, force: true });
     } else {
       await this.requireRemote(
         workspace,
         workspace.placement.target,
-        `rm -rf -- ${q(posix.dirname(workspace.path))}`,
+        `rm -rf -- ${q(workspace.path)} ${q(remoteWorkspaceControl(workspace.path, workspace.runId))}`,
         { timeout: 60, signal },
       );
     }

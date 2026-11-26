@@ -16,7 +16,7 @@ import { deploymentLock } from '../deployments/deployment-lock';
 import { normalizeReleasePath as snapshotPath } from '../deployments/deployment-scope';
 import { DeploymentsService } from '../deployments/deployments.service';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
-import { shellQuote as q } from '../pipelines/pipeline.validation';
+import { shellQuote as q, shellWorkspacePath } from '../pipelines/pipeline.validation';
 import type { ComposeReleaseEvidence } from '../service-configs/compose-template-reference';
 import { terminalTaskStatuses, type TaskPayload } from '../tasks/tasks.types';
 import type { GraphReleaseResult } from './graph-release-gates';
@@ -125,17 +125,16 @@ function inspectCommand(
   const owner = q(`${scope.projectId}:${scope.serviceId}:${scope.environmentId}`);
   const releaseCase = (entry: ReleaseEvidence | undefined, status: 'CURRENT' | 'PREVIOUS') => {
     if (!entry) return '';
-    const path = `${root}/releases/${entry.releaseKey}`;
     return `${q(`releases/${entry.releaseKey}`)})
     result=${status}
-    release_dir=${q(path)}
+    release_dir="$root/releases/${entry.releaseKey}"
     test ! -L "$release_dir" && test -d "$release_dir" && test "$(realpath -e -- "$release_dir")" = "$release_dir" || exit 42
     ${compose ? verifyComposeRelease(scope, entry.compose) : ':'}
     ;;`;
   };
   const noActive = compose ? 'exit 42' : 'result=NO_ACTIVE_RELEASE';
   return `set -eu
-root=${q(root)}
+root=${shellWorkspacePath(root)}
 current="$root/current"
 test ! -L /var/tmp && test -d /var/tmp && test "$(stat -c '%u:%a' -- /var/tmp)" = 0:1777 || exit 42
 if test -e ${lockDirectory} || test -L ${lockDirectory}; then
@@ -145,7 +144,8 @@ fi
 lock_state() { if ${lockCheck}; then printf CLEAR; else printf HELD; fi; }
 before=$(lock_state)
 test ! -L "$root" && test "$(realpath -m -- "$root")" = "$root" || exit 42
-test -d ${q(posix.dirname(root))} && test -x ${q(posix.dirname(root))} || exit 42
+parent=${shellWorkspacePath(posix.dirname(root))}
+test -d "$parent" && test -x "$parent" || exit 42
 if test -e "$root"; then
   test -d "$root" && test -x "$root" || exit 42
   test ! -L "$root/.veyops-managed" && test -f "$root/.veyops-managed" || exit 42

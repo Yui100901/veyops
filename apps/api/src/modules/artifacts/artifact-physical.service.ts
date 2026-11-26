@@ -16,6 +16,7 @@ import { dataDirectory, encryptionKey } from '../../core/config';
 import { ProcessRunnerService } from '../../infrastructure/build-runner/process-runner.service';
 import { SshService, type SshTarget } from '../../infrastructure/ssh/ssh.service';
 import { CredentialsService } from '../credentials/credentials.service';
+import type { FlowWorkspace } from '../execution-graphs/flow-workspace-paths';
 import { relativePath, shellQuote as q } from '../pipelines/pipeline.validation';
 import { checkRegistryManifest } from '../registries/registry-connection';
 import { RegistriesService } from '../registries/registries.service';
@@ -27,6 +28,15 @@ import {
   type ArtifactDigest,
   type PathArtifactKind,
 } from './artifact-physical-paths';
+import {
+  checkLocalWorkspaceArtifact,
+  checkRemoteWorkspaceArtifact,
+  checkWorkspaceSelection,
+  copyWorkspaceExport,
+  workspaceArtifactDigest,
+  workspaceArtifactOwner,
+  type WorkspaceArtifactLocation,
+} from './flow-workspace-artifact';
 
 export interface ArtifactPhysical {
   kind: PathArtifactKind | 'DOCKER_IMAGE';
@@ -47,6 +57,7 @@ export interface ArtifactPhysical {
   registryId?: string;
   digest?: string;
   ownerToken?: string;
+  workspace?: WorkspaceArtifactLocation;
 }
 export type ArtifactVerification = {
   status: 'AVAILABLE' | 'MISSING' | 'CHANGED' | 'UNVERIFIABLE';
@@ -226,6 +237,62 @@ export class ArtifactPhysicalService {
       },
     );
     return { exitCode, stdout, stderr };
+  }
+
+  async retainFlowWorkspace(input: {
+    workspace: FlowWorkspace;
+    excludePaths?: string[];
+    signal?: AbortSignal;
+  }): Promise<ArtifactPhysical> {
+    const { runId, path, placement } = input.workspace;
+    const target = placement.location === 'TARGET' ? placement.target : undefined;
+    if (target && !target.hostKeyFingerprint)
+      throw new BadRequestException('目标端留档需要已确认 SSH 指纹');
+    const workspace: WorkspaceArtifactLocation = {
+      projectSlug: placement.projectSlug,
+      runId,
+      ...(placement.location === 'TARGET' && { targetRoot: placement.root }),
+      ...(input.excludePaths?.length && { excludePaths: input.excludePaths }),
+    };
+    const ownerToken = workspaceArtifactOwner(workspace, target);
+    const physical: ArtifactPhysical = {
+      kind: 'DIRECTORY',
+      collection: 'WORK_DIRECTORY',
+      location: target ? 'SERVER_PATH' : 'BUILDER_PATH',
+      owner: 'MANAGED',
+      path,
+      workspace,
+      ownerToken,
+      ...(target
+        ? { serverId: target.id, hostKeyFingerprint: target.hostKeyFingerprint! }
+        : { builderId: 'manager' }),
+    };
+    try {
+      return { ...physical, ...(await this.measureFlowWorkspace(physical, target, input.signal)) };
+    } catch (error) {
+      if (input.signal?.aborted) throw error;
+      throw new ConflictException('执行目录无法验证，留档未登记');
+    }
+  }
+
+  private async measureFlowWorkspace(
+    physical: ArtifactPhysical,
+    target?: SshTarget,
+    signal?: AbortSignal,
+  ) {
+    if (target) {
+      const probe = await this.server(
+        target,
+        [this.serverSlot(physical, target), linuxArtifactDigest, 'workspace_digest'].join('\n'),
+        signal,
+      );
+      if (probe.exitCode === 44) throw new ArtifactOutputMissing();
+      if (probe.exitCode === 45) throw new InvalidArtifactObject();
+      if (probe.exitCode !== 0) throw new Error('执行目录校验失败');
+      return parseDigest(probe.stdout);
+    }
+    await checkLocalWorkspaceArtifact(physical.path!, physical.workspace!, physical.ownerToken!);
+    return workspaceArtifactDigest(physical.path!, physical.workspace!, signal);
   }
 
   async collectServerPath(
@@ -474,6 +541,13 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
       physical.serverId !== target.id
     )
       throw new InvalidArtifactObject();
+    if (physical.workspace)
+      return checkRemoteWorkspaceArtifact(
+        physical.path,
+        physical.workspace,
+        physical.ownerToken,
+        target,
+      );
     const instance = posix.basename(posix.dirname(physical.path));
     const suffix = '/.veyops/artifacts/' + instance + '/payload';
     if (
@@ -675,7 +749,9 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
       if (physical.kind === 'DOCKER_IMAGE' || !physical.sha256 || !sha256.test(physical.sha256))
         return outcome('CHANGED');
       let measured: ArtifactDigest;
-      if (physical.location === 'SERVER_PATH' && target) {
+      if (physical.workspace && (target || physical.location === 'BUILDER_PATH')) {
+        measured = await this.measureFlowWorkspace(physical, target, signal);
+      } else if (physical.location === 'SERVER_PATH' && target) {
         const probe = await this.server(
           target,
           [
@@ -701,6 +777,7 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
           : 'CHANGED',
       );
     } catch (error) {
+      if (error instanceof ArtifactOutputMissing) return outcome('MISSING');
       if (error instanceof InvalidArtifactObject) return outcome('CHANGED');
       if (physical.location === 'BUILDER_PATH' && hasErrno(error, 'ENOENT'))
         return outcome('MISSING');
@@ -766,6 +843,11 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
     )
       throw new ConflictException('无法将该产物应用到当前服务器');
     const selected = artifactSelection(physical, configuredPath);
+    try {
+      if (physical.workspace) checkWorkspaceSelection(selected, physical.workspace);
+    } catch {
+      throw new ConflictException('产物中找不到已选子路径，或该路径无法发布');
+    }
     const receipt = await this.server(
       target,
       [
@@ -778,12 +860,21 @@ printf '%s\n%s\n' "$slot/payload" "$measured"
         'kind=' + q(physical.kind),
         'selected=' + q(selected),
         String.raw`
-[[ "$(artifact_digest "$kind" "$slot/payload")" == "$expected" ]] || exit 45
-${remoteSelectPath}
 parent=$(dirname -- "$archive")
 [[ "$(realpath -e -- "$parent")" == "$parent" && ! -e "$archive" && ! -L "$archive" ]]
 stage=$(mktemp -d "$parent/.pickup-XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
+`,
+        physical.workspace
+          ? String.raw`
+slot="$stage/export"
+mkdir -p -- "$slot/payload"
+workspace_copy "$slot/payload"
+`
+          : '',
+        String.raw`
+[[ "$(artifact_digest "$kind" "$slot/payload")" == "$expected" ]] || exit 45
+${remoteSelectPath}
 mkdir -- "$stage/files"
 cp -a -- "$source" "$stage/files/$name"
 [[ "$(artifact_digest "$kind" "$stage/files/$name")" == "$expected" ]] || exit 45
@@ -813,14 +904,26 @@ printf '%s:%s\n' "$(checksum "$archive")" "$(stat -c '%s' -- "$archive")"
     const path = artifactSelection(physical, configuredPath);
     if (physical.location !== 'BUILDER_PATH' || physical.kind === 'DOCKER_IMAGE')
       throw new ConflictException('无法读取管理端文件产物');
+    let workspaceStage: string | undefined;
     try {
-      const slot = await this.builderSlot(physical);
-      const measured = await this.readyBuilderSlot(
-        slot,
-        physical.ownerToken!,
-        physical.kind,
-        signal,
-      );
+      if (physical.workspace) {
+        checkWorkspaceSelection(path, physical.workspace);
+        await checkLocalWorkspaceArtifact(physical.path!, physical.workspace, physical.ownerToken!);
+        workspaceStage = await mkdtemp(join(dirname(archive), '.workspace-'));
+        await copyWorkspaceExport(
+          physical.path!,
+          join(workspaceStage, 'payload'),
+          physical.workspace,
+          signal,
+        );
+      }
+      const slot = workspaceStage ?? (await this.builderSlot(physical));
+      const kind = physical.kind;
+      const measure = () =>
+        workspaceStage
+          ? artifactPathDigest(join(slot, 'payload'), kind, signal)
+          : this.readyBuilderSlot(slot, physical.ownerToken!, kind, signal);
+      const measured = await measure();
       if (measured.sha256 !== physical.sha256 || measured.sizeBytes !== physical.sizeBytes)
         throw new InvalidArtifactObject();
       const source = await this.builderSelection(slot, path);
@@ -842,12 +945,7 @@ printf '%s:%s\n' "$(checksum "$archive")" "$(stat -c '%s' -- "$archive")"
           { timeout: 180, signal },
         );
         if (packaged.exitCode !== 0) throw new InvalidArtifactObject();
-        const after = await this.readyBuilderSlot(
-          slot,
-          physical.ownerToken!,
-          physical.kind,
-          signal,
-        );
+        const after = await measure();
         if (after.sha256 !== measured.sha256 || after.sizeBytes !== measured.sizeBytes)
           throw new InvalidArtifactObject();
         const { sha256: checksum, sizeBytes } = await artifactPathDigest(archive, 'FILE', signal);
@@ -860,6 +958,8 @@ printf '%s:%s\n' "$(checksum "$archive")" "$(stat -c '%s' -- "$archive")"
       if (error instanceof InvalidArtifactObject || hasErrno(error, 'ENOENT'))
         throw new ConflictException('管理端产物或所选子路径缺失、已变化或无法归档');
       throw error;
+    } finally {
+      if (workspaceStage) await rm(workspaceStage, { recursive: true, force: true });
     }
   }
 
@@ -876,9 +976,18 @@ printf '%s:%s\n' "$(checksum "$archive")" "$(stat -c '%s' -- "$archive")"
     const target = await this.servers.get(physical.serverId);
     const stage = await this.server(
       target,
-      ['umask 077', this.serverSlot(physical, target), 'mktemp -d "$root/.pickup-XXXXXXXX"'].join(
-        '\n',
-      ),
+      [
+        'umask 077',
+        this.serverSlot(physical, target),
+        ...(physical.workspace
+          ? [
+              remoteArtifactRoot,
+              'mkdir -p -- "$root"',
+              '[[ "$(realpath -e -- "$root")" == "$root" ]]',
+            ]
+          : []),
+        'mktemp -d "$root/.pickup-XXXXXXXX"',
+      ].join('\n'),
       signal,
     );
     const directory = stage.stdout.trim();
@@ -904,8 +1013,8 @@ printf '%s:%s\n' "$(checksum "$archive")" "$(stat -c '%s' -- "$archive")"
     }
   }
 
-  private async builderSelection(slot: string, path: string) {
-    const root = join(slot, 'payload');
+  private async builderSelection(slot: string, path: string, workspace?: boolean) {
+    const root = workspace ? slot : join(slot, 'payload');
     const source = resolve(root, path);
     if ((path !== '.' && !containedPath(root, source)) || (await realpath(source)) !== source)
       throw new InvalidArtifactObject();
@@ -916,8 +1025,17 @@ printf '%s:%s\n' "$(checksum "$archive")" "$(stat -c '%s' -- "$archive")"
     const path = artifactSelection(physical, configuredPath);
     if (path === '.' || !physical) return;
     try {
+      if (physical.workspace) checkWorkspaceSelection(path, physical.workspace);
       if (physical.location === 'BUILDER_PATH') {
-        await this.builderSelection(await this.builderSlot(physical), path);
+        if (physical.workspace) {
+          const workspace = physical.path!;
+          await checkLocalWorkspaceArtifact(workspace, physical.workspace, physical.ownerToken!);
+          const selected = await this.builderSelection(workspace, path, true);
+          const details = await lstat(selected);
+          if (!details.isDirectory() && !details.isFile()) throw new InvalidArtifactObject();
+        } else {
+          await this.builderSelection(await this.builderSlot(physical), path);
+        }
       } else if (physical.location === 'SERVER_PATH' && physical.serverId) {
         const target = await this.servers.get(physical.serverId);
         const result = await this.server(
@@ -927,7 +1045,9 @@ printf '%s:%s\n' "$(checksum "$archive")" "$(stat -c '%s' -- "$archive")"
             linuxArtifactDigest,
             'kind=' + q(physical.kind),
             'selected=' + q(path),
-            remoteSelectPath,
+            physical.workspace
+              ? 'source="$workspace/$selected"; [[ "$(realpath -e -- "$source")" == "$source" && ( -f "$source" || -d "$source" ) ]]'
+              : remoteSelectPath,
           ].join('\n'),
         );
         if (result.exitCode !== 0) throw new InvalidArtifactObject();
@@ -953,6 +1073,39 @@ printf '%s:%s\n' "$(checksum "$archive")" "$(stat -c '%s' -- "$archive")"
     if (state.status !== 'AVAILABLE') return { status: 'RETRY', reason: state.reason };
     try {
       if (physical.serverId && !target) target = await this.servers.get(physical.serverId);
+      if (physical.workspace) {
+        if (physical.location === 'SERVER_PATH' && target) {
+          const candidate = await this.server(
+            target,
+            [
+              this.serverSlot(physical, target),
+              linuxArtifactDigest,
+              'expected=' + q(physical.sha256 + ':' + physical.sizeBytes),
+              '[[ "$(workspace_digest)" == "$expected" ]] || exit 45',
+              'rm -rf -- "$workspace" "$control"',
+            ].join('\n'),
+            signal,
+          );
+          if (candidate.exitCode === 0 || candidate.exitCode === 44) return { status: 'DELETED' };
+          return {
+            status: 'RETRY',
+            reason: candidate.exitCode === 45 ? reasons.CHANGED : reasons.UNVERIFIABLE,
+          };
+        }
+        if (physical.location !== 'BUILDER_PATH') return { status: 'RETRY' };
+        const path = physical.path!;
+        const control = await checkLocalWorkspaceArtifact(
+          path,
+          physical.workspace,
+          physical.ownerToken!,
+        );
+        const measured = await workspaceArtifactDigest(path, physical.workspace, signal);
+        if (measured.sha256 !== physical.sha256 || measured.sizeBytes !== physical.sizeBytes)
+          return { status: 'RETRY', reason: reasons.CHANGED };
+        await rm(path, { recursive: true, force: false });
+        await rm(control, { recursive: true, force: false });
+        return { status: 'DELETED' };
+      }
       if (physical.location === 'DOCKER_ENGINE') {
         if (target && target.hostKeyFingerprint !== physical.hostKeyFingerprint)
           return { status: 'RETRY', reason: fingerprintChanged };

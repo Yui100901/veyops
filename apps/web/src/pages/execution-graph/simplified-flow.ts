@@ -31,7 +31,6 @@ export interface SimplifiedRelease {
   serviceId?: string;
   targets?: DeploymentSelection;
   reuseExecutionServer?: boolean;
-  deployPath?: string;
   contentPath?: string;
   artifactId?: string;
   allowArtifactOverride?: boolean;
@@ -60,7 +59,6 @@ export interface SimplifiedStart {
 export interface SimplifiedFinish {
   saveWorkspace?: boolean;
   retention?: 'PERSISTENT' | 'RUN';
-  excludePaths?: string[];
   images?: SimplifiedFinishImage[];
   requireRelease?: 'ACTIVATED' | 'HEALTHY';
 }
@@ -155,7 +153,6 @@ export interface SimplifiedPublicPlan {
     serviceId: string;
     serverIds: string[];
     artifactId?: string;
-    deployPath: string;
     contentPath?: string;
     method: string;
     image?: { id: string; name: string };

@@ -34,7 +34,6 @@ function deployment(): GraphCanvas {
           release: {
             serviceId,
             targets: { serverIds: [serverId] },
-            deployPath: '/srv/app',
             contentPath: 'app/dist/',
           },
         },
@@ -253,9 +252,9 @@ test('V2 rejects legacy writes and still permits saving incomplete configuration
   canvas.endpoints[0]!.outputBindings = {};
   assert.equal(canvasIssues(canvas)[0]?.fieldId, 'outputBindings');
   delete canvas.endpoints[0]!.outputBindings;
-  canvas.nodes[0]!.start!.release!.contentPath = '';
+  delete canvas.nodes[0]!.start!.release!.serviceId;
   assert.doesNotThrow(() => compileCanvas(canvas, false));
-  assert.equal(canvasIssues(canvas)[0]?.fieldId, 'start.release.contentPath');
+  assert.equal(canvasIssues(canvas)[0]?.fieldId, 'start.release.serviceId');
 });
 
 test('V2 computes safe repository directories and identifies overlapping roots', () => {

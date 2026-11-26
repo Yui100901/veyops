@@ -4,6 +4,7 @@ import type { Kysely, Selectable } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database, DeploymentRecordsTable } from '../../core/database/schema';
 import type { PipelineSnapshot, PipelineTarget } from '../pipelines/pipeline.types';
+import { isProjectReleasePath } from '../pipelines/pipeline.validation';
 import type { TaskPayload } from '../tasks/tasks.types';
 import { lockTaskLease, TaskLeaseUnavailableError } from '../tasks/task-lease';
 import { assertCurrentTargets, serviceReleasePolicy } from './release-policy';
@@ -63,6 +64,20 @@ export class DeploymentsService {
       .executeTakeFirst();
     if (occupied && occupied.release_scope_key !== deploymentScopeKey(scope, serverId))
       throw new ConflictException('部署目录已有其他发布，请先核查当前部署方式及归属');
+    if (isProjectReleasePath(scope.definition.deployPath)) {
+      const previous = await db
+        .selectFrom('deployment_records')
+        .select('deploy_path')
+        .where('service_id', '=', scope.serviceId)
+        .where('environment_id', '=', scope.environmentId)
+        .where('server_id', '=', serverId)
+        .where((eb) => eb.or([eb('activated_at', 'is not', null), eb('status', '=', 'SUCCESS')]))
+        .orderBy((eb) => eb.fn.coalesce('activated_at', 'started_at'), 'desc')
+        .orderBy('id', 'desc')
+        .executeTakeFirst();
+      if (previous?.deploy_path && previous.deploy_path !== scope.definition.deployPath)
+        throw new ConflictException('该服务在当前服务器已有其他位置的发布，请先核查现有实例');
+    }
   }
 
   async assertAutomaticDelivery(

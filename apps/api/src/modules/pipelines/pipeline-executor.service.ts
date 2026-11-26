@@ -43,7 +43,13 @@ import type {
   PipelineSnapshot,
 } from './pipeline.types';
 import { isStandaloneGraphBuild } from './pipeline.types';
-import { deploymentGuard, relativePath, shellQuote as q } from './pipeline.validation';
+import {
+  deploymentGuard,
+  isProjectReleasePath,
+  relativePath,
+  shellQuote as q,
+  shellWorkspacePath as remotePath,
+} from './pipeline.validation';
 import { serializeComposeEnvironment } from './environment.serialization';
 import { createTargetWorkspace, targetWorkspacePath } from './target-workspace';
 import { composeHealthCheck, httpHealthCheck, waitForReleaseHealth } from './release-health';
@@ -170,7 +176,7 @@ export class PipelineExecutor {
       const activePath = `${path}/${expectedLink}`;
       const guard = await this.ssh.execute(
         target,
-        `test "$(readlink -- ${q(path + '/current')})" = ${q(expectedLink)} && test "$(realpath -e -- ${q(activePath)})" = ${q(activePath)} && test -d ${q(activePath)}`,
+        `test "$(readlink -- ${remotePath(path + '/current')})" = ${q(expectedLink)} && test "$(realpath -e -- ${remotePath(activePath)})" = ${remotePath(activePath)} && test -d ${remotePath(activePath)}`,
         { timeout: 30, signal: context.signal },
       );
       if (guard.signal || guard.exitCode !== 0) {
@@ -181,7 +187,7 @@ export class PipelineExecutor {
         checkedIdentity = true;
         const check = await this.ssh.execute(
           target,
-          `cd -- ${q(activePath)} || exit 90\n${command}`,
+          `cd -- ${remotePath(activePath)} || exit 90\n${command}`,
           {
             timeout: timeoutSeconds,
             signal: context.signal,
@@ -540,7 +546,7 @@ export class PipelineExecutor {
                 const currentPath = `${snapshot.definition.deployPath}/current`;
                 const link = await this.builds.remoteCapture(
                   target,
-                  `readlink -- ${q(currentPath)}`,
+                  `readlink -- ${remotePath(currentPath)}`,
                   session,
                   30,
                 );
@@ -548,7 +554,7 @@ export class PipelineExecutor {
                   throw new BuildCommandError(1, '远端当前发布与已记录版本不一致，请先核查');
               });
             } else if (snapshot.graphDeployment) {
-              const current = q(`${snapshot.definition.deployPath}/current`);
+              const current = remotePath(`${snapshot.definition.deployPath}/current`);
               await step('PREPARE', '确认部署位置没有其他当前版本', () =>
                 this.builds.remote(
                   target,
@@ -1291,9 +1297,12 @@ export class PipelineExecutor {
       p = d.deployPath,
       release = p + '/releases/' + session.taskId;
     const owner = `${s.projectId}:${s.serviceId}:${s.environmentId}`;
+    const archiveLegacyBuild = isProjectReleasePath(p)
+      ? ''
+      : `cp -- ${q(archive)} ${remotePath(p + '/.artifacts/' + session.taskId + '.tar.gz')}\n`;
     await this.builds.remote(
       target,
-      `set -eu\n${deploymentGuard(p, owner)}\nprintf '%s  %s\\n' ${q(checksum)} ${q(archive)} | sha256sum -c -\ntest ! -e ${q(release)} && test ! -L ${q(release)}\nmkdir ${q(release)}\ntar -xzf ${q(archive)} -C ${q(release)} --no-same-owner\ncp -- ${q(archive)} ${q(p + '/.artifacts/' + session.taskId + '.tar.gz')}\n`,
+      `set -eu\n${deploymentGuard(p, owner)}\nprintf '%s  %s\\n' ${q(checksum)} ${q(archive)} | sha256sum -c -\ntest ! -e ${remotePath(release)} && test ! -L ${remotePath(release)}\nmkdir ${remotePath(release)}\ntar -xzf ${q(archive)} -C ${remotePath(release)} --no-same-owner\n${archiveLegacyBuild}`,
       session,
       300,
     );
@@ -1301,7 +1310,7 @@ export class PipelineExecutor {
   private switchRelease(session: BuildSession) {
     const path = session.snapshot.definition.deployPath;
     const next = `${path}/.current-${session.taskId}`;
-    return `ln -s ${q('releases/' + session.taskId)} ${q(next)}; mv -Tf -- ${q(next)} ${q(path + '/current')}`;
+    return `ln -s ${q('releases/' + session.taskId)} ${remotePath(next)}; mv -Tf -- ${remotePath(next)} ${remotePath(path + '/current')}`;
   }
   private async activateFileRelease(
     target: SshTarget,
@@ -1313,7 +1322,7 @@ export class PipelineExecutor {
     let stop = '';
     if (stopCommand && stoppedRelease) {
       const path = session.snapshot.definition.deployPath;
-      const current = q(`${path}/current`);
+      const current = remotePath(`${path}/current`);
       const envFile = `${work}/stop.env`;
       await this.uploadReleaseEnvironment(target, envFile, stoppedRelease);
       stop = `if test -e ${current} || test -L ${current}; then
@@ -1321,9 +1330,9 @@ export class PipelineExecutor {
   version=\${previous#releases/}
   test "$previous" = "releases/$version"
   case "$version" in ''|*[!a-fA-F0-9-]*) exit 1 ;; esac
-  test ! -L ${q(path + '/releases/')}"$version"
+  test ! -L ${remotePath(path + '/releases/')}"$version"
   test -d ${current}
-  ( . ${q(envFile)}; cd ${current}; ${stopCommand}
+  ( cd ${current}; . ${q(envFile)}; ${stopCommand}
   )
 fi
 `;
@@ -1424,16 +1433,28 @@ fi
     }
     await this.builds.remote(
       target,
-      `set -eu; ${deploymentGuard(p, `${s.projectId}:${s.serviceId}:${s.environmentId}`)}; test ! -e ${q(release)} && test ! -L ${q(release)}; mkdir ${q(release)}`,
+      `set -eu; ${deploymentGuard(p, `${s.projectId}:${s.serviceId}:${s.environmentId}`)}; test ! -e ${remotePath(release)} && test ! -L ${remotePath(release)}; mkdir ${remotePath(release)}`,
       session,
       30,
     );
-    if (composeYaml)
-      await this.ssh.uploadContent(target, composeYaml, release + '/compose.yaml', {
-        timeout: 60,
+    // SFTP takes literal paths. Stage uploads in the absolute task directory.
+    const uploadContent = async (name: string, content: string, timeout: number) => {
+      const destination = release + '/' + name;
+      const upload = destination.startsWith('~/') ? work + '/' + name : destination;
+      await this.ssh.uploadContent(target, content, upload, {
+        timeout,
         signal: session.context.signal,
         mode: 0o600,
       });
+      if (upload !== destination)
+        await this.builds.remote(
+          target,
+          `mv -Tf -- ${q(upload)} ${remotePath(destination)}`,
+          session,
+          30,
+        );
+    };
+    if (composeYaml) await uploadContent('compose.yaml', composeYaml, 60);
     else if (artifact) throw new Error('缺少已归档的 Compose 配置');
     else if (manager?.localCompose)
       await this.ssh.upload(target, manager.localCompose, release + '/compose.yaml', {
@@ -1443,7 +1464,7 @@ fi
     else
       await this.builds.remote(
         target,
-        `set -eu; ${enterRepositoryDirectory(work, d.repoPath)}; ${resolveRepositoryFile(d.composeFilePath)}; cp -- "$veyops_file" ${q(release + '/compose.yaml')}`,
+        `set -eu; ${enterRepositoryDirectory(work, d.repoPath)}; ${resolveRepositoryFile(d.composeFilePath)}; cp -- "$veyops_file" ${remotePath(release + '/compose.yaml')}`,
         session,
         30,
       );
@@ -1473,12 +1494,8 @@ fi
 
     const configure = async (reference: string) => {
       const env = serializeComposeEnvironment({ ...session.variables, VEYOPS_IMAGE: reference });
-      await this.ssh.uploadContent(target, env, release + '/.env', {
-        timeout: 30,
-        signal: session.context.signal,
-        mode: 0o600,
-      });
-      const compose = `VEYOPS_IMAGE=${q(reference)} ${docker} compose --project-name ${q(project)} --env-file ${q(release + '/.env')} -f ${q(release + '/compose.yaml')}`;
+      await uploadContent('.env', env, 30);
+      const compose = `VEYOPS_IMAGE=${q(reference)} ${docker} compose --project-name ${q(project)} --env-file ${remotePath(release + '/.env')} -f ${remotePath(release + '/compose.yaml')}`;
       const images = (
         await this.builds.remoteCapture(
           target,
@@ -1653,7 +1670,7 @@ test "$(${docker} image inspect --format ${q(inspect)} ${q(imageReference)})" = 
     await this.uploadReleaseEnvironment(target, envFile, session);
     await this.builds.remote(
       target,
-      `set -eu; . ${q(envFile)}; cd ${q(session.snapshot.definition.deployPath + '/current')}; ${command}`,
+      `set -eu; cd ${remotePath(session.snapshot.definition.deployPath + '/current')}; . ${q(envFile)}; ${command}`,
       session,
       timeout,
       failureMessage,

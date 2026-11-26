@@ -31,6 +31,7 @@ export async function artifactPathDigest(
   path: string,
   kind: PathArtifactKind,
   signal?: AbortSignal,
+  filter?: (relativePath: string, name: string) => boolean,
 ): Promise<ArtifactDigest> {
   const root = await lstat(path);
   if (kind === 'FILE' && root.isFile()) return fileDigest(path, signal);
@@ -41,8 +42,10 @@ export async function artifactPathDigest(
     const entries = await readdir(directory, { encoding: 'buffer', withFileTypes: true });
     for (const entry of entries) {
       const name = new TextDecoder('utf-8', { fatal: true }).decode(entry.name);
-      if (!entry.isDirectory() && !entry.isFile()) throw new InvalidArtifactObject();
       const relative = relativeDirectory ? relativeDirectory + '/' + name : name;
+      if (filter && (!filter(relative, name) || (!entry.isDirectory() && !entry.isFile())))
+        continue;
+      if (!entry.isDirectory() && !entry.isFile()) throw new InvalidArtifactObject();
       names.push({ relative, nameBytes: Buffer.from('./' + relative), file: entry.isFile() });
       if (entry.isDirectory()) await walk(join(directory, name), relative);
     }

@@ -144,7 +144,7 @@ export function SystemPage({ user }: { user: User }) {
             </div>
             <div className="setting-row">
               <span>
-                <HardDrive size={17} /> 目标端工作目录
+                <HardDrive size={17} /> 目标端工作根目录
               </span>
               <strong className="mono">{value?.targetWorkspaceRoot ?? '—'}</strong>
             </div>

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
-import { shellQuote as quote } from '../pipelines/pipeline.validation';
+import { shellQuote as quote, shellWorkspacePath } from '../pipelines/pipeline.validation';
 import { normalizeReleasePath } from './deployment-scope';
 
 const lockDirectory = '/var/tmp/.veyops-deployment-locks';
@@ -24,7 +24,9 @@ printf '%s' ${token} > ${path}/owner`;
   const rootParts = root.split('/');
   const managedParentChecks = snapshot.graphDeployment
     ? rootParts.slice(2).map((_, index) => {
-        const marker = quote(rootParts.slice(0, index + 2).join('/') + '/.veyops-managed');
+        const marker = shellWorkspacePath(
+          rootParts.slice(0, index + 2).join('/') + '/.veyops-managed',
+        );
         return `test ! -e ${marker} && test ! -L ${marker} || exit 76`;
       })
     : [];
@@ -35,7 +37,7 @@ umask 077
 if ${parentGuard}; then mkdir -m 700 -- ${lockDirectory} 2>/dev/null || :; fi
 ${namespaceGuard}
 # Reject alias paths before acquiring the path lock.
-test "$(realpath -m -- ${quote(root)})" = ${quote(root)} || exit 76
+test "$(realpath -m -- ${shellWorkspacePath(root)})" = ${shellWorkspacePath(root)} || exit 76
 ${managedParentChecks.join('\n')}
 ${acquire(locks[0]!)}
 if ! mkdir -m 700 -- ${locks[1]!}; then

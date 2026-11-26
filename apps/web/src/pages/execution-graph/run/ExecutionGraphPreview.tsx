@@ -801,7 +801,7 @@ export function SimplifiedPlanDetails({
                 本次发布镜像 · <code>{release.image.name}</code>
               </small>
             )}
-            {release.contentPath && (
+            {release.method === 'FILE' && release.contentPath && (
               <small>
                 快照发布内容 · <code>{release.contentPath}</code>
               </small>
@@ -811,18 +811,15 @@ export function SimplifiedPlanDetails({
                 Compose 配置 · <code>{release.compose.path}</code>
               </small>
             )}
-            <small>
-              目标发布目录 · <code>{release.deployPath}</code>
-            </small>
           </div>
         </section>
       )}
       <section>
         <h4>结束结果</h4>
         <div className="execution-plan-row">
-          {plan.workspaceRetention === 'PERSISTENT' && <span>保存工作区快照，可历史重发</span>}
-          {plan.workspaceRetention === 'RUN' && <span>工作区快照仅供本次运行使用</span>}
-          {plan.workspaceRetention === 'OFF' && <span>本次不生成工作区快照</span>}
+          {plan.workspaceRetention === 'PERSISTENT' && <span>保留整个执行目录，可历史重发</span>}
+          {plan.workspaceRetention === 'RUN' && <span>执行目录仅供本次运行使用</span>}
+          {plan.workspaceRetention === 'OFF' && <span>执行目录随运行结束清理</span>}
           {plan.imageTagVariable && (
             <span>
               脚本镜像标签变量 <code>{plan.imageTagVariable}</code>

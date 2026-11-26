@@ -199,13 +199,12 @@ async function checkTemplates(databaseUrl?: string) {
     start.release = {
       serviceId: service.id,
       targets: { serverIds: [target.id] },
-      deployPath: '/tmp/veyops-flow-template-fixture',
     };
-    const missingSelection = await api
+    const wholeWorkspace = await api
       .post(`${path}/validate`)
       .send({ definition: { canvas: ready } })
       .expect(201);
-    assert.equal(missingSelection.body.data.issues[0].fieldId, 'start.release.contentPath');
+    assert.deepEqual(wholeWorkspace.body.data.issues, []);
     start.release.contentPath = 'project/dist/';
     const readyDraft = (await save(ready, saved.revision).expect(200)).body.data;
     const published = (

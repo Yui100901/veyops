@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import type { PipelineSnapshot } from '../pipelines/pipeline.types';
-import { safeDeployPath } from '../pipelines/pipeline.validation';
+import { releasePath } from '../pipelines/pipeline.validation';
 
 export type ReleaseScope = Pick<
   PipelineSnapshot,
@@ -9,7 +9,7 @@ export type ReleaseScope = Pick<
 > & { definition: Pick<PipelineSnapshot['definition'], 'artifactType' | 'deployPath'> };
 
 export function normalizeReleasePath(path: string) {
-  return safeDeployPath(posix.normalize(safeDeployPath(path)));
+  return releasePath(posix.normalize(releasePath(path)));
 }
 
 export function graphComposeProject({

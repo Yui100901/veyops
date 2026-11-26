@@ -11,7 +11,7 @@ import type {
 const labels = {
   defaultBuildLocation: '默认构建位置',
   defaultMaxParallelTargets: '默认目标并发数',
-  targetWorkspaceRoot: '目标端工作目录',
+  targetWorkspaceRoot: '目标端工作根目录',
   logRetentionDays: '任务日志保留天数',
 };
 const keys = Object.keys(labels) as (keyof SystemRuntimeDefaults)[];
@@ -60,7 +60,7 @@ export function ExecutionSettingsFields({
       </Field>
       <Field
         label={labels.targetWorkspaceRoot}
-        hint="在目标服务器上构建时，将在此目录下创建任务工作区。使用绝对路径或以 ~/ 开头的子目录。"
+        hint="目标端按「项目标识/执行 ID」创建执行目录。可填写绝对路径或 ~/ 开头的目录。"
       >
         <input
           name="targetWorkspaceRoot"
@@ -104,9 +104,11 @@ export function executionChanges(form: FormData, initial: ProjectExecutionOverri
 
 export function ProjectExecutionSettingsPanel({
   projectId,
+  projectSlug,
   user,
 }: {
   projectId: string;
+  projectSlug: string;
   user: User;
 }) {
   const path = '/projects/' + encodeURIComponent(projectId) + '/execution-settings';
@@ -142,6 +144,12 @@ export function ProjectExecutionSettingsPanel({
       }
     >
       <ErrorBanner error={resource.error} retry={resource.reload} />
+      {settings && (
+        <p className="field-note">
+          项目在目标端的工作目录{' '}
+          <code>{settings.effective.targetWorkspaceRoot + '/' + projectSlug}</code>
+        </p>
+      )}
       {resource.loading ? (
         <Loading />
       ) : (

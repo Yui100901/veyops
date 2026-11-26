@@ -338,31 +338,23 @@ export function SimplifiedStartSettings({
         )}
       {releaseAction && (
         <fieldset className="graph-fields" data-graph-node-field="start.release">
-          <legend>受管发布</legend>
+          <legend>发布设置</legend>
           <div className="form-grid">
             {control('start.release.serviceId', '项目服务', 'SERVICE', release.serviceId, (value) =>
               changeRelease({ serviceId: value as string | undefined, artifactId: undefined }),
             )}
-            <SimplifiedText
-              id="start.release.deployPath"
-              label="目标发布目录"
-              placeholder="/srv/api"
-              value={release.deployPath}
-              canEdit={canEdit}
-              change={(deployPath) => changeRelease({ deployPath })}
-            />
             {!composeRelease && (
               <div className="graph-fields">
                 <SimplifiedText
                   id="start.release.contentPath"
-                  label="发布内容"
+                  label="发布内容子路径（可选）"
                   placeholder="example/dist/"
                   value={release.contentPath}
                   canEdit={canEdit}
                   change={(contentPath) => changeRelease({ contentPath })}
-                  hint="相对交付快照根目录。"
+                  hint="相对交付产物根目录。留空发布整个目录。"
                 />
-                {canEdit && release.contentPath !== '.' && (
+                {canEdit && release.contentPath && release.contentPath !== '.' && (
                   <div className="heading-actions">
                     <button
                       type="button"
@@ -718,7 +710,7 @@ export function SimplifiedEndSettings({
     <fieldset className="graph-fields" data-graph-node-field="finish">
       <legend>交付结果</legend>
       <Check
-        label="保存工作区"
+        label="保留整个执行目录"
         id="finish.saveWorkspace"
         value={saveWorkspace}
         canEdit={canEdit}
@@ -741,26 +733,8 @@ export function SimplifiedEndSettings({
               </select>
             </Field>
           ) : (
-            <p className="field-note">使用本次文件发布时会生成仅供本次运行的临时快照。</p>
+            <p className="field-note">本次文件发布所需的执行目录会作为临时产物保留。</p>
           )}
-          <Field label="排除路径" hint="工作区相对路径，每行一项。">
-            <textarea
-              data-graph-node-field="finish.excludePaths"
-              key={node.id + ':exclude:' + (finish.excludePaths ?? []).join('\n')}
-              defaultValue={finish.excludePaths?.join('\n') ?? ''}
-              readOnly={!canEdit}
-              rows={3}
-              placeholder="example/tmp"
-              onBlur={(event) => {
-                const excludePaths = event.target.value
-                  .split('\n')
-                  .map((path) => path.trim())
-                  .filter(Boolean);
-                if (excludePaths.join('\n') !== (finish.excludePaths ?? []).join('\n'))
-                  change({ excludePaths });
-              }}
-            />
-          </Field>
         </div>
       )}
       <SimplifiedImageSettings

@@ -59,6 +59,8 @@ import {
 import {
   relativePath,
   safeDeployPath,
+  isProjectReleasePath,
+  releasePath,
   validateDefinition,
   validateGitUrl,
 } from './pipeline.validation';
@@ -184,10 +186,11 @@ export class PipelinesService implements OnModuleInit {
     fromArtifact = false,
     allowArchivedSource = false,
     graphBuild = false,
+    graphRelease = false,
   ) {
-    validateDefinition(definition, mode === 'DEPLOY' && !fromArtifact);
+    validateDefinition(definition, mode === 'DEPLOY' && !fromArtifact, graphRelease);
     validatePipelineNodes(definition);
-    if (fromArtifact) safeDeployPath(definition.deployPath);
+    if (fromArtifact) (graphRelease ? releasePath : safeDeployPath)(definition.deployPath);
     const project = await this.database.db
       .selectFrom('projects')
       .select(['id', 'name'])
@@ -490,6 +493,7 @@ export class PipelinesService implements OnModuleInit {
       const { method, composeSource, artifactPath } = profile.delivery;
       definition.deployPath = normalizeReleasePath(definition.deployPath);
       if (
+        !isProjectReleasePath(definition.deployPath) &&
         definition.deployPath
           .split('/')
           .some((part) => ['.artifacts', '.veyops-managed', 'current', 'releases'].includes(part))
@@ -706,6 +710,7 @@ export class PipelinesService implements OnModuleInit {
       fromArtifact,
       fromArtifact && !!profile,
       mode === 'BUILD_ONLY' && Boolean(profile?.graphVariables),
+      Boolean(graphDeployment),
     );
     const sources =
       definition.nodes && !fromArtifact

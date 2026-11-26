@@ -128,10 +128,11 @@ test(
                 onData?: (text: string, stream: 'stdout') => void;
               },
             ) => {
-              const activate = /ln -s '([^']+)' '[^']+'; mv -Tf -- '[^']+' '([^']+)'/.exec(command);
+              const activate =
+                /ln -s '([^']+)' .*?; mv -Tf -- .*? (?:"\$\{HOME:\?\}"\/)?'([^']+)'$/.exec(command);
               if (activate) releases.set(activate[2]!, activate[1]!);
               if (command.includes('fixture-health-probe')) probeCount++;
-              const readlink = /^readlink -- '([^']+)'$/.exec(command);
+              const readlink = /^readlink -- (?:"\$\{HOME:\?\}"\/)?'([^']+)'$/.exec(command);
               if (readlink) {
                 const target = releases.get(readlink[1]!);
                 if (target) options?.onData?.(target + '\n', 'stdout');
@@ -232,7 +233,6 @@ test(
         release: {
           serviceId: service.id,
           targets: { serverIds: [server.id] },
-          deployPath: '/srv/fixture-flow',
           contentPath: 'fixture/dist',
         },
         variables: [{ key: 'FIXTURE_VALUE', value: 'configured' }],
@@ -263,6 +263,7 @@ test(
       const worker = app.get(TaskWorkerService);
       const waitRun = async (id: string, expected: string) => {
         const deadline = Date.now() + 25_000;
+        let lastState: unknown;
         while (Date.now() < deadline) {
           await worker.tick();
           const run = (await api.get(graphPath + '/runs/' + id).expect(200)).body.data as {
@@ -288,6 +289,7 @@ test(
             }[];
           };
           if (run.status === expected) return run;
+          lastState = { status: run.status, nodes: run.nodes };
           if (['SUCCESS', 'FAILED', 'NEEDS_ATTENTION', 'CANCELLED'].includes(run.status)) {
             const failed = run.nodes.find(({ status }) =>
               ['FAILED', 'NEEDS_ATTENTION'].includes(status),
@@ -300,7 +302,7 @@ test(
           }
           await delay(100);
         }
-        assert.fail('Execution flow did not reach ' + expected);
+        assert.fail(`Execution flow did not reach ${expected}: ${JSON.stringify(lastState)}`);
       };
       const runVersion = async (
         version: number,
@@ -330,7 +332,8 @@ test(
         ).includes(sha),
       );
       assert.deepEqual(deployedContent, ['content from the confirmed Git commit\nconfigured\n']);
-      assert.ok(releases.has('/srv/fixture-flow/current'));
+      const currentPath = `.veyops/workspace/${project.slug}/.deployments/${service.id}/current`;
+      assert.ok(releases.has(currentPath));
       const log = await api
         .get(graphPath + `/runs/${run.id}/nodes/${canvas.nodes[2]!.id}/logs`)
         .expect(200);
@@ -344,11 +347,13 @@ test(
       assert.equal(artifacts.length, 1);
       assert.equal(artifacts[0].graphRunId, run.id);
       const snapshotPath = artifacts[0].physical.path as string;
+      assert.equal(snapshotPath, run.simplified?.workspacePath);
+      assert.ok(snapshotPath.endsWith(join(project.slug, run.id)));
       const entries = await exec('tar', ['-tzf', artifacts[0].storageKey]);
       assert.ok(snapshotPath && entries.stdout.includes('alternate/fixture/input.txt'));
       assert.ok(!entries.stdout.includes('private.vars'));
 
-      const current = releases.get('/srv/fixture-flow/current');
+      const current = releases.get(currentPath);
       const failing = structuredClone(canvas);
       failing.nodes[2]!.build!.buildCommand = 'exit 23';
       const failingVersion = await publish(failing);
@@ -359,7 +364,7 @@ test(
         'SKIPPED',
       );
       assert.deepEqual(failed.artifactIds, []);
-      assert.equal(releases.get('/srv/fixture-flow/current'), current);
+      assert.equal(releases.get(currentPath), current);
 
       const replay = structuredClone(canvas);
       const releaseStart = replay.nodes[0]!;
@@ -389,7 +394,7 @@ test(
         deployedContent,
         Array<string>(2).fill('content from the confirmed Git commit\nconfigured\n'),
       );
-      assert.notEqual(releases.get('/srv/fixture-flow/current'), current);
+      assert.notEqual(releases.get(currentPath), current);
 
       const approvalTemplate: GraphCanvas = (
         await create(graphPath + '/draft/templates/expand', {

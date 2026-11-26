@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import test from 'node:test';
 import type { SshOptions, SshTarget } from '../infrastructure/ssh/ssh.service';
 import type { GraphCheckoutSnapshot } from '../modules/projects/repository-metadata.service';
@@ -18,6 +18,10 @@ test('flow workspaces preserve files across actions, isolate runs and verify pat
   t.after(() => rm(root, { recursive: true, force: true }));
   const { FlowWorkspaceService } =
     await import('../modules/execution-graphs/flow-workspace.service.js');
+  const { ArtifactPhysicalService } =
+    await import('../modules/artifacts/artifact-physical.service.js');
+  const { ProcessRunnerService } =
+    await import('../infrastructure/build-runner/process-runner.service.js');
   const runId = randomUUID();
   const context: TaskExecutionContext = {
     signal: new AbortController().signal,
@@ -77,12 +81,13 @@ test('flow workspaces preserve files across actions, isolate runs and verify pat
     } as never,
     null!,
   );
-  const placement = { location: 'MANAGER' } as const;
+  const placement = { location: 'MANAGER', projectSlug: 'project1' } as const;
   const [workspace, concurrent] = await Promise.all([
     managed.open(runId, placement),
     managed.open(runId, placement),
   ]);
   assert.equal(workspace.path, concurrent.path);
+  assert.ok(workspace.path.endsWith(sep + join('flow-workspaces', 'project1', runId)));
   const other = await managed.open(randomUUID(), placement);
   assert.notEqual(workspace.path, other.path);
   const checkouts = sources.map((source, index) => ({
@@ -125,7 +130,30 @@ test('flow workspaces preserve files across actions, isolate runs and verify pat
   );
   await assert.rejects(managed.open(runId, placement, undefined, other.path), /已变化/);
   await assert.rejects(managed.cleanup({ ...workspace, path: other.path }), /已变化/);
-  await managed.cleanup(workspace);
+  await writeFile(join(workspace.path, '.env'), 'PRIVATE_VALUE=keep-local');
+  await writeFile(join(workspace.path, 'private-settings'), 'private-value');
+  const processes = new ProcessRunnerService();
+  const artifacts = new ArtifactPhysicalService(null!, null!, processes, null!, null!);
+  const retained = await artifacts.retainFlowWorkspace({
+    workspace,
+    excludePaths: ['private-settings'],
+  });
+  assert.equal(retained.path, workspace.path);
+  assert.equal(await readFile(join(retained.path!, '.env'), 'utf8'), 'PRIVATE_VALUE=keep-local');
+  assert.equal((await artifacts.verify(retained)).status, 'AVAILABLE');
+  const archive = join(root, 'workspace.tar.gz');
+  await artifacts.stageBuilderArchive(retained, archive, '.');
+  const contents = await processes.run('tar', ['-tzf', archive], { timeout: 10 });
+  assert.equal(contents.exitCode, 0);
+  assert.match(contents.stdout, /frontend\/example\/build.txt/);
+  assert.doesNotMatch(contents.stdout, /\.env|external|private-settings/);
+  await assert.rejects(artifacts.verifyPathSelection(retained, 'private-settings'), /找不到/);
+  const output = join(workspace.path, 'frontend', 'example', 'build.txt');
+  await writeFile(output, 'changed');
+  assert.equal((await artifacts.verify(retained)).status, 'CHANGED');
+  assert.equal((await artifacts.remove(retained)).status, 'RETRY');
+  await writeFile(output, 'compiled');
+  assert.equal((await artifacts.remove(retained)).status, 'DELETED');
   await assert.rejects(managed.open(runId, placement, undefined, workspace.path));
   await managed.cleanup(other);
 
@@ -138,7 +166,7 @@ test('flow workspaces preserve files across actions, isolate runs and verify pat
     credentialId: randomUUID(),
     hostKeyFingerprint: 'SHA256:expected',
   };
-  const remotePath = '/srv/work/veyops-flow-' + runId + '/workspace';
+  const remotePath = '/srv/work/project1/' + runId;
   let remoteReceipt = remotePath;
   const requests: Array<{ command: string; options: SshOptions }> = [];
   const target = new FlowWorkspaceService(
@@ -157,6 +185,7 @@ test('flow workspaces preserve files across actions, isolate runs and verify pat
   );
   const remote = await target.open(runId, {
     location: 'TARGET',
+    projectSlug: 'project1',
     target: server,
     root: '/srv/work',
   });
@@ -171,14 +200,14 @@ test('flow workspaces preserve files across actions, isolate runs and verify pat
     context,
   );
   const request = requests.at(-1)!;
-  assert.match(request.command, /exec flock -n/);
+  assert.match(request.command, /flock -n 9/);
   assert.match(request.command, /frontend\/example/);
   assert.doesNotMatch(request.command, /fixture-password/);
   assert.equal(request.options.variables?.variables.VEYOPS_WORKSPACE, remotePath);
   assert.deepEqual(request.options.secrets, ['fixture-password']);
-  remoteReceipt = '/srv/other/veyops-flow-' + runId + '/workspace';
+  remoteReceipt = '/srv/other/project1/' + runId;
   await assert.rejects(target.cleanup(remote), /未确认/);
   remoteReceipt = remotePath;
   await target.cleanup(remote);
-  assert.match(requests.at(-1)!.command, /exec flock -n.*rm -rf/s);
+  assert.match(requests.at(-1)!.command, /flock -n 9.*rm -rf/s);
 });

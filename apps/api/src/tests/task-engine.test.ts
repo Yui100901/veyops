@@ -139,7 +139,7 @@ test('standalone simplified actions enqueue without a service and still reject a
     };
     const node = { id: 'checkout', name: 'Checkout', type: 'CHECKOUT' } as const;
     const plan: SimplifiedRunPlan = {
-      placement: { location: 'MANAGER' },
+      placement: { location: 'MANAGER', projectSlug: 'fixture' },
       sources: [],
       environment: { variables: {}, secretVariables: {}, variableSources: [] },
       finish: { saveWorkspace: true },

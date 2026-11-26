@@ -21,6 +21,17 @@ import { validateSimplifiedSourceDirectories } from './simplified-flow-definitio
 
 const unsupportedDraft = '执行图仅支持简化执行链，请使用 FLOW_V2 画布';
 
+function readStoredDefinition(json: string) {
+  const definition = JSON.parse(json) as GraphDefinition;
+  if (definition.canvas?.model === 'FLOW_V2') {
+    for (const { start, finish } of definition.canvas.nodes) {
+      if (start?.release) Reflect.deleteProperty(start.release, 'deployPath');
+      if (finish) Reflect.deleteProperty(finish, 'excludePaths');
+    }
+  }
+  return definition;
+}
+
 function writableCanvas(definition: GraphDefinition) {
   if (definition.canvas?.model !== 'FLOW_V2') throw new BadRequestException(unsupportedDraft);
   return definition.canvas;
@@ -32,7 +43,7 @@ function graphResponse(row: Selectable<Database['execution_graphs']>) {
     projectId: row.project_id,
     revision: row.revision,
     publishedVersion: row.published_version,
-    draft: withDraftCanvas(JSON.parse(row.draft_json) as GraphDefinition),
+    draft: withDraftCanvas(readStoredDefinition(row.draft_json)),
   };
 }
 
@@ -197,7 +208,7 @@ export class ExecutionGraphsService {
     await requireProject(this.database.db, projectId);
     const graph = await this.graph(projectId);
     this.checkRevision(graph.revision, expectedRevision);
-    const draft = JSON.parse(graph.draft_json) as GraphDefinition;
+    const draft = readStoredDefinition(graph.draft_json);
     const definition = compileCanvas(writableCanvas(draft), true);
     const prior = graph.published_version
       ? (JSON.parse(
@@ -248,7 +259,7 @@ export class ExecutionGraphsService {
       .where('graph_id', '=', candidate.id)
       .where('source_revision', '=', expectedRevision)
       .executeTakeFirst();
-    const draft = JSON.parse(candidate.draft_json) as GraphDefinition;
+    const draft = readStoredDefinition(candidate.draft_json);
     const definition = compileCanvas(writableCanvas(draft), true);
     const version = (candidate.published_version ?? 0) + 1;
     const triggerChecks = priorPublication
@@ -332,7 +343,7 @@ export class ExecutionGraphsService {
     return this.database.db.transaction().execute(async (tx) => {
       const graph = await this.lockDraft(tx, projectId, expectedRevision);
       const published = await this.publishedVersion(tx, graph.id, version);
-      const stored = JSON.parse(published.definition_json) as GraphDefinition;
+      const stored = readStoredDefinition(published.definition_json);
       const definition = compileCanvas(writableCanvas(stored), true);
       await this.validateReferences(tx, projectId, definition);
       const row = await this.updateDraft(tx, graph, definition);

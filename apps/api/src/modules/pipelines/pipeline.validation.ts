@@ -3,6 +3,8 @@ import { posix } from 'node:path';
 import type { PipelineDefinition } from './pipeline.types';
 
 export const shellQuote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
+export const shellWorkspacePath = (path: string) =>
+  path.startsWith('~/') ? '"${HOME:?}"' + '/' + shellQuote(path.slice(2)) : shellQuote(path);
 export function relativePath(value: string): string {
   if (
     !value ||
@@ -29,12 +31,32 @@ export function safeDeployPath(value: string): string {
     );
   return value.replace(/\/+$/, '');
 }
-export function validateDefinition(definition: PipelineDefinition, deploy: boolean) {
+export function isProjectReleasePath(value: string) {
+  return (
+    /^~?\/[^\x00-\x1f\x7f]+\/[a-z0-9][a-z0-9-]{0,62}\/\.deployments\/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(
+      value,
+    ) &&
+    value
+      .replace(/^~?\//, '')
+      .split('/')
+      .every((part) => part && part !== '.' && part !== '..')
+  );
+}
+export function releasePath(value: string) {
+  return isProjectReleasePath(value) ? value : safeDeployPath(value);
+}
+
+export function validateDefinition(
+  definition: PipelineDefinition,
+  deploy: boolean,
+  graphRelease = false,
+) {
   relativePath(definition.repoPath);
   relativePath(definition.outputPath);
   relativePath(definition.dockerfilePath);
   relativePath(definition.composeFilePath);
-  if (definition.deployPath || deploy) safeDeployPath(definition.deployPath);
+  if (definition.deployPath || deploy)
+    (graphRelease ? releasePath : safeDeployPath)(definition.deployPath);
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,199}$/.test(definition.buildImage))
     throw new BadRequestException('无效构建容器镜像');
   if (definition.artifactType === 'DOCKER_IMAGE') {
@@ -55,6 +77,6 @@ export function validateGitUrl(url: string) {
     throw new BadRequestException('Git URL不能内嵌凭据');
 }
 export function deploymentGuard(path: string, owner: string): string {
-  const p = shellQuote(safeDeployPath(path));
+  const p = shellWorkspacePath(releasePath(path));
   return `test ! -L ${p}; test "$(realpath -m ${p})" = ${p}; mkdir -p ${p}; if test -f ${p}/.veyops-managed; then test "$(cat ${p}/.veyops-managed)" = ${shellQuote(owner)}; else test -z "$(ls -A ${p})"; printf '%s' ${shellQuote(owner)} > ${p}/.veyops-managed; fi; test ! -L ${p}/releases; test ! -L ${p}/.artifacts; mkdir -p ${p}/releases ${p}/.artifacts; test ! -e ${p}/current || test -L ${p}/current`;
 }

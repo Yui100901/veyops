@@ -89,7 +89,7 @@ export class PipelineDefinitionDto {
   @IsString() @Length(0, 65536) installCommand = '';
   @IsString() @Length(0, 65536) buildCommand = '';
   @IsString() @Length(1, 300) outputPath = 'dist';
-  @IsString() @Length(0, 500) deployPath = '';
+  @IsString() @Length(0, 1024) deployPath = '';
   @IsString() @Length(0, 65536) startCommand = '';
   @IsOptional() @IsString() @Length(0, 65536) stopCommand?: string;
   @IsString() @Length(0, 65536) healthCheckCommand = '';

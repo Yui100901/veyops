@@ -19,7 +19,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { posix } from 'node:path';
-import { normalizeRelativePath, safeDeployPath } from '../pipelines/pipeline.validation';
+import { normalizeRelativePath } from '../pipelines/pipeline.validation';
 import { isGitBranchName } from '../projects/git-ref';
 import { httpCloneUrl } from '../projects/http-clone-url';
 import { redactTaskLog } from '../tasks/task-log.service';
@@ -89,7 +89,6 @@ export class SimplifiedRelease {
   @Type(() => SimplifiedReleaseTargets)
   targets?: SimplifiedReleaseTargets;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() reuseExecutionServer?: boolean;
-  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) deployPath?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) contentPath?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() artifactId?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() useUpstreamArtifact?: boolean;
@@ -161,13 +160,6 @@ export class SimplifiedFinish {
   @ValidateIf((_o, v) => v !== undefined)
   @IsIn(['PERSISTENT', 'RUN'])
   retention?: 'PERSISTENT' | 'RUN';
-  @ValidateIf((_o, v) => v !== undefined)
-  @IsArray()
-  @ArrayMaxSize(100)
-  @ArrayUnique()
-  @IsString({ each: true })
-  @MaxLength(1024, { each: true })
-  excludePaths?: string[];
   @ValidateIf((_o, v) => v !== undefined)
   @IsArray()
   @ArrayMaxSize(20)
@@ -477,12 +469,6 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
       report('start.release.upstreamArtifactName', '选择接收上游产物后才可指定登记名称');
     if (release?.upstreamArtifactName && !simplifiedImageName(release.upstreamArtifactName))
       report('start.release.upstreamArtifactName', '请填写有效的上游产物登记名称');
-    if (!release?.deployPath?.trim()) report('start.release.deployPath', '请填写目标发布目录');
-    try {
-      safeDeployPath(release!.deployPath!.trim());
-    } catch {
-      report('start.release.deployPath', '请填写安全的目标端绝对发布目录');
-    }
     if (release?.reuseExecutionServer) {
       if (execution?.location === 'MANAGER')
         report('start.release.reuseExecutionServer', '使用管理端构建时请单独选择发布目标');
@@ -491,16 +477,11 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
     }
     if (deploys[0]!.deploy?.method !== 'COMPOSE') {
       if (release?.imageId) report('start.release.imageId', '文件发布无需选择本次镜像');
-      if (!release?.contentPath?.trim())
-        report('start.release.contentPath', '请选择发布内容，发布整个快照时请显式填写 .');
       safeRelative(start, 'start.release.contentPath', release?.contentPath, flow.id);
     }
   }
   if (finish.finish?.requireRelease && !deploys.length)
     nodeIssue(finish, 'finish.requireRelease', '核对发布结果需要受管发布动作', flow.id);
-  for (const [index, path] of (finish.finish?.excludePaths ?? []).entries())
-    if (safeRelative(finish, 'finish.excludePaths.' + index, path, flow.id) === '.')
-      nodeIssue(finish, 'finish.excludePaths.' + index, '排除项须位于工作区下', flow.id);
 
   const dockerBuilds = ordered.filter(
     (node) => node.type === 'BUILD' && node.build?.dockerfilePath,

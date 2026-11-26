@@ -182,7 +182,7 @@ export function ProjectConfiguration({
           </form>
         )}
       </Section>
-      <ProjectExecutionSettingsPanel projectId={id} user={user} />
+      <ProjectExecutionSettingsPanel projectId={id} projectSlug={slug} user={user} />
       <Section title="项目公共变量" subtitle="项目各环境自动继承公共变量，并可用同名变量覆盖。">
         <div className="section-body">
           <p className="field-note">

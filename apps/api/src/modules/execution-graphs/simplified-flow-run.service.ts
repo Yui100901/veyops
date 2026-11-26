@@ -110,7 +110,6 @@ type FixedRelease = {
   method: 'FILE' | 'COMPOSE';
   image?: { id: string; name: string };
   path: string;
-  deployPath: string;
   workspaceComposePath?: string;
   rollbackBaseline?: Record<string, string>;
   requireApproval: boolean;
@@ -309,6 +308,12 @@ export class SimplifiedFlowRunService {
     )
       throw issue('REPOSITORY', 'sources', '源码目录重名或互相包含');
     const defaults = await this.settings.get(projectId);
+    const { slug: projectSlug } = await this.database.db
+      .selectFrom('projects')
+      .select('slug')
+      .where('id', '=', projectId)
+      .where('deleted_at', 'is', null)
+      .executeTakeFirstOrThrow();
     const hasWorkspaceActions = flow.nodes.some(({ type }) =>
       ['CHECKOUT', 'BUILD', 'CHECK', 'SHELL'].includes(type),
     );
@@ -317,7 +322,7 @@ export class SimplifiedFlowRunService {
       execution?.location && execution.location !== 'INHERIT'
         ? execution.location
         : defaults.defaultBuildLocation;
-    let placement: FlowWorkspacePlacement = { location: 'MANAGER' };
+    let placement: FlowWorkspacePlacement = { location: 'MANAGER', projectSlug };
     let buildSelection: DeploymentSelection | undefined;
     if (location === 'TARGET' && (needsWorkspace || execution?.serverId || execution?.groupId)) {
       const choice = execution?.serverId
@@ -334,7 +339,7 @@ export class SimplifiedFlowRunService {
         const [target] = await this.servers.snapshot(ids);
         if (!target?.hostKeyFingerprint || !target.credentialId)
           throw new BadRequestException('构建服务器需要 SSH 凭据及已确认的指纹');
-        placement = { location, target, root: defaults.targetWorkspaceRoot };
+        placement = { location, target, root: defaults.targetWorkspaceRoot, projectSlug };
         if (automation) await assertAutomaticTargets(this.database.db, [target]);
       } catch (error) {
         throw issue(
@@ -375,8 +380,7 @@ export class SimplifiedFlowRunService {
       throw issue('CONFIGURATION', 'dotenv', '已确认的源码缺少指定的变量文件');
     let fixedRelease: FixedRelease | undefined;
     if (releaseNode) {
-      if (!release?.serviceId || !release.deployPath)
-        throw issue('RELEASE_TARGET', 'release', '请选择项目服务并填写发布目录');
+      if (!release?.serviceId) throw issue('RELEASE_TARGET', 'release', '请选择项目服务');
       const selection =
         release.reuseExecutionServer && placement.location === 'TARGET'
           ? { serverIds: [placement.target.id] }
@@ -412,6 +416,7 @@ export class SimplifiedFlowRunService {
         version,
         node: releaseNode,
         release,
+        projectWorkspace: `${defaults.targetWorkspaceRoot}/${projectSlug}`,
         environment,
         targets,
         sources: fixedSources,
@@ -498,6 +503,7 @@ export class SimplifiedFlowRunService {
     version: number;
     node: GraphNode;
     release: NonNullable<SimplifiedStart['release']>;
+    projectWorkspace: string;
     environment: GraphVariableSnapshot;
     targets: DeploymentSelection;
     sources: SimplifiedRunPlan['sources'];
@@ -511,6 +517,7 @@ export class SimplifiedFlowRunService {
       version,
       node,
       release,
+      projectWorkspace,
       environment,
       targets,
       sources,
@@ -519,6 +526,7 @@ export class SimplifiedFlowRunService {
       finish,
     } = input;
     const serviceId = release.serviceId!;
+    const deployPath = `${projectWorkspace}/.deployments/${serviceId}`;
     const environmentId = graphDeliveryEnvironment(projectId).id;
     const historical = artifactId
       ? await this.pipelines.deliveryArtifactBuild(projectId, serviceId, environmentId, [
@@ -542,7 +550,7 @@ export class SimplifiedFlowRunService {
       ...(method === 'COMPOSE' && {
         registryId: historical?.definition.registryId ?? image?.registryId,
       }),
-      deployPath: release.deployPath,
+      deployPath,
       ...(node.deploy && {
         startCommand: node.deploy.startCommand,
         stopCommand: node.deploy.stopCommand,
@@ -604,7 +612,6 @@ export class SimplifiedFlowRunService {
       artifactId,
       knownHash: known?.configurationHash,
       planHash: upcoming.configurationHash,
-      deployPath: release.deployPath!,
       path,
       method,
       image: image && { id: image.id, name: image.name },
@@ -904,6 +911,14 @@ export class SimplifiedFlowRunService {
   }
 
   async cleanup(runId: string, plan: SimplifiedRunPlan, path: string) {
+    const retained = await this.database.db
+      .selectFrom('artifacts')
+      .select('id')
+      .where('graph_run_id', '=', runId)
+      .where('artifact_name', '=', workspaceArtifact)
+      .where('pruned_at', 'is', null)
+      .executeTakeFirst();
+    if (retained) return;
     await this.workspaces.cleanup({ runId, placement: plan.placement, path }).catch(() => {
       this.logger.warn(`执行流 ${runId} 的工作区清理失败`);
     });
@@ -928,18 +943,11 @@ export class SimplifiedFlowRunService {
               : [],
           )
         : [];
-      const input = {
-        workspace,
-        relativePath: '.',
-        kind: 'DIRECTORY' as const,
-        collection: 'WORK_DIRECTORY' as const,
-        excludePaths: [...(plan.finish.excludePaths ?? []), ...dotenvPaths],
-        instanceId: identity.instanceId,
+      const physical = await this.physical.retainFlowWorkspace({
+        workspace: { runId: snapshot.graph!.runId, placement: plan.placement, path: workspace },
+        excludePaths: dotenvPaths,
         signal: ctx.signal,
-      };
-      const physical = target
-        ? await this.physical.collectServerPath({ ...input, target })
-        : await this.physical.collectBuilderPath(input);
+      });
       let archive: { path: string; checksum: string; sizeBytes: number } | undefined;
       if (!target) {
         const root = join(dataDirectory, 'artifacts');
@@ -970,7 +978,7 @@ export class SimplifiedFlowRunService {
         physical,
         persist: workspaceRetention(plan.finish, true) === 'PERSISTENT',
       });
-      ctx.log('工作区快照已校验并登记。\n', target?.id);
+      ctx.log('执行目录已校验并登记为产物。\n', target?.id);
     }
     for (const id of capture.imageIds) {
       const image = plan.finish.images?.find((entry) => entry.id === id);
