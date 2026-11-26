@@ -324,9 +324,7 @@ function simplifiedNodeReferences(source: ReferenceSource, node: GraphNode) {
       referenceRows(field('start.variables.' + key + '.credentialId'), 'CREDENTIAL', credentialId),
     ),
     ...referenceRows(field('start.release.serviceId'), 'SERVICE', config?.release?.serviceId),
-    ...(config?.release?.reuseExecutionServer
-      ? []
-      : selectionReferences(field('start.release.targets'), config?.release?.targets)),
+    ...selectionReferences(field('start.release.targets'), config?.release?.targets),
     ...referenceRows(field('start.release.artifactId'), 'ARTIFACT', config?.release?.artifactId),
     ...(node.finish?.images ?? []).flatMap(({ registryId }, index) =>
       referenceRows(field(`finish.images.${index}.registryId`), 'REGISTRY', registryId),
@@ -525,6 +523,7 @@ export function runResourceReferences(
     const prepared = objectValue(value);
     const simplified = objectValue(prepared.simplified);
     const release = objectValue(simplified.release);
+    const workspaceSource = objectValue(simplified.workspaceSource);
     const executionServer = objectValue(objectValue(simplified.placement).target);
     const inputs = objectValue(prepared.inputs);
     const parameters = objectValue(inputs.parameters);
@@ -549,10 +548,19 @@ export function runResourceReferences(
       ...credentialReferences(context, prepared.frozenEnvironment),
       ...referenceRows(context, 'ARTIFACT', inputs.artifactIds),
       ...referenceRows(context, 'ARTIFACT', release.artifactId),
+      ...referenceRows(
+        { ...context, fieldId: 'workspaceArtifactId' },
+        'ARTIFACT',
+        workspaceSource.artifactId,
+      ),
       ...referenceRows(context, 'SERVICE', simplified.serviceId),
       ...selectionReferences(context, simplified.buildSelection),
       ...selectionReferences(context, release.targets),
-      ...referenceRows(context, 'SERVER', [executionServer.id, ...samples(release.serverIds)]),
+      ...referenceRows(context, 'SERVER', [
+        executionServer.id,
+        workspaceSource.serverId,
+        ...samples(release.serverIds),
+      ]),
       ...referenceRows(context, 'CREDENTIAL', executionServer.credentialId),
       ...samples(simplified.sources).flatMap((entry) => {
         const checkout = objectValue(objectValue(entry).source);

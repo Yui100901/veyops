@@ -488,6 +488,17 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     shallow: false,
   });
   const graphPath = `/api/v1/projects/${project}/execution-graph`;
+  await git('clone', '--bare', '--no-local', bare, join(directory, 'secondary.git'));
+  const secondaryRepository = (
+    await admin
+      .post(repositoryPath)
+      .send({
+        name: 'Secondary fixture',
+        cloneUrl: `${fixture.url}/secondary.git`,
+        credentialId: credential,
+      })
+      .expect(201)
+  ).body.data;
   const graph = {
     flows: [],
     canvas: {
@@ -512,10 +523,8 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
               { id: 'main', repositoryId: id, ref: { kind: 'BRANCH', value: 'main' } },
               {
                 id: 'feature',
-                repositoryId: id,
-                parentDirectory: 'second',
+                repositoryId: secondaryRepository.id,
                 ref: { kind: 'BRANCH', value: 'feature/release' },
-                allowRefOverride: true,
               },
             ],
           },
@@ -627,26 +636,14 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     namedCheckout.output.sources.map(({ commitSha }: { commitSha: string }) => commitSha),
     [main, feature],
   );
-  const changedRef = (
-    await admin
-      .post(namedPath + '/preview')
-      .send({
-        ...args,
-        inputs: { parameters: { 'git:feature': { kind: 'TAG', value: 'release/v1' } } },
-      })
-      .expect(201)
-  ).body.data;
-  assert.equal(changedRef.checkouts[1].commitSha, main);
-  const missingRef = await admin
+  const changedRef = await admin
     .post(namedPath + '/preview')
     .send({
       ...args,
-      inputs: {
-        parameters: { 'git:feature': { kind: 'BRANCH', value: 'missing-fixture-branch' } },
-      },
+      inputs: { parameters: { 'git:feature': { kind: 'TAG', value: 'release/v1' } } },
     })
     .expect(400);
-  assert.equal(missingRef.body.error.planIssue.fieldId, 'sources');
+  assert.match(changedRef.body.error.message, /Git|参数|开始节点/);
   const defaults = (
     await admin
       .post(namedPath + '/preview')

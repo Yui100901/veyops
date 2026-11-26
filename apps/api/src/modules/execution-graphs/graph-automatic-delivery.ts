@@ -5,6 +5,7 @@ import type { SshTarget } from '../../infrastructure/ssh/ssh.service';
 import type { GraphDefinition } from './execution-graph-definition';
 import { graphTriggerKinds, type GraphTriggerKind } from './graph-trigger.dto';
 import type { GraphCheckoutEvent } from '../projects/repository-metadata.service';
+import { simplifiedWorkspaceInput } from './simplified-flow-definition';
 
 export interface GraphAutomation {
   kind: GraphTriggerKind;
@@ -114,7 +115,10 @@ export function assertAutomaticGraphFlow(
   const flows = new Set([flowId]);
   let hasDelivery = false;
   for (const id of flows) {
-    for (const node of definition.flows.find((entry) => entry.id === id)?.nodes ?? []) {
+    const flow = definition.flows.find((entry) => entry.id === id);
+    if (flow && simplifiedWorkspaceInput(flow)?.required)
+      throw new ConflictException('此执行流需要手动选择历史目录，无法启用自动触发');
+    for (const node of flow?.nodes ?? []) {
       if (node.type === 'FLOW_CALL' && node.flowId) flows.add(node.flowId);
       if (
         graphNodeRequiresIsolation(node.type) ||

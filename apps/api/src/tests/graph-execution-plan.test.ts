@@ -137,7 +137,6 @@ async function checkPlan(t: TestContext, url?: string) {
     const release = {
       serviceId: service.id,
       targets: { groupIds: [group.id] },
-      contentPath: 'repository/dist',
     };
     const makeFlow = (id: string, start: object, managed = false) => {
       const nodes = [
@@ -242,7 +241,7 @@ async function checkPlan(t: TestContext, url?: string) {
     );
     assert.equal(preview.simplified.location, 'MANAGER');
     assert.deepEqual(preview.simplified.release.serverIds, [first.id]);
-    assert.equal(preview.simplified.release.contentPath, 'repository/dist');
+    assert.equal(Object.hasOwn(preview.simplified.release, 'contentPath'), false);
     assert.equal(Object.hasOwn(preview.simplified.release, 'deployPath'), false);
     assert.equal(preview.deliveries[0].requireApproval, false);
     const runner = app.get(GraphRunnerService);

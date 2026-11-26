@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  HttpException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -9,27 +10,56 @@ import type { Kysely, Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
+import { selectedServerIds } from '../deployment-targets/deployment-selection';
 import { lockProjectGraph, requireProject } from '../projects/project-guards';
 import { graphResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
+import { SystemSettingsService } from '../system/system-settings.service';
 import { canvasIssues, compileCanvas, withDraftCanvas } from './execution-graph-canvas';
 import { type GraphDefinition, type SaveGraphDraftDto } from './execution-graph-definition';
 import { GraphCompileError, type GraphDiagnostic } from './graph-fields';
 import { expandGraphTemplate, type ExpandGraphTemplateDto } from './graph-flow-templates';
 import { GraphTriggersService } from './graph-triggers.service';
-import { validateSimplifiedSourceDirectories } from './simplified-flow-definition';
+import {
+  simplifiedUsesWorkspace,
+  validateSimplifiedSourceDirectories,
+} from './simplified-flow-definition';
 
 const unsupportedDraft = '执行图仅支持简化执行链，请使用 FLOW_V2 画布';
 
-function readStoredDefinition(json: string) {
+function readStoredDraft(json: string) {
   const definition = JSON.parse(json) as GraphDefinition;
+  let review: GraphDiagnostic | undefined;
   if (definition.canvas?.model === 'FLOW_V2') {
-    for (const { start, finish } of definition.canvas.nodes) {
-      if (start?.release) Reflect.deleteProperty(start.release, 'deployPath');
+    const nodes = [
+      ...definition.canvas.nodes,
+      ...(definition.canvas.templates ?? []),
+      ...definition.flows.flatMap(({ nodes }) => nodes),
+    ];
+    for (const { id, name, start, finish } of nodes) {
+      const remove = (value: object, keys: string[], fieldId: string) => {
+        for (const key of keys) {
+          if (!Object.hasOwn(value, key)) continue;
+          Reflect.deleteProperty(value, key);
+          review ??= {
+            flowId: id,
+            nodeId: id,
+            fieldId,
+            fieldSection: 'execution',
+            message: `「${name}」的旧入口配置需要复核。请核对检出目录、发布目标和启动命令后保存草稿`,
+          };
+        }
+      };
+      if (start?.release) {
+        Reflect.deleteProperty(start.release, 'deployPath');
+        remove(start.release, ['reuseExecutionServer', 'contentPath'], 'start.release');
+      }
+      for (const source of start?.sources ?? [])
+        remove(source, ['parentDirectory', 'allowRefOverride'], 'start.sources');
       if (finish) Reflect.deleteProperty(finish, 'excludePaths');
     }
   }
-  return definition;
+  return { definition, review };
 }
 
 function writableCanvas(definition: GraphDefinition) {
@@ -37,13 +67,21 @@ function writableCanvas(definition: GraphDefinition) {
   return definition.canvas;
 }
 
+function savedPublicationCanvas(json: string) {
+  const { definition, review } = readStoredDraft(json);
+  if (review) throw new GraphCompileError(review);
+  return writableCanvas(definition);
+}
+
 function graphResponse(row: Selectable<Database['execution_graphs']>) {
+  const { definition, review } = readStoredDraft(row.draft_json);
   return {
     id: row.id,
     projectId: row.project_id,
     revision: row.revision,
     publishedVersion: row.published_version,
-    draft: withDraftCanvas(readStoredDefinition(row.draft_json)),
+    draft: withDraftCanvas(definition),
+    ...(review && { draftReviewRequired: true }),
   };
 }
 
@@ -53,6 +91,7 @@ export class ExecutionGraphsService {
     private readonly database: DatabaseService,
     private readonly audit: AuditService,
     private readonly triggers: GraphTriggersService,
+    private readonly settings: SystemSettingsService,
   ) {}
 
   private async graph(projectId: string, db = this.database.db) {
@@ -103,6 +142,47 @@ export class ExecutionGraphsService {
     projectId: string,
     definition: GraphDefinition,
   ) {
+    const simplifiedFlows = definition.flows.filter(({ model }) => model === 'FLOW_V2');
+    const inherited = await this.settings.get(projectId, tx);
+    for (const flow of simplifiedFlows) {
+      const start = flow.nodes.find(({ type }) => type === 'START')!;
+      const execution = start.start?.execution;
+      if (
+        !simplifiedUsesWorkspace(flow.nodes) ||
+        (execution?.location && execution.location !== 'INHERIT'
+          ? execution.location
+          : inherited.defaultBuildLocation) !== 'TARGET'
+      )
+        continue;
+      try {
+        if (!execution?.serverId && !execution?.groupId)
+          throw new BadRequestException('目标端工作区需要选择一台执行服务器或一个分组');
+        const ids = await selectedServerIds(tx, {
+          serverIds: execution.serverId ? [execution.serverId] : [],
+          groupIds: execution.groupId ? [execution.groupId] : [],
+        });
+        if (ids.length !== 1) throw new BadRequestException('执行分组必须解析为一台可用服务器');
+        const ready = await tx
+          .selectFrom('servers as server')
+          .innerJoin('credentials as ssh', 'ssh.id', 'server.credential_id')
+          .select('server.host_key_fingerprint as fingerprint')
+          .where('server.id', '=', ids[0]!)
+          .where('ssh.status', '=', 'ACTIVE')
+          .where('ssh.type', 'in', ['SSH_PASSWORD', 'SSH_KEY'])
+          .executeTakeFirst();
+        if (!ready?.fingerprint)
+          throw new BadRequestException('执行服务器需要有效的 SSH 凭据和已确认的主机指纹');
+      } catch (error) {
+        if (!(error instanceof HttpException)) throw error;
+        throw new GraphCompileError({
+          flowId: flow.id,
+          nodeId: start.id,
+          fieldId: 'start.execution',
+          fieldSection: 'execution',
+          message: `「${start.name}」 · ${error.message}`,
+        });
+      }
+    }
     const reference = await unavailableReference(
       tx,
       projectId,
@@ -122,7 +202,6 @@ export class ExecutionGraphsService {
         message: (path ? path + ' · ' : '') + '引用的资源不存在、已停用或不属于当前项目',
       });
     }
-    const simplifiedFlows = definition.flows.filter(({ model }) => model === 'FLOW_V2');
     const ids = [
       ...new Set(
         simplifiedFlows.flatMap(({ nodes }) =>
@@ -208,8 +287,7 @@ export class ExecutionGraphsService {
     await requireProject(this.database.db, projectId);
     const graph = await this.graph(projectId);
     this.checkRevision(graph.revision, expectedRevision);
-    const draft = readStoredDefinition(graph.draft_json);
-    const definition = compileCanvas(writableCanvas(draft), true);
+    const definition = compileCanvas(savedPublicationCanvas(graph.draft_json), true);
     const prior = graph.published_version
       ? (JSON.parse(
           (await this.publishedVersion(this.database.db, graph.id, graph.published_version))
@@ -259,8 +337,7 @@ export class ExecutionGraphsService {
       .where('graph_id', '=', candidate.id)
       .where('source_revision', '=', expectedRevision)
       .executeTakeFirst();
-    const draft = readStoredDefinition(candidate.draft_json);
-    const definition = compileCanvas(writableCanvas(draft), true);
+    const definition = compileCanvas(savedPublicationCanvas(candidate.draft_json), true);
     const version = (candidate.published_version ?? 0) + 1;
     const triggerChecks = priorPublication
       ? []
@@ -343,8 +420,7 @@ export class ExecutionGraphsService {
     return this.database.db.transaction().execute(async (tx) => {
       const graph = await this.lockDraft(tx, projectId, expectedRevision);
       const published = await this.publishedVersion(tx, graph.id, version);
-      const stored = readStoredDefinition(published.definition_json);
-      const definition = compileCanvas(writableCanvas(stored), true);
+      const definition = compileCanvas(savedPublicationCanvas(published.definition_json), true);
       await this.validateReferences(tx, projectId, definition);
       const row = await this.updateDraft(tx, graph, definition);
       await this.audit.record(

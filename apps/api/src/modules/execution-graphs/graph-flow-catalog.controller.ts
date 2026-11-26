@@ -3,6 +3,7 @@ import { sql } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { GraphDefinition } from './execution-graph-definition';
 import { flowStart } from './graph-run-bindings';
+import { simplifiedWorkspaceInput } from './simplified-flow-definition';
 
 @Controller('delivery-flows')
 export class GraphFlowCatalogController {
@@ -109,6 +110,8 @@ export class GraphFlowCatalogController {
           version?: number;
           hasRuntimeInputs?: boolean;
           needsArtifactInput?: boolean;
+          supportsWorkspaceInput?: boolean;
+          needsWorkspaceInput?: boolean;
         }
       >();
       for (const node of draftCanvas?.nodes ?? []) {
@@ -128,6 +131,7 @@ export class GraphFlowCatalogController {
         const serviceId = start?.release?.serviceId;
         const requiresArtifact = start?.release?.artifactSource === 'RUN_PARAMETER';
         const artifactOverride = Boolean(start?.release?.allowArtifactOverride);
+        const workspace = simplifiedWorkspaceInput(flow);
         notes.set(flow.id, {
           id: flow.id,
           name: flow.name,
@@ -137,7 +141,7 @@ export class GraphFlowCatalogController {
           hasRuntimeInputs: Boolean(
             requiresArtifact ||
             artifactOverride ||
-            start?.sources?.some(({ allowRefOverride }) => allowRefOverride) ||
+            workspace?.required ||
             start?.variables?.some(
               ({ allowOverride, credentialId }) => allowOverride && !credentialId,
             ) ||
@@ -149,6 +153,8 @@ export class GraphFlowCatalogController {
           ),
           needsArtifactInput:
             requiresArtifact || (artifactOverride && Boolean(start?.release?.useUpstreamArtifact)),
+          supportsWorkspaceInput: Boolean(workspace),
+          needsWorkspaceInput: Boolean(workspace?.required),
         });
       }
       return {

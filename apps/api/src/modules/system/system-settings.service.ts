@@ -91,9 +91,9 @@ export class SystemSettingsService {
     private readonly audit: AuditService,
   ) {}
 
-  private async resolve(projectId?: string) {
+  private async resolve(projectId?: string, db = this.database.db) {
     const keys = projectId ? [settingsKey, projectKey(projectId)] : [settingsKey];
-    const rows = await this.database.db
+    const rows = await db
       .selectFrom('system_settings')
       .select(['key', 'value_json'])
       .where('key', 'in', keys)
@@ -103,8 +103,8 @@ export class SystemSettingsService {
     return { system, overrides, effective: { ...system, ...overrides } };
   }
 
-  async get(projectId?: string): Promise<SystemSettings> {
-    return (await this.resolve(projectId)).effective;
+  async get(projectId?: string, db = this.database.db): Promise<SystemSettings> {
+    return (await this.resolve(projectId, db)).effective;
   }
 
   async project(projectId: string) {

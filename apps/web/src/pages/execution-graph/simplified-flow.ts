@@ -1,4 +1,4 @@
-import type { DeploymentSelection, ProjectDetail } from '../../models';
+import type { DeploymentSelection } from '../../models';
 import {
   effectiveNodeType,
   graphNodeLabels,
@@ -17,8 +17,6 @@ export interface SimplifiedSource {
   id: string;
   repositoryId?: string;
   ref?: SimplifiedGitRef;
-  parentDirectory?: string;
-  allowRefOverride?: boolean;
 }
 
 export interface SimplifiedExecution {
@@ -30,8 +28,6 @@ export interface SimplifiedExecution {
 export interface SimplifiedRelease {
   serviceId?: string;
   targets?: DeploymentSelection;
-  reuseExecutionServer?: boolean;
-  contentPath?: string;
   artifactSource?: 'RUN_PARAMETER';
   artifactId?: string;
   allowArtifactOverride?: boolean;
@@ -105,6 +101,7 @@ export function simplifiedNodeLabel(type: GraphNode['type']) {
 }
 
 export const simplifiedConditionField = 'conditionValue';
+export const simplifiedWorkspaceArtifactField = 'workspaceArtifactId';
 
 export function isNativeDockerBuild(node: GraphNode) {
   return effectiveNodeType(node) === 'BUILD' && Boolean(node.build?.dockerfilePath?.trim());
@@ -112,6 +109,25 @@ export function isNativeDockerBuild(node: GraphNode) {
 
 export function producesWorkspace(node: GraphNode) {
   return ['CHECKOUT', 'SHELL', 'CHECK', 'BUILD'].includes(effectiveNodeType(node));
+}
+
+export function simplifiedWorkspaceInput(flow: GraphFlow): GraphField | undefined {
+  if (
+    flow.model !== simplifiedModel ||
+    flow.nodes.some((node) => isReleaseNode(node) || effectiveNodeType(node) === 'SOURCE_REVIEW') ||
+    !flow.nodes.some((node) => ['BUILD', 'SHELL', 'CHECK'].includes(effectiveNodeType(node)))
+  )
+    return;
+  const start = flow.nodes.find(({ type }) => type === 'START');
+  return {
+    id: simplifiedWorkspaceArtifactField,
+    name: '历史目录',
+    type: 'ARTIFACT',
+    required:
+      flow.nodes.some((node) => effectiveNodeType(node) === 'CHECKOUT') &&
+      !start?.start?.sources?.length,
+    acceptedArtifactTypes: ['DIRECTORY'],
+  };
 }
 
 export function simplifiedReleaseInput(
@@ -166,6 +182,21 @@ export interface SimplifiedPublicPlan {
     compose?: { sourceId?: string; path: string };
   };
   workspacePath?: string;
+  workspaceSource?:
+    | { kind: 'NEW' }
+    | {
+        kind: 'HISTORICAL';
+        artifactId: string;
+        runId: string;
+        createdAt: number;
+        sizeBytes: number | null;
+        sources: {
+          repositoryId: string;
+          ref?: string;
+          commitSha: string;
+          checkoutPath?: string;
+        }[];
+      };
   artifacts?: {
     id: string;
     name: string;
@@ -179,26 +210,12 @@ export interface SimplifiedPublicPlan {
   }[];
 }
 
-export function simplifiedRuntimeInputs(flow: GraphFlow, project: ProjectDetail): GraphField[] {
+export function simplifiedRuntimeInputs(flow: GraphFlow): GraphField[] {
   const start = flow.nodes.find(({ type }) => type === 'START')?.start;
   const artifact = simplifiedReleaseInput(flow);
+  const workspace = simplifiedWorkspaceInput(flow);
   return [
-    ...(start?.sources ?? []).flatMap((source) =>
-      source.allowRefOverride
-        ? [
-            {
-              id: 'git:' + source.id,
-              name:
-                'Git 版本 · ' +
-                (project.repositories.find(({ id }) => id === source.repositoryId)?.name ??
-                  source.id),
-              type: 'GIT_REF' as const,
-              required: false,
-              defaultValue: source.ref,
-            },
-          ]
-        : [],
-    ),
+    ...(workspace ? [workspace] : []),
     ...(start?.variables ?? []).flatMap((variable) =>
       variable.allowOverride && !variable.credentialId
         ? [
@@ -223,7 +240,7 @@ export function simplifiedRuntimeInputs(flow: GraphFlow, project: ProjectDetail)
   ];
 }
 
-export function simplifiedSourceDirectory(url: string, parent = '.') {
+export function simplifiedSourceDirectory(url: string) {
   let name: string;
   try {
     const address = new URL(url);
@@ -235,17 +252,19 @@ export function simplifiedSourceDirectory(url: string, parent = '.') {
   } catch {
     return;
   }
-  if (!name.trim() || name.includes('/') || name.includes('\\')) return;
-  const parts = parent
-    .trim()
-    .split('/')
-    .filter((part) => part && part !== '.');
   if (
-    parent.trim().startsWith('/') ||
-    parent.includes('\\') ||
-    /^[a-z]:/i.test(parent.trim()) ||
-    [name, ...parts].some((part) => part === '.' || part === '..' || /^\.(git|veyops)$/i.test(part))
+    !name.trim() ||
+    name.includes('/') ||
+    name.includes('\\') ||
+    /^[a-z]:/i.test(name) ||
+    name === '.' ||
+    name === '..' ||
+    /^\.(git|veyops)$/i.test(name) ||
+    Array.from(name).some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127;
+    })
   )
     return;
-  return [...parts, name].join('/');
+  return name;
 }

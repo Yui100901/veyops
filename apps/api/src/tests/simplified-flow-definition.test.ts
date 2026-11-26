@@ -11,9 +11,12 @@ import {
 import { SaveGraphDraftDto } from '../modules/execution-graphs/execution-graph-definition';
 import type { GraphCanvas } from '../modules/execution-graphs/execution-graph-definition';
 import {
+  legacySimplifiedSourceDirectory,
   simplifiedSourceDirectory,
+  simplifiedWorkspaceInput,
   validateSimplifiedSourceDirectories,
 } from '../modules/execution-graphs/simplified-flow-definition';
+import { GraphCompileError } from '../modules/execution-graphs/graph-fields';
 import { graphResourceReferences } from '../modules/projects/project-resource-extraction';
 
 const repositoryId = 'd408caad-b09a-4c8e-95a4-a74a44a60387';
@@ -34,7 +37,6 @@ function deployment(): GraphCanvas {
           release: {
             serviceId,
             targets: { serverIds: [serverId] },
-            contentPath: 'app/dist/',
           },
         },
       },
@@ -278,24 +280,55 @@ test('V2 rejects legacy writes and still permits saving incomplete configuration
   assert.equal(canvasIssues(canvas)[0]?.fieldId, 'start.release.serviceId');
 });
 
-test('V2 computes safe repository directories and identifies overlapping roots', () => {
+test('V2 computes safe repository roots and diagnoses every colliding source row', () => {
   const url = 'https://git.example.com/team/example.git';
   assert.equal(simplifiedSourceDirectory(url), 'example');
-  assert.equal(simplifiedSourceDirectory(url, './parent/'), 'parent/example');
-  assert.throws(() => simplifiedSourceDirectory(url, '../outside'), /路径/);
-  assert.throws(() => simplifiedSourceDirectory(url, '.git/submodules'), /保留名称/);
+  assert.equal(legacySimplifiedSourceDirectory(url, './parent/'), 'parent/example');
+  assert.throws(() => legacySimplifiedSourceDirectory(url, '../outside'), /路径/);
+  assert.throws(() => legacySimplifiedSourceDirectory(url, '.git/submodules'), /保留名称/);
   assert.throws(() => simplifiedSourceDirectory('https://git.example.com/foo%2fbar.git'), /安全/);
   const canvas = deployment();
   canvas.nodes[0]!.start!.sources!.push({
     id: 'second',
     repositoryId,
-    parentDirectory: 'example/subdir',
   });
   const flow = compileCanvas(canvas, true).flows[0]!;
   assert.throws(
     () => validateSimplifiedSourceDirectories(flow, new Map([[repositoryId, url]])),
-    /重名或相互包含/,
+    (error) =>
+      error instanceof GraphCompileError &&
+      error.issues.map(({ fieldId }) => fieldId).join(',') ===
+        'start.sources.source.repositoryId,start.sources.second.repositoryId',
   );
+});
+
+test('V2 rejects superseded start fields and permits a history-only build path', () => {
+  const old = deployment();
+  Object.assign(old.nodes[0]!.start!.sources![0]!, {
+    parentDirectory: 'nested',
+    allowRefOverride: true,
+  });
+  Object.assign(old.nodes[0]!.start!.release!, { reuseExecutionServer: true, contentPath: 'dist' });
+  const input = plainToInstance(SaveGraphDraftDto, {
+    expectedRevision: 1,
+    definition: { canvas: old },
+  });
+  const problems = JSON.stringify(
+    validateSync(input, { whitelist: true, forbidNonWhitelisted: true }),
+  );
+  for (const key of ['parentDirectory', 'allowRefOverride', 'reuseExecutionServer', 'contentPath'])
+    assert.match(problems, new RegExp('property ' + key + ' should not exist'));
+
+  const canvas = deployment();
+  delete canvas.nodes[0]!.start!.sources;
+  assert.equal(canvasIssues(canvas)[0]?.fieldId, 'start.sources');
+  delete canvas.nodes[0]!.start!.release;
+  delete canvas.nodes.find(({ id }) => id === 'end')!.finish!.requireRelease;
+  canvas.nodes = canvas.nodes.filter(({ id }) => id !== 'deploy');
+  canvas.edges = canvas.edges.filter(({ from, to }) => from !== 'deploy' && to !== 'deploy');
+  canvas.edges.push({ from: 'build', to: 'end' });
+  const [flow] = compileCanvas(canvas, true).flows;
+  assert.equal(simplifiedWorkspaceInput(flow!)?.required, true);
 });
 
 test('V2 requires an explicit order between snapshot creation and parallel writes', () => {

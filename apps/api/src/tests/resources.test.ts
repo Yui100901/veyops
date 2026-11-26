@@ -170,10 +170,10 @@ async function checkResources(databaseUrl?: string) {
                   ...(withRelease && {
                     start: {
                       environmentSetId: environmentSet.id,
+                      execution: { location: 'MANAGER' },
                       release: {
                         targets: { groupIds: [group.id] },
                         serviceId: service.id,
-                        contentPath: 'dist',
                       },
                     },
                   }),

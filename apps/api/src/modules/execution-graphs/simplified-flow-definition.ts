@@ -25,7 +25,12 @@ import { httpCloneUrl } from '../projects/http-clone-url';
 import { redactTaskLog } from '../tasks/task-log.service';
 import type { GraphCanvas, GraphFlow, GraphNode } from './execution-graph-definition';
 import { graphBranchPaths } from './graph-binding-validation';
-import { GraphCompileError, safeGraphEnvironmentKey, type GraphField } from './graph-fields';
+import {
+  GraphCompileError,
+  safeGraphEnvironmentKey,
+  type GraphDiagnostic,
+  type GraphField,
+} from './graph-fields';
 
 const idFormat = /^[A-Za-z0-9_-]{1,64}$/;
 const variableFormat = /^[a-zA-Z_][a-zA-Z0-9_]{0,127}$/;
@@ -44,8 +49,6 @@ export class SimplifiedSource {
   @ValidateNested()
   @Type(() => SimplifiedGitRef)
   ref?: SimplifiedGitRef;
-  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) parentDirectory?: string;
-  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() allowRefOverride?: boolean;
 }
 
 export class SimplifiedExecution {
@@ -88,8 +91,6 @@ export class SimplifiedRelease {
   @ValidateNested()
   @Type(() => SimplifiedReleaseTargets)
   targets?: SimplifiedReleaseTargets;
-  @ValidateIf((_o, v) => v !== undefined) @IsBoolean() reuseExecutionServer?: boolean;
-  @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(1024) contentPath?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() artifactId?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsIn(['RUN_PARAMETER']) artifactSource?: 'RUN_PARAMETER';
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() useUpstreamArtifact?: boolean;
@@ -212,7 +213,7 @@ export function simplifiedRelativePath(path?: string) {
   return normalizeRelativePath(path?.trim() || '.');
 }
 
-export function simplifiedSourceDirectory(cloneUrl: string, parentDirectory?: string) {
+export function simplifiedSourceDirectory(cloneUrl: string) {
   const safeUrl = new URL(httpCloneUrl(cloneUrl));
   let name: string;
   try {
@@ -225,10 +226,14 @@ export function simplifiedSourceDirectory(cloneUrl: string, parentDirectory?: st
   }
   if (!name.trim() || name === '.' || name.includes('/') || /^\.(git|veyops)$/i.test(name))
     throw new BadRequestException('无法从仓库地址生成安全的检出目录');
+  return normalizeRelativePath(name);
+}
+
+export function legacySimplifiedSourceDirectory(cloneUrl: string, parentDirectory: string) {
   const parent = simplifiedRelativePath(parentDirectory);
   if (parent.split('/').some((part) => /^\.(git|veyops)$/i.test(part)))
     throw new BadRequestException('检出父目录包含 Git 或平台保留名称');
-  return posix.join(parent, normalizeRelativePath(name));
+  return posix.join(parent, simplifiedSourceDirectory(cloneUrl));
 }
 
 export function simplifiedGitRefValid(ref: SimplifiedGitRef) {
@@ -340,43 +345,62 @@ export function validateSimplifiedSourceDirectories(
   repositoryUrls: ReadonlyMap<string, string>,
 ) {
   const start = flow.nodes.find(({ type }) => type === 'START')!;
-  const directories: string[] = [];
+  const directories = new Map<string, SimplifiedSource[]>();
   for (const source of start.start?.sources ?? []) {
     const url = source.repositoryId && repositoryUrls.get(source.repositoryId);
     if (!url) continue;
     let directory: string;
     try {
-      directory = simplifiedSourceDirectory(url, source.parentDirectory);
+      directory = simplifiedSourceDirectory(url);
     } catch {
       nodeIssue(
         start,
-        'start.sources.' + source.id + '.parentDirectory',
+        'start.sources.' + source.id + '.repositoryId',
         '无法生成安全的检出目录',
         flow.id,
       );
     }
-    if (
-      directories.some(
-        (previous) =>
-          previous === directory ||
-          previous.startsWith(directory + '/') ||
-          directory.startsWith(previous + '/'),
-      )
-    )
-      nodeIssue(
-        start,
-        'start.sources.' + source.id + '.parentDirectory',
-        '源码目录重名或相互包含，请修改检出父目录',
-        flow.id,
-      );
-    directories.push(directory);
+    const key = directory.toLowerCase();
+    directories.set(key, [...(directories.get(key) ?? []), source]);
   }
+  const collisions = [...directories].flatMap(([directory, sources]): GraphDiagnostic[] =>
+    sources.length < 2
+      ? []
+      : sources.map(({ id }) => ({
+          flowId: flow.id,
+          nodeId: start.id,
+          fieldId: 'start.sources.' + id + '.repositoryId',
+          fieldSection: 'execution',
+          severity: 'ERROR',
+          message: `「${start.name}」 · 源码目录「${directory}」重名，请选择不同的仓库`,
+        })),
+  );
+  if (collisions.length) throw new GraphCompileError(collisions[0]!, collisions);
 }
 
 const workspaceActions = new Set(['CHECKOUT', 'SHELL', 'CHECK', 'BUILD']);
 
 export function simplifiedUsesWorkspace(nodes: readonly GraphNode[]) {
   return nodes.some(({ type }) => workspaceActions.has(type));
+}
+
+export function simplifiedWorkspaceInput(flow: GraphFlow): GraphField | undefined {
+  if (
+    flow.model !== 'FLOW_V2' ||
+    flow.nodes.some(({ type }) =>
+      ['DEPLOY_ARTIFACT', 'ROLLBACK_ARTIFACT', 'SOURCE_REVIEW'].includes(type),
+    ) ||
+    !flow.nodes.some(({ type }) => ['BUILD', 'SHELL', 'CHECK'].includes(type))
+  )
+    return undefined;
+  const start = flow.nodes.find(({ type }) => type === 'START');
+  return {
+    id: 'workspaceArtifactId',
+    name: '历史目录',
+    type: 'ARTIFACT',
+    required: flow.nodes.some(({ type }) => type === 'CHECKOUT') && !start?.start?.sources?.length,
+    acceptedArtifactTypes: ['DIRECTORY'],
+  };
 }
 
 export function simplifiedEffectiveFinish(
@@ -432,15 +456,10 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
       report('start.sources.' + source.id + '.repositoryId', '请选择项目仓库');
     if (source.ref && !simplifiedGitRefValid(source.ref))
       report('start.sources.' + source.id + '.ref', '请选择有效的分支、标签或完整提交 SHA');
-    safeRelative(
-      start,
-      'start.sources.' + source.id + '.parentDirectory',
-      source.parentDirectory,
-      flow.id,
-    );
   }
   const checkouts = ordered.filter(({ type }) => type === 'CHECKOUT');
-  if (checkouts.length && !sources.length) report('start.sources', '请配置代码拉取使用的项目仓库');
+  if (checkouts.length && !sources.length && !simplifiedWorkspaceInput(flow)?.required)
+    report('start.sources', '请配置代码拉取使用的项目仓库');
   if (checkouts.length > 1)
     nodeIssue(
       checkouts[1]!,
@@ -454,7 +473,12 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
   const execution = config.execution;
   if (execution?.serverId && execution.groupId)
     report('start.execution', '请为工作区选择一台执行服务器或一个分组');
-  if (execution?.location === 'TARGET' && !execution.serverId && !execution.groupId)
+  if (
+    simplifiedUsesWorkspace(ordered) &&
+    execution?.location === 'TARGET' &&
+    !execution.serverId &&
+    !execution.groupId
+  )
     report('start.execution', '目标端工作区需要一台执行服务器或一个分组');
   const keys = new Set<string>();
   for (const { key, value, credentialId, allowOverride } of config.variables ?? []) {
@@ -507,15 +531,11 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
       report('start.release.upstreamArtifactName', '选择接收上游产物后才可指定登记名称');
     if (release?.upstreamArtifactName && !simplifiedImageName(release.upstreamArtifactName))
       report('start.release.upstreamArtifactName', '请填写有效的上游产物登记名称');
-    if (release?.reuseExecutionServer) {
-      if (execution?.location === 'MANAGER')
-        report('start.release.reuseExecutionServer', '使用管理端构建时请单独选择发布目标');
-    } else if (!release?.targets?.serverIds?.length && !release?.targets?.groupIds?.length) {
+    if (!release?.targets?.serverIds?.length && !release?.targets?.groupIds?.length) {
       report('start.release.targets', '请选择发布服务器或分组');
     }
     if (deploys[0]!.deploy?.method !== 'COMPOSE') {
       if (release?.imageId) report('start.release.imageId', '文件发布无需选择本次镜像');
-      safeRelative(start, 'start.release.contentPath', release?.contentPath, flow.id);
     }
   }
   if (activeFinish.requireRelease && !deploys.length)

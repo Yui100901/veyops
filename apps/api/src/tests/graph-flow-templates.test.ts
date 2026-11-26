@@ -80,6 +80,7 @@ async function checkTemplates(databaseUrl?: string) {
   try {
     configureApp(app);
     await app.init();
+    const db = app.get(DatabaseService).db;
     const root = '/api/v1';
     const api = request.agent(app.getHttpServer());
     await api.post(`${root}/auth/login`).send({ username: 'root', password }).expect(201);
@@ -281,6 +282,7 @@ async function checkTemplates(databaseUrl?: string) {
       for (const node of canvas.nodes) {
         if (node.start) {
           for (const source of node.start.sources ?? []) source.repositoryId = repository.id;
+          if (node.start.sources?.length) node.start.execution = { location: 'MANAGER' };
           node.start.release = node.start.release
             ? { ...node.start.release, serviceId: service.id, targets: { serverIds: [target.id] } }
             : { serviceId: service.id };
@@ -297,13 +299,49 @@ async function checkTemplates(databaseUrl?: string) {
       return canvas;
     };
     const ready = configured(seed);
+    const buildOnlyId = ready.endpoints[1]!.startId;
+    const inherited = structuredClone(ready);
+    inherited.nodes.find(({ id }) => id === buildOnlyId)!.start!.execution = {
+      location: 'INHERIT',
+    };
+    const inheritedCheck = await api
+      .post(`${path}/validate`)
+      .send({ definition: { canvas: inherited } })
+      .expect(201);
+    assert.equal(inheritedCheck.body.data.issues[0].flowId, buildOnlyId);
+    assert.equal(inheritedCheck.body.data.issues[0].fieldId, 'start.execution');
+    assert.deepEqual(
+      (await save(inherited, saved.revision).expect(200)).body.data.draft.canvas.nodes.find(
+        ({ id }: { id: string }) => id === buildOnlyId,
+      ).start.execution,
+      { location: 'INHERIT' },
+    );
+
+    ready.nodes.find(({ id }) => id === buildOnlyId)!.start!.sources = [];
     const wholeWorkspace = await api
       .post(`${path}/validate`)
       .send({ definition: { canvas: ready } })
       .expect(201);
     assert.deepEqual(wholeWorkspace.body.data.issues, []);
-    ready.nodes[0]!.start!.release!.contentPath = 'project/dist/';
-    const readyDraft = (await save(ready, saved.revision).expect(200)).body.data;
+    const savedReady = (await save(ready, saved.revision + 1).expect(200)).body.data;
+    const oldDraft = JSON.parse(JSON.stringify(savedReady.draft));
+    oldDraft.canvas.nodes[0].start.release.contentPath = 'project/dist';
+    await db
+      .updateTable('execution_graphs')
+      .set({ draft_json: JSON.stringify(oldDraft) })
+      .where('project_id', '=', project.id)
+      .execute();
+    const review = (await api.get(path).expect(200)).body.data;
+    assert.equal(review.draftReviewRequired, true);
+    assert.equal(review.draft.canvas.nodes[0].start.release.contentPath, undefined);
+    await api.post(`${path}/publish`).send({ expectedRevision: review.revision }).expect(400);
+    const readyDraft = (await save(review.draft.canvas, review.revision).expect(200)).body.data;
+    assert.equal(readyDraft.draftReviewRequired, undefined);
+    assert.deepEqual(
+      readyDraft.draft.canvas.nodes.find(({ id }: { id: string }) => id === buildOnlyId).start
+        .sources,
+      [],
+    );
     const published = (
       await api.post(`${path}/publish`).send({ expectedRevision: readyDraft.revision }).expect(201)
     ).body.data;
@@ -314,9 +352,18 @@ async function checkTemplates(databaseUrl?: string) {
       .send({ version: published.publishedVersion })
       .expect(400);
     assert.match(requiresArtifact.body.error.message, /历史产物/);
+    const requiresWorkspace = await api
+      .post(`${path}/flows/${buildOnlyId}/preview`)
+      .send({ version: published.publishedVersion })
+      .expect(400);
+    assert.equal(requiresWorkspace.body.error.planIssue.fieldId, 'workspaceArtifactId');
+    const historyEntry = (await projectCatalog()).flows.find(
+      ({ id }: { id: string }) => id === buildOnlyId,
+    );
+    assert.equal(historyEntry.needsWorkspaceInput, true);
+    assert.equal(historyEntry.supportsWorkspaceInput, true);
 
     const disconnected = structuredClone(ready);
-    const buildOnlyId = disconnected.endpoints[1]!.startId;
     disconnected.nodes = disconnected.nodes.filter(({ id }) => id !== buildOnlyId);
     disconnected.edges = disconnected.edges.filter(({ from }) => from !== buildOnlyId);
     disconnected.endpoints = disconnected.endpoints.filter(
@@ -379,7 +426,6 @@ async function checkTemplates(databaseUrl?: string) {
       ],
       templates: [],
     };
-    const db = app.get(DatabaseService).db;
     await save(mixed, ciPublished.revision).expect(400);
     await api
       .post(`${path}/catalog`)

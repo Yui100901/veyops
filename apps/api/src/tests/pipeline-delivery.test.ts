@@ -190,7 +190,7 @@ async function checkDelivery(databaseUrl?: string) {
       },
       upload: async (target: { id: string }, source: string) => {
         if (captureFlowUpload) {
-          const result = await processRunner.run('tar', ['-xOzf', source, './index.html'], {
+          const result = await processRunner.run('tar', ['-xOzf', source, './app/dist/index.html'], {
             timeout: 10,
           });
           assert.equal(result.exitCode, 0, result.stderr);
@@ -1345,14 +1345,12 @@ async function checkDelivery(databaseUrl?: string) {
             id: 'app',
             repositoryId: repo.id,
             ref: { kind: 'COMMIT' as const, value: successfulCommit },
-            allowRefOverride: true,
           },
         ],
         execution: { location: 'MANAGER' as const },
         release: {
           serviceId: service.id,
           targets: { serverIds: [serverIds[0]!] },
-          contentPath: 'app/dist',
         },
       },
     };
@@ -1401,8 +1399,8 @@ async function checkDelivery(databaseUrl?: string) {
       return { exitCode: 0, stdout: '', stderr: '' };
     };
     const flow = graphPath + '/flows/' + defaults.startId;
-    const submit = async (inputs: object = {}) => {
-      const args = { version: graphVersion, inputs };
+    const submit = async (version = graphVersion) => {
+      const args = { version };
       const plan = await create(flow + '/preview', args);
       return create(flow + '/run', {
         ...args,
@@ -1453,9 +1451,22 @@ async function checkDelivery(databaseUrl?: string) {
     assert.deepEqual(flowArchives, [serverIds[0]]);
     assert.equal(activations().length, initialActivations + 1);
     assert.deepEqual(completed.artifactIds, gate.output.scope.artifactIds);
-    const failedRun = await submit({
-      parameters: { 'git:app': { kind: 'COMMIT', value: failingCommit } },
+    buildFlow.start.sources[0]!.ref.value = failingCommit;
+    const nextDraft = (
+      await api
+        .put('/api/v1' + graphPath + '/draft')
+        .send({
+          expectedRevision: edited.revision,
+          definition: {
+            canvas: { ...edited.draft.canvas, nodes: flowNodes },
+          },
+        })
+        .expect(200)
+    ).body.data;
+    const { publishedVersion: failedVersion } = await create(graphPath + '/publish', {
+      expectedRevision: nextDraft.revision,
     });
+    const failedRun = await submit(failedVersion);
     const failedCheckout = await wait(failedRun.id, ['SUCCESS', 'FAILED']);
     assert.equal(failedCheckout.status, 'FAILED');
     assert.equal(activations().length, initialActivations + 1);
