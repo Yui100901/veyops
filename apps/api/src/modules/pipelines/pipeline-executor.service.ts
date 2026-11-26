@@ -1490,7 +1490,7 @@ fi
     }
     if (s.graphDeployment) {
       if (!composeYaml) throw new ConflictException('缺少已确认的 Compose 模板');
-      assertGraphCompose(composeYaml);
+      assertGraphCompose(composeYaml, s.graphDeployment.imageBindings);
     }
     await this.builds.remote(
       target,

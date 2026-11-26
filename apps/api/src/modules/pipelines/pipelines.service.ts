@@ -521,7 +521,7 @@ export class PipelinesService implements OnModuleInit {
           pinned,
           path,
         );
-        assertGraphCompose(yaml);
+        assertGraphCompose(yaml, imageBindings);
         graphDeployment.template = {
           source: 'REPOSITORY_FILE',
           repositoryId,
@@ -1605,7 +1605,7 @@ export class PipelinesService implements OnModuleInit {
           composeChecksum(template.compose_yaml) !== checksum
         )
           throw artifactIssue(new ConflictException('归档 Compose 模板已变化'));
-        assertGraphCompose(template.compose_yaml);
+        assertGraphCompose(template.compose_yaml, imageBindings);
       }
     }
     if (p.managedCompose)

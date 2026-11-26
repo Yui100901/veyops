@@ -1135,17 +1135,20 @@ export class SimplifiedFlowRunService {
       entry.id,
     );
     if (await this.artifacts.requireFlowInstance(identity.instanceId, runId)) return;
-    const composePath =
-      (releaseImageEntries(plan.release).some(({ id }) => id === entry.id)
-        ? plan.release?.workspaceComposePath
-        : undefined) ?? entry.composePath;
+    const releaseImage = releaseImageEntries(plan.release).some(({ id }) => id === entry.id);
+    const releaseComposePath = releaseImage ? plan.release?.workspaceComposePath : undefined;
+    const composePath = releaseComposePath ?? entry.composePath;
     const composeYaml = composePath
       ? workspace &&
         (await this.builds.flowComposeSnapshot(session, workspace, composePath, target))
       : undefined;
     if (composePath && (!composeYaml || redactTaskLog(composeYaml) !== composeYaml))
       throw new BadRequestException('Compose 文件缺失或包含应使用凭据引用的内容');
-    if (composeYaml) assertGraphCompose(composeYaml);
+    if (composeYaml)
+      assertGraphCompose(
+        composeYaml,
+        releaseComposePath ? plan.release?.profile.delivery?.imageBindings : undefined,
+      );
     if (entry.source === 'REGISTRY') {
       const reference = entry.reference!;
       const digest = reference.match(/@(sha256:[a-f0-9]{64})$/)?.[1];

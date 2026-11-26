@@ -11,7 +11,7 @@ function object(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
-export function parseComposeTemplate(content?: string) {
+export function parseComposeTemplate(content?: string, requiredImageVariables = ['VEYOPS_IMAGE']) {
   if (!content?.trim() || Buffer.byteLength(content) > maxComposeBytes || /\0/.test(content))
     throw new BadRequestException('Compose 模板不能为空，且大小不能超过 256 KiB');
   let parsed: unknown;
@@ -29,14 +29,18 @@ export function parseComposeTemplate(content?: string) {
   const services = Object.values(parsed.services);
   if (!services.every(object))
     throw new BadRequestException('Compose 模板中每个服务都必须是键值映射');
-  if (
-    !services.some(
-      ({ image }) =>
-        typeof image === 'string' &&
-        /^(?:\$VEYOPS_IMAGE|\$\{VEYOPS_IMAGE(?:(?::?[-?])[^}]*)?\})$/.test(image),
-    )
-  )
-    throw new BadRequestException('至少一个 Compose 服务必须通过 ${VEYOPS_IMAGE} 使用发布镜像');
+  const imageVariables = new Set(
+    services.flatMap(({ image }) => {
+      if (typeof image !== 'string') return [];
+      const match = /^(?:\$([A-Z][A-Z\d_]*)|\$\{([A-Z][A-Z\d_]*)(?:(?::?[-?])[^}]*)?\})$/.exec(
+        image,
+      );
+      return match ? [match[1] ?? match[2]] : [];
+    }),
+  );
+  const missing = requiredImageVariables.filter((name) => !imageVariables.has(name));
+  if (missing.length)
+    throw new BadRequestException('Compose 模板缺少固定发布镜像变量：' + missing.join('、'));
   return { compose: parsed, services, content };
 }
 

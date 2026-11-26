@@ -7,8 +7,11 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-export function assertGraphCompose(text: string) {
-  const { compose, services } = parseComposeTemplate(text);
+export function assertGraphCompose(text: string, imageBindings?: Record<string, string>) {
+  const { compose, services } = parseComposeTemplate(
+    text,
+    imageBindings && Object.keys(imageBindings),
+  );
   if (compose.include || compose.configs || compose.secrets)
     throw new BadRequestException('图内 Compose 模板须自包含，请使用执行图变量和项目内资源');
   const volumes = new Set(Object.keys(compose.volumes ? record(compose.volumes) : {}));

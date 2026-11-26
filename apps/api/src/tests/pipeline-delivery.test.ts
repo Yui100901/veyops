@@ -10,6 +10,17 @@ import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import type { ProcessOptions } from '../infrastructure/build-runner/process-runner.service';
+import { assertGraphCompose } from '../modules/pipelines/graph-compose';
+
+test('graph Compose requires every fixed image binding in its own service image field', () => {
+  const bindings = { VEYOPS_IMAGE_FRONTEND: 'fixture/front', VEYOPS_IMAGE_BACKEND: 'fixture/back' };
+  const frontend = 'services:\n  frontend:\n    image: ${VEYOPS_IMAGE_FRONTEND}\n';
+  const complete = frontend + '  backend:\n    image: ${VEYOPS_IMAGE_BACKEND:?required}\n';
+  assert.doesNotThrow(() => assertGraphCompose(complete, bindings));
+  assert.throws(() => assertGraphCompose(frontend, bindings), /VEYOPS_IMAGE_BACKEND/);
+  assert.throws(() => assertGraphCompose(complete), /固定发布镜像变量：VEYOPS_IMAGE$/);
+  assert.doesNotThrow(() => assertGraphCompose('services: { app: { image: "${VEYOPS_IMAGE}" } }'));
+});
 
 let testDirectory: Promise<string> | undefined;
 const deliveryDirectory = () =>
