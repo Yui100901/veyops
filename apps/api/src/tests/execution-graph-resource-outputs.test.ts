@@ -68,10 +68,10 @@ test('FLOW_V2 exposes node and task logs and validates artifact ownership', asyn
       path: '/tmp/fixture/' + runId,
     });
     workspace.cleanup = async () => undefined;
-    workspace.command = async (_workspace, options, context) => {
+    workspace.command = async (current, options, context) => {
       assert.equal(options.variables?.values.VEYOPS_SERVICE_ID, serviceId);
       context.log('自动采集的脚本日志');
-      return { exitCode: 0, stdout: '', stderr: '' };
+      return { exitCode: 0, directory: current.path };
     };
     const graphPath = `${root}/projects/${projectId}/execution-graph`;
     const draft = (await api.get(graphPath).expect(200)).body.data;

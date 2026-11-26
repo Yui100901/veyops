@@ -1,19 +1,23 @@
 import { randomUUID } from 'node:crypto';
-import type { SuperTest, Test } from 'supertest';
+import type { Test } from 'supertest';
 
-export async function flowTarget(api: Pick<SuperTest<Test>, 'post' | 'patch'>, automatic = false) {
+export async function flowTarget(
+  api: { post(url: string): Test; patch(url: string): Test },
+  automatic = false,
+  host = '127.0.0.1',
+) {
   const credential = (
     await api
       .post('/api/v1/credentials')
-      .send({ name: 'Execution SSH', type: 'SSH_PASSWORD', secret: { password: randomUUID() } })
+      .send({ name: 'Execution SSH ' + host, type: 'SSH_PASSWORD', secret: { password: randomUUID() } })
       .expect(201)
   ).body.data;
   const server = (
     await api
       .post('/api/v1/servers')
       .send({
-        name: 'Execution server',
-        host: '127.0.0.1',
+        name: 'Execution server ' + host,
+        host,
         username: 'fixture',
         credentialId: credential.id,
         hostKeyFingerprint: 'a'.repeat(64),
