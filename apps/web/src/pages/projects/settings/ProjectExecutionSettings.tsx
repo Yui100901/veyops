@@ -9,14 +9,12 @@ import type {
 } from '../../../models';
 
 const labels = {
-  defaultBuildLocation: '默认构建位置',
-  defaultMaxParallelTargets: '默认目标并发数',
+  defaultMaxParallelTargets: '批量运维并发',
   targetWorkspaceRoot: '目标端工作根目录',
   logRetentionDays: '任务日志保留天数',
 };
-const keys = Object.keys(labels) as (keyof SystemRuntimeDefaults)[];
+const keys = Object.keys(labels) as (keyof typeof labels)[];
 function settingValue(key: keyof SystemRuntimeDefaults, value: string | number) {
-  if (key === 'defaultBuildLocation') return value === 'TARGET' ? '目标服务器' : '管理端隔离环境';
   if (key === 'logRetentionDays') return value === 0 ? '一直保留' : value + ' 天';
   if (key === 'defaultMaxParallelTargets') return value + ' 台';
   return String(value);
@@ -33,20 +31,9 @@ export function ExecutionSettingsFields({
     system ? '继承系统 · ' + settingValue(key, system[key]) : undefined;
   return (
     <div className="form-grid">
-      <Field label={labels.defaultBuildLocation} hint="执行流未指定构建位置时使用。">
-        <select
-          name="defaultBuildLocation"
-          defaultValue={values.defaultBuildLocation ?? ''}
-          required={!system}
-        >
-          {system && <option value="">{placeholder('defaultBuildLocation')}</option>}
-          <option value="TARGET">目标服务器</option>
-          <option value="MANAGER">管理端隔离环境</option>
-        </select>
-      </Field>
       <Field
         label={labels.defaultMaxParallelTargets}
-        hint="未显式指定并发数时，同时执行的目标服务器数量，范围 1–10 台。"
+        hint="一项批量运维任务可同时操作的服务器数量，范围 1–10 台。"
       >
         <input
           type="number"

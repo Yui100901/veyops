@@ -17,13 +17,14 @@ export interface ManagedUser extends Omit<User, 'passwordChangeRecommended'> {
   updatedAt: number;
 }
 export interface SystemRuntimeDefaults {
-  defaultBuildLocation: 'TARGET' | 'MANAGER';
   defaultMaxParallelTargets: number;
+  maxConcurrentFlowsPerServer: number;
   logRetentionDays: number;
   targetWorkspaceRoot: string;
 }
 export type ProjectExecutionOverrides = {
-  [Key in keyof SystemRuntimeDefaults]?: SystemRuntimeDefaults[Key] | null;
+  [Key in Exclude<keyof SystemRuntimeDefaults, 'maxConcurrentFlowsPerServer'>]?:
+    SystemRuntimeDefaults[Key] | null;
 };
 export interface ProjectExecutionSettings {
   system: SystemRuntimeDefaults;

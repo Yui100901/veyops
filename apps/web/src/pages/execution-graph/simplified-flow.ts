@@ -1,4 +1,3 @@
-import type { DeploymentSelection } from '../../models';
 import {
   effectiveNodeType,
   graphNodeLabels,
@@ -20,20 +19,18 @@ export interface SimplifiedSource {
 }
 
 export interface SimplifiedExecution {
-  location: 'INHERIT' | 'MANAGER' | 'TARGET';
   serverId?: string;
-  groupId?: string;
 }
 
 export interface SimplifiedRelease {
   serviceId?: string;
-  targets?: DeploymentSelection;
   artifactSource?: 'RUN_PARAMETER';
   artifactId?: string;
   allowArtifactOverride?: boolean;
   useUpstreamArtifact?: boolean;
   upstreamArtifactName?: string;
   imageId?: string;
+  imageIds?: string[];
   compose?: { sourceId?: string; path: string };
 }
 
@@ -67,6 +64,16 @@ export interface SimplifiedFinishImage {
   reference?: string;
   registryId?: string;
   composePath?: string;
+  buildNodeId?: string;
+}
+
+export function simplifiedTarget(start?: SimplifiedStart) {
+  const serverId = start?.execution?.serverId;
+  return serverId ? { serverIds: [serverId] } : undefined;
+}
+
+export function simplifiedComposeImageVariable(id: string) {
+  return 'VEYOPS_IMAGE_' + id.toUpperCase().replace(/-/g, '_');
 }
 
 export const simplifiedActions = [
@@ -86,7 +93,7 @@ export type SimplifiedAction = (typeof simplifiedActions)[number];
 
 export const simplifiedNodeGroups = [
   { name: '常用节点', types: ['START', 'END', 'CHECKOUT', 'SHELL', 'BUILD', 'DEPLOY_ARTIFACT'] },
-  { name: '流程控制', types: ['CONDITION', 'DELAY'] },
+  { name: '流程控制', types: ['CONDITION', 'PARALLEL', 'JOIN', 'DELAY'] },
   { name: '审核与发布', types: ['SOURCE_REVIEW', 'APPROVAL', 'HEALTH_CHECK', 'ROLLBACK_ARTIFACT'] },
 ] as const;
 
@@ -179,6 +186,7 @@ export interface SimplifiedPublicPlan {
     contentPath?: string;
     method: string;
     image?: { id: string; name: string };
+    images?: { id: string; name: string }[];
     compose?: { sourceId?: string; path: string };
   };
   workspacePath?: string;

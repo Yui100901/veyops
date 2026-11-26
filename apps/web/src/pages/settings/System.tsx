@@ -15,7 +15,7 @@ import {
   Workflow,
 } from 'lucide-react';
 import { api, message, useResource } from '../../api';
-import { ErrorBanner, Form, Loading, PageHeader, Section } from '../../components';
+import { ErrorBanner, Field, Form, Loading, PageHeader, Section } from '../../components';
 import type { SystemRuntimeDefaults, User } from '../../models';
 import { InlineEditor, useInlineEditor } from '../../InlineEditor';
 import {
@@ -125,22 +125,16 @@ export function SystemPage({ user }: { user: User }) {
             <div className="setting-row">
               <span>
                 <Server size={17} />
-                默认目标并发
+                批量运维并发
               </span>
               <strong>{value?.defaultMaxParallelTargets ?? '—'}</strong>
             </div>
             <div className="setting-row">
               <span>
-                <HardDrive size={17} />
-                默认构建位置
+                <Workflow size={17} />
+                单台服务器执行流并发
               </span>
-              <strong>
-                {value?.defaultBuildLocation === 'TARGET'
-                  ? '目标服务器'
-                  : value?.defaultBuildLocation === 'MANAGER'
-                    ? '管理端隔离环境'
-                    : '—'}
-              </strong>
+              <strong>{value?.maxConcurrentFlowsPerServer ?? '—'}</strong>
             </div>
             <div className="setting-row">
               <span>
@@ -250,6 +244,9 @@ function RuntimeDefaultsEditor({
     event.preventDefault();
     const fields = new FormData(event.currentTarget);
     const changed = executionChanges(fields, settings);
+    const maxConcurrentFlowsPerServer = Number(fields.get('maxConcurrentFlowsPerServer'));
+    if (maxConcurrentFlowsPerServer !== settings.maxConcurrentFlowsPerServer)
+      changed.maxConcurrentFlowsPerServer = maxConcurrentFlowsPerServer;
     setSaving(true);
     setError('');
     try {
@@ -268,6 +265,19 @@ function RuntimeDefaultsEditor({
     <InlineEditor title="编辑运行设置" busy={saving} onClose={onClose}>
       <Form onSubmit={save} onCancel={onClose} busy={saving} error={error}>
         <ExecutionSettingsFields values={settings} />
+        <Field
+          label="单台服务器执行流并发"
+          hint="每台服务器分别计算。达到上限时，同一服务器的执行流按提交顺序等待。"
+        >
+          <input
+            type="number"
+            name="maxConcurrentFlowsPerServer"
+            min={1}
+            max={10}
+            required
+            defaultValue={settings.maxConcurrentFlowsPerServer ?? 3}
+          />
+        </Field>
       </Form>
     </InlineEditor>
   );

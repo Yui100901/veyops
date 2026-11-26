@@ -13,14 +13,14 @@ test "${#revision}" -eq 40 || exit 2
 case "$database" in sqlite|postgres) ;; *) printf '%s\n' 'Choose sqlite or postgres.' >&2; exit 2 ;; esac
 case "$mode" in
   acceptance|flow-v2|flow-v2-image) test -z "$bind" ;;
-  preview)
+  preview|gitea-preview)
     if ! printf '%s\n' "$bind" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}:[1-9][0-9]{3,4}$' ||
        [ "${bind%:*}" = 0.0.0.0 ] || [ "${bind##*:}" -gt 65535 ]; then
       printf '%s\n' 'Preview requires a specific host IPv4 address and port.' >&2
       exit 2
     fi
     ;;
-  *) printf '%s\n' 'Choose acceptance, flow-v2, flow-v2-image or preview.' >&2; exit 2 ;;
+  *) printf '%s\n' 'Choose acceptance, flow-v2, flow-v2-image, preview or gitea-preview.' >&2; exit 2 ;;
 esac
 
 repo=$(git rev-parse --show-toplevel)
@@ -60,6 +60,7 @@ postgres="$prefix-db"
 case "$mode" in
   flow-v2) targets='test-a test-b' ;;
   flow-v2-image) targets='test-a' ;;
+  gitea-preview) targets='test-a test-b production-a' ;;
   *) targets='test-a test-b production-a production-b' ;;
 esac
 cleanup() {
@@ -146,7 +147,7 @@ create_network "${VEYOPS_ACCEPT_NETWORK_SUBNET:-}" --internal "$network"
 for target in $targets; do
   mkdir -p "$work/targets/$target/deploy"
   ssh-keygen -q -t ed25519 -N '' -f "$work/host-ssh/$target"
-  docker run --pull=never -d --privileged --cgroupns=host --name "$prefix-$target" \
+  docker run --pull=never -d --user root --privileged --cgroupns=host --name "$prefix-$target" \
     --network "$network" --network-alias "$target" --label "veyops.acceptance=$prefix" \
     --mount "type=bind,src=$work,dst=/accept" \
     --mount "type=bind,src=$work/targets/$target/deploy,dst=/srv/veyops-stage0" \
@@ -173,6 +174,7 @@ done
 # Save before loading so a failed save cannot be masked by a pipeline.
 case "$mode" in
   flow-v2) ;;
+  gitea-preview) docker image save -o "$work/images.tar" "$site_image" ;;
   *) docker image save -o "$work/images.tar" "$site_image" "$target_image" ;;
 esac
 if [ "$mode" != flow-v2 ]; then
@@ -205,11 +207,18 @@ fi
     printf 'DATABASE_URL=postgresql://veyops:%s@database:5432/veyops_acceptance\n' "$password"
     printf 'VEYOPS_ACCEPT_RESTORE_DATABASE_URL=postgresql://veyops:%s@database:5432/veyops_restore\n' "$password"
   fi
-  printf 'ADMIN_PASSWORD=%s\n' "$(openssl rand -hex 24)"
+  if [ "$mode" = gitea-preview ] && [ -n "${VEYOPS_ACCEPT_PREVIEW_ADMIN_PASSWORD:-}" ]; then
+    printf 'ADMIN_PASSWORD=%s\n' "$VEYOPS_ACCEPT_PREVIEW_ADMIN_PASSWORD"
+  else
+    printf 'ADMIN_PASSWORD=%s\n' "$(openssl rand -hex 24)"
+  fi
   printf 'ENCRYPTION_KEY=%s\n' "$(openssl rand -hex 32)"
   printf 'DOCKER_HOST=unix:///accept/targets/test-a/docker.sock\nNODE_PATH=/app/apps/api/node_modules:/app/node_modules\n'
   if [ "$mode" = flow-v2-image ]; then
     printf 'VEYOPS_AUTO_DELIVERY_TRIGGERS=UPSTREAM\n'
+  fi
+  if [ "$mode" = gitea-preview ]; then
+    printf 'VEYOPS_AUTO_DELIVERY_TRIGGERS=WEBHOOK,CRON,UPSTREAM\n'
   fi
   printf 'BUILD_HELPER_IMAGE=%s\nVEYOPS_ACCEPT_BUILD_IMAGE=%s\n' "$target_image" "$target_image"
 } >"$work/bootstrap.env"
@@ -223,8 +232,13 @@ fi
   fi
 } >"$work/candidate.txt"
 
-if [ "$mode" = preview ]; then
+if [ "$mode" = preview ] || [ "$mode" = gitea-preview ]; then
   create_network "${VEYOPS_ACCEPT_PREVIEW_SUBNET:-}" "$preview_network"
+  if [ "$mode" = gitea-preview ]; then
+    for target in $targets; do
+      docker network connect "$preview_network" "$prefix-$target"
+    done
+  fi
   set -- --network "$preview_network" --publish "$bind:3000"
 else
   set -- --network "$network" --network-alias manager
@@ -234,11 +248,11 @@ docker create --pull=never --name "$manager" --user root "$@" \
   --mount "type=bind,src=$work,dst=/accept" \
   --mount "type=bind,src=$work/plugins,dst=/usr/local/lib/docker/cli-plugins,readonly" \
   --entrypoint /bin/sh "$candidate" -eu -c 'export PATH=/accept/bin:$PATH; exec node /accept/tools/acceptance/p1-delivery.cjs "$@"' sh "$revision" "$site_image" "$mode" >/dev/null
-if [ "$mode" = preview ]; then
+if [ "$mode" = preview ] || [ "$mode" = gitea-preview ]; then
   docker network connect --alias manager "$network" "$manager"
 fi
 docker start "$manager" >/dev/null
-if [ "$mode" = preview ]; then
+if [ "$mode" = preview ] || [ "$mode" = gitea-preview ]; then
   for attempt in $(seq 1 90); do
     if [ -s "$work/preview.json" ] && curl -fsS --max-time 3 "http://$bind/api/v1/health" >/dev/null 2>&1; then
       rm -f -- "$work/bootstrap.env" "$work/postgres.env"

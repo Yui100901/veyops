@@ -23,7 +23,8 @@ export function SimplifiedImageSettings({
   patch: (fields: Partial<GraphNode>) => void;
 }) {
   const images = node.finish?.images ?? [];
-  const hasNativeBuild = flowNodes.some(isNativeDockerBuild);
+  const nativeBuilds = flowNodes.filter(isNativeDockerBuild);
+  const hasNativeBuild = nativeBuilds.length > 0;
   const registries = useResource<{ id: string; name: string }[]>(
     images.some(({ source }) => source === 'REGISTRY') ? '/registries' : null,
   );
@@ -45,7 +46,8 @@ export function SimplifiedImageSettings({
       {
         id: graphKey('image'),
         name,
-        source: hasNativeBuild && !images.length ? 'BUILT_IN' : 'WORKSPACE',
+        source: hasNativeBuild ? 'BUILT_IN' : 'WORKSPACE',
+        ...(nativeBuilds.length === 1 && { buildNodeId: nativeBuilds[0]!.id }),
       },
     ]);
 
@@ -78,6 +80,7 @@ export function SimplifiedImageSettings({
                     source: event.target.value as SimplifiedFinishImage['source'],
                     reference: undefined,
                     registryId: undefined,
+                    buildNodeId: undefined,
                   })
                 }
               >
@@ -88,6 +91,31 @@ export function SimplifiedImageSettings({
                 <option value="REGISTRY">Registry 固定 Digest</option>
               </select>
             </Field>
+            {image.source === 'BUILT_IN' && (nativeBuilds.length > 1 || image.buildNodeId) && (
+              <Field label="构建节点">
+                <select
+                  data-graph-node-field={field + '.buildNodeId'}
+                  value={
+                    image.buildNodeId ?? (nativeBuilds.length === 1 ? nativeBuilds[0]!.id : '')
+                  }
+                  disabled={!canEdit}
+                  onChange={(event) => update({ buildNodeId: event.target.value || undefined })}
+                >
+                  <option value="">选择生成此镜像的节点</option>
+                  {image.buildNodeId &&
+                    !nativeBuilds.some(({ id }) => id === image.buildNodeId) && (
+                      <option value={image.buildNodeId} disabled>
+                        原构建节点不可用
+                      </option>
+                    )}
+                  {nativeBuilds.map(({ id, name }) => (
+                    <option key={id} value={id}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            )}
             {image.source === 'REGISTRY' && (
               <>
                 <Field label="镜像仓库">

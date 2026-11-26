@@ -317,6 +317,26 @@ button.graph-node:focus-visible {
 .graph-connectors .graph-arrow {
   fill: #7890aa;
 }
+.graph-connectors .graph-trigger-connector > path {
+  stroke: #7548a6;
+  stroke-width: 2;
+  stroke-dasharray: 7 4;
+  stroke-linejoin: round;
+}
+.graph-connectors .graph-trigger-arrow {
+  fill: #7548a6;
+}
+.graph-trigger-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-inline-end: auto;
+}
+.graph-trigger-legend::before {
+  width: 1.25rem;
+  border-top: 2px dashed #7548a6;
+  content: '';
+}
 .graph-connectors .edge-true > path {
   stroke: #328063;
 }

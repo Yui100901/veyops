@@ -1,17 +1,19 @@
 import { Plus, Trash2 } from 'lucide-react';
 import { useId, useState } from 'react';
 import { useResource } from '../../../api';
-import { Field } from '../../../components';
-import type { DeploymentSelection, ProjectDetail, ProjectExecutionSettings } from '../../../models';
+import { ErrorBanner, Field } from '../../../components';
+import type { ProjectDetail, ProjectExecutionSettings, Server } from '../../../models';
 import { effectiveNodeType, graphKey, isReleaseNode } from '../execution-graph-definition';
 import type { GraphField, GraphNode } from '../execution-graph-definition';
 import {
   isSimplifiedAction,
   producesWorkspace,
+  simplifiedComposeImageVariable,
   simplifiedNodeGroups,
   simplifiedNodeLabel,
   simplifiedReleaseKinds,
   simplifiedSourceDirectory,
+  simplifiedTarget,
   type SimplifiedAction,
   type SimplifiedFinish,
   type SimplifiedGitRef,
@@ -110,13 +112,15 @@ export function SimplifiedStartSettings({
   const start = node.start ?? {};
   const patchStart = (next: Partial<SimplifiedStart>) => patch({ start: { ...start, ...next } });
   const sources = start.sources ?? [];
-  const execution = start.execution ?? { location: 'INHERIT' };
+  const serverId = start.execution?.serverId;
+  const legacyExecution = !canEdit
+    ? (start.execution as { location?: string; groupId?: string } | undefined)
+    : undefined;
   const release = start.release ?? {};
   const releaseAction = flowNodes.find(isReleaseNode);
   const rollback = releaseAction && effectiveNodeType(releaseAction) === 'ROLLBACK_ARTIFACT';
   const producesFiles = flowNodes.some(producesWorkspace);
   const hasCheckout = flowNodes.some((item) => effectiveNodeType(item) === 'CHECKOUT');
-  const hasWorkspace = producesFiles || !releaseAction;
   const [sourceChoice, setSourceChoice] = useState<'FIXED'>();
   const artifactMode =
     rollback || release.artifactId
@@ -137,15 +141,10 @@ export function SimplifiedStartSettings({
   const composeRelease = releaseAction?.deploy?.method === 'COMPOSE';
   const images = flowNodes.find(({ type }) => type === 'END')?.finish?.images ?? [];
   const historical = artifactMode !== 'CURRENT';
+  const servers = useResource<Server[]>('/servers');
   const runtime = useResource<ProjectExecutionSettings>(
-    hasWorkspace && execution.location !== 'MANAGER'
-      ? '/projects/' + project.id + '/execution-settings'
-      : null,
+    producesFiles ? '/projects/' + project.id + '/execution-settings' : null,
   );
-  const effectiveLocation =
-    execution.location === 'INHERIT'
-      ? runtime.data?.effective.defaultBuildLocation
-      : execution.location;
   const variables = start.variables ?? [];
 
   function updateSources(next: SimplifiedSource[]) {
@@ -186,86 +185,62 @@ export function SimplifiedStartSettings({
       </div>
     );
   }
-  const locationTarget = {
-    ...(execution.serverId && { serverIds: [execution.serverId] }),
-    ...(execution.groupId && { groupIds: [execution.groupId] }),
-  };
-  const selectedTargets =
-    !canEdit && 'reuseExecutionServer' in release && release.reuseExecutionServer
-      ? locationTarget
-      : release.targets;
-  const targetControl = () =>
-    control('start.release.targets', '发布服务器／分组', 'TARGETS', selectedTargets, (value) =>
-      changeRelease({ targets: value as DeploymentSelection | undefined }),
-    );
+  const selectedTargets = simplifiedTarget(start);
   const projectWorkspace =
-    effectiveLocation === 'TARGET'
-      ? (runtime.data?.effective.targetWorkspaceRoot ?? '~/.veyops/workspace').replace(/\/+$/, '') +
-        '/' +
-        project.slug
-      : effectiveLocation === 'MANAGER'
-        ? 'flow-workspaces/' + project.slug
-        : undefined;
+    (runtime.data?.effective.targetWorkspaceRoot ?? '~/.veyops/workspace').replace(/\/+$/, '') +
+    '/' +
+    project.slug;
+  const imageIds =
+    release.imageIds ??
+    (release.imageId ? [release.imageId] : images.length === 1 ? [images[0]!.id] : []);
+  function changeImage(id: string, selected: boolean) {
+    const ids = selected ? [...imageIds, id] : imageIds.filter((value) => value !== id);
+    changeRelease({ imageId: undefined, imageIds: ids.length ? ids : undefined });
+  }
   return (
     <>
-      {hasWorkspace ? (
-        <div className="graph-fields" data-graph-node-field="start.execution">
-          <div className="graph-location-grid">
-            <Field
-              label="执行位置"
-              hint={
-                execution.location === 'INHERIT' && effectiveLocation
-                  ? '当前生效 · ' + (effectiveLocation === 'TARGET' ? '目标端' : '管理端')
-                  : undefined
-              }
-            >
-              <select
-                data-graph-node-field="start.execution.location"
-                value={execution.location}
-                disabled={!canEdit}
-                onChange={(event) => {
-                  const location = event.target.value as typeof execution.location;
-                  patchStart({
-                    execution: location === 'MANAGER' ? { location } : { ...execution, location },
-                  });
-                }}
-              >
-                <option value="INHERIT">沿用项目设置</option>
-                <option value="MANAGER">管理端</option>
-                <option value="TARGET">目标端</option>
-              </select>
-            </Field>
-            {effectiveLocation === 'TARGET' && (
-              <div data-graph-node-field="start.execution.serverId">
-                {control(
-                  'start.execution.groupId',
-                  '执行服务器／分组',
-                  'TARGETS',
-                  locationTarget,
-                  (value) => {
-                    const selected = value as DeploymentSelection | undefined;
-                    patchStart({
-                      execution: {
-                        location: execution.location,
-                        serverId: selected?.serverIds?.[0],
-                        groupId: selected?.groupIds?.[0],
-                      },
-                    });
-                  },
-                  { purpose: 'BUILD_TARGETS', required: true },
-                )}
-              </div>
+      <div className="graph-fields" data-graph-node-field="start.execution">
+        <Field
+          label="执行服务器"
+          hint={releaseAction ? '这条执行流的所有操作都使用此服务器。' : undefined}
+        >
+          <select
+            data-graph-node-field="start.execution.serverId"
+            value={serverId ?? ''}
+            disabled={!canEdit}
+            onChange={(event) =>
+              patchStart({
+                execution: event.target.value ? { serverId: event.target.value } : undefined,
+              })
+            }
+          >
+            <option value="">
+              {legacyExecution?.location === 'MANAGER'
+                ? '旧版管理端执行'
+                : legacyExecution?.groupId
+                  ? '旧版服务器分组'
+                  : '选择一台服务器'}
+            </option>
+            {serverId && !servers.data?.some(({ id }) => id === serverId) && (
+              <option value={serverId} disabled>
+                服务器 {serverId}
+              </option>
             )}
-          </div>
-          {projectWorkspace && (
-            <p className="field-note graph-workspace-path">
-              工作区 · <code>{projectWorkspace}/&lt;执行 ID&gt;</code>
-            </p>
-          )}
-        </div>
-      ) : (
-        targetControl()
-      )}
+            {servers.data?.map(({ id, name, host, port }) => (
+              <option key={id} value={id}>
+                {name} · {host}
+                {port !== 22 ? ':' + port : ''}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <ErrorBanner error={servers.error} retry={servers.reload} />
+        {producesFiles && legacyExecution?.location !== 'MANAGER' && (
+          <p className="field-note graph-workspace-path">
+            工作区 · <code>{projectWorkspace}/&lt;执行 ID&gt;</code>
+          </p>
+        )}
+      </div>
       {(hasCheckout || sources.length > 0) && (
         <fieldset
           className="graph-fields graph-source-settings"
@@ -393,7 +368,6 @@ export function SimplifiedStartSettings({
           {control('start.release.serviceId', '项目服务', 'SERVICE', release.serviceId, (value) =>
             changeRelease({ serviceId: value as string | undefined, artifactId: undefined }),
           )}
-          {hasWorkspace && targetControl()}
           {!canEdit &&
             'contentPath' in release &&
             typeof release.contentPath === 'string' &&
@@ -405,28 +379,46 @@ export function SimplifiedStartSettings({
           {composeRelease && (
             <div className="form-grid" data-graph-node-field="start.release.compose">
               {!historical && (
-                <Field label="本次发布镜像" hint="镜像登记项由本流的结束节点配置。">
-                  <select
-                    data-graph-node-field="start.release.imageId"
-                    value={release.imageId ?? (images.length === 1 ? images[0]?.id : '')}
-                    disabled={!canEdit}
-                    onChange={(event) =>
-                      changeRelease({ imageId: event.target.value || undefined })
-                    }
-                  >
-                    <option value="">选择镜像登记项</option>
-                    {release.imageId && !images.some(({ id }) => id === release.imageId) && (
-                      <option value={release.imageId} disabled>
-                        原登记项已移除
-                      </option>
-                    )}
-                    {images.map(({ id, name }) => (
-                      <option key={id} value={id}>
-                        {name || '未命名镜像'}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
+                <fieldset
+                  className="graph-fields graph-compose-images"
+                  data-graph-node-field="start.release.imageIds"
+                >
+                  <legend>本次发布镜像</legend>
+                  {!images.length && <p className="field-note">请在结束节点添加镜像登记项。</p>}
+                  {images.map(({ id, name }) => (
+                    <div className="graph-compose-image" key={id}>
+                      <Check
+                        label={name || '未命名镜像'}
+                        value={imageIds.includes(id)}
+                        canEdit={canEdit && images.length > 1}
+                        change={(selected) => changeImage(id, selected)}
+                      />
+                      {images.length > 1 && (
+                        <code className="field-note">
+                          {'${' + simplifiedComposeImageVariable(id) + '}'}
+                        </code>
+                      )}
+                    </div>
+                  ))}
+                  {imageIds.some((id) => !images.some((image) => image.id === id)) && (
+                    <button
+                      type="button"
+                      className="button secondary small"
+                      disabled={!canEdit}
+                      onClick={() => {
+                        const available = imageIds.filter((id) =>
+                          images.some((image) => image.id === id),
+                        );
+                        changeRelease({
+                          imageId: undefined,
+                          imageIds: available.length ? available : undefined,
+                        });
+                      }}
+                    >
+                      移除失效的镜像登记项
+                    </button>
+                  )}
+                </fieldset>
               )}
               <Field label="Compose 配置来源">
                 <select
@@ -498,6 +490,7 @@ export function SimplifiedStartSettings({
                         ...(mode === 'RUN_PARAMETER' && { allowArtifactOverride: undefined }),
                         ...(mode !== 'CURRENT' && {
                           imageId: undefined,
+                          imageIds: undefined,
                           ...(!release.compose?.sourceId && { compose: undefined }),
                         }),
                       });
@@ -544,7 +537,7 @@ export function SimplifiedStartSettings({
                       useUpstreamArtifact: undefined,
                       ...(typeof value === 'string' &&
                         !release.compose?.sourceId && { compose: undefined }),
-                      ...(typeof value === 'string' && { imageId: undefined }),
+                      ...(typeof value === 'string' && { imageId: undefined, imageIds: undefined }),
                     })
                   }
                   disabled={!canEdit}
@@ -1023,8 +1016,10 @@ export function SimplifiedActionSettings({
               value={build.repoPath}
               change={(repoPath) => patch({ build: { ...build, repoPath } })}
             />
-            {text('build.buildImage', '构建环境镜像（可选）', build.buildImage, (buildImage) =>
-              patch({ build: { ...build, buildImage } }),
+            {!canEdit && build.buildImage && (
+              <p className="field-note">
+                旧版构建环境镜像 · <code>{build.buildImage}</code>
+              </p>
             )}
             {timeout('build.timeout', build.timeout, (timeout) =>
               patch({ build: { ...build, timeout } }),

@@ -5,6 +5,7 @@ import { useResource, type GraphIssueLocation } from '../../../api';
 import { Confirm, ErrorBanner, Field } from '../../../components';
 import type { ProjectDetail, Server } from '../../../models';
 import { graphDragType, NodeMap } from './ExecutionGraphCanvas';
+import { upstreamTriggerLinks, type TriggerRule } from './graph-trigger-model';
 import { ExecutionGraphInputSummary } from './ExecutionGraphInputSummary';
 import { ExecutionGraphStartSettings, isStartBusinessField } from './ExecutionGraphStartSettings';
 import { ArtifactOutputEditor, BuildFields, DeployFields } from './ExecutionGraphPresets';
@@ -202,7 +203,7 @@ export function ProjectGraphEditor({
       ? null
       : '/projects/' + project.id + '/execution-graph/catalog',
   );
-  const triggers = useResource<{ flowId: string; enabled: boolean }[]>(
+  const triggers = useResource<TriggerRule[]>(
     project.archived ? null : '/projects/' + project.id + '/execution-graph/triggers',
     8000,
   );
@@ -1176,6 +1177,7 @@ export function ProjectGraphEditor({
           </div>
           <NodeMap
             flow={flow}
+            triggerLinks={upstreamTriggerLinks(triggers.data, canvas.endpoints)}
             selected={activeNode ? [activeNode.id] : []}
             selectedEdge={activeEdge && selection?.kind === 'edge' ? selection.index : undefined}
             highlighted={highlight?.nodes}

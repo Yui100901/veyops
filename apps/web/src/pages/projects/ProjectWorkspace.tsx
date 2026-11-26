@@ -1,5 +1,5 @@
 import './project-workspace.css';
-import { lazy, Suspense, useRef } from 'react';
+import { lazy, Suspense, useEffect, useRef } from 'react';
 import { ArrowLeft, Boxes, FolderGit2, GitFork, Settings2 } from 'lucide-react';
 import { useResource } from '../../api';
 import { ErrorBanner, Loading, PageHeader } from '../../components';
@@ -17,9 +17,11 @@ const icons = { resources: FolderGit2, graph: GitFork, artifacts: Boxes, configu
 export function ProjectWorkspace({
   route,
   user,
+  onProject,
 }: {
   route: NonNullable<ReturnType<typeof readProjectWorkspace>>;
   user: User;
+  onProject: (project: ProjectDetail) => void;
 }) {
   const { id, entry, location, search, tab } = route;
   const graphRunDrafts = useRef<GraphRunDrafts>(new Map());
@@ -27,6 +29,9 @@ export function ProjectWorkspace({
     `/projects/${id}${entry === 'artifacts' || entry === 'graph' ? '/delivery-context' : ''}`,
   );
   const project = projectResource.data;
+  useEffect(() => {
+    if (project) onProject(project);
+  }, [project, onProject]);
   const back = workspaceBackLink(location);
   const scope = {
     origin: location.origin,

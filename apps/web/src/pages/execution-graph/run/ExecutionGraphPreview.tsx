@@ -863,11 +863,11 @@ export function SimplifiedPlanDetails({
                 </a>
               </small>
             )}
-            {release.image && (
-              <small>
-                本次发布镜像 · <code>{release.image.name}</code>
+            {(release.images ?? (release.image ? [release.image] : [])).map((image) => (
+              <small key={image.id}>
+                本次发布镜像 · <code>{image.name}</code>
               </small>
-            )}
+            ))}
             {release.method === 'FILE' && release.contentPath && (
               <small>
                 快照发布内容 · <code>{release.contentPath}</code>

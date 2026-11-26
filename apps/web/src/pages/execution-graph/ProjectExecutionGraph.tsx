@@ -42,7 +42,12 @@ import {
 } from './editor/SimplifiedFlowSettings';
 import { simplifiedActions, simplifiedModel } from './simplified-flow';
 import { ExecutionGraphTriggers } from './editor/ExecutionGraphTriggers';
-import { triggerFlows, type TriggerPreflightIssue } from './editor/graph-trigger-model';
+import {
+  triggerFlows,
+  upstreamTriggerLinks,
+  type TriggerPreflightIssue,
+  type TriggerRule,
+} from './editor/graph-trigger-model';
 import { GraphVersionTools } from './ExecutionGraphVersions';
 import { effectiveNodeType, graphNodeTypeLabel, isReleaseNode } from './execution-graph-definition';
 import { GraphResourceContext } from './graph-resource-context';
@@ -1411,6 +1416,10 @@ function PublishedNodes({
   const catalog = useResource<GraphCatalog>(
     definition.canvas?.model === simplifiedModel ? null : path + '/catalog',
   );
+  const triggers = useResource<TriggerRule[]>(
+    definition.canvas?.model === simplifiedModel && !project.archived ? path + '/triggers' : null,
+    8000,
+  );
   const targetNames = useGraphTargetNames(
     definition.flows.some(({ nodes }) => nodes.some(isReleaseNode)),
   );
@@ -1485,6 +1494,10 @@ function PublishedNodes({
   const renderCanvas = (expanded: boolean) => (
     <NodeMap
       flow={flow}
+      triggerLinks={upstreamTriggerLinks(
+        triggers.data?.filter((rule) => rule.version === version),
+        definition.canvas?.endpoints ?? [],
+      )}
       selected={selected ? [selected] : []}
       highlighted={new Set(highlight?.nodes.map(({ id }) => id))}
       highlightEdges={

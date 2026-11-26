@@ -5,6 +5,7 @@ import type { GraphDocument, GraphField } from '../execution-graph-definition';
 import {
   simplifiedModel,
   simplifiedReleaseKinds,
+  simplifiedTarget,
   simplifiedWorkspaceInput,
 } from '../simplified-flow';
 import type { SimplifiedSource } from '../simplified-flow';
@@ -66,6 +67,20 @@ export interface TriggerRule extends TriggerConfig {
   resolvedRepositoryId?: string;
   resolvedRef?: string;
   observation?: { commitSha?: string | null; lastCheckedAt?: number; error?: string | null } | null;
+}
+
+export function upstreamTriggerLinks(
+  rules: readonly TriggerRule[] | undefined,
+  endpoints: readonly { startId: string; endId: string }[],
+) {
+  const pairs = new Map(endpoints.map(({ startId, endId }) => [startId, endId]));
+  return (rules ?? []).flatMap((rule) => {
+    if (!rule.enabled || rule.kind !== 'UPSTREAM' || !rule.upstreamFlowId) return [];
+    const from = pairs.get(rule.upstreamFlowId);
+    return from && pairs.has(rule.flowId)
+      ? [{ id: rule.id, name: rule.name, from, to: rule.flowId }]
+      : [];
+  });
 }
 
 export interface TriggerEvent {
@@ -145,7 +160,7 @@ function requiredArtifact(start: GraphNode | undefined, path: GraphNode[]) {
       acceptedArtifactTypes: simplifiedReleaseKinds(deliveryMethod),
     },
     serviceId: release.serviceId,
-    targets: release.targets,
+    targets: simplifiedTarget(start?.start),
     deliveryMethod,
   };
 }

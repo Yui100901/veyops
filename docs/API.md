@@ -194,15 +194,15 @@
 
 模板展开生成三个入口及共享节点。将返回的节点、连线和端点整体追加到现有 `FLOW_V2` 画布，再按草稿修订号保存。
 
-| 位置                                                    | 字段                                                                                                                                                                                                                                                                                |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `START.start.sources[]`                                 | `{id,repositoryId,ref?}`。`ref` 为 `{kind:"BRANCH"\|"TAG"\|"COMMIT",value}`。留空时使用仓库默认分支。各仓库在工作区下以克隆地址末段去掉 `.git` 命名。预览固定实际 SHA。                                                                                                             |
-| `START.start.execution`                                 | `{location:"INHERIT"\|"MANAGER"\|"TARGET",serverId?,groupId?}`。目标端需要一台服务器或可解析为单台服务器的分组。                                                                                                                                                                    |
-| `START.start.release`                                   | `{serviceId?,targets?,artifactSource?,artifactId?,useUpstreamArtifact?,allowArtifactOverride?}`。`targets` 包含 `serverIds`、`groupIds` 及可选的 `strategy`、`maxParallel`、`failurePolicy`。发布位置由系统按项目和服务分配。发布目标独立于执行服务器。文件部署交付整个可分发目录。 |
-| `START.start.environmentSetId`、`variables[]`、`dotenv` | 变量条目为 `{key,value?,credentialId?,allowOverride?}`，仓库变量文件为 `{sourceId,path}`。敏感值通过凭据引用。                                                                                                                                                                      |
-| 功能节点                                                | 代码拉取使用 `checkout.fullClone`。构建使用 `build.repoPath`、`installCommand`、`buildCommand`、`buildImage`。检查和 Shell 使用 `shell.directory`、`command`、`timeout`。文件部署使用 `deploy.method:"FILE"` 和选填的停止、启动命令。                                               |
-| 条件节点                                                | 用 `condition.parameterKey`、`branch.parameterKey` 或 `switch.parameterKey` 读取开始节点显式声明的普通变量。默认使用运行条件值。                                                                                                                                                    |
-| `END.finish`                                            | `{saveWorkspace?,retention?:"PERSISTENT"\|"RUN",images?,requireRelease?:"ACTIVATED"\|"HEALTHY"}`。发布开始前登记并校验实际执行目录。结束阶段核对要求的发布状态。                                                                                                                    |
+| 位置                                                    | 字段                                                                                                                                                                                                                                      |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `START.start.sources[]`                                 | `{id,repositoryId,ref?}`。`ref` 为 `{kind:"BRANCH"\|"TAG"\|"COMMIT",value}`。留空时使用仓库默认分支。各仓库在工作区下以克隆地址末段去掉 `.git` 命名。预览固定实际 SHA。                                                                   |
+| `START.start.execution`                                 | `{serverId?}`。草稿可暂时留空，发布要求选择一台已确认 SSH 指纹和凭据的服务器。该服务器承担整次运行。                                                                                                                                      |
+| `START.start.release`                                   | `{serviceId?,artifactSource?,artifactId?,useUpstreamArtifact?,allowArtifactOverride?,imageId?,imageIds?,compose?}`。服务关联决定托管发布范围。发布和构建共用开始节点的执行服务器。                                                        |
+| `START.start.environmentSetId`、`variables[]`、`dotenv` | 变量条目为 `{key,value?,credentialId?,allowOverride?}`，仓库变量文件为 `{sourceId,path}`。敏感值通过凭据引用。                                                                                                                            |
+| 功能节点                                                | 代码拉取使用 `checkout.fullClone`。构建使用 `build.repoPath`、`installCommand`、`buildCommand`、`dockerfilePath`。检查和 Shell 使用 `shell.directory`、`command`、`timeout`。文件部署使用 `deploy.method:"FILE"` 和选填的停止、启动命令。 |
+| 条件节点                                                | 用 `condition.parameterKey`、`branch.parameterKey` 或 `switch.parameterKey` 读取开始节点显式声明的普通变量。默认使用运行条件值。                                                                                                          |
+| `END.finish`                                            | `{saveWorkspace?,retention?:"PERSISTENT"\|"RUN",images?,requireRelease?:"ACTIVATED"\|"HEALTHY"}`。发布开始前登记并校验实际执行目录。结束阶段核对要求的发布状态。                                                                          |
 
 运行时 `inputs.parameters` 使用 `var:<key>` 或 `artifactId` 提供开始节点允许的参数。Git 版本由发布版的开始节点固定，匹配的仓库推送和轮询采用事件提交。仓库、执行位置、目标及凭据随发布版固定。开始节点设置了 `useUpstreamArtifact` 时，上游成功事件继承实际登记并符合条件的产物。模板或草稿出现所需资源缺失、旧端口、无效路径或当前版本尚未支持的动作时，发布检查返回定位诊断。
 
@@ -243,7 +243,7 @@
 
 `parameterMappings` 按开始字段 ID 指定固定值、事件字段或上游输出。事件字段按规则类型开放，包括 `repository`、`commit`、`ref`、`eventId`、`scheduledAt`、`upstreamRunId` 和 `upstreamStatus`。自动运行用已发布默认值填充未映射字段。
 
-自动执行有外部影响的节点时，入口类型须在 API 和执行器进程的 `VEYOPS_AUTO_DELIVERY_TRIGGERS` 中放行。通过 `PATCH /servers/:id/automatic-execution` 提交 `{enabled:true}` 为已验证 SSH 身份的目标授权。目标端使用私有工作目录，管理端运行器使用 `WEBHOOK_BUILD_DOCKER_SOCKET`。发布继续执行已配置的审批、资源权限和产物校验。
+自动执行有外部影响的节点时，入口类型须在 API 和执行器进程的 `VEYOPS_AUTO_DELIVERY_TRIGGERS` 中放行。通过 `PATCH /servers/:id/automatic-execution` 提交 `{enabled:true}` 为已验证 SSH 身份的目标授权。目标端使用私有工作目录。上游触发仅接受同项目执行流。发布继续执行已配置的审批、资源权限和产物校验。
 
 ## 服务门户、项目发布和服务器
 

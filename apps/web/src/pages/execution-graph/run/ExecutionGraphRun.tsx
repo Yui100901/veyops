@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Play } from 'lucide-react';
 import { ApiError, message, post, useResource, type ExecutionPlanIssue } from '../../../api';
 import { ErrorBanner, Field } from '../../../components';
-import type { ProjectDetail, ProjectExecutionSettings } from '../../../models';
+import type { ProjectDetail, Server } from '../../../models';
 import {
   GraphFieldValue,
   useProjectEnvironmentSets,
@@ -29,6 +29,7 @@ import { graphStartReadiness, type GraphWorkbenchScope } from '../graph-workbenc
 import {
   simplifiedConditionField,
   simplifiedRuntimeInputs,
+  simplifiedTarget,
   simplifiedWorkspaceArtifactField,
 } from '../simplified-flow';
 
@@ -129,16 +130,8 @@ export function ExecutionGraphStart({
   const fields = simplifiedRuntimeInputs(flow);
   const workspaceField = fields.find(({ id }) => id === simplifiedWorkspaceArtifactField);
   const entryFields = fields.filter(({ id }) => id !== simplifiedWorkspaceArtifactField);
-  const configuredLocation = start?.execution?.location ?? 'INHERIT';
-  const projectExecution = useResource<ProjectExecutionSettings>(
-    workspaceField && configuredLocation === 'INHERIT'
-      ? '/projects/' + project.id + '/execution-settings'
-      : null,
-  );
-  const location =
-    configuredLocation === 'INHERIT'
-      ? projectExecution.data?.effective.defaultBuildLocation
-      : configuredLocation;
+  const serverId = start?.execution?.serverId;
+  const servers = useResource<Server[]>(workspaceField && serverId ? '/servers' : null);
   const runtimePresets = Object.fromEntries(
     fields.flatMap(({ id }) =>
       initialInputs && Object.hasOwn(initialInputs, id) ? [[id, initialInputs[id]]] : [],
@@ -178,7 +171,7 @@ export function ExecutionGraphStart({
   const fieldRefs = useRef(new Map<string, HTMLElement>());
   const scope: FieldScope = {
     serviceId: start?.release?.serviceId,
-    targets: start?.release?.targets,
+    targets: simplifiedTarget(start),
     deliveryMethod: flow.nodes.find(isReleaseNode)?.deploy?.method,
   };
   const [preview, setPreview] = useState<Preview>();
@@ -362,13 +355,10 @@ export function ExecutionGraphStart({
         {workspaceField && (
           <div className="workspace-history-setup">
             <div className="workspace-history-heading">
-              <strong>执行位置</strong>
+              <strong>执行服务器</strong>
               <span className="field-note">
-                {location === 'TARGET'
-                  ? '目标端'
-                  : location === 'MANAGER'
-                    ? '管理端'
-                    : '沿用项目设置'}
+                {servers.data?.find(({ id }) => id === serverId)?.name ??
+                  (serverId ? '目标端' : '尚未配置')}
               </span>
             </div>
             {!workspaceField.required && (

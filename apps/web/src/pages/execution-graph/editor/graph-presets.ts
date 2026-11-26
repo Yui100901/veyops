@@ -25,9 +25,7 @@ export function makeNode(type: GraphNode['type'], model?: GraphCanvas['model']):
     name,
     ...(simple && { model }),
     ...(type === 'START' &&
-      (simple
-        ? { start: { execution: { location: 'INHERIT' as const } } }
-        : { contract: 'PRESET' as const })),
+      (simple ? { start: { execution: {} } } : { contract: 'PRESET' as const })),
     ...(simple && type === 'END' && { finish: {} }),
     ...(type === 'LOG' && { message: name }),
     ...(operation === 'SHELL' || operation === 'CHECK' ? { shell: { timeout: 180 } } : {}),

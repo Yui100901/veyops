@@ -286,14 +286,6 @@
   justify-self: start;
 }
 
-.graph-location-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
-  gap: 0.55rem 0.8rem;
-  align-items: start;
-}
-
-.graph-location-grid > *,
 .graph-workspace-path,
 .graph-target-members {
   min-width: 0;
@@ -535,4 +527,16 @@
   .graph-editing-area:has(> .graph-palette) {
     grid-template-columns: minmax(10rem, 11rem) minmax(0, 1fr);
   }
+}
+.graph-compose-images {
+  min-width: 0;
+}
+
+.graph-compose-image {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.graph-compose-image code {
+  overflow-wrap: anywhere;
 }

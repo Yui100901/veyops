@@ -6,6 +6,7 @@ import type {
   PointerEvent as ReactPointerEvent,
 } from 'react';
 import { createPortal } from 'react-dom';
+import type { upstreamTriggerLinks } from './graph-trigger-model';
 import {
   Box,
   CheckCircle2,
@@ -173,6 +174,7 @@ function bounds(start: Point, end: Point) {
 export function NodeMap({
   flow,
   autoLayout = false,
+  triggerLinks = [],
   selected = [],
   multiple,
   onSelect,
@@ -197,6 +199,7 @@ export function NodeMap({
 }: {
   flow: GraphFlow;
   autoLayout?: boolean;
+  triggerLinks?: ReturnType<typeof upstreamTriggerLinks>;
   selected?: string[];
   multiple?: boolean;
   onSelect?: (id: string, additive: boolean) => void;
@@ -242,6 +245,11 @@ export function NodeMap({
     indices.forEach((index, slot) => offsets.set(index, (slot - (indices.length - 1) / 2) * 24));
   const width = onDropNode ? Math.max(layoutWidth + 170, 640) : layoutWidth;
   const height = onDropNode ? Math.max(layoutHeight + 100, 360) : layoutHeight;
+  const visibleTriggerLinks = triggerLinks.flatMap((link) => {
+    const from = points.get(link.from);
+    const to = points.get(link.to);
+    return from && to ? [{ ...link, from, to }] : [];
+  });
   const target = reveal && 'nodeId' in reveal ? points.get(reveal.nodeId) : undefined;
   const edge = reveal && 'edge' in reveal ? reveal.edge : undefined;
   const edgeFrom = edge && points.get(edge.from);
@@ -353,6 +361,14 @@ export function NodeMap({
     <div className="graph-canvas">
       <div className="graph-canvas-controls">
         <span>{onDropNode ? '项目画布' : '执行流画布'}</span>
+        {visibleTriggerLinks.length > 0 && (
+          <span
+            className="graph-trigger-legend"
+            title={visibleTriggerLinks.map(({ name }) => name).join('、')}
+          >
+            上游触发
+          </span>
+        )}
         <div className="graph-canvas-zoom">
           <label htmlFor={`${marker}-zoom`}>缩放</label>
           <input
@@ -482,7 +498,38 @@ export function NodeMap({
                 >
                   <path d="M 0 0 L 10 5 L 0 10 z" className="graph-arrow" />
                 </marker>
+                <marker
+                  id={marker + '-trigger'}
+                  viewBox="0 0 10 10"
+                  refX="8"
+                  refY="5"
+                  markerWidth="6"
+                  markerHeight="6"
+                  orient="auto"
+                >
+                  <path d="M 0 0 L 10 5 L 0 10 z" className="graph-trigger-arrow" />
+                </marker>
               </defs>
+              {visibleTriggerLinks.map(({ id, name, from, to }, index) => {
+                const start = from.x + cardWidth / 2;
+                const end = to.x + cardWidth / 2;
+                const above = Math.min(from.y, to.y) >= 24;
+                const y = from.y + (above ? 0 : cardHeight);
+                const endY = to.y + (above ? -4 : cardHeight + 4);
+                const bend = 12 + (index % 3) * 5;
+                const lane = above
+                  ? Math.max(7, Math.min(y, endY) - bend)
+                  : Math.min(height - 6, Math.max(y, endY) + bend);
+                return (
+                  <g key={id} className="graph-trigger-connector">
+                    <title>{name}</title>
+                    <path
+                      d={`M ${start} ${y} V ${lane} H ${end} V ${endY}`}
+                      markerEnd={`url(#${marker}-trigger)`}
+                    />
+                  </g>
+                );
+              })}
               {flow.edges.map((edge, i) => {
                 const from = points.get(edge.from);
                 const to = points.get(edge.to);

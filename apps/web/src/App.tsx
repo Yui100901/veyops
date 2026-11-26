@@ -26,7 +26,7 @@ import { AIPage } from './pages/ai/AI';
 import { DashboardPage } from './pages/dashboard/Dashboard';
 import { CredentialsPage } from './pages/infrastructure/Credentials';
 import { TaskPage, TasksPage } from './pages/operations/Operations';
-import { operationsTabForPath } from './pages/operations/operation-routes';
+import { operationsTabForPath, operationsTabs } from './pages/operations/operation-routes';
 import { AuditPage } from './pages/settings/Audit';
 import { DeliveryRecordsPage } from './pages/delivery/Delivery';
 import { RegistriesPage } from './pages/delivery/Registries';
@@ -39,7 +39,8 @@ import {
   NotificationSmtpPage,
 } from './pages/notifications/Notifications';
 import { userRoleNames } from './models';
-import type { User } from './models';
+import type { ProjectDetail, User } from './models';
+import { projectBreadcrumbs, WorkspaceBreadcrumb } from './WorkspaceBreadcrumb';
 
 const ServersPage = lazy(() =>
   import('./pages/infrastructure/Servers').then(({ ServersPage }) => ({ default: ServersPage })),
@@ -451,6 +452,7 @@ export function App() {
   const [error, setError] = useState('');
   const [menu, setMenu] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [breadcrumbProject, setBreadcrumbProject] = useState<ProjectDetail>();
   const route = useRoute();
   const [routePath, routeSearch] = route.split('?', 2);
   const [, routeRoot, routeId, routeSection] = routePath.split('/');
@@ -554,6 +556,30 @@ export function App() {
   const current = navigation.find(
     (item) => navigationPath === item.path || navigationPath.startsWith(item.path + '/'),
   );
+  const pageTitle =
+    routeTitles[routePath] ??
+    (operationsTab ? operationsTabs[operationsTab] : undefined) ??
+    platformPage?.name ??
+    (flowTaskRoute
+      ? '执行流详情'
+      : routeRoot === 'tasks' && routeId
+        ? '任务详情'
+        : current?.name) ??
+    '页面';
+  const breadcrumb = projectRoute
+    ? projectBreadcrumbs(
+        projectRoute,
+        breadcrumbProject?.id === projectRoute.id ? breadcrumbProject : undefined,
+      )
+    : [
+        ...(current && current.name !== pageTitle
+          ? [{ label: current.name, href: current.path }]
+          : []),
+        ...(platformPage && platformPage.name !== pageTitle
+          ? [{ label: platformPage.name, href: platformPage.path }]
+          : []),
+        { label: pageTitle },
+      ];
   let page;
   if (routePath === '/' || routePath === '/portal')
     page = <ServicePortal key={route} search={routeSearch} />;
@@ -565,7 +591,14 @@ export function App() {
   else if (routePath === '/credentials') page = <CredentialsPage user={user} />;
   else if (routePath === '/projects') page = <ProjectsPage user={user} search={routeSearch} />;
   else if (projectRoute)
-    page = <ProjectWorkspace key={projectRoute.id} route={projectRoute} user={user} />;
+    page = (
+      <ProjectWorkspace
+        key={projectRoute.id}
+        route={projectRoute}
+        user={user}
+        onProject={setBreadcrumbProject}
+      />
+    );
   else if (routePath === '/views' || routePath.startsWith('/views/'))
     page = (
       <Redirect path={routePath === '/views/abnormal' ? '/portal?abnormal=true' : '/portal'} />
@@ -679,7 +712,7 @@ export function App() {
       </aside>
       <div className="main-shell">
         <header className="topbar">
-          <div>
+          <div className="topbar-path">
             <button
               className="mobile-menu icon-button bare"
               aria-label={menu ? '关闭菜单' : '打开菜单'}
@@ -689,11 +722,7 @@ export function App() {
             >
               {menu ? <X size={20} /> : <Menu size={20} />}
             </button>
-            <span className="topbar-workspace">工作空间</span>
-            <span className="breadcrumb-slash">/</span>
-            <strong>
-              {routeTitles[routePath] ?? platformPage?.name ?? current?.name ?? '页面'}
-            </strong>
+            <WorkspaceBreadcrumb items={breadcrumb} />
           </div>
           <div className="topbar-right">
             <NotificationBell key={user.id} active={routePath === '/notifications'} />

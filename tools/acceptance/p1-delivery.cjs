@@ -518,11 +518,17 @@ async function verifyBackup(
 async function run() {
   assert.match(revision, /^[0-9a-f]{40}$/);
   assert.equal(fixtureImage, 'busybox:1.36');
-  assert.ok(['acceptance', 'flow-v2', 'flow-v2-image', 'preview'].includes(mode ?? 'acceptance'));
+  assert.ok(
+    ['acceptance', 'flow-v2', 'flow-v2-image', 'preview', 'gitea-preview'].includes(
+      mode ?? 'acceptance',
+    ),
+  );
   assert.equal(process.env.DOCKER_HOST, 'unix:///accept/targets/test-a/docker.sock');
   assert.ok(['sqlite', 'postgres'].includes(process.env.DATABASE_CLIENT));
   const focused = mode === 'flow-v2' || mode === 'flow-v2-image';
-  const demo = focused ? undefined : loadDemo('/accept/examples/refactor-stage0/project.yaml');
+  const giteaPreview = mode === 'gitea-preview';
+  const demo =
+    focused || giteaPreview ? undefined : loadDemo('/accept/examples/refactor-stage0/project.yaml');
   const gitRoot = acceptanceRoot + '/repo';
   const source = demo && (await prepareDemoRepository(demo, gitRoot));
   if (mode === 'acceptance' || !mode) prepareP2Repository(gitRoot, source);
@@ -540,9 +546,24 @@ async function run() {
     const user = await api.post('/auth/login', { username: 'root', password: initialPassword });
     assert.equal(user.mustChangePassword, false);
     assert.equal(user.passwordChangeRecommended, true);
-    if (mode !== 'preview') {
+    if (mode !== 'preview' && !giteaPreview) {
       await api.post('/auth/dismiss-password-reminder');
       assert.equal((await api.get('/auth/me')).passwordChangeRecommended, false);
+    }
+    if (giteaPreview) {
+      const fixture = await registerFlowV2Targets(api, ['test-a', 'test-b', 'production-a']);
+      await writeFile(
+        acceptanceRoot + '/preview-login.txt',
+        '用户名 root\n密码 ' + initialPassword + '\n',
+        { flag: 'wx', mode: 0o600 },
+      );
+      await writeFile(
+        acceptanceRoot + '/preview.json',
+        JSON.stringify({ revision, ...fixture }) + '\n',
+        { flag: 'wx', mode: 0o600 },
+      );
+      await once(process, 'SIGTERM');
+      return;
     }
     if (focused) {
       const targets = mode === 'flow-v2' ? ['test-a', 'test-b'] : ['test-a'];

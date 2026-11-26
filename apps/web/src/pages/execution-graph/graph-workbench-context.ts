@@ -291,14 +291,22 @@ export function graphStartReadiness(
   const start = flow.nodes.find(({ type }) => type === 'START');
   const issues: GraphStartConfigurationIssue[] = [];
   const missingFields: GraphField[] = [];
-  if (flow.model === simplifiedModel && start?.start) {
+  if (flow.model === simplifiedModel && start) {
+    if (!start.start?.execution?.serverId) {
+      issues.push({
+        reason: 'FIXED_INPUT_MISSING',
+        nodeId: start.id,
+        fieldId: 'start.execution.serverId',
+        fieldName: '执行服务器',
+      });
+    }
     const workspace = simplifiedWorkspaceInput(flow);
     const historical =
       workspace && (workspace.required || options?.historicalWorkspace || inputs?.[workspace.id]);
     if (historical) {
       if (!inputs?.[workspace.id]) missingFields.push(workspace);
     } else {
-      for (const source of start.start.sources ?? []) {
+      for (const source of start.start?.sources ?? []) {
         if (
           source.repositoryId &&
           project?.repositories.some(({ id }) => id === source.repositoryId)
@@ -315,7 +323,7 @@ export function graphStartReadiness(
         });
       }
     }
-    const serviceId = start.start.release?.serviceId;
+    const serviceId = start.start?.release?.serviceId;
     if (serviceId && project && !project.services.some(({ id }) => id === serviceId)) {
       issues.push({
         reason: 'RESOURCE_UNAVAILABLE',

@@ -43,7 +43,6 @@ export function SimplifiedEntryCopy({
 
   const included = (item: Change) => selected[item.id] ?? !item.overwrite;
   const release = start.release ?? {};
-  const targets = release.targets;
   const compose = release.compose;
   function sourceDirectory(repositoryId?: string) {
     const repo = project.repositories.find(({ id }) => id === repositoryId);
@@ -91,17 +90,12 @@ export function SimplifiedEntryCopy({
         Boolean(draft.sources?.some(({ repositoryId }) => repositoryId)),
         { sources: start.sources, dotenv: start.dotenv },
       );
-    if (builds && start.execution)
+    if (start.execution?.serverId)
       add(
         'execution',
-        '执行位置',
-        Boolean(
-          draft.execution &&
-          (draft.execution.location !== 'INHERIT' ||
-            draft.execution.serverId ||
-            draft.execution.groupId),
-        ),
-        { execution: start.execution },
+        '执行服务器',
+        Boolean(draft.execution?.serverId && draft.execution.serverId !== start.execution.serverId),
+        { execution: { serverId: start.execution.serverId } },
       );
     if (start.environmentSetId)
       add('environmentSet', '项目变量集合', Boolean(draft.environmentSetId), {
@@ -123,15 +117,6 @@ export function SimplifiedEntryCopy({
           serviceId: release.serviceId,
           artifactId: undefined,
         },
-      );
-    if (deploys && (targets?.serverIds?.length || targets?.groupIds?.length))
-      addRelease(
-        'targets',
-        '发布服务器和分组',
-        Boolean(
-          draft.release?.targets?.serverIds?.length || draft.release?.targets?.groupIds?.length,
-        ),
-        { targets },
       );
     const sourceChange = changes.find(({ id }) => id === entry.id + ':sources');
     const receivingSources = sourceChange && included(sourceChange) ? start.sources : draft.sources;
@@ -155,24 +140,30 @@ export function SimplifiedEntryCopy({
             ? workspaceComposePath
             : undefined;
     const images = end?.finish?.images ?? [];
-    const image =
-      images.find(({ id }) => id === release.imageId) ??
-      (images.length === 1 ? images[0] : undefined);
-    if (builds && end && image && composePath && image.composePath !== composePath)
-      changes.push({
-        id: end.id + ':compose',
-        title: '构建结束归档 Compose 文件 · ' + composePath,
-        overwrite: Boolean(image.composePath),
-        apply: (node) => ({
-          ...node,
-          finish: {
-            ...node.finish,
-            images: node.finish?.images?.map((item) =>
-              item.id === image.id ? { ...item, composePath } : item,
-            ),
-          },
-        }),
-      });
+    if (builds && end && composePath) {
+      const selectedImages = release.imageIds ?? (release.imageId ? [release.imageId] : []);
+      for (const image of images) {
+        if (
+          (images.length !== 1 && !selectedImages.includes(image.id)) ||
+          image.composePath === composePath
+        )
+          continue;
+        changes.push({
+          id: end.id + ':compose:' + image.id,
+          title: '构建结束归档 Compose · ' + (image.name || image.id) + ' · ' + composePath,
+          overwrite: Boolean(image.composePath),
+          apply: (node) => ({
+            ...node,
+            finish: {
+              ...node.finish,
+              images: node.finish?.images?.map((item) =>
+                item.id === image.id ? { ...item, composePath } : item,
+              ),
+            },
+          }),
+        });
+      }
+    }
     return changes.length ? [{ entry, end, changes }] : [];
   });
   if (!destinations.length) return null;
