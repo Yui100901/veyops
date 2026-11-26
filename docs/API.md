@@ -182,7 +182,7 @@
 | `POST /runs/:runId/nodes/:nodeId/decision`                          | 管理员提交 `{decision:"APPROVE"\|"REJECT",expectedScopeHash?}`。源码审核与绑定发布的审批必须传回等待节点 `output.scopeHash`。响应保留实际范围、决定、操作者及时间。                                                                 |
 | `POST /runs/:runId/nodes/:nodeId/targets/:serverId/inspect-release` | 管理员或原发起操作员核查已结束的失败或待核查目标。返回 `CURRENT`、`PREVIOUS`、`NO_ACTIVE_RELEASE` 或 `UNKNOWN`，附时间及可确认的发布和锁信息。仅执行远端读取并写审计；运行详情的逐目标 `inspection` 返回最近一次核查。              |
 
-内置模板 ID 为 `MINIMAL_CI_CD`、`CI_BUILD`、`CD_DEPLOY`。新项目保存 `MINIMAL_CI_CD` 的简化目录产物草稿，修订为 `1`，等待配置与发布。预览响应的 `routing` 区分已纳入、待分支决定、本次跳过和流外连线。条件分支 `branch.cases` 使用 `{id,value,label?}`，连线按 `CASE:<id>` 或 `DEFAULT` 识别。
+内置模板 ID 为 `MINIMAL_CI_CD`、`COMPLETE_CI_CD`。两套模板各生成三个端点，`startId` 指向「构建并部署」入口。最小模板生成 8 个节点和 7 条线，完整模板生成 11 个节点和 10 条线。新项目以最小目录产物模板保存修订 `1`。预览响应的 `routing` 区分已纳入、待分支决定、本次跳过和流外连线。条件分支 `branch.cases` 使用 `{id,value,label?}`，连线按 `CASE:<id>` 或 `DEFAULT` 识别。
 
 服务卡片通过 `GET /projects/:id/recent-service-graph-runs` 读取最近的相关图运行。可对单个服务请求 `GET /projects/:id/services/:serviceId/recent-graph-runs`。关联来自实际任务或仍在等待的已确认交付节点。
 
@@ -192,7 +192,7 @@
 
 `canvas.endpoints` 中每条记录保存 `{startId,endId}`。开始节点在 `start` 中集中选择资源。结束节点在 `finish` 中描述留档和验收。动作按连线共享当前运行的工作目录，运行详情用内置事实记录检出版本、工作目录、审批、发布及健康检查。
 
-添加模板会生成一条独立的简化执行链。将返回的节点、连线和端点追加到现有 `FLOW_V2` 画布，再按草稿修订号保存。
+模板展开生成三个入口及共享节点。将返回的节点、连线和端点整体追加到现有 `FLOW_V2` 画布，再按草稿修订号保存。
 
 | 位置                                                    | 字段                                                                                                                                                                                                                                                                                                                    |
 | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -211,6 +211,8 @@
 `END.finish.images` 为 `{id,name,source,reference?,registryId?}[]`。每条流内登记名称规范化为小写且唯一，`id` 用于稳定引用。`BUILT_IN` 采用 `BUILD.build.dockerfilePath` 构建出的实际 Image ID。`WORKSPACE` 读取 `<name>:<VEYOPS_IMAGE_TAG>`，该保留变量由运行 ID 导出。`REGISTRY` 需要 `registryId` 和带固定 Digest 的完整 `reference`。`START.start.release.imageId` 选择本次 Compose 发布项，只有一项时可省略。启用 `useUpstreamArtifact` 后，可用 `upstreamArtifactName` 选定上游持久产物，实际实例 ID 在触发时固定。
 
 `START.start.release.compose` 使用 `{sourceId?,path}`。省略 `sourceId` 时，从工作区归档所选镜像的 Compose YAML。指定源码时从其已确认提交读取。历史镜像允许使用随产物归档的配置。`ROLLBACK_ARTIFACT` 使用开始节点选定的历史产物和预览时各目标的当前版本，要求人工审批。
+
+`START.start.release.artifactSource: "RUN_PARAMETER"` 允许没有预填产物的仅部署入口发布。发起预览和运行时须提供 `inputs.parameters.artifactId`。固定历史实例或上游产物使用各自的来源配置。纯历史发布路径只应用结束节点的发布核对。纯构建镜像登记项可加 `composePath`，相对本次工作区，供历史镜像部署时读取随附配置。
 
 ### 历史执行图
 

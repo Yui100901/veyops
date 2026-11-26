@@ -51,7 +51,7 @@ fi
 docker image inspect "$target_image" "$site_image" >/dev/null
 if [ "$database" = postgres ]; then docker image inspect "$postgres_image" >/dev/null; fi
 
-work=$(mktemp -d /tmp/veyops-candidate-XXXXXX)
+work=$(mktemp -d "${TMPDIR:-/tmp}/veyops-candidate-XXXXXX")
 prefix=$(basename "$work")
 network="$prefix-net"
 preview_network="$prefix-preview"

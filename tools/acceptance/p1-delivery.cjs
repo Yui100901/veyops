@@ -246,6 +246,7 @@ function createGraphRunner(api, fixture, evidence) {
         if (
           node.status !== 'WAITING' ||
           !['APPROVAL', 'SOURCE_REVIEW'].includes(node.type) ||
+          !node.output?.scopeHash ||
           decisions.has(node.nodeId)
         )
           continue;
