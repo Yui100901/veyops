@@ -173,7 +173,6 @@ async function checkResources(databaseUrl?: string) {
                       release: {
                         targets: { groupIds: [group.id] },
                         serviceId: service.id,
-                        deployPath: '/srv/resource-fixture',
                         contentPath: 'dist',
                       },
                     },
@@ -189,6 +188,13 @@ async function checkResources(databaseUrl?: string) {
           },
         })
         .expect(200);
+      if (withRelease) {
+        const start = draft.body.data.draft.canvas.nodes.find(
+          ({ id }: { id: string }) => id === 'start',
+        );
+        assert.ok(start?.start?.release);
+        assert.equal(Object.hasOwn(start.start.release, 'deployPath'), false);
+      }
       const published = await create(graphPath + '/publish', {
         expectedRevision: draft.body.data.revision,
       });

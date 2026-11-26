@@ -29,6 +29,7 @@ async function checkPlan(t: TestContext, url?: string) {
   const { BuildsService } = await import('../modules/builds/builds.service.js');
   const { GraphRunnerService } =
     await import('../modules/execution-graphs/graph-runner.service.js');
+  const { PipelinesService } = await import('../modules/pipelines/pipelines.service.js');
   const { RepositoryMetadataService } =
     await import('../modules/projects/repository-metadata.service.js');
   const { ServersService } = await import('../modules/servers/servers.service.js');
@@ -136,7 +137,6 @@ async function checkPlan(t: TestContext, url?: string) {
     const release = {
       serviceId: service.id,
       targets: { groupIds: [group.id] },
-      deployPath: '/opt/veyops-fixture',
       contentPath: 'repository/dist',
     };
     const makeFlow = (id: string, start: object, managed = false) => {
@@ -233,10 +233,17 @@ async function checkPlan(t: TestContext, url?: string) {
     assert.equal(target.simplified.location, 'TARGET');
     assert.equal(target.simplified.serverId, second.id);
     const combined = flow('combined');
+    const releasePlans = t.mock.method(app.get(PipelinesService), 'previewArtifactDeployPlan');
     const preview = await create(combined + '/preview', args);
+    assert.equal(releasePlans.mock.callCount(), 1);
+    assert.equal(
+      releasePlans.mock.calls[0]?.arguments[2]?.definition.deployPath,
+      `~/.veyops/workspace/${project.slug}/.deployments/${service.id}`,
+    );
     assert.equal(preview.simplified.location, 'MANAGER');
     assert.deepEqual(preview.simplified.release.serverIds, [first.id]);
     assert.equal(preview.simplified.release.contentPath, 'repository/dist');
+    assert.equal(Object.hasOwn(preview.simplified.release, 'deployPath'), false);
     assert.equal(preview.deliveries[0].requireApproval, false);
     const runner = app.get(GraphRunnerService);
     const automation = { kind: 'API' as const, ruleId: 'fixture', revision: '1' };
