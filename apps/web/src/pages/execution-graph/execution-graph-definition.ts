@@ -176,6 +176,7 @@ export interface GraphFlowTemplate {
   name: string;
   description: string;
   steps: string[];
+  entries?: { name: string; steps: string[] }[];
   artifactTypes: GraphArtifactType[];
 }
 export interface GraphFlowExpansion {

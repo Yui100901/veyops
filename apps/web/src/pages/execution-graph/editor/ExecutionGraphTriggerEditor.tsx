@@ -60,6 +60,12 @@ export function ExecutionGraphTriggerEditor({
   const hasSource = choice === 'POLL' || choice === 'WEBHOOK' || choice === 'API';
   const signed = choice === 'WEBHOOK' && form.webhookProtocol === 'SIGNED';
   const start = flows.find(({ id }) => id === startId);
+  const requiredArtifact = start?.requiredArtifact;
+  const artifactMapping = form.parameterMappings?.artifactId;
+  const triggerArtifactId =
+    artifactMapping?.source === 'VALUE' && typeof artifactMapping.value === 'string'
+      ? artifactMapping.value
+      : undefined;
   const sources = start?.sources?.filter(
     ({ repositoryId, ref }) => repositoryId && (!ref || ref.kind === 'BRANCH'),
   );
@@ -113,13 +119,19 @@ export function ExecutionGraphTriggerEditor({
       const enabled =
         action === 'enable' ||
         ((action === 'save' || action === 'check') && Boolean(rule?.enabled));
+      if (requiredArtifact && (enabled || action === 'check') && !triggerArtifactId) {
+        setError('请为自动触发选择同一服务的产物实例。');
+        return;
+      }
       const body = triggerRequest(
         {
           ...form,
           ...(showSources && { sourceId }),
           parameterMappings:
             start?.sources !== undefined
-              ? {}
+              ? requiredArtifact && triggerArtifactId
+                ? { artifactId: { source: 'VALUE', value: triggerArtifactId } }
+                : {}
               : Object.fromEntries(
                   Object.entries(form.parameterMappings ?? {}).filter(
                     ([id]) =>
@@ -416,6 +428,21 @@ export function ExecutionGraphTriggerEditor({
         )}
         {start?.useUpstreamArtifact && (
           <p className="field-note">此执行流使用上游产物，触发条件选择“上游成功”。</p>
+        )}
+        {requiredArtifact && (
+          <GraphFieldValue
+            project={project}
+            field={requiredArtifact.field}
+            scope={requiredArtifact}
+            value={triggerArtifactId}
+            artifactInstancesOnly
+            change={(value) =>
+              patch({
+                parameterMappings:
+                  typeof value === 'string' ? { artifactId: { source: 'VALUE', value } } : {},
+              })
+            }
+          />
         )}
         {start?.sources === undefined && Boolean(fields.length) && (
           <details className="graph-field-card" open={form.kind === 'UPSTREAM' || undefined}>

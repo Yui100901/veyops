@@ -1,5 +1,5 @@
 import { Plus, Trash2 } from 'lucide-react';
-import { useId } from 'react';
+import { useId, useState } from 'react';
 import { useResource } from '../../../api';
 import { Field } from '../../../components';
 import type { DeploymentSelection, ProjectDetail, ProjectExecutionSettings } from '../../../models';
@@ -7,6 +7,7 @@ import { effectiveNodeType, graphKey, isReleaseNode } from '../execution-graph-d
 import type { GraphField, GraphNode } from '../execution-graph-definition';
 import {
   isSimplifiedAction,
+  producesWorkspace,
   simplifiedNodeGroups,
   simplifiedNodeLabel,
   simplifiedReleaseKinds,
@@ -113,6 +114,16 @@ export function SimplifiedStartSettings({
   const release = start.release ?? {};
   const releaseAction = flowNodes.find(isReleaseNode);
   const rollback = releaseAction && effectiveNodeType(releaseAction) === 'ROLLBACK_ARTIFACT';
+  const producesFiles = flowNodes.some(producesWorkspace);
+  const [sourceChoice, setSourceChoice] = useState<'FIXED'>();
+  const artifactMode =
+    rollback || release.artifactId
+      ? 'FIXED'
+      : release.useUpstreamArtifact
+        ? 'UPSTREAM'
+        : release.artifactSource === 'RUN_PARAMETER'
+          ? 'RUN_PARAMETER'
+          : (sourceChoice ?? (producesFiles ? 'CURRENT' : 'FIXED'));
   const staleRelease =
     !releaseAction &&
     Object.entries(release).some(([field, value]) => field !== 'serviceId' && value);
@@ -123,7 +134,7 @@ export function SimplifiedStartSettings({
   );
   const composeRelease = releaseAction?.deploy?.method === 'COMPOSE';
   const images = flowNodes.find(({ type }) => type === 'END')?.finish?.images ?? [];
-  const historical = Boolean(release.artifactId || release.useUpstreamArtifact);
+  const historical = artifactMode !== 'CURRENT';
   const runtime = useResource<ProjectExecutionSettings>(
     execution.location === 'INHERIT' ? '/projects/' + project.id + '/execution-settings' : null,
   );
@@ -461,30 +472,42 @@ export function SimplifiedStartSettings({
               release.targets,
               (value) => changeRelease({ targets: value as DeploymentSelection | undefined }),
             )}
-          <details
-            className="graph-field-card"
-            open={rollback || release.artifactId || release.useUpstreamArtifact ? true : undefined}
-          >
+          <details className="graph-field-card" open={historical ? true : undefined}>
             <summary>交付产物来源</summary>
             <div className="graph-fields" data-graph-node-field="start.release.artifactId">
               {!rollback && (
-                <Check
-                  id="start.release.useUpstreamArtifact"
-                  label="使用上游成功运行的产物"
-                  value={release.useUpstreamArtifact}
-                  canEdit={canEdit}
-                  change={(useUpstreamArtifact) =>
-                    changeRelease({
-                      useUpstreamArtifact,
-                      ...(useUpstreamArtifact && {
+                <Field label="产物来源">
+                  <select
+                    value={artifactMode}
+                    data-graph-node-field="start.release.artifactSource"
+                    disabled={!canEdit}
+                    onChange={(event) => {
+                      const mode = event.target.value;
+                      setSourceChoice(mode === 'FIXED' ? 'FIXED' : undefined);
+                      changeRelease({
+                        artifactSource: mode === 'RUN_PARAMETER' ? 'RUN_PARAMETER' : undefined,
                         artifactId: undefined,
-                        imageId: undefined,
-                        ...(!release.compose?.sourceId && { compose: undefined }),
-                      }),
-                      ...(!useUpstreamArtifact && { upstreamArtifactName: undefined }),
-                    })
-                  }
-                />
+                        useUpstreamArtifact: mode === 'UPSTREAM' || undefined,
+                        upstreamArtifactName: undefined,
+                        ...(mode === 'RUN_PARAMETER' && { allowArtifactOverride: undefined }),
+                        ...(mode !== 'CURRENT' && {
+                          imageId: undefined,
+                          ...(!release.compose?.sourceId && { compose: undefined }),
+                        }),
+                      });
+                    }}
+                  >
+                    {producesFiles && <option value="CURRENT">本次构建产物</option>}
+                    <option value="RUN_PARAMETER">运行时选择已有产物</option>
+                    <option value="FIXED">固定已有产物</option>
+                    <option value="UPSTREAM">上游成功运行的产物</option>
+                  </select>
+                </Field>
+              )}
+              {artifactMode === 'RUN_PARAMETER' && (
+                <p className="field-note">
+                  运行此执行流时必须选择同一服务的产物。自动交付可使用上游产物模式。
+                </p>
               )}
               {release.useUpstreamArtifact && (
                 <SimplifiedText
@@ -497,21 +520,22 @@ export function SimplifiedStartSettings({
                   change={(upstreamArtifactName) => changeRelease({ upstreamArtifactName })}
                 />
               )}
-              {(rollback || !release.useUpstreamArtifact) && (
+              {artifactMode === 'FIXED' && (
                 <GraphFieldValue
                   project={project}
                   field={{
                     id: 'artifactId',
                     name: rollback ? '曾成功发布的产物实例' : '已登记产物实例',
                     type: 'ARTIFACT',
-                    required: Boolean(rollback),
+                    required: true,
                     acceptedArtifactTypes: simplifiedReleaseKinds(releaseAction?.deploy?.method),
                   }}
                   value={release.artifactId}
                   change={(value) =>
                     changeRelease({
                       artifactId: value as string | undefined,
-                      ...(rollback && { useUpstreamArtifact: undefined }),
+                      artifactSource: undefined,
+                      useUpstreamArtifact: undefined,
                       ...(typeof value === 'string' &&
                         !release.compose?.sourceId && { compose: undefined }),
                       ...(typeof value === 'string' && { imageId: undefined }),
@@ -526,13 +550,15 @@ export function SimplifiedStartSettings({
                   }}
                 />
               )}
-              <Check
-                id="start.release.allowArtifactOverride"
-                label="允许运行时选择历史产物"
-                value={release.allowArtifactOverride}
-                canEdit={canEdit}
-                change={(allowArtifactOverride) => changeRelease({ allowArtifactOverride })}
-              />
+              {artifactMode !== 'RUN_PARAMETER' && (
+                <Check
+                  id="start.release.allowArtifactOverride"
+                  label="允许运行时选择历史产物"
+                  value={release.allowArtifactOverride}
+                  canEdit={canEdit}
+                  change={(allowArtifactOverride) => changeRelease({ allowArtifactOverride })}
+                />
+              )}
             </div>
           </details>
         </fieldset>
@@ -695,12 +721,20 @@ export function SimplifiedEndSettings({
   patch,
   flowNodes,
   hasReleaseOnAllFlows = flowNodes.some(isReleaseNode),
-}: NodeSettings & { flowNodes: GraphNode[]; hasReleaseOnAllFlows?: boolean }) {
+  shared = false,
+}: NodeSettings & { flowNodes: GraphNode[]; hasReleaseOnAllFlows?: boolean; shared?: boolean }) {
   const finish = node.finish ?? {};
   const saveWorkspace = finish.saveWorkspace !== false;
   const startRelease = flowNodes.find((item) => item.type === 'START')?.start?.release;
+  const historicalOnly = Boolean(
+    (startRelease?.artifactId ||
+      startRelease?.artifactSource === 'RUN_PARAMETER' ||
+      startRelease?.useUpstreamArtifact) &&
+    !flowNodes.some(producesWorkspace),
+  );
   const requiresFileSnapshot =
     !startRelease?.artifactId &&
+    startRelease?.artifactSource !== 'RUN_PARAMETER' &&
     !startRelease?.useUpstreamArtifact &&
     flowNodes.some(
       (item) => effectiveNodeType(item) === 'DEPLOY_ARTIFACT' && item.deploy?.method !== 'COMPOSE',
@@ -709,46 +743,52 @@ export function SimplifiedEndSettings({
   return (
     <fieldset className="graph-fields" data-graph-node-field="finish">
       <legend>交付结果</legend>
-      <Check
-        label="保留整个执行目录"
-        id="finish.saveWorkspace"
-        value={saveWorkspace}
-        canEdit={canEdit}
-        change={(saveWorkspace) => change({ saveWorkspace })}
-      />
-      {(saveWorkspace || requiresFileSnapshot) && (
-        <div className="form-grid">
-          {saveWorkspace ? (
-            <Field label="保留范围">
-              <select
-                value={finish.retention ?? 'PERSISTENT'}
-                disabled={!canEdit}
-                data-graph-node-field="finish.retention"
-                onChange={(event) =>
-                  change({ retention: event.target.value as SimplifiedFinish['retention'] })
-                }
-              >
-                <option value="PERSISTENT">登记并可历史重发</option>
-                <option value="RUN">仅供本次运行</option>
-              </select>
-            </Field>
-          ) : (
-            <p className="field-note">本次文件发布所需的执行目录会作为临时产物保留。</p>
+      {historicalOnly ? (
+        <p className="field-note">沿用本次选定的产物实例，结束时核对发布结果。</p>
+      ) : (
+        <>
+          <Check
+            label="保留整个执行目录"
+            id="finish.saveWorkspace"
+            value={saveWorkspace}
+            canEdit={canEdit}
+            change={(saveWorkspace) => change({ saveWorkspace })}
+          />
+          {(saveWorkspace || requiresFileSnapshot) && (
+            <div className="form-grid">
+              {saveWorkspace ? (
+                <Field label="保留范围">
+                  <select
+                    value={finish.retention ?? 'PERSISTENT'}
+                    disabled={!canEdit}
+                    data-graph-node-field="finish.retention"
+                    onChange={(event) =>
+                      change({ retention: event.target.value as SimplifiedFinish['retention'] })
+                    }
+                  >
+                    <option value="PERSISTENT">登记并可历史重发</option>
+                    <option value="RUN">仅供本次运行</option>
+                  </select>
+                </Field>
+              ) : (
+                <p className="field-note">本次文件发布所需的执行目录会作为临时产物保留。</p>
+              )}
+            </div>
           )}
-        </div>
+          <SimplifiedImageSettings
+            node={node}
+            canEdit={canEdit}
+            project={project}
+            flowNodes={flowNodes}
+            patch={patch}
+          />
+        </>
       )}
-      <SimplifiedImageSettings
-        node={node}
-        canEdit={canEdit}
-        project={project}
-        flowNodes={flowNodes}
-        patch={patch}
-      />
       {hasReleaseOnAllFlows ? (
         <Field label="发布结果核对">
           <select
             data-graph-node-field="finish.requireRelease"
-            disabled={!canEdit}
+            disabled={!canEdit || (historicalOnly && shared)}
             value={finish.requireRelease ?? ''}
             onChange={(event) =>
               change({
@@ -931,13 +971,27 @@ export function SimplifiedActionSettings({
         )}
       </div>
       {operation === 'CHECKOUT' && (
-        <Check
-          id="checkout.fullClone"
-          label="拉取完整 Git 历史"
-          value={node.checkout?.fullClone}
-          canEdit={canEdit}
-          change={(fullClone) => patch({ checkout: { fullClone } })}
-        />
+        <>
+          {!!sources.length && (
+            <ul className="graph-edge-list" aria-label="当前执行流的源码">
+              {sources.map(({ id, repositoryId, ref }) => (
+                <li key={id}>
+                  {project.repositories.find((repo) => repo.id === repositoryId)?.name ??
+                    '未选择仓库'}
+                  {' · '}
+                  {ref?.value ?? '仓库默认分支'}
+                </li>
+              ))}
+            </ul>
+          )}
+          <Check
+            id="checkout.fullClone"
+            label="拉取完整 Git 历史"
+            value={node.checkout?.fullClone}
+            canEdit={canEdit}
+            change={(fullClone) => patch({ checkout: { fullClone } })}
+          />
+        </>
       )}
       {(operation === 'SHELL' || operation === 'CHECK') && (
         <>

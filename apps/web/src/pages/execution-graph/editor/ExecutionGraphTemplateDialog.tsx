@@ -58,7 +58,7 @@ export function ExecutionGraphTemplateDialog({
   return (
     <Modal
       title="添加执行流"
-      description="选择流程模板和交付类型。新流程会追加到当前草稿。"
+      description="每套模板包含三个独立入口。选择模板和交付类型后追加到当前草稿。"
       busy={busy}
       onClose={() => {
         if (!pending.current) close();
@@ -75,7 +75,7 @@ export function ExecutionGraphTemplateDialog({
           {!!templates.length && (
             <fieldset className="graph-template-options workbench-stack">
               <legend>流程模板</legend>
-              {templates.map(({ id, name, description, steps, artifactTypes }) => (
+              {templates.map(({ id, name, description, steps, entries, artifactTypes }) => (
                 <label className="graph-field-card graph-template-choice" key={id}>
                   <input
                     type="radio"
@@ -94,7 +94,17 @@ export function ExecutionGraphTemplateDialog({
                   <span>
                     <strong>{name}</strong>
                     <small>{description}</small>
-                    <small>{steps.join(' → ')}</small>
+                    {entries?.length ? (
+                      entries.map((entry) => (
+                        <small key={entry.name}>
+                          <b>{entry.name}</b>
+                          {' · '}
+                          {entry.steps.join(' → ')}
+                        </small>
+                      ))
+                    ) : (
+                      <small>{steps.join(' → ')}</small>
+                    )}
                   </span>
                 </label>
               ))}

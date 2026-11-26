@@ -84,7 +84,7 @@ function ProjectFlowRow({
     '#' + graphWorkbenchPath(projectId, { ...origin, ...options });
   const draftHref = href({ pane: 'draft', start: id, node: id });
   const secondary = [];
-  if (version && flow.hasRuntimeInputs)
+  if (version && flow.hasRuntimeInputs && !flow.needsArtifactInput)
     secondary.push({ label: '带参数运行', href: href({ pane: 'run', start: id, version }) });
   if (version && inDraft) secondary.push({ label: '配置画布', href: draftHref });
 
@@ -115,7 +115,14 @@ function ProjectFlowRow({
       </div>
       {canEdit && (
         <div className="workbench-actions project-flow-actions">
-          {version ? (
+          {version && flow.needsArtifactInput ? (
+            <a
+              className="button primary small"
+              href={href({ pane: 'run', start: id, version, field: 'artifactId' })}
+            >
+              <Play size={15} aria-hidden="true" /> 选择产物
+            </a>
+          ) : version ? (
             <button
               type="button"
               className="button primary small"

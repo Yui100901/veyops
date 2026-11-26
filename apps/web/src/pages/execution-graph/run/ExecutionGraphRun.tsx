@@ -177,6 +177,7 @@ export function ExecutionGraphStart({
   const base = path + '/flows/' + encodeURIComponent(flow.id);
   const useDefaults =
     !start?.release?.useUpstreamArtifact &&
+    start?.release?.artifactSource !== 'RUN_PARAMETER' &&
     !preview &&
     !revision &&
     !Object.keys(edits).length &&

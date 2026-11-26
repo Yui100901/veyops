@@ -352,7 +352,9 @@ function ArtifactValue({
   for (const [artifactId, instances] of groups) {
     const artifact = instances[0]!;
     const title = [
-      artifact.name ?? artifactKindLabel(artifact.kind ?? artifact.artifactType),
+      artifact.name,
+      artifactKindLabel(artifact.kind ?? artifact.artifactType),
+      artifact.graphFlowName ?? (artifact.graphRunId ? artifact.graphRunId.slice(0, 8) : undefined),
       artifact.sourceCommit?.slice(0, 12),
       formatTime(artifact.createdAt),
     ]
@@ -441,7 +443,13 @@ function ArtifactValue({
           empty={latest ? '使用最新兼容产物' : '选择已有产物'}
         />
       )}
-      {!versions.loading && !rows.length && <p className="field-note">没有匹配的可用产物。</p>}
+      {!versions.loading && !pendingTargets && !rows.length && (
+        <p className="field-note">
+          {artifactInstancesOnly && field.required
+            ? '没有匹配的可用产物。请先为所选服务运行构建并保留产物。'
+            : '没有匹配的可用产物。'}
+        </p>
+      )}
       <ErrorBanner error={versions.error} retry={versions.reload} />
     </>
   );

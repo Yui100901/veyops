@@ -92,15 +92,16 @@ export function appendFlowTemplate(
   const names = new Set(
     canvas.nodes.filter(({ type }) => type === 'START').map(({ name }) => name),
   );
-  let name = start.name;
-  for (let suffix = 2; names.has(name); suffix++) name = start.name + '（' + suffix + '）';
-  const nodes = placeFlowTemplate(canvas, fragment);
+  const nodes = placeFlowTemplate(canvas, fragment).map((node) => {
+    if (node.type !== 'START') return node;
+    let name = node.name;
+    for (let suffix = 2; names.has(name); suffix++) name = node.name + '（' + suffix + '）';
+    names.add(name);
+    return name === node.name ? node : { ...node, name };
+  });
   return {
     ...canvas,
-    nodes: [
-      ...canvas.nodes,
-      ...nodes.map((node) => (node.id === startId ? { ...node, name } : node)),
-    ],
+    nodes: [...canvas.nodes, ...nodes],
     edges: [...canvas.edges, ...fragment.edges],
     endpoints: [...canvas.endpoints, ...fragment.endpoints],
     templates: [...canvas.templates, ...fragment.templates],

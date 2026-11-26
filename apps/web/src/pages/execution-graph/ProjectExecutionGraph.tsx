@@ -1502,6 +1502,7 @@ function PublishedNodes({
                 )}
                 {simplified && inspectedNode.type === 'START' ? (
                   <SimplifiedStartSettings
+                    key={inspectedNode.id}
                     node={inspectedNode}
                     project={project}
                     canEdit={false}
@@ -1515,6 +1516,7 @@ function PublishedNodes({
                     canEdit={false}
                     patch={() => {}}
                     flowNodes={inspectedFlow?.nodes ?? []}
+                    shared={flowsWithNode.length > 1}
                   />
                 ) : simplified &&
                   simplifiedActions.some(

@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import type { DragEvent, ReactNode } from 'react';
 import { Copy, Plus, Trash2, ArrowRight, ArrowLeft, ChevronDown } from 'lucide-react';
 import { useResource, type GraphIssueLocation } from '../../../api';
-import { ErrorBanner, Field } from '../../../components';
+import { Confirm, ErrorBanner, Field } from '../../../components';
 import type { ProjectDetail, Server } from '../../../models';
 import { graphDragType, NodeMap } from './ExecutionGraphCanvas';
 import { ExecutionGraphInputSummary } from './ExecutionGraphInputSummary';
@@ -47,6 +47,7 @@ import {
   reachable,
 } from './execution-graph-draft-impact';
 import { authoredNode, makeNode } from './graph-presets';
+import { SimplifiedEntryCopy } from './SimplifiedEntryCopy';
 import {
   SimplifiedActionSettings,
   SimplifiedEndSettings,
@@ -147,21 +148,34 @@ export function ProjectGraphEditor({
   initialFieldLocation?: GraphIssueLocation;
   insertedStartId?: string;
 }) {
+  const defaultEntry = canvas.model === simplifiedModel ? canvas.endpoints[0]?.startId : undefined;
+  const initialSelection = initialNodeId ?? initialFlowId ?? defaultEntry;
   const [selection, select] = useState<Selection | undefined>(
-    initialNodeId ? { kind: 'node', id: initialNodeId } : undefined,
+    initialSelection ? { kind: 'node', id: initialSelection } : undefined,
   );
   const [hovered, hover] = useState<string>();
   const [source, setSource] = useState<string>();
   const [connector, setConnector] = useState<Connector>();
-  const [startId, setStartId] = useState<string | undefined>(initialFlowId);
+  const [startId, setStartId] = useState<string | undefined>(
+    () =>
+      initialFlowId ??
+      (canvas.endpoints.some(({ startId }) => startId === initialSelection)
+        ? initialSelection
+        : undefined),
+  );
   const [paletteExpanded, setPaletteExpanded] = useState(true);
   const [reusableExpanded, setReusableExpanded] = useState(false);
   const [tab, setTab] = useState<FunctionalTab>('input');
   const [error, setError] = useState('');
   const [parameterRepair, setParameterRepair] = useState<ParameterRepair>();
   const [impact, setImpact] = useState<DraftImpact>();
+  const [deleteStart, setDeleteStart] = useState<{
+    nodeId: string;
+    endName: string;
+    exits: Set<number>;
+  }>();
   const [reveal, setReveal] = useState<{ nodeId: string } | { edge: GraphEdge } | undefined>(() =>
-    initialNodeId ? { nodeId: initialNodeId } : undefined,
+    initialSelection ? { nodeId: initialSelection } : undefined,
   );
   const [diagnosticEdge, setDiagnosticEdge] = useState<GraphEdge>();
   const [focusRequest, setFocusRequest] = useState<FieldFocus | undefined>(() =>
@@ -219,24 +233,24 @@ export function ProjectGraphEditor({
     activeNode?.type === 'START'
       ? (pathHighlight(canvas, activeNode.id)?.nodes ?? reachable(canvas, activeNode.id))
       : undefined;
-  const inspectedEndPaths =
-    activeNode?.type === 'END'
-      ? canvas.endpoints.flatMap(({ startId, endId }) => {
-          const path = endId === activeNode.id && pathHighlight(canvas, startId);
-          return path ? [path.nodes] : [];
+  const inspectedPaths =
+    simplified && activeNode
+      ? canvas.endpoints.flatMap(({ startId }) => {
+          const path = pathHighlight(canvas, startId);
+          const start = canvas.nodes.find(({ id }) => id === startId);
+          return start && path?.nodes.has(activeNode.id) ? [{ start, path }] : [];
         })
       : [];
+  const inspection =
+    inspectedPaths.find(({ start }) => start.id === activePair?.startId) ?? inspectedPaths[0];
+  const inspectedEndPaths = activeNode?.type === 'END' ? inspectedPaths : [];
   const inspectedEndScope =
     activeNode?.type === 'END'
-      ? activePair && selectedPath
-        ? selectedPath.nodes
-        : inspectedEndPaths.length
-          ? new Set(inspectedEndPaths.flatMap((path) => [...path]))
-          : reachable(canvas, activeNode.id, true)
+      ? (inspection?.path.nodes ?? reachable(canvas, activeNode.id, true))
       : undefined;
   const inspectedActionStart =
     simplified && activeNode
-      ? (canvas.nodes.find((node) => node.id === activePair?.startId) ??
+      ? (inspection?.start ??
         canvas.nodes.find(
           (node) =>
             node.type === 'START' &&
@@ -460,6 +474,19 @@ export function ProjectGraphEditor({
         inspected.id,
       );
     }
+    if (
+      simplified &&
+      !template &&
+      inspectedPaths.length > 1 &&
+      Object.keys(fields).some((key) => key !== 'name' && key !== 'position')
+    ) {
+      recordImpact(
+        next,
+        '共享节点的配置已更新，以下执行流会使用该配置。',
+        inspectedPaths.map(({ start }) => start.id),
+        inspected.id,
+      );
+    }
     onChange(next);
   }
   function addNode(raw: GraphNode, position?: Position) {
@@ -614,12 +641,36 @@ export function ProjectGraphEditor({
     select(undefined);
     setError('');
   }
-  function deleteNode(id: string) {
+  function deleteNode(id: string, exits?: Set<number>) {
     if (!canEdit) return;
+    const pair = canvas.endpoints.find(({ startId }) => startId === id);
+    if (
+      !exits &&
+      pair &&
+      endpointModel(pair) === simplifiedModel &&
+      !canvas.endpoints.some(({ startId, endId }) => startId !== id && endId === pair.endId)
+    ) {
+      const path = pathHighlight(canvas, id);
+      const exclusive = new Set(
+        canvas.edges.flatMap(({ from, to }, index) =>
+          from !== id && to === pair.endId && path?.edges.has(index) ? [index] : [],
+        ),
+      );
+      if (exclusive.size) {
+        setDeleteStart({
+          nodeId: id,
+          endName: canvas.nodes.find(({ id }) => id === pair.endId)?.name ?? pair.endId,
+          exits: exclusive,
+        });
+        return;
+      }
+    }
     const next = {
       ...canvas,
       nodes: canvas.nodes.filter((item) => item.id !== id),
-      edges: canvas.edges.filter((edge) => edge.from !== id && edge.to !== id),
+      edges: canvas.edges.filter(
+        (edge, index) => edge.from !== id && edge.to !== id && !exits?.has(index),
+      ),
       endpoints: canvas.endpoints
         .filter((pair) => pair.startId !== id && pair.endId !== id)
         .map((pair) => {
@@ -637,10 +688,13 @@ export function ProjectGraphEditor({
           return { ...pair, inputBindings, environmentBindings, edgeSelections };
         }),
     };
-    recordImpact(next, '节点已删除，请复核以下执行流。', [
-      ...flowsUsingNode(canvas, id),
-      ...changedTopologyFlows(canvas, next),
-    ]);
+    recordImpact(
+      next,
+      exits?.size
+        ? '开始节点和独有的结束连线已移除，请复核以下执行流。'
+        : '节点已删除，请复核以下执行流。',
+      [...flowsUsingNode(canvas, id), ...changedTopologyFlows(canvas, next)],
+    );
     onChange(next);
     select(undefined);
     setSource(undefined);
@@ -1159,6 +1213,19 @@ export function ProjectGraphEditor({
         aria-label="节点与连线详情"
         tabIndex={-1}
       >
+        {deleteStart && (
+          <Confirm
+            title="删除执行入口"
+            description={`「${deleteStart.endName}」将没有配对入口。删除开始节点时一并移除通往该结束节点的专用连线，保留画布上的结束节点。`}
+            destructive
+            label="删除入口及专用连线"
+            onClose={() => setDeleteStart(undefined)}
+            onConfirm={() => {
+              deleteNode(deleteStart.nodeId, deleteStart.exits);
+              setDeleteStart(undefined);
+            }}
+          />
+        )}
         {!inspected && !activeEdge && !connector && (
           <header className="graph-inspector-title">
             <h3>节点详情</h3>
@@ -1171,6 +1238,28 @@ export function ProjectGraphEditor({
               <p>{template ? '复用节点' : isFunction ? '功能节点' : '节点属性'}</p>
               <h3 tabIndex={-1}>{inspected.name || graphNodeTypeLabel(inspected)}</h3>
             </header>
+            {simplified &&
+              inspected.type !== 'START' &&
+              inspection &&
+              (inspectedPaths.length > 1 ? (
+                <Field
+                  label="所属执行流"
+                  hint="此节点由以下执行流共享。所选入口决定显示的源码目录和结果设置。"
+                >
+                  <select
+                    value={inspection.start.id}
+                    onChange={(event) => setStartId(event.target.value)}
+                  >
+                    {inspectedPaths.map(({ start }) => (
+                      <option key={start.id} value={start.id}>
+                        {start.name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              ) : (
+                <p className="field-note">所属执行流 · {inspection.start.name}</p>
+              ))}
             <NodeIdentity
               node={inspected}
               canEdit={canEdit}
@@ -1217,12 +1306,22 @@ export function ProjectGraphEditor({
                 ) : inspected.type === 'START' ? (
                   <>
                     <SimplifiedStartSettings
+                      key={inspected.id}
                       node={inspected}
                       project={project}
                       canEdit={canEdit}
                       patch={patch}
                       flowNodes={canvas.nodes.filter(({ id }) => inspectedStartScope?.has(id))}
                     />
+                    {canEdit && (
+                      <SimplifiedEntryCopy
+                        key={inspected.id}
+                        canvas={canvas}
+                        source={inspected}
+                        project={project}
+                        onChange={onChange}
+                      />
+                    )}
                     {renderResources?.(inspected, activePair)}
                     {renderStart?.(inspected.id)}
                     <details className="graph-field-card">
@@ -1243,10 +1342,13 @@ export function ProjectGraphEditor({
                       canEdit={canEdit}
                       patch={patch}
                       flowNodes={canvas.nodes.filter(({ id }) => inspectedEndScope?.has(id))}
+                      shared={inspectedEndPaths.length > 1}
                       hasReleaseOnAllFlows={
                         inspectedEndPaths.length
-                          ? inspectedEndPaths.every((path) =>
-                              canvas.nodes.some((item) => path.has(item.id) && isReleaseNode(item)),
+                          ? inspectedEndPaths.every(({ path }) =>
+                              canvas.nodes.some(
+                                (item) => path.nodes.has(item.id) && isReleaseNode(item),
+                              ),
                             )
                           : undefined
                       }

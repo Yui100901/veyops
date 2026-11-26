@@ -32,6 +32,7 @@ export interface SimplifiedRelease {
   targets?: DeploymentSelection;
   reuseExecutionServer?: boolean;
   contentPath?: string;
+  artifactSource?: 'RUN_PARAMETER';
   artifactId?: string;
   allowArtifactOverride?: boolean;
   useUpstreamArtifact?: boolean;
@@ -69,6 +70,7 @@ export interface SimplifiedFinishImage {
   source: 'BUILT_IN' | 'WORKSPACE' | 'REGISTRY';
   reference?: string;
   registryId?: string;
+  composePath?: string;
 }
 
 export const simplifiedActions = [
@@ -108,21 +110,26 @@ export function isNativeDockerBuild(node: GraphNode) {
   return effectiveNodeType(node) === 'BUILD' && Boolean(node.build?.dockerfilePath?.trim());
 }
 
+export function producesWorkspace(node: GraphNode) {
+  return ['CHECKOUT', 'SHELL', 'CHECK', 'BUILD'].includes(effectiveNodeType(node));
+}
+
 export function simplifiedReleaseInput(
   flow: GraphFlow,
   type?: GraphArtifactType,
 ): GraphField | undefined {
   const release = flow.nodes.find(({ type }) => type === 'START')?.start?.release;
   const action = flow.nodes.find(isReleaseNode);
-  if (!release?.allowArtifactOverride || !action) return;
+  const runtimeArtifact = release?.artifactSource === 'RUN_PARAMETER';
+  if ((!release?.allowArtifactOverride && !runtimeArtifact) || !action) return;
   const kinds = simplifiedReleaseKinds(action.deploy?.method);
   if (type && !kinds.includes(type)) return;
   return {
     id: 'artifactId',
     name: '已登记产物',
     type: 'ARTIFACT',
-    required: Boolean(release.useUpstreamArtifact),
-    defaultValue: release.artifactId,
+    required: runtimeArtifact || Boolean(release?.useUpstreamArtifact),
+    defaultValue: release?.artifactId,
     acceptedArtifactTypes: kinds,
   };
 }

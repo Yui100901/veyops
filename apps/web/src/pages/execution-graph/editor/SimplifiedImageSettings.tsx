@@ -116,6 +116,18 @@ export function SimplifiedImageSettings({
                 </Field>
               </>
             )}
+            <Field
+              label="随产物归档的 Compose 文件（选填）"
+              hint="相对本次工作区，用于历史镜像部署。"
+            >
+              <input
+                data-graph-node-field={field + '.composePath'}
+                value={image.composePath ?? ''}
+                placeholder="api/compose.yaml"
+                readOnly={!canEdit}
+                onChange={(event) => update({ composePath: event.target.value || undefined })}
+              />
+            </Field>
             {canEdit && (
               <div>
                 <button
