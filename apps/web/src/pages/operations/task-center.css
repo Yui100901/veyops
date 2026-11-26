@@ -1,0 +1,8 @@
+.task-center-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  padding: 0.8rem var(--surface-inset);
+}

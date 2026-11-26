@@ -12,7 +12,8 @@ function projectReturn(projectId?: string, path?: string) {
     /^\/projects\/([\w-]+)(?:\/(?:execution-graph|artifacts|delivery|configuration))?(?:\?[^#]*)?$/.exec(
       path,
     );
-  return match?.[1] === projectId ? path : undefined;
+  const taskRun = /^\/tasks\/flows\/([\w-]+)\/[\w-]+(?:\?[^#]*)?$/.exec(path);
+  return match?.[1] === projectId || taskRun?.[1] === projectId ? path : undefined;
 }
 
 export function readServerResourceLocation(search?: string): ServerResourceLocation {

@@ -7,15 +7,16 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { graphTaskKeyPrefix } from '../execution-graphs/graph-run-lifecycle';
+import { activeFlowStatuses, graphTaskKeyPrefix } from '../execution-graphs/graph-run-lifecycle';
 import { TaskHandlerRegistry } from './task-handler.registry';
-import { Selectable, Transaction } from 'kysely';
+import { Selectable, sql, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import { Database, TaskTargetsTable, TasksTable } from '../../core/database/schema';
 import {
   CreateTaskInput,
   TaskExecutionContext,
   TaskPayload,
+  failedTaskStatuses,
   terminalTaskStatuses,
 } from './tasks.types';
 import { TaskLogService, redactTaskLog } from './task-log.service';
@@ -32,6 +33,7 @@ import { isStandaloneGraphBuild } from '../pipelines/pipeline.types';
 import { lockProjectGraph } from '../projects/project-guards';
 import { taskPayloadResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
+import { encodeTaskCenterCursor, taskCenterCursor, type TaskCenterQuery } from './task-center.dto';
 
 const terminal = new Set<string>(terminalTaskStatuses);
 export const isTerminalStatus = (status: string) => terminal.has(status);
@@ -316,6 +318,127 @@ export class TasksService {
     let query = this.database.db.selectFrom('tasks').selectAll();
     if (type) query = query.where('task_type', '=', type);
     return (await query.orderBy('created_at', 'desc').limit(100).execute()).map(taskDto);
+  }
+  async center({ status, q, before, limit = 100 }: TaskCenterQuery) {
+    const db = this.database.db;
+    const tasks = db
+      .selectFrom('tasks as task')
+      .select([
+        'task.id',
+        'task.name',
+        'task.status',
+        'task.created_at as createdAt',
+        'task.created_by as createdBy',
+        'task.project_id as projectId',
+        sql<string | null>`null`.as('projectName'),
+        'task.started_at as startedAt',
+        'task.finished_at as finishedAt',
+        sql<string | null>`null`.as('flowId'),
+        sql<number | null>`null`.as('version'),
+        sql<0 | 1>`0`.as('kind'),
+      ])
+      .where(
+        'task.id',
+        'not in',
+        db
+          .selectFrom('execution_node_runs')
+          .select('task_id')
+          .where('task_id', 'is not', null)
+          .unionAll(
+            db.selectFrom('execution_flow_runs').select('task_id').where('task_id', 'is not', null),
+          ),
+      )
+      // A completed snapshot can be replaced by the action task on the same node.
+      .where(({ not, exists, selectFrom, ref }) =>
+        not(
+          exists(
+            selectFrom('execution_node_runs as dispatch')
+              .innerJoin('execution_flow_runs as owner', 'owner.id', 'dispatch.run_id')
+              .select('dispatch.id')
+              .whereRef('owner.project_id', '=', 'task.project_id')
+              .where('task.task_type', '=', 'GRAPH_MODULE')
+              .where('task.idempotency_key', 'like', graphTaskKeyPrefix + '%:snapshot')
+              .where(
+                'dispatch.id',
+                '=',
+                sql<string>`replace(
+                  substr(${ref('task.idempotency_key')}, ${graphTaskKeyPrefix.length + 1}),
+                  ${':snapshot'}, ''
+                )`,
+              ),
+          ),
+        ),
+      );
+    const runs = db
+      .selectFrom('execution_flow_runs as run')
+      .innerJoin('projects as project', 'project.id', 'run.project_id')
+      .select((eb) => [
+        'run.id',
+        'run.flow_name as name',
+        'run.status',
+        'run.created_at as createdAt',
+        'run.created_by as createdBy',
+        'run.project_id as projectId',
+        'project.name as projectName',
+        eb
+          .selectFrom('execution_node_runs as node')
+          .select((node) => node.fn.min<number>('node.started_at').as('firstStartedAt'))
+          .whereRef('node.run_id', '=', 'run.id')
+          .as('startedAt'),
+        'run.finished_at as finishedAt',
+        'run.flow_id as flowId',
+        'run.version',
+        sql<1>`1`.as('kind'),
+      ])
+      .where('run.parent_run_id', 'is', null);
+    let entries = db.selectFrom(tasks.unionAll(runs).as('entry')).selectAll();
+    if (status === 'ACTIVE')
+      entries = entries.where('entry.status', 'in', ['PENDING', ...activeFlowStatuses]);
+    else if (status === 'FAILED') entries = entries.where('entry.status', 'in', failedTaskStatuses);
+    else if (status === 'SUCCESS') entries = entries.where('entry.status', '=', 'SUCCESS');
+    const term = q?.trim().replace(/[!%_]/g, '!$&');
+    if (term)
+      entries = entries.where(
+        ({ ref }) =>
+          sql<boolean>`lower(${ref('entry.name')}) like lower(${'%' + term + '%'}) escape '!'`,
+      );
+    if (before) {
+      const cursor = taskCenterCursor(before);
+      entries = entries.where(({ eb, or, and }) =>
+        or([
+          eb('entry.createdAt', '<', cursor.createdAt),
+          and([eb('entry.createdAt', '=', cursor.createdAt), eb('entry.id', '<', cursor.id)]),
+          and([
+            eb('entry.createdAt', '=', cursor.createdAt),
+            eb('entry.id', '=', cursor.id),
+            eb('entry.kind', '<', cursor.kind),
+          ]),
+        ]),
+      );
+    }
+    const rows = await entries
+      .orderBy('entry.createdAt', 'desc')
+      .orderBy('entry.id', 'desc')
+      .orderBy('entry.kind', 'desc')
+      .limit(limit + 1)
+      .execute();
+    const page = rows.slice(0, limit);
+    const taskIds = page.filter(({ kind }) => kind === 0).map(({ id }) => id);
+    const details = taskIds.length
+      ? await db.selectFrom('tasks').selectAll().where('id', 'in', taskIds).execute()
+      : [];
+    const byId = new Map(details.map((task) => [task.id, taskDto(task)]));
+    const items = page
+      .map(({ kind, ...row }) =>
+        kind === 1
+          ? { ...row, type: 'EXECUTION_FLOW' as const, flowRunId: row.id, result: null }
+          : byId.get(row.id),
+      )
+      .filter((item) => item !== undefined);
+    return {
+      items,
+      nextBefore: rows.length > limit ? encodeTaskCenterCursor(page.at(-1)!) : null,
+    };
   }
   async row(id: string) {
     const task = await this.database.db

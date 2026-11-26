@@ -1,13 +1,15 @@
-import { ArrowRight, Terminal } from 'lucide-react';
+import { ArrowRight, Terminal, Workflow } from 'lucide-react';
 import { formatTime } from '../../api';
 import { Status } from '../../components';
 import type { Task } from '../../models';
+import { executionFlowTaskPath } from '../execution-graph/graph-workbench-context';
 
 const taskTypeNames: Record<string, string> = {
   COMMAND: '临时命令',
   OPERATION_PLAN: '运维方案',
   PIPELINE: '构建与部署',
   GRAPH_CHECKOUT: '执行图源码拉取',
+  EXECUTION_FLOW: '执行流',
 };
 
 export function taskTypeLabel(task: Task) {
@@ -34,17 +36,26 @@ export function TaskTable({ tasks, compact = false }: { tasks: Task[]; compact?:
         <tbody>
           {tasks.map((task) => {
             const type = taskTypeLabel(task);
+            const executionFlow = task.type === 'EXECUTION_FLOW';
+            const href =
+              executionFlow && task.projectId
+                ? '#' + executionFlowTaskPath(task.projectId, task.flowRunId ?? task.id)
+                : `#/tasks/${task.id}`;
+            const Icon = executionFlow ? Workflow : Terminal;
             return (
-              <tr key={task.id}>
+              <tr key={`${task.type}:${task.id}`}>
                 <td>
-                  <a href={`#/tasks/${task.id}`} className="table-name">
+                  <a href={href} className="table-name">
                     {!compact && (
                       <span className="tiny-icon">
-                        <Terminal size={15} />
+                        <Icon size={15} aria-hidden="true" />
                       </span>
                     )}
                     {task.name}
                   </a>
+                  {!compact && executionFlow && task.projectName && (
+                    <small className="cell-sub">{task.projectName}</small>
+                  )}
                   {compact && (
                     <small className="cell-sub">
                       {type} · {formatTime(task.finishedAt ?? task.createdAt)}
@@ -66,11 +77,7 @@ export function TaskTable({ tasks, compact = false }: { tasks: Task[]; compact?:
                 {!compact && <td className="muted nowrap">{formatTime(task.createdAt)}</td>}
                 {!compact && (
                   <td>
-                    <a
-                      href={`#/tasks/${task.id}`}
-                      className="row-link"
-                      aria-label={`查看任务 ${task.name}`}
-                    >
+                    <a href={href} className="row-link" aria-label={`查看任务 ${task.name}`}>
                       <ArrowRight size={16} />
                     </a>
                   </td>

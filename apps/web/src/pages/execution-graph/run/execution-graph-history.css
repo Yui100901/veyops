@@ -13,6 +13,27 @@
   color: var(--muted);
 }
 
+.graph-history-view-controls {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.graph-history-view-controls .field {
+  min-width: 0;
+}
+
+.graph-history-view-controls .resource-section-switcher {
+  margin: 0;
+}
+
+.graph-history-node-workspace > article {
+  scroll-margin-top: 1rem;
+}
+
 .graph-history-context-content {
   overflow-wrap: anywhere;
 }

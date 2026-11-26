@@ -18,18 +18,36 @@ export function ExecutionGraphNodeLogs({
   path,
   status,
   legacy,
+  deferUntilVisible = false,
 }: {
   path: string;
   status: string;
   legacy: string;
+  deferUntilVisible?: boolean;
 }) {
   const [log, setLog] = useState<NodeLog>();
   const heading = useId();
+  const section = useRef<HTMLElement>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [inViewport, setInViewport] = useState(false);
+  const canLoad = !deferUntilVisible || inViewport;
   const latest = useRef<NodeLog | undefined>(undefined);
   const request = useRef<AbortController | undefined>(undefined);
   const active = activeStates.has(status);
+  useEffect(() => {
+    if (!deferUntilVisible || !section.current) return;
+    if (typeof IntersectionObserver === 'undefined') {
+      setInViewport(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      ([entry]) => setInViewport(Boolean(entry?.isIntersecting)),
+      { rootMargin: '180px 0px' },
+    );
+    observer.observe(section.current);
+    return () => observer.disconnect();
+  }, [deferUntilVisible]);
   const reload = useCallback(async () => {
     if (request.current) return;
     const controller = new AbortController();
@@ -89,6 +107,7 @@ export function ExecutionGraphNodeLogs({
     }
   }, [path]);
   useEffect(() => {
+    if (!canLoad) return;
     void reload();
     const interval = active
       ? window.setInterval(() => {
@@ -100,19 +119,19 @@ export function ExecutionGraphNodeLogs({
       request.current = undefined;
       window.clearInterval(interval);
     };
-  }, [active, reload]);
+  }, [active, canLoad, reload]);
 
   const summary = log?.summary ?? legacy;
   const content = log?.source === 'TASK' ? log.content : log?.content || summary;
   const currentStatus = log?.status ?? status;
   return (
-    <section className="graph-history-node-logs" aria-labelledby={heading}>
+    <section className="graph-history-node-logs" aria-labelledby={heading} ref={section}>
       <header className="graph-history-logs-header">
         <h4 id={heading}>节点日志</h4>
         <button
           className="button secondary small"
           type="button"
-          disabled={loading}
+          disabled={loading && canLoad}
           onClick={() => void reload()}
         >
           {log?.more ? '继续读取日志' : '刷新节点日志'}
@@ -128,11 +147,13 @@ export function ExecutionGraphNodeLogs({
         </pre>
       ) : (
         <p className="graph-history-node-log-state" role="status">
-          {loading
-            ? '正在读取节点日志…'
-            : activeStates.has(currentStatus)
-              ? '等待节点输出日志…'
-              : '此节点暂无日志。'}
+          {!canLoad && !log
+            ? '滚动至此自动读取日志。'
+            : loading
+              ? '正在读取节点日志…'
+              : activeStates.has(currentStatus)
+                ? '等待节点输出日志…'
+                : '此节点暂无日志。'}
         </p>
       )}
       {log?.truncated && <p className="field-note">日志较长，当前显示最近读取的内容。</p>}

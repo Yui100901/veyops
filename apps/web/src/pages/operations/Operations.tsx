@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type Ref } from 'react';
+import { lazy, Suspense, useDeferredValue, useEffect, useRef, useState, type Ref } from 'react';
 import {
   ArrowLeft,
   Clock3,
@@ -38,8 +38,11 @@ import { ContextAIButton } from '../ai/AI';
 import { FailureHandling } from '../delivery/FailureHandling';
 import { RunArtifacts } from '../delivery/Delivery';
 import type { DeliveryLogSelection, DeliveryTaskStep } from '../delivery/DeliveryTaskStages';
+import './task-center.css';
 
 const DeliveryTaskStages = lazy(() => import('../delivery/DeliveryTaskStages'));
+
+type TaskCenterPage = { items: Task[]; nextBefore: string | null };
 
 function renderTaskLog(
   content: string,
@@ -66,25 +69,23 @@ function renderTaskLog(
 }
 
 export function TasksPage() {
-  const resource = useResource<Task[]>('/tasks', 3000);
   const [filter, setFilter] = useState('ALL');
   const [search, setSearch] = useState('');
-  const list = (resource.data ?? []).filter(
-    (task) =>
-      (filter === 'ALL' ||
-        (filter === 'ACTIVE'
-          ? activeTask(task.status)
-          : filter === 'FAILED'
-            ? ['FAILED', 'PARTIAL_FAILED', 'NEEDS_ATTENTION', 'TIMED_OUT'].includes(task.status)
-            : task.status === filter)) &&
-      task.name.toLowerCase().includes(search.toLowerCase()),
-  );
+  const [cursors, setCursors] = useState<string[]>([]);
+  const query = new URLSearchParams({ status: filter });
+  const term = useDeferredValue(search).trim();
+  if (term) query.set('q', term);
+  const before = cursors.at(-1);
+  if (before) query.set('before', before);
+  const resource = useResource<TaskCenterPage>('/tasks/center?' + query, 3000);
+  const list = resource.data?.items ?? [];
+  const nextBefore = resource.data?.nextBefore;
   return (
     <>
       <PageHeader
         eyebrow="EXECUTION HISTORY"
         title="任务中心"
-        description="统一追踪执行进度，保留每一台服务器的独立结果。"
+        description="查看执行流、临时命令和运维方案的运行进度。"
         action={
           <>
             <a className="button secondary" href="#/operations/schedules">
@@ -97,7 +98,6 @@ export function TasksPage() {
       <ErrorBanner error={resource.error} retry={resource.reload} />
       <Section
         title="执行任务"
-        subtitle={`共 ${resource.data?.length ?? 0} 项任务`}
         action={
           <div className="search-input">
             <Search size={16} />
@@ -105,7 +105,11 @@ export function TasksPage() {
               aria-label="搜索任务"
               placeholder="搜索任务名称"
               value={search}
-              onChange={(event) => setSearch(event.target.value)}
+              maxLength={160}
+              onChange={(event) => {
+                setSearch(event.target.value);
+                setCursors([]);
+              }}
             />
           </div>
         }
@@ -120,7 +124,12 @@ export function TasksPage() {
             <button
               key={value}
               className={filter === value ? 'active' : ''}
-              onClick={() => setFilter(value)}
+              type="button"
+              aria-pressed={filter === value}
+              onClick={() => {
+                setFilter(value);
+                setCursors([]);
+              }}
             >
               {label}
             </button>
@@ -128,11 +137,13 @@ export function TasksPage() {
         </div>
         {resource.loading ? (
           <Loading />
-        ) : !resource.data?.length ? (
+        ) : list.length ? (
+          <TaskTable tasks={list} />
+        ) : resource.error ? null : filter === 'ALL' && !term && !before ? (
           <Empty
             icon={<ListTodo size={25} />}
             title="还没有执行任务"
-            description="从运维中心提交命令，或运行一个可复用的运维方案。"
+            description="运行项目执行流、临时命令或运维方案后，可以在这里查看。"
             action={
               <a className="button primary" href="#/operations">
                 <Terminal size={16} />
@@ -140,10 +151,34 @@ export function TasksPage() {
               </a>
             }
           />
-        ) : !list.length ? (
-          <Empty title="没有匹配的任务" description="调整筛选条件以查看其他执行记录。" />
         ) : (
-          <TaskTable tasks={list} />
+          <Empty
+            title={before ? '没有更早的任务' : '没有匹配的任务'}
+            description={before ? '返回较新一页查看。' : '可调整状态筛选或搜索关键词。'}
+          />
+        )}
+        {(before || nextBefore) && (
+          <nav className="task-center-pagination" aria-label="任务列表翻页">
+            <button
+              className="button secondary small"
+              type="button"
+              disabled={!before}
+              onClick={() => setCursors((current) => current.slice(0, -1))}
+            >
+              较新一页
+            </button>
+            <span>第 {cursors.length + 1} 页</span>
+            <button
+              className="button secondary small"
+              type="button"
+              disabled={!nextBefore || resource.loading || Boolean(resource.error)}
+              onClick={() => {
+                if (nextBefore) setCursors((current) => [...current, nextBefore]);
+              }}
+            >
+              更早一页
+            </button>
+          </nav>
         )}
       </Section>
     </>
@@ -216,9 +251,9 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
     value.flowRunId &&
     '#' +
       graphWorkbenchPath(value.projectId, {
-      ...workspaceOrigin(scope.origin, scope.originQuery ?? undefined),
-      serviceId: value.serviceId ?? undefined,
-      environmentId: value.environmentId ?? undefined,
+        ...workspaceOrigin(scope.origin, scope.originQuery ?? undefined),
+        serviceId: value.serviceId ?? undefined,
+        environmentId: value.environmentId ?? undefined,
         pane: 'history',
         run: value.flowRunId,
         node: value.flowNodeId,

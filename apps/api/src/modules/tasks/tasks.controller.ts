@@ -16,6 +16,7 @@ import { Equals } from 'class-validator';
 import { Roles, type CurrentUser } from '../auth/auth.decorators';
 import { TasksService, isTerminalStatus } from './tasks.service';
 import { AuditService } from '../audit/audit.service';
+import { TaskCenterQuery } from './task-center.dto';
 
 class RetryTargetDto {
   @Equals(true) confirmed!: boolean;
@@ -29,6 +30,9 @@ export class TasksController {
   ) {}
   @Get() list() {
     return this.tasks.list();
+  }
+  @Get('center') center(@Query() query: TaskCenterQuery) {
+    return this.tasks.center(query);
   }
   @Get(':id') get(@Param('id') id: string) {
     return this.tasks.get(id);

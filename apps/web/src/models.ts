@@ -266,6 +266,7 @@ export interface Task {
   flowNodeId?: string;
   createdBy?: string | null;
   projectId?: string | null;
+  projectName?: string;
   serviceId?: string | null;
   environmentId?: string | null;
   type: string;

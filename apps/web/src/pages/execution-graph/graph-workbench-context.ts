@@ -71,6 +71,12 @@ export function graphWorkbenchPath(projectId: string, location: GraphLocation = 
   return queryPath(`/projects/${encodeURIComponent(projectId)}/execution-graph`, location);
 }
 
+export function executionFlowTaskPath(projectId: string, runId: string, node?: string) {
+  return queryPath(`/tasks/flows/${encodeURIComponent(projectId)}/${encodeURIComponent(runId)}`, {
+    node,
+  });
+}
+
 export function releaseArtifactInput(flow: GraphFlow, artifactType?: GraphArtifactType) {
   if (flow.model === simplifiedModel) return simplifiedReleaseInput(flow, artifactType);
 }

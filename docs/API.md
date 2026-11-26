@@ -303,6 +303,8 @@
 
 终态为 SUCCESS、FAILED、PARTIAL_FAILED、CANCELLED、TIMED_OUT、NEEDS_ATTENTION。Worker 租约过期进入 NEEDS_ATTENTION，不隐式重试。
 
+任务中心使用 `GET /tasks/center`，按创建时间倒序返回 `{items,nextBefore}`。可传 `status=ALL|ACTIVE|SUCCESS|FAILED`、名称搜索 `q`、每页 `limit` 和上一页的 `nextBefore` 作为 `before`。执行流运行在列表中以 `type: "EXECUTION_FLOW"` 返回一条记录，包含 `projectId`、`flowRunId` 和运行状态。执行流详情沿用项目运行和节点日志接口。
+
 `POST /tasks/:id/targets/:targetId/retry` 接收 `{confirmed:true}`。管理员或提交任务的运维人员可重试明确返回失败退出码的目标，以及执行前已跳过的目标。重试使用原任务的命令或方案版本，生成独立任务并返回 `retryOf`。同一来源目标的重复请求返回同一次重试，下一次重试可从该重试任务发起。
 
 ## 定时运维

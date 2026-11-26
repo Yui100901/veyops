@@ -69,7 +69,10 @@ const maxZoom = 100;
 
 const clampZoom = (value: number) => Math.max(minZoom, Math.min(maxZoom, value));
 
-function layout(flow: GraphFlow, manual?: { id: string; point: Point }) {
+function layout(
+  flow: GraphFlow,
+  { autoLayout, manual }: { autoLayout?: boolean; manual?: { id: string; point: Point } } = {},
+) {
   const nodes = orderedNodes(flow);
   const depth = new Map<string, number>();
   const columns: (typeof nodes)[] = [];
@@ -87,15 +90,16 @@ function layout(flow: GraphFlow, manual?: { id: string; point: Point }) {
   const maxRows = Math.max(1, ...columns.map((col) => col.length));
   const points = new Map<string, { x: number; y: number }>();
   columns.forEach((column, level) => {
-    column.forEach((node, lane) =>
+    column.forEach((node, lane) => {
+      const saved = autoLayout ? undefined : manual?.id === node.id ? manual.point : node.position;
       points.set(
         node.id,
-        (manual?.id === node.id ? manual.point : node.position) ?? {
+        saved ?? {
           x: margin + level * (cardWidth + columnGap),
           y: margin + (lane + (maxRows - column.length) / 2) * (cardHeight + rowGap),
         },
-      ),
-    );
+      );
+    });
   });
   const coords = [...points.values()];
   return {
@@ -168,6 +172,7 @@ function bounds(start: Point, end: Point) {
 
 export function NodeMap({
   flow,
+  autoLayout = false,
   selected = [],
   multiple,
   onSelect,
@@ -191,6 +196,7 @@ export function NodeMap({
   nodeSummary,
 }: {
   flow: GraphFlow;
+  autoLayout?: boolean;
   selected?: string[];
   multiple?: boolean;
   onSelect?: (id: string, additive: boolean) => void;
@@ -214,14 +220,16 @@ export function NodeMap({
   nodeSummary?: (node: GraphNode) => string | undefined;
 }) {
   const marker = useId();
-  const [zoom, setZoom] = useState(maxZoom);
+  const [zoomOverride, setZoomOverride] = useState<number>();
+  const [fitZoom, setFitZoom] = useState(maxZoom);
+  const zoom = zoomOverride ?? (autoLayout ? fitZoom : maxZoom);
   const scale = zoom / 100;
   const [drag, setDrag] = useState<{ start: Point; end: Point }>();
   const [manual, setManual] = useState<{ id: string; point: Point }>();
   const [menu, setMenu] = useState<CanvasMenuState>();
   const scroll = useRef<HTMLDivElement>(null);
   const moving = useRef<{ id: string; pointer: Point; position: Point } | null>(null);
-  const { points, width: layoutWidth, height: layoutHeight } = layout(flow, manual);
+  const { points, width: layoutWidth, height: layoutHeight } = layout(flow, { autoLayout, manual });
   const repeated = new Map<string, number[]>();
   flow.edges.forEach(({ from, to }, index) => {
     const key = JSON.stringify([from, to]);
@@ -244,6 +252,19 @@ export function NodeMap({
   const revealY = target
     ? target.y + cardHeight / 2
     : edgeFrom && edgeTo && (edgeFrom.y + edgeTo.y + cardHeight) / 2;
+
+  useLayoutEffect(() => {
+    const viewport = scroll.current;
+    if (!autoLayout || !viewport) return;
+    const fit = () => {
+      if (viewport.clientWidth)
+        setFitZoom(clampZoom(Math.floor((viewport.clientWidth / width) * 100)));
+    };
+    fit();
+    const observer = new ResizeObserver(fit);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, [autoLayout, width]);
 
   useLayoutEffect(() => {
     const viewport = scroll.current;
@@ -343,13 +364,13 @@ export function NodeMap({
             max={maxZoom}
             step={1}
             value={zoom}
-            onChange={(event) => setZoom(clampZoom(event.currentTarget.valueAsNumber))}
+            onChange={(event) => setZoomOverride(clampZoom(event.currentTarget.valueAsNumber))}
           />
           <button
             type="button"
-            aria-label="恢复 100% 缩放"
-            title="恢复 100% 缩放"
-            onClick={() => setZoom(maxZoom)}
+            aria-label={autoLayout ? '适应画布宽度' : '恢复 100% 缩放'}
+            title={autoLayout ? '适应画布宽度' : '恢复 100% 缩放'}
+            onClick={() => setZoomOverride(undefined)}
           >
             {zoom}%
           </button>

@@ -66,6 +66,7 @@ const OperationsCenterPage = lazy(() =>
     default: OperationsCenterPage,
   })),
 );
+const ExecutionFlowTask = lazy(() => import('./pages/operations/ExecutionFlowTask'));
 const ServicePortal = lazy(() =>
   import('./pages/projects/ServicePortal').then(({ ServicePortal }) => ({
     default: ServicePortal,
@@ -455,6 +456,7 @@ export function App() {
   const [, routeRoot, routeId, routeSection] = routePath.split('/');
   const params = new URLSearchParams(routeSearch);
   const projectRoute = readProjectWorkspace(routePath, routeSearch);
+  const flowTaskRoute = /^\/tasks\/flows\/([^/]+)\/([^/]+)$/.exec(routePath);
   async function boot() {
     setLoading(true);
     setError('');
@@ -584,6 +586,16 @@ export function App() {
   else if (routePath === '/registries') page = <RegistriesPage user={user} />;
   else if (operationsTab) page = <OperationsCenterPage tab={operationsTab} user={user} />;
   else if (routePath === '/tasks') page = <TasksPage />;
+  else if (flowTaskRoute)
+    page = (
+      <ExecutionFlowTask
+        key={routePath}
+        projectId={flowTaskRoute[1]!}
+        runId={flowTaskRoute[2]!}
+        nodeId={params.get('node') ?? undefined}
+        user={user}
+      />
+    );
   else if (route.startsWith('/tasks/'))
     page = <TaskPage key={route} id={routePath.slice(7)} user={user} search={routeSearch} />;
   else if (routePath === '/audit') page = <AuditPage />;
