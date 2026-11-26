@@ -93,9 +93,6 @@ type ComposeRelease = {
   composeProject?: string;
   dockerEngineId?: string;
 };
-type ComposeDeploymentArtifact = DeploymentArtifact & {
-  pins?: Record<string, DeploymentArtifact>;
-};
 type RollbackCandidate = {
   artifactId: string;
   snapshot: PipelineSnapshot;
@@ -291,7 +288,7 @@ export class PipelineExecutor {
         return;
       }
     }
-    const deploymentInputs = new Map<string, ComposeDeploymentArtifact>();
+    const deploymentInputs = new Map<string, DeploymentArtifact>();
     const preparingTargets = new Map<string, string>();
     if (deployArtifact) {
       context.log('校验已归档的部署产物\n');
@@ -301,7 +298,8 @@ export class PipelineExecutor {
           if (context.signal.aborted) return;
           if (trackedPreparation && !shared)
             preparingTargets.set(target.id, await context.startTarget(target.id));
-          const artifact = shared ?? (await this.deploymentInput(snapshot, target));
+          const artifact =
+            shared ?? (await this.artifacts.forDeployment(snapshot, target.id, target));
           deploymentInputs.set(target.id, artifact);
           if (
             snapshot.deploymentArtifacts?.length === 1 &&
@@ -1197,7 +1195,9 @@ export class PipelineExecutor {
       ...previous,
       runId: forward.snapshot.runId,
       mode: 'DEPLOY_ARTIFACT',
-      deploymentArtifacts: [originalArtifact],
+      deploymentArtifacts: previous.graphDeployment?.imageBindings
+        ? previous.deploymentArtifacts
+        : [originalArtifact],
       releaseKey,
       rollbackOfDeploymentId: failedDeploymentId,
       expectedCurrentDeploymentId: undefined,
@@ -1404,35 +1404,6 @@ fi
       dockerEngineId,
     };
   }
-
-  private async deploymentInput(
-    snapshot: PipelineSnapshot,
-    target: SshTarget,
-  ): Promise<ComposeDeploymentArtifact> {
-    const bindings = snapshot.graphDeployment?.imageBindings;
-    if (!bindings) return this.artifacts.forDeployment(snapshot, target.id, target);
-    const pins: Record<string, DeploymentArtifact> = {};
-    for (const [variable, name] of Object.entries(bindings)) {
-      const reference = snapshot.deploymentArtifacts?.find((entry) => entry.name === name);
-      if (!reference || reference.serverId !== target.id)
-        throw new ConflictException('Compose 缺少同一执行服务器上的固定镜像');
-      const artifact = await this.artifacts.forDeployment(
-        { ...snapshot, deploymentArtifacts: [reference] },
-        target.id,
-        target,
-      );
-      if (
-        !artifact.imageId ||
-        !artifact.imageReference ||
-        artifact.physical?.location !== 'DOCKER_ENGINE'
-      )
-        throw new ConflictException('Compose 镜像组只接受已验证的目标端 Docker 镜像');
-      pins[variable] = artifact;
-    }
-    const first = Object.values(pins)[0];
-    if (!first) throw new ConflictException('Compose 镜像组为空');
-    return { ...first, pins };
-  }
   private async targetImage(target: SshTarget, work: string, session: BuildSession) {
     const d = session.snapshot.definition;
     const { registry, config } = await this.builds.remoteRegistryLogin(target, work, session);
@@ -1465,7 +1436,7 @@ fi
     image: string,
     session: BuildSession,
     manager?: BuildOutput,
-    artifact?: ComposeDeploymentArtifact,
+    artifact?: DeploymentArtifact,
     activeDockerEngineId?: string,
   ) {
     if (!artifact?.imageId && !/^[a-zA-Z0-9._:/-]+@sha256:[a-f0-9]{64}$/.test(image))
@@ -1555,13 +1526,19 @@ fi
 
     const configure = async (reference: string) => {
       const pins = Object.entries(artifact?.pins ?? {});
-      const env = serializeComposeEnvironment({
-        ...session.variables,
+      const pinnedImages = {
         VEYOPS_IMAGE: reference,
         ...Object.fromEntries(pins.map(([variable, entry]) => [variable, entry.imageReference!])),
+      };
+      const env = serializeComposeEnvironment({
+        ...session.variables,
+        ...pinnedImages,
       });
       await uploadContent('.env', env, 30);
-      const compose = `VEYOPS_IMAGE=${q(reference)} ${docker} compose --project-name ${q(project)} --env-file ${remotePath(release + '/.env')} -f ${remotePath(release + '/compose.yaml')}`;
+      const imageEnvironment = Object.entries(pinnedImages)
+        .map(([variable, value]) => `${variable}=${q(value)}`)
+        .join(' ');
+      const compose = `${imageEnvironment} ${docker} compose --project-name ${q(project)} --env-file ${remotePath(release + '/.env')} -f ${remotePath(release + '/compose.yaml')}`;
       const images = (
         await this.builds.remoteCapture(
           target,

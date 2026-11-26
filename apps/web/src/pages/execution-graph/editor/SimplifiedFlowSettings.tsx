@@ -393,9 +393,13 @@ export function SimplifiedStartSettings({
                         canEdit={canEdit && images.length > 1}
                         change={(selected) => changeImage(id, selected)}
                       />
-                      {images.length > 1 && (
+                      {imageIds.includes(id) && (
                         <code className="field-note">
-                          {'${' + simplifiedComposeImageVariable(id) + '}'}
+                          {'${' +
+                            (imageIds.length > 1
+                              ? simplifiedComposeImageVariable(id)
+                              : 'VEYOPS_IMAGE') +
+                            '}'}
                         </code>
                       )}
                     </div>

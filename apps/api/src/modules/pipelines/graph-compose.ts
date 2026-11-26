@@ -1,5 +1,8 @@
 import { BadRequestException } from '@nestjs/common';
-import { parseComposeTemplate } from '../service-configs/compose-template-reference';
+import {
+  composeImageVariable,
+  parseComposeTemplate,
+} from '../service-configs/compose-template-reference';
 
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value))
@@ -12,6 +15,14 @@ export function assertGraphCompose(text: string, imageBindings?: Record<string, 
     text,
     imageBindings && Object.keys(imageBindings),
   );
+  if (
+    imageBindings &&
+    services.some(({ image }) => {
+      const variable = composeImageVariable(image);
+      return !variable || !Object.hasOwn(imageBindings, variable);
+    })
+  )
+    throw new BadRequestException('多镜像 Compose 中每个服务都须引用本次确认的镜像变量');
   if (compose.include || compose.configs || compose.secrets)
     throw new BadRequestException('图内 Compose 模板须自包含，请使用执行图变量和项目内资源');
   const volumes = new Set(Object.keys(compose.volumes ? record(compose.volumes) : {}));

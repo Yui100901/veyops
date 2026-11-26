@@ -194,7 +194,9 @@ export class ReleaseRequestsService {
       ...source.snapshot,
       mode: 'DEPLOY_ARTIFACT',
       deployAfterBuild: false,
-      deploymentArtifacts: [{ id: source.artifactId, serverId: artifact.server_id }],
+      deploymentArtifacts: source.snapshot.graphDeployment?.imageBindings
+        ? source.snapshot.deploymentArtifacts
+        : [{ id: source.artifactId, serverId: artifact.server_id }],
       triggerType: 'MANUAL',
       graphAutomation: undefined,
       rollbackOfDeploymentId: id,
@@ -234,10 +236,19 @@ export class ReleaseRequestsService {
         confirmationHash,
         deploymentId: id,
         artifactId: source.artifactId,
+        artifactIds: snapshot.deploymentArtifacts?.map(({ id }) => id) ?? [],
         sourceCommit: snapshot.commitSha,
         checksum: artifact.checksum,
         imageDigest: artifact.image_digest,
         imageReference: deploymentArtifact.imageReference,
+        images: deploymentArtifact.pins
+          ? Object.entries(deploymentArtifact.pins).map(([variable, image]) => ({
+              variable,
+              artifactId: image.id,
+              imageReference: image.imageReference,
+              imageId: image.imageId,
+            }))
+          : undefined,
         composeTemplate: snapshot.managedCompose ?? deploymentArtifact.composeTemplate,
         previousCompose,
         serviceId: row.service_id,

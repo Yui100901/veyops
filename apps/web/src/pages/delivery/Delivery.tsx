@@ -772,16 +772,23 @@ export function DeliveryRecordsPage({
                                     `${r.composeRelease.template.commitSha.slice(0, 12)} · `}
                                   {r.composeRelease.template.checksum.slice(0, 12)}
                                 </small>
-                                <small
-                                  className="cell-detail"
-                                  title={
-                                    r.composeRelease.imageReference +
-                                    ' · ' +
-                                    r.composeRelease.imageId
-                                  }
-                                >
-                                  镜像 {r.composeRelease.imageId.slice(0, 19)}
-                                </small>
+                                {(
+                                  r.composeRelease.images ?? [
+                                    {
+                                      artifactId: r.artifactId ?? '',
+                                      imageReference: r.composeRelease.imageReference,
+                                      imageId: r.composeRelease.imageId,
+                                    },
+                                  ]
+                                ).map((image) => (
+                                  <small
+                                    key={image.artifactId || image.imageReference}
+                                    className="cell-detail"
+                                    title={image.imageReference + ' · ' + image.imageId}
+                                  >
+                                    镜像 {image.imageReference} · {image.imageId.slice(0, 19)}
+                                  </small>
+                                ))}
                               </>
                             )}
                           </td>

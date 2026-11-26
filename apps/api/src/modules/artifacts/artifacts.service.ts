@@ -133,6 +133,7 @@ const localImageReference = new RegExp(
 );
 export interface DeploymentArtifact {
   id: string;
+  pins?: Record<string, DeploymentArtifact>;
   localArchive?: string;
   checksum?: string;
   imageReference?: string;
@@ -963,6 +964,45 @@ export class ArtifactsService {
     serverId: string,
     target?: SshTarget,
   ): Promise<DeploymentArtifact> {
+    const bindings = snapshot.graphDeployment?.imageBindings;
+    if (!bindings) return this.deploymentArtifact(snapshot, serverId, target);
+    const entries = Object.entries(bindings);
+    const references = snapshot.deploymentArtifacts ?? [];
+    if (
+      entries.length < 2 ||
+      entries.length !== references.length ||
+      new Set(entries.map(([, name]) => name)).size !== entries.length ||
+      new Set(references.map(({ id }) => id)).size !== entries.length ||
+      entries.some(([variable]) => !/^VEYOPS_IMAGE_[A-Z0-9_]+$/.test(variable))
+    )
+      throw new ConflictException('Compose 缺少完整的已确认镜像组');
+    const pins: Record<string, DeploymentArtifact> = {};
+    for (const [variable, name] of entries) {
+      const matches = references.filter((entry) => entry.name === name);
+      const reference = matches[0];
+      if (matches.length !== 1 || !reference || reference.serverId !== serverId)
+        throw new ConflictException('Compose 缺少同一执行服务器上的固定镜像');
+      const artifact = await this.deploymentArtifact(
+        { ...snapshot, deploymentArtifacts: [reference] },
+        serverId,
+        target,
+      );
+      if (
+        !artifact.imageId ||
+        !artifact.imageReference ||
+        artifact.physical?.location !== 'DOCKER_ENGINE'
+      )
+        throw new ConflictException('Compose 镜像组只接受已验证的目标端 Docker 镜像');
+      pins[variable] = artifact;
+    }
+    return { ...Object.values(pins)[0]!, pins };
+  }
+
+  private async deploymentArtifact(
+    snapshot: PipelineSnapshot,
+    serverId: string,
+    target?: SshTarget,
+  ): Promise<DeploymentArtifact> {
     const candidates = snapshot.deploymentArtifacts?.filter(
       (artifact) => artifact.serverId === null || artifact.serverId === serverId,
     );
@@ -993,6 +1033,7 @@ export class ArtifactsService {
     ).executeTakeFirst();
     if (
       !row ||
+      (candidate.name !== undefined && candidate.name !== row.artifact_name) ||
       applicationServer(row) !== (candidate.sourceServerId ?? candidate.serverId) ||
       (row.temporary_root_id && row.temporary_root_id !== snapshot.artifactRootRunId) ||
       !hasDeployableMetadata(
