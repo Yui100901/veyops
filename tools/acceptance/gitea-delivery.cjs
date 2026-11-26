@@ -847,11 +847,46 @@ async function exercise() {
   console.log(JSON.stringify({ command: 'verified', state: statePath, results: plan.evidence }));
 }
 
+async function retryFullstack() {
+  const plan = state();
+  assert.equal(plan.veyopsBase, veyopsBase.origin);
+  const record = plan.repositories.fullstack;
+  assert.ok(record.hookRuleId && record.pushSha, 'An earlier fullstack exercise is required.');
+  const api = await application();
+  const previous = (await api.get(rulePath(record, record.hookRuleId) + '/events')).find(
+    (event) => event.metadata?.commitSha === record.pushSha && event.runId,
+  );
+  assert.ok(
+    previous &&
+      ['SUCCESS', 'FAILED', 'NEEDS_ATTENTION', 'PARTIAL_FAILED', 'CANCELLED', 'TIMED_OUT'].includes(
+        previous.runStatus,
+      ),
+    'Wait until the previous fullstack run is terminal.',
+  );
+  record.retryOf = { runId: previous.runId, commitSha: record.pushSha, status: previous.runStatus };
+  record.pushSha = push(record, 'main', 'fullstack');
+  save(plan);
+  console.log(
+    JSON.stringify({
+      command: 'pushed',
+      fixture: 'fullstack',
+      branch: 'main',
+      sha: record.pushSha,
+      retryOf: record.retryOf,
+    }),
+  );
+  await exercise();
+}
+
 (async () => {
   if (process.argv[2] === 'seed') await seed();
   else if (process.argv[2] === 'configure') await configure();
   else if (process.argv[2] === 'exercise') await exercise();
-  else throw new Error('Usage: node tools/acceptance/gitea-delivery.cjs seed|configure|exercise');
+  else if (process.argv[2] === 'retry-fullstack') await retryFullstack();
+  else
+    throw new Error(
+      'Usage: node tools/acceptance/gitea-delivery.cjs seed|configure|exercise|retry-fullstack',
+    );
 })().catch((error) => {
   const secrets = [password, process.env.VEYOPS_ACCEPT_PREVIEW_ADMIN_PASSWORD].filter(Boolean);
   console.error(
