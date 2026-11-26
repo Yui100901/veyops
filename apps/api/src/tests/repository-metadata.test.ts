@@ -13,6 +13,7 @@ import { promisify } from 'node:util';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import { flowTarget } from './helpers/flow-target';
 
 const exec = promisify(execFile);
 
@@ -488,6 +489,25 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
     shallow: false,
   });
   const graphPath = `/api/v1/projects/${project}/execution-graph`;
+  const flowServer = await flowTarget(admin);
+  const { FlowWorkspaceService } =
+    await import('../modules/execution-graphs/flow-workspace.service.js');
+  const workspace = app.get(FlowWorkspaceService);
+  workspace.open = async (runId, placement) => ({
+    runId,
+    placement,
+    path: '/tmp/fixture/' + runId,
+  });
+  workspace.cleanup = async () => undefined;
+  workspace.checkout = async (_workspace, projectId, checkouts, context) =>
+    Promise.all(
+      checkouts.map(async ({ directory, source }) => ({
+        ...(await metadata.checkoutGraphSource(projectId, source, context.signal)),
+        repositoryId: source.repositoryId,
+        directory,
+        ref: source.ref,
+      })),
+    );
   await git('clone', '--bare', '--no-local', bare, join(directory, 'secondary.git'));
   const secondaryRepository = (
     await admin
@@ -509,7 +529,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
           name: '默认仓库',
           type: 'START',
           start: {
-            execution: { location: 'MANAGER' },
+            execution: { serverId: flowServer },
             sources: [{ id: 'main', repositoryId: id }],
           },
         },
@@ -518,7 +538,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
           name: '具名源码',
           type: 'START',
           start: {
-            execution: { location: 'MANAGER' },
+            execution: { serverId: flowServer },
             sources: [
               { id: 'main', repositoryId: id, ref: { kind: 'BRANCH', value: 'main' } },
               {

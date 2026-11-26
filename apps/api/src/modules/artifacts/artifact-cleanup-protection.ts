@@ -2,6 +2,7 @@ import type { Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
 import { activeFlowStatuses } from '../execution-graphs/graph-run-lifecycle';
 import { projectResourceReferences } from '../projects/project-resource-references';
+import type { ComposeReleaseEvidence } from '../service-configs/compose-template-reference';
 
 export const activeArtifactTaskStatuses = [
   'PENDING',
@@ -24,6 +25,7 @@ export async function protectedArtifacts(db: Kysely<Database>) {
         'health_status',
         'activated_at',
         'previous_deployment_id',
+        'compose_release_json',
       ])
       .where((eb) =>
         eb.or([
@@ -46,6 +48,13 @@ export async function protectedArtifacts(db: Kysely<Database>) {
       .execute(),
   ]);
   const protectedIds = new Set<string>();
+  const protectDeployment = (deployment: (typeof deployments)[number]) => {
+    if (deployment.artifact_id) protectedIds.add(deployment.artifact_id);
+    const compose = JSON.parse(
+      deployment.compose_release_json ?? 'null',
+    ) as ComposeReleaseEvidence | null;
+    for (const image of compose?.images ?? []) protectedIds.add(image.artifactId);
+  };
   const previousIds = new Set<string>();
   const current = new Set<string>();
   const healthy = new Set<string>();
@@ -65,7 +74,7 @@ export async function protectedArtifacts(db: Kysely<Database>) {
   for (const deployment of deployments) {
     const scope = deployment.release_scope_key;
     if (deployment.status === 'RUNNING' || deployment.status === 'NEEDS_ATTENTION') {
-      if (deployment.artifact_id) protectedIds.add(deployment.artifact_id);
+      protectDeployment(deployment);
       if (deployment.previous_deployment_id) previousIds.add(deployment.previous_deployment_id);
     }
     if (deployment.activated_at === null && deployment.status !== 'SUCCESS') continue;
@@ -73,7 +82,7 @@ export async function protectedArtifacts(db: Kysely<Database>) {
       deployment.artifact_id &&
       (!scope || !current.has(scope) || pinnedRuns.has(deployment.pipeline_run_id))
     )
-      protectedIds.add(deployment.artifact_id);
+      protectDeployment(deployment);
     if (!scope) continue;
     current.add(scope);
     if (
@@ -82,13 +91,12 @@ export async function protectedArtifacts(db: Kysely<Database>) {
       deployment.artifact_id &&
       !healthy.has(scope)
     ) {
-      protectedIds.add(deployment.artifact_id);
+      protectDeployment(deployment);
       healthy.add(scope);
     }
   }
   for (const deployment of deployments)
-    if (previousIds.has(deployment.id) && deployment.artifact_id)
-      protectedIds.add(deployment.artifact_id);
+    if (previousIds.has(deployment.id) && deployment.artifact_id) protectDeployment(deployment);
   for (const task of tasks) {
     const payload = JSON.parse(task.payload_json) as {
       pipeline?: { deploymentArtifacts?: { id: string }[] };

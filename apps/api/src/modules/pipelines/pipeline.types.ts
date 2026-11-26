@@ -104,6 +104,7 @@ export interface PipelineSnapshot {
     method: 'FILE' | 'COMPOSE';
     artifactPath?: string;
     composeProject?: string;
+    imageBindings?: Record<string, string>;
     targetPaths?: Record<string, string>;
     template?: Extract<
       import('../service-configs/compose-template-reference').ComposeTemplateReference,
@@ -130,6 +131,7 @@ export interface PipelineSnapshot {
   allowPartialDeploy?: boolean;
   deploymentArtifacts?: {
     id: string;
+    name?: string | null;
     serverId: string | null;
     sourceServerId?: string;
     fingerprint?: string;

@@ -238,10 +238,9 @@ test(
       start.start = {
         ...start.start,
         sources: [{ id: 'repo', repositoryId: repo.id, ref: { kind: 'BRANCH', value: 'main' } }],
-        execution: { location: 'MANAGER' },
+        execution: { serverId: server.id },
         release: {
           serviceId: service.id,
-          targets: { serverIds: [server.id] },
         },
         variables: [{ key: 'FIXTURE_VALUE', value: 'configured' }],
         dotenv: { sourceId: 'repo', path: 'private.vars' },
@@ -277,6 +276,7 @@ test(
           ...structuredClone(start.start!.release!),
           artifactSource: 'RUN_PARAMETER',
         };
+        onlyRelease.start!.execution = { serverId: server.id };
         const build = template.nodes.find(({ operation }) => operation === 'BUILD')!;
         build.build = structuredClone(canvas.nodes[2]!.build!);
         return { mainStart, onlyBuild, onlyRelease };
@@ -416,7 +416,7 @@ test(
       const replay = structuredClone(canvas);
       const releaseStart = replay.nodes[0]!;
       releaseStart.start!.sources = [];
-      releaseStart.start!.execution = { location: 'INHERIT' };
+      releaseStart.start!.execution = { serverId: server.id };
       delete releaseStart.start!.dotenv;
       releaseStart.start!.release!.artifactId = artifacts[0].id;
       const deploy = replay.nodes[3]!;
@@ -872,7 +872,7 @@ test(
         hostKeyFingerprint: 'b'.repeat(64),
       });
       const both = structuredClone(replay);
-      both.nodes[0]!.start!.release!.targets = { serverIds: [server.id, secondServer.id] };
+      both.nodes[0]!.start!.execution = { serverId: secondServer.id };
       const bothVersion = await publish(both);
       const bothPreview = await create(flow + '/preview', { version: bothVersion });
       const previousRelease = releases.get(currentPath);

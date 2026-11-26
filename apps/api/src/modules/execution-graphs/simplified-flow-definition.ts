@@ -6,15 +6,12 @@ import {
   IsArray,
   IsBoolean,
   IsIn,
-  IsInt,
   IsObject,
   IsString,
   IsUUID,
   Length,
   Matches,
-  Max,
   MaxLength,
-  Min,
   ValidateIf,
   ValidateNested,
 } from 'class-validator';
@@ -52,32 +49,19 @@ export class SimplifiedSource {
 }
 
 export class SimplifiedExecution {
-  @IsIn(['INHERIT', 'MANAGER', 'TARGET']) location!: 'INHERIT' | 'MANAGER' | 'TARGET';
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() serverId?: string;
-  @ValidateIf((_o, v) => v !== undefined) @IsUUID() groupId?: string;
 }
 
-export class SimplifiedReleaseTargets {
-  @ValidateIf((_o, v) => v !== undefined)
-  @IsArray()
-  @ArrayMaxSize(100)
-  @ArrayUnique()
-  @IsUUID(undefined, { each: true })
-  serverIds?: string[];
-  @ValidateIf((_o, v) => v !== undefined)
-  @IsArray()
-  @ArrayMaxSize(100)
-  @ArrayUnique()
-  @IsUUID(undefined, { each: true })
-  groupIds?: string[];
-  @ValidateIf((_o, v) => v !== undefined)
-  @IsIn(['PARALLEL', 'SEQUENTIAL'])
-  strategy?: 'PARALLEL' | 'SEQUENTIAL';
-  @ValidateIf((_o, v) => v !== undefined) @IsInt() @Min(1) @Max(10) maxParallel?: number;
-  @ValidateIf((_o, v) => v !== undefined)
-  @IsIn(['CONTINUE', 'STOP'])
-  failurePolicy?: 'CONTINUE' | 'STOP';
-}
+export type HistoricalSimplifiedExecution = SimplifiedExecution & {
+  location?: 'INHERIT' | 'MANAGER' | 'TARGET';
+  groupId?: string;
+};
+
+export type HistoricalSimplifiedRelease = SimplifiedRelease & {
+  targets?: { serverIds?: string[]; groupIds?: string[] };
+  contentPath?: string;
+  reuseExecutionServer?: boolean;
+};
 
 export class SimplifiedComposeFile {
   @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) sourceId?: string;
@@ -86,16 +70,17 @@ export class SimplifiedComposeFile {
 
 export class SimplifiedRelease {
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() serviceId?: string;
-  @ValidateIf((_o, v) => v !== undefined)
-  @IsObject()
-  @ValidateNested()
-  @Type(() => SimplifiedReleaseTargets)
-  targets?: SimplifiedReleaseTargets;
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() artifactId?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsIn(['RUN_PARAMETER']) artifactSource?: 'RUN_PARAMETER';
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() useUpstreamArtifact?: boolean;
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() allowArtifactOverride?: boolean;
   @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) imageId?: string;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsArray()
+  @ArrayMaxSize(20)
+  @ArrayUnique()
+  @Matches(idFormat, { each: true })
+  imageIds?: string[];
   @ValidateIf((_o, v) => v !== undefined) @IsString() @MaxLength(255) upstreamArtifactName?: string;
   @ValidateIf((_o, v) => v !== undefined)
   @IsObject()
@@ -155,6 +140,7 @@ export class SimplifiedFinishImage {
   @IsIn(['BUILT_IN', 'WORKSPACE', 'REGISTRY']) source!: 'BUILT_IN' | 'WORKSPACE' | 'REGISTRY';
   @ValidateIf((_o, v) => v !== undefined) @IsString() @Length(1, 512) reference?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() registryId?: string;
+  @ValidateIf((_o, v) => v !== undefined) @Matches(idFormat) buildNodeId?: string;
   @ValidateIf((_o, v) => v !== undefined) @IsString() @Length(1, 1024) composePath?: string;
 }
 
@@ -190,13 +176,19 @@ export function simplifiedImageName(value: string) {
     : undefined;
 }
 
-export function simplifiedReleaseImage(finish: SimplifiedFinish, release: SimplifiedRelease) {
+export function simplifiedReleaseImages(
+  finish: SimplifiedFinish,
+  release: SimplifiedRelease,
+): SimplifiedFinishImage[] {
   const images = finish.images ?? [];
-  return release.imageId
-    ? images.find(({ id }) => id === release.imageId)
-    : images.length === 1
-      ? images[0]
-      : undefined;
+  const ids = release.imageIds ?? (release.imageId ? [release.imageId] : []);
+  if (!ids.length) return images.length === 1 ? images : [];
+  const selected = ids.map((id) => images.find((image) => image.id === id));
+  return selected.every((image): image is SimplifiedFinishImage => Boolean(image)) ? selected : [];
+}
+
+export function simplifiedComposeImageVariable(id: string) {
+  return 'VEYOPS_IMAGE_' + id.toUpperCase().replaceAll('-', '_');
 }
 
 function dockerImageName(name: string) {
@@ -275,6 +267,7 @@ const obsoleteActionFields = {
     'branch',
     'commitSha',
     'buildLocation',
+    'buildImage',
     'artifactType',
     'outputPath',
     'artifacts',
@@ -470,16 +463,6 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
   if (sources.length && !checkouts.length)
     report('start.sources', '请添加代码拉取动作以检出配置的仓库');
 
-  const execution = config.execution;
-  if (execution?.serverId && execution.groupId)
-    report('start.execution', '请为工作区选择一台执行服务器或一个分组');
-  if (
-    simplifiedUsesWorkspace(ordered) &&
-    execution?.location === 'TARGET' &&
-    !execution.serverId &&
-    !execution.groupId
-  )
-    report('start.execution', '目标端工作区需要一台执行服务器或一个分组');
   const keys = new Set<string>();
   for (const { key, value, credentialId, allowOverride } of config.variables ?? []) {
     if (!safeGraphEnvironmentKey(key) || keys.has(key))
@@ -522,7 +505,10 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
     if (!release?.serviceId) report('start.release.serviceId', '请选择发布的项目服务');
     if (
       release?.artifactSource === 'RUN_PARAMETER' &&
-      (release.artifactId || release.useUpstreamArtifact || release.imageId)
+      (release.artifactId ||
+        release.useUpstreamArtifact ||
+        release.imageId ||
+        release.imageIds?.length)
     )
       report('start.release.artifactSource', '运行时选择产物不能与其他产物来源同时设置');
     if (release?.useUpstreamArtifact && release.artifactId)
@@ -531,26 +517,21 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
       report('start.release.upstreamArtifactName', '选择接收上游产物后才可指定登记名称');
     if (release?.upstreamArtifactName && !simplifiedImageName(release.upstreamArtifactName))
       report('start.release.upstreamArtifactName', '请填写有效的上游产物登记名称');
-    if (!release?.targets?.serverIds?.length && !release?.targets?.groupIds?.length) {
-      report('start.release.targets', '请选择发布服务器或分组');
-    }
+    if (release?.imageId && release.imageIds?.length)
+      report('start.release.imageIds', '请选择一组本次发布镜像');
     if (deploys[0]!.deploy?.method !== 'COMPOSE') {
-      if (release?.imageId) report('start.release.imageId', '文件发布无需选择本次镜像');
+      if (release?.imageId || release?.imageIds?.length)
+        report('start.release.imageIds', '文件发布无需选择本次镜像');
     }
   }
+  if (!config.execution?.serverId)
+    report('start.execution.serverId', '请选择此执行流唯一的执行服务器');
   if (activeFinish.requireRelease && !deploys.length)
     nodeIssue(finish, 'finish.requireRelease', '核对发布结果需要受管发布动作', flow.id);
 
   const dockerBuilds = ordered.filter(
     (node) => node.type === 'BUILD' && node.build?.dockerfilePath,
   );
-  if (dockerBuilds.length > 1)
-    nodeIssue(
-      dockerBuilds[1]!,
-      'build.dockerfilePath',
-      '每次运行只能登记一个内置构建镜像',
-      flow.id,
-    );
   const imageIds = new Set<string>();
   const imageNames = new Set<string>();
   const images = activeFinish.images ?? [];
@@ -576,8 +557,22 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
           flow.id,
         );
     }
-    if (image.source === 'BUILT_IN' && !dockerBuilds.length)
-      nodeIssue(finish, field + '.source', '请添加内置 Dockerfile 构建或选择其他镜像来源', flow.id);
+    if (image.source === 'BUILT_IN') {
+      const producer = image.buildNodeId
+        ? dockerBuilds.find(({ id }) => id === image.buildNodeId)
+        : dockerBuilds.length === 1
+          ? dockerBuilds[0]
+          : undefined;
+      if (!producer)
+        nodeIssue(
+          finish,
+          field + '.buildNodeId',
+          '请选择本流中产生该镜像的 Dockerfile 构建节点',
+          flow.id,
+        );
+    } else if (image.buildNodeId) {
+      nodeIssue(finish, field + '.buildNodeId', '只有内置 Dockerfile 镜像关联构建节点', flow.id);
+    }
     if (
       image.source === 'WORKSPACE' &&
       !ordered.some(({ type }) => ['BUILD', 'SHELL', 'CHECK'].includes(type))
@@ -607,14 +602,22 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
       node.deploy?.method === 'COMPOSE'
     ) {
       const compose = config.release?.compose;
-      const image = simplifiedReleaseImage(activeFinish, config.release ?? {});
-      if (!existingArtifact && config.release?.imageId && !image)
-        report('start.release.imageId', '找不到已选的镜像登记项');
-      if (!existingArtifact && !image) {
-        if (images.length > 1) report('start.release.imageId', '请选择本次要发布的镜像登记项');
-        nodeIssue(finish, 'finish.images', '从本次构建发布时请登记一个镜像', flow.id);
+      const selection = simplifiedReleaseImages(activeFinish, config.release ?? {});
+      if (!existingArtifact && !selection.length) {
+        if (images.length) report('start.release.imageIds', '请选择本次要发布的镜像登记项');
+        nodeIssue(finish, 'finish.images', '从本次构建发布时请登记镜像', flow.id);
       }
-      if (!existingArtifact && !compose && !image?.composePath)
+      if (
+        selection.length > 1 &&
+        (selection.some(({ source }) => source === 'REGISTRY') ||
+          new Set(selection.map(({ id }) => simplifiedComposeImageVariable(id))).size !==
+            selection.length)
+      )
+        report(
+          'start.release.imageIds',
+          '多镜像发布需选择本机镜像，登记标识转换后的 Compose 变量必须唯一',
+        );
+      if (!existingArtifact && !compose && (selection.length > 1 || !selection[0]?.composePath))
         report('start.release.compose', '从本次构建发布时请选择 Compose 文件');
       if (compose) {
         safeRelative(start, 'start.release.compose.path', compose.path, flow.id);
@@ -708,12 +711,15 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
     const stage = approvals.find(({ id }) => path.active.has(id)) ?? release;
     const before = happensBefore.get(stage.id)!;
     const compose = release.deploy?.method === 'COMPOSE';
-    const releaseImage = compose
-      ? simplifiedReleaseImage(activeFinish, config.release!)
-      : undefined;
-    if (releaseImage?.source === 'BUILT_IN' && !before.has(dockerBuilds[0]!.id))
+    const releaseImages = compose ? simplifiedReleaseImages(activeFinish, config.release!) : [];
+    if (
+      releaseImages.some(
+        (image) =>
+          image.source === 'BUILT_IN' && !before.has(image.buildNodeId ?? dockerBuilds[0]!.id),
+      )
+    )
       report(
-        'start.release.imageId',
+        'start.release.imageIds',
         '所选镜像的 Dockerfile 构建须在每条发布路径上的审批与部署之前执行',
       );
     const writers = ordered.filter(
@@ -721,7 +727,7 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
     );
     if (
       !writers.some(({ id }) => before.has(id)) &&
-      (!compose || releaseImage?.source !== 'REGISTRY' || !config.release?.compose?.sourceId)
+      (!compose || releaseImages[0]?.source !== 'REGISTRY' || !config.release?.compose?.sourceId)
     )
       report('start.release.artifactId', '请选择历史产物，或在固化交付内容前添加工作区动作');
     for (const node of writers) {

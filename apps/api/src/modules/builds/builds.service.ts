@@ -30,7 +30,10 @@ import { artifactIdentity } from '../artifacts/artifact-identities';
 import { graphUnscopedArtifactService } from '../pipelines/delivery-execution-profile';
 import { RegistriesService } from '../registries/registries.service';
 import { gitCredentialHelper } from '../projects/git-credential';
-import { RepositoryMetadataService } from '../projects/repository-metadata.service';
+import {
+  RepositoryMetadataService,
+  type GraphCheckoutSnapshot,
+} from '../projects/repository-metadata.service';
 import type {
   PipelineSnapshot,
   PipelineNode,
@@ -173,12 +176,21 @@ export function webhookBuildSocket() {
 }
 
 export { gitCredentialHelper } from '../projects/git-credential';
-function gitCommand(credentialResponse?: string) {
+function gitCommand(credentialResponse?: string, restricted = false) {
   const options = [
     '-c core.hooksPath=/dev/null',
     '-c credential.helper=',
     '-c http.followRedirects=false',
   ];
+  if (restricted) {
+    options.push(
+      '-c protocol.allow=never',
+      '-c protocol.http.allow=always',
+      '-c protocol.https.allow=always',
+      '-c http.lowSpeedLimit=1',
+      '-c http.lowSpeedTime=15',
+    );
+  }
   if (credentialResponse)
     options.push(`-c credential.helper=${q(gitCredentialHelper(credentialResponse))}`);
   return `GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git ${options.join(' ')}`;
@@ -190,12 +202,13 @@ export const checkoutScript = (
   credentialResponse?: string,
 ) => nodeCheckoutScript({ url, commitSha }, workspace, '.', credentialResponse);
 export function nodeCheckoutScript(
-  source: { url: string; commitSha: string },
+  source: { url: string; commitSha: string; fullClone?: boolean },
   workspace: string,
   directory: string,
   credentialResponse?: string,
+  reportCheckout = false,
 ) {
-  const git = gitCommand(credentialResponse);
+  const git = gitCommand(credentialResponse, reportCheckout);
   const destination = posix.join('repo', relativePath(directory));
   const objectFormat = source.commitSha.length === 64 ? ' --object-format=sha256' : '';
   return `set -eu
@@ -208,9 +221,10 @@ mkdir -p -- "$destination"
 cd -P "$destination"
 ${git} init -q${objectFormat}
 ${git} remote add origin ${q(source.url)}
-${git} fetch --no-recurse-submodules --no-tags --depth=1 origin ${q(source.commitSha)}
+${git} fetch --no-recurse-submodules --no-tags${source.fullClone ? '' : ' --depth=1'} origin ${q(source.commitSha)}
 ${git} checkout --detach FETCH_HEAD
 test "$(${git} rev-parse HEAD)" = ${q(source.commitSha)}
+${reportCheckout ? `printf 'VEYOPS_FLOW_GIT=%s:%s\\n' ${q(source.commitSha)} "$(${git} rev-parse --is-shallow-repository)"` : ''}
 `;
 }
 export const packScript = (
@@ -377,11 +391,38 @@ export class BuildsService {
       throw new Error('Pipeline Git checkout暂不支持SSH私钥；请改用HTTPS Token凭据');
     const username = s.username || 'oauth2',
       password = s.token || s.password;
-    if (!password || /[\r\n]/.test(username + password))
+    if (!password || /[\r\n\0]/.test(username + password))
       throw new Error('Git凭据须包含单行token或用户名密码');
     return {
       response: `username=${username}\npassword=${password}\n`,
       values: credentialSecrets(s),
+    };
+  }
+
+  async prepareFlowTargetCheckout(
+    projectId: string,
+    source: GraphCheckoutSnapshot,
+    staging: string,
+  ) {
+    if (!this.repositories) throw new ConflictException('仓库读取服务不可用');
+    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(source.commitSha))
+      throw new ConflictException('确认的源码提交无效');
+    const repository = await this.repositories.requireRepositoryAccess(
+      projectId,
+      source.repositoryId,
+      source.access,
+    );
+    const secret = await this.gitSecret(repository.credential_id);
+    const credential = secret ? { ...secret, path: staging + '/git-credentials' } : undefined;
+    return {
+      command: nodeCheckoutScript(
+        { url: repository.url, commitSha: source.commitSha, fullClone: source.fullClone },
+        staging,
+        '.',
+        credential?.path,
+        true,
+      ),
+      credential,
     };
   }
   async resolveVariables(snapshot: PipelineSnapshot) {

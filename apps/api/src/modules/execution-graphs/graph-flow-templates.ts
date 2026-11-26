@@ -287,7 +287,6 @@ function expandSimplifiedTemplate(
   });
   const buildInput = (): NonNullable<GraphNode['start']> => ({
     sources: [{ id: 'source' }],
-    execution: { location: 'INHERIT' },
   });
   const end = (
     name: string,

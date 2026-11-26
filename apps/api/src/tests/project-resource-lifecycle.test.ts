@@ -60,13 +60,14 @@ async function checkLifecycle(url?: string) {
         hostKeyFingerprint: 'a'.repeat(64),
       });
     const project = (slug: string) => make('/projects', { name: slug, slug });
+    const controlServer = await server('Control flow host');
     const start = { id: 'start', type: 'START', name: 'Start' };
     const end = { id: 'end', type: 'END', name: 'End' };
     async function save(graphPath: string, serverId?: string) {
       const { revision } = await get(graphPath);
       const nodes = serverId
         ? [
-            { ...start, start: { execution: { location: 'TARGET', serverId } } },
+            { ...start, start: { execution: { serverId } } },
             {
               id: 'shell',
               type: 'SHELL',
@@ -75,7 +76,7 @@ async function checkLifecycle(url?: string) {
             },
             end,
           ]
-        : [start, end];
+        : [{ ...start, start: { execution: { serverId: controlServer.id } } }, end];
       const edges = nodes.slice(1).map((node, index) => ({ from: nodes[index]!.id, to: node.id }));
       return (
         await client
@@ -88,7 +89,12 @@ async function checkLifecycle(url?: string) {
                 model: 'FLOW_V2',
                 nodes: [
                   ...nodes,
-                  { id: 'control', type: 'START', name: 'Control flow' },
+                  {
+                    id: 'control',
+                    type: 'START',
+                    name: 'Control flow',
+                    start: { execution: { serverId: controlServer.id } },
+                  },
                   { id: 'control-end', type: 'END', name: 'Control end' },
                 ],
                 edges: [...edges, { from: 'control', to: 'control-end' }],

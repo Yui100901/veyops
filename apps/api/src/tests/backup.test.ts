@@ -35,6 +35,7 @@ import {
 const sampleUser = 'test-admin';
 const sampleTask = 'test-task';
 const graphProject = 'backup-project';
+const graphServer = 'e86c9b90-2ad4-4ac1-8972-f6dc918b33e8';
 const historicalLog = 'first version completed';
 const taskLog = 'logs/2026/11/test-task.log';
 const artifact = 'artifacts/test-task.tar.gz';
@@ -104,11 +105,31 @@ async function withGraphServices(
       { provide: RepositoryMetadataService, useValue: {} },
       {
         provide: SystemSettingsService,
-        useValue: { get: async () => ({ defaultBuildLocation: 'MANAGER' }) },
+        useValue: {
+          get: async () => ({
+            targetWorkspaceRoot: '~/.veyops/workspace',
+            maxConcurrentRunsPerServer: 2,
+          }),
+        },
       },
       { provide: FlowWorkspaceService, useValue: {} },
       { provide: BuildsService, useValue: {} },
-      { provide: ServersService, useValue: {} },
+      {
+        provide: ServersService,
+        useValue: {
+          snapshot: async () => [
+            {
+              id: graphServer,
+              name: 'Backup execution host',
+              host: '127.0.0.1',
+              port: 22,
+              username: 'backup',
+              hostKeyFingerprint: 'b'.repeat(64),
+              credentialId: 'backup-ssh-credential',
+            },
+          ],
+        },
+      },
       { provide: ArtifactsService, useValue: {} },
       { provide: ArtifactPhysicalService, useValue: {} },
       // This fixture uses only local log nodes; a delivery task must never be submitted.
@@ -144,6 +165,24 @@ async function seed(database: DatabaseService, key: Buffer) {
     { name: 'Backup fixture', type: 'API_KEY', secret },
     sampleUser,
   );
+  const ssh = await credentials(database, key).create(
+    { name: 'Backup execution SSH', type: 'SSH_PASSWORD', secret: { password: 'fixture' } },
+    sampleUser,
+  );
+  await database.db
+    .insertInto('servers')
+    .values({
+      id: graphServer,
+      name: 'Backup execution host',
+      host: '127.0.0.1',
+      port: 22,
+      username: 'backup',
+      credential_id: ssh.id,
+      host_key_fingerprint: 'b'.repeat(64),
+      created_at: 2,
+      updated_at: 2,
+    })
+    .execute();
   await database.db
     .insertInto('tasks')
     .values({
@@ -186,7 +225,12 @@ async function seed(database: DatabaseService, key: Buffer) {
       canvas: {
         model: 'FLOW_V2',
         nodes: [
-          { id: 'start', type: 'START', name: '开始' },
+          {
+            id: 'start',
+            type: 'START',
+            name: '开始',
+            start: { execution: { serverId: graphServer } },
+          },
           report,
           { id: 'end', type: 'END', name: '结束' },
         ],

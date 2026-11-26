@@ -107,7 +107,7 @@ export function archivedComposeTemplate(
     source: 'ARCHIVE',
     path: path
       ? posix.join(definition?.repoPath ?? '.', path)
-      : release?.image?.name === name
+      : release?.image?.name === name || release?.images?.some((image) => image.name === name)
         ? release?.workspaceComposePath
         : undefined,
     checksum,

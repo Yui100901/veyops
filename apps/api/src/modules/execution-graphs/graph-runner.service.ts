@@ -38,6 +38,7 @@ import type { SourceReviewProof } from '../deployments/source-review.service';
 import { lockProjectGraph, requireProject } from '../projects/project-guards';
 import { runResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
+import { SystemSettingsService } from '../system/system-settings.service';
 import {
   confirmDeploymentMembers,
   directDeploymentSelection,
@@ -478,7 +479,7 @@ class FlowWorkspaceBusy extends Error {}
 @Injectable()
 export class GraphRunnerService implements OnModuleInit {
   private readonly logger = new Logger(GraphRunnerService.name);
-  private cursor?: string;
+  private cursor?: { id: string; created_at: number };
   private pumping?: Promise<void>;
   constructor(
     private readonly database: DatabaseService,
@@ -489,6 +490,7 @@ export class GraphRunnerService implements OnModuleInit {
     @Optional() private readonly nodeTasks?: GraphNodeTasks,
     @Optional() private readonly repositories?: RepositoryMetadataService,
     @Optional() private readonly simplifiedRuns?: SimplifiedFlowRunService,
+    @Optional() private readonly settings?: SystemSettingsService,
   ) {}
 
   onModuleInit() {
@@ -1681,6 +1683,7 @@ export class GraphRunnerService implements OnModuleInit {
           contentPath: release.path === '.' ? undefined : release.path,
           method: release.method,
           image: release.image,
+          images: release.images,
           compose:
             release.profile.delivery?.composeSource?.kind === 'REPOSITORY_FILE'
               ? { path: release.profile.delivery.composeSource.path }
@@ -2666,14 +2669,27 @@ export class GraphRunnerService implements OnModuleInit {
     inputs: GraphInputsDto,
     deliveries: Record<string, Delivery | GraphNodePlan>,
   ) {
+    const snapshot = JSON.parse(values.inputs_json) as RunSnapshot;
+    const placement = snapshot.simplified?.placement;
+    const serverId = placement?.location === 'TARGET' && !values.parent_run_id
+      ? placement.target.id
+      : null;
+    const previous = serverId
+      ? await tx.selectFrom('execution_flow_runs').select('created_at')
+          .where('execution_server_id', '=', serverId)
+          .orderBy('created_at', 'desc').limit(1).executeTakeFirst()
+      : undefined;
     const row = await tx
       .insertInto('execution_flow_runs')
-      .values(this.runValues(values))
+      .values({
+        ...this.runValues(values),
+        execution_server_id: serverId,
+        created_at: Math.max(Date.now(), previous ? previous.created_at + 1 : 0),
+      })
       .onConflict((c) => c.columns(['project_id', 'created_by', 'idempotency_key']).doNothing())
       .returningAll()
       .executeTakeFirst();
     if (!row) return undefined;
-    const snapshot = JSON.parse(values.inputs_json) as RunSnapshot;
     const initialContext = snapshot.simplified
       ? undefined
       : {
@@ -2724,6 +2740,7 @@ export class GraphRunnerService implements OnModuleInit {
     values: Omit<
       Run,
       'created_at' | 'finished_at' | 'status' | 'task_id' | 'trigger_type' | 'workspace_path'
+      | 'execution_server_id' | 'execution_admitted_at'
     > &
       Pick<Partial<Run>, 'trigger_type'>,
   ) {
@@ -3295,16 +3312,40 @@ export class GraphRunnerService implements OnModuleInit {
     );
   }
 
+  private async admitTargetRun(tx: Transaction<Database>, run: Run) {
+    const serverId = run.execution_server_id;
+    if (!serverId || run.execution_admitted_at !== null || run.status === 'CANCEL_REQUESTED')
+      return true;
+    // Per-server admission is serialized across workers. SSH work runs outside this transaction.
+    await tx.updateTable('servers').set((eb) => ({ id: eb.ref('id') }))
+      .where('id', '=', serverId).execute();
+    const queue = tx.selectFrom('execution_flow_runs')
+      .where('execution_server_id', '=', serverId);
+    const earlier = await queue.select('id').where('status', '=', 'QUEUED')
+      .where('execution_admitted_at', 'is', null)
+      .orderBy('created_at').orderBy('id').executeTakeFirst();
+    if (earlier?.id !== run.id) return false;
+    const { total } = await queue.select((eb) => eb.fn.countAll<number>().as('total'))
+      .where('execution_admitted_at', 'is not', null)
+      .where('status', 'in', activeFlowStatuses).executeTakeFirstOrThrow();
+    const limit = this.settings ? (await this.settings.get(undefined, tx)).maxConcurrentFlowsPerServer : 3;
+    if (Number(total) >= limit) return false;
+    await tx.updateTable('execution_flow_runs').set({ execution_admitted_at: Date.now() })
+      .where('id', '=', run.id).execute();
+    return true;
+  }
+
   private async settle(runId: string) {
     return this.database.db.transaction().execute(async (tx) => {
       const run = await this.lockRun(tx, runId);
       if (!run) return undefined;
+      if (!(await this.admitTargetRun(tx, run))) return undefined;
       const { definition } = await this.published(run.project_id, run.version, tx);
       const flow = this.flow(definition, run.flow_id);
       const snapshot = JSON.parse(run.inputs_json) as RunSnapshot;
       const plan = snapshot.simplified;
-      const dockerBuild =
-        plan && flow.nodes.find(({ type, build }) => type === 'BUILD' && build?.dockerfilePath);
+      const dockerBuilds =
+        plan ? flow.nodes.filter(({ type, build }) => type === 'BUILD' && build?.dockerfilePath) : [];
       const rows = await tx
         .selectFrom('execution_node_runs')
         .selectAll()
@@ -3322,6 +3363,13 @@ export class GraphRunnerService implements OnModuleInit {
             : [],
         ),
       );
+      const expectedImageIds = Object.fromEntries(
+        dockerBuilds.flatMap(({ id }) => {
+          const imageId = stringValue(outputs.get(id)?.imageId);
+          return imageId ? [[id, imageId]] : [];
+        }),
+      );
+      const expectedImageId = dockerBuilds.length === 1 ? expectedImageIds[dockerBuilds[0]!.id] : undefined;
       const trigger = snapshot.trigger ?? { triggeredAt: run.created_at };
       const bindings = plan
         ? { context: {}, outputs }
@@ -3376,6 +3424,22 @@ export class GraphRunnerService implements OnModuleInit {
       const busy = jobStates.some(
         (task) => !isNodeTerminal(taskStatus(task.status, task.available_at)),
       );
+      const busyActions = rows.flatMap((row) => {
+        const task = row.task_id && byTask.get(row.task_id);
+        const action = flow.nodes.find(({ id }) => id === row.node_id);
+        return task && action && !isNodeTerminal(taskStatus(task.status, task.available_at))
+          ? [action]
+          : [];
+      });
+      const disjointBuild = (node: GraphNode, others: GraphNode[]) => {
+        if (node.type !== 'BUILD' || others.some(({ type }) => type !== 'BUILD')) return false;
+        const directory = normalizeRelativePath(node.build?.repoPath || '.');
+        return directory !== '.' && others.every(({ build }) => {
+          const other = normalizeRelativePath(build?.repoPath || '.');
+          return other !== '.' && other !== directory &&
+            !other.startsWith(directory + '/') && !directory.startsWith(other + '/');
+        });
+      };
       const ready: {
         node: NodeRun;
         action: GraphNode;
@@ -3573,10 +3637,6 @@ export class GraphRunnerService implements OnModuleInit {
           const artifacts = needsArtifactFacts
             ? await this.simplifiedRuns.snapshotArtifacts(tx, run.id)
             : [];
-          const builtImage = dockerBuild && byId.get(dockerBuild.id)?.status === 'SUCCESS';
-          const expectedImageId = builtImage
-            ? stringValue(outputs.get(dockerBuild.id)?.imageId)
-            : undefined;
           const currentFileRelease = Boolean(preparingRelease && selectedRelease.method === 'FILE');
           const workspaceSnapshot = artifacts.some(
             ({ artifact_type, artifact_name }) =>
@@ -3600,32 +3660,37 @@ export class GraphRunnerService implements OnModuleInit {
             ({ node_id, node_type }) => node_type === 'CHECKOUT' && outputs.has(node_id),
           );
           const images = plan.finish.images ?? [];
-          const releaseImage =
+          const releaseImages =
             preparingRelease && selectedRelease.method === 'COMPOSE'
-              ? images.find(({ id }) => id === selectedRelease.image?.id)
-              : undefined;
+              ? (selectedRelease.images ?? (selectedRelease.image ? [selectedRelease.image] : []))
+                  .map(({ id }) => images.find((entry) => entry.id === id))
+              : [];
+          const hasBuiltImage = (image: (typeof images)[number]) =>
+            image.source !== 'BUILT_IN' ||
+            Boolean(image.buildNodeId ? expectedImageIds[image.buildNodeId] : expectedImageId);
+          const missingImage = releaseImages.find((image) => image && !hasBuiltImage(image));
           if (
             preparingRelease &&
             selectedRelease.method === 'COMPOSE' &&
-            (!releaseImage || (releaseImage.source === 'BUILT_IN' && !builtImage))
+            (!releaseImages.length || releaseImages.includes(undefined) || missingImage)
           ) {
             await this.terminalNode(
               tx,
               row,
               'FAILED',
-              releaseImage
-                ? `镜像「${releaseImage.name}」的 Docker 构建未执行，无法发布。`
+              missingImage
+                ? `镜像「${missingImage.name}」的 Docker 构建未执行，无法发布。`
                 : '未找到本次发布所选的镜像登记项。',
             );
             continue;
           }
-          const imageIds = (node.type === 'END' ? images : releaseImage ? [releaseImage] : [])
+          const imageIds = (node.type === 'END' ? images : releaseImages.filter((image) => image !== undefined))
             .filter(
-              ({ name, source }) =>
-                (source !== 'BUILT_IN' || builtImage) &&
+              (image) =>
+                hasBuiltImage(image) &&
                 !artifacts.some(
                   ({ artifact_type, artifact_name }) =>
-                    artifact_type === 'DOCKER_IMAGE' && artifact_name === name,
+                    artifact_type === 'DOCKER_IMAGE' && artifact_name === image.name,
                 ),
             )
             .map(({ id }) => id);
@@ -3634,6 +3699,7 @@ export class GraphRunnerService implements OnModuleInit {
                 workspace: collectWorkspace,
                 imageIds,
                 expectedImageId,
+                expectedImageIds,
                 checkoutCompleted,
               }
             : undefined;
@@ -3661,7 +3727,9 @@ export class GraphRunnerService implements OnModuleInit {
                 'SKIPPED',
                 '同次运行存在状态未确认的动作，停止派发后续任务。',
               );
-            } else if (!busy && !ready.length) {
+            } else if ((!busy && !ready.length) ||
+              (stage === 'ACTION' && ready.every((entry) => entry.stage === 'ACTION') &&
+                disjointBuild(node, [...busyActions, ...ready.map(({ action }) => action)]))) {
               ready.push({
                 node: row,
                 action: node,
@@ -4675,13 +4743,18 @@ export class GraphRunnerService implements OnModuleInit {
     const db = this.database.db;
     const query = db
       .selectFrom('execution_flow_runs')
-      .select('id')
+      .select(['id', 'created_at'])
       .where('status', 'in', activeFlowStatuses);
-    const rows = await (this.cursor ? query.where('id', '>', this.cursor) : query)
+    const cursor = this.cursor;
+    const rows = await (cursor ? query.where((eb) => eb.or([
+      eb('created_at', '>', cursor.created_at),
+      eb.and([eb('created_at', '=', cursor.created_at), eb('id', '>', cursor.id)]),
+    ])) : query)
+      .orderBy('created_at')
       .orderBy('id')
       .limit(50)
       .execute();
-    this.cursor = rows.length === 50 ? rows.at(-1)!.id : undefined;
+    this.cursor = rows.length === 50 ? rows.at(-1) : undefined;
     for (const { id } of rows) {
       try {
         await this.advance(id);
@@ -5128,6 +5201,7 @@ export class GraphRunnerService implements OnModuleInit {
           contentPath: simplified.release.path === '.' ? undefined : simplified.release.path,
           method: simplified.release.method,
           image: simplified.release.image,
+          images: simplified.release.images,
         },
         workspacePath: row.workspacePath,
         artifacts: snapshots.map((artifact) => ({

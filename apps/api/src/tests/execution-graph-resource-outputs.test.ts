@@ -9,6 +9,7 @@ import test from 'node:test';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import { flowTarget } from './helpers/flow-target';
 
 test('FLOW_V2 exposes node and task logs and validates artifact ownership', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'veyops-graph-output-'));
@@ -24,7 +25,8 @@ test('FLOW_V2 exposes node and task logs and validates artifact ownership', asyn
   });
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
-  const { BuildsService } = await import('../modules/builds/builds.service.js');
+  const { FlowWorkspaceService } =
+    await import('../modules/execution-graphs/flow-workspace.service.js');
   const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
   const app = (
     await Test.createTestingModule({ imports: [AppModule] }).compile()
@@ -58,15 +60,16 @@ test('FLOW_V2 exposes node and task logs and validates artifact ownership', asyn
     const otherId = await create('/projects', 'foreign-outputs');
     const serviceId = await create(`/projects/${projectId}/services`, 'valid-service');
     const foreignServiceId = await create(`/projects/${otherId}/services`, 'other-service');
-
-    app.get(BuildsService).managerFlowCommand = async (
-      { context },
-      _workspace,
-      _command,
-      _directory,
-      variables,
-    ) => {
-      assert.equal(variables.VEYOPS_SERVICE_ID, serviceId);
+    const serverId = await flowTarget(api);
+    const workspace = app.get(FlowWorkspaceService);
+    workspace.open = async (runId, placement) => ({
+      runId,
+      placement,
+      path: '/tmp/fixture/' + runId,
+    });
+    workspace.cleanup = async () => undefined;
+    workspace.command = async (_workspace, options, context) => {
+      assert.equal(options.variables?.values.VEYOPS_SERVICE_ID, serviceId);
       context.log('自动采集的脚本日志');
       return { exitCode: 0, stdout: '', stderr: '' };
     };
@@ -86,7 +89,7 @@ test('FLOW_V2 exposes node and task logs and validates artifact ownership', asyn
                   id: 'start',
                   name: '开始',
                   type: 'START',
-                  start: { execution: { location: 'MANAGER' }, release: { serviceId } },
+                  start: { execution: { serverId }, release: { serviceId } },
                 },
                 {
                   id: 'legacy-log',

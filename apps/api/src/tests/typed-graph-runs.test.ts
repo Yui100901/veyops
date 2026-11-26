@@ -9,6 +9,7 @@ import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
+import { flowTarget } from './helpers/flow-target';
 
 async function checkTypedRuns(url?: string) {
   const data = await mkdtemp(join(tmpdir(), 'veyops-typed-flow-'));
@@ -50,6 +51,7 @@ async function checkTypedRuns(url?: string) {
       .send({ currentPassword: initial, newPassword: password })
       .expect(200);
     await post('/auth/login', { username: 'root', password });
+    const serverId = await flowTarget(api);
     const project = await post('/projects', { name: 'Typed flow', slug: 'typed-flow' });
     const graph = `/projects/${project.id}/execution-graph`;
     const definition = {
@@ -60,7 +62,10 @@ async function checkTypedRuns(url?: string) {
             id: 'start',
             name: 'Choose a route',
             type: 'START',
-            start: { variables: [{ key: 'REF', value: 'manual', allowOverride: true }] },
+            start: {
+              execution: { serverId },
+              variables: [{ key: 'REF', value: 'manual', allowOverride: true }],
+            },
           },
           {
             id: 'check',

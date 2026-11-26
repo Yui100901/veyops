@@ -17,6 +17,7 @@ import { AuditService } from '../audit/audit.service';
 export interface SystemSettings {
   defaultBuildLocation: 'TARGET' | 'MANAGER';
   defaultMaxParallelTargets: number;
+  maxConcurrentFlowsPerServer: number;
   logRetentionDays: number;
   targetWorkspaceRoot: string;
 }
@@ -25,6 +26,7 @@ const settingsKey = 'system:execution-defaults';
 const defaults: SystemSettings = {
   defaultBuildLocation: 'TARGET',
   defaultMaxParallelTargets: 3,
+  maxConcurrentFlowsPerServer: 3,
   logRetentionDays: 0,
   targetWorkspaceRoot: '~/.veyops/workspace',
 };
@@ -39,6 +41,12 @@ export class UpdateSystemSettingsDto implements Partial<SystemSettings> {
   @Min(1)
   @Max(10)
   defaultMaxParallelTargets?: number;
+
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsInt()
+  @Min(1)
+  @Max(10)
+  maxConcurrentFlowsPerServer?: number;
 
   @ValidateIf((_object, value) => value !== undefined)
   @IsInt()
@@ -147,7 +155,11 @@ export class SystemSettingsService {
     return this.resolve(projectId);
   }
 
-  private async save(input: UpdateProjectSettingsDto, userId: string, projectId?: string) {
+  private async save(
+    input: UpdateProjectSettingsDto & { maxConcurrentFlowsPerServer?: number },
+    userId: string,
+    projectId?: string,
+  ) {
     const key = projectId ? projectKey(projectId) : settingsKey;
     if (input.targetWorkspaceRoot != null) validateWorkspaceRoot(input.targetWorkspaceRoot);
     await this.database.db.transaction().execute(async (tx) => {

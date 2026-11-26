@@ -167,16 +167,13 @@ async function checkResources(databaseUrl?: string) {
                   id: 'start',
                   type: 'START',
                   name: '目标选择',
-                  ...(withRelease && {
-                    start: {
+                  start: {
+                    execution: { serverId: server.id },
+                    ...(withRelease && {
                       environmentSetId: environmentSet.id,
-                      execution: { location: 'MANAGER' },
-                      release: {
-                        targets: { groupIds: [group.id] },
-                        serviceId: service.id,
-                      },
-                    },
-                  }),
+                      release: { serviceId: service.id },
+                    }),
+                  },
                 },
                 ...actions,
                 { id: 'end', type: 'END', name: '完成' },
@@ -201,13 +198,13 @@ async function checkResources(databaseUrl?: string) {
       return published.publishedVersion as number;
     };
     const resourceVersion = await publishResourceReferences(true);
-    const blockedGroup = await api.delete(base + '/server-groups/' + group.id).expect(409);
+    const blockedServer = await api.delete(base + '/servers/' + server.id).expect(409);
     assert.ok(
-      blockedGroup.body.error.references.some(
+      blockedServer.body.error.references.some(
         (ref: { sourceKind: string; state: string; fieldId: string }) =>
           ref.sourceKind === 'GRAPH' &&
           ref.state === 'RUNNABLE' &&
-          ref.fieldId === 'start.release.targets',
+          ref.fieldId === 'start.execution.serverId',
       ),
     );
     const graphInventory = await fetch(root + '/resource-references');

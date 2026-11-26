@@ -1,7 +1,6 @@
 import {
   BadRequestException,
   ConflictException,
-  HttpException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -10,18 +9,17 @@ import type { Kysely, Selectable, Transaction } from 'kysely';
 import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
-import { selectedServerIds } from '../deployment-targets/deployment-selection';
 import { lockProjectGraph, requireProject } from '../projects/project-guards';
 import { graphResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
-import { SystemSettingsService } from '../system/system-settings.service';
 import { canvasIssues, compileCanvas, withDraftCanvas } from './execution-graph-canvas';
 import { type GraphDefinition, type SaveGraphDraftDto } from './execution-graph-definition';
 import { GraphCompileError, type GraphDiagnostic } from './graph-fields';
 import { expandGraphTemplate, type ExpandGraphTemplateDto } from './graph-flow-templates';
 import { GraphTriggersService } from './graph-triggers.service';
 import {
-  simplifiedUsesWorkspace,
+  type HistoricalSimplifiedExecution,
+  type HistoricalSimplifiedRelease,
   validateSimplifiedSourceDirectories,
 } from './simplified-flow-definition';
 
@@ -36,7 +34,7 @@ function readStoredDraft(json: string) {
       ...(definition.canvas.templates ?? []),
       ...definition.flows.flatMap(({ nodes }) => nodes),
     ];
-    for (const { id, name, start, finish } of nodes) {
+    for (const { id, name, start, finish, build } of nodes) {
       const remove = (value: object, keys: string[], fieldId: string) => {
         for (const key of keys) {
           if (!Object.hasOwn(value, key)) continue;
@@ -46,17 +44,32 @@ function readStoredDraft(json: string) {
             nodeId: id,
             fieldId,
             fieldSection: 'execution',
-            message: `「${name}」的旧入口配置需要复核。请核对检出目录、发布目标和启动命令后保存草稿`,
+            message: `「${name}」的旧入口配置需要复核。请选择本流程唯一的执行服务器并保存草稿`,
           };
         }
       };
-      if (start?.release) {
-        Reflect.deleteProperty(start.release, 'deployPath');
-        remove(start.release, ['reuseExecutionServer', 'contentPath'], 'start.release');
-      }
-      for (const source of start?.sources ?? [])
-        remove(source, ['parentDirectory', 'allowRefOverride'], 'start.sources');
       if (finish) Reflect.deleteProperty(finish, 'excludePaths');
+      if (build) remove(build, ['buildImage'], 'build.buildImage');
+      if (!start) continue;
+      const legacyExecution = start.execution as HistoricalSimplifiedExecution | undefined;
+      const legacyRelease = start.release as HistoricalSimplifiedRelease | undefined;
+      const previousTargets = legacyRelease?.targets;
+      if (
+        !legacyExecution?.serverId &&
+        !legacyExecution?.groupId &&
+        legacyExecution?.location !== 'MANAGER' &&
+        previousTargets?.serverIds?.length === 1 &&
+        !previousTargets.groupIds?.length
+      )
+        start.execution = { ...legacyExecution, serverId: previousTargets.serverIds[0] };
+      if (start.execution)
+        remove(start.execution, ['location', 'groupId'], 'start.execution.serverId');
+      if (start.release) {
+        Reflect.deleteProperty(start.release, 'deployPath');
+        remove(start.release, ['targets', 'reuseExecutionServer', 'contentPath'], 'start.release');
+      }
+      for (const source of start.sources ?? [])
+        remove(source, ['parentDirectory', 'allowRefOverride'], 'start.sources');
     }
   }
   return { definition, review };
@@ -91,7 +104,6 @@ export class ExecutionGraphsService {
     private readonly database: DatabaseService,
     private readonly audit: AuditService,
     private readonly triggers: GraphTriggersService,
-    private readonly settings: SystemSettingsService,
   ) {}
 
   private async graph(projectId: string, db = this.database.db) {
@@ -143,45 +155,28 @@ export class ExecutionGraphsService {
     definition: GraphDefinition,
   ) {
     const simplifiedFlows = definition.flows.filter(({ model }) => model === 'FLOW_V2');
-    const inherited = await this.settings.get(projectId, tx);
     for (const flow of simplifiedFlows) {
       const start = flow.nodes.find(({ type }) => type === 'START')!;
-      const execution = start.start?.execution;
-      if (
-        !simplifiedUsesWorkspace(flow.nodes) ||
-        (execution?.location && execution.location !== 'INHERIT'
-          ? execution.location
-          : inherited.defaultBuildLocation) !== 'TARGET'
-      )
-        continue;
-      try {
-        if (!execution?.serverId && !execution?.groupId)
-          throw new BadRequestException('目标端工作区需要选择一台执行服务器或一个分组');
-        const ids = await selectedServerIds(tx, {
-          serverIds: execution.serverId ? [execution.serverId] : [],
-          groupIds: execution.groupId ? [execution.groupId] : [],
-        });
-        if (ids.length !== 1) throw new BadRequestException('执行分组必须解析为一台可用服务器');
-        const ready = await tx
+      const serverId = start.start?.execution?.serverId;
+      const ready =
+        serverId &&
+        (await tx
           .selectFrom('servers as server')
           .innerJoin('credentials as ssh', 'ssh.id', 'server.credential_id')
           .select('server.host_key_fingerprint as fingerprint')
-          .where('server.id', '=', ids[0]!)
+          .where('server.id', '=', serverId)
+          .where('server.is_active', '=', 1)
           .where('ssh.status', '=', 'ACTIVE')
           .where('ssh.type', 'in', ['SSH_PASSWORD', 'SSH_KEY'])
-          .executeTakeFirst();
-        if (!ready?.fingerprint)
-          throw new BadRequestException('执行服务器需要有效的 SSH 凭据和已确认的主机指纹');
-      } catch (error) {
-        if (!(error instanceof HttpException)) throw error;
+          .executeTakeFirst());
+      if (!ready || !ready.fingerprint)
         throw new GraphCompileError({
           flowId: flow.id,
           nodeId: start.id,
-          fieldId: 'start.execution',
+          fieldId: 'start.execution.serverId',
           fieldSection: 'execution',
-          message: `「${start.name}」 · ${error.message}`,
+          message: `「${start.name}」 · 执行服务器需要有效的 SSH 凭据和已确认的主机指纹`,
         });
-      }
     }
     const reference = await unavailableReference(
       tx,

@@ -894,14 +894,11 @@ export class RepositoryMetadataService {
     };
   }
 
-  private async withRepository<T>(
+  async requireRepositoryAccess(
     projectId: string,
     repositoryId: string,
-    callback: (repository: GitRepository) => Promise<T>,
     expected?: RepositoryAccess,
-    timeoutMs = 25_000,
-    cancellation?: AbortSignal,
-  ): Promise<T> {
+  ) {
     const repository = await this.database.db
       .selectFrom('repositories')
       .innerJoin('projects', 'projects.id', 'repositories.project_id')
@@ -918,7 +915,19 @@ export class RepositoryMetadataService {
         expected.credential_id !== repository.credential_id)
     )
       throw new ConflictException('源码节点的仓库配置已变化，请重新预览');
-    const url = httpCloneUrl(repository.clone_url);
+    return { ...repository, url: httpCloneUrl(repository.clone_url) };
+  }
+
+  private async withRepository<T>(
+    projectId: string,
+    repositoryId: string,
+    callback: (repository: GitRepository) => Promise<T>,
+    expected?: RepositoryAccess,
+    timeoutMs = 25_000,
+    cancellation?: AbortSignal,
+  ): Promise<T> {
+    const repository = await this.requireRepositoryAccess(projectId, repositoryId, expected);
+    const url = repository.url;
     const workspace = await mkdtemp(join(tmpdir(), 'veyops-git-'));
     try {
       const options = [

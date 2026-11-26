@@ -10,6 +10,8 @@ import { unversionedArtifactRepository } from '../execution-graphs/graph-workspa
 import {
   isSimplifiedCanvasNode,
   simplifiedTriggerArtifactInput,
+  type HistoricalSimplifiedExecution,
+  type HistoricalSimplifiedRelease,
 } from '../execution-graphs/simplified-flow-definition';
 
 export const projectResourceTypes = [
@@ -294,6 +296,8 @@ function flowReferences(source: ReferenceSource, flow: GraphFlow, flows: Map<str
 
 function simplifiedNodeReferences(source: ReferenceSource, node: GraphNode) {
   const config = node.start;
+  const execution = config?.execution as HistoricalSimplifiedExecution | undefined;
+  const oldRelease = config?.release as HistoricalSimplifiedRelease | undefined;
   const context = {
     ...source,
     nodeId: node.id,
@@ -305,26 +309,18 @@ function simplifiedNodeReferences(source: ReferenceSource, node: GraphNode) {
     ...(config?.sources ?? []).flatMap(({ id, repositoryId }) =>
       referenceRows(field('start.sources.' + id + '.repositoryId'), 'REPOSITORY', repositoryId),
     ),
-    ...(config?.execution?.location === 'MANAGER'
+    ...(execution?.location === 'MANAGER'
       ? []
       : [
-          ...referenceRows(
-            field('start.execution.serverId'),
-            'SERVER',
-            config?.execution?.serverId,
-          ),
-          ...referenceRows(
-            field('start.execution.groupId'),
-            'SERVER_GROUP',
-            config?.execution?.groupId,
-          ),
+          ...referenceRows(field('start.execution.serverId'), 'SERVER', execution?.serverId),
+          ...referenceRows(field('start.execution.groupId'), 'SERVER_GROUP', execution?.groupId),
         ]),
     ...referenceRows(field('start.environmentSetId'), 'ENVIRONMENT_SET', config?.environmentSetId),
     ...(config?.variables ?? []).flatMap(({ key, credentialId }) =>
       referenceRows(field('start.variables.' + key + '.credentialId'), 'CREDENTIAL', credentialId),
     ),
     ...referenceRows(field('start.release.serviceId'), 'SERVICE', config?.release?.serviceId),
-    ...selectionReferences(field('start.release.targets'), config?.release?.targets),
+    ...selectionReferences(field('start.release.targets'), oldRelease?.targets),
     ...referenceRows(field('start.release.artifactId'), 'ARTIFACT', config?.release?.artifactId),
     ...(node.finish?.images ?? []).flatMap(({ registryId }, index) =>
       referenceRows(field(`finish.images.${index}.registryId`), 'REGISTRY', registryId),

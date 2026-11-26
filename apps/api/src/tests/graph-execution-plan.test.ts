@@ -26,7 +26,6 @@ async function checkPlan(t: TestContext, url?: string) {
   });
   const { AppModule } = await import('../app.module.js');
   const { configureApp } = await import('../bootstrap.js');
-  const { BuildsService } = await import('../modules/builds/builds.service.js');
   const { GraphRunnerService } =
     await import('../modules/execution-graphs/graph-runner.service.js');
   const { PipelinesService } = await import('../modules/pipelines/pipelines.service.js');
@@ -134,10 +133,7 @@ async function checkPlan(t: TestContext, url?: string) {
     const draft = (await api.get(base + path).expect(200)).body.data;
     const flow = (id: string) => path + '/flows/' + id;
     const source = { id: 'main', repositoryId: repo.id, ref: { kind: 'COMMIT', value: pin } };
-    const release = {
-      serviceId: service.id,
-      targets: { groupIds: [group.id] },
-    };
+    const release = { serviceId: service.id };
     const makeFlow = (id: string, start: object, managed = false) => {
       const nodes = [
         { id, name: id, type: 'START', start },
@@ -167,7 +163,7 @@ async function checkPlan(t: TestContext, url?: string) {
         endpoint: { startId: id, endId: id + '-end' },
       };
     };
-    const managed = { sources: [source], execution: { location: 'MANAGER' }, release };
+    const managed = { sources: [source], execution: { serverId: first.id }, release };
     const builds = [
       makeFlow('fresh', {
         sources: [
@@ -178,7 +174,7 @@ async function checkPlan(t: TestContext, url?: string) {
             ref: { kind: 'BRANCH', value: 'main' },
           },
         ],
-        execution: { location: 'MANAGER' },
+        execution: { serverId: first.id },
         environmentSetId: env.id,
         dotenv: { sourceId: 'main', path: '.env.test' },
       }),
@@ -186,7 +182,7 @@ async function checkPlan(t: TestContext, url?: string) {
       makeFlow('sensitive', { ...managed, environmentSetId: env.id }, true),
       makeFlow('target', {
         sources: [source],
-        execution: { location: 'TARGET', serverId: second.id },
+        execution: { serverId: second.id },
       }),
     ];
     const response = await api
@@ -209,8 +205,8 @@ async function checkPlan(t: TestContext, url?: string) {
     });
     const args = { version };
     const fresh = await create(flow('fresh') + '/preview', args);
-    assert.equal(snapshots.mock.callCount(), 0);
-    assert.equal(fresh.simplified.location, 'MANAGER');
+    assert.equal(snapshots.mock.callCount(), 1);
+    assert.equal(fresh.simplified.location, 'TARGET');
     assert.deepEqual(
       fresh.checkouts.map(({ directory, commitSha }: { directory: string; commitSha: string }) => [
         directory,
@@ -239,7 +235,7 @@ async function checkPlan(t: TestContext, url?: string) {
       releasePlans.mock.calls[0]?.arguments[2]?.definition.deployPath,
       `~/.veyops/workspace/${project.slug}/.deployments/${service.id}`,
     );
-    assert.equal(preview.simplified.location, 'MANAGER');
+    assert.equal(preview.simplified.location, 'TARGET');
     assert.deepEqual(preview.simplified.release.serverIds, [first.id]);
     assert.equal(Object.hasOwn(preview.simplified.release, 'contentPath'), false);
     assert.equal(Object.hasOwn(preview.simplified.release, 'deployPath'), false);
@@ -254,40 +250,31 @@ async function checkPlan(t: TestContext, url?: string) {
         /API 尚未放行/,
       );
       process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = 'API';
-      const isolated = t.mock.method(
-        BuildsService,
-        'automaticManagerSocket',
-        async () => '/run/user/1000/fixture-docker.sock',
+      await assert.rejects(
+        runner.preview(project.id, 'combined', args, { automation }),
+        /缺少有效的自动执行授权/,
       );
-      try {
-        await assert.rejects(
-          runner.preview(project.id, 'sensitive', args, { automation }),
-          (error: unknown) =>
-            error instanceof ExecutionPlanIssueError &&
-            error.issue.fieldId === 'variables' &&
-            /敏感变量/.test(error.message),
-        );
-        await assert.rejects(
-          runner.preview(project.id, 'combined', args, { automation }),
-          /缺少有效的自动执行授权/,
-        );
-        await api
-          .patch(base + '/servers/' + first.id + '/automatic-execution')
-          .send({ enabled: true })
-          .expect(200);
-        const automatic = await runner.preview(project.id, 'combined', args, { automation });
-        assert.ok(
-          automatic.gates.some(
-            ({ nodeId, kind, releaseNodeId }) =>
-              nodeId === 'combined-approval' &&
-              kind === 'APPROVAL' &&
-              releaseNodeId === 'combined-release',
-          ),
-        );
-        assert.deepEqual(automatic.deliveries[0]!.serverIds, [first.id]);
-      } finally {
-        isolated.mock.restore();
-      }
+      await api
+        .patch(base + '/servers/' + first.id + '/automatic-execution')
+        .send({ enabled: true })
+        .expect(200);
+      await assert.rejects(
+        runner.preview(project.id, 'sensitive', args, { automation }),
+        (error: unknown) =>
+          error instanceof ExecutionPlanIssueError &&
+          error.issue.fieldId === 'variables' &&
+          /敏感变量/.test(error.message),
+      );
+      const automatic = await runner.preview(project.id, 'combined', args, { automation });
+      assert.ok(
+        automatic.gates.some(
+          ({ nodeId, kind, releaseNodeId }) =>
+            nodeId === 'combined-approval' &&
+            kind === 'APPROVAL' &&
+            releaseNodeId === 'combined-release',
+        ),
+      );
+      assert.deepEqual(automatic.deliveries[0]!.serverIds, [first.id]);
     } finally {
       if (previous === undefined) delete process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS;
       else process.env.VEYOPS_AUTO_DELIVERY_TRIGGERS = previous;
@@ -304,10 +291,10 @@ async function checkPlan(t: TestContext, url?: string) {
       .patch(base + '/server-groups/' + group.id)
       .send({ name: 'Release', serverIds: [first.id, second.id] })
       .expect(200);
-    await run(combined, preview).expect(409);
     const changed = await create(combined + '/preview', args);
-    assert.deepEqual(new Set(changed.simplified.release.serverIds), new Set([first.id, second.id]));
-    assert.notEqual(changed.configurationHash, preview.configurationHash);
+    assert.deepEqual(changed.simplified.release.serverIds, [first.id]);
+    assert.equal(changed.configurationHash, preview.configurationHash);
+    await run(combined, preview).expect(201);
 
     alternatePin = 'c'.repeat(40);
     await run(flow('fresh'), fresh).expect(409);
@@ -322,10 +309,10 @@ async function checkPlan(t: TestContext, url?: string) {
   }
 }
 
-test('SQLite graph plan separates build and release and rejects stale target membership', (t) =>
+test('SQLite graph plan pins build and release to one server and rejects stale commits', (t) =>
   checkPlan(t));
 test(
-  'PostgreSQL graph plan separates build and release and rejects stale target membership',
+  'PostgreSQL graph plan pins build and release to one server and rejects stale commits',
   { skip: !process.env.VEYOPS_TEST_POSTGRES_URL },
   (t) => withIsolatedPostgres(process.env.VEYOPS_TEST_POSTGRES_URL!, (url) => checkPlan(t, url)),
 );

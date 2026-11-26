@@ -12,6 +12,7 @@ import request from 'supertest';
 import { initialGraphDraft } from '../core/database/execution-graphs-migration';
 import type { GraphCanvas } from '../modules/execution-graphs/execution-graph-definition';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
+import { flowTarget } from './helpers/flow-target';
 
 const choice = { variables: [{ key: 'CHOICE', value: 'ordinary', allowOverride: true }] };
 const parameters = (value: string) => ({ 'var:CHOICE': value });
@@ -170,6 +171,15 @@ async function checkGraph(url?: string) {
       .post(root + '/auth/login')
       .send({ username: 'root', password })
       .expect(201);
+    const serverId = await flowTarget(api);
+    const withTarget = (draft: GraphCanvas): GraphCanvas => ({
+      ...draft,
+      nodes: draft.nodes.map((node) =>
+        node.type === 'START'
+          ? { ...node, start: { ...node.start, execution: { serverId } } }
+          : node,
+      ),
+    });
     const project = async (slug: string) =>
       (
         await api
@@ -193,7 +203,7 @@ async function checkGraph(url?: string) {
     const canvas: GraphCanvas = {
       model: 'FLOW_V2',
       nodes: [
-        { id: 'start', type: 'START', name: '构建' },
+        { id: 'start', type: 'START', name: '构建', start: { execution: { serverId } } },
         {
           id: 'build',
           type: 'FUNCTION',
@@ -288,7 +298,7 @@ async function checkGraph(url?: string) {
         .put(otherPath + '/draft')
         .send({
           expectedRevision: otherGraph.revision,
-          definition: { canvas: dagCanvas },
+          definition: { canvas: withTarget(dagCanvas) },
         })
         .expect(200)
     ).body.data;
@@ -311,7 +321,7 @@ async function checkGraph(url?: string) {
       const draft = (
         await api
           .put(plainPath + '/draft')
-          .send({ expectedRevision: revision, definition: { canvas } })
+          .send({ expectedRevision: revision, definition: { canvas: withTarget(canvas) } })
           .expect(200)
       ).body.data;
       const { publishedVersion } = (
@@ -446,7 +456,7 @@ async function checkGraph(url?: string) {
     );
     const unsupportedCall = await api
       .post(otherPath + '/validate')
-      .send({ definition: { canvas: invalidCall } })
+      .send({ definition: { canvas: withTarget(invalidCall) } })
       .expect(201);
     assert.ok(
       unsupportedCall.body.data.issues.some((issue: { nodeId: string }) => issue.nodeId === 'call'),
@@ -461,7 +471,7 @@ async function checkGraph(url?: string) {
       canvas: {
         model: 'FLOW_V2',
         nodes: [
-          { id: flowId, type: 'START', name: '核对项目' },
+          { id: flowId, type: 'START', name: '核对项目', start: { execution: { serverId } } },
           { id: 'report', type: 'LOG', name: '记录结果', message },
           { id: 'end', type: 'END', name: '完成' },
         ],
@@ -640,7 +650,7 @@ async function checkGraph(url?: string) {
     const savedAdvanced = (
       await api
         .put(advancedPath + '/draft')
-        .send({ expectedRevision: 1, definition: { canvas: advancedCanvas } })
+        .send({ expectedRevision: 1, definition: { canvas: withTarget(advancedCanvas) } })
         .expect(200)
     ).body.data;
     await api

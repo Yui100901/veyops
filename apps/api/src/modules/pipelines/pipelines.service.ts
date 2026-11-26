@@ -490,7 +490,7 @@ export class PipelinesService implements OnModuleInit {
     ) as PipelineDefinition;
     let graphDeployment: PipelineSnapshot['graphDeployment'];
     if (profile?.delivery && fromArtifact) {
-      const { method, composeSource, artifactPath } = profile.delivery;
+      const { method, composeSource, artifactPath, imageBindings } = profile.delivery;
       definition.deployPath = normalizeReleasePath(definition.deployPath);
       if (
         !isProjectReleasePath(definition.deployPath) &&
@@ -508,6 +508,7 @@ export class PipelinesService implements OnModuleInit {
       graphDeployment = {
         method,
         ...(artifactPath && { artifactPath: relativePath(artifactPath) }),
+        ...(imageBindings && { imageBindings }),
       };
       if (method === 'COMPOSE')
         graphDeployment.composeProject = graphComposeProject({ ...pipeline, definition });
@@ -1311,6 +1312,7 @@ export class PipelinesService implements OnModuleInit {
     serviceId: string,
     environmentId: string,
     artifactIds: string[],
+    imageBindings?: Record<string, string>,
   ) {
     const issue: Omit<ExecutionPlanIssue, 'message'> = {
       code: 'ARTIFACT',
@@ -1347,13 +1349,15 @@ export class PipelinesService implements OnModuleInit {
         (candidate) =>
           candidate.id !== row.id ||
           candidate.artifact_type !== row.artifact_type ||
-          candidate.artifact_name !== row.artifact_name,
+          (!imageBindings && candidate.artifact_name !== row.artifact_name),
       )
     )
       throw executionIssue(
         new BadRequestException('请选择该服务和环境下同一次成功构建的产物'),
         issue,
       );
+    if (imageBindings && !this.matchesImageBindings(rows, imageBindings))
+      throw executionIssue(new BadRequestException('请选择同次构建完整的 Compose 镜像组'), issue);
     const build = (JSON.parse(row.payload_json) as TaskPayload).pipeline;
     if (!build || build.mode === 'DEPLOY_ARTIFACT')
       throw executionIssue(new BadRequestException('产物没有可用的构建记录'), issue);
@@ -1365,6 +1369,24 @@ export class PipelinesService implements OnModuleInit {
       },
       commitSha: row.commit_sha,
     };
+  }
+
+  private matchesImageBindings(
+    rows: { artifact_type: string; artifact_name: string | null }[],
+    bindings: Record<string, string>,
+  ) {
+    const entries = Object.entries(bindings);
+    const names = new Set(rows.map(({ artifact_name }) => artifact_name));
+    return (
+      entries.length > 1 &&
+      entries.length === rows.length &&
+      names.size === entries.length &&
+      rows.every(({ artifact_type }) => artifact_type === 'DOCKER_IMAGE') &&
+      new Set(entries.map(([, name]) => name)).size === entries.length &&
+      entries.every(
+        ([variable, name]) => /^VEYOPS_IMAGE_[A-Z0-9_]+$/.test(variable) && names.has(name),
+      )
+    );
   }
 
   async deliveryArtifactCandidates(projectId: string, serviceId: string, environmentId: string) {
@@ -1489,18 +1511,21 @@ export class PipelinesService implements OnModuleInit {
       : query.where('pipeline_runs.pipeline_id', '=', id);
     const rows = await scoped.orderBy('artifacts.id').execute();
     const source = rows[0];
+    const imageBindings = profile?.delivery?.imageBindings;
     if (
       !source ||
       rows.length !== artifactIds.length ||
       rows.some(
         (row) =>
           row.run_id !== source.run_id ||
-          row.artifact_name !== source.artifact_name ||
+          (!imageBindings && row.artifact_name !== source.artifact_name) ||
           row.artifact_kind !== source.artifact_kind ||
           (row.artifact_commit !== null && row.artifact_commit !== source.commit_sha),
       )
     )
       throw artifactIssue(new BadRequestException('产物必须来自相同服务和环境的一次构建'));
+    if (imageBindings && !this.matchesImageBindings(rows, imageBindings))
+      throw artifactIssue(new BadRequestException('请选择同次构建完整的 Compose 镜像组'));
     if (source.status !== 'SUCCESS' && source.status !== 'PARTIAL_FAILED')
       throw artifactIssue(new ConflictException('来源任务没有可发布的成功构建'));
     const serverIds = rows.flatMap((row) => (row.server_id ? [row.server_id] : []));
@@ -1604,7 +1629,16 @@ export class PipelinesService implements OnModuleInit {
     ) {
       references = [{ ...references[0], serverId: null, sourceServerId: references[0].serverId }];
     }
-    if (!this.artifactsMatchTargets(references, targets))
+    if (imageBindings) {
+      if (targets.length !== 1 || references.some(({ serverId }) => serverId !== targets[0]))
+        throw artifactIssue(
+          new BadRequestException('Compose 镜像组必须与本次执行使用同一台服务器'),
+        );
+      references = references.map((reference) => ({
+        ...reference,
+        name: rows.find(({ id }) => id === reference.id)!.artifact_name ?? undefined,
+      }));
+    } else if (!this.artifactsMatchTargets(references, targets))
       throw artifactIssue(new BadRequestException('目标端构建产物须与所选部署目标逐一匹配'));
     if (profile?.delivery?.rollback)
       await graphRollbackBaselines(

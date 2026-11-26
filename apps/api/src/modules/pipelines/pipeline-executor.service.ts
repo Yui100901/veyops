@@ -88,9 +88,13 @@ type ComposeRelease = {
   docker: string;
   image: string;
   imageId?: string;
+  images?: NonNullable<ComposeReleaseEvidence['images']>;
   template?: ComposeTemplateReference;
   composeProject?: string;
   dockerEngineId?: string;
+};
+type ComposeDeploymentArtifact = DeploymentArtifact & {
+  pins?: Record<string, DeploymentArtifact>;
 };
 type RollbackCandidate = {
   artifactId: string;
@@ -287,7 +291,7 @@ export class PipelineExecutor {
         return;
       }
     }
-    const deploymentInputs = new Map<string, DeploymentArtifact>();
+    const deploymentInputs = new Map<string, ComposeDeploymentArtifact>();
     const preparingTargets = new Map<string, string>();
     if (deployArtifact) {
       context.log('校验已归档的部署产物\n');
@@ -297,8 +301,7 @@ export class PipelineExecutor {
           if (context.signal.aborted) return;
           if (trackedPreparation && !shared)
             preparingTargets.set(target.id, await context.startTarget(target.id));
-          const artifact =
-            shared ?? (await this.artifacts.forDeployment(snapshot, target.id, target));
+          const artifact = shared ?? (await this.deploymentInput(snapshot, target));
           deploymentInputs.set(target.id, artifact);
           if (
             snapshot.deploymentArtifacts?.length === 1 &&
@@ -1357,12 +1360,27 @@ fi
   private async activateComposeRelease(
     target: SshTarget,
     session: BuildSession,
-    { compose, docker, image, imageId, template, composeProject, dockerEngineId }: ComposeRelease,
+    {
+      compose,
+      docker,
+      image,
+      imageId,
+      images,
+      template,
+      composeProject,
+      dockerEngineId,
+    }: ComposeRelease,
   ) {
     const engineGuard = dockerEngineId
       ? `test "$(${docker} info --format '{{.ID}}')" = ${q(dockerEngineId)}\n`
       : '';
-    const action = `set -eu\n${engineGuard}${compose} up -d --no-build${imageId ? ' --pull never' : ''}\n${verifyComposeImage(compose, docker, image, imageId)}\n${this.switchRelease(session)}`;
+    const verify = images
+      ? [...images]
+          .reverse()
+          .map((entry) => verifyComposeImage(compose, docker, entry.imageReference, entry.imageId))
+          .join('\n')
+      : verifyComposeImage(compose, docker, image, imageId);
+    const action = `set -eu\n${engineGuard}${compose} up -d --no-build${imageId ? ' --pull never' : ''}\n${verify}\n${this.switchRelease(session)}`;
     const failure = 'Compose 发布激活失败。请检查宿主机端口占用、Compose 容器状态和当前版本链接';
     if (!template) {
       await this.builds.remote(target, action, session, 600, failure);
@@ -1377,7 +1395,43 @@ fi
     );
     const verified = /^VEYOPS_COMPOSE_IMAGE_ID=(sha256:[a-f0-9]{64})\s*$/m.exec(output)?.[1];
     if (!verified) throw new Error('Compose 激活未返回已验证的镜像 ID');
-    return { template, imageReference: image, imageId: verified, composeProject, dockerEngineId };
+    return {
+      template,
+      imageReference: image,
+      imageId: verified,
+      images,
+      composeProject,
+      dockerEngineId,
+    };
+  }
+
+  private async deploymentInput(
+    snapshot: PipelineSnapshot,
+    target: SshTarget,
+  ): Promise<ComposeDeploymentArtifact> {
+    const bindings = snapshot.graphDeployment?.imageBindings;
+    if (!bindings) return this.artifacts.forDeployment(snapshot, target.id, target);
+    const pins: Record<string, DeploymentArtifact> = {};
+    for (const [variable, name] of Object.entries(bindings)) {
+      const reference = snapshot.deploymentArtifacts?.find((entry) => entry.name === name);
+      if (!reference || reference.serverId !== target.id)
+        throw new ConflictException('Compose 缺少同一执行服务器上的固定镜像');
+      const artifact = await this.artifacts.forDeployment(
+        { ...snapshot, deploymentArtifacts: [reference] },
+        target.id,
+        target,
+      );
+      if (
+        !artifact.imageId ||
+        !artifact.imageReference ||
+        artifact.physical?.location !== 'DOCKER_ENGINE'
+      )
+        throw new ConflictException('Compose 镜像组只接受已验证的目标端 Docker 镜像');
+      pins[variable] = artifact;
+    }
+    const first = Object.values(pins)[0];
+    if (!first) throw new ConflictException('Compose 镜像组为空');
+    return { ...first, pins };
   }
   private async targetImage(target: SshTarget, work: string, session: BuildSession) {
     const d = session.snapshot.definition;
@@ -1411,7 +1465,7 @@ fi
     image: string,
     session: BuildSession,
     manager?: BuildOutput,
-    artifact?: DeploymentArtifact,
+    artifact?: ComposeDeploymentArtifact,
     activeDockerEngineId?: string,
   ) {
     if (!artifact?.imageId && !/^[a-zA-Z0-9._:/-]+@sha256:[a-f0-9]{64}$/.test(image))
@@ -1500,7 +1554,12 @@ fi
     }
 
     const configure = async (reference: string) => {
-      const env = serializeComposeEnvironment({ ...session.variables, VEYOPS_IMAGE: reference });
+      const pins = Object.entries(artifact?.pins ?? {});
+      const env = serializeComposeEnvironment({
+        ...session.variables,
+        VEYOPS_IMAGE: reference,
+        ...Object.fromEntries(pins.map(([variable, entry]) => [variable, entry.imageReference!])),
+      });
       await uploadContent('.env', env, 30);
       const compose = `VEYOPS_IMAGE=${q(reference)} ${docker} compose --project-name ${q(project)} --env-file ${remotePath(release + '/.env')} -f ${remotePath(release + '/compose.yaml')}`;
       const images = (
@@ -1514,10 +1573,53 @@ fi
       )
         .trim()
         .split(/\s+/);
-      if (!images.includes(reference))
+      if (pins.length) {
+        const expected = new Set(pins.map(([, entry]) => entry.imageReference!));
+        if (
+          images.some((name) => !expected.has(name)) ||
+          [...expected].some((name) => !images.includes(name))
+        )
+          throw new ConflictException('Compose 须使用已确认镜像组中的全部镜像');
+      } else if (!images.includes(reference))
         throw new Error('Compose必须通过 ${VEYOPS_IMAGE} 使用本次固定镜像');
       return { compose, images };
     };
+
+    if (artifact?.pins) {
+      const pins = Object.values(artifact.pins);
+      if (pins.some(({ physical }) => physical?.engineId !== dockerEngineId))
+        throw new ConflictException('Docker 引擎与 Compose 镜像组不一致');
+      await this.builds.remote(
+        target,
+        [
+          'set -eu',
+          'umask 077',
+          `mkdir -- ${q(config)}`,
+          ...pins.map(
+            ({ imageReference, imageId }) =>
+              `test "$(${docker} image inspect --format '{{.Id}}' -- ${q(imageReference!)})" = ${q(imageId!)}`,
+          ),
+        ].join('\n'),
+        session,
+        30,
+        'Compose 镜像组的引用已变化，请重新预览',
+      );
+      const { compose } = await configure(image);
+      return {
+        compose,
+        docker,
+        image,
+        imageId: artifact.imageId,
+        template,
+        composeProject,
+        dockerEngineId,
+        images: pins.map(({ id, imageId, imageReference }) => ({
+          artifactId: id,
+          imageId: imageId!,
+          imageReference: imageReference!,
+        })),
+      };
+    }
 
     const offline = async (error: unknown): Promise<ComposeRelease> => {
       if (

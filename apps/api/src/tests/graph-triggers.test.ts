@@ -10,6 +10,7 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import type { GraphFlow } from '../modules/execution-graphs/execution-graph-definition';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
+import { flowTarget } from './helpers/flow-target';
 
 async function verify(databaseUrl?: string) {
   const dir = await mkdtemp(join(tmpdir(), 'veyops-native-graph-triggers-'));
@@ -79,12 +80,13 @@ async function verify(databaseUrl?: string) {
         .expect(201)
     ).body.data;
     const path = root + '/projects/' + project.id + '/execution-graph';
+    const serverId = await flowTarget(admin);
     const triggers = path + '/triggers';
     const makeFlow = (id: string, message: string) => ({
       id,
       name: id,
       nodes: [
-        { id, type: 'START', name: '开始' },
+        { id, type: 'START', name: '开始', start: { execution: { serverId } } },
         { id: id + '-log', type: 'LOG', name: '日志', message },
         { id: id + '-end', type: 'END', name: '结束' },
       ],

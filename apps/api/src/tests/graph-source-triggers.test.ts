@@ -10,6 +10,7 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import type { GraphCheckoutEvent } from '../modules/projects/repository-metadata.service';
 import { withIsolatedPostgres } from './helpers/isolated-postgres';
+import { flowTarget } from './helpers/flow-target';
 
 const a = 'a'.repeat(40);
 const b = 'b'.repeat(40);
@@ -67,6 +68,7 @@ async function verify(t: TestContext, databaseUrl?: string) {
       slug: 'source-trigger',
     });
     const scope = prefix + '/projects/' + project.id;
+    const serverId = await flowTarget(api, true);
     t.mock.method(metadata, 'refreshBranches', async () => ({
       defaultBranch: 'main',
       branches: [
@@ -147,7 +149,7 @@ async function verify(t: TestContext, databaseUrl?: string) {
                   type: 'START',
                   name: '开始',
                   start: {
-                    execution: { location: 'MANAGER' },
+                    execution: { serverId },
                     sources: [
                       {
                         id: 'watched',
@@ -374,7 +376,7 @@ async function verify(t: TestContext, databaseUrl?: string) {
                   type: 'START',
                   name: '开始两路检出',
                   start: {
-                    execution: { location: 'MANAGER' },
+                    execution: { serverId },
                     sources: [
                       {
                         id: 'selected',

@@ -2151,6 +2151,34 @@ export const migrationProvider: MigrationProvider = {
           );
         },
       } satisfies Migration,
+      '043_execution_server_queue': {
+        async up(db) {
+          await db.schema
+            .alterTable('execution_flow_runs')
+            .addColumn('execution_server_id', 'text')
+            .execute();
+          await db.schema
+            .alterTable('execution_flow_runs')
+            .addColumn('execution_admitted_at', 'bigint')
+            .execute();
+          await db.schema
+            .createIndex('execution_flow_runs_server_queue')
+            .on('execution_flow_runs')
+            .columns(['execution_server_id', 'status', 'created_at', 'id'])
+            .execute();
+        },
+        async down(db) {
+          await db.schema.dropIndex('execution_flow_runs_server_queue').execute();
+          await db.schema
+            .alterTable('execution_flow_runs')
+            .dropColumn('execution_admitted_at')
+            .execute();
+          await db.schema
+            .alterTable('execution_flow_runs')
+            .dropColumn('execution_server_id')
+            .execute();
+        },
+      } satisfies Migration,
     };
   },
 };

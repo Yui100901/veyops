@@ -96,7 +96,7 @@ async function checkTemplates(databaseUrl?: string) {
     assert.equal(draft.publishedVersion, null);
     const seed: GraphCanvas = draft.draft.canvas;
     assertSharedCanvas(seed, seed.nodes[0]!.id, false);
-    assert.equal(seed.nodes[0]?.start?.execution?.location, 'INHERIT');
+    assert.equal(seed.nodes[0]?.start?.execution, undefined);
     assert.equal(seed.nodes[4]?.finish?.saveWorkspace, true);
     assert.equal(seed.nodes[4]?.finish?.requireRelease, 'ACTIVATED');
     assert.ok(
@@ -282,9 +282,9 @@ async function checkTemplates(databaseUrl?: string) {
       for (const node of canvas.nodes) {
         if (node.start) {
           for (const source of node.start.sources ?? []) source.repositoryId = repository.id;
-          if (node.start.sources?.length) node.start.execution = { location: 'MANAGER' };
+          node.start.execution = { serverId: target.id };
           node.start.release = node.start.release
-            ? { ...node.start.release, serviceId: service.id, targets: { serverIds: [target.id] } }
+            ? { ...node.start.release, serviceId: service.id }
             : { serviceId: service.id };
         }
         if (node.operation === 'BUILD')
@@ -300,21 +300,19 @@ async function checkTemplates(databaseUrl?: string) {
     };
     const ready = configured(seed);
     const buildOnlyId = ready.endpoints[1]!.startId;
-    const inherited = structuredClone(ready);
-    inherited.nodes.find(({ id }) => id === buildOnlyId)!.start!.execution = {
-      location: 'INHERIT',
-    };
-    const inheritedCheck = await api
+    const withoutTarget = structuredClone(ready);
+    delete withoutTarget.nodes.find(({ id }) => id === buildOnlyId)!.start!.execution;
+    const missingTargetCheck = await api
       .post(`${path}/validate`)
-      .send({ definition: { canvas: inherited } })
+      .send({ definition: { canvas: withoutTarget } })
       .expect(201);
-    assert.equal(inheritedCheck.body.data.issues[0].flowId, buildOnlyId);
-    assert.equal(inheritedCheck.body.data.issues[0].fieldId, 'start.execution');
-    assert.deepEqual(
-      (await save(inherited, saved.revision).expect(200)).body.data.draft.canvas.nodes.find(
+    assert.equal(missingTargetCheck.body.data.issues[0].flowId, buildOnlyId);
+    assert.equal(missingTargetCheck.body.data.issues[0].fieldId, 'start.execution.serverId');
+    assert.equal(
+      (await save(withoutTarget, saved.revision).expect(200)).body.data.draft.canvas.nodes.find(
         ({ id }: { id: string }) => id === buildOnlyId,
       ).start.execution,
-      { location: 'INHERIT' },
+      undefined,
     );
 
     ready.nodes.find(({ id }) => id === buildOnlyId)!.start!.sources = [];

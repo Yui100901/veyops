@@ -58,6 +58,7 @@ export interface ComposeReleaseEvidence {
   template: ComposeTemplateReference;
   imageReference: string;
   imageId: string;
+  images?: { artifactId: string; imageReference: string; imageId: string }[];
   composeProject?: string;
   dockerEngineId?: string;
 }

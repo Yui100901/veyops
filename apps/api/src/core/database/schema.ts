@@ -823,6 +823,8 @@ export interface Database {
     configuration_hash: string;
     inputs_json: string;
     workspace_path: Generated<string | null>;
+    execution_server_id: Generated<string | null>;
+    execution_admitted_at: Generated<number | null>;
     status: string;
     created_at: number;
     finished_at: Generated<number | null>;

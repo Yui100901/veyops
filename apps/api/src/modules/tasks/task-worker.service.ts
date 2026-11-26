@@ -34,7 +34,7 @@ const LOG_FAILED = '任务日志存储失败，远程执行结果需人工核查
 const CANCELLED = '任务已取消';
 const LOG_PRUNE_INTERVAL_MS = 60 * 60_000;
 const ARTIFACT_PRUNE_INTERVAL_MS = 60 * 60_000;
-const MAX_GRAPH_TASKS_PER_WORKER = 3;
+const CLAIM_BATCH_SIZE = 50;
 
 @Injectable()
 export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -179,11 +179,13 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     await this.pruneArtifacts();
     this.tickArtifactCleanup();
     if (!this.activeJobs.size) this.sqliteLeaseLost = false;
-    while (
+    for (
+      let claimed = 0;
       !this.stopping &&
       !this.sqliteLeaseLost &&
-      this.activeJobs.size < MAX_GRAPH_TASKS_PER_WORKER &&
-      [...this.activeJobs.values()].every((job) => job.graph)
+      claimed < CLAIM_BATCH_SIZE &&
+      [...this.activeJobs.values()].every((job) => job.graph);
+      claimed++
     ) {
       const task = await this.claim(true, this.activeJobs.size > 0);
       if (!task) return;
@@ -256,12 +258,14 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       .select(['id', 'idempotency_key'])
       .where('status', '=', 'PENDING')
       .where('available_at', '<=', Date.now())
+      .$if(parallelGraph, (query) =>
+        query.where('idempotency_key', 'like', graphTaskKeyPrefix + '%'),
+      )
       .orderBy('priority', 'desc')
       .orderBy('created_at')
       .limit(1)
       .executeTakeFirst();
-    if (!candidate || (parallelGraph && !candidate.idempotency_key?.startsWith(graphTaskKeyPrefix)))
-      return undefined;
+    if (!candidate) return undefined;
     const now = Date.now();
     let claim = this.database.db
       .updateTable('tasks')

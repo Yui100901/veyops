@@ -54,7 +54,6 @@ type FlowCommand = {
   automation?: boolean | GraphAutomation;
 };
 
-const maxArchiveBytes = 1024 ** 3;
 const restoredLeaf = 'historical-input';
 const pendingLeaf = 'historical-input.pending';
 
@@ -190,7 +189,7 @@ export class FlowWorkspaceService {
             ]),
         remoteControlChecks(owner),
         `exec 9<"$control/${lockLeaf}"`,
-        'flock -x 9',
+        priorPath ? 'flock -s 9' : 'flock -x 9',
         ...(priorPath
           ? []
           : [
@@ -305,8 +304,27 @@ export class FlowWorkspaceService {
     const checkedOut = [];
     for (const [index, { source }] of checkouts.entries()) {
       const directory = directories[index]!;
-      // The same verified Git transport is used for both placements. Target
-      // actions reuse the checkout installed once on their confirmed host.
+      if (workspaceState.placement.location === 'TARGET') {
+        const receipt = await this.targetCheckout(
+          workspaceState,
+          workspaceState.placement.target,
+          projectId,
+          { ...source, fullClone: fullClone ?? source.fullClone },
+          directory,
+          context,
+        );
+        context.log(
+          `目标端检出 ${directory} · ${receipt.commitSha}\n`,
+          workspaceState.placement.target.id,
+        );
+        checkedOut.push({
+          ...receipt,
+          repositoryId: source.repositoryId,
+          directory,
+          ref: source.ref,
+        });
+        continue;
+      }
       const staging = await mkdtemp(join(stagingBase, 'flow-checkout-'));
       try {
         const tree = join(staging, 'source');
@@ -317,30 +335,15 @@ export class FlowWorkspaceService {
           tree,
         );
         context.signal.throwIfAborted();
-        if (workspaceState.placement.location === 'MANAGER') {
-          const segments = directory.split('/');
-          const leaf = segments.pop()!;
-          let parent = workspaceState.path;
-          for (const segment of segments) parent = await makeDirectory(join(parent, segment));
-          const destination = join(parent, leaf);
-          if (await entry(destination))
-            throw new ConflictException('源码检出目录已存在，不能覆盖先前工作区');
-          await rename(tree, destination);
-        } else {
-          await this.transferCheckout(
-            workspaceState,
-            workspaceState.placement.target,
-            staging,
-            directory,
-            context,
-          );
-        }
-        context.log(
-          `检出 ${directory} · ${receipt.commitSha}\n`,
-          workspaceState.placement.location === 'TARGET'
-            ? workspaceState.placement.target.id
-            : undefined,
-        );
+        const segments = directory.split('/');
+        const leaf = segments.pop()!;
+        let parent = workspaceState.path;
+        for (const segment of segments) parent = await makeDirectory(join(parent, segment));
+        const destination = join(parent, leaf);
+        if (await entry(destination))
+          throw new ConflictException('源码检出目录已存在，不能覆盖先前工作区');
+        await rename(tree, destination);
+        context.log(`检出 ${directory} · ${receipt.commitSha}\n`);
         checkedOut.push({
           ...receipt,
           repositoryId: source.repositoryId,
@@ -354,34 +357,41 @@ export class FlowWorkspaceService {
     return checkedOut;
   }
 
-  private async transferCheckout(
+  private async targetCheckout(
     workspace: FlowWorkspace,
     target: SshTarget,
-    staging: string,
+    projectId: string,
+    source: GraphCheckoutSnapshot,
     directory: string,
     context: TaskExecutionContext,
   ) {
-    const archive = join(staging, 'source.tar.gz');
-    const packed = await this.processes.run('tar', ['-czf', archive, '-C', staging, 'source'], {
-      timeout: 300,
-      signal: context.signal,
-    });
-    const size = (await lstat(archive)).size;
-    if (packed.exitCode !== 0 || size === 0 || size > maxArchiveBytes)
-      throw new ConflictException('源码检出打包失败或超过 1 GiB');
     const control = remoteWorkspaceControl(workspace.path, workspace.runId);
     const remote = control + '/checkout-' + randomUUID();
-    const payload = remote + '/source.tar.gz';
+    const { command, credential } = await this.builds.prepareFlowTargetCheckout(
+      projectId,
+      source,
+      remote,
+    );
     const destination = posix.join(workspace.path, directory);
     const parent = posix.dirname(destination);
+    let stdout = '';
     const options: SshOptions = {
       timeout: 300,
       signal: context.signal,
-      onData: (text) => context.log(text, target.id),
+      secrets: credential?.values,
+      onData: (text, stream) => {
+        if (stream === 'stdout') stdout = (stdout + text).slice(-16_000);
+        else context.log(text, target.id);
+      },
     };
     await this.requireRemote(workspace, target, `umask 077; mkdir -- ${q(remote)}`, options);
     try {
-      await this.ssh.upload(target, archive, payload, options);
+      if (credential)
+        await this.ssh.uploadContent(target, credential.response, credential.path, {
+          timeout: 30,
+          signal: context.signal,
+          mode: 0o600,
+        });
       await this.requireRemote(
         workspace,
         target,
@@ -391,13 +401,17 @@ export class FlowWorkspaceService {
           `test ! -L ${q(destination)}`,
           `mkdir -p -- ${q(parent)}`,
           `test "$(realpath -e -- ${q(parent)})" = ${q(parent)}`,
-          `tar -xzf ${q(payload)} --no-same-owner --no-same-permissions -C ${q(remote)}`,
-          `test -d ${q(remote + '/source')}`,
-          `test ! -L ${q(remote + '/source')}`,
-          `mv -T -- ${q(remote + '/source')} ${q(destination)}`,
+          command,
+          `test -d ${q(remote + '/repo')}`,
+          `test ! -L ${q(remote + '/repo')}`,
+          `mv -T -- ${q(remote + '/repo')} ${q(destination)}`,
         ].join('\n'),
         options,
       );
+      const match = /^VEYOPS_FLOW_GIT=([a-f0-9]{40}|[a-f0-9]{64}):(true|false)\s*$/m.exec(stdout);
+      if (match?.[1] !== source.commitSha)
+        throw new ConflictException('目标端实际检出提交与已确认版本不一致');
+      return { commitSha: match[1], shallow: match[2] === 'true', subject: '' };
     } finally {
       await this.requireRemote(workspace, target, `rm -rf -- ${q(remote)}`, { timeout: 30 }).catch(
         () => undefined,
@@ -432,6 +446,7 @@ export class FlowWorkspaceService {
             if (stream === 'stdout') probe += output;
           },
         },
+        true,
       );
       if (probe.trim() === 'yes') return;
       if (probe.trim() !== 'no') throw new ConflictException('无法确认本次历史目录还原状态');
@@ -609,6 +624,7 @@ export class FlowWorkspaceService {
         secrets,
         onData: (text) => context.log(text, target.id),
       },
+      true,
     );
     return { exitCode: result.exitCode, directory };
   }
@@ -618,6 +634,7 @@ export class FlowWorkspaceService {
     target: SshTarget,
     command: string,
     options: SshOptions,
+    shared = false,
   ) {
     const result = await this.ssh.execute(
       target,
@@ -627,7 +644,7 @@ export class FlowWorkspaceService {
         `control=${q(remoteWorkspaceControl(workspace.path, workspace.runId))}`,
         remoteControlChecks(ownership(workspace.runId, workspace.placement)),
         `exec 9<"$control/${lockLeaf}"`,
-        'flock -n 9',
+        shared ? 'flock -sn 9' : 'flock -n 9',
         remoteWorkspaceChecks(),
         `( exec 9<&-; exec /bin/sh -eu -c ${q(command)} )`,
       ].join('\n'),

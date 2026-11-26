@@ -33,10 +33,9 @@ function deployment(): GraphCanvas {
         type: 'START',
         start: {
           sources: [{ id: 'source', repositoryId }],
-          execution: { location: 'MANAGER' },
+          execution: { serverId },
           release: {
             serviceId,
-            targets: { serverIds: [serverId] },
           },
         },
       },
@@ -91,8 +90,8 @@ test('a V2 canvas publishes actions and resource references without generic bind
     references.map(({ resourceType, resourceId, fieldId }) => [resourceType, resourceId, fieldId]),
     [
       ['REPOSITORY', repositoryId, 'start.sources.source.repositoryId'],
+      ['SERVER', serverId, 'start.execution.serverId'],
       ['SERVICE', serviceId, 'start.release.serviceId'],
-      ['SERVER', serverId, 'start.release.targets'],
     ],
   );
 });
@@ -116,6 +115,38 @@ test('a historical Compose-only route shares its end with a build without regist
   delete start!.start!.release!.artifactId;
   start!.start!.release!.compose = { path: 'compose.yaml' };
   assert.equal(canvasIssues(canvas)[0]?.fieldId, 'start.release.compose.sourceId');
+});
+
+test('parallel Docker builds publish a Compose group from two explicit image registrations', () => {
+  const canvas = deployment();
+  const [start, checkout, front, deploy, finish] = canvas.nodes;
+  front!.build = { repoPath: 'app/front', dockerfilePath: 'Dockerfile' };
+  const back = {
+    id: 'build-back',
+    name: '构建后端',
+    type: 'FUNCTION' as const,
+    operation: 'BUILD' as const,
+    build: { repoPath: 'app/back', dockerfilePath: 'Dockerfile' },
+  };
+  canvas.nodes.push(back);
+  canvas.edges.push({ from: checkout!.id, to: back.id }, { from: back.id, to: deploy!.id });
+  deploy!.deploy = { method: 'COMPOSE' };
+  start!.start!.release!.imageIds = ['front', 'back'];
+  start!.start!.release!.compose = { path: 'app/compose.yaml' };
+  finish!.finish!.images = [
+    { id: 'front', name: 'fixture/frontend', source: 'BUILT_IN', buildNodeId: front!.id },
+    { id: 'back', name: 'fixture/backend', source: 'BUILT_IN', buildNodeId: back.id },
+  ];
+  assert.doesNotThrow(() => compileCanvas(canvas, true));
+
+  delete finish!.finish!.images[1]!.buildNodeId;
+  assert.equal(canvasIssues(canvas)[0]?.fieldId, 'finish.images.1.buildNodeId');
+  finish!.finish!.images[1]!.buildNodeId = 'unrelated';
+  assert.equal(canvasIssues(canvas)[0]?.fieldId, 'finish.images.1.buildNodeId');
+
+  finish!.finish!.images[1]!.buildNodeId = back.id;
+  start!.start!.release!.imageIds = ['front', 'missing'];
+  assert.equal(canvasIssues(canvas)[0]?.fieldId, 'start.release.imageIds');
 });
 
 function existingCanvas(): GraphCanvas {

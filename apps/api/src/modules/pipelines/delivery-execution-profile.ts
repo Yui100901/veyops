@@ -14,6 +14,7 @@ export type GraphDeliveryConfiguration = {
     | { kind: 'ARTIFACT' }
     | { kind: 'REPOSITORY_FILE'; repositoryId: string; commitSha: string; path: string };
   rollback?: 'CURRENT' | 'AFTER_RELEASE';
+  imageBindings?: Record<string, string>;
 };
 
 /**
