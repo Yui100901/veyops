@@ -3,17 +3,15 @@ import { useId } from 'react';
 import { useResource } from '../../../api';
 import { Field } from '../../../components';
 import type { DeploymentSelection, ProjectDetail, ProjectExecutionSettings } from '../../../models';
-import {
-  effectiveNodeType,
-  graphKey,
-  graphNodeLabels,
-  isReleaseNode,
-} from '../execution-graph-definition';
+import { effectiveNodeType, graphKey, isReleaseNode } from '../execution-graph-definition';
 import type { GraphField, GraphNode } from '../execution-graph-definition';
 import {
-  simplifiedActions,
+  isSimplifiedAction,
+  simplifiedNodeGroups,
+  simplifiedNodeLabel,
   simplifiedReleaseKinds,
   simplifiedSourceDirectory,
+  type SimplifiedAction,
   type SimplifiedFinish,
   type SimplifiedGitRef,
   type SimplifiedSource,
@@ -874,7 +872,7 @@ export function SimplifiedActionSettings({
   selectOperation,
 }: NodeSettings & {
   sources: SimplifiedSource[];
-  selectOperation: (operation: (typeof simplifiedActions)[number]) => void;
+  selectOperation?: (operation: SimplifiedAction) => void;
 }) {
   const operation = effectiveNodeType(node);
   const shell = node.shell ?? {};
@@ -919,22 +917,45 @@ export function SimplifiedActionSettings({
   );
   return (
     <div className="graph-inspector-panel graph-fields">
-      <Field label="执行动作">
-        <select
-          data-graph-node-field="operation"
-          value={operation}
-          disabled={!canEdit}
-          onChange={(event) =>
-            selectOperation(event.target.value as (typeof simplifiedActions)[number])
-          }
-        >
-          {simplifiedActions.map((action) => (
-            <option key={action} value={action}>
-              {action === 'SHELL' ? '执行命令' : graphNodeLabels[action]}
-            </option>
-          ))}
-        </select>
-      </Field>
+      <div className="graph-fields">
+        <p className="graph-action-name">
+          <span className="field-note">执行动作</span>
+          <strong>{simplifiedNodeLabel(operation)}</strong>
+        </p>
+        {canEdit && selectOperation && (
+          <details key={node.id + ':' + operation} className="graph-field-card">
+            <summary>更换动作</summary>
+            <Field label="选择新动作">
+              <select
+                data-graph-node-field="operation"
+                value=""
+                onChange={(event) => {
+                  const action = event.target.value as GraphNode['type'];
+                  if (isSimplifiedAction(action) && action !== operation) selectOperation(action);
+                }}
+              >
+                <option value="" disabled>
+                  请选择动作
+                </option>
+                {simplifiedNodeGroups.map(({ name, types }) => {
+                  const choices = types.filter(
+                    (type) => isSimplifiedAction(type) && type !== operation,
+                  );
+                  return choices.length ? (
+                    <optgroup key={name} label={name}>
+                      {choices.map((type) => (
+                        <option key={type} value={type}>
+                          {simplifiedNodeLabel(type)}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : null;
+                })}
+              </select>
+            </Field>
+          </details>
+        )}
+      </div>
       {operation === 'CHECKOUT' && (
         <Check
           id="checkout.fullClone"

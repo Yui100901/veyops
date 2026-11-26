@@ -10,7 +10,7 @@ import { simplifiedModel } from '../simplified-flow';
 
 const artifactNames: Record<GraphArtifactType, string> = {
   FILE: '文件',
-  DIRECTORY: '目录',
+  DIRECTORY: '目录产物',
   DOCKER_IMAGE: 'Docker 镜像',
 };
 
@@ -57,8 +57,9 @@ export function ExecutionGraphTemplateDialog({
 
   return (
     <Modal
-      title="添加模板执行链"
-      description="在当前草稿增加一条独立的执行链。"
+      title="添加执行流"
+      description="选择流程模板和交付类型。新流程会追加到当前草稿。"
+      busy={busy}
       onClose={() => {
         if (!pending.current) close();
       }}
@@ -72,9 +73,9 @@ export function ExecutionGraphTemplateDialog({
             <p className="field-note">暂无可用的流程模板。</p>
           )}
           {!!templates.length && (
-            <fieldset className="graph-template-options">
+            <fieldset className="graph-template-options workbench-stack">
               <legend>流程模板</legend>
-              {templates.map(({ id, name, steps, artifactTypes }) => (
+              {templates.map(({ id, name, description, steps, artifactTypes }) => (
                 <label className="graph-field-card graph-template-choice" key={id}>
                   <input
                     type="radio"
@@ -92,6 +93,7 @@ export function ExecutionGraphTemplateDialog({
                   />
                   <span>
                     <strong>{name}</strong>
+                    <small>{description}</small>
                     <small>{steps.join(' → ')}</small>
                   </span>
                 </label>
@@ -119,7 +121,7 @@ export function ExecutionGraphTemplateDialog({
             取消
           </button>
           <button type="submit" className="button primary" disabled={!template || busy}>
-            {busy ? '正在生成…' : '添加执行链'}
+            {busy ? '正在添加…' : '添加到草稿'}
           </button>
         </div>
       </form>

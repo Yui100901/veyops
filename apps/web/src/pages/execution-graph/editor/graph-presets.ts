@@ -5,7 +5,7 @@ import {
   graphNodeFamily,
   graphNodeLabels,
 } from '../execution-graph-definition';
-import { simplifiedModel } from '../simplified-flow';
+import { simplifiedModel, simplifiedNodeLabel } from '../simplified-flow';
 import type {
   GraphArtifactOutput,
   GraphArtifactType,
@@ -16,10 +16,9 @@ import type {
 } from '../execution-graph-definition';
 
 export function makeNode(type: GraphNode['type'], model?: GraphCanvas['model']): GraphNode {
-  const simple = model === 'FLOW_V2';
-  const name =
-    simple && (type === 'FUNCTION' || type === 'SHELL') ? '执行命令' : graphNodeLabels[type];
+  const simple = model === simplifiedModel;
   const operation = type === 'FUNCTION' ? 'SHELL' : type;
+  const name = simple ? simplifiedNodeLabel(operation) : graphNodeLabels[type];
   return authoredNode({
     id: graphKey('node'),
     type,

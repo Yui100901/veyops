@@ -13,16 +13,19 @@ const templates = [
   {
     id: 'MINIMAL_CI_CD',
     name: '最小构建并部署',
+    description: '一次完成代码拉取、构建和部署。',
     operations: ['CHECKOUT', 'BUILD', 'DEPLOY_ARTIFACT'],
   },
   {
     id: 'CI_BUILD',
     name: '较完整的构建',
+    description: '先检查与测试，通过后构建并留档。',
     operations: ['CHECKOUT', 'CHECK', 'BUILD'],
   },
   {
     id: 'CD_DEPLOY',
     name: '较完整的部署',
+    description: '发布已有产物，部署前审批，部署后检查健康状态。',
     operations: ['APPROVAL', 'DEPLOY_ARTIFACT', 'HEALTH_CHECK'],
   },
 ] as const;
@@ -39,9 +42,10 @@ const labels: Record<TemplateOperation, string> = {
   HEALTH_CHECK: '发布健康检查',
 };
 
-export const graphFlowTemplates = templates.map(({ id, name, operations }) => ({
+export const graphFlowTemplates = templates.map(({ id, name, description, operations }) => ({
   id,
   name,
+  description,
   steps: ['开始', ...operations.map((operation) => labels[operation]), '结束'],
   artifactTypes: graphArtifactTypes,
 }));

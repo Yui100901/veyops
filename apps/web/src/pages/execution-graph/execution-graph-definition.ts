@@ -174,6 +174,7 @@ export interface GraphCatalog {
 export interface GraphFlowTemplate {
   id: string;
   name: string;
+  description: string;
   steps: string[];
   artifactTypes: GraphArtifactType[];
 }

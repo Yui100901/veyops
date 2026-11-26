@@ -1,6 +1,7 @@
 import type { DeploymentSelection, ProjectDetail } from '../../models';
 import {
   effectiveNodeType,
+  graphNodeLabels,
   isReleaseNode,
   type GraphArtifactType,
   type GraphField,
@@ -84,6 +85,24 @@ export const simplifiedActions = [
   'SOURCE_REVIEW',
   'DELAY',
 ] as const;
+
+export type SimplifiedAction = (typeof simplifiedActions)[number];
+
+export const simplifiedNodeGroups = [
+  { name: '常用节点', types: ['START', 'END', 'CHECKOUT', 'SHELL', 'BUILD', 'DEPLOY_ARTIFACT'] },
+  { name: '流程控制', types: ['CONDITION', 'DELAY'] },
+  { name: '审核与发布', types: ['SOURCE_REVIEW', 'APPROVAL', 'HEALTH_CHECK', 'ROLLBACK_ARTIFACT'] },
+] as const;
+
+export function isSimplifiedAction(type: GraphNode['type']): type is SimplifiedAction {
+  return simplifiedActions.some((action) => action === type);
+}
+
+export function simplifiedNodeLabel(type: GraphNode['type']) {
+  if (type === 'SHELL') return '执行命令';
+  if (type === 'APPROVAL') return '发布审批';
+  return graphNodeLabels[type];
+}
 
 export const simplifiedConditionField = 'conditionValue';
 

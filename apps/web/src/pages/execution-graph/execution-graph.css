@@ -486,9 +486,7 @@ button.graph-node:focus-visible {
   overflow-wrap: anywhere;
 }
 .graph-template-options {
-  display: grid;
-  gap: 0.6rem;
-  min-width: 0;
+  --workbench-gap: 0.6rem;
   margin: 0;
   padding: 0;
   border: 0;
@@ -506,7 +504,8 @@ button.graph-node:focus-visible {
 .graph-template-choice > span {
   display: grid;
   gap: 0.25rem;
-  min-width: 0;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
 }
 .graph-template-choice > span > small {
   color: var(--muted);

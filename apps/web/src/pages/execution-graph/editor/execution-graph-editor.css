@@ -54,9 +54,7 @@
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 7rem), 1fr));
 }
 
-.graph-palette > h3,
-.graph-palette-group > h4,
-.graph-palette-templates {
+.graph-palette-group > h4 {
   grid-column: 1 / -1;
 }
 
@@ -68,23 +66,25 @@
   display: none;
 }
 
-.graph-palette-templates {
+.graph-palette-section {
   min-width: 0;
+  border-top: 1px solid var(--border);
 }
 
-.graph-palette-templates > summary {
-  padding: 0.5rem 0.55rem;
+.graph-palette-section > summary {
+  padding: 0.5rem 0.3rem 0.15rem;
   color: var(--accent-dark);
   cursor: pointer;
 }
 
-.graph-palette-templates > .graph-palette-group {
-  margin-top: 0.35rem;
+.graph-palette-section > :not(summary) {
+  margin-top: 0.5rem;
 }
 
-.graph-palette-templates .field {
-  grid-column: 1 / -1;
-  margin: 0;
+.graph-palette-more {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  gap: 0.65rem;
 }
 
 .graph-palette-node {
@@ -112,6 +112,14 @@
   color: var(--accent-dark);
   background: #eff8ff;
   border-color: var(--accent);
+}
+
+.graph-action-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.65rem;
+  margin: 0;
 }
 
 .graph-canvas-help {
@@ -402,28 +410,13 @@
   border-color: #c84941;
 }
 
-@container graph-editor (width < 52rem) {
-  .graph-palette > .graph-palette-group {
-    grid-template-columns: minmax(0, 1fr) repeat(2, minmax(0, 1.15fr));
-    align-items: center;
-  }
-
-  .graph-palette > .graph-palette-group:has(.graph-palette-templates) {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .graph-palette > .graph-palette-group > :is(h4, .graph-palette-templates:not([open])) {
-    grid-column: auto;
-  }
-}
-
 @container graph-editor (width < 74rem) {
   .graph-palette {
     padding: 0.35rem 0.6rem;
   }
 
   .graph-palette > h3,
-  .graph-palette[data-expanded='false'] > .graph-palette-group {
+  .graph-palette[data-expanded='false'] > :is(.graph-palette-group, .graph-palette-section) {
     display: none;
   }
 
@@ -447,10 +440,6 @@
 }
 
 @container graph-editor (min-width: 52rem) {
-  .graph-palette {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
   .graph-inspector :is(.graph-inspector-identity, .graph-preset-fields) {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -464,9 +453,5 @@
 @container graph-editor (min-width: 74rem) {
   .graph-editing-area:has(> .graph-palette) {
     grid-template-columns: minmax(10rem, 11rem) minmax(0, 1fr);
-  }
-
-  .graph-palette {
-    grid-template-columns: minmax(0, 1fr);
   }
 }

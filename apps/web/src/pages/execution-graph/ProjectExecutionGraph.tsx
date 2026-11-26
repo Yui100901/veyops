@@ -680,7 +680,7 @@ function Workspace({
                   disabled={busy}
                   onClick={() => setTemplateOpen(true)}
                 >
-                  <ListPlus size={16} /> 添加模板执行链
+                  <ListPlus size={16} /> 添加执行流
                 </button>
                 <button
                   type="button"
@@ -1525,7 +1525,6 @@ function PublishedNodes({
                     project={project}
                     canEdit={false}
                     patch={() => {}}
-                    selectOperation={() => {}}
                     sources={inspectedStart?.sources ?? []}
                   />
                 ) : simplified && definition.canvas ? (

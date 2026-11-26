@@ -52,7 +52,7 @@ import {
   SimplifiedEndSettings,
   SimplifiedStartSettings,
 } from './SimplifiedFlowSettings';
-import { simplifiedActions, simplifiedModel } from '../simplified-flow';
+import { simplifiedModel, simplifiedNodeGroups, simplifiedNodeLabel } from '../simplified-flow';
 import './execution-graph-editor.css';
 
 type NodeType = GraphNode['type'];
@@ -73,7 +73,7 @@ const functionalTabs = {
   output: '输出',
   environment: '环境变量',
 };
-const systemNodePresets = graphOperations.filter((type) => type !== 'SHELL' && type !== 'DELAY');
+const [commonNodes, ...advancedNodeGroups] = simplifiedNodeGroups;
 type FunctionalTab = keyof typeof functionalTabs;
 
 function focusInspectorField(inspector: HTMLElement, focus: FieldFocus, bound: boolean) {
@@ -154,8 +154,8 @@ export function ProjectGraphEditor({
   const [source, setSource] = useState<string>();
   const [connector, setConnector] = useState<Connector>();
   const [startId, setStartId] = useState<string | undefined>(initialFlowId);
-  const [templateType, setTemplateType] = useState<NodeType>('FUNCTION');
-  const [paletteExpanded, setPaletteExpanded] = useState(false);
+  const [paletteExpanded, setPaletteExpanded] = useState(true);
+  const [reusableExpanded, setReusableExpanded] = useState(false);
   const [tab, setTab] = useState<FunctionalTab>('input');
   const [error, setError] = useState('');
   const [parameterRepair, setParameterRepair] = useState<ParameterRepair>();
@@ -211,12 +211,6 @@ export function ProjectGraphEditor({
     canvas,
     template ?? connectionSource ?? selectedStart ?? activeNode,
   );
-  const simplifiedPalette = paletteModel === simplifiedModel;
-  const paletteOperations = simplifiedPalette ? simplifiedActions : graphOperations;
-  const availableTemplateType =
-    templateType === 'FUNCTION' || paletteOperations.some((type) => type === templateType)
-      ? templateType
-      : 'FUNCTION';
   const selectedPath = pathHighlight(canvas, selectedPair?.startId);
   const activePair =
     activeNode && selectedPath?.nodes.has(activeNode.id) ? selectedPair : undefined;
@@ -900,7 +894,7 @@ export function ProjectGraphEditor({
     );
   }
 
-  function paletteButton(type: NodeType, label = graphNodeLabels[type]) {
+  function paletteButton(type: NodeType) {
     return (
       <button
         type="button"
@@ -911,12 +905,12 @@ export function ProjectGraphEditor({
         onClick={() => addNode(makeNode(type, paletteModel))}
       >
         <Plus size={14} />
-        {label}
+        {simplifiedNodeLabel(type)}
       </button>
     );
   }
 
-  function createTemplate(node: GraphNode) {
+  function saveReusableNode(node: GraphNode) {
     const item = {
       ...authoredNode(structuredClone(node)),
       id: graphKey('template'),
@@ -925,6 +919,8 @@ export function ProjectGraphEditor({
     onChange({ ...canvas, templates: [...canvas.templates, item] });
     select({ kind: 'template', id: item.id });
     setTab(effectiveNodeType(item) === 'SHELL' ? 'execution' : 'input');
+    setPaletteExpanded(true);
+    setReusableExpanded(true);
     setConnector(undefined);
     setSource(undefined);
   }
@@ -958,32 +954,27 @@ export function ProjectGraphEditor({
               <ChevronDown size={16} aria-hidden="true" />
             </button>
             <div className="graph-palette-group">
-              <h4>开始与结束</h4>
-              {paletteButton('START')}
-              {paletteButton('END')}
+              <h4>{commonNodes.name}</h4>
+              {commonNodes.types.map(paletteButton)}
             </div>
-            <div className="graph-palette-group">
-              <h4>{simplifiedPalette ? '执行动作' : '功能节点'}</h4>
-              {paletteButton('FUNCTION', simplifiedPalette ? '执行命令' : '新建自定义节点')}
-              <details className="graph-palette-templates">
-                <summary>系统模板</summary>
-                <div className="graph-palette-group">
-                  {(simplifiedPalette
-                    ? simplifiedActions.filter((action) => action !== 'SHELL')
-                    : systemNodePresets
-                  ).map((operation) => paletteButton(operation))}
-                </div>
-              </details>
-              {!simplifiedPalette && (
-                <details className="graph-palette-templates">
-                  <summary>高级节点</summary>
-                  <div className="graph-palette-group">{paletteButton('DELAY')}</div>
-                </details>
-              )}
-              <details className="graph-palette-templates" open={template ? true : undefined}>
-                <summary>
-                  项目模板{canvas.templates.length ? ' · ' + canvas.templates.length : ''}
-                </summary>
+            <details className="graph-palette-section">
+              <summary>更多节点</summary>
+              <div className="graph-palette-more">
+                {advancedNodeGroups.map(({ name, types }) => (
+                  <div key={name} className="graph-palette-group">
+                    <h4>{name}</h4>
+                    {types.map(paletteButton)}
+                  </div>
+                ))}
+              </div>
+            </details>
+            {canvas.templates.length > 0 && (
+              <details
+                className="graph-palette-section"
+                open={reusableExpanded}
+                onToggle={(event) => setReusableExpanded(event.currentTarget.open)}
+              >
+                <summary>复用节点 · {canvas.templates.length}</summary>
                 <div className="graph-palette-group">
                   {canvas.templates.map((item) => (
                     <button
@@ -998,40 +989,16 @@ export function ProjectGraphEditor({
                         setTab('input');
                         setConnector(undefined);
                         setSource(undefined);
+                        window.requestAnimationFrame(revealInspector);
                       }}
                     >
                       <Copy size={14} />
-                      {item.name || '未命名模板'}
+                      {item.name || '未命名复用节点'}
                     </button>
                   ))}
-                  <Field label="起始模板">
-                    <select
-                      value={availableTemplateType}
-                      onChange={(event) => setTemplateType(event.target.value as NodeType)}
-                    >
-                      <option value="FUNCTION">空白功能节点</option>
-                      {paletteOperations.map((type) => (
-                        <option key={type} value={type}>
-                          {graphNodeLabels[type]}
-                        </option>
-                      ))}
-                    </select>
-                  </Field>
-                  <button
-                    type="button"
-                    className="button secondary small"
-                    onClick={() => createTemplate(makeNode(availableTemplateType, paletteModel))}
-                  >
-                    <Plus size={15} />
-                    新建项目模板
-                  </button>
                 </div>
               </details>
-            </div>
-            <div className="graph-palette-group">
-              <h4>条件节点</h4>
-              {paletteButton('CONDITION')}
-            </div>
+            )}
           </aside>
         )}
         <div className="graph-canvas-column">
@@ -1201,7 +1168,7 @@ export function ProjectGraphEditor({
         {inspected && (
           <>
             <header className="graph-inspector-title">
-              <p>{template ? '项目模板' : isFunction ? '功能节点' : '节点属性'}</p>
+              <p>{template ? '复用节点' : isFunction ? '功能节点' : '节点属性'}</p>
               <h3 tabIndex={-1}>{inspected.name || graphNodeTypeLabel(inspected)}</h3>
             </header>
             <NodeIdentity
@@ -1543,18 +1510,18 @@ export function ProjectGraphEditor({
                   <button
                     type="button"
                     className="button secondary small"
-                    onClick={() => createTemplate(activeNode)}
+                    onClick={() => saveReusableNode(activeNode)}
                   >
-                    保存为项目模板
+                    保存为复用节点
                   </button>
                 )}
                 <button type="button" className="button secondary small" onClick={duplicate}>
                   <Copy size={15} />
-                  {template ? '复制模板' : '复制节点'}
+                  {template ? '复制复用节点' : '复制节点'}
                 </button>
                 <button type="button" className="button secondary small" onClick={removeSelection}>
                   <Trash2 size={15} />
-                  {template ? '删除模板' : '删除节点'}
+                  {template ? '删除复用节点' : '删除节点'}
                 </button>
               </div>
             )}
@@ -1974,6 +1941,9 @@ function changeOperation(
   model?: GraphCanvas['model'],
 ): Partial<GraphNode> {
   const next = makeNode(operation, model);
+  const previousType = effectiveNodeType(node);
+  const defaultNames = [graphNodeLabels[previousType]];
+  if (model === simplifiedModel) defaultNames.push(simplifiedNodeLabel(previousType));
   return {
     type: 'FUNCTION',
     operation,
@@ -1994,7 +1964,7 @@ function changeOperation(
     approval: next.approval,
     healthCheck: next.healthCheck,
     flowId: next.flowId,
-    ...(node.name === graphNodeTypeLabel(node) && { name: next.name }),
+    ...(defaultNames.includes(node.name) && { name: next.name }),
   };
 }
 
