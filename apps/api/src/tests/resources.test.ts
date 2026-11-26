@@ -535,9 +535,15 @@ async function checkResources(databaseUrl?: string) {
       ),
     );
     await api.delete(base + root + '/environments/' + staging.id).expect(200);
-    await api.delete(base + '/servers/' + server.id).expect(200);
-    assert.deepEqual((await fetch('/server-groups'))[0].serverIds, []);
+    const graphInUse = await api.delete(base + '/servers/' + server.id).expect(409);
+    assert.ok(
+      graphInUse.body.error.references.some(
+        (ref: { fieldId: string; state: string }) =>
+          ref.fieldId === 'start.execution.serverId' && ref.state === 'RUNNABLE',
+      ),
+    );
     await api.delete(base + '/server-groups/' + group.id).expect(200);
+    await fetch('/servers/' + server.id);
   } finally {
     await app.close();
     await rm(directory, { recursive: true, force: true });

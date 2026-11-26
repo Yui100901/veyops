@@ -287,20 +287,22 @@ async function checkPlan(t: TestContext, url?: string) {
         expectedPlanSections: plan.planSections,
         idempotencyKey: randomUUID(),
       });
+    const beforeGroupEdit = await create(combined + '/preview', args);
     await api
       .patch(base + '/server-groups/' + group.id)
       .send({ name: 'Release', serverIds: [first.id, second.id] })
       .expect(200);
     const changed = await create(combined + '/preview', args);
     assert.deepEqual(changed.simplified.release.serverIds, [first.id]);
-    assert.equal(changed.configurationHash, preview.configurationHash);
-    await run(combined, preview).expect(201);
+    assert.equal(changed.configurationHash, beforeGroupEdit.configurationHash);
+    await run(combined, beforeGroupEdit).expect(201);
 
+    const beforeSourceEdit = await create(flow('fresh') + '/preview', args);
     alternatePin = 'c'.repeat(40);
-    await run(flow('fresh'), fresh).expect(409);
+    await run(flow('fresh'), beforeSourceEdit).expect(409);
     const refreshed = await create(flow('fresh') + '/preview', args);
     assert.equal(refreshed.checkouts[1].commitSha, alternatePin);
-    assert.notEqual(refreshed.configurationHash, fresh.configurationHash);
+    assert.notEqual(refreshed.configurationHash, beforeSourceEdit.configurationHash);
     const started = await run(flow('fresh'), refreshed).expect(201);
     assert.match(started.body.data.status, /QUEUED|RUNNING/);
   } finally {

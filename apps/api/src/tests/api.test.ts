@@ -414,25 +414,29 @@ async function checkApi(databaseUrl?: string) {
     const initialSettings = await viewer.get('/api/v1/system').expect(200);
     assert.equal(initialSettings.body.data.defaultBuildLocation, 'TARGET');
     assert.equal(initialSettings.body.data.defaultMaxParallelTargets, 3);
+    assert.equal(initialSettings.body.data.maxConcurrentFlowsPerServer, 3);
     assert.equal(initialSettings.body.data.logRetentionDays, 0);
     await viewer.patch('/api/v1/system').send({ logRetentionDays: 7 }).expect(403);
     await api.patch('/api/v1/system').send({ defaultMaxParallelTargets: 11 }).expect(400);
+    await api.patch('/api/v1/system').send({ maxConcurrentFlowsPerServer: 0 }).expect(400);
     await api.patch('/api/v1/system').send({ logRetentionDays: null }).expect(400);
     await api.patch('/api/v1/system').send({ defaultBuildLocation: 'OTHER' }).expect(400);
     await Promise.all([
       api.patch('/api/v1/system').send({ defaultBuildLocation: 'MANAGER' }).expect(200),
       api
         .patch('/api/v1/system')
-        .send({ defaultMaxParallelTargets: 6, logRetentionDays: 7 })
+        .send({ defaultMaxParallelTargets: 6, maxConcurrentFlowsPerServer: 2, logRetentionDays: 7 })
         .expect(200),
     ]);
     const savedSettings = await viewer.get('/api/v1/system').expect(200);
     assert.equal(savedSettings.body.data.defaultBuildLocation, 'MANAGER');
     assert.equal(savedSettings.body.data.defaultMaxParallelTargets, 6);
+    assert.equal(savedSettings.body.data.maxConcurrentFlowsPerServer, 2);
     assert.equal(savedSettings.body.data.logRetentionDays, 7);
     assert.equal(savedSettings.body.data.targetWorkspaceRoot, '~/.veyops/workspace');
     const executionPath = `/api/v1/projects/${projectId}/execution-settings`;
     await viewer.patch(executionPath).send({ logRetentionDays: 4 }).expect(403);
+    await api.patch(executionPath).send({ maxConcurrentFlowsPerServer: 4 }).expect(400);
     const inherited = await viewer.get(executionPath).expect(200);
     assert.deepEqual(inherited.body.data.overrides, {});
     assert.equal(inherited.body.data.effective.defaultBuildLocation, 'MANAGER');
@@ -453,6 +457,7 @@ async function checkApi(databaseUrl?: string) {
     assert.deepEqual(overridden.effective, {
       targetWorkspaceRoot: '/srv/team builds',
       defaultMaxParallelTargets: 2,
+      maxConcurrentFlowsPerServer: 2,
       defaultBuildLocation: 'TARGET',
       logRetentionDays: 0,
     });

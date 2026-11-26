@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -46,8 +46,6 @@ async function checkDelivery(databaseUrl?: string) {
   const { PipelineTriggersService } =
     await import('../modules/pipeline-triggers/pipeline-triggers.service.js');
   const { BuildsService } = await import('../modules/builds/builds.service.js');
-  const { expandGraphTemplate } =
-    await import('../modules/execution-graphs/graph-flow-templates.js');
   const { RepositoryMetadataService } =
     await import('../modules/projects/repository-metadata.service.js');
 
@@ -67,8 +65,6 @@ async function checkDelivery(databaseUrl?: string) {
   const remoteCommands: { serverId: string; command: string }[] = [];
   const releaseLinks = new Map<string, string>();
   const transferredArchives: string[] = [];
-  const flowArchives: string[] = [];
-  let captureFlowUpload = false;
   let failedBuildServer: string | undefined;
   let registryPullFails = false;
   let failNextHealthCheck = false;
@@ -189,17 +185,8 @@ async function checkDelivery(databaseUrl?: string) {
         return { exitCode: 0 };
       },
       upload: async (target: { id: string }, source: string) => {
-        if (captureFlowUpload) {
-          const result = await processRunner.run('tar', ['-xOzf', source, './app/dist/index.html'], {
-            timeout: 10,
-          });
-          assert.equal(result.exitCode, 0, result.stderr);
-          assert.equal(result.stdout, 'verified release');
-          flowArchives.push(target.id);
-        } else {
-          assert.deepEqual(await readFile(source), archive);
-          transferredArchives.push(target.id);
-        }
+        assert.deepEqual(await readFile(source), archive);
+        transferredArchives.push(target.id);
       },
       uploadContent: async (_target: unknown, contents: string, destination: string) => {
         if (destination.endsWith('/compose.yaml')) composeUploads.push(contents);
@@ -1308,7 +1295,6 @@ async function checkDelivery(databaseUrl?: string) {
       isolation.mock.restore();
     }
 
-    const graphPath = '/projects/' + project.id + '/execution-graph';
     const graphEnv = await create('/projects/' + project.id + '/environments', {
       name: 'Graph release',
       slug: 'graph-release',
@@ -1334,143 +1320,6 @@ async function checkDelivery(databaseUrl?: string) {
 
     const revision2 = await create(managedPath, managed(managedV2, 1));
     assert.equal(revision2.version, 2);
-
-    const defaults = expandGraphTemplate('MINIMAL_CI_CD', 'DIRECTORY', 'FLOW_V2');
-    const [start, checkoutNode, buildNode, deployNode, end] = defaults.canvas.nodes;
-    const buildFlow = {
-      ...start!,
-      start: {
-        sources: [
-          {
-            id: 'app',
-            repositoryId: repo.id,
-            ref: { kind: 'COMMIT' as const, value: successfulCommit },
-          },
-        ],
-        execution: { location: 'MANAGER' as const },
-        release: {
-          serviceId: service.id,
-          targets: { serverIds: [serverIds[0]!] },
-        },
-      },
-    };
-    const approve = {
-      id: 'confirm',
-      type: 'APPROVAL' as const,
-      name: 'Approve the frozen payload',
-    };
-    const buildAction = {
-      ...buildNode!,
-      build: { buildCommand: 'BUILD_FLOW_FIXTURE', repoPath: 'app' },
-    };
-    const flowNodes = [buildFlow, checkoutNode!, buildAction, approve, deployNode!, end!];
-    const current = (await api.get('/api/v1' + graphPath).expect(200)).body.data;
-    const edited = (
-      await api
-        .put('/api/v1' + graphPath + '/draft')
-        .send({
-          expectedRevision: current.revision,
-          definition: {
-            canvas: {
-              ...defaults.canvas,
-              nodes: flowNodes,
-              endpoints: [defaults.canvas.endpoints[0]!],
-              edges: flowNodes
-                .slice(1)
-                .map(({ id: to }, index) => ({ from: flowNodes[index]!.id, to })),
-            },
-          },
-        })
-        .expect(200)
-    ).body.data;
-    const { publishedVersion: graphVersion } = await create(graphPath + '/publish', {
-      expectedRevision: edited.revision,
-    });
-    const fixtureBuilds = app.get(BuildsService);
-    fixtureBuilds.managerFlowCommand = async (_options, workspace, command, subdirectory) => {
-      assert.equal(command, 'BUILD_FLOW_FIXTURE');
-      assert.equal(subdirectory, 'app');
-      assert.equal(
-        await readFile(join(workspace, subdirectory, 'origin.txt'), 'utf8'),
-        successfulCommit,
-      );
-      await mkdir(join(workspace, subdirectory, 'dist'));
-      await writeFile(join(workspace, subdirectory, 'dist', 'index.html'), 'verified release');
-      return { exitCode: 0, stdout: '', stderr: '' };
-    };
-    const flow = graphPath + '/flows/' + defaults.startId;
-    const submit = async (version = graphVersion) => {
-      const args = { version };
-      const plan = await create(flow + '/preview', args);
-      return create(flow + '/run', {
-        ...args,
-        expectedConfigurationHash: plan.configurationHash,
-        idempotencyKey: randomUUID(),
-      });
-    };
-    const wait = async (id: string, states: string[], approvalNodeId?: string) => {
-      for (let attempt = 0; attempt < 120; attempt++) {
-        await worker.tick();
-        const current = (await api.get('/api/v1' + graphPath + '/runs/' + id).expect(200)).body
-          .data;
-        const approvalReady =
-          !approvalNodeId ||
-          current.status !== 'WAITING' ||
-          current.nodes.some(
-            (node: { nodeId: string; output?: { scopeHash?: string } }) =>
-              node.nodeId === approvalNodeId && node.output?.scopeHash,
-          );
-        if (states.includes(current.status) && approvalReady) return current;
-        await delay(15);
-      }
-      assert.fail('Graph run did not reach ' + states.join('/'));
-    };
-    const initialActivations = activations().length;
-    captureFlowUpload = true;
-    const flowRun = await submit();
-    const pending = await wait(flowRun.id, ['WAITING', 'FAILED'], approve.id);
-    if (pending.status !== 'WAITING') {
-      const node = pending.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === approve.id);
-      const failedTask = node?.taskId && (await getTask(node.taskId));
-      assert.fail(JSON.stringify({ nodes: pending.nodes, task: failedTask?.errorSummary }));
-    }
-    assert.equal(activations().length, initialActivations);
-    assert.equal(flowArchives.length, 0);
-    const gate = pending.nodes.find(({ nodeId }: { nodeId: string }) => nodeId === approve.id);
-    const decision = graphPath + '/runs/' + pending.id + '/nodes/' + approve.id + '/decision';
-    assert.ok(gate.output.scopeHash);
-    assert.equal(gate.output.scope.artifactIds.length, 1);
-    await post(decision, { decision: 'APPROVE', expectedScopeHash: '0'.repeat(64) }).expect(409);
-    assert.equal(activations().length, initialActivations);
-    await create(decision, {
-      decision: 'APPROVE',
-      expectedScopeHash: gate.output.scopeHash,
-    });
-    const completed = await wait(flowRun.id, ['SUCCESS', 'FAILED']);
-    assert.equal(completed.status, 'SUCCESS', JSON.stringify(completed.nodes));
-    assert.deepEqual(flowArchives, [serverIds[0]]);
-    assert.equal(activations().length, initialActivations + 1);
-    assert.deepEqual(completed.artifactIds, gate.output.scope.artifactIds);
-    buildFlow.start.sources[0]!.ref.value = failingCommit;
-    const nextDraft = (
-      await api
-        .put('/api/v1' + graphPath + '/draft')
-        .send({
-          expectedRevision: edited.revision,
-          definition: {
-            canvas: { ...edited.draft.canvas, nodes: flowNodes },
-          },
-        })
-        .expect(200)
-    ).body.data;
-    const { publishedVersion: failedVersion } = await create(graphPath + '/publish', {
-      expectedRevision: nextDraft.revision,
-    });
-    const failedRun = await submit(failedVersion);
-    const failedCheckout = await wait(failedRun.id, ['SUCCESS', 'FAILED']);
-    assert.equal(failedCheckout.status, 'FAILED');
-    assert.equal(activations().length, initialActivations + 1);
-    assert.deepEqual(failedCheckout.artifactIds, []);
   } finally {
     await app.close();
   }

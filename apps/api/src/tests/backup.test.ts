@@ -108,7 +108,7 @@ async function withGraphServices(
         useValue: {
           get: async () => ({
             targetWorkspaceRoot: '~/.veyops/workspace',
-            maxConcurrentRunsPerServer: 2,
+            maxConcurrentFlowsPerServer: 2,
           }),
         },
       },
@@ -117,17 +117,24 @@ async function withGraphServices(
       {
         provide: ServersService,
         useValue: {
-          snapshot: async () => [
-            {
-              id: graphServer,
-              name: 'Backup execution host',
-              host: '127.0.0.1',
-              port: 22,
-              username: 'backup',
-              hostKeyFingerprint: 'b'.repeat(64),
-              credentialId: 'backup-ssh-credential',
-            },
-          ],
+          snapshot: async () => {
+            const { credential_id } = await database.db
+              .selectFrom('servers')
+              .select('credential_id')
+              .where('id', '=', graphServer)
+              .executeTakeFirstOrThrow();
+            return [
+              {
+                id: graphServer,
+                name: 'Backup execution host',
+                host: '127.0.0.1',
+                port: 22,
+                username: 'backup',
+                hostKeyFingerprint: 'b'.repeat(64),
+                credentialId: credential_id,
+              },
+            ];
+          },
         },
       },
       { provide: ArtifactsService, useValue: {} },

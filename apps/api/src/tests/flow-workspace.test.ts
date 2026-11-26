@@ -168,7 +168,9 @@ test('flow workspaces preserve files across actions, isolate runs and verify pat
   };
   const remotePath = '/srv/work/project1/' + runId;
   let remoteReceipt = remotePath;
+  let checkoutSha = sources[0]!.commitSha;
   const requests: Array<{ command: string; options: SshOptions }> = [];
+  const uploads: Array<{ contents: string; destination: string; mode?: number }> = [];
   const target = new FlowWorkspaceService(
     {
       async execute(connection: SshTarget, commandText: string, options: SshOptions) {
@@ -176,10 +178,38 @@ test('flow workspaces preserve files across actions, isolate runs and verify pat
         requests.push({ command: commandText, options });
         if (commandText.includes('VEYOPS_FLOW_WORKSPACE='))
           options.onData?.('VEYOPS_FLOW_WORKSPACE=' + remoteReceipt + '\n', 'stdout');
+        if (commandText.includes('git fixture checkout'))
+          options.onData?.('VEYOPS_FLOW_GIT=' + checkoutSha + ':true\n', 'stdout');
         return { exitCode: 0 };
       },
+      async uploadContent(
+        connection: SshTarget,
+        contents: string,
+        destination: string,
+        options: { mode?: number },
+      ) {
+        assert.equal(connection, server);
+        uploads.push({ contents, destination, mode: options.mode });
+      },
     } as never,
-    null!,
+    {
+      async prepareFlowTargetCheckout(
+        projectId: string,
+        source: GraphCheckoutSnapshot,
+        directory: string,
+      ) {
+        assert.equal(projectId, 'project');
+        assert.equal(source.commitSha, sources[0]!.commitSha);
+        return {
+          command: 'git fixture checkout',
+          credential: {
+            path: directory + '/credential',
+            response: 'fixture-credential-response',
+            values: ['fixture-credential-response'],
+          },
+        };
+      },
+    } as never,
     null!,
     null!,
   );
@@ -190,6 +220,20 @@ test('flow workspaces preserve files across actions, isolate runs and verify pat
     root: '/srv/work',
   });
   assert.equal(remote.path, remotePath);
+  const [frozenSource] = await target.checkout(remote, 'project', [checkouts[0]!], context);
+  assert.equal(frozenSource?.commitSha, sources[0]!.commitSha);
+  assert.equal(frozenSource?.shallow, true);
+  assert.equal(uploads[0]?.mode, 0o600);
+  assert.match(uploads[0]!.destination, /\/\.runs\/.*\/checkout-.*\/credential$/);
+  const checkout = requests.find(({ command: script }) => script.includes('git fixture checkout'))!;
+  assert.match(checkout.command, /flock -n 9.*git fixture checkout.*mv -T/s);
+  assert.doesNotMatch(checkout.command, /fixture-credential-response/);
+  assert.deepEqual(checkout.options.secrets, ['fixture-credential-response']);
+  checkoutSha = sources[1]!.commitSha;
+  await assert.rejects(
+    target.checkout(remote, 'project', [checkouts[0]!], context),
+    /提交与已确认版本不一致/,
+  );
   await target.command(
     remote,
     {
@@ -200,7 +244,7 @@ test('flow workspaces preserve files across actions, isolate runs and verify pat
     context,
   );
   const request = requests.at(-1)!;
-  assert.match(request.command, /flock -n 9/);
+  assert.match(request.command, /flock -sn 9/);
   assert.match(request.command, /frontend\/example/);
   assert.doesNotMatch(request.command, /fixture-password/);
   assert.equal(request.options.variables?.variables.VEYOPS_WORKSPACE, remotePath);

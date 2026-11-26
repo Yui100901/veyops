@@ -551,7 +551,7 @@ async function checkMetadata(t: TestContext, databaseUrl?: string) {
         },
         { id: 'checkout', name: '检出', type: 'FUNCTION', operation: 'CHECKOUT' },
         { id: 'named-checkout', name: '具名检出', type: 'FUNCTION', operation: 'CHECKOUT' },
-        { id: 'end', name: '完成检出', type: 'END' },
+        { id: 'end', name: '完成检出', type: 'END', finish: { saveWorkspace: false } },
       ],
       endpoints: [
         { startId: 'default', endId: 'end' },
