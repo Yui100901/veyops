@@ -152,7 +152,7 @@ test(
               return { exitCode: 0 };
             },
             upload: async (_target: unknown, archive: string) => {
-              const { stdout } = await exec('tar', ['-xOzf', archive, './built.txt']);
+              const { stdout } = await exec('tar', ['-xOzf', archive, './fixture/dist/built.txt']);
               deployedContent.push(stdout);
             },
           })
@@ -237,28 +237,19 @@ test(
       const start = canvas.nodes[0]!;
       start.start = {
         ...start.start,
-        sources: [
-          { id: 'repo', repositoryId: repo.id, ref: { kind: 'BRANCH', value: 'main' } },
-          {
-            id: 'alternate',
-            repositoryId: repo.id,
-            ref: { kind: 'BRANCH', value: 'main' },
-            parentDirectory: 'alternate',
-          },
-        ],
+        sources: [{ id: 'repo', repositoryId: repo.id, ref: { kind: 'BRANCH', value: 'main' } }],
         execution: { location: 'MANAGER' },
         release: {
           serviceId: service.id,
           targets: { serverIds: [server.id] },
-          contentPath: 'fixture/dist',
         },
         variables: [{ key: 'FIXTURE_VALUE', value: 'configured' }],
-        dotenv: { sourceId: 'alternate', path: 'private.vars' },
+        dotenv: { sourceId: 'repo', path: 'private.vars' },
       };
       canvas.nodes[2]!.build = {
         repoPath: 'fixture',
         buildCommand:
-          'test -n "$FLOW_PRIVATE"; mkdir dist; cat input.txt > dist/built.txt; printf "%s\\n" "$FIXTURE_VALUE" >> dist/built.txt; echo built-fixture',
+          'test -n "$FLOW_PRIVATE"; mkdir -p dist; cat input.txt > dist/built.txt; printf "%s\\n" "$FIXTURE_VALUE" >> dist/built.txt; echo built-fixture',
       };
       const publish = async (definition: GraphCanvas) => {
         const { revision } = (await api.get(graphPath).expect(200)).body.data;
@@ -296,6 +287,17 @@ test(
       const preview = await create(flow + '/preview', { version });
       assert.ok(JSON.stringify(preview).includes(sha), 'preview pins the actual Git SHA');
       assert.equal(preview.simplified.workspaceRetention, 'PERSISTENT');
+      assert.equal(preview.simplified.release.contentPath, undefined);
+      await api
+        .post(flow + '/preview')
+        .send({
+          version,
+          inputs: { parameters: { 'git:repo': { kind: 'COMMIT', value: sha } } },
+        })
+        .expect(400)
+        .expect(({ body }) => {
+          assert.match(JSON.stringify(body), /Git 版本由已发布的开始节点配置/);
+        });
       const worker = app.get(TaskWorkerService);
       const waitRun = async (id: string, expected: string) => {
         const deadline = Date.now() + 25_000;
@@ -308,6 +310,7 @@ test(
             artifactIds: string[];
             simplified?: {
               workspacePath?: string | null;
+              workspaceSource?: { kind: string; artifactId?: string };
               artifacts: {
                 id: string;
                 name: string;
@@ -382,11 +385,12 @@ test(
       ).body.data;
       assert.equal(artifacts.length, 1);
       assert.equal(artifacts[0].graphRunId, run.id);
+      assert.equal(artifacts[0].workspaceReusable, true);
       const snapshotPath = artifacts[0].physical.path as string;
       assert.equal(snapshotPath, run.simplified?.workspacePath);
       assert.ok(snapshotPath.endsWith(join(project.slug, run.id)));
       const entries = await exec('tar', ['-tzf', artifacts[0].storageKey]);
-      assert.ok(snapshotPath && entries.stdout.includes('alternate/fixture/input.txt'));
+      assert.ok(snapshotPath && entries.stdout.includes('fixture/input.txt'));
       assert.ok(!entries.stdout.includes('private.vars'));
 
       const current = releases.get(currentPath);
@@ -424,8 +428,16 @@ test(
         { from: deploy.id, to: end.id },
       ];
       const missingSubpath = structuredClone(replay);
-      missingSubpath.nodes[0]!.start!.release!.contentPath = 'fixture/missing-subpath';
-      const missingVersion = await publish(missingSubpath);
+      Object.assign(missingSubpath.nodes[0]!.start!.release!, {
+        contentPath: 'fixture/missing-subpath',
+      });
+      await api
+        .put(graphPath + '/draft')
+        .send({
+          expectedRevision: (await api.get(graphPath).expect(200)).body.data.revision,
+          definition: { canvas: missingSubpath },
+        })
+        .expect(400);
       const { createBackup, restoreBackup } = await import('../core/database/backup.js');
       const key = Buffer.from(process.env.ENCRYPTION_KEY!, 'hex');
       const backup = join(directory, 'replay-backup');
@@ -461,11 +473,58 @@ test(
       await assert.rejects(stat(snapshotPath), { code: 'ENOENT' });
       await rename(artifacts[0].storageKey, join(directory, 'replay-original-archive.tar.gz'));
       await copyFile(join(restored, 'artifacts', archiveName), artifacts[0].storageKey);
-      const missingPreview = await api
-        .post(flow + '/preview')
-        .send({ version: missingVersion })
-        .expect(409);
-      assert.match(JSON.stringify(missingPreview.body), /所选子路径缺失/);
+      const historicalOnly = structuredClone(shared);
+      const historicalStart = historicalOnly.nodes.find(({ id }) => id === onlyBuild.id)!;
+      historicalStart.start!.sources = [];
+      delete historicalStart.start!.dotenv;
+      historicalOnly.nodes.find(
+        ({ type, operation }) => type === 'FUNCTION' && operation === 'BUILD',
+      )!.build!.buildCommand =
+        'test -s dist/built.txt; test ! -e .git; test ! -e private.vars; printf restored > dist/reused.txt';
+      const historicalVersion = await publish(historicalOnly);
+      const historicalFlow = graphPath + '/flows/' + onlyBuild.id;
+      await api
+        .post(historicalFlow + '/preview')
+        .send({ version: historicalVersion })
+        .expect(400);
+      await api
+        .post(historicalFlow + '/preview')
+        .send({
+          version: historicalVersion,
+          inputs: { parameters: { workspaceArtifactId: randomUUID() } },
+        })
+        .expect(400);
+      const historicalInputs = { parameters: { workspaceArtifactId: artifacts[0].id } };
+      const historicalPreview = await create(historicalFlow + '/preview', {
+        version: historicalVersion,
+        inputs: historicalInputs,
+      });
+      assert.equal(historicalPreview.simplified.workspaceSource.artifactId, artifacts[0].id);
+      assert.equal(historicalPreview.simplified.workspaceSource.runId, run.id);
+      assert.equal(historicalPreview.simplified.workspaceSource.sources[0]?.commitSha, sha);
+      assert.deepEqual(historicalPreview.checkouts, []);
+      const historicalRequest = await create(historicalFlow + '/run', {
+        version: historicalVersion,
+        inputs: historicalInputs,
+        expectedConfigurationHash: historicalPreview.configurationHash,
+        idempotencyKey: randomUUID(),
+      });
+      const historicalRun = await waitRun(historicalRequest.id, 'SUCCESS');
+      const historicalPath = historicalRun.simplified?.workspacePath;
+      assert.ok(historicalPath && historicalPath !== snapshotPath);
+      assert.equal(historicalRun.simplified?.workspaceSource?.artifactId, artifacts[0].id);
+      assert.equal(
+        (
+          historicalRun.nodes.find(({ nodeId }) => nodeId === canvas.nodes[1]!.id)?.output as
+            { checkoutSkipped?: string } | undefined
+        )?.checkoutSkipped,
+        'HISTORICAL_WORKSPACE',
+      );
+      assert.ok(historicalRun.artifactIds[0] && historicalRun.artifactIds[0] !== artifacts[0].id);
+      assert.equal(
+        await readFile(join(historicalPath, 'fixture', 'dist', 'reused.txt'), 'utf8'),
+        'restored',
+      );
       const replayVersion = await publish(replay);
       const replayPreview = await create(flow + '/preview', { version: replayVersion });
       assert.equal(replayPreview.simplified.workspaceRetention, 'OFF');
@@ -840,6 +899,64 @@ test(
       assert.equal(deployedContent.length, previousPublications);
       assert.ok(sharedBuild.simplified?.workspacePath);
       assert.ok(sharedBuild.artifactIds[0]);
+      const sourceId = sharedBuild.artifactIds[0];
+      const fromExisting = { parameters: { workspaceArtifactId: sourceId } };
+      const sourceCleanup = { artifacts: [{ artifactId: sourceId }] };
+      assert.equal(
+        (await create(root + '/artifact-retention/preview', sourceCleanup)).eligibleCount,
+        1,
+      );
+      const fromExistingPlan = await create(buildFlow + '/preview', {
+        version: sharedVersion,
+        inputs: fromExisting,
+      });
+      const protectedRequest = await create(buildFlow + '/run', {
+        version: sharedVersion,
+        inputs: fromExisting,
+        expectedConfigurationHash: fromExistingPlan.configurationHash,
+        idempotencyKey: randomUUID(),
+      });
+      assert.equal(
+        (await create(root + '/artifact-retention/preview', sourceCleanup)).eligibleCount,
+        0,
+        'the run holds its historical input before dispatch',
+      );
+      const configuredHistory = await waitRun(protectedRequest.id, 'SUCCESS');
+      assert.notEqual(
+        configuredHistory.simplified?.workspacePath,
+        sharedBuild.simplified?.workspacePath,
+      );
+      assert.equal(deployedContent.length, previousPublications);
+      assert.equal(
+        (await create(root + '/artifact-retention/preview', sourceCleanup)).eligibleCount,
+        1,
+        'a completed build releases its historical input',
+      );
+
+      const brokenRequest = await create(buildFlow + '/run', {
+        version: sharedVersion,
+        inputs: fromExisting,
+        expectedConfigurationHash: fromExistingPlan.configurationHash,
+        idempotencyKey: randomUUID(),
+      });
+      const { storage_key: historyArchive } = await app
+        .get(DatabaseService)
+        .db.selectFrom('artifacts')
+        .select('storage_key')
+        .where('id', '=', sourceId)
+        .executeTakeFirstOrThrow();
+      const goodArchive = await readFile(historyArchive);
+      await writeFile(historyArchive, 'changed after enqueue');
+      try {
+        const broken = await waitRun(brokenRequest.id, 'FAILED');
+        assert.equal(
+          broken.nodes.find(({ nodeId }) => nodeId === canvas.nodes[2]!.id)?.status,
+          'SKIPPED',
+        );
+        assert.deepEqual(broken.artifactIds, []);
+      } finally {
+        await writeFile(historyArchive, goodArchive);
+      }
       const releaseFlow = graphPath + '/flows/' + onlyRelease.id;
       const missingArtifact = await api
         .post(releaseFlow + '/preview')

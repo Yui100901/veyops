@@ -1,11 +1,22 @@
 import { ConflictException, Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { basename, join, posix } from 'node:path';
 import { dataDirectory } from '../../core/config';
 import { ProcessRunnerService } from '../../infrastructure/build-runner/process-runner.service';
 import { executionVariableName } from '../../infrastructure/execution-variables';
 import { SshService, type SshOptions, type SshTarget } from '../../infrastructure/ssh/ssh.service';
+import { artifactPathDigest, linuxArtifactDigest } from '../artifacts/artifact-physical-paths';
 import { BuildCommandError, BuildsService, enterSourceDirectory } from '../builds/builds.service';
 import { normalizeRelativePath, shellQuote as q } from '../pipelines/pipeline.validation';
 import {
@@ -44,6 +55,15 @@ type FlowCommand = {
 };
 
 const maxArchiveBytes = 1024 ** 3;
+const restoredLeaf = 'historical-input';
+const pendingLeaf = 'historical-input.pending';
+
+type RestoreArchive = {
+  checksum: string;
+  sizeBytes: number;
+  treeChecksum: string;
+  treeSize: number;
+};
 
 function ownership(runId: string, placement: FlowWorkspacePlacement) {
   return workspaceOwner(
@@ -382,6 +402,165 @@ export class FlowWorkspaceService {
       await this.requireRemote(workspace, target, `rm -rf -- ${q(remote)}`, { timeout: 30 }).catch(
         () => undefined,
       );
+    }
+  }
+
+  async restore(
+    workspace: FlowWorkspace,
+    fingerprint: string,
+    context: TaskExecutionContext,
+    stage: (archive: string) => Promise<RestoreArchive>,
+  ) {
+    const { placement, path, runId } = workspace;
+    if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new ConflictException('历史目录确认信息无效');
+    const control =
+      placement.location === 'TARGET'
+        ? remoteWorkspaceControl(path, runId)
+        : localWorkspaceControl(path, runId);
+    if (placement.location === 'MANAGER') {
+      if (await this.localRestoreReceipt(control, fingerprint)) return;
+    } else {
+      let probe = '';
+      await this.requireRemote(
+        workspace,
+        placement.target,
+        [this.remoteRestoreReceipt(control, fingerprint), 'printf "%s\n" "$restored"'].join('\n'),
+        {
+          timeout: 30,
+          signal: context.signal,
+          onData: (output, stream) => {
+            if (stream === 'stdout') probe += output;
+          },
+        },
+      );
+      if (probe.trim() === 'yes') return;
+      if (probe.trim() !== 'no') throw new ConflictException('无法确认本次历史目录还原状态');
+    }
+    const staging = await mkdtemp(join(await realpath(dataDirectory), '.flow-restore-'));
+    try {
+      const archive = join(staging, 'workspace.tar.gz');
+      const receipt = await stage(archive);
+      if (placement.location === 'MANAGER')
+        await this.restoreLocal(workspace, control, archive, fingerprint, receipt, context.signal);
+      else
+        await this.restoreRemote(
+          workspace,
+          placement.target,
+          control,
+          archive,
+          fingerprint,
+          receipt,
+          context.signal,
+        );
+    } finally {
+      await rm(staging, { recursive: true, force: true });
+    }
+  }
+
+  private async localRestoreReceipt(control: string, fingerprint: string) {
+    const marker = join(control, restoredLeaf);
+    const receipt = await entry(marker);
+    if (!receipt) return false;
+    if (!receipt.isFile() || (await readFile(marker, 'utf8')) !== fingerprint + '\n')
+      throw new ConflictException('历史目录还原回执发生变化');
+    return true;
+  }
+
+  private async restoreLocal(
+    workspace: FlowWorkspace,
+    control: string,
+    archive: string,
+    fingerprint: string,
+    receipt: RestoreArchive,
+    signal: AbortSignal,
+  ) {
+    const { path, runId, placement } = workspace;
+    const digest = await artifactPathDigest(archive, 'FILE', signal);
+    if (digest.sha256 !== receipt.checksum || digest.sizeBytes !== receipt.sizeBytes)
+      throw new ConflictException('历史目录归档校验失败');
+    await this.open(runId, placement, signal, path);
+    if (await this.localRestoreReceipt(control, fingerprint)) return;
+    const pending = join(control, pendingLeaf);
+    const contents = await readdir(path);
+    const intent = await entry(pending);
+    if (intent) {
+      if (!intent.isFile() || (await readFile(pending, 'utf8')) !== fingerprint + '\n')
+        throw new ConflictException('历史目录还原回执发生变化');
+      for (const child of contents) await rm(join(path, child), { recursive: true, force: true });
+    } else {
+      if (contents.length) throw new ConflictException('本次还原的工作区不是空目录');
+      await writeFile(pending, fingerprint + '\n', { flag: 'wx', mode: 0o600 });
+    }
+    const unpacked = await this.processes.run(
+      'tar',
+      ['-xzf', archive, '--no-same-owner', '--no-same-permissions', '-C', path],
+      { timeout: 300, signal },
+    );
+    if (unpacked.exitCode !== 0) throw new ConflictException('无法解开历史目录归档');
+    const tree = await artifactPathDigest(path, 'DIRECTORY', signal);
+    if (tree.sha256 !== receipt.treeChecksum || tree.sizeBytes !== receipt.treeSize)
+      throw new ConflictException('还原后的历史目录与登记摘要不一致');
+    await rename(pending, join(control, restoredLeaf));
+  }
+
+  private remoteRestoreReceipt(control: string, fingerprint: string) {
+    return [
+      `done_file=${q(control + '/' + restoredLeaf)}`,
+      `pending=${q(control + '/' + pendingLeaf)}`,
+      `expected=${q(fingerprint)}`,
+      'restored=no',
+      'if test -e "$done_file" || test -L "$done_file"; then',
+      '  test -f "$done_file" && test ! -L "$done_file" || exit 1',
+      '  test "$(cat -- "$done_file")" = "$expected" || exit 1',
+      '  restored=yes',
+      'fi',
+    ].join('\n');
+  }
+
+  private async restoreRemote(
+    workspace: FlowWorkspace,
+    target: SshTarget,
+    control: string,
+    archive: string,
+    fingerprint: string,
+    receipt: RestoreArchive,
+    signal: AbortSignal,
+  ) {
+    const staging = control + '/restore-' + randomUUID();
+    const input = staging + '/workspace.tar.gz';
+    await this.requireRemote(workspace, target, `umask 077; mkdir -- ${q(staging)}`, {
+      timeout: 30,
+      signal,
+    });
+    try {
+      await this.ssh.upload(target, archive, input, { timeout: 300, signal });
+      const command = [
+        'set -euo pipefail',
+        'umask 077',
+        `cd -- ${q(workspace.path)}`,
+        this.remoteRestoreReceipt(control, fingerprint),
+        'if [[ "$restored" == yes ]]; then exit 0; fi',
+        linuxArtifactDigest,
+        `[[ "$(artifact_digest FILE ${q(input)})" == ${q(receipt.checksum + ':' + receipt.sizeBytes)} ]]`,
+        'if [[ -e "$pending" || -L "$pending" ]]; then',
+        '  [[ -f "$pending" && ! -L "$pending" && "$(cat -- "$pending")" == "$expected" ]]',
+        '  find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +',
+        'else',
+        '  [[ -z "$(find . -mindepth 1 -maxdepth 1 -print -quit)" ]]',
+        '  ( set -C; printf "%s\n" "$expected" > "$pending" )',
+        'fi',
+        `tar -xzf ${q(input)} --no-same-owner --no-same-permissions`,
+        `[[ "$(artifact_digest DIRECTORY .)" == ${q(receipt.treeChecksum + ':' + receipt.treeSize)} ]]`,
+        'mv -T -- "$pending" "$done_file"',
+      ].join('\n');
+      await this.requireRemote(workspace, target, `bash -c ${q(command)}`, {
+        timeout: 300,
+        signal,
+      });
+    } finally {
+      await this.requireRemote(workspace, target, `rm -f -- ${q(input)}; rmdir -- ${q(staging)}`, {
+        timeout: 30,
+      }).catch(() => undefined);
     }
   }
 

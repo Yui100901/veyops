@@ -16,7 +16,11 @@ import {
   type ArtifactPhysical,
 } from '../artifacts/artifact-physical.service';
 import { artifactPathDigest } from '../artifacts/artifact-physical-paths';
-import { ArtifactsService, deploymentFingerprint } from '../artifacts/artifacts.service';
+import {
+  ArtifactsService,
+  deploymentFingerprint,
+  type HistoricalWorkspace,
+} from '../artifacts/artifacts.service';
 import { BuildsService, type BuildSession } from '../builds/builds.service';
 import { CredentialsService } from '../credentials/credentials.service';
 import {
@@ -63,7 +67,6 @@ import {
   type FlowCheckout,
   type FlowWorkspacePlacement,
 } from './flow-workspace.service';
-import type { GitRefValue } from './graph-run-bindings';
 import type { GraphInputsDto } from './graph-runner.controller';
 import {
   graphGateHash,
@@ -75,8 +78,9 @@ import {
   simplifiedEffectiveFinish,
   simplifiedImageName,
   simplifiedReleaseImage,
-  simplifiedSourceDirectory,
+  legacySimplifiedSourceDirectory,
   simplifiedUsesWorkspace,
+  simplifiedWorkspaceInput,
   type SimplifiedFinish,
   type SimplifiedStart,
 } from './simplified-flow-definition';
@@ -125,6 +129,7 @@ export type SimplifiedRunPlan = {
   serviceId?: string;
   buildSelection?: DeploymentSelection;
   sources: (FlowCheckout & { id: string })[];
+  workspaceSource?: HistoricalWorkspace & { fingerprint: string };
   environment: GraphVariableSnapshot;
   dotenv?: GraphEnvironmentFilePin;
   finish: SimplifiedFinish;
@@ -159,17 +164,19 @@ export type SimplifiedActionPayload = {
 
 type Facts = Record<string, unknown> & { workspacePath?: string; snapshotReady?: boolean };
 
-function versionOverride(value: unknown): GitRefValue {
-  if (
-    !value ||
-    typeof value !== 'object' ||
-    !('kind' in value) ||
-    !('value' in value) ||
-    !['BRANCH', 'COMMIT', 'TAG'].includes(String(value.kind)) ||
-    typeof value.value !== 'string'
-  )
-    throw new BadRequestException('Git 版本应为分支、标签或完整 SHA');
-  return value as GitRefValue;
+export function publicWorkspaceSource(plan: SimplifiedRunPlan) {
+  const source = plan.workspaceSource;
+  return source
+    ? {
+        kind: source.kind,
+        artifactId: source.artifactId,
+        runId: source.runId,
+        createdAt: source.createdAt,
+        sizeBytes: source.sizeBytes,
+        serverId: source.serverId,
+        sources: source.sources,
+      }
+    : { kind: 'NEW' as const };
 }
 
 @Injectable()
@@ -209,6 +216,14 @@ export class SimplifiedFlowRunService {
     const releaseNode = flow.nodes.find(
       ({ type }) => type === 'DEPLOY_ARTIFACT' || type === 'ROLLBACK_ARTIFACT',
     );
+    // Published definitions can still contain these fields. Draft writes use the current DTO.
+    const legacyRelease = release as
+      | (typeof release & {
+          contentPath?: string;
+          reuseExecutionServer?: boolean;
+        })
+      | undefined;
+    const workspaceInput = simplifiedWorkspaceInput(flow);
     const issue = (
       code: 'REPOSITORY' | 'BUILD_TARGET' | 'RELEASE_TARGET' | 'CONFIGURATION' | 'ARTIFACT',
       fieldId: string,
@@ -217,7 +232,12 @@ export class SimplifiedFlowRunService {
       new ExecutionPlanIssueError({
         code,
         fieldId,
-        parameterId: code === 'ARTIFACT' ? 'artifactId' : undefined,
+        parameterId:
+          code === 'ARTIFACT'
+            ? fieldId === 'workspaceArtifactId'
+              ? fieldId
+              : 'artifactId'
+            : undefined,
         message,
         nodeId: start.id,
         nodeName: start.name,
@@ -225,13 +245,21 @@ export class SimplifiedFlowRunService {
       });
     const requiresArtifact = release?.artifactSource === 'RUN_PARAMETER';
     const allowed = new Set([
-      ...sources.filter((entry) => entry.allowRefOverride).map(({ id }) => 'git:' + id),
       ...variables
         .filter((entry) => entry.allowOverride && !entry.credentialId)
         .map(({ key }) => 'var:' + key),
       ...(requiresArtifact || release?.allowArtifactOverride ? ['artifactId'] : []),
+      ...(workspaceInput && !automation ? ['workspaceArtifactId'] : []),
     ]);
     const overrides = input.parameters ?? {};
+    if (Object.keys(overrides).some((key) => key.startsWith('git:')))
+      throw issue(
+        'CONFIGURATION',
+        'sources',
+        'Git 版本由已发布的开始节点配置，请调整草稿后重新发布',
+      );
+    if (overrides.workspaceArtifactId !== undefined && (!workspaceInput || automation))
+      throw issue('ARTIFACT', 'workspaceArtifactId', '此入口仅支持手动从历史目录构建');
     if (
       Object.keys(overrides).some((key) => !allowed.has(key)) ||
       Object.entries(input).some(
@@ -239,6 +267,27 @@ export class SimplifiedFlowRunService {
       )
     )
       throw issue('CONFIGURATION', 'start', '请使用开始节点允许临时覆盖的运行参数');
+    if (workspaceInput?.required && overrides.workspaceArtifactId === undefined)
+      throw issue(
+        'ARTIFACT',
+        'workspaceArtifactId',
+        '请选择当前项目的历史执行目录。没有可选目录时，请先运行可生成目录产物的构建',
+      );
+    const historical = overrides.workspaceArtifactId;
+    if (historical !== undefined && (typeof historical !== 'string' || !isUUID(historical)))
+      throw issue('ARTIFACT', 'workspaceArtifactId', '请选择有效的历史目录实例');
+    const workspaceSource =
+      historical === undefined
+        ? undefined
+        : await this.artifacts
+            .planHistoricalWorkspace(projectId, historical)
+            .catch((error: unknown) => {
+              throw issue(
+                'ARTIFACT',
+                'workspaceArtifactId',
+                error instanceof Error ? error.message : '无法核对历史目录',
+              );
+            });
     const useUpstreamArtifact =
       releaseNode && automation?.kind === 'UPSTREAM' && release?.useUpstreamArtifact;
     const upstreamArtifact = useUpstreamArtifact ? trigger?.upstreamArtifactId : undefined;
@@ -266,10 +315,9 @@ export class SimplifiedFlowRunService {
     };
     const event = graphCheckoutEvent(trigger);
     const fixedSources = await Promise.all(
-      sources.map(async (entry) => {
+      (workspaceSource ? [] : sources).map(async (entry) => {
         if (!entry.repositoryId) throw issue('REPOSITORY', 'sources', '请选择项目仓库');
-        const provided = overrides['git:' + entry.id];
-        const ref = provided !== undefined ? versionOverride(provided) : entry.ref;
+        const ref = entry.ref;
         const matchingEvent =
           event &&
           (trigger?.sourceId === entry.id ||
@@ -291,7 +339,10 @@ export class SimplifiedFlowRunService {
           return {
             id: entry.id,
             source,
-            directory: simplifiedSourceDirectory(source.access.clone_url, entry.parentDirectory),
+            directory: legacySimplifiedSourceDirectory(
+              source.access.clone_url,
+              (entry as typeof entry & { parentDirectory?: string }).parentDirectory ?? '.',
+            ),
           };
         } catch (error) {
           throw issue(
@@ -323,7 +374,7 @@ export class SimplifiedFlowRunService {
       .where('deleted_at', 'is', null)
       .executeTakeFirstOrThrow();
     const hasWorkspaceActions = simplifiedUsesWorkspace(flow.nodes);
-    const needsWorkspace = hasWorkspaceActions || Boolean(release?.reuseExecutionServer);
+    const needsWorkspace = hasWorkspaceActions || Boolean(legacyRelease?.reuseExecutionServer);
     const location =
       execution?.location && execution.location !== 'INHERIT'
         ? execution.location
@@ -369,7 +420,21 @@ export class SimplifiedFlowRunService {
     );
     if (automation && (Object.keys(environment.secretVariables).length || dotenv))
       throw issue('CONFIGURATION', 'variables', '自动执行不能使用敏感变量或仓库变量文件');
-    const dotenvSource = dotenv && fixedSources.find(({ id }) => id === dotenv.sourceId)?.source;
+    let dotenvSource: Pick<FlowCheckout['source'], 'repositoryId' | 'commitSha'> | undefined =
+      dotenv && fixedSources.find(({ id }) => id === dotenv.sourceId)?.source;
+    if (dotenv && workspaceSource) {
+      const configured = sources.find(({ id }) => id === dotenv.sourceId);
+      const matches = workspaceSource.sources.filter(
+        ({ repositoryId }) => repositoryId === configured?.repositoryId,
+      );
+      if (matches.length !== 1)
+        throw issue(
+          'ARTIFACT',
+          'workspaceArtifactId',
+          '所选历史目录不能唯一定位变量文件对应的仓库和提交',
+        );
+      dotenvSource = matches[0];
+    }
     const dotenvPin =
       dotenv && dotenvSource
         ? {
@@ -383,14 +448,16 @@ export class SimplifiedFlowRunService {
       (!dotenvPin ||
         !(await this.metadata.inspectGraphEnvironmentFile(projectId, dotenvPin, [dotenvPin.path])))
     )
-      throw issue('CONFIGURATION', 'dotenv', '已确认的源码缺少指定的变量文件');
+      throw workspaceSource
+        ? issue('ARTIFACT', 'workspaceArtifactId', '所选历史目录的固定源码缺少指定的变量文件')
+        : issue('CONFIGURATION', 'dotenv', '已确认的源码缺少指定的变量文件');
     let fixedRelease: FixedRelease | undefined;
     if (releaseNode) {
       if (!release?.serviceId) throw issue('RELEASE_TARGET', 'release', '请选择项目服务');
       const selection =
-        release.reuseExecutionServer && placement.location === 'TARGET'
+        legacyRelease?.reuseExecutionServer && placement.location === 'TARGET'
           ? { serverIds: [placement.target.id] }
-          : release.reuseExecutionServer
+          : legacyRelease?.reuseExecutionServer
             ? undefined
             : release.targets;
       const targets =
@@ -437,6 +504,7 @@ export class SimplifiedFlowRunService {
       placement,
       buildSelection,
       sources: fixedSources,
+      workspaceSource,
       serviceId: release?.serviceId,
       environment,
       dotenv: dotenvPin,
@@ -542,7 +610,9 @@ export class SimplifiedFlowRunService {
     const method = node.deploy?.method ?? 'FILE';
     const image =
       method === 'COMPOSE' && !artifactId ? simplifiedReleaseImage(finish, release) : undefined;
-    const path = normalizeRelativePath(release.contentPath || '.');
+    const path = normalizeRelativePath(
+      (release as typeof release & { contentPath?: string }).contentPath || '.',
+    );
     const compose =
       release.compose?.sourceId && sources.find(({ id }) => id === release.compose!.sourceId);
     if (artifactId && release.compose && !compose)
@@ -632,11 +702,13 @@ export class SimplifiedFlowRunService {
     };
   }
 
-  async confirm(tx: Transaction<Database>, plan: SimplifiedRunPlan) {
+  async confirm(tx: Transaction<Database>, plan: SimplifiedRunPlan, projectId: string) {
     if (plan.placement.location === 'TARGET' && plan.buildSelection)
       await confirmDeploymentMembers(tx, plan.buildSelection, [plan.placement.target.id]);
     if (plan.release)
       await confirmDeploymentMembers(tx, plan.release.targets, plan.release.serverIds);
+    if (plan.workspaceSource)
+      await this.artifacts.confirmHistoricalWorkspace(tx, projectId, plan.workspaceSource);
   }
 
   task(
@@ -683,8 +755,18 @@ export class SimplifiedFlowRunService {
       },
     };
     if (stage !== 'SNAPSHOT') return task;
-    const actualSources = snapshot?.checkoutCompleted ? plan.sources : [];
-    const source = actualSources[0]?.source;
+    const actualSources = plan.workspaceSource
+      ? plan.workspaceSource.sources.map(({ checkoutPath, ...source }) => ({
+          ...source,
+          path: checkoutPath,
+        }))
+      : (snapshot?.checkoutCompleted ? plan.sources : []).map(({ source, directory }) => ({
+          repositoryId: source.repositoryId,
+          commitSha: source.commitSha,
+          ref: source.ref,
+          path: directory,
+        }));
+    const source = actualSources[0];
     const commitSha = source?.commitSha ?? unversionedArtifactCommit;
     const definition = Object.assign(new PipelineDefinitionDto(), {
       repositoryId: source?.repositoryId ?? unversionedArtifactRepository,
@@ -702,12 +784,7 @@ export class SimplifiedFlowRunService {
     );
     const pipeline: PipelineSnapshot = {
       graph: { runId: run.id, rootRunId: run.id, nodeRunId: row.id },
-      artifactSources: actualSources.map(({ source, directory }) => ({
-        repositoryId: source.repositoryId,
-        commitSha: source.commitSha,
-        ref: source.ref,
-        path: directory,
-      })),
+      artifactSources: actualSources,
       runId: randomUUID(),
       pipelineId: profile.id,
       pipelineVersionId: profile.versionId,
@@ -810,12 +887,36 @@ export class SimplifiedFlowRunService {
       if (!linked) throw new ConflictException('运行的工作区位置已变化');
     }
     const facts: Facts = { workspacePath: workspace.path, location: plan.placement.location };
+    if (plan.workspaceSource && stage === 'ACTION') {
+      const historical = plan.workspaceSource;
+      try {
+        await this.workspaces.restore(workspace, historical.fingerprint, context, (archive) =>
+          this.artifacts.stageHistoricalWorkspace(projectId, historical, archive, context.signal),
+        );
+      } catch (error) {
+        if (context.signal.aborted || error instanceof SshExecutionError) throw error;
+        throw new ExecutionPlanIssueError({
+          code: 'ARTIFACT',
+          fieldId: 'workspaceArtifactId',
+          parameterId: 'workspaceArtifactId',
+          message: error instanceof Error ? error.message : '无法还原已确认的历史目录',
+        });
+      }
+      facts.workspaceArtifactId = historical.artifactId;
+    }
     if (stage === 'SNAPSHOT') {
       if (!snapshot) throw new ConflictException('缺少已确认的留档请求');
       await this.capture(this.captureSession(task, context, plan), plan, workspace.path, snapshot);
       return { ...facts, snapshotReady: true };
     }
     if (node.type === 'CHECKOUT') {
+      if (plan.workspaceSource) {
+        context.log(
+          '历史工作区已准备，跳过 Git 拉取。\n',
+          plan.placement.location === 'TARGET' ? plan.placement.target.id : undefined,
+        );
+        return { ...facts, checkoutSkipped: 'HISTORICAL_WORKSPACE' };
+      }
       const actual = await this.workspaces.checkout(
         workspace,
         projectId,
@@ -829,6 +930,8 @@ export class SimplifiedFlowRunService {
     const file = plan.dotenv
       ? await this.metadata.readGraphEnvironmentFile(projectId, plan.dotenv)
       : {};
+    const sourceCommit =
+      plan.sources[0]?.source.commitSha ?? plan.workspaceSource?.sources[0]?.commitSha;
     const environment = {
       values: {
         ...file,
@@ -838,7 +941,7 @@ export class SimplifiedFlowRunService {
         [flowImageTagVariable]: flowImageTag(runId),
         VEYOPS_PROJECT_ID: projectId,
         ...(plan.serviceId && { VEYOPS_SERVICE_ID: plan.serviceId }),
-        ...(plan.sources[0] && { VEYOPS_GIT_COMMIT_SHA: plan.sources[0].source.commitSha }),
+        ...(sourceCommit && { VEYOPS_GIT_COMMIT_SHA: sourceCommit }),
       },
       secrets: [...secrets, ...Object.values(file).filter(Boolean)],
     };
@@ -949,9 +1052,9 @@ export class SimplifiedFlowRunService {
       const identity = artifactIdentity(snapshot, workspaceArtifact, target?.id);
       const dotenv = plan.dotenv;
       const dotenvPaths = dotenv
-        ? plan.sources.flatMap(({ source, directory }) =>
-            source.repositoryId === dotenv.repositoryId && source.commitSha === dotenv.commitSha
-              ? [directory + '/' + dotenv.path]
+        ? (snapshot.artifactSources ?? []).flatMap(({ repositoryId, commitSha, path }) =>
+            path && repositoryId === dotenv.repositoryId && commitSha === dotenv.commitSha
+              ? [path + '/' + dotenv.path]
               : [],
           )
         : [];

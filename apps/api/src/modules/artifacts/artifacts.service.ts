@@ -19,7 +19,7 @@ import {
 import { ArrayMaxSize, ArrayUnique, IsArray, IsOptional, IsUUID } from 'class-validator';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { open, realpath } from 'node:fs/promises';
+import { copyFile, open, realpath } from 'node:fs/promises';
 import { basename, dirname, join, posix } from 'node:path';
 import type { Response } from 'express';
 import { dataDirectory } from '../../core/config';
@@ -161,6 +161,16 @@ type Verification = {
   reason?: string;
 };
 
+export type HistoricalWorkspace = {
+  kind: 'HISTORICAL';
+  artifactId: string;
+  runId: string;
+  createdAt: number;
+  sizeBytes: number | null;
+  serverId?: string;
+  sources: { repositoryId: string; ref?: string; commitSha: string; checkoutPath?: string }[];
+};
+
 function physicalOf(row: Pick<Instance, 'physical_json'>) {
   return row.physical_json ? (JSON.parse(row.physical_json) as ArtifactPhysical) : undefined;
 }
@@ -172,6 +182,35 @@ function archivedWorkspace(physical: ArtifactPhysical | undefined, storageType: 
     physical.workspace
     ? physical
     : undefined;
+}
+
+function reusableWorkspace(row: Instance, status: string | null) {
+  if (
+    status !== 'SUCCESS' ||
+    !row.graph_run_id ||
+    row.artifact_type !== 'FILE' ||
+    row.artifact_kind !== 'DIRECTORY' ||
+    row.lifecycle_state !== 'ACTIVE' ||
+    row.pruned_at !== null ||
+    row.temporary_root_id !== null
+  )
+    return undefined;
+  const physical = physicalOf(row);
+  if (
+    physical?.kind !== 'DIRECTORY' ||
+    physical.workspace?.runId !== row.graph_run_id ||
+    !physical.sha256 ||
+    !sha256.test(physical.sha256) ||
+    !Number.isSafeInteger(physical.sizeBytes) ||
+    physical.sizeBytes! < 0
+  )
+    return undefined;
+  return row.storage_type === 'REMOTE_FILE' &&
+    physical.location === 'SERVER_PATH' &&
+    physical.serverId &&
+    physical.serverId === row.server_id
+    ? physical
+    : archivedWorkspace(physical, row.storage_type);
 }
 
 function applicationServer(row: Pick<Instance, 'physical_json' | 'server_id'>) {
@@ -490,6 +529,7 @@ export class ArtifactsService {
         'flow.version as graphVersion',
         'flow.flow_name as graphFlowName',
         'flow.inputs_json as graphInputs',
+        'flow.status as workspaceRunStatus',
         'node.name as graphNodeName',
         'node.node_type as graphNodeType',
         'node.node_id as graphNodeId',
@@ -594,6 +634,9 @@ export class ArtifactsService {
       verificationReason: r.verification_reason,
       verifiedAt: r.verified_at,
       temporary: Boolean(r.temporary_root_id),
+      workspaceReusable:
+        !['MISSING', 'CHANGED', 'UNVERIFIABLE'].includes(r.verification_status ?? '') &&
+        Boolean(reusableWorkspace(r, r.workspaceRunStatus)),
       projectId: r.project_id,
       serviceId:
         r.service_id === graphUnscopedArtifactService(r.project_id).id ? null : r.service_id,
@@ -733,6 +776,95 @@ export class ArtifactsService {
     if (verification.status !== 'AVAILABLE')
       throw new ConflictException(verification.reason ?? '已登记的镜像实例不可用');
     return true;
+  }
+
+  private async historicalWorkspaceRow(db: Kysely<Database>, projectId: string, id: string) {
+    const row = await db
+      .selectFrom('artifacts')
+      .innerJoin('execution_flow_runs as flow', (join) =>
+        join
+          .onRef('flow.id', '=', 'artifacts.graph_run_id')
+          .onRef('flow.project_id', '=', 'artifacts.project_id'),
+      )
+      .selectAll('artifacts')
+      .select('flow.status as workspaceRunStatus')
+      .where('artifacts.id', '=', id)
+      .where('artifacts.project_id', '=', projectId)
+      .executeTakeFirst();
+    const physical = row && reusableWorkspace(row, row.workspaceRunStatus);
+    if (!row || !physical)
+      throw new ConflictException(
+        '所选产物不是当前项目中可用的持久执行目录，可能已清理或来源运行未成功',
+      );
+    return { row, physical, fingerprint: deploymentFingerprint(row) };
+  }
+
+  async planHistoricalWorkspace(projectId: string, id: string) {
+    const { row, fingerprint } = await this.historicalWorkspaceRow(this.database.db, projectId, id);
+    const verification = await this.check(row);
+    if (verification.status !== 'AVAILABLE')
+      throw new ConflictException(verification.reason ?? '历史执行目录无法校验');
+    const manifest = (await readArtifactSources(this.database.db, [id])).get(id) ?? [];
+    const source: HistoricalWorkspace = {
+      kind: 'HISTORICAL',
+      artifactId: id,
+      runId: row.graph_run_id!,
+      createdAt: row.created_at,
+      sizeBytes: row.size_bytes,
+      serverId: row.server_id ?? undefined,
+      sources: manifest.map(({ repositoryId, ref, commitSha, path }) => ({
+        repositoryId,
+        ref,
+        commitSha,
+        checkoutPath: path,
+      })),
+    };
+    return { ...source, fingerprint };
+  }
+
+  async confirmHistoricalWorkspace(
+    db: Kysely<Database>,
+    projectId: string,
+    source: HistoricalWorkspace & { fingerprint: string },
+  ) {
+    const fixed = await this.historicalWorkspaceRow(db, projectId, source.artifactId);
+    if (fixed.fingerprint !== source.fingerprint)
+      throw new ConflictException('历史目录校验信息发生变化，请重新选择或预览');
+    return fixed;
+  }
+
+  async stageHistoricalWorkspace(
+    projectId: string,
+    source: HistoricalWorkspace & { fingerprint: string },
+    destination: string,
+    signal: AbortSignal,
+  ) {
+    const { row, physical } = await this.confirmHistoricalWorkspace(
+      this.database.db,
+      projectId,
+      source,
+    );
+    if (!this.physical) throw new ConflictException('历史目录验证服务不可用');
+    const key = archiveKey(row);
+    if (key) {
+      const archive = await this.archiveReceipt(key, row);
+      signal.throwIfAborted();
+      // A whole workspace uses the original archive, even after backup recovery. The
+      // receiver hashes this private copy and compares the extracted directory manifest.
+      await copyFile(archive.localArchive, destination, constants.COPYFILE_EXCL);
+      return {
+        checksum: archive.checksum,
+        sizeBytes: archive.sizeBytes,
+        treeChecksum: physical.sha256!,
+        treeSize: physical.sizeBytes!,
+      };
+    }
+    const receipt = await this.physical.stageLocalPathArchive(physical, destination, '.', signal);
+    return {
+      ...receipt,
+      treeChecksum: physical.sha256!,
+      treeSize: physical.sizeBytes!,
+    };
   }
 
   private async recordCheck(row: Instance, check: Verification, userId?: string) {

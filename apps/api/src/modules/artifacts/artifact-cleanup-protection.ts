@@ -93,11 +93,14 @@ export async function protectedArtifacts(db: Kysely<Database>) {
     const payload = JSON.parse(task.payload_json) as {
       pipeline?: { deploymentArtifacts?: { id: string }[] };
       graphModule?: { shell?: { artifact?: { instanceId: string } } };
+      simplifiedAction?: { plan?: { workspaceSource?: { artifactId: string } } };
     };
     for (const artifact of payload.pipeline?.deploymentArtifacts ?? [])
       protectedIds.add(artifact.id);
     const scriptArtifact = payload.graphModule?.shell?.artifact;
     if (scriptArtifact) protectedIds.add(scriptArtifact.instanceId);
+    const workspaceInput = payload.simplifiedAction?.plan?.workspaceSource;
+    if (workspaceInput) protectedIds.add(workspaceInput.artifactId);
   }
   return protectedIds;
 }

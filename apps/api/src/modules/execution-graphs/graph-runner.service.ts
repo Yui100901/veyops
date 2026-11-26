@@ -147,6 +147,7 @@ import { normalizeRelativePath } from '../pipelines/pipeline.validation';
 import {
   flowImageTag,
   flowImageTagVariable,
+  publicWorkspaceSource,
   SimplifiedFlowRunService,
   type SimplifiedRunPlan,
   type SimplifiedSnapshotRequest,
@@ -1553,9 +1554,21 @@ export class GraphRunnerService implements OnModuleInit {
     }));
     if (authorizePlan)
       await authorizePlan({
-        serverIds: [...new Set([...(target ? [target.id] : []), ...(release?.serverIds ?? [])])],
-        repositoryIds: [...new Set(sources.map(({ repositoryId }) => repositoryId))],
-        serviceIds: release ? [release.serviceId] : [],
+        serverIds: [
+          ...new Set([
+            ...(target ? [target.id] : []),
+            ...(release?.serverIds ?? []),
+            ...(plan.workspaceSource?.serverId ? [plan.workspaceSource.serverId] : []),
+          ]),
+        ],
+        repositoryIds: [
+          ...new Set(
+            [...sources, ...(plan.workspaceSource?.sources ?? [])].map(
+              ({ repositoryId }) => repositoryId,
+            ),
+          ),
+        ],
+        serviceIds: plan.serviceId ? [plan.serviceId] : [],
         unbounded:
           flow.nodes.some(({ type }) => ['CHECK', 'SHELL', 'BUILD'].includes(type)) ||
           Boolean(release?.artifactId),
@@ -1577,7 +1590,14 @@ export class GraphRunnerService implements OnModuleInit {
       pipelineHash: release.planHash,
       profile: release.profile,
     };
-    const deliveries = publicRelease ? [publicDelivery(publicRelease, definition)] : [];
+    const deliveries = publicRelease
+      ? [
+          {
+            ...publicDelivery(publicRelease, definition),
+            artifactPath: release?.path === '.' ? undefined : release?.path,
+          },
+        ]
+      : [];
     const plans: Record<string, Delivery | GraphNodePlan> = Object.fromEntries(
       flow.nodes
         .filter(({ type }) => type === 'HEALTH_CHECK')
@@ -1646,6 +1666,9 @@ export class GraphRunnerService implements OnModuleInit {
         serverId: target?.id,
         serverName: target?.name,
         sources,
+        workspaceSource: simplifiedUsesWorkspace(selectedNodes)
+          ? publicWorkspaceSource(plan)
+          : undefined,
         finish: plan.finish,
         imageTagVariable: plan.finish.images?.some(({ source }) => source !== 'REGISTRY')
           ? flowImageTagVariable
@@ -1655,7 +1678,7 @@ export class GraphRunnerService implements OnModuleInit {
           serviceId: release.serviceId,
           serverIds: release.serverIds,
           artifactId: release.artifactId,
-          contentPath: release.path,
+          contentPath: release.path === '.' ? undefined : release.path,
           method: release.method,
           image: release.image,
           compose:
@@ -2853,9 +2876,12 @@ export class GraphRunnerService implements OnModuleInit {
       await this.lockProject(tx, projectId);
       const confirmed = await this.published(projectId, request.version, tx, true);
       if (simplified) {
-        await this.simplifiedRuns!.confirm(tx, simplified);
-        const existing = simplified.release?.artifactId;
-        if (existing) await lockAvailableArtifacts(tx, [existing]);
+        const referenced = [
+          simplified.release?.artifactId,
+          simplified.workspaceSource?.artifactId,
+        ].filter((id): id is string => Boolean(id));
+        if (referenced.length) await lockAvailableArtifacts(tx, referenced);
+        await this.simplifiedRuns!.confirm(tx, simplified, projectId);
       }
       for (const previous of environmentSets) {
         const latest = await resolveEnvironmentSet(tx, projectId, previous.id).catch(
@@ -5088,6 +5114,9 @@ export class GraphRunnerService implements OnModuleInit {
           branch: source.branch,
           tag: source.tag,
         })),
+        workspaceSource: simplifiedUsesWorkspace(flow.nodes)
+          ? publicWorkspaceSource(simplified)
+          : undefined,
         finish: simplified.finish,
         imageTag: simplified.finish.images?.some(({ source }) => source !== 'REGISTRY')
           ? flowImageTag(id)
@@ -5096,7 +5125,7 @@ export class GraphRunnerService implements OnModuleInit {
           serviceId: simplified.release.serviceId,
           serverIds: simplified.release.serverIds,
           artifactId: releaseArtifactId,
-          contentPath: simplified.release.path,
+          contentPath: simplified.release.path === '.' ? undefined : simplified.release.path,
           method: simplified.release.method,
           image: simplified.release.image,
         },
