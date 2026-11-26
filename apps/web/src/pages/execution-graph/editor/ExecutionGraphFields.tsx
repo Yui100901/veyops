@@ -67,6 +67,7 @@ interface ValueProps {
   artifactInstancesOnly?: boolean;
   credentialTypes?: readonly string[];
   compactTargets?: boolean;
+  useRepositoryDefault?: boolean;
 }
 
 function stringValue(value: unknown) {
@@ -240,14 +241,19 @@ function GitVersionValue({
   disabled,
   scope,
   checkRequired,
+  useRepositoryDefault,
 }: ValueProps) {
   const current = value as { kind?: string; value?: string } | undefined;
-  const kind = current?.kind ?? 'BRANCH';
+  const kind = current?.kind ?? (useRepositoryDefault ? 'DEFAULT' : 'BRANCH');
+  const trackBranches = kind === 'BRANCH' || kind === 'DEFAULT';
   const list = useId();
   const repositoryPath = scope?.repositoryId
     ? '/projects/' + project.id + '/repositories/' + scope.repositoryId
     : null;
-  const branches = useRepositoryBranches(kind === 'BRANCH' ? repositoryPath : null);
+  const branches = useRepositoryBranches(trackBranches ? repositoryPath : null);
+  const defaultBranch = branches.data
+    ? branches.data.defaultBranch
+    : project.repositories.find(({ id }) => id === scope?.repositoryId)?.defaultBranch;
   return (
     <div className="graph-fields">
       <div className="graph-field-pair">
@@ -255,35 +261,43 @@ function GitVersionValue({
           <select
             value={kind}
             disabled={disabled}
-            onChange={(event) => change({ kind: event.target.value, value: '' })}
+            onChange={(event) => {
+              const kind = event.target.value;
+              change(kind === 'DEFAULT' ? undefined : { kind, value: '' });
+            }}
           >
+            {useRepositoryDefault && (
+              <option value="DEFAULT">
+                仓库默认分支{defaultBranch ? `（${defaultBranch}）` : ''}
+              </option>
+            )}
             <option value="BRANCH">分支</option>
             <option value="TAG">标签</option>
             <option value="COMMIT">提交 SHA</option>
           </select>
         </Field>
-        <Field
-          label={kind === 'BRANCH' ? '分支名称' : kind === 'TAG' ? '标签名称' : '完整提交 SHA'}
-        >
-          <input
-            required={checkRequired && (field.required || value !== undefined)}
-            disabled={disabled}
-            value={current?.value ?? ''}
-            list={kind === 'BRANCH' ? list : undefined}
-            pattern={kind === 'COMMIT' ? '(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})' : undefined}
-            onChange={(event) => change({ kind, value: event.target.value })}
-          />
-          <datalist id={list}>
-            {branches.data?.branches.map(({ name }) => (
-              <option value={name} key={name} />
-            ))}
-          </datalist>
-        </Field>
+        {kind !== 'DEFAULT' && (
+          <Field
+            label={kind === 'BRANCH' ? '分支名称' : kind === 'TAG' ? '标签名称' : '完整提交 SHA'}
+          >
+            <input
+              required={checkRequired && (field.required || value !== undefined)}
+              disabled={disabled}
+              value={current?.value ?? ''}
+              list={kind === 'BRANCH' ? list : undefined}
+              pattern={kind === 'COMMIT' ? '(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})' : undefined}
+              onChange={(event) => change({ kind, value: event.target.value })}
+            />
+            <datalist id={list}>
+              {branches.data?.branches.map(({ name }) => (
+                <option value={name} key={name} />
+              ))}
+            </datalist>
+          </Field>
+        )}
       </div>
-      {repositoryPath && kind === 'BRANCH' && !disabled && (
-        <BranchSyncControls branches={branches} />
-      )}
-      {!field.required && value !== undefined && !disabled && (
+      {repositoryPath && trackBranches && !disabled && <BranchSyncControls branches={branches} />}
+      {!useRepositoryDefault && !field.required && value !== undefined && !disabled && (
         <button type="button" className="button secondary small" onClick={() => change(undefined)}>
           清除版本
         </button>

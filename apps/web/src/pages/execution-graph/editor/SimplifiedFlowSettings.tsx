@@ -267,7 +267,10 @@ export function SimplifiedStartSettings({
         targetControl()
       )}
       {(hasCheckout || sources.length > 0) && (
-        <fieldset className="graph-fields" data-graph-node-field="start.sources">
+        <fieldset
+          className="graph-fields graph-source-settings"
+          data-graph-node-field="start.sources"
+        >
           <legend>源码</legend>
           {hasCheckout && !sources.length && !releaseAction && (
             <p className="field-note">未配置源码时，手动运行需选择同项目的历史目录。</p>
@@ -283,8 +286,8 @@ export function SimplifiedStartSettings({
               : undefined;
             const directory = repo && simplifiedSourceDirectory(repo.cloneUrl);
             return (
-              <div className="graph-field-card graph-fields" key={source.id}>
-                <div className="form-grid">
+              <div className="graph-field-card graph-source-card" key={source.id}>
+                <div className="graph-source-fields">
                   {control(
                     sourcePath + 'repositoryId',
                     '项目仓库',
@@ -306,49 +309,52 @@ export function SimplifiedStartSettings({
                       }
                       disabled={!canEdit}
                       scope={{ repositoryId: source.repositoryId }}
+                      useRepositoryDefault
                     />
                   </div>
                 </div>
-                <div className="heading-actions">
-                  {directory && (
-                    <span className="field-note graph-workspace-path">
-                      源码目录 ·{' '}
-                      <code>
-                        ./
-                        {legacy?.parentDirectory && legacy.parentDirectory !== '.'
-                          ? `${legacy.parentDirectory}/`
-                          : ''}
-                        {directory}
-                      </code>
-                    </span>
-                  )}
-                  {legacy?.allowRefOverride && (
-                    <span className="field-note">此发布版本允许运行时更换 Git 版本。</span>
-                  )}
-                  {canEdit && (
-                    <button
-                      type="button"
-                      className="button secondary small"
-                      aria-label={'移除源码 ' + (repo?.name ?? index + 1)}
-                      onClick={() => updateSources(sources.filter(({ id }) => id !== source.id))}
-                    >
-                      <Trash2 size={14} /> 移除源码
-                    </button>
-                  )}
-                </div>
+                {(directory || legacy?.allowRefOverride || canEdit) && (
+                  <div className="graph-source-footer">
+                    <div className="graph-source-meta">
+                      {directory && (
+                        <span className="field-note graph-workspace-path">
+                          源码目录 ·{' '}
+                          <code>
+                            ./
+                            {legacy?.parentDirectory && legacy.parentDirectory !== '.'
+                              ? `${legacy.parentDirectory}/`
+                              : ''}
+                            {directory}
+                          </code>
+                        </span>
+                      )}
+                      {legacy?.allowRefOverride && (
+                        <span className="field-note">此发布版本允许运行时更换 Git 版本。</span>
+                      )}
+                    </div>
+                    {canEdit && (
+                      <button
+                        type="button"
+                        className="button secondary small"
+                        aria-label={'移除源码 ' + (repo?.name ?? index + 1)}
+                        onClick={() => updateSources(sources.filter(({ id }) => id !== source.id))}
+                      >
+                        <Trash2 size={14} aria-hidden="true" /> 移除源码
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}
           {canEdit && hasCheckout && sources.length < 12 && (
-            <div className="heading-actions">
-              <button
-                type="button"
-                className="button secondary small"
-                onClick={() => updateSources([...sources, { id: graphKey('source') }])}
-              >
-                <Plus size={14} /> 添加源码
-              </button>
-            </div>
+            <button
+              type="button"
+              className="button secondary small graph-source-add"
+              onClick={() => updateSources([...sources, { id: graphKey('source') }])}
+            >
+              <Plus size={14} aria-hidden="true" /> 添加源码
+            </button>
           )}
         </fieldset>
       )}
