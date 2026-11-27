@@ -15,7 +15,7 @@ import {
   serviceDeliveryHeads,
   serviceDeliveryStatus,
 } from '../deployments/service-delivery-status';
-import { projectAddressLinks } from '../projects/project-card-data';
+import { projectAddressDto, projectAddressLinks } from '../projects/project-card-data';
 
 class PortalQuery {
   @IsOptional() @IsString() @MaxLength(160) q?: string;
@@ -55,7 +55,7 @@ export class PortalService {
         .execute(),
     ]);
     const byService = new Map<string, { id: string; name: string; url: string }[]>();
-    for (const { serviceId, id, name, url } of addresses) {
+    for (const { serviceId, id, name, url } of addresses.map(projectAddressDto)) {
       const links = byService.get(serviceId);
       if (links) links.push({ id, name, url });
       else byService.set(serviceId, [{ id, name, url }]);

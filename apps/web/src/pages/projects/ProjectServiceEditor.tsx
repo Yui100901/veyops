@@ -1,13 +1,19 @@
 import { useRef, useState, type FormEvent } from 'react';
 import { ArrowDown, ArrowUp, Plus, Trash2 } from 'lucide-react';
-import { ApiError, api, message, post } from '../../api';
+import { ApiError, api, message, post, useResource } from '../../api';
 import { Field, Form, Modal } from '../../components';
 import { InlineEditor } from '../../InlineEditor';
-import type { Service } from '../../models';
+import type { Server, Service, ServiceAddressBinding } from '../../models';
 import { ProjectAccessLinks, projectAccessUrl } from './ProjectAccessLinks';
 
-type AddressDraft = { id?: string; key: string; name: string; url: string };
-type AddressField = 'name' | 'url' | 'id';
+type AddressDraft = {
+  id?: string;
+  key: string;
+  name: string;
+  url: string;
+  binding?: ServiceAddressBinding;
+};
+type AddressField = 'name' | 'url' | 'id' | 'binding';
 type AddressErrors = Record<string, Partial<Record<AddressField, string>>>;
 
 function fieldErrors(details: Record<string, unknown> | undefined, rows: AddressDraft[]) {
@@ -17,7 +23,7 @@ function fieldErrors(details: Record<string, unknown> | undefined, rows: Address
     const path = issue?.path;
     if (!Array.isArray(path) || path[0] !== 'addresses' || !Number.isInteger(path[1])) continue;
     const field = path[2];
-    if (field !== 'name' && field !== 'url' && field !== 'id') continue;
+    if (field !== 'name' && field !== 'url' && field !== 'id' && field !== 'binding') continue;
     const row = rows[path[1]];
     if (row && typeof issue.message === 'string') {
       errors[row.key] = { ...errors[row.key], [field as AddressField]: issue.message };
@@ -30,10 +36,23 @@ function focusAddress(form: HTMLFormElement, errors: AddressErrors) {
   const first = Object.entries(errors)[0];
   if (!first) return;
   const [key, fields] = first;
-  const field = fields.name || fields.id ? 'name' : 'url';
+  const field = fields.name || fields.id ? 'name' : fields.binding ? 'binding' : 'url';
   form
     .querySelector<HTMLInputElement>(`[data-address-row="${key}"] [data-address-field="${field}"]`)
     ?.focus();
+}
+
+function previewAddress(binding: ServiceAddressBinding, serverHost = '') {
+  const host = binding.host?.trim() || serverHost;
+  if (!host || !binding.port || /[\s/@?#\\]/.test(host)) return;
+  const authority = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  const parsed = URL.parse(
+    `${binding.protocol}://${authority}:${binding.externalPort ?? binding.port}`,
+  );
+  if (!parsed || (binding.path && (!binding.path.startsWith('/') || /[?#\\]/.test(binding.path))))
+    return;
+  if (binding.path) parsed.pathname = binding.path;
+  return parsed.href;
 }
 
 export function ProjectServiceEditor({
@@ -59,6 +78,8 @@ export function ProjectServiceEditor({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [errors, setErrors] = useState<AddressErrors>({});
+  const hasBinding = rows.some((row) => row.binding);
+  const servers = useResource<Server[]>(hasBinding ? '/servers' : null);
   const path = `/projects/${projectId}/services`;
   const itemPath = service ? `${path}/${service.id}` : undefined;
 
@@ -90,6 +111,14 @@ export function ProjectServiceEditor({
     setErrors((current) => ({ ...current, [key]: { ...current[key], [field]: undefined } }));
   }
 
+  function setBinding(key: string, binding?: ServiceAddressBinding) {
+    setRows((current) => current.map((row) => (row.key === key ? { ...row, binding } : row)));
+    setErrors((current) => ({
+      ...current,
+      [key]: { ...current[key], binding: undefined, url: undefined },
+    }));
+  }
+
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (modal) event.stopPropagation();
@@ -103,12 +132,19 @@ export function ProjectServiceEditor({
       serviceType: value('serviceType'),
       description: value('description'),
     };
-    const addresses = rows.map(({ id, name, url }) => ({ id, name: name.trim(), url: url.trim() }));
+    const addresses = rows.map(({ id, name, url, binding }) => ({
+      id,
+      name: name.trim(),
+      url: url.trim(),
+      binding,
+    }));
     const invalid = Object.fromEntries(
-      addresses.flatMap(({ name, url }, index) => {
+      addresses.flatMap(({ name, url, binding }, index) => {
         const issues = {
           ...(!name && { name: '请输入地址名称。' }),
-          ...(!projectAccessUrl(url) && { url: '请输入不含登录凭据的 HTTP(S) 地址。' }),
+          ...(!binding && !projectAccessUrl(url) && { url: '请输入不含登录凭据的 HTTP(S) 地址。' }),
+          ...(binding &&
+            (!binding.serverId || !binding.port) && { binding: '请选择服务器并填写监听端口。' }),
         };
         return Object.keys(issues).length ? [[rows[index].key, issues]] : [];
       }),
@@ -133,7 +169,12 @@ export function ProjectServiceEditor({
         addresses.length !== initialAddresses.length ||
         addresses.some((row, index) => {
           const initial = initialAddresses[index];
-          return row.id !== initial.id || row.name !== initial.name || row.url !== initial.url;
+          return (
+            row.id !== initial.id ||
+            row.name !== initial.name ||
+            row.url !== initial.url ||
+            JSON.stringify(row.binding) !== JSON.stringify(initial.binding)
+          );
         });
       const saved = itemPath
         ? await api<Service>(itemPath, {
@@ -217,84 +258,214 @@ export function ProjectServiceEditor({
         <fieldset className="service-address-editor">
           <legend>访问地址</legend>
           {!rows.length && <p className="muted">暂无访问地址</p>}
-          {rows.map((row, index) => (
-            <div
-              key={row.key}
-              className="service-address-editor-row"
-              data-address-row={row.key}
-              role="group"
-              aria-label={`第 ${index + 1} 条地址`}
-            >
-              <Field label="地址名称">
-                <input
-                  value={row.name}
-                  data-address-field="name"
-                  maxLength={100}
-                  onChange={(event) => change(row.key, 'name', event.target.value)}
-                  aria-invalid={Boolean(errors[row.key]?.name)}
-                />
-                {errors[row.key]?.name && (
+          {rows.map((row, index) => {
+            const binding = row.binding;
+            const host = servers.data?.find(({ id }) => id === binding?.serverId)?.host;
+            const preview = binding && previewAddress(binding, host);
+            return (
+              <div
+                key={row.key}
+                className="service-address-editor-row"
+                data-address-row={row.key}
+                role="group"
+                aria-label={`第 ${index + 1} 条地址`}
+              >
+                <Field label="地址名称">
+                  <input
+                    value={row.name}
+                    data-address-field="name"
+                    maxLength={100}
+                    onChange={(event) => change(row.key, 'name', event.target.value)}
+                    aria-invalid={Boolean(errors[row.key]?.name)}
+                  />
+                  {errors[row.key]?.name && (
+                    <small className="error-text" role="alert">
+                      {errors[row.key].name}
+                    </small>
+                  )}
+                </Field>
+                <div className="service-address-fields">
+                  <Field label="地址来源">
+                    <select
+                      value={binding ? 'PORT' : 'URL'}
+                      disabled={busy}
+                      onChange={(event) => {
+                        setBinding(
+                          row.key,
+                          event.target.value === 'PORT'
+                            ? { serverId: '', protocol: 'http', port: 0 }
+                            : undefined,
+                        );
+                      }}
+                    >
+                      <option value="URL">手动填写完整 URL</option>
+                      <option value="PORT">按服务器和端口生成</option>
+                    </select>
+                  </Field>
+                  {binding ? (
+                    <>
+                      <div className="service-address-binding">
+                        <Field label="服务器">
+                          <select
+                            data-address-field="binding"
+                            value={binding.serverId}
+                            disabled={busy || servers.loading}
+                            onChange={(event) =>
+                              setBinding(row.key, { ...binding, serverId: event.target.value })
+                            }
+                          >
+                            <option value="">选择服务器</option>
+                            {binding.serverId &&
+                              !servers.data?.some(({ id }) => id === binding.serverId) && (
+                                <option value={binding.serverId}>已关联服务器</option>
+                              )}
+                            {servers.data?.map((server) => (
+                              <option key={server.id} value={server.id}>
+                                {server.name} · {server.host}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                        <Field label="监听端口">
+                          <input
+                            type="number"
+                            min={1}
+                            max={65535}
+                            value={binding.port || ''}
+                            onChange={(event) =>
+                              setBinding(row.key, { ...binding, port: Number(event.target.value) })
+                            }
+                          />
+                        </Field>
+                        <Field label="协议">
+                          <select
+                            value={binding.protocol}
+                            onChange={(event) =>
+                              setBinding(row.key, {
+                                ...binding,
+                                protocol: event.target.value === 'https' ? 'https' : 'http',
+                              })
+                            }
+                          >
+                            <option value="http">HTTP</option>
+                            <option value="https">HTTPS</option>
+                          </select>
+                        </Field>
+                        <Field label="访问主机（可选）">
+                          <input
+                            value={binding.host ?? ''}
+                            placeholder={host ?? '默认使用服务器地址'}
+                            maxLength={253}
+                            onChange={(event) =>
+                              setBinding(row.key, {
+                                ...binding,
+                                host: event.target.value || undefined,
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field label="对外端口（可选）">
+                          <input
+                            type="number"
+                            min={1}
+                            max={65535}
+                            value={binding.externalPort ?? ''}
+                            onChange={(event) =>
+                              setBinding(row.key, {
+                                ...binding,
+                                externalPort: Number(event.target.value) || undefined,
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field label="路径（可选）">
+                          <input
+                            value={binding.path ?? ''}
+                            placeholder="/"
+                            maxLength={1024}
+                            onChange={(event) =>
+                              setBinding(row.key, {
+                                ...binding,
+                                path: event.target.value || undefined,
+                              })
+                            }
+                          />
+                        </Field>
+                      </div>
+                      <p className="muted">
+                        SSH 地址与服务入口不同时，可填写实际访问主机及对外端口。
+                      </p>
+                      {preview && (
+                        <p className="service-address-preview">
+                          <code>{preview}</code>
+                        </p>
+                      )}
+                      {(errors[row.key]?.binding || servers.error) && (
+                        <small className="error-text" role="alert">
+                          {errors[row.key]?.binding || servers.error}
+                        </small>
+                      )}
+                    </>
+                  ) : (
+                    <Field label="访问 URL">
+                      <input
+                        value={row.url}
+                        data-address-field="url"
+                        maxLength={2048}
+                        inputMode="url"
+                        onChange={(event) => change(row.key, 'url', event.target.value)}
+                        aria-invalid={Boolean(errors[row.key]?.url)}
+                      />
+                      {errors[row.key]?.url && (
+                        <small className="error-text" role="alert">
+                          {errors[row.key].url}
+                        </small>
+                      )}
+                    </Field>
+                  )}
+                </div>
+                <div className="row-actions service-address-order">
+                  <button
+                    type="button"
+                    className="button secondary small"
+                    aria-label={`上移第 ${index + 1} 条地址`}
+                    title="上移"
+                    disabled={busy || index === 0}
+                    onClick={() => move(index, -1)}
+                  >
+                    <ArrowUp size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className="button secondary small"
+                    aria-label={`下移第 ${index + 1} 条地址`}
+                    title="下移"
+                    disabled={busy || index === rows.length - 1}
+                    onClick={() => move(index, 1)}
+                  >
+                    <ArrowDown size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className="button secondary small"
+                    aria-label={`删除第 ${index + 1} 条地址`}
+                    title="删除地址"
+                    disabled={busy}
+                    onClick={() =>
+                      setRows((current) => current.filter((item) => item.key !== row.key))
+                    }
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+                {errors[row.key]?.id && (
                   <small className="error-text" role="alert">
-                    {errors[row.key].name}
+                    {errors[row.key].id}
                   </small>
                 )}
-              </Field>
-              <Field label="访问 URL">
-                <input
-                  value={row.url}
-                  data-address-field="url"
-                  maxLength={2048}
-                  inputMode="url"
-                  onChange={(event) => change(row.key, 'url', event.target.value)}
-                  aria-invalid={Boolean(errors[row.key]?.url)}
-                />
-                {errors[row.key]?.url && (
-                  <small className="error-text" role="alert">
-                    {errors[row.key].url}
-                  </small>
-                )}
-              </Field>
-              <div className="row-actions service-address-order">
-                <button
-                  type="button"
-                  className="button secondary small"
-                  aria-label={`上移第 ${index + 1} 条地址`}
-                  title="上移"
-                  disabled={busy || index === 0}
-                  onClick={() => move(index, -1)}
-                >
-                  <ArrowUp size={16} />
-                </button>
-                <button
-                  type="button"
-                  className="button secondary small"
-                  aria-label={`下移第 ${index + 1} 条地址`}
-                  title="下移"
-                  disabled={busy || index === rows.length - 1}
-                  onClick={() => move(index, 1)}
-                >
-                  <ArrowDown size={16} />
-                </button>
-                <button
-                  type="button"
-                  className="button secondary small"
-                  aria-label={`删除第 ${index + 1} 条地址`}
-                  title="删除地址"
-                  disabled={busy}
-                  onClick={() =>
-                    setRows((current) => current.filter((item) => item.key !== row.key))
-                  }
-                >
-                  <Trash2 size={16} />
-                </button>
               </div>
-              {errors[row.key]?.id && (
-                <small className="error-text" role="alert">
-                  {errors[row.key].id}
-                </small>
-              )}
-            </div>
-          ))}
+            );
+          })}
           <button
             type="button"
             className="button secondary small"

@@ -436,7 +436,9 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
     ),
     false,
   );
-  assert.deepEqual(await db.selectFrom('service_addresses').selectAll().execute(), [address]);
+  assert.deepEqual(await db.selectFrom('service_addresses').selectAll().execute(), [
+    { ...address, binding_server_id: null, binding_json: null },
+  ]);
   assert.deepEqual(await db.selectFrom('services').select('id').execute(), [{ id: 'service' }]);
   assert.deepEqual(
     await db.selectFrom('execution_flow_runs').select('id').orderBy('id').execute(),

@@ -129,6 +129,8 @@ export interface ServiceAddressesTable {
   name: string;
   url: string;
   position: number;
+  binding_server_id: Generated<string | null>;
+  binding_json: Generated<string | null>;
 }
 
 export interface ServiceRepositoriesTable {

@@ -148,8 +148,24 @@
 }
 
 .service-address-editor-row > .field,
-.service-address-editor > p {
+.service-address-editor > p,
+.service-address-fields p {
   margin: 0;
+}
+
+.service-address-fields,
+.service-address-binding {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.service-address-binding {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr));
+}
+
+.service-address-preview {
+  overflow-wrap: anywhere;
 }
 
 .service-address-order {

@@ -46,7 +46,7 @@ import { Roles } from '../auth/auth.decorators';
 import type { CurrentUser } from '../auth/auth.decorators';
 import type { AuthRequest } from '../auth/auth.guard';
 import { recentDeployments } from '../deployments/deployment-history';
-import { byProject, projectAddressLinks } from './project-card-data';
+import { byProject, projectAddressDto, projectAddressLinks } from './project-card-data';
 import { projectServices, saveServiceAddresses, serviceDto } from './service-addresses';
 import { pipelineSourceRepositories } from '../pipelines/pipeline-node-config';
 import type { PipelineDefinition } from '../pipelines/pipeline.types';
@@ -187,7 +187,7 @@ export class ProjectsService {
             .execute()
         : [],
     ]);
-    const links = byProject(addresses);
+    const links = byProject(addresses.map(projectAddressDto));
     const sets = byProject(environmentSets);
     return rows.map((r) => ({
       id: r.id,

@@ -222,10 +222,19 @@ export interface Repository {
   credentialId?: string | null;
   description?: string;
 }
+export interface ServiceAddressBinding {
+  serverId: string;
+  protocol: 'http' | 'https';
+  port: number;
+  host?: string;
+  externalPort?: number;
+  path?: string;
+}
 export interface ServiceAddress {
   id: string;
   name: string;
   url: string;
+  binding?: ServiceAddressBinding;
 }
 export interface Service {
   id: string;

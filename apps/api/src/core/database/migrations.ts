@@ -2217,6 +2217,21 @@ export const migrationProvider: MigrationProvider = {
           await db.schema.dropTable('interactive_command_inputs').execute();
         },
       } satisfies Migration,
+      '047_service_address_bindings': {
+        async up(db) {
+          await db.schema
+            .alterTable('service_addresses')
+            .addColumn('binding_server_id', 'text', (column) =>
+              column.references('servers.id').onDelete('set null'),
+            )
+            .execute();
+          await db.schema.alterTable('service_addresses').addColumn('binding_json', 'text').execute();
+        },
+        async down(db) {
+          await db.schema.alterTable('service_addresses').dropColumn('binding_json').execute();
+          await db.schema.alterTable('service_addresses').dropColumn('binding_server_id').execute();
+        },
+      } satisfies Migration,
     };
   },
 };

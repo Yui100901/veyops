@@ -280,6 +280,37 @@ async function checkResources(databaseUrl?: string) {
       addresses: [address],
     });
     assert.deepEqual(retainedAddress.addresses, [address]);
+    const accessServer = await create('/servers', { ...serverInput, name: 'Access test host' });
+    const boundServicePath = '/projects/' + peer.id + '/services';
+    const boundService = await create(boundServicePath, {
+      name: 'Bound service', slug: 'bound-service',
+      addresses: [
+        { name: 'Internal', binding: { serverId: accessServer.id, protocol: 'http', port: 8080 } },
+        { name: 'External', binding: {
+          serverId: accessServer.id, protocol: 'https', port: 8080,
+          host: 'service.example.invalid', externalPort: 443, path: '/app',
+        } },
+        { name: 'Manual', url: 'https://proxy.example.invalid/route?via=portal' },
+      ],
+    });
+    assert.deepEqual(boundService.addresses.map(({ url }: { url: string }) => url), [
+      'http://127.0.0.1:8080/', 'https://service.example.invalid/app',
+      'https://proxy.example.invalid/route?via=portal',
+    ]);
+    assert.equal(boundService.addresses[1].binding.port, 8080);
+    await app.get(DatabaseService).db.updateTable('servers').set({ host: '2001:db8::2' })
+      .where('id', '=', accessServer.id).execute();
+    const details = await fetch(`${boundServicePath}/${boundService.id}`);
+    assert.equal(details.addresses[0].url, 'http://[2001:db8::2]:8080/');
+    assert.equal(details.addresses[1].url, 'https://service.example.invalid/app');
+    const portal = await fetch(`/portal?projectId=${peer.id}`);
+    assert.equal(portal.projects[0].services[0].addresses[0].url, details.addresses[0].url);
+    await api.patch(base + `${boundServicePath}/${boundService.id}`).send({
+      expectedRevision: boundService.revision,
+      addresses: [{ name: 'Invalid', binding: {
+        serverId: accessServer.id, protocol: 'http', port: 8080, host: 'other.example.invalid@bad.test',
+      } }],
+    }).expect(400);
     await api
       .patch(base + '/projects/' + peer.id + '/services/' + service.id)
       .send({ expectedRevision: retainedAddress.revision, name: 'Wrong project', slug: 'wrong' })
