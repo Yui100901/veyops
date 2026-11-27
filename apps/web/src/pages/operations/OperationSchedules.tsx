@@ -99,13 +99,10 @@ interface SourceVersion {
 }
 
 const kinds: Record<ScheduleKind, string> = {
-  COMMAND_TEMPLATE: '命令模板',
+  COMMAND_TEMPLATE: '已停用的命令模板',
   OPERATION_PLAN: '运维方案',
 };
-const sourcePaths: Record<ScheduleKind, string> = {
-  COMMAND_TEMPLATE: '/command-templates',
-  OPERATION_PLAN: '/operation-plans',
-};
+const planPath = '/operation-plans';
 
 export function civilTime(value: number, timeZone: string) {
   const parts = Object.fromEntries(
@@ -213,9 +210,9 @@ function ScheduleEditor({
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const [kind, setKind] = useState<ScheduleKind>(initial?.kind ?? 'COMMAND_TEMPLATE');
-  const [sourceId, setSourceId] = useState(initial?.sourceId ?? '');
-  const [version, setVersion] = useState(initial?.sourceVersion);
+  const initialPlan = initial?.kind === 'OPERATION_PLAN' ? initial : undefined;
+  const [sourceId, setSourceId] = useState(initialPlan?.sourceId ?? '');
+  const [version, setVersion] = useState(initialPlan?.sourceVersion);
   const [timing, setTiming] = useState<'ONCE' | 'INTERVAL' | 'CRON' | 'DAILY' | 'WEEKLY'>(
     initial?.timing.type ?? 'INTERVAL',
   );
@@ -228,9 +225,9 @@ function ScheduleEditor({
   }>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const sources = useResource<ScheduleSource[]>(sourcePaths[kind]);
+  const sources = useResource<ScheduleSource[]>(planPath);
   const versions = useResource<SourceVersion[]>(
-    sourceId ? sourcePaths[kind] + '/' + sourceId + '/versions' : null,
+    sourceId ? planPath + '/' + encodeURIComponent(sourceId) + '/versions' : null,
   );
   const servers = useResource<Server[]>('/servers');
   const groups = useResource<ServerGroup[]>('/server-groups');
@@ -252,7 +249,7 @@ function ScheduleEditor({
         !selectedVersion ||
         !versions.data?.some((item) => item.version === selectedVersion)
       )
-        throw new Error('请选择已有的命令模板或运维方案版本。');
+        throw new Error('请选择已有的运维方案版本。');
       const timeZone = String(data.get('timeZone')).trim();
       new Intl.DateTimeFormat('zh-CN', { timeZone });
       const intervalSeconds = Number(data.get('intervalSeconds'));
@@ -289,7 +286,7 @@ function ScheduleEditor({
       }
       const config: ScheduleConfig = {
         name: String(data.get('name')).trim(),
-        kind,
+        kind: 'OPERATION_PLAN',
         sourceId,
         sourceVersion: selectedVersion,
         timing: planTiming,
@@ -353,23 +350,7 @@ function ScheduleEditor({
             <input name="name" required maxLength={120} defaultValue={initial?.name} />
           </Field>
           <div className="form-grid">
-            <Field label="执行类型">
-              <select
-                value={kind}
-                onChange={(event) => {
-                  setKind(event.target.value as ScheduleKind);
-                  setSourceId('');
-                  setVersion(undefined);
-                }}
-              >
-                {Object.entries(kinds).map(([id, label]) => (
-                  <option value={id} key={id}>
-                    {label}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label={kinds[kind]} required>
+            <Field label="运维方案" required>
               <select
                 required
                 value={sourceId}
@@ -379,7 +360,7 @@ function ScheduleEditor({
                 }}
               >
                 <option value="" disabled>
-                  请选择{kinds[kind]}
+                  请选择运维方案
                 </option>
                 {sources.data
                   ?.filter((item) => item.enabled !== false || item.id === sourceId)
@@ -762,8 +743,7 @@ export function OperationSchedulesPage({ user }: { user: User }) {
   const systemZone = useResource<{ timeZone: string }>(
     user.role === 'VIEWER' ? null : endpoint + '/time-zone',
   );
-  const templates = useResource<ScheduleSource[]>(sourcePaths.COMMAND_TEMPLATE);
-  const plans = useResource<ScheduleSource[]>(sourcePaths.OPERATION_PLAN);
+  const plans = useResource<ScheduleSource[]>(planPath);
   const [editing, setEditing] = useInlineEditor<OperationSchedule | 'new'>();
   const [viewing, setViewing] = useState<OperationSchedule>();
   const [deleting, setDeleting] = useState<OperationSchedule>();
@@ -773,9 +753,7 @@ export function OperationSchedulesPage({ user }: { user: User }) {
   }>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const sourceNames = new Map(
-    [...(templates.data ?? []), ...(plans.data ?? [])].map((source) => [source.id, source.name]),
-  );
+  const sourceNames = new Map(plans.data?.map((source) => [source.id, source.name]));
   async function change(action: () => Promise<unknown>) {
     setBusy(true);
     setError('');
@@ -829,7 +807,7 @@ export function OperationSchedulesPage({ user }: { user: User }) {
       <div hidden={Boolean(editing)}>
         <Section
           title="定时任务"
-          subtitle="按计划运行固定版本的模板和方案。"
+          subtitle="按计划运行固定版本的运维方案。"
           action={
             <div className="row-actions">
               <RefreshButton onClick={schedules.reload} />
@@ -951,7 +929,7 @@ export function OperationSchedulesPage({ user }: { user: User }) {
                                   <button
                                     className="button secondary small"
                                     type="button"
-                                    disabled={busy}
+                                    disabled={busy || schedule.kind !== 'OPERATION_PLAN'}
                                     onClick={() => previewEnable(schedule)}
                                   >
                                     启用

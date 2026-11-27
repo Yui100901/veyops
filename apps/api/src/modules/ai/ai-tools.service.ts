@@ -110,7 +110,7 @@ export const aiToolDefinitions = [
     { definition: str },
     ['definition'],
   ),
-  tool('get_operation_plan', '读取当前页面已选运维方案的版本和步骤列表', {
+  tool('get_operation_plan', '读取当前页面已选运维方案的版本、节点和分支', {
     operationPlanId: str,
   }),
   tool(
@@ -697,6 +697,16 @@ export class AiToolsService {
           version: plan.version,
           category: plan.category,
           steps: plan.steps.map(({ name, timeout }) => ({ name, timeout })),
+          chain: {
+            nodes: plan.chain.nodes.map(({ id, type, name, timeout, fact }) => ({
+              id,
+              type,
+              name,
+              timeout,
+              fact,
+            })),
+            edges: plan.chain.edges,
+          },
         };
       }
       case 'draft_pipeline':

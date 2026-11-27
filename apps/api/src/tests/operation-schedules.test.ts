@@ -147,18 +147,21 @@ async function verifySchedules(databaseUrl?: string) {
       name: 'Fixture group',
       serverIds: [serverA.id],
     });
-    const command = await create('/command-templates', {
-      name: 'Fixture command',
-      command: 'printf "$VEYOPS_PARAM_MESSAGE"',
+    const versionedPlan = await create('/operation-plans', {
+      name: 'Fixture versioned plan',
+      steps: [{ name: 'Observe', command: 'printf "$VEYOPS_PARAM_MESSAGE"' }],
       parameters: [{ name: 'MESSAGE', type: 'STRING', required: true }],
     });
     await api
-      .patch(base + '/command-templates/' + command.id)
+      .patch(base + '/operation-plans/' + versionedPlan.id)
       .send({
         name: 'Updated fixture',
-        command: 'printf "second version"',
+        steps: [{ name: 'Observe', command: 'printf "second version"' }],
       })
       .expect(200);
+    const historyOfPlan = (
+      await api.get(base + '/operation-plans/' + versionedPlan.id + '/versions').expect(200)
+    ).body.data;
     const plan = await create('/operation-plans', {
       name: 'Fixture plan',
       steps: [{ name: 'Observe', command: 'uname -a' }],
@@ -168,8 +171,8 @@ async function verifySchedules(databaseUrl?: string) {
     const root = '/operation-schedules';
     const body = {
       name: 'Fixture interval',
-      kind: 'COMMAND_TEMPLATE',
-      sourceId: command.id,
+      kind: 'OPERATION_PLAN',
+      sourceId: versionedPlan.id,
       sourceVersion: 1,
       timing: { type: 'INTERVAL', intervalSeconds: 10, timeZone: 'UTC' },
       target: { serverIds: [], groupIds: [group.id] },
@@ -179,6 +182,10 @@ async function verifySchedules(databaseUrl?: string) {
       failurePolicy: 'STOP',
       timeoutSeconds: 37,
     };
+    await api
+      .post(base + root + '/preview')
+      .send({ ...body, kind: 'COMMAND_TEMPLATE' })
+      .expect(400);
     const save = async (data: object, session = api) => {
       const preview = await create(root + '/preview', data, session);
       return create(
@@ -212,7 +219,10 @@ async function verifySchedules(databaseUrl?: string) {
       .where('id', '=', first.taskId)
       .executeTakeFirstOrThrow();
     const task = JSON.parse(persisted.payload_json);
-    assert.equal(task.commandTemplate.version, 1);
+    assert.equal(
+      persisted.operation_plan_version_id,
+      historyOfPlan.find((item: { version: number }) => item.version === 1).id,
+    );
     assert.equal(task.targets[0].id, serverA.id);
     assert.match(task.steps[0].command, /first version/);
     assert.equal(task.maxParallel, 2);

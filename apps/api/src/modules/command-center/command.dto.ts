@@ -35,8 +35,8 @@ export class ExecutionOptionsDto extends TargetSelectionDto {
   @Min(1)
   @Max(10)
   maxParallel?: number;
-  @IsOptional() @IsIn(['STOP', 'CONTINUE']) failurePolicy: 'STOP' | 'CONTINUE' = 'CONTINUE';
-  @IsOptional() @IsInt() @Min(1) @Max(3600) timeout = 300;
+  @IsOptional() @IsIn(['STOP', 'CONTINUE']) failurePolicy?: 'STOP' | 'CONTINUE';
+  @IsOptional() @IsInt() @Min(1) @Max(3600) timeout?: number;
 }
 export class ExecuteCommandDto extends ExecutionOptionsDto {
   @IsOptional() @IsString() @Length(1, 120) name?: string;

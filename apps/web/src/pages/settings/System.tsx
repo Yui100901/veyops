@@ -137,6 +137,22 @@ export function SystemPage({ user }: { user: User }) {
               <strong>{value?.maxConcurrentFlowsPerServer ?? '—'}</strong>
             </div>
             <div className="setting-row">
+              <span>运维任务失败策略</span>
+              <strong>
+                {value?.defaultOperationFailurePolicy === 'STOP'
+                  ? '停止启动剩余目标'
+                  : '继续执行其他目标'}
+              </strong>
+            </div>
+            <div className="setting-row">
+              <span>运维任务单目标超时</span>
+              <strong>
+                {value?.defaultOperationTimeoutSeconds == null
+                  ? '—'
+                  : `${value.defaultOperationTimeoutSeconds} 秒`}
+              </strong>
+            </div>
+            <div className="setting-row">
               <span>
                 <HardDrive size={17} /> 目标端工作根目录
               </span>
@@ -247,6 +263,12 @@ function RuntimeDefaultsEditor({
     const maxConcurrentFlowsPerServer = Number(fields.get('maxConcurrentFlowsPerServer'));
     if (maxConcurrentFlowsPerServer !== settings.maxConcurrentFlowsPerServer)
       changed.maxConcurrentFlowsPerServer = maxConcurrentFlowsPerServer;
+    const defaultOperationFailurePolicy = String(fields.get('defaultOperationFailurePolicy'));
+    if (defaultOperationFailurePolicy !== settings.defaultOperationFailurePolicy)
+      changed.defaultOperationFailurePolicy = defaultOperationFailurePolicy;
+    const defaultOperationTimeoutSeconds = Number(fields.get('defaultOperationTimeoutSeconds'));
+    if (defaultOperationTimeoutSeconds !== settings.defaultOperationTimeoutSeconds)
+      changed.defaultOperationTimeoutSeconds = defaultOperationTimeoutSeconds;
     setSaving(true);
     setError('');
     try {
@@ -265,19 +287,40 @@ function RuntimeDefaultsEditor({
     <InlineEditor title="编辑运行设置" busy={saving} onClose={onClose}>
       <Form onSubmit={save} onCancel={onClose} busy={saving} error={error}>
         <ExecutionSettingsFields values={settings} />
-        <Field
-          label="单台服务器任务并发"
-          hint="同一服务器的执行流、运维命令和交互会话共用此上限，达到上限后按提交顺序等待。"
-        >
-          <input
-            type="number"
-            name="maxConcurrentFlowsPerServer"
-            min={1}
-            max={10}
-            required
-            defaultValue={settings.maxConcurrentFlowsPerServer ?? 10}
-          />
-        </Field>
+        <div className="form-grid">
+          <Field
+            label="单台服务器任务并发"
+            hint="同一服务器的执行流、运维命令和交互会话共用此上限，达到上限后按提交顺序等待。"
+          >
+            <input
+              type="number"
+              name="maxConcurrentFlowsPerServer"
+              min={1}
+              max={10}
+              required
+              defaultValue={settings.maxConcurrentFlowsPerServer ?? 10}
+            />
+          </Field>
+          <Field label="运维任务失败策略">
+            <select
+              name="defaultOperationFailurePolicy"
+              defaultValue={settings.defaultOperationFailurePolicy ?? 'CONTINUE'}
+            >
+              <option value="CONTINUE">继续执行其他目标</option>
+              <option value="STOP">停止启动剩余目标</option>
+            </select>
+          </Field>
+          <Field label="运维任务单目标超时（秒）">
+            <input
+              type="number"
+              name="defaultOperationTimeoutSeconds"
+              min={1}
+              max={3600}
+              required
+              defaultValue={settings.defaultOperationTimeoutSeconds ?? 300}
+            />
+          </Field>
+        </div>
       </Form>
     </InlineEditor>
   );

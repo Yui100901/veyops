@@ -9,6 +9,7 @@ import test from 'node:test';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import type { SshOptions, SshTarget } from '../infrastructure/ssh/ssh.service';
 import type { TaskPayload } from '../modules/tasks/tasks.types';
 
 test('versioned batch operations validate parameters, preserve snapshots and stop a failed precheck', async () => {
@@ -26,14 +27,40 @@ test('versioned batch operations validate parameters, preserve snapshots and sto
   const { configureApp } = await import('../bootstrap.js');
   const { DatabaseService } = await import('../core/database/database.service.js');
   const { SshService } = await import('../infrastructure/ssh/ssh.service.js');
+  const { OpenAiCompatibleService } =
+    await import('../infrastructure/ai-provider/openai-compatible.service.js');
+  const { deploymentProbe, initializationPlans } =
+    await import('../modules/ai/ai-deployment-tools.service.js');
   const { TaskWorkerService } = await import('../modules/tasks/task-worker.service.js');
   const executed: string[] = [];
+  const assistantRequests: string[] = [];
+  const assistantResponses = [
+    { existingPlanId: initializationPlans.nginx },
+    {
+      name: 'Install Nginx on Linux',
+      actions: [{ type: 'INSTALL_PACKAGES', packages: { 'apt-get': ['nginx'], dnf: ['nginx'] } }],
+    },
+  ];
   const module = await Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(SshService)
     .useValue({
-      execute: async (_target: unknown, command: string) => {
+      execute: async (target: SshTarget, command: string, options: SshOptions) => {
         executed.push(command);
+        if (command === deploymentProbe) {
+          const facts =
+            target.host === 'replacement.test'
+              ? 'os=rocky\ndnf=available'
+              : 'os=ubuntu\napt-get=available';
+          options.onData?.(`${facts}\nuid=0\ninit=systemd\nprobeComplete=1\n`, 'stdout');
+        }
         return { exitCode: command.endsWith('\nfalse') ? 9 : 0 };
+      },
+    })
+    .overrideProvider(OpenAiCompatibleService)
+    .useValue({
+      complete: async (_connection: unknown, messages: { content: string }[]) => {
+        assistantRequests.push(messages[1]!.content);
+        return { content: JSON.stringify(assistantResponses.shift()) };
       },
     })
     .compile();
@@ -65,54 +92,30 @@ test('versioned batch operations validate parameters, preserve snapshots and sto
         hostKeyFingerprint: '0'.repeat(64),
       })
       .expect(201);
-    const execution = { confirmed: true, serverIds: [server.body.data.id], version: 1 };
     const parameters = [
       { name: 'MESSAGE', type: 'STRING', required: true },
       { name: 'RETRIES', type: 'NUMBER', defaultValue: 0 },
       { name: 'CHECK', type: 'BOOLEAN', defaultValue: false },
     ];
     const command = 'printf "%s\n" "$VEYOPS_PARAM_MESSAGE"';
-    const templateDefinition = { name: 'Report', command, parameters, timeout: 42 };
-    const templates = '/api/v1/command-templates';
-    const template = await api.post(templates).send(templateDefinition).expect(201);
-    const templatePath = `${templates}/${template.body.data.id}`;
+    await api.get('/api/v1/command-templates').expect(404);
+    const defaults = (await api.get('/api/v1/system').expect(200)).body.data;
+    assert.equal(defaults.maxConcurrentFlowsPerServer, 10);
+    assert.equal(defaults.defaultOperationFailurePolicy, 'CONTINUE');
+    assert.equal(defaults.defaultOperationTimeoutSeconds, 300);
     await api
-      .patch(templatePath)
-      .send({ ...templateDefinition, name: 'New report', timeout: 11 })
+      .patch('/api/v1/system')
+      .send({
+        defaultMaxParallelTargets: 4,
+        defaultOperationFailurePolicy: 'STOP',
+        defaultOperationTimeoutSeconds: 42,
+      })
       .expect(200);
-    const versions = await api.get(templatePath + '/versions').expect(200);
-    assert.deepEqual(
-      versions.body.data.map((row: { version: number; timeout: number }) => [
-        row.version,
-        row.timeout,
-      ]),
-      [
-        [2, 11],
-        [1, 42],
-      ],
-    );
-    await api
-      .post(templatePath + '/run')
-      .send(execution)
-      .expect(400);
-    await api
-      .post(templatePath + '/run')
-      .send({ ...execution, parameters: { MESSAGE: 1 } })
-      .expect(400);
-    await api
-      .post(templatePath + '/run')
-      .send({ ...execution, parameters: { MESSAGE: 'hi', UNKNOWN: true } })
-      .expect(400);
     const literal = "it's `literal`";
     const commandTask = await api
-      .post(templatePath + '/run')
-      .send({ ...execution, parameters: { MESSAGE: literal } })
+      .post('/api/v1/commands/execute')
+      .send({ confirmed: true, serverIds: [server.body.data.id], command: 'hostname' })
       .expect(201);
-    assert.deepEqual(commandTask.body.data.commandTemplate, {
-      id: template.body.data.id,
-      version: 1,
-    });
-    assert.equal(commandTask.body.data.name, 'Report · v1');
     const db = app.get(DatabaseService).db;
     const stored = await db
       .selectFrom('tasks')
@@ -121,18 +124,10 @@ test('versioned batch operations validate parameters, preserve snapshots and sto
       .executeTakeFirstOrThrow();
     const commandPayload = JSON.parse(stored.payload_json) as TaskPayload;
     assert.equal(commandPayload.timeout, 42);
-    assert.equal(
-      commandPayload.steps[0].command,
-      "export VEYOPS_PARAM_MESSAGE='it'\"'\"'s `literal`'\nexport VEYOPS_PARAM_RETRIES='0'\nexport VEYOPS_PARAM_CHECK='false'\n" +
-        command,
-    );
+    assert.equal(commandPayload.maxParallel, 4);
+    assert.equal(commandPayload.failurePolicy, 'STOP');
+    assert.equal(commandPayload.steps[0].command, 'hostname');
     await api.post(`/api/v1/tasks/${commandTask.body.data.id}/cancel`).expect(201);
-    await api.delete(templatePath).expect(200);
-    await api
-      .post(templatePath + '/run')
-      .send({ ...execution, parameters: { MESSAGE: 'hi' } })
-      .expect(400);
-    assert.equal((await api.get(templatePath + '/versions').expect(200)).body.data.length, 2);
 
     const planDefinition = {
       name: 'Checked maintenance',
@@ -143,6 +138,22 @@ test('versioned batch operations validate parameters, preserve snapshots and sto
     };
     const plan = await api.post('/api/v1/operation-plans').send(planDefinition).expect(201);
     const planPath = '/api/v1/operation-plans/' + plan.body.data.id;
+    const directTarget = { confirmed: true, serverIds: [server.body.data.id], version: 1 };
+    await api
+      .post(planPath + '/run')
+      .send(directTarget)
+      .expect(400);
+    await api
+      .post(planPath + '/run')
+      .send({ ...directTarget, parameters: { MESSAGE: 1 } })
+      .expect(400);
+    await api
+      .post(planPath + '/run')
+      .send({
+        ...directTarget,
+        parameters: { MESSAGE: 'hi', UNKNOWN: true },
+      })
+      .expect(400);
     const operator = request.agent(app.getHttpServer());
     const operatorAccount = { username: 'plan-operator', password: initialPassword };
     const user = await api
@@ -167,7 +178,7 @@ test('versioned batch operations validate parameters, preserve snapshots and sto
     const confirmedPlan = {
       ...selection,
       confirmed: true,
-      parameters: { MESSAGE: 'fixture' },
+      parameters: { MESSAGE: literal },
       version: 1,
       expectedTargetHash: preview.body.data.targetHash,
     };
@@ -241,6 +252,14 @@ test('versioned batch operations validate parameters, preserve snapshots and sto
       .where('id', '=', task.body.data.id)
       .executeTakeFirstOrThrow();
     const planPayload = JSON.parse(savedPlanTask.payload_json) as TaskPayload;
+    assert.equal(planPayload.maxParallel, 4);
+    assert.equal(planPayload.failurePolicy, 'STOP');
+    assert.equal(planPayload.timeout, 42);
+    assert.equal(
+      planPayload.steps[1].command,
+      "export VEYOPS_PARAM_MESSAGE='it'\"'\"'s `literal`'\nexport VEYOPS_PARAM_RETRIES='0'\nexport VEYOPS_PARAM_CHECK='false'\n" +
+        command,
+    );
     assert.deepEqual(
       planPayload.targets.map(({ id }) => id),
       [replacement.body.data.id],
@@ -269,6 +288,93 @@ test('versioned batch operations validate parameters, preserve snapshots and sto
     );
     await operator.get(reuse).expect(403);
     assert.equal(JSON.stringify(draft).includes(credential.body.data.id), false);
+
+    const nativeDefinition = {
+      name: 'Canvas maintenance',
+      parameters: [{ name: 'MESSAGE', type: 'STRING', required: true }],
+      chain: {
+        nodes: [
+          { id: 'start', type: 'START', name: 'Start', x: 32, y: 50 },
+          { id: 'system', type: 'CONDITION', name: 'System', x: 270, y: 50, fact: 'OS' },
+          { id: 'inspect', type: 'COMMAND', name: 'Inspect', x: 508, y: 50, command },
+          { id: 'end', type: 'END', name: 'End', x: 746, y: 50 },
+        ],
+        edges: [
+          { from: 'start', to: 'system' },
+          { from: 'system', to: 'inspect', when: 'debian' },
+          { from: 'inspect', to: 'end' },
+        ],
+      },
+    };
+    const nativePlan = await api.post('/api/v1/operation-plans').send(nativeDefinition).expect(201);
+    const nativePath = '/api/v1/operation-plans/' + nativePlan.body.data.id;
+    assert.deepEqual(nativePlan.body.data.chain, nativeDefinition.chain);
+    await api
+      .patch(nativePath)
+      .send({ ...nativeDefinition, name: 'Canvas maintenance updated' })
+      .expect(200);
+    const versions = (await api.get(nativePath + '/versions').expect(200)).body.data;
+    assert.deepEqual(
+      versions.map(({ version }: { version: number }) => version),
+      [2, 1],
+    );
+    assert.deepEqual(versions[1].chain, nativeDefinition.chain);
+    const nativeTask = await api
+      .post(nativePath + '/run')
+      .send({ ...confirmedPlan, expectedTargetHash: refreshed.body.data.targetHash })
+      .expect(201);
+    assert.equal(nativeTask.body.data.name, 'Canvas maintenance · v1');
+    const nativePayload = await db
+      .selectFrom('tasks')
+      .select('payload_json')
+      .where('id', '=', nativeTask.body.data.id)
+      .executeTakeFirstOrThrow();
+    const nativeSnapshot = JSON.parse(nativePayload.payload_json) as TaskPayload;
+    assert.deepEqual(nativeSnapshot.operationChain?.edges, nativeDefinition.chain.edges);
+    assert.equal(
+      nativeSnapshot.operationChain?.nodes.find(({ id }) => id === 'inspect')?.command,
+      "export VEYOPS_PARAM_MESSAGE='it'\"'\"'s `literal`'\n" + command,
+    );
+
+    await api
+      .post('/api/v1/ai/providers')
+      .send({
+        name: 'Fixture AI',
+        baseUrl: 'http://127.0.0.1:9999/v1',
+        model: 'fixture-model',
+        apiKey: 'fixture-model-key',
+      })
+      .expect(201);
+    const inspectStart = executed.length;
+    const recommend = await api
+      .post('/api/v1/operation-plans/ai-assist')
+      .send({
+        serverIds: [server.body.data.id],
+        instructions: '在所选服务器上使用包管理器安装 Nginx',
+      })
+      .expect(201);
+    assert.equal(recommend.body.data.kind, 'RECOMMENDATION');
+    assert.equal(recommend.body.data.plan.id, initializationPlans.nginx);
+    assert.match(assistantRequests[0]!, /"packageManager":"apt-get"/);
+    const suggestion = await api
+      .post('/api/v1/operation-plans/ai-assist')
+      .send({
+        serverIds: [server.body.data.id, replacement.body.data.id],
+        instructions: '在所选服务器上使用包管理器安装 Nginx',
+      })
+      .expect(201);
+    assert.equal(suggestion.body.data.kind, 'DRAFT');
+    assert.deepEqual(
+      suggestion.body.data.draft.chain.edges.flatMap(({ when }: { when?: string }) => when ?? []),
+      ['apt-get', 'dnf'],
+    );
+    assert.match(assistantRequests[1]!, /"packageManager":"dnf"/);
+    assert.equal(assistantRequests[1]!.includes(initializationPlans.nginx), false);
+    assert.deepEqual(executed.slice(inspectStart), [
+      deploymentProbe,
+      deploymentProbe,
+      deploymentProbe,
+    ]);
   } finally {
     await app.close();
     await rm(directory, { recursive: true, force: true });

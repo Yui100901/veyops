@@ -462,21 +462,24 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
       })),
     )
     .execute();
+  assert.ifError((await migrator.migrateTo('047_service_address_bindings')).error);
+  const schedule = {
+    id: 'schedule',
+    name: 'Existing template schedule',
+    owner_id: 'existing-user',
+    kind: 'COMMAND_TEMPLATE',
+    source_id: 'existing-template',
+    source_version: 1,
+    config_json: '{}',
+    approved_targets_json: '[]',
+    status: 'ENABLED',
+    next_run_at: now + 60_000,
+    created_at: now,
+    updated_at: now,
+  };
   await db
     .insertInto('operation_schedules')
-    .values({
-      id: 'schedule',
-      name: 'Existing template schedule',
-      owner_id: 'existing-user',
-      kind: 'COMMAND_TEMPLATE',
-      source_id: 'existing-template',
-      source_version: 1,
-      config_json: '{}',
-      approved_targets_json: '[]',
-      status: 'ENABLED',
-      created_at: now,
-      updated_at: now,
-    })
+    .values([schedule, { ...schedule, id: 'plan-schedule', kind: 'OPERATION_PLAN' }])
     .execute();
   const occurrence = {
     id: 'run',
@@ -493,6 +496,41 @@ async function verifyUpgrade(db: Kysely<Database>, migrator: Migrator) {
       .values({ ...occurrence, id: 'duplicate' })
       .execute(),
   );
+  await db
+    .insertInto('operation_schedule_runs')
+    .values({
+      ...occurrence,
+      id: 'pending-template-confirmation',
+      status: 'AWAITING_CONFIRMATION',
+      scheduled_at: now + 60_000,
+      confirmation_expires_at: now + 120_000,
+    })
+    .execute();
+  assert.ifError((await migrator.migrateToLatest()).error);
+  const retired = await db
+    .selectFrom('operation_schedules')
+    .select(['status', 'next_run_at', 'status_reason'])
+    .where('id', '=', schedule.id)
+    .executeTakeFirstOrThrow();
+  assert.equal(retired.status, 'DISABLED');
+  assert.equal(retired.next_run_at, null);
+  assert.match(retired.status_reason ?? '', /命令模板已停用/);
+  const untouchedPlan = await db
+    .selectFrom('operation_schedules')
+    .select('status')
+    .where('id', '=', 'plan-schedule')
+    .executeTakeFirstOrThrow();
+  assert.equal(untouchedPlan.status, 'ENABLED');
+  const retiredRuns = await db
+    .selectFrom('operation_schedule_runs')
+    .select(['id', 'status', 'confirmation_expires_at'])
+    .where('schedule_id', '=', schedule.id)
+    .orderBy('id')
+    .execute();
+  assert.deepEqual(retiredRuns, [
+    { id: 'pending-template-confirmation', status: 'SKIPPED', confirmation_expires_at: null },
+    { id: 'run', status: 'SKIPPED', confirmation_expires_at: null },
+  ]);
   const event = {
     id: 'event',
     task_id: 'DEPLOY',

@@ -45,7 +45,7 @@ export class OperationScheduleTargetDto {
 
 export class PreviewOperationScheduleDto {
   @IsString() @Length(1, 120) name!: string;
-  @IsIn(['COMMAND_TEMPLATE', 'OPERATION_PLAN']) kind!: 'COMMAND_TEMPLATE' | 'OPERATION_PLAN';
+  @IsIn(['OPERATION_PLAN']) kind!: 'OPERATION_PLAN';
   @IsUUID() sourceId!: string;
   @IsInt() @Min(1) sourceVersion!: number;
   @IsDefined()

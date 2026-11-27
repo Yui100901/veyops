@@ -2232,6 +2232,36 @@ export const migrationProvider: MigrationProvider = {
           await db.schema.alterTable('service_addresses').dropColumn('binding_server_id').execute();
         },
       } satisfies Migration,
+      '048_retire_command_templates': {
+        async up(db) {
+          const data = db as Kysely<Database>;
+          const reason = '命令模板已停用，请编辑并选择运维方案';
+          await data
+            .updateTable('operation_schedules')
+            .set({
+              status: 'DISABLED',
+              next_run_at: null,
+              status_reason: reason,
+              updated_at: Date.now(),
+            })
+            .where('kind', '=', 'COMMAND_TEMPLATE')
+            .where('status', '!=', 'DELETED')
+            .execute();
+          await data
+            .updateTable('operation_schedule_runs')
+            .set({ status: 'SKIPPED', reason, confirmation_expires_at: null })
+            .where('status', '=', 'AWAITING_CONFIRMATION')
+            .where(
+              'schedule_id',
+              'in',
+              data.selectFrom('operation_schedules').select('id').where('kind', '=', 'COMMAND_TEMPLATE'),
+            )
+            .execute();
+        },
+        async down() {
+          // Retired schedules remain disabled until their owners explicitly enable them.
+        },
+      } satisfies Migration,
     };
   },
 };

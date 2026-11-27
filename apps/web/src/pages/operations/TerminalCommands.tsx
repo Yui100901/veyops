@@ -5,6 +5,7 @@ import { ErrorBanner, Status } from '../../components';
 import type { Server, Task, TaskTarget, User } from '../../models';
 import { BatchTargetPicker, useBatchTargetResources } from './BatchTargets';
 import type { TargetPreview, TargetSelection } from './BatchTargets';
+import { resolveSelectedServerIds } from './CompactTargetPicker';
 import { TargetedOperationsAI } from './TargetedOperationsAI';
 import './terminal-commands.css';
 
@@ -19,10 +20,12 @@ type InitialInput = Prompt & { taskId: string; serverIds: string[] };
 function TerminalInput({
   label,
   disabled,
+  multiline = false,
   onRun,
 }: {
   label: string;
   disabled: boolean;
+  multiline?: boolean;
   onRun: (prompt: Prompt) => Promise<boolean>;
 }) {
   const [input, setInput] = useState('');
@@ -44,31 +47,56 @@ function TerminalInput({
   }
 
   return (
-    <form className="terminal-input" onSubmit={submit}>
+    <form
+      className={multiline ? 'terminal-input terminal-input-multiline' : 'terminal-input'}
+      onSubmit={submit}
+    >
       <span aria-hidden="true">❯</span>
-      <input
-        type={masked ? 'password' : 'text'}
-        aria-label={label}
-        placeholder={masked ? '输入隐藏内容，回车发送' : '输入命令，回车执行'}
-        value={input}
-        onChange={(event) => setInput(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' && event.nativeEvent.isComposing) event.preventDefault();
-        }}
-        autoComplete="off"
-        autoCapitalize="off"
-        spellCheck={false}
-        maxLength={4095}
-        readOnly={busy}
-        disabled={disabled}
-      />
+      {multiline && !masked ? (
+        <textarea
+          aria-label={label}
+          placeholder="输入命令，回车发送，Shift+Enter 换行"
+          value={input}
+          onChange={(event) => setInput(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
+            event.preventDefault();
+            event.currentTarget.form?.requestSubmit();
+          }}
+          rows={4}
+          autoCapitalize="off"
+          spellCheck={false}
+          maxLength={4095}
+          readOnly={busy}
+          disabled={disabled}
+        />
+      ) : (
+        <input
+          type={masked ? 'password' : 'text'}
+          aria-label={label}
+          placeholder={masked ? '输入隐藏内容，回车发送' : '输入命令，回车执行'}
+          value={input}
+          onChange={(event) => setInput(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && event.nativeEvent.isComposing) event.preventDefault();
+          }}
+          autoComplete="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          maxLength={4095}
+          readOnly={busy}
+          disabled={disabled}
+        />
+      )}
       <button
         type="button"
         className="terminal-input-action"
         aria-label={masked ? '显示输入' : '隐藏本地输入及回显'}
         aria-pressed={masked}
-        title={masked ? '显示输入' : '隐藏本地输入及回显'}
-        disabled={disabled || busy}
+        title={
+          input.includes('\n') ? '隐藏输入适用于单行' : masked ? '显示输入' : '隐藏本地输入及回显'
+        }
+        disabled={disabled || busy || input.includes('\n')}
         onClick={() => setMasked(!masked)}
       >
         {masked ? <Eye size={16} /> : <EyeOff size={16} />}
@@ -172,12 +200,7 @@ export function TerminalCommands({ user }: { user: User }) {
     session ? `/tasks/${session.taskId}/targets` : null,
     active ? 1000 : 0,
   );
-  const selectedIds = new Set([
-    ...(selection.serverIds ?? []),
-    ...(resources.groups.data ?? [])
-      .filter(({ id }) => selection.groupIds?.includes(id))
-      .flatMap(({ serverIds }) => serverIds),
-  ]);
+  const selectedIds = resolveSelectedServerIds(selection, resources.groups.data ?? []);
   const selected = (resources.servers.data ?? []).filter(({ id }) => selectedIds.has(id));
   const displayed = active && session ? session.targets : selected;
   const ready = (targets.data ?? []).filter(
@@ -229,8 +252,9 @@ export function TerminalCommands({ user }: { user: User }) {
 
   async function run(prompt: Prompt, serverId?: string) {
     if (!canRun || !displayed.length || closing || submitting.current) return false;
-    if (new TextEncoder().encode(prompt.input).length > 4095) {
-      setError('命令不能超过 4095 字节');
+    const encoder = new TextEncoder();
+    if (prompt.input.split('\n').some((line) => encoder.encode(line).length > 4095)) {
+      setError('每行命令不能超过 4095 字节');
       return false;
     }
     submitting.current = true;
@@ -337,11 +361,13 @@ export function TerminalCommands({ user }: { user: User }) {
         <>
           <div className="terminal-session-bar">
             <div className="terminal-broadcast">
-              <span>
+              <header>
+                <Terminal size={16} aria-hidden="true" />
                 {active ? `广播 · ${ready.length} 台就绪` : `广播 · ${displayed.length} 台`}
-              </span>
+              </header>
               <TerminalInput
                 label="广播命令"
+                multiline
                 disabled={locked || (active && !ready.length)}
                 onRun={(prompt) => run(prompt)}
               />

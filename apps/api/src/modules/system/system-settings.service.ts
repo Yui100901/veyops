@@ -17,6 +17,8 @@ import { AuditService } from '../audit/audit.service';
 export interface SystemSettings {
   defaultBuildLocation: 'TARGET' | 'MANAGER';
   defaultMaxParallelTargets: number;
+  defaultOperationFailurePolicy: 'CONTINUE' | 'STOP';
+  defaultOperationTimeoutSeconds: number;
   maxConcurrentFlowsPerServer: number;
   logRetentionDays: number;
   targetWorkspaceRoot: string;
@@ -27,6 +29,8 @@ export const defaultServerConcurrency = 10;
 const defaults: SystemSettings = {
   defaultBuildLocation: 'TARGET',
   defaultMaxParallelTargets: 3,
+  defaultOperationFailurePolicy: 'CONTINUE',
+  defaultOperationTimeoutSeconds: 300,
   maxConcurrentFlowsPerServer: defaultServerConcurrency,
   logRetentionDays: 0,
   targetWorkspaceRoot: '~/.veyops/workspace',
@@ -42,6 +46,16 @@ export class UpdateSystemSettingsDto implements Partial<SystemSettings> {
   @Min(1)
   @Max(10)
   defaultMaxParallelTargets?: number;
+
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsIn(['CONTINUE', 'STOP'])
+  defaultOperationFailurePolicy?: SystemSettings['defaultOperationFailurePolicy'];
+
+  @ValidateIf((_object, value) => value !== undefined)
+  @IsInt()
+  @Min(1)
+  @Max(3600)
+  defaultOperationTimeoutSeconds?: number;
 
   @ValidateIf((_object, value) => value !== undefined)
   @IsInt()
@@ -157,7 +171,13 @@ export class SystemSettingsService {
   }
 
   private async save(
-    input: UpdateProjectSettingsDto & { maxConcurrentFlowsPerServer?: number },
+    input: UpdateProjectSettingsDto &
+      Pick<
+        UpdateSystemSettingsDto,
+        | 'maxConcurrentFlowsPerServer'
+        | 'defaultOperationFailurePolicy'
+        | 'defaultOperationTimeoutSeconds'
+      >,
     userId: string,
     projectId?: string,
   ) {

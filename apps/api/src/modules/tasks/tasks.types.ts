@@ -46,6 +46,7 @@ export interface AiRepairOrigin {
   automatic: boolean;
 }
 export interface TaskPayload {
+  operationChain?: import('../operation-plans/operation-chain').OperationChain;
   interactive?: boolean;
   graphModule?: GraphModulePayload;
   simplifiedAction?: SimplifiedActionPayload;

@@ -10,27 +10,31 @@
 
 .terminal-session-bar {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   flex-wrap: wrap;
   gap: 8px;
 }
 
 .terminal-broadcast {
-  display: flex;
-  align-items: center;
-  flex: 1 1 290px;
+  flex: 1 1 440px;
   min-width: 0;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--panel, white);
+  border: 1px solid var(--terminal-line);
+  border-radius: 8px;
 }
 
-.terminal-broadcast > span {
-  flex: 0 0 auto;
-  padding: 0 10px;
-  font-size: 12px;
-  white-space: nowrap;
-  border-inline-end: 1px solid var(--border);
+.terminal-broadcast > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 37px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--terminal-line);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.terminal-broadcast > header svg {
+  color: #8adaaf;
 }
 
 .terminal-grid {
@@ -40,14 +44,18 @@
   gap: 12px;
 }
 
+.terminal-broadcast,
 .terminal-pane {
   --terminal-line: #30434b;
   --terminal-muted: #a5b7bb;
+  background: #121719;
+  color: #ecf3f1;
+}
+
+.terminal-pane {
   min-width: 0;
   border: 1px solid var(--terminal-line);
   border-radius: 8px;
-  background: #13242b;
-  color: #ecf3f1;
 }
 
 .terminal-pane-header {
@@ -65,8 +73,7 @@
 }
 
 .terminal-pane-header strong,
-.terminal-pane-header small,
-.terminal-echo code {
+.terminal-pane-header small {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -105,12 +112,20 @@
 
 .terminal-echo {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 8px;
   padding: 4px 10px;
   border-top: 1px solid var(--terminal-line);
   color: #bcf0cd;
   font-size: 12px;
+}
+
+.terminal-echo code {
+  min-width: 0;
+  max-height: 5lh;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .terminal-echo span {
@@ -138,13 +153,24 @@
   color: #bcf0cd;
 }
 
+.terminal-input-multiline {
+  align-items: flex-start;
+  color: #bcf0cd;
+  padding: 8px 6px 8px 10px;
+}
+
+.terminal-input-multiline > span {
+  padding-top: 4px;
+}
+
 .terminal-input:focus-within {
   outline: 2px solid #58a997;
   outline-offset: -2px;
   border-radius: 5px;
 }
 
-.terminal-input input {
+.terminal-input input,
+.terminal-input textarea {
   flex: 1;
   min-width: 0;
   min-height: 28px;
@@ -159,12 +185,20 @@
     monospace;
 }
 
-.terminal-input input:focus {
+.terminal-input textarea {
+  min-height: 82px;
+  resize: vertical;
+  padding: 3px;
+}
+
+.terminal-input input:focus,
+.terminal-input textarea:focus {
   outline: none;
   box-shadow: none;
 }
 
-.terminal-pane .terminal-input input::placeholder {
+.terminal-input input::placeholder,
+.terminal-input textarea::placeholder {
   color: var(--terminal-muted);
 }
 

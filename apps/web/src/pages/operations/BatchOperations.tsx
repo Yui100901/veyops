@@ -1,30 +1,7 @@
-import { operationsTabs, type OperationsTab } from './operation-routes';
-import { InlineEditor, useInlineEditor } from '../../InlineEditor';
-import { useState } from 'react';
-import { ContextAIButton } from '../ai/AI';
-import type { FormEvent, ReactNode } from 'react';
-import { FileCode2, Pencil, Play, Plus, Terminal, Trash2 } from 'lucide-react';
-import {
-  ApiError,
-  api,
-  formatTime,
-  message,
-  navigate,
-  post,
-  remove,
-  useResource,
-  useRoute,
-} from '../../api';
-import {
-  Confirm,
-  Empty,
-  ErrorBanner,
-  Field,
-  Form,
-  Loading,
-  PageHeader,
-  Section,
-} from '../../components';
+import { useState, type FormEvent } from 'react';
+import { Play } from 'lucide-react';
+import { ApiError, formatTime, message, navigate, post, useResource, useRoute } from '../../api';
+import { ErrorBanner, Field, Loading, PageHeader, Section } from '../../components';
 import type {
   OperationParameter,
   OperationStep,
@@ -34,32 +11,22 @@ import type {
   User,
 } from '../../models';
 import {
-  BatchStrategy,
   BatchTargetPicker,
-  defaultExecutionOptions,
   ResolvedTargets,
   useBatchSelection,
+  type TargetPreview,
+  type TargetSelection,
 } from './BatchTargets';
-import type { ExecutionOptions, TargetPreview, TargetSelection } from './BatchTargets';
+import { OperationPlanWorkspace } from './OperationPlanWorkspace';
+import type { Chain } from './OperationPlanCanvas';
 import { OperationSchedulesPage } from './OperationSchedules';
 import { TargetedOperationsAI } from './TargetedOperationsAI';
 import { TerminalCommands } from './TerminalCommands';
+import { operationsTabs, type OperationsTab } from './operation-routes';
 
-interface CommandTemplate {
-  id: string;
-  name: string;
-  description: string;
-  command: string;
-  timeout: number;
-  currentVersion: number;
-  parameters?: OperationParameter[];
-  enabled?: boolean;
-}
-
-interface CommandReuse extends ExecutionOptions {
+interface CommandReuse {
   name: string;
   command: string;
-  timeout: number;
   selection: TargetSelection;
   previousTargetHash?: string;
   previousTargets: TargetPreview['targets'];
@@ -70,25 +37,19 @@ interface PlanVersion {
   version: number;
   createdAt: number;
   parameters?: OperationParameter[];
-  steps: OperationStep[];
-  preChecks?: OperationStep[];
-  postChecks?: OperationStep[];
-  osRequirements?: string;
+  chain?: Chain;
 }
 
-type TemplateVersion = Pick<
-  CommandTemplate,
-  'id' | 'name' | 'description' | 'command' | 'timeout' | 'parameters'
-> & {
-  version: number;
-  createdAt: number;
-};
-
-const planSteps = [
-  { key: 'preChecks', label: '前置检查', limit: 15 },
-  { key: 'steps', label: '执行步骤', limit: 50 },
-  { key: 'postChecks', label: '执行后验证', limit: 15 },
-] as const;
+interface TaskReview {
+  targets: TargetPreview;
+  plan?: {
+    id: string;
+    name: string;
+    version: number;
+    parameters: Record<string, ParameterValue>;
+    steps: Pick<OperationStep, 'name' | 'command'>[];
+  };
+}
 
 function hasTargets(selection: TargetSelection) {
   return Boolean(selection.serverIds?.length || selection.groupIds?.length);
@@ -133,7 +94,10 @@ function ParameterField({ parameter }: { parameter: OperationParameter }) {
 }
 
 export function OperationsCenterPage({ tab, user }: { tab: OperationsTab; user: User }) {
-  const reuseId = new URLSearchParams(useRoute().split('?')[1]).get('reuse');
+  const query = new URLSearchParams(useRoute().split('?')[1]);
+  const reuseId = query.get('reuse');
+  const planId = query.get('planId') ?? '';
+  const reviewVersion = Number(query.get('version')) || undefined;
   const activeTab = tab === 'commands' && reuseId ? 'tasks' : tab;
   return (
     <>
@@ -161,17 +125,33 @@ export function OperationsCenterPage({ tab, user }: { tab: OperationsTab; user: 
       {activeTab === 'commands' ? (
         <TerminalCommands user={user} />
       ) : activeTab === 'tasks' ? (
-        <CommandWorkspace user={user} reuseId={reuseId} />
+        <CommandWorkspace
+          key={`${reuseId ?? ''}:${planId}:${reviewVersion ?? ''}`}
+          user={user}
+          reuseId={reuseId}
+          planId={planId}
+          reviewVersion={reviewVersion}
+        />
       ) : activeTab === 'schedules' ? (
         <OperationSchedulesPage user={user} />
       ) : (
-        <ReusableOperations key={activeTab} mode={activeTab} user={user} />
+        <OperationPlanWorkspace user={user} />
       )}
     </>
   );
 }
 
-function CommandWorkspace({ user, reuseId }: { user: User; reuseId: string | null }) {
+function CommandWorkspace({
+  user,
+  reuseId,
+  planId,
+  reviewVersion,
+}: {
+  user: User;
+  reuseId: string | null;
+  planId: string;
+  reviewVersion?: number;
+}) {
   const reusable = useResource<CommandReuse>(
     reuseId && user.role !== 'VIEWER'
       ? `/tasks/${encodeURIComponent(reuseId)}/command-reuse`
@@ -181,12 +161,27 @@ function CommandWorkspace({ user, reuseId }: { user: User; reuseId: string | nul
   return (
     <>
       <ErrorBanner error={reusable.error} retry={reusable.reload} />
-      <CommandTaskPage key={reuseId ?? 'new'} user={user} reuse={reusable.data ?? undefined} />
+      <CommandTaskPage
+        user={user}
+        reuse={reusable.data ?? undefined}
+        initialPlanId={planId}
+        initialVersion={reviewVersion}
+      />
     </>
   );
 }
 
-function CommandTaskPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
+function CommandTaskPage({
+  user,
+  reuse,
+  initialPlanId,
+  initialVersion,
+}: {
+  user: User;
+  reuse?: CommandReuse;
+  initialPlanId: string;
+  initialVersion?: number;
+}) {
   const source = reuse?.selection;
   const previousSelector = Boolean(
     source?.deploymentTargetIds?.length ||
@@ -199,30 +194,25 @@ function CommandTaskPage({ user, reuse }: { user: User; reuse?: CommandReuse }) 
   );
   const [command, setCommand] = useState(reuse?.command ?? '');
   const [name, setName] = useState(reuse?.name ?? '');
-  const [timeout, setTimeoutValue] = useState(reuse?.timeout ?? 300);
-  const [options, setOptions] = useState<ExecutionOptions>(() =>
-    reuse
-      ? {
-          strategy: reuse.strategy,
-          maxParallel: reuse.maxParallel,
-          failurePolicy: reuse.failurePolicy,
-        }
-      : defaultExecutionOptions,
-  );
-  const [preview, setPreview] = useState<TargetPreview>();
+  const [planId, setPlanId] = useState(initialPlanId);
+  const [versionNumber, setVersionNumber] = useState(initialVersion);
+  const [review, setReview] = useState<TaskReview>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [lastPreview, setLastPreview] = useState<Pick<TargetPreview, 'targets' | 'targetHash'>>();
-  const [templateName, setTemplateName] = useState('');
-  const [templateSaved, setTemplateSaved] = useState(false);
-  const [savingTemplate, setSavingTemplate] = useState(false);
   const canEdit = user.role !== 'VIEWER';
   const plans = useResource<Plan[]>(canEdit ? '/operation-plans' : null);
-  const templates = useResource<CommandTemplate[]>(canEdit ? '/command-templates' : null);
   const availablePlans = (plans.data ?? []).filter((plan) => plan.enabled !== false);
-  const reusableTemplates = (templates.data ?? []).filter((item) => item.enabled !== false);
-  const [reference, setReference] = useInlineEditor<Plan | CommandTemplate>();
-  const editing = canEdit && !busy && !preview;
+  const plan = availablePlans.find(({ id }) => id === planId);
+  const planEndpoint = plan ? `/operation-plans/${encodeURIComponent(plan.id)}` : null;
+  const versions = useResource<PlanVersion[]>(planEndpoint ? `${planEndpoint}/versions` : null);
+  const version = versions.data?.find(
+    (item) => item.version === (versionNumber ?? plan?.currentVersion),
+  );
+  const preview = review?.targets;
+  const editing = canEdit && !busy && !review;
+  const ready =
+    editing && hasTargets(selection) && (planId ? Boolean(version) : Boolean(command.trim()));
   const comparison =
     lastPreview ??
     (reuse && { targets: reuse.previousTargets, targetHash: reuse.previousTargetHash });
@@ -241,1004 +231,240 @@ function CommandTaskPage({ user, reuse }: { user: User; reuse?: CommandReuse }) 
       ),
     ) ?? [];
 
-  async function saveTemplate() {
-    if (!editing || !templateName.trim() || !command.trim() || savingTemplate) return;
-    setSavingTemplate(true);
-    setTemplateSaved(false);
-    setError('');
-    try {
-      await post('/command-templates', {
-        name: templateName.trim(),
-        command,
-        timeout,
-        parameters: [],
-      });
-      setTemplateName('');
-      await templates.reload();
-      setTemplateSaved(true);
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setSavingTemplate(false);
-    }
-  }
-
   async function prepare(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!canEdit || busy || preview) return;
+    if (!ready) return;
+    const executionPlan =
+      plan && version
+        ? {
+            id: plan.id,
+            name: plan.name,
+            version: version.version,
+            parameters: operationParameters(
+              new FormData(event.currentTarget),
+              version.parameters ?? [],
+            ),
+            steps:
+              version.chain?.nodes.flatMap(({ type, name, command }) =>
+                type === 'COMMAND' && command ? [{ name, command }] : [],
+              ) ?? [],
+          }
+        : undefined;
     setBusy(true);
     setError('');
     try {
-      setPreview(await post<TargetPreview>('/commands/preview', selection));
+      setReview({
+        targets: await post<TargetPreview>('/commands/preview', selection),
+        plan: executionPlan,
+      });
     } catch (err) {
       setError(message(err));
     } finally {
       setBusy(false);
     }
   }
+
   async function execute() {
-    if (!preview || !canEdit || busy) return;
+    if (!review || !canEdit || busy) return;
     setBusy(true);
     setError('');
     try {
-      const task = await post<Task>('/commands/execute', {
+      const confirmed = {
         ...selection,
-        ...options,
-        maxParallel: options.strategy === 'SEQUENTIAL' ? 1 : options.maxParallel,
-        name: name.trim() || '执行命令任务',
-        command,
-        timeout,
-        expectedTargetHash: preview.targetHash,
+        expectedTargetHash: review.targets.targetHash,
         confirmed: true,
-      });
+      };
+      const task = review.plan
+        ? await post<Task>(`/operation-plans/${encodeURIComponent(review.plan.id)}/run`, {
+            ...confirmed,
+            version: review.plan.version,
+            parameters: review.plan.parameters,
+          })
+        : await post<Task>('/commands/execute', {
+            ...confirmed,
+            name: name.trim() || '执行命令任务',
+            command,
+          });
       navigate(`/tasks/${task.id}`);
     } catch (err) {
       if (err instanceof ApiError && [400, 409].includes(err.status)) {
-        setLastPreview(preview);
-        setPreview(undefined);
+        setLastPreview(review.targets);
+        setReview(undefined);
       }
       setError(message(err));
     } finally {
       setBusy(false);
     }
   }
+
   return (
     <>
       <ErrorBanner error={plans.error} retry={plans.reload} />
-      <ErrorBanner error={templates.error} retry={templates.reload} />
-      <div hidden={Boolean(reference)}>
-        <form className="command-layout" onSubmit={prepare}>
-          <div>
-            <Section title="执行目标" body="compact">
-              <BatchTargetPicker
-                selection={selection}
-                onChange={setSelection}
-                disabled={!editing}
-              />
-            </Section>
-            <details className="command-advanced panel">
-              <summary>并发、失败策略和超时</summary>
-              <div className="form-body">
-                <BatchStrategy options={options} onChange={setOptions} disabled={!editing} />
-                <Field label="单目标超时（秒）">
-                  <input
-                    type="number"
-                    min={1}
-                    max={3600}
-                    value={timeout}
-                    required
-                    disabled={!editing}
-                    onChange={(event) => setTimeoutValue(Number(event.target.value))}
-                  />
-                </Field>
-              </div>
-            </details>
-          </div>
-          <Section
-            title="执行任务"
-            subtitle="编写脚本，或选择命令模板与运维方案。"
-            className="operations-task-command"
-            action={
-              canEdit && (
-                <select
-                  className="button secondary"
-                  aria-label="引用常用命令或运维方案"
-                  value=""
-                  disabled={!editing || (!availablePlans.length && !reusableTemplates.length)}
-                  onChange={(event) =>
-                    setReference(
-                      [...reusableTemplates, ...availablePlans].find(
-                        (item) => item.id === event.target.value,
-                      ),
-                    )
-                  }
-                >
-                  <option value="">引用常用命令或方案</option>
-                  {!!reusableTemplates.length && (
-                    <optgroup label="命令模板">
-                      {reusableTemplates.map(({ id, name: label }) => (
-                        <option key={id} value={id}>
-                          {label}
-                        </option>
-                      ))}
-                    </optgroup>
-                  )}
-                  {!!availablePlans.length && (
-                    <optgroup label="运维方案">
-                      {availablePlans.map(({ id, name: label }) => (
-                        <option key={id} value={id}>
-                          {label}
-                        </option>
-                      ))}
-                    </optgroup>
-                  )}
-                </select>
-              )
-            }
-          >
-            <div className="command-editor">
-              <textarea
-                aria-label="Shell 命令"
-                value={command}
-                onChange={(event) => setCommand(event.target.value)}
-                disabled={!editing}
-                maxLength={65536}
-                spellCheck={false}
-                rows={4}
-                required
-                placeholder="uname -a && uptime"
-              />
-            </div>
-            <div className="command-options">
-              <Field label="任务名称（可选）">
-                <input
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  maxLength={100}
-                  disabled={!editing}
-                />
-              </Field>
-              <ErrorBanner error={preview ? '' : error} />
-              {templateSaved && (
-                <p className="field-note" role="status">
-                  命令模板已保存
-                </p>
-              )}
-              {canEdit && !preview && command.trim() && (
-                <details>
-                  <summary>保存为命令模板</summary>
-                  <div className="row-actions">
-                    <Field label="模板名称">
-                      <input
-                        value={templateName}
-                        maxLength={120}
-                        onChange={(e) => setTemplateName(e.target.value)}
-                      />
-                    </Field>
-                    <button
-                      type="button"
-                      className="button secondary"
-                      onClick={() => void saveTemplate()}
-                      disabled={!templateName.trim() || savingTemplate || !editing}
-                    >
-                      保存模板
-                    </button>
-                  </div>
-                </details>
-              )}
-              <div className="row-actions">
-                <button
-                  className="button primary"
-                  disabled={!editing || !hasTargets(selection) || !command.trim()}
-                >
-                  <Play size={16} />
-                  预览并执行
-                </button>
-              </div>
-            </div>
+      <form className="command-layout" onSubmit={prepare}>
+        <div>
+          <Section title="执行目标" body="compact">
+            <BatchTargetPicker selection={selection} onChange={setSelection} disabled={!editing} />
           </Section>
-        </form>
-        {preview && (
-          <Section title="确认执行目标" subtitle={`将在 ${preview.count} 台服务器上运行上方命令`}>
-            <div className="form-body">
-              <ResolvedTargets preview={preview} />
-              {(added.length > 0 ||
-                removed.length > 0 ||
-                changed.length > 0 ||
-                (comparison?.targetHash && comparison.targetHash !== preview.targetHash)) && (
-                <div role="status" className="command-target-changes">
-                  <strong>执行目标与上次确认的范围有变化</strong>
-                  {!!added.length && <p>新增 {added.map(({ name: label }) => label).join('、')}</p>}
-                  {!!removed.length && (
-                    <p>移除 {removed.map(({ name: label }) => label).join('、')}</p>
-                  )}
-                  {!!changed.length && (
-                    <p>地址或名称变化 {changed.map(({ name: label }) => label).join('、')}</p>
-                  )}
-                  {!added.length && !removed.length && !changed.length && (
-                    <p>请复核目标的 SSH 配置。</p>
-                  )}
-                </div>
-              )}
-              <ErrorBanner error={error} />
-              <div className="row-actions">
-                <button
-                  type="button"
-                  className="button secondary"
-                  disabled={busy}
-                  onClick={() => {
-                    setPreview(undefined);
+        </div>
+        <Section title="执行任务" className="operations-task-command">
+          <div className="command-options">
+            {canEdit && (
+              <Field label="任务内容">
+                <select
+                  value={planId}
+                  disabled={!editing}
+                  onChange={(event) => {
+                    setPlanId(event.target.value);
+                    setVersionNumber(undefined);
                     setError('');
                   }}
                 >
-                  返回编辑
-                </button>
-                <button
-                  type="button"
-                  className="button primary"
-                  disabled={busy}
-                  onClick={() => void execute()}
-                >
-                  确认执行
-                </button>
-              </div>
-            </div>
-          </Section>
-        )}
-        {canEdit && (
-          <TargetedOperationsAI
-            key={JSON.stringify(selection)}
-            user={user}
-            selection={selection}
-            disabled={!editing || !hasTargets(selection)}
-          />
-        )}
-      </div>
-      {reference && (
-        <OperationRun
-          user={user}
-          endpoint={'steps' in reference ? '/operation-plans' : '/command-templates'}
-          entry={reference}
-          canRun={canEdit}
-          initialSelection={selection}
-          initialOptions={options}
-          onClose={() => setReference(undefined)}
-        />
-      )}
-    </>
-  );
-}
-
-function ReusableOperations({ mode, user }: { mode: 'plans' | 'templates'; user: User }) {
-  const isPlan = mode === 'plans';
-  const label = isPlan ? '运维方案' : '命令模板';
-  const endpoint = isPlan ? '/operation-plans' : '/command-templates';
-  const resource = useResource<(Plan | CommandTemplate)[]>(endpoint);
-  const [editing, setEditing] = useInlineEditor<Plan | CommandTemplate | 'new'>();
-  const [viewing, setViewing] = useInlineEditor<Plan | CommandTemplate>();
-  const [deleting, setDeleting] = useState<Plan | CommandTemplate>();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const canEdit = user.role !== 'VIEWER';
-
-  async function archive() {
-    if (!deleting) return;
-    setBusy(true);
-    setError('');
-    try {
-      await remove(`${endpoint}/${deleting.id}`);
-      setDeleting(undefined);
-      await resource.reload();
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <>
-      <ErrorBanner error={resource.error} retry={resource.reload} />
-      <div hidden={Boolean(editing || viewing)}>
-        <Section
-          title={label}
-          action={
-            canEdit && (
-              <button className="button secondary" onClick={() => setEditing('new')}>
-                <Plus size={16} />
-                创建{label}
-              </button>
-            )
-          }
-        >
-          {resource.loading ? (
-            <Loading />
-          ) : !resource.data?.length ? (
-            <Empty
-              title={`暂无${label}`}
-              description={canEdit ? `创建${label}后即可保存版本并批量执行。` : ''}
-            />
-          ) : (
-            <div className="resource-list">
-              {resource.data.map((entry) => (
-                <div key={entry.id}>
-                  <span className="resource-avatar">
-                    {isPlan ? <FileCode2 size={18} /> : <Terminal size={18} />}
-                  </span>
-                  <div>
-                    <strong>{entry.name}</strong>
-                    <small>{entry.description}</small>
-                  </div>
-                  <span className="tag">v{entry.currentVersion}</span>
-                  <span className="row-actions">
-                    <button className="button compact" onClick={() => setViewing(entry)}>
-                      {canEdit && entry.enabled !== false ? '查看并运行' : '查看版本'}
-                    </button>
-                    {canEdit && (
-                      <>
-                        <button
-                          className="icon-button bare muted"
-                          aria-label={`编辑${entry.name}`}
-                          onClick={() => setEditing(entry)}
-                        >
-                          <Pencil size={15} />
-                        </button>
-                        {entry.enabled !== false && (
-                          <button
-                            className="icon-button bare muted"
-                            aria-label={`归档${entry.name}`}
-                            onClick={() => {
-                              setError('');
-                              setDeleting(entry);
-                            }}
-                          >
-                            <Trash2 size={15} />
-                          </button>
-                        )}
-                      </>
-                    )}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </Section>
-      </div>
-      {editing && (
-        <DefinitionEditor
-          endpoint={endpoint}
-          label={label}
-          isPlan={isPlan}
-          entry={editing === 'new' ? undefined : editing}
-          onClose={() => setEditing(undefined)}
-          onSave={() => {
-            setEditing(undefined);
-            void resource.reload();
-          }}
-        />
-      )}
-      {viewing && (
-        <OperationRun
-          user={user}
-          endpoint={endpoint}
-          entry={viewing}
-          canRun={canEdit && viewing.enabled !== false}
-          onClose={() => setViewing(undefined)}
-        />
-      )}
-      {deleting && (
-        <Confirm
-          title={`归档${label}`}
-          description={`归档「${deleting.name}」，保留历史版本和任务记录。`}
-          onClose={() => !busy && setDeleting(undefined)}
-          onConfirm={archive}
-          busy={busy}
-          error={error}
-          destructive
-          label="归档"
-        />
-      )}
-    </>
-  );
-}
-
-function OperationRun({
-  user,
-  endpoint,
-  entry,
-  canRun,
-  initialSelection = {},
-  initialOptions = defaultExecutionOptions,
-  onClose,
-}: {
-  endpoint: string;
-  entry: Plan | CommandTemplate;
-  canRun: boolean;
-  user: User;
-  initialSelection?: TargetSelection;
-  initialOptions?: ExecutionOptions;
-  onClose: () => void;
-}) {
-  const base = `${endpoint}/${entry.id}`;
-  const history = useResource<(PlanVersion | TemplateVersion)[]>(`${base}/versions`);
-  const [versionNumber, setVersionNumber] = useState(entry.currentVersion);
-  const { selection, setSelection } = useBatchSelection(initialSelection);
-  const [options, setOptions] = useState(initialOptions);
-  const [review, setReview] = useState<{
-    preview: TargetPreview;
-    parameters: Record<string, ParameterValue>;
-    version: number;
-  }>();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const version = history.data?.find((item) => item.version === versionNumber);
-  const definitions = version?.parameters ?? [];
-
-  async function prepare(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!canRun || !version || busy || review) return;
-    const parameters = operationParameters(new FormData(event.currentTarget), definitions);
-    setBusy(true);
-    setError('');
-    try {
-      const preview = await post<TargetPreview>('/commands/preview', selection);
-      setReview({ preview, parameters, version: version.version });
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function run() {
-    if (!review || !canRun || busy) return;
-    setBusy(true);
-    setError('');
-    try {
-      const task = await post<Task>(`${base}/run`, {
-        ...selection,
-        ...options,
-        maxParallel: options.strategy === 'SEQUENTIAL' ? 1 : options.maxParallel,
-        parameters: review.parameters,
-        version: review.version,
-        expectedTargetHash: review.preview.targetHash,
-        confirmed: true,
-      });
-      navigate(`/tasks/${task.id}`);
-    } catch (err) {
-      if (err instanceof ApiError && [400, 409].includes(err.status)) setReview(undefined);
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <InlineEditor title={entry.name} wide busy={busy} onClose={onClose}>
-      <form onSubmit={prepare}>
-        <div className="form-body">
-          <ErrorBanner
-            error={history.error || error}
-            retry={history.error ? history.reload : undefined}
-          />
-          {history.loading && <Loading />}
-          {!!history.data?.length && (
-            <Field label="执行版本">
-              <select
-                value={versionNumber}
-                disabled={busy || Boolean(review)}
-                onChange={(event) => setVersionNumber(Number(event.target.value))}
-              >
-                {history.data.map((item) => (
-                  <option key={item.id} value={item.version}>
-                    v{item.version}
-                    {item.version === entry.currentVersion ? '（当前）' : ''} ·{' '}
-                    {formatTime(item.createdAt)}
-                  </option>
-                ))}
-              </select>
-            </Field>
-          )}
-          {version && <VersionDefinition version={version} />}
-          {version && endpoint === '/operation-plans' && (
-            <ContextAIButton
-              user={user}
-              objectName={entry.name}
-              context={{
-                kind: 'OPERATION_PLAN',
-                operationPlanId: entry.id,
-                version: versionNumber,
-              }}
-              label={`AI 运维方案 · v${versionNumber}`}
-            />
-          )}
-          {canRun && version && (
-            <>
-              <div key={versionNumber} hidden={Boolean(review)}>
-                {definitions.length > 0 && (
-                  <div className="form-grid">
-                    {definitions.map((parameter) => (
+                  <option value="">编写 Shell 命令</option>
+                  {planId && !plan && <option value={planId}>运维方案不可用</option>}
+                  {availablePlans.map(({ id, name: label }) => (
+                    <option key={id} value={id}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            )}
+            {planId ? (
+              <fieldset disabled={!editing} className="task-plan-fields">
+                <ErrorBanner error={versions.error} retry={versions.reload} />
+                {versions.loading && <Loading />}
+                {!!versions.data?.length && (
+                  <Field label="执行版本">
+                    <select
+                      value={version?.version ?? ''}
+                      onChange={(event) => setVersionNumber(Number(event.target.value))}
+                    >
+                      {!version && (
+                        <option value="" disabled>
+                          请选择版本
+                        </option>
+                      )}
+                      {versions.data.map((item) => (
+                        <option key={item.id} value={item.version}>
+                          v{item.version} · {formatTime(item.createdAt)}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                )}
+                {!!version?.parameters?.length && (
+                  <div className="form-grid" key={version.id}>
+                    {version.parameters.map((parameter) => (
                       <ParameterField key={parameter.name} parameter={parameter} />
                     ))}
                   </div>
                 )}
-                <h3 className="field-title">执行目标</h3>
-                <BatchTargetPicker
-                  selection={selection}
-                  onChange={setSelection}
-                  disabled={busy || Boolean(review)}
-                />
-                <h3 className="field-title">执行策略</h3>
-                <BatchStrategy
-                  options={options}
-                  onChange={setOptions}
-                  disabled={busy || Boolean(review)}
-                />
-              </div>
-              {review && (
-                <>
-                  <h3 className="field-title">已解析 {review.preview.count} 台服务器</h3>
-                  <ResolvedTargets preview={review.preview} />
-                  {definitions.map(({ name, defaultValue }) => (
-                    <p className="field-note" key={name}>
-                      {name} · {String(review.parameters[name] ?? defaultValue ?? '未指定')}
-                    </p>
-                  ))}
-                </>
-              )}
-            </>
-          )}
-        </div>
-        <div className="modal-footer">
-          <button
-            className="button secondary"
-            type="button"
-            disabled={busy}
-            onClick={() => (review ? setReview(undefined) : onClose())}
-          >
-            {review ? '返回选择' : '关闭'}
-          </button>
-          {canRun &&
-            version &&
-            (review ? (
-              <button type="button" className="button primary" disabled={busy} onClick={run}>
-                确认执行 · {review.preview.count} 台
-              </button>
+              </fieldset>
             ) : (
-              <button
-                type="submit"
-                className="button primary"
-                disabled={busy || !hasTargets(selection)}
-              >
-                预览执行目标
-              </button>
-            ))}
-        </div>
-      </form>
-    </InlineEditor>
-  );
-}
-
-function VersionDefinition({ version }: { version: PlanVersion | TemplateVersion }) {
-  if ('command' in version)
-    return (
-      <>
-        <p className="field-note">
-          {version.name} · 超时 {version.timeout} 秒
-        </p>
-        <pre className="code-preview">{version.command}</pre>
-      </>
-    );
-  const steps = planSteps.map(
-    ({ key, label }) =>
-      !!version[key]?.length && (
-        <div className="plan-steps" key={key}>
-          <h3 className="field-title">{label}</h3>
-          {version[key].map((step, index) => (
-            <div key={index}>
-              <strong>
-                {index + 1}. {step.name}
-              </strong>
-              <pre className="code-preview">{step.command}</pre>
-            </div>
-          ))}
-        </div>
-      ),
-  );
-  return (
-    <>
-      {version.osRequirements && <p className="field-note">适用系统 · {version.osRequirements}</p>}
-      {steps}
-    </>
-  );
-}
-
-function DefinitionEditor({
-  endpoint,
-  label,
-  isPlan,
-  entry,
-  onClose,
-  onSave,
-}: {
-  endpoint: string;
-  label: string;
-  isPlan: boolean;
-  entry?: Plan | CommandTemplate;
-  onClose: () => void;
-  onSave: () => void;
-}) {
-  const plan = entry && 'steps' in entry ? entry : undefined;
-  const template = entry && 'command' in entry ? entry : undefined;
-  const [parameters, setParameters] = useState(entry?.parameters ?? []);
-  const [steps, setSteps] = useState({
-    steps: plan?.steps ?? [{ name: '', command: '' }],
-    preChecks: plan?.preChecks ?? [],
-    postChecks: plan?.postChecks ?? [],
-  });
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  async function save(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const data = new FormData(event.currentTarget);
-    const body = {
-      name: String(data.get('name')).trim(),
-      description: String(data.get('description')).trim(),
-      parameters,
-      ...(isPlan
-        ? {
-            ...steps,
-            category: String(data.get('category')).trim(),
-            osRequirements: String(data.get('osRequirements')).trim(),
-          }
-        : {
-            command: String(data.get('command')),
-            timeout: Number(data.get('timeout')),
-          }),
-    };
-    setBusy(true);
-    setError('');
-    try {
-      if (entry)
-        await api(`${endpoint}/${entry.id}`, { method: 'PATCH', body: JSON.stringify(body) });
-      else await post(endpoint, body);
-      onSave();
-    } catch (err) {
-      setError(message(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <InlineEditor title={`${entry ? '编辑' : '创建'}${label}`} wide busy={busy} onClose={onClose}>
-      <Form
-        onSubmit={save}
-        busy={busy}
-        error={error}
-        onCancel={onClose}
-        submit={entry ? '保存为新版本' : '创建'}
-      >
-        <Field label="名称" required>
-          <input name="name" maxLength={120} defaultValue={entry?.name} required autoFocus />
-        </Field>
-        <Field label="说明">
-          <textarea
-            name="description"
-            maxLength={2000}
-            defaultValue={entry?.description}
-            rows={2}
-          />
-        </Field>
-        {isPlan ? (
-          <div className="form-grid">
-            <Field label="分类">
-              <input name="category" maxLength={100} defaultValue={plan?.category ?? 'CUSTOM'} />
-            </Field>
-            <Field label="适用系统">
-              <input name="osRequirements" maxLength={200} defaultValue={plan?.osRequirements} />
-            </Field>
-          </div>
-        ) : (
-          <>
-            <Field label="Shell 命令" required>
-              <textarea
-                name="command"
-                className="mono"
-                maxLength={65536}
-                defaultValue={template?.command}
-                rows={5}
-                spellCheck={false}
-                required
-              />
-            </Field>
-            <Field label="单目标超时（秒）" required>
-              <input
-                name="timeout"
-                type="number"
-                min={1}
-                max={3600}
-                defaultValue={template?.timeout ?? 300}
-                required
-              />
-            </Field>
-          </>
-        )}
-        <ParameterEditor items={parameters} onChange={setParameters} />
-        {isPlan &&
-          planSteps.map(({ key, label: stepLabel, limit }) => (
-            <StepEditor
-              key={key}
-              label={stepLabel}
-              limit={limit}
-              items={steps[key]}
-              main={key === 'steps'}
-              onChange={(items) => setSteps({ ...steps, [key]: items })}
-            />
-          ))}
-      </Form>
-    </InlineEditor>
-  );
-}
-
-function EditorGroup({
-  label,
-  add,
-  disabled,
-  children,
-}: {
-  label: string;
-  add: () => void;
-  disabled: boolean;
-  children: ReactNode;
-}) {
-  return (
-    <div className="batch-editor-group">
-      <div className="batch-editor-heading">
-        <h3 className="field-title">{label}</h3>
-        <button className="button secondary small" type="button" onClick={add} disabled={disabled}>
-          <Plus size={14} />
-          添加
-        </button>
-      </div>
-      {children}
-    </div>
-  );
-}
-
-function StepEditor({
-  label,
-  limit,
-  items,
-  main,
-  onChange,
-}: {
-  label: string;
-  limit: number;
-  items: OperationStep[];
-  main: boolean;
-  onChange: (items: OperationStep[]) => void;
-}) {
-  function update(index: number, step: OperationStep) {
-    onChange(items.map((item, position) => (position === index ? step : item)));
-  }
-  function move(index: number, offset: number) {
-    const ordered = [...items];
-    [ordered[index], ordered[index + offset]] = [ordered[index + offset], ordered[index]];
-    onChange(ordered);
-  }
-  return (
-    <EditorGroup
-      label={label}
-      add={() => onChange([...items, { name: '', command: '' }])}
-      disabled={items.length >= limit}
-    >
-      {items.map((step, index) => (
-        <fieldset className="batch-editor-item" key={index}>
-          <legend>
-            {label} {index + 1}
-          </legend>
-          <Field label="名称" required>
-            <input
-              value={step.name}
-              maxLength={120}
-              required
-              onChange={(event) => update(index, { ...step, name: event.target.value })}
-            />
-          </Field>
-          <Field label="Shell 命令" required>
-            <textarea
-              className="mono"
-              rows={3}
-              value={step.command}
-              maxLength={65536}
-              required
-              spellCheck={false}
-              onChange={(event) => update(index, { ...step, command: event.target.value })}
-            />
-          </Field>
-          <div className="form-grid">
-            <Field label="超时（秒）">
-              <input
-                type="number"
-                min={1}
-                max={3600}
-                value={step.timeout ?? ''}
-                onChange={(event) =>
-                  update(index, {
-                    ...step,
-                    timeout: event.target.value === '' ? undefined : Number(event.target.value),
-                  })
-                }
-              />
-            </Field>
-            {main && (
-              <Field label="此步骤失败后">
-                <select
-                  value={step.failurePolicy ?? 'STOP'}
-                  onChange={(event) =>
-                    update(index, {
-                      ...step,
-                      failurePolicy: event.target.value as OperationStep['failurePolicy'],
-                    })
-                  }
-                >
-                  <option value="STOP">停止此服务器的后续步骤</option>
-                  <option value="CONTINUE">继续后续步骤</option>
-                </select>
-              </Field>
+              <>
+                <div className="command-editor">
+                  <textarea
+                    aria-label="Shell 命令"
+                    value={command}
+                    onChange={(event) => setCommand(event.target.value)}
+                    disabled={!editing}
+                    maxLength={65536}
+                    spellCheck={false}
+                    rows={4}
+                    required
+                    placeholder="uname -a && uptime"
+                  />
+                </div>
+                <Field label="任务名称（可选）">
+                  <input
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    maxLength={100}
+                    disabled={!editing}
+                  />
+                </Field>
+              </>
+            )}
+            <ErrorBanner error={preview ? '' : error} />
+            {!review && (
+              <div className="row-actions">
+                <button className="button primary" disabled={!ready}>
+                  <Play size={16} />
+                  预览并执行
+                </button>
+              </div>
             )}
           </div>
-          <div className="row-actions">
-            <button
-              type="button"
-              className="button compact"
-              disabled={index === 0}
-              onClick={() => move(index, -1)}
-            >
-              上移
-            </button>
-            <button
-              type="button"
-              className="button compact"
-              disabled={index === items.length - 1}
-              onClick={() => move(index, 1)}
-            >
-              下移
-            </button>
-            <button
-              type="button"
-              className="text-button danger-text"
-              disabled={main && items.length === 1}
-              onClick={() => onChange(items.filter((_, position) => position !== index))}
-            >
-              移除
-            </button>
-          </div>
-        </fieldset>
-      ))}
-    </EditorGroup>
-  );
-}
-
-function ParameterEditor({
-  items,
-  onChange,
-}: {
-  items: OperationParameter[];
-  onChange: (items: OperationParameter[]) => void;
-}) {
-  function update(index: number, parameter: OperationParameter) {
-    onChange(items.map((item, position) => (position === index ? parameter : item)));
-  }
-  return (
-    <EditorGroup
-      label="参数"
-      add={() => onChange([...items, { name: '', type: 'STRING' }])}
-      disabled={items.length >= 32}
-    >
-      {items.length > 0 && (
-        <p className="field-note">
-          在 Shell 中通过 <code>"$VEYOPS_PARAM_NAME"</code> 引用名为 <code>NAME</code> 的参数。
-        </p>
-      )}
-      {items.map((parameter, index) => (
-        <fieldset className="batch-editor-item" key={index}>
-          <legend>参数 {index + 1}</legend>
-          <div className="form-grid">
-            <Field label="参数名" required>
-              <input
-                value={parameter.name}
-                pattern="[A-Z][A-Z0-9_]{0,63}"
-                placeholder="NODE_VERSION"
-                required
-                onChange={(event) => update(index, { ...parameter, name: event.target.value })}
-              />
-            </Field>
-            <Field label="参数类型">
-              <select
-                value={parameter.type}
-                onChange={(event) =>
-                  update(index, {
-                    ...parameter,
-                    type: event.target.value as OperationParameter['type'],
-                    defaultValue: undefined,
-                  })
-                }
+        </Section>
+      </form>
+      {review && preview && (
+        <Section
+          title="确认执行目标"
+          subtitle={
+            review.plan
+              ? `将在 ${preview.count} 台服务器上运行 ${review.plan.name} · v${review.plan.version}`
+              : `将在 ${preview.count} 台服务器上运行上方命令`
+          }
+        >
+          <div className="form-body">
+            <ResolvedTargets preview={preview} />
+            {review.plan?.steps.map(({ name: stepName, command: shell }, index) => (
+              <details className="version-entry" key={index}>
+                <summary>{stepName}</summary>
+                <pre className="schedule-command">{shell}</pre>
+              </details>
+            ))}
+            {(added.length > 0 ||
+              removed.length > 0 ||
+              changed.length > 0 ||
+              (comparison?.targetHash && comparison.targetHash !== preview.targetHash)) && (
+              <div role="status" className="command-target-changes">
+                <strong>执行目标与上次确认的范围有变化</strong>
+                {!!added.length && <p>新增 {added.map(({ name: label }) => label).join('、')}</p>}
+                {!!removed.length && (
+                  <p>移除 {removed.map(({ name: label }) => label).join('、')}</p>
+                )}
+                {!!changed.length && (
+                  <p>地址或名称变化 {changed.map(({ name: label }) => label).join('、')}</p>
+                )}
+                {!added.length && !removed.length && !changed.length && (
+                  <p>请复核目标的 SSH 配置。</p>
+                )}
+              </div>
+            )}
+            <ErrorBanner error={error} />
+            <div className="row-actions">
+              <button
+                type="button"
+                className="button secondary"
+                disabled={busy}
+                onClick={() => {
+                  setReview(undefined);
+                  setError('');
+                }}
               >
-                <option value="STRING">文本</option>
-                <option value="NUMBER">数字</option>
-                <option value="BOOLEAN">是或否</option>
-              </select>
-            </Field>
+                返回编辑
+              </button>
+              <button
+                type="button"
+                className="button primary"
+                disabled={busy}
+                onClick={() => void execute()}
+              >
+                确认执行
+              </button>
+            </div>
           </div>
-          <div className="form-grid">
-            <Field label="默认值">
-              {parameter.type === 'BOOLEAN' ? (
-                <select
-                  value={parameter.defaultValue === undefined ? '' : String(parameter.defaultValue)}
-                  onChange={(event) =>
-                    update(index, {
-                      ...parameter,
-                      defaultValue:
-                        event.target.value === '' ? undefined : event.target.value === 'true',
-                    })
-                  }
-                >
-                  <option value="">无</option>
-                  <option value="true">是</option>
-                  <option value="false">否</option>
-                </select>
-              ) : (
-                <input
-                  type={parameter.type === 'NUMBER' ? 'number' : 'text'}
-                  step={parameter.type === 'NUMBER' ? 'any' : undefined}
-                  value={parameter.defaultValue === undefined ? '' : String(parameter.defaultValue)}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    update(index, {
-                      ...parameter,
-                      defaultValue:
-                        value === ''
-                          ? undefined
-                          : parameter.type === 'NUMBER'
-                            ? Number(value)
-                            : value,
-                    });
-                  }}
-                />
-              )}
-            </Field>
-            <Field label="参数说明">
-              <input
-                value={parameter.description ?? ''}
-                maxLength={300}
-                onChange={(event) =>
-                  update(index, { ...parameter, description: event.target.value })
-                }
-              />
-            </Field>
-          </div>
-          <div className="row-actions">
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={parameter.required ?? false}
-                onChange={(event) =>
-                  update(index, { ...parameter, required: event.target.checked })
-                }
-              />
-              必填
-            </label>
-            <button
-              type="button"
-              className="text-button danger-text"
-              onClick={() => onChange(items.filter((_, position) => position !== index))}
-            >
-              移除
-            </button>
-          </div>
-        </fieldset>
-      ))}
-    </EditorGroup>
+        </Section>
+      )}
+      {canEdit && !planId && (
+        <TargetedOperationsAI
+          key={JSON.stringify(selection)}
+          user={user}
+          selection={selection}
+          disabled={!editing || !hasTargets(selection)}
+        />
+      )}
+    </>
   );
 }

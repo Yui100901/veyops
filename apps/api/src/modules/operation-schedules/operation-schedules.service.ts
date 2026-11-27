@@ -13,12 +13,11 @@ import { DatabaseService } from '../../core/database/database.service';
 import type { Database } from '../../core/database/schema';
 import { AuditService } from '../audit/audit.service';
 import type { CurrentUser } from '../auth/auth.decorators';
-import { CommandTemplatesService } from '../command-center/command-templates.service';
 import { TargetResolver } from '../command-center/target-resolver.service';
 import { OperationPlansService } from '../operation-plans/operation-plans.service';
 import { SystemSettingsService } from '../system/system-settings.service';
 import { TasksService } from '../tasks/tasks.service';
-import type { CreateTaskInput } from '../tasks/tasks.types';
+import type { CreateTaskInput, TaskPayload } from '../tasks/tasks.types';
 import type {
   PreviewOperationScheduleDto,
   SaveOperationScheduleDto,
@@ -36,7 +35,10 @@ const scheduledBatchSize = 50;
 type Actor = Pick<CurrentUser, 'id' | 'role'>;
 type ScheduleRow = Selectable<Database['operation_schedules']>;
 type RunState = 'QUEUED' | 'AWAITING_CONFIRMATION' | 'SKIPPED' | 'FAILED';
-type ScheduleConfig = Omit<PreviewOperationScheduleDto, 'timing'> & { timing: ScheduleTiming };
+type ScheduleConfig = Omit<PreviewOperationScheduleDto, 'timing' | 'kind'> & {
+  timing: ScheduleTiming;
+  kind: 'OPERATION_PLAN' | 'COMMAND_TEMPLATE';
+};
 type ApprovedTargets = { hash: string; ids: string[] };
 type RunSnapshot = {
   name: string;
@@ -79,13 +81,20 @@ function errorReason(error: unknown) {
   return error instanceof HttpException && error.getStatus() < 500 ? error.message : undefined;
 }
 
+function reviewSteps(payload: TaskPayload) {
+  if (payload.operationChain)
+    return payload.operationChain.nodes.flatMap((node) =>
+      node.type === 'COMMAND' ? [{ name: node.name, command: node.command }] : [],
+    );
+  return payload.steps.map(({ name, command }) => ({ name, command }));
+}
+
 @Injectable()
 export class OperationSchedulesService {
   private readonly logger = new Logger(OperationSchedulesService.name);
 
   constructor(
     private readonly database: DatabaseService,
-    private readonly commands: CommandTemplatesService,
     private readonly plans: OperationPlansService,
     private readonly targets: TargetResolver,
     private readonly tasks: TasksService,
@@ -94,6 +103,8 @@ export class OperationSchedulesService {
   ) {}
 
   private async prepare(config: ScheduleConfig, targetHash: string): Promise<PreparedAction> {
+    if (config.kind !== 'OPERATION_PLAN')
+      throw new BadRequestException('此计划使用已停用的命令模板，请编辑并选择运维方案');
     const options = {
       ...config.target,
       confirmed: true,
@@ -101,18 +112,17 @@ export class OperationSchedulesService {
       parameters: config.parameters,
       strategy: config.strategy ?? 'PARALLEL',
       maxParallel: config.maxParallel,
-      failurePolicy: config.failurePolicy ?? 'CONTINUE',
-      timeout: config.timeoutSeconds ?? 300,
+      failurePolicy: config.failurePolicy,
+      timeout: config.timeoutSeconds,
       expectedTargetHash: targetHash,
     };
-    return config.kind === 'COMMAND_TEMPLATE'
-      ? this.commands.prepareRun(config.sourceId, options)
-      : this.plans.prepareRun(config.sourceId, options);
+    return this.plans.prepareRun(config.sourceId, options);
   }
 
   private async previewConfig(input: PreviewOperationScheduleDto, now: number) {
     const name = input.name.trim();
     if (!name) throw new BadRequestException('计划名称不能为空');
+    const settings = await this.settings.get();
     const config: ScheduleConfig = {
       name,
       kind: input.kind,
@@ -124,9 +134,9 @@ export class OperationSchedulesService {
         Object.entries(input.parameters ?? {}).sort(([a], [b]) => a.localeCompare(b)),
       ),
       strategy: input.strategy ?? 'PARALLEL',
-      maxParallel: input.maxParallel ?? (await this.settings.get()).defaultMaxParallelTargets,
-      failurePolicy: input.failurePolicy ?? 'CONTINUE',
-      timeoutSeconds: input.timeoutSeconds ?? 300,
+      maxParallel: input.maxParallel ?? settings.defaultMaxParallelTargets,
+      failurePolicy: input.failurePolicy ?? settings.defaultOperationFailurePolicy,
+      timeoutSeconds: input.timeoutSeconds ?? settings.defaultOperationTimeoutSeconds,
       requireConfirmation: input.requireConfirmation !== false,
     };
     const upcoming = upcomingTimes(config.timing, now, now, 5);
@@ -137,7 +147,13 @@ export class OperationSchedulesService {
       ids: targetPreview.targets.map(({ id }) => id),
     };
     const configurationHash = createHash('sha256')
-      .update(JSON.stringify([config, approved.hash, prepared.input.payload.steps]))
+      .update(
+        JSON.stringify([
+          config,
+          approved.hash,
+          prepared.input.payload.operationChain ?? prepared.input.payload.steps,
+        ]),
+      )
       .digest('hex');
     return {
       config,
@@ -157,7 +173,7 @@ export class OperationSchedulesService {
       targets: result.targets,
       configurationHash: result.configurationHash,
       requireConfirmation: result.config.requireConfirmation,
-      steps: result.prepared.input.payload.steps.map(({ name, command }) => ({ name, command })),
+      steps: reviewSteps(result.prepared.input.payload),
     };
   }
 
@@ -319,8 +335,11 @@ export class OperationSchedulesService {
 
   async enable(id: string, expectedConfigurationHash: string, actor: Actor) {
     const existing = await this.row(id, actor);
+    const { config } = configOf(existing);
+    if (config.kind !== 'OPERATION_PLAN')
+      throw new BadRequestException('此计划使用已停用的命令模板，请编辑并选择运维方案');
     return this.saveConfig(
-      configOf(existing).config,
+      { ...config, kind: config.kind },
       true,
       expectedConfigurationHash,
       actor,
@@ -467,6 +486,7 @@ export class OperationSchedulesService {
       .selectFrom('operation_schedules')
       .selectAll()
       .where('status', '=', 'ENABLED')
+      .where('kind', '=', 'OPERATION_PLAN')
       .where('next_run_at', '<=', now)
       .orderBy('next_run_at')
       .orderBy('id')
@@ -510,7 +530,7 @@ export class OperationSchedulesService {
         kind: config.kind,
         revision: row.revision,
         targetIds: approved.ids,
-        steps: prepared?.input.payload.steps.map(({ name }) => name),
+        steps: prepared && reviewSteps(prepared.input.payload).map(({ name }) => name),
       };
       let status: RunState = 'FAILED';
       let taskId: string | null = null;

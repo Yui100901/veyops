@@ -4,6 +4,7 @@ import { SshService, SshTarget } from '../../infrastructure/ssh/ssh.service';
 import { TargetResolver } from '../command-center/target-resolver.service';
 import { OperationPlansService } from '../operation-plans/operation-plans.service';
 import { planTemplates } from '../operation-plans/plan-templates';
+import { operationPackageManagers } from '../operation-plans/operation-chain';
 import { isTerminalStatus, TasksService } from '../tasks/tasks.service';
 import type { AiRepairOrigin } from '../tasks/tasks.types';
 
@@ -20,7 +21,7 @@ export const deploymentProbe = `export LC_ALL=C NPM_CONFIG_UPDATE_NOTIFIER=false
 printf 'uid=%s\\n' "$(id -u)"
 printf 'os=%s\\n' "$(awk -F= '$1 == "ID" { gsub(/"/, "", $2); print $2; exit }' /etc/os-release 2>/dev/null)"
 printf 'init=%s\\n' "$(cat /proc/1/comm 2>/dev/null)"
-for tool in apt-get systemctl git curl docker node npm corepack nginx java go rustc python3; do
+for tool in ${operationPackageManagers.join(' ')} systemctl git curl docker node npm corepack nginx java go rustc python3; do
   if command -v "$tool" >/dev/null 2>&1; then printf '%s=available\\n' "$tool"; fi
 done
 df -Pk / | awk 'NR==2 { sub(/%$/, "", $5); printf "diskTotalKiB=%s\\ndiskUsedKiB=%s\\nfreeKiB=%s\\ndiskUsePercent=%s\\n", $2, $3, $4, $5 }'
@@ -51,7 +52,7 @@ const probeKeys = new Set([
   'uid',
   'os',
   'init',
-  'apt-get',
+  ...operationPackageManagers,
   'systemctl',
   'git',
   'curl',

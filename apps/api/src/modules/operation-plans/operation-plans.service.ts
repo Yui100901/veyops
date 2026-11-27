@@ -13,6 +13,12 @@ import {
   validateParameterDefinitions,
 } from '../command-center/command-parameters';
 import { seedPlanTemplates } from './plan-templates';
+import {
+  legacyOperationChain,
+  legacyOperationSteps,
+  validateOperationChain,
+  type OperationChain,
+} from './operation-chain';
 import { AuditService } from '../audit/audit.service';
 import { SystemSettingsService } from '../system/system-settings.service';
 import type { Selectable, Transaction } from 'kysely';
@@ -27,18 +33,23 @@ interface PlanDefinition {
   description?: string;
   category?: string;
   osRequirements?: string;
+  chain?: OperationChain;
 }
 
 function planDefinition(input: CreatePlanDto) {
+  if (input.chain && (input.steps?.length || input.preChecks?.length || input.postChecks?.length))
+    throw new BadRequestException('请选择一种运维方案定义');
+  if (!input.chain && !input.steps?.length) throw new BadRequestException('运维方案缺少执行链');
   return {
     name: input.name,
     description: input.description,
     category: input.category,
     osRequirements: input.osRequirements ?? '',
-    steps: input.steps,
+    steps: input.steps ?? [],
     preChecks: input.preChecks ?? [],
     postChecks: input.postChecks ?? [],
     parameters: validateParameterDefinitions(input.parameters ?? []),
+    ...(input.chain && { chain: validateOperationChain(input.chain) }),
   };
 }
 
@@ -56,6 +67,7 @@ function readPlanDefinition(json: string | null) {
 function presentPlan(plan: Selectable<OperationPlansTable>, definition: PlanDefinition) {
   return {
     ...definition,
+    chain: definition.chain ?? legacyOperationChain(definition),
     id: plan.id,
     name: plan.name,
     description: plan.description,
@@ -202,12 +214,16 @@ export class OperationPlansService implements OnModuleInit {
         .where('plan_id', '=', id)
         .orderBy('version', 'desc')
         .execute()
-    ).map((row) => ({
-      id: row.id,
-      version: row.version,
-      createdAt: row.created_at,
-      ...readPlanDefinition(row.definition_json),
-    }));
+    ).map((row) => {
+      const definition = readPlanDefinition(row.definition_json);
+      return {
+        id: row.id,
+        version: row.version,
+        createdAt: row.created_at,
+        ...definition,
+        chain: definition.chain ?? legacyOperationChain(definition),
+      };
+    });
   }
   async prepareRun(id: string, input: RunPlanDto) {
     const plan = await this.database.db
@@ -226,19 +242,18 @@ export class OperationPlansService implements OnModuleInit {
     if (!version) throw new NotFoundException('方案版本不存在');
     const definition = readPlanDefinition(version.definition_json);
     const environment = parameterEnvironment(definition.parameters, input.parameters ?? {});
-    const checks = (items: ExecutionStep[], phase: 'precheck' | 'postcheck') =>
-      items.map((step, index) => ({
-        ...step,
-        key: `${phase}-${index + 1}`,
-        name: `${phase === 'precheck' ? '前置检查' : '执行后验证'} · ${step.name}`,
-        failurePolicy: 'STOP' as const,
-      }));
-    const steps = [
-      ...checks(definition.preChecks, 'precheck'),
-      ...definition.steps,
-      ...checks(definition.postChecks, 'postcheck'),
-    ].map((step) => ({ ...step, command: environment + step.command }));
+    const steps = legacyOperationSteps(definition).map((step) => ({
+      ...step,
+      command: environment + step.command,
+    }));
+    const operationChain = definition.chain && {
+      ...definition.chain,
+      nodes: definition.chain.nodes.map((node) =>
+        node.type === 'COMMAND' ? { ...node, command: environment + node.command } : node,
+      ),
+    };
     const scope = await this.targets.executionScope(input);
+    const defaults = await this.settings.get(scope?.projectId);
     const execution: CreateTaskInput = {
       type: 'OPERATION_PLAN',
       name: `${definition.name ?? plan.name} · v${version.version}`,
@@ -247,12 +262,11 @@ export class OperationPlansService implements OnModuleInit {
       payload: {
         targets: await this.targets.resolveForExecution(input),
         steps,
+        ...(operationChain && { operationChain }),
         strategy: input.strategy,
-        maxParallel:
-          input.maxParallel ??
-          (await this.settings.get(scope?.projectId)).defaultMaxParallelTargets,
-        failurePolicy: input.failurePolicy,
-        timeout: input.timeout,
+        maxParallel: input.maxParallel ?? defaults.defaultMaxParallelTargets,
+        failurePolicy: input.failurePolicy ?? defaults.defaultOperationFailurePolicy,
+        timeout: input.timeout ?? defaults.defaultOperationTimeoutSeconds,
       },
     };
     return {

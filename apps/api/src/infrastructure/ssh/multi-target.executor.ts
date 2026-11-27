@@ -3,6 +3,11 @@ import { setTimeout as pause } from 'node:timers/promises';
 import { SshExecutionError, SshService, type SshTarget } from './ssh.service';
 import { TaskExecutionContext, TaskRecord, TaskStatus } from '../../modules/tasks/tasks.types';
 import { InteractiveCommandInputs } from './interactive-command-inputs';
+import {
+  operationFactsProbe,
+  parseOperationFacts,
+  resolveOperationChain,
+} from '../../modules/operation-plans/operation-chain';
 
 @Injectable()
 export class MultiTargetExecutor {
@@ -11,7 +16,7 @@ export class MultiTargetExecutor {
     @Optional() private readonly inputs?: InteractiveCommandInputs,
   ) {}
   async execute(task: TaskRecord, context: TaskExecutionContext): Promise<void> {
-    const { targets, steps, strategy, maxParallel, failurePolicy, timeout, interactive } =
+    const { targets, operationChain, strategy, maxParallel, failurePolicy, timeout, interactive } =
       task.payload;
     const abortSiblings = new AbortController();
     const signal = AbortSignal.any([context.signal, abortSiblings.signal]);
@@ -22,6 +27,41 @@ export class MultiTargetExecutor {
         let targetExitCode: number | null = 0;
         let targetError: string | undefined;
         context.log(`\n── ${target.name} (${target.host}) ──\n`, target.id);
+        let steps = task.payload.steps;
+        if (operationChain) {
+          try {
+            let output = '';
+            const needsFacts = operationChain.nodes.some(({ type }) => type === 'CONDITION');
+            if (needsFacts) {
+              const result = await this.ssh.execute(target, operationFactsProbe, {
+                timeout: Math.min(15, timeout),
+                signal,
+                onData: (text, stream) => {
+                  if (stream === 'stdout' && output.length < 4096)
+                    output += text.slice(0, 4096 - output.length);
+                },
+              });
+              if (result.exitCode !== 0) throw new Error('无法探查执行目标系统信息');
+            }
+            const route = resolveOperationChain(
+              operationChain,
+              needsFacts ? parseOperationFacts(output) : {},
+            );
+            steps = route.steps;
+            for (const branch of route.branches) context.log(`${branch}\n`, target.id);
+          } catch (caught) {
+            const status = signal.aborted
+              ? 'CANCELLED'
+              : caught instanceof SshExecutionError
+                ? caught.kind
+                : 'FAILED';
+            const error = caught instanceof Error ? caught.message : '无法解析执行链';
+            await context.finishTarget(targetId, status, null, error);
+            context.log(`执行链结束：${status} ${error}\n`, target.id);
+            failed = true;
+            return;
+          }
+        }
         for (const [stepIndex, step] of steps.entries()) {
           if (signal.aborted) {
             targetStatus = 'CANCELLED';

@@ -197,14 +197,18 @@
 | 位置                                                    | 字段                                                                                                                                                                                                                                      |
 | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `START.start.sources[]`                                 | `{id,repositoryId,ref?}`。`ref` 为 `{kind:"BRANCH"\|"TAG"\|"COMMIT",value}`。留空时使用仓库默认分支。各仓库在工作区下以克隆地址末段去掉 `.git` 命名。预览固定实际 SHA。                                                                   |
-| `START.start.execution`                                 | `{serverId?}`。草稿可暂时留空，发布要求选择一台已确认 SSH 指纹和凭据的服务器。该服务器承担整次运行。                                                                                                                                      |
+| `START.start.execution`                                 | 省略目标时在启动时选择。固定目标使用 `{serverIds:[...]}`，已有的 `{serverId}` 继续表示固定单台。每台服务器承担各自完整的一次运行。 |
 | `START.start.release`                                   | `{serviceId?,artifactSource?,artifactId?,useUpstreamArtifact?,allowArtifactOverride?,imageId?,imageIds?,compose?}`。服务关联决定托管发布范围。发布和构建共用开始节点的执行服务器。                                                        |
 | `START.start.environmentSetId`、`variables[]`、`dotenv` | 变量条目为 `{key,value?,credentialId?,allowOverride?}`，仓库变量文件为 `{sourceId,path}`。敏感值通过凭据引用。                                                                                                                            |
 | 功能节点                                                | 代码拉取使用 `checkout.fullClone`。构建使用 `build.repoPath`、`installCommand`、`buildCommand`、`dockerfilePath`。检查和 Shell 使用 `shell.directory`、`command`、`timeout`。文件部署使用 `deploy.method:"FILE"` 和选填的停止、启动命令。 |
 | 条件节点                                                | 用 `condition.parameterKey`、`branch.parameterKey` 或 `switch.parameterKey` 读取开始节点显式声明的普通变量。默认使用运行条件值。                                                                                                          |
 | `END.finish`                                            | `{saveWorkspace?,retention?:"PERSISTENT"\|"RUN",images?,requireRelease?:"ACTIVATED"\|"HEALTHY"}`。发布开始前登记并校验实际执行目录。结束阶段核对要求的发布状态。                                                                          |
 
-运行时 `inputs.parameters` 使用 `var:<key>` 或 `artifactId` 提供开始节点允许的参数。Git 版本由发布版的开始节点固定，匹配的仓库推送和轮询采用事件提交。仓库、执行位置、目标及凭据随发布版固定。开始节点设置了 `useUpstreamArtifact` 时，上游成功事件继承实际登记并符合条件的产物。模板或草稿出现所需资源缺失、旧端口、无效路径或当前版本尚未支持的动作时，发布检查返回定位诊断。
+运行时 `inputs.parameters` 使用 `var:<key>` 或 `artifactId` 提供开始节点允许的参数。启动时选择模式通过 `inputs.serverIds` 提交所选服务器。`POST /flows/:flowId/preview-targets` 返回逐服务器预览和批次 `configurationHash`。带该摘要及 `idempotencyKey` 调用 `POST /flows/:flowId/run-targets` 后返回 `{runs:[{serverId,runId}]}`。固定多台模式须一起提交全部已固定的服务器，或省略 `inputs.serverIds` 以使用配置。每台服务器拥有独立运行记录和工作区。
+
+Git 版本由发布版的开始节点固定，匹配的仓库推送和轮询采用事件提交。自动触发的入口需要固定单台服务器。开始节点设置了 `useUpstreamArtifact` 时，上游成功事件继承实际登记并符合条件的产物。模板或草稿出现所需资源缺失、旧端口、无效路径或当前版本尚未支持的动作时，发布检查返回定位诊断。
+
+`POST /projects/:id/execution-graph/ai-draft` 提交 `repositoryId` 及可选的 `ref`、`environmentSetId`、`serverIds`、`instructions`。`serviceId` 关联现有服务，`suggestService:true` 请求新增服务建议，两者互斥。响应附执行图草稿、证据提交和读取文件。新增建议含有 `proposedService`，用户确认后可创建服务并用实际服务 ID 替换草稿中的建议 ID。
 
 纯构建使用 `inputs.parameters.workspaceArtifactId` 选择同项目的持久目录产物。存在拉取动作且未配置仓库时，该参数必填并限定手动运行。`GET /artifacts?projectId=:id&kind=DIRECTORY` 的 `workspaceReusable` 标记候选目录。预览和运行详情的 `simplified.workspaceSource` 区分 `NEW` 和 `HISTORICAL`，历史模式附带实例、来源运行和固定提交。本次执行使用新工作区，代码拉取记录 `checkoutSkipped: "HISTORICAL_WORKSPACE"`。
 
@@ -251,21 +255,23 @@
 
 `GET /projects?include=addresses` 返回活动项目和有序服务地址。`GET /delivery-flows` 返回按项目分组的草稿及当前已发布执行流，带草稿存在、未发布修改和最近运行信息。项目卡片的快捷运行提交所显示的版本及幂等键。
 
+项目服务的 `addresses` 每项接收 `{name,url}` 或 `{name,binding:{serverId,port,protocol,host?,externalPort?,path?}}`。`port` 是监听端口，`protocol` 为 `http` 或 `https`。缺省时采用关联服务器地址和监听端口，可用 `host`、`externalPort` 表达独立的服务入口。详情、项目卡片和门户均返回解析后的完整 `url`。
+
 `GET /servers/:id` 和 `GET /server-groups/:id` 的 `deployedServices` 按项目服务、实际服务器和发布范围提供当前版本及最近尝试。分组查询使用当前启用成员。只有失败尝试的服务可从原发布记录或门户异常入口查看。
 
 ## 系统运行设置
 
-`GET /system` 返回系统执行默认值。`PATCH /system` 接受 `{defaultBuildLocation?,targetWorkspaceRoot?,defaultMaxParallelTargets?,maxConcurrentFlowsPerServer?,logRetentionDays?}`。仅管理员可修改，省略字段保留原值。目标端工作目录默认 `~/.veyops/workspace`，可设为绝对路径或以 `~/` 开头的子目录。`maxConcurrentFlowsPerServer` 的范围为 1–10，默认 10。同一服务器上的执行流和运维命令共用该限额。`defaultMaxParallelTargets` 用于单批运维的目标并行数，默认 3。
+`GET /system` 返回系统执行默认值。`PATCH /system` 接受 `{defaultBuildLocation?,targetWorkspaceRoot?,defaultMaxParallelTargets?,maxConcurrentFlowsPerServer?,defaultOperationFailurePolicy?,defaultOperationTimeoutSeconds?,logRetentionDays?}`。仅管理员可修改，省略字段保留原值。目标端工作目录默认 `~/.veyops/workspace`，可设为绝对路径或以 `~/` 开头的子目录。`maxConcurrentFlowsPerServer` 的范围为 1–10，默认 10。同一服务器上的执行流和运维命令共用该限额。`defaultMaxParallelTargets` 用于单批运维的目标并行数，默认 3。运维任务失败策略默认 `CONTINUE`，单目标超时默认 300 秒，可在 1–3600 秒内设置。
 
 `GET /projects/:id/execution-settings` 返回 `{system,overrides,effective}`，分别为系统默认值、项目显式覆盖值和项目生效值。管理员可用 `PATCH` 修改同一路径，字段与系统设置一致。单项传 `null` 恢复继承，省略则保留原值。构建配置继承位置时，预览会解析项目当前的默认构建位置。目标端构建预览会返回 `targetWorkspaceRoot`，该值随运行快照保存。
 
 日志保留期为 0–3650 天，默认 0 表示长期保留。Worker 周期性清理已结束且超过所属项目保留期的任务日志，保留任务记录、子步骤、审计和产物。未关联项目的任务使用系统保留期。
 
-批量命令、命令模板及运维方案只选一个项目，或只选该项目下的一个环境时，省略 `maxParallel` 会使用该项目的并发设置。混合选择、跨项目选择或直接选择服务器、分组时，省略并发数会使用系统设置。
+批量命令和运维方案只选一个项目，或只选该项目下的一个环境时，省略 `maxParallel` 会使用该项目的并发设置。混合选择、跨项目选择或直接选择服务器、分组时，省略并发数会使用系统设置。
 
 ## 运维中心与命令
 
-网页入口为 `#/operations`。临时命令、命令模板、运维方案和定时运维分别使用 `#/operations/commands`、`#/operations/templates`、`#/operations/plans`、`#/operations/schedules`。原有 `#/commands`、`#/plans`、`#/tasks/schedules` 书签仍可打开对应分区。
+网页入口为 `#/operations`。执行命令、执行任务、运维方案和定时运维分别使用 `#/operations/commands`、`#/operations/tasks`、`#/operations/plans`、`#/operations/schedules`。原有 `#/commands`、`#/plans`、`#/tasks/schedules` 书签仍可打开对应分区。
 
 `POST /commands/preview` 返回 `{count,targets,targetHash}`。目标可通过 `serverIds`、`groupIds`、`tags`、`projectIds`、`environmentIds` 和 `deploymentTargetIds` 选择。项目和环境通过已配置的服务环境部署目标关联服务器。同一标签选择内要求匹配所有标签，各选择的结果合并去重。
 
@@ -276,17 +282,13 @@
   "name": "系统巡检",
   "command": "uname -srm; uptime",
   "serverIds": ["<server UUID>"],
-  "confirmed": true,
-  "strategy": "PARALLEL",
-  "maxParallel": 3,
-  "failurePolicy": "CONTINUE",
-  "timeout": 300
+  "confirmed": true
 }
 ```
 
 提交分组、标签、项目、环境或部署目标时，将预览返回的 `targetHash` 作为 `expectedTargetHash` 一并提交。目标或 SSH 配置发生变化时重新预览。执行返回排队的 Task，支持 `PARALLEL`、`SEQUENTIAL`、`STOP` 和 `CONTINUE`，超时单位为秒。`GET /commands/executions` 返回命令历史。
 
-`GET /command-templates` 查询命令模板，`POST /command-templates` 创建模板，`PATCH /command-templates/:id` 保存新版本，`DELETE /command-templates/:id` 归档。通过 `GET /command-templates/:id/versions` 读取版本，向 `POST /command-templates/:id/run` 提交版本、参数和执行目标。
+`POST /commands/:taskId/input` 可向运行中的 SSH 会话发送多行输入。每行上限为 4095 字节，`targetIds` 使用任务内目标 ID。
 
 ## 任务与日志
 
@@ -321,7 +323,7 @@
 | GET           | `/operation-schedules/:id/runs`                                  | 执行历史及关联任务，可查看跳过、待确认和暂停原因                         |
 | POST          | `/operation-schedules/:id/runs/:runId/approve`                   | 提交 `{confirmed:true}` 后复核权限、版本和目标，再入队                   |
 
-预览参数包含 `name`、`kind`（`COMMAND_TEMPLATE` 或 `OPERATION_PLAN`）、`sourceId`、`sourceVersion`、`timing`、`target`。`timing` 使用 `ONCE` 与 `runAt`（Unix 毫秒）、`INTERVAL` 与 `intervalSeconds`，或 `CRON` 与五字段 `cron`。可选 `timeZone` 使用 IANA 名称。`target` 至少选一台 `serverIds` 或一个 `groupIds`。可配置 `parameters`、`strategy`、`maxParallel`、`failurePolicy`、`timeoutSeconds` 和 `requireConfirmation`。逐次确认默认开启。
+预览参数包含 `name`、`kind`（`OPERATION_PLAN`）、`sourceId`、`sourceVersion`、`timing`、`target`。`timing` 使用 `ONCE` 与 `runAt`（Unix 毫秒）、`INTERVAL` 与 `intervalSeconds`，或 `CRON` 与五字段 `cron`。可选 `timeZone` 使用 IANA 名称。`target` 至少选一台 `serverIds` 或一个 `groupIds`。可配置 `parameters`、`strategy`、`maxParallel`、`failurePolicy`、`timeoutSeconds` 和 `requireConfirmation`。逐次确认默认开启。使用旧命令模板的计划已停用，可编辑为运维方案，原运行记录仍可查。
 
 Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑保存，周期计划继续等待下一个有效时刻。
 
@@ -351,13 +353,25 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
   "name": "只读检查",
   "description": "检查系统版本",
   "category": "CUSTOM",
-  "steps": [{ "name": "系统信息", "command": "uname -srm", "timeout": 30 }]
+  "chain": {
+    "nodes": [
+      { "id": "start", "type": "START", "name": "开始", "x": 32, "y": 48 },
+      { "id": "inspect", "type": "COMMAND", "name": "系统信息", "x": 270, "y": 48, "command": "uname -srm", "timeout": 30 },
+      { "id": "end", "type": "END", "name": "结束", "x": 508, "y": 48 }
+    ],
+    "edges": [
+      { "from": "start", "to": "inspect" },
+      { "from": "inspect", "to": "end" }
+    ]
+  }
 }
 ```
 
-每次更新创建新版本。定义可包含 `preChecks`、`postChecks` 及 `parameters`。每项参数包含 `name`、`type`，可设置 `required`、`defaultValue` 和 `description`。命令中可用 `"$VEYOPS_PARAM_NODE_VERSION"` 读取参数。运行请求使用与命令相同的目标和执行策略字段，并可传入 `version` 和键值形式的 `parameters`。
+每次更新创建新版本。执行链包含一个 `START`、至少一个 `COMMAND` 和至少一个 `END`。条件节点使用 `CONDITION` 和 `fact`（`PACKAGE_MANAGER` 或 `OS`）。条件出线可通过 `when` 指定匹配值，例如 `apt-get`、`dnf` 或 `ubuntu`，省略 `when` 表示默认分支。运行时每台服务器根据实测结果选择分支，缺少匹配分支的目标会失败。连线必须从开始可达并通向结束，执行链不能有循环。
 
-从临时命令页引用方案时，先读取 `GET /operation-plans/:id/versions` 并选定版本，再向 `POST /commands/preview` 提交目标选择。核对步骤、参数及服务器后，通过 `POST /operation-plans/:id/run` 提交同一目标选择、固定版本和预览返回的哈希。
+现有版本中的 `preChecks`、`steps`、`postChecks` 会按原顺序转换成画布，旧版本和定时任务仍可按原版本运行。定义可以设置 `parameters`。参数包含 `name`、`type`，可设置 `required`、`defaultValue` 和 `description`。命令中可用 `"$VEYOPS_PARAM_NODE_VERSION"` 读取参数。
+
+从执行任务页引用方案时，先读取 `GET /operation-plans/:id/versions` 并选定版本，再向 `POST /commands/preview` 提交目标选择。核对执行链、参数及服务器后，通过 `POST /operation-plans/:id/run` 提交同一目标选择、固定版本和预览返回的哈希。
 
 ```json
 {
@@ -368,6 +382,12 @@ Worker 为正常轮询保留 5 秒容差。到期超过 5 秒的执行按漏跑�
   "confirmed": true
 }
 ```
+
+`POST /operation-plans/ai-assist` 接收 `instructions`、`serverIds` 和 `groupIds`。系统按 AI 策略以只读方式采集所选目标的发行版及包管理器，并查找兼容方案。响应包含检测到的 `targets` 和以下结果之一。
+
+- `RECOMMENDATION` 附带可查看的 `plan.id` 和 `plan.version`。
+- `DRAFT` 附带待审核的 `draft.chain`，可审阅后另行调用创建接口保存。
+- `UNAVAILABLE` 附带 `notes`，说明当前请求缺少可用的动作。
 
 方案新增版本后，显式选择的旧版本仍可执行。目标成员或 SSH 连接信息与预览不一致时，接口拒绝入队。重新预览并核对目标后可再次提交。管理员和运维人员可执行，只读账号可查看版本。成功入队后从返回的任务 ID 查询 `GET /tasks/:id`、`/tasks/:id/targets` 和 `/tasks/:id/logs?offset=0`。
 

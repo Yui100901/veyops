@@ -1665,11 +1665,6 @@ tbody tr:hover {
   gap: var(--section-gap);
   min-width: 0;
 }
-.command-advanced > summary {
-  padding: 0.75rem 1rem;
-  cursor: pointer;
-  font-weight: 600;
-}
 .command-target-changes {
   padding: 0.75rem;
   border: 1px solid var(--border);

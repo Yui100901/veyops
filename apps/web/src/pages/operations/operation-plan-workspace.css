@@ -1,0 +1,218 @@
+.operation-plan-workspace,
+.operation-plan-form,
+.operation-plan-view,
+.operation-plan-assistant {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.operation-plan-list-actions,
+.operation-plan-view-actions,
+.operation-chain-tools,
+.operation-chain-details-title,
+.operation-chain-connect,
+.operation-chain-links,
+.operation-plan-target-facts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.operation-plan-view-actions,
+.operation-chain-connect {
+  align-items: end;
+}
+.operation-plan-view-actions .field {
+  flex: 0 1 230px;
+}
+.operation-chain-connect .field {
+  flex: 0 1 190px;
+}
+.operation-chain-connect .button,
+.operation-plan-view-actions .button {
+  min-height: 37px;
+}
+.operation-plan-description p,
+.operation-plan-advice p {
+  margin: 0 0 5px;
+}
+.operation-chain {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: white;
+}
+.operation-chain-tools {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.operation-chain-scroll {
+  min-height: 214px;
+  max-height: min(54vh, 490px);
+  overflow: auto;
+  background: #f7fafb radial-gradient(#cad9df 0.9px, transparent 0.9px) 0 0 / 15px 15px;
+}
+.operation-chain-canvas {
+  position: relative;
+}
+.operation-chain-canvas svg:not(.operation-chain-node svg) {
+  position: absolute;
+  inset: 0 auto auto 0;
+  pointer-events: none;
+}
+.operation-chain-canvas svg > g > path {
+  fill: none;
+  stroke: #748a98;
+  stroke-width: 1.7;
+}
+.operation-chain-canvas .conditional > path {
+  stroke: #895e37;
+  stroke-dasharray: 5 3;
+}
+.operation-chain-canvas svg marker path {
+  fill: #748a98;
+}
+.operation-chain-canvas svg text {
+  font-size: 11px;
+  font-weight: 700;
+  fill: #7b4d2f;
+  paint-order: stroke;
+  stroke: #f7fafb;
+  stroke-width: 3px;
+}
+.operation-chain-node {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid #b3c1cb;
+  border-radius: 9px;
+  background: #fff;
+  color: #263540;
+  text-align: left;
+  box-shadow: 0 2px 5px #24425112;
+  touch-action: none;
+  user-select: none;
+}
+.operation-chain-node > svg {
+  flex: none;
+}
+.operation-chain-node > span {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+}
+.operation-chain-node :is(small, strong) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.operation-chain-node small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.operation-chain-node strong {
+  font-size: 13px;
+}
+.operation-chain-node:is(.start, .end) {
+  border-color: #92c1b8;
+  background: #eff8f5;
+  color: var(--accent-dark);
+}
+.operation-chain-node.condition {
+  border-color: #d4b18d;
+  background: #fff7e9;
+  color: #7b4d2f;
+}
+.operation-chain-node[aria-pressed='true'] {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.operation-chain-canvas.connecting .operation-chain-node {
+  cursor: crosshair;
+}
+.operation-chain-details {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+}
+.operation-chain-details-title {
+  justify-content: space-between;
+}
+.operation-chain-fields,
+.operation-plan-parameter {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+.operation-chain-command,
+.operation-plan-command {
+  font-family: 'IBM Plex Mono', Consolas, monospace;
+}
+.operation-plan-command {
+  max-height: 300px;
+  margin: 0;
+  overflow: auto;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #14232e;
+  color: #e5f3f6;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.operation-chain-links:empty {
+  display: none;
+}
+.operation-chain-links > span,
+.operation-plan-target-facts > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #f8fafb;
+}
+.operation-chain-links > span > small {
+  color: var(--muted);
+  font-family: Consolas, monospace;
+}
+.operation-plan-parameters,
+.operation-plan-advice {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.operation-plan-parameters summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.operation-plan-parameters .field-note {
+  margin: 8px 0;
+}
+.operation-plan-parameter {
+  align-items: end;
+  grid-template-columns: repeat(4, minmax(110px, 1fr)) auto auto;
+  margin-bottom: 9px;
+}
+.operation-plan-parameter > .checkbox-row {
+  align-self: center;
+}
+.operation-plan-advice {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  margin-top: 12px;
+}
+@media (max-width: 760px) {
+  .operation-plan-parameter {
+    grid-template-columns: repeat(2, minmax(100px, 1fr));
+  }
+  .operation-plan-list > div {
+    flex-wrap: wrap;
+  }
+}
