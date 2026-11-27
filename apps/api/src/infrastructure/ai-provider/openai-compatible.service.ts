@@ -25,6 +25,7 @@ interface AiCompletionOptions {
   signal?: AbortSignal;
   maxTokens?: number;
   maxResponseBytes?: number;
+  requireTool?: boolean;
 }
 
 export function completionUrl(base: string): string {
@@ -91,7 +92,13 @@ export class OpenAiCompatibleService {
           ...(new URL(connection.baseUrl).hostname === 'api.deepseek.com'
             ? { thinking: { type: 'disabled' } }
             : {}),
-          ...(tools.length ? { tools, tool_choice: 'auto' } : {}),
+          ...(tools.length
+            ? {
+                tools,
+                tool_choice: options.requireTool ? 'required' : 'auto',
+                ...(options.requireTool && { parallel_tool_calls: false }),
+              }
+            : {}),
         }),
       });
       if (!response.ok) {

@@ -946,38 +946,76 @@ test('command-center AI limits tools to its selected targets and requires initia
   const f = await fixture();
   let round = 0;
   const server = await upstream((body) => {
-    if (++round > 1)
-      return { body: { choices: [{ message: { content: '请核对所选服务器与安装方案。' } }] } };
-    assert.deepEqual(body.tools.map((tool: { function: { name: string } }) => tool.function.name).sort(), [
-      'execute_command', 'initialize_component', 'inspect_servers',
-    ]);
+    assert.equal(body.tool_choice, 'required');
+    assert.equal(body.parallel_tool_calls, false);
+    if (++round > 1) {
+      const reply = {
+        id: 'ops-reply',
+        type: 'function',
+        function: {
+          name: 'respond_to_operator',
+          arguments: JSON.stringify({ message: '请核对所选服务器并确认安装方案。' }),
+        },
+      };
+      return { body: { choices: [{ message: { content: null, tool_calls: [reply] } }] } };
+    }
+    assert.deepEqual(
+      body.tools.map((tool: { function: { name: string } }) => tool.function.name).sort(),
+      ['execute_command', 'initialize_component', 'inspect_servers', 'respond_to_operator'],
+    );
     const toolCalls = [
       ['inspect_servers', { serverIds: [randomUUID()] }],
       ['inspect_servers', {}],
       ['initialize_component', { component: 'docker' }],
     ].map(([name, args], index) => ({
-      id: 'ops-' + index, type: 'function', function: { name, arguments: JSON.stringify(args) },
+      id: 'ops-' + index,
+      type: 'function',
+      function: { name, arguments: JSON.stringify(args) },
     }));
     return { body: { choices: [{ message: { content: null, tool_calls: toolCalls } }] } };
   });
   try {
     const { id, name, host, username } = f.target;
-    await f.database.db.insertInto('servers').values({
-      id, name, host, username, created_at: Date.now(), updated_at: Date.now(),
-    }).execute();
-    await f.providers.create({
-      name: 'Ops Mock', baseUrl: server.url, model: 'test', apiKey: 'mock-key',
-      timeoutSeconds: 5, enabled: true,
-    }, f.actor.id);
+    await f.database.db
+      .insertInto('servers')
+      .values({
+        id,
+        name,
+        host,
+        username,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      })
+      .execute();
+    await f.providers.create(
+      {
+        name: 'Ops Mock',
+        baseUrl: server.url,
+        model: 'test',
+        apiKey: 'mock-key',
+        timeoutSeconds: 5,
+        enabled: true,
+      },
+      f.actor.id,
+    );
     await f.policy.update({ mode: 'FULL_CONTROL', serverIds: [id] }, f.actor);
-    const result = await f.ai.chat({
-      message: '查看磁盘占用并安装 Docker', context: { kind: 'COMMAND_TARGETS', serverIds: [id] },
-    }, f.actor);
+    const result = await f.ai.chat(
+      {
+        message: '查看磁盘占用并安装 Docker',
+        context: { kind: 'COMMAND_TARGETS', serverIds: [id] },
+      },
+      f.actor,
+    );
     assert.equal(f.executeCount(), 0);
+    assert.equal(result.message, '请核对所选服务器并确认安装方案。');
     assert.equal(result.proposals[0]?.actionType, 'initialize_component');
     const history = await f.ai.messages(result.conversationId, f.actor);
-    assert.ok(history.some(({ role, content }) => role === 'TOOL' && content.includes('超出当前选择')));
-    assert.ok(history.some(({ role, content }) => role === 'TOOL' && content.includes('"git":"available"')));
+    assert.ok(
+      history.some(({ role, content }) => role === 'TOOL' && content.includes('超出当前选择')),
+    );
+    assert.ok(
+      history.some(({ role, content }) => role === 'TOOL' && content.includes('"git":"available"')),
+    );
     await f.proposals.confirm(result.proposals[0]!.id, f.actor);
     assert.equal(f.executeCount(), 1);
   } finally {

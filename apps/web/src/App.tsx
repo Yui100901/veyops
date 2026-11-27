@@ -501,7 +501,8 @@ export function App() {
   function showNavigationLabel(name: string, link: HTMLAnchorElement) {
     if (!sidebarCollapsed) return;
     const { right, top, height } = link.getBoundingClientRect();
-    setNavTooltip({ name, left: right + 12, top: top + height / 2 });
+    const sidebarRight = link.closest('.sidebar')?.getBoundingClientRect().right ?? right;
+    setNavTooltip({ name, left: sidebarRight + 8, top: top + height / 2 });
   }
   async function logout() {
     setLoggingOut(true);
