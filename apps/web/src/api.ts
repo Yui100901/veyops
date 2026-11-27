@@ -305,7 +305,7 @@ export function useTaskLogs(
   const [error, setError] = useState('');
   const cursor = useRef(0);
   const epoch = useRef(0);
-  const pending = useRef<Promise<void>>();
+  const pending = useRef<Promise<void> | undefined>(undefined);
   const reload = useCallback(() => {
     if (!path) return;
     if (pending.current) return pending.current;
