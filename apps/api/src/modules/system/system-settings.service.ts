@@ -23,10 +23,11 @@ export interface SystemSettings {
 }
 
 const settingsKey = 'system:execution-defaults';
+export const defaultServerConcurrency = 10;
 const defaults: SystemSettings = {
   defaultBuildLocation: 'TARGET',
   defaultMaxParallelTargets: 3,
-  maxConcurrentFlowsPerServer: 3,
+  maxConcurrentFlowsPerServer: defaultServerConcurrency,
   logRetentionDays: 0,
   targetWorkspaceRoot: '~/.veyops/workspace',
 };

@@ -27,8 +27,15 @@ import { SecretRedactor } from '../infrastructure/ssh/secret-redactor';
 import { TaskExecutionContext, TaskPayload, TaskStatus } from '../modules/tasks/tasks.types';
 import { TasksController } from '../modules/tasks/tasks.controller';
 import { AuditService } from '../modules/audit/audit.service';
+import { SystemSettingsService } from '../modules/system/system-settings.service';
+import { canAdmitServerWork, nextServerWorkOrder } from '../modules/tasks/server-execution-queue';
 import { lastValueFrom, toArray } from 'rxjs';
 import { rmSync } from 'node:fs';
+import {
+  createPostgresService,
+  postgresTestUrl,
+  withIsolatedPostgres,
+} from './helpers/isolated-postgres';
 
 class MemoryLogs extends TaskLogService {
   lines = new Map<string, string>();
@@ -69,10 +76,12 @@ function context() {
   };
   return { ctx, results, controller };
 }
-async function databaseFixture() {
-  process.env.DATABASE_CLIENT = 'sqlite';
-  process.env.DATABASE_PATH = ':memory:';
-  const database = new DatabaseService();
+async function databaseFixture(provided?: DatabaseService) {
+  if (!provided) {
+    process.env.DATABASE_CLIENT = 'sqlite';
+    process.env.DATABASE_PATH = ':memory:';
+  }
+  const database = provided ?? new DatabaseService();
   await database.onModuleInit();
   const now = Date.now();
   const userId = randomUUID();
@@ -511,64 +520,167 @@ test('registered handlers execute through the queue and persist target and paren
     await fixture.database.onApplicationShutdown();
   }
 });
-test('a SQLite worker processes independent graph nodes concurrently and preserves normal queue order', async () => {
-  const { database, userId, logs, tasks } = await databaseFixture();
+async function verifySharedSlots(provided?: DatabaseService) {
+  const { database, userId, logs } = await databaseFixture(provided);
+  const settings = new SystemSettingsService(database, new AuditService(database));
   const registry = new TaskHandlerRegistry();
-  const worker = new TaskWorkerService(database, tasks, registry, logs);
+  const tasks = new TasksService(database, logs, registry, settings);
+  const worker = new TaskWorkerService(database, tasks, registry, logs, settings);
   const started = new Set<string>();
-  let release = () => {};
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
+  let releaseNodes = () => {};
+  let releaseCommand = () => {};
+  const nodeGate = new Promise<void>((resolve) => {
+    releaseNodes = resolve;
+  });
+  const commandGate = new Promise<void>((resolve) => {
+    releaseCommand = resolve;
   });
   try {
     const serverId = randomUUID();
+    const otherId = randomUUID();
+    const graphId = randomUUID();
+    const projectId = randomUUID();
+    const now = Date.now();
+    await settings.update({ maxConcurrentFlowsPerServer: 2 }, userId);
     await database.db
       .insertInto('servers')
+      .values(
+        [serverId, otherId].map((id) => ({
+          id,
+          name: id,
+          host: 'host',
+          username: 'ops',
+          created_at: now,
+          updated_at: now,
+        })),
+      )
+      .execute();
+    await database.db
+      .insertInto('projects')
       .values({
-        id: serverId,
-        name: 'server',
-        host: 'host',
-        username: 'ops',
-        created_at: Date.now(),
-        updated_at: Date.now(),
+        id: projectId,
+        name: 'Queue',
+        slug: 'queue',
+        created_by: userId,
+        created_at: now,
+        updated_at: now,
       })
       .execute();
-    const submit = (name: string, idempotencyKey?: string) =>
+    await database.db
+      .insertInto('execution_graphs')
+      .values({
+        id: graphId,
+        project_id: projectId,
+        revision: 1,
+        draft_json: '{}',
+        created_at: now,
+        updated_at: now,
+      })
+      .execute();
+    await database.db
+      .insertInto('execution_graph_versions')
+      .values({
+        id: randomUUID(),
+        graph_id: graphId,
+        version: 1,
+        source_revision: 1,
+        definition_json: '{}',
+        created_by: userId,
+        created_at: now,
+      })
+      .execute();
+    const putFlow = (id: string, status: 'RUNNING' | 'QUEUED') =>
+      database.db.transaction().execute(async (tx) => {
+        const queuedAt = await nextServerWorkOrder(tx, serverId);
+        await tx
+          .insertInto('execution_flow_runs')
+          .values({
+            id,
+            graph_id: graphId,
+            project_id: projectId,
+            version: 1,
+            flow_id: 'start',
+            flow_name: 'Build',
+            created_by: userId,
+            idempotency_key: id,
+            request_hash: id,
+            configuration_hash: id,
+            inputs_json: '{}',
+            execution_server_id: serverId,
+            created_at: queuedAt,
+            status,
+            execution_admitted_at: status === 'RUNNING' ? now : null,
+          })
+          .execute();
+      });
+    const runningFlow = randomUUID();
+    const waitingFlow = randomUUID();
+    await putFlow(runningFlow, 'RUNNING');
+    const submit = (name: string, host = serverId, idempotencyKey?: string) =>
       tasks.create(
-        { type: 'COMMAND', name, payload: payload([target(serverId)]), idempotencyKey },
+        { type: 'COMMAND', name, payload: payload([target(host)]), idempotencyKey },
         userId,
       );
-    const left = await submit('left', 'execution-flow:' + randomUUID());
-    const right = await submit('right', 'execution-flow:' + randomUUID());
-    const regular = await submit('regular');
+    const left = await submit('left', serverId, 'execution-flow:' + randomUUID());
+    const right = await submit('right', serverId, 'execution-flow:' + randomUUID());
+    const first = await submit('first command');
+    await putFlow(waitingFlow, 'QUEUED');
+    const after = await submit('after waiting flow');
+    const separate = await submit('independent server', otherId);
     registry.register({
       type: 'COMMAND',
       execute: async (task, ctx) => {
-        const targetId = await ctx.startTarget(serverId);
+        const targetId = await ctx.startTarget(task.payload.targets[0]!.id);
         started.add(task.id);
-        if (task.id !== regular.id) await gate;
+        if (task.id === left.id || task.id === right.id) await nodeGate;
+        if (task.id === first.id) await commandGate;
         await ctx.finishTarget(targetId, 'SUCCESS', 0);
       },
     });
     await worker.tick();
-    await waitFor(async () => started.has(left.id) && started.has(right.id));
-    assert.equal((await tasks.get(left.id)).status, 'RUNNING');
-    assert.equal((await tasks.get(right.id)).status, 'RUNNING');
-    assert.equal((await tasks.get(regular.id)).status, 'PENDING');
-    release();
-    await waitFor(
-      async () =>
-        (await tasks.get(left.id)).status === 'SUCCESS' &&
-        (await tasks.get(right.id)).status === 'SUCCESS',
+    await waitFor(async () =>
+      [left.id, right.id, first.id, separate.id].every((id) => started.has(id)),
     );
+    assert.equal((await tasks.get(after.id)).status, 'PENDING');
+    releaseCommand();
+    await waitFor(async () => (await tasks.get(first.id)).status === 'SUCCESS');
     await worker.tick();
-    await waitFor(async () => (await tasks.get(regular.id)).status === 'SUCCESS');
+    assert.equal((await tasks.get(after.id)).status, 'PENDING');
+    await database.db.transaction().execute(async (tx) => {
+      assert.equal(await canAdmitServerWork(tx, serverId, 'FLOW', waitingFlow, 2), true);
+      await tx
+        .updateTable('execution_flow_runs')
+        .set({
+          status: 'RUNNING',
+          execution_admitted_at: Date.now(),
+        })
+        .where('id', '=', waitingFlow)
+        .execute();
+    });
+    await worker.tick();
+    assert.equal((await tasks.get(after.id)).status, 'PENDING');
+    releaseNodes();
+    await database.db
+      .updateTable('execution_flow_runs')
+      .set({ status: 'SUCCESS', finished_at: Date.now() })
+      .where('id', '=', runningFlow)
+      .execute();
+    await worker.tick();
+    await waitFor(async () => (await tasks.get(after.id)).status === 'SUCCESS');
   } finally {
-    release();
+    releaseNodes();
+    releaseCommand();
     await worker.shutdown();
     await database.onApplicationShutdown();
   }
-});
+}
+test('SQLite flows and command targets share FIFO server slots', () => verifySharedSlots());
+test(
+  'PostgreSQL flows and command targets share FIFO server slots',
+  { skip: !postgresTestUrl },
+  () =>
+    withIsolatedPostgres(postgresTestUrl!, (url) => verifySharedSlots(createPostgresService(url))),
+);
 test('running cancellation signals the active handler and reaches CANCELLED', async () => {
   const fixture = await databaseFixture();
   let worker: TaskWorkerService | undefined;

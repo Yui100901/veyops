@@ -7,6 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { activeFlowStatuses, graphTaskKeyPrefix } from '../execution-graphs/graph-run-lifecycle';
 import { TaskHandlerRegistry } from './task-handler.registry';
 import { Selectable, sql, Transaction } from 'kysely';
@@ -34,6 +35,12 @@ import { lockProjectGraph } from '../projects/project-guards';
 import { taskPayloadResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
 import { encodeTaskCenterCursor, taskCenterCursor, type TaskCenterQuery } from './task-center.dto';
+import {
+  canAdmitServerWork,
+  isQueuedOperation,
+  nextServerWorkOrder,
+} from './server-execution-queue';
+import { defaultServerConcurrency, SystemSettingsService } from '../system/system-settings.service';
 
 const terminal = new Set<string>(terminalTaskStatuses);
 export const isTerminalStatus = (status: string) => terminal.has(status);
@@ -74,6 +81,7 @@ function presentTask(task: Selectable<TasksTable>, payload: TaskPayload) {
     errorSummary: task.error_summary,
     result,
     operationPlanVersionId: task.operation_plan_version_id,
+    ...(payload.interactive && { interactive: true as const }),
     commandTemplate: payload.commandTemplate ?? null,
     retryOf: payload.retryOf ?? null,
     ...(task.project_id && flowRunId && { flowRunId, flowNodeId }),
@@ -104,6 +112,7 @@ export class TasksService {
     private readonly database: DatabaseService,
     private readonly logStore: TaskLogService,
     @Optional() private readonly registry?: TaskHandlerRegistry,
+    @Optional() private readonly settings?: SystemSettingsService,
   ) {}
   bindCancellation(id: string, controller: AbortController): () => void {
     this.cancellations.set(id, controller);
@@ -258,7 +267,12 @@ export class TasksService {
         .executeTakeFirstOrThrow();
       return existing.id;
     }
-    if (targets.length)
+    if (targets.length) {
+      const order = new Map<string, number>();
+      if (isQueuedOperation(input.type, input.idempotencyKey)) {
+        for (const serverId of targets.map(({ id }) => id).sort())
+          order.set(serverId, await nextServerWorkOrder(tx, serverId));
+      }
       await tx
         .insertInto('task_targets')
         .values(
@@ -266,6 +280,7 @@ export class TasksService {
             id: randomUUID(),
             task_id: id,
             server_id: target.id,
+            execution_queued_at: order.get(target.id) ?? null,
             server_name_snapshot: target.name,
             release_scope_key:
               input.type === 'PIPELINE' &&
@@ -281,6 +296,7 @@ export class TasksService {
           })),
         )
         .execute();
+    }
     // Graph artifact producers keep their authored task scope while recording
     // delivery history against the backing service and environment.
     const deliveryServiceId = input.registrationProfile?.serviceId ?? input.scope?.serviceId;
@@ -487,6 +503,7 @@ export class TasksService {
       payload.steps?.length === 1 &&
       command &&
       !payload.commandTemplate &&
+      !payload.interactive &&
       !payload.graphModule &&
       !payload.aiRepair &&
       !payload.environment &&
@@ -541,6 +558,7 @@ export class TasksService {
       canRetry:
         !!user &&
         (user.role === 'ADMIN' || (user.role === 'OPERATOR' && task.created_by === user.id)) &&
+        !snapshot.interactive &&
         retryable(task, row) &&
         versionedTargets.has(row.server_id!),
     }));
@@ -558,6 +576,7 @@ export class TasksService {
     if (!target) throw new NotFoundException('任务目标不存在');
     if (!retryable(task, target)) throw new ConflictException('此目标的执行结果不允许重试');
     const payload = JSON.parse(task.payload_json) as TaskPayload;
+    if (payload.interactive) throw new ConflictException('请重新发起交互任务');
     const previous = payload.targets.find((item) => item.id === target.server_id);
     if (!previous?.credentialNonce)
       throw new ConflictException('原任务缺少可核对的 SSH 快照，请重新提交');
@@ -684,9 +703,35 @@ export class TasksService {
   }
   context(task: Selectable<TasksTable>, signal: AbortSignal): TaskExecutionContext {
     const owner = task.lease_owner!;
+    const queued = isQueuedOperation(task.task_type, task.idempotency_key);
+    const tryStartTarget = (serverId: string) =>
+      this.database.db.transaction().execute(async (tx) => {
+        if (signal.aborted || !(await lockTaskLease(tx, task.id, owner)))
+          throw new TaskLeaseUnavailableError();
+        const target = await tx
+          .selectFrom('task_targets')
+          .select('id')
+          .where('task_id', '=', task.id)
+          .where('server_id', '=', serverId)
+          .where('status', '=', 'PENDING')
+          .executeTakeFirstOrThrow();
+        if (queued) {
+          const limit =
+            (await this.settings?.get(undefined, tx))?.maxConcurrentFlowsPerServer ??
+            defaultServerConcurrency;
+          if (!(await canAdmitServerWork(tx, serverId, 'OPERATION', target.id, limit))) return;
+        }
+        await tx
+          .updateTable('task_targets')
+          .set({ status: 'RUNNING', started_at: Date.now() })
+          .where('id', '=', target.id)
+          .execute();
+        return target.id;
+      });
     return {
       signal,
       leaseOwner: owner,
+      ...(queued && { tryStartTarget }),
       log: (text, serverId) => {
         this.logStore.append(
           task.id,
@@ -694,20 +739,14 @@ export class TasksService {
           serverId ? `[${serverId}] ${text}` : text,
         );
       },
-      startTarget: (serverId) =>
-        this.database.db.transaction().execute(async (tx) => {
-          if (signal.aborted || !(await lockTaskLease(tx, task.id, owner)))
-            throw new TaskLeaseUnavailableError();
-          const row = await tx
-            .updateTable('task_targets')
-            .set({ status: 'RUNNING', started_at: Date.now() })
-            .where('task_id', '=', task.id)
-            .where('server_id', '=', serverId)
-            .where('status', '=', 'PENDING')
-            .returning('id')
-            .executeTakeFirstOrThrow();
-          return row.id;
-        }),
+      startTarget: async (serverId) => {
+        while (!signal.aborted) {
+          const id = await tryStartTarget(serverId);
+          if (id) return id;
+          await delay(250, undefined, { signal }).catch(() => undefined);
+        }
+        throw new TaskLeaseUnavailableError();
+      },
       finishTarget: (targetId, status, exitCode, error) =>
         this.database.db.transaction().execute(async (tx) => {
           if (!(await lockTaskLease(tx, task.id, owner, true))) return;

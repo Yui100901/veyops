@@ -91,6 +91,7 @@ export const aiContextKinds = [
   'PIPELINE',
   'TASK',
   'OPERATION_PLAN',
+  'COMMAND_TARGETS',
 ] as const;
 export type AiContextKind = (typeof aiContextKinds)[number];
 
@@ -101,6 +102,7 @@ export class AiContextDto {
   @IsOptional() @IsUUID() pipelineId?: string;
   @IsOptional() @IsUUID() taskId?: string;
   @IsOptional() @IsUUID() operationPlanId?: string;
+  @IsOptional() @IsArray() @ArrayMaxSize(100) @IsUUID('all', { each: true }) serverIds?: string[];
   @IsOptional() @IsInt() @Min(1) version?: number;
   @IsOptional() @IsString() @Matches(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i) commitSha?: string;
 }

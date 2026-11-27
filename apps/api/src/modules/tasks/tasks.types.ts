@@ -46,6 +46,7 @@ export interface AiRepairOrigin {
   automatic: boolean;
 }
 export interface TaskPayload {
+  interactive?: boolean;
   graphModule?: GraphModulePayload;
   simplifiedAction?: SimplifiedActionPayload;
   environment?: ExecutionVariables;
@@ -72,6 +73,7 @@ export interface TaskExecutionContext {
   signal: AbortSignal;
   log(text: string, serverId?: string): void;
   startTarget(serverId: string): Promise<string>;
+  tryStartTarget?(serverId: string): Promise<string | undefined>;
   finishTarget(
     targetId: string,
     status: TaskStatus,

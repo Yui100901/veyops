@@ -2179,6 +2179,44 @@ export const migrationProvider: MigrationProvider = {
             .execute();
         },
       } satisfies Migration,
+      '044_shared_server_queue': {
+        async up(db) {
+          await db.schema
+            .alterTable('task_targets')
+            .addColumn('execution_queued_at', 'bigint')
+            .execute();
+          await db.schema
+            .createIndex('task_targets_server_queue')
+            .on('task_targets')
+            .columns(['server_id', 'execution_queued_at', 'status'])
+            .execute();
+        },
+        async down(db) {
+          await db.schema.dropIndex('task_targets_server_queue').execute();
+          await db.schema.alterTable('task_targets').dropColumn('execution_queued_at').execute();
+        },
+      } satisfies Migration,
+      '045_interactive_command_inputs': {
+        async up(db) {
+          await db.schema
+            .createTable('interactive_command_inputs')
+            .addColumn('id', 'text', (column) => column.primaryKey().notNull())
+            .addColumn('task_target_id', 'text', (column) =>
+              column.notNull().references('task_targets.id').onDelete('cascade'),
+            )
+            .addColumn('sequence', 'bigint', (column) => column.notNull())
+            .addColumn('created_at', 'bigint', (column) => column.notNull())
+            .addColumn('encrypted_input', 'text', (column) => column.notNull())
+            .addUniqueConstraint('interactive_command_inputs_target_sequence', [
+              'task_target_id',
+              'sequence',
+            ])
+            .execute();
+        },
+        async down(db) {
+          await db.schema.dropTable('interactive_command_inputs').execute();
+        },
+      } satisfies Migration,
     };
   },
 };

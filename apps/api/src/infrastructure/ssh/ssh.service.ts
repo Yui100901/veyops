@@ -23,6 +23,7 @@ export interface SshOptions {
   timeout: number;
   signal?: AbortSignal;
   onData?: (text: string, stream: 'stdout' | 'stderr') => void;
+  interactiveInput?: (write: (line: string) => Promise<void>, signal: AbortSignal) => Promise<void>;
   secrets?: string[];
   variables?: ExecutionVariables;
 }
@@ -132,12 +133,17 @@ export class SshService {
           .join('\n') + '\n'
       : undefined;
     // Send variable values on the SSH channel so remote process arguments stay free of secrets.
-    const script = exports === undefined ? command : `. /dev/stdin || exit $?\n${command}`;
+    if (exports !== undefined && options.interactiveInput)
+      throw new SshExecutionError('交互命令不能写入运行变量');
+    const script = options.interactiveInput
+      ? `stty -echo 2>/dev/null || true\n${command}`
+      : exports === undefined ? command : `. /dev/stdin || exit $?\n${command}`;
     return new Promise((resolve, reject) => {
       const client = new Client();
       let channel: ClientChannel | undefined;
       let settled = false;
       let hostKeyRejected = false;
+      const inputChannel = new AbortController();
       let outputBytes = 0;
       const outputLimit = 5 * 1024 * 1024;
       const decoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') };
@@ -182,6 +188,7 @@ export class SshService {
       const finish = (error?: Error, result?: { exitCode: number; signal?: string }) => {
         if (settled) return;
         settled = true;
+        inputChannel.abort();
         clearTimeout(timer);
         options.signal?.removeEventListener('abort', cancel);
         const finalError = error ?? flush();
@@ -230,7 +237,7 @@ export class SshService {
           client.end();
           return;
         }
-        client.exec(script, (error, stream) => {
+        client.exec(script, options.interactiveInput ? { pty: { term: 'dumb' } } : {}, (error, stream) => {
           if (error) {
             finish(new SshExecutionError(redactText(error.message, secretValues)));
             return;
@@ -257,6 +264,17 @@ export class SshService {
               );
           });
           if (exports !== undefined) stream.end(exports);
+          if (options.interactiveInput)
+            void options.interactiveInput(
+              (line) => new Promise<void>((resolve, reject) => {
+                if (inputChannel.signal.aborted) return reject(new Error('SSH 输入通道已关闭'));
+                stream.write(line, (writeError) => writeError ? reject(writeError) : resolve());
+              }),
+              inputChannel.signal,
+            ).catch(() => {
+              if (!inputChannel.signal.aborted)
+                finish(new SshExecutionError('SSH 交互输入发送失败，请核查远程状态', 'NEEDS_ATTENTION'));
+            });
         });
       });
       client.on('error', (error: Error) =>

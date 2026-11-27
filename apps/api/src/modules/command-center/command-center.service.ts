@@ -39,6 +39,7 @@ export class CommandCenterService implements OnModuleInit {
       name: input.name ?? '临时命令',
       scope,
       payload: {
+        ...(input.interactive && { interactive: true }),
         targets: await this.targets.resolveForExecution(input),
         steps: [{ name: '执行命令', command: input.command }],
         strategy: input.strategy,

@@ -55,10 +55,23 @@ const server = new Server({ hostKeys: [hostKey] }, (connection) => {
   connection.on('ready', () =>
     connection.on('session', (accept) => {
       const session = accept();
+      session.on('pty', (approvePty) => approvePty?.());
       session.on('exec', (acceptCommand, _reject, info) => {
         const stream = acceptCommand();
         stream.on('error', () => undefined);
         if (info.command === 'wait') return;
+        if (info.command.endsWith('\ninteractive-fixture')) {
+          let input = '';
+          stream.write('ready> ');
+          stream.on('data', (chunk: Buffer) => {
+            input += chunk.toString();
+            if (!input.endsWith('\n')) return;
+            stream.write(`response:${input}`);
+            stream.exit(0);
+            stream.end();
+          });
+          return;
+        }
         if (info.command === 'missing-exit-status') {
           stream.close();
           return;
@@ -193,6 +206,17 @@ test('real SSH rejects a changed host key and a wrong password', async () => {
 test('real SSH exposes independent command exit codes', async () => {
   const result = await service().execute(target, 'nonzero', { timeout: 5 });
   assert.equal(result.exitCode, 7);
+});
+
+test('a real SSH PTY accepts stdin and streams the remote response without closing early', async () => {
+  let output = '';
+  const result = await service().execute(target, 'interactive-fixture', {
+    timeout: 3,
+    onData: (text) => { output += text; },
+    interactiveInput: async (write) => { await write('hello target\n'); },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.match(output, /ready> response:hello target/);
 });
 test('real SSH treats a channel close without exit status as an uncertain result', async () => {
   await assert.rejects(

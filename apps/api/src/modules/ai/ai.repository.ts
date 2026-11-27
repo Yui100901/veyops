@@ -193,6 +193,21 @@ export class AiRepository {
         }
         result.projectId = requestedProjectId;
         break;
+      case 'COMMAND_TARGETS': {
+        const serverIds = input.serverIds ?? [];
+        const targets = await db
+          .selectFrom('servers')
+          .select(['id', 'name'])
+          .where('id', 'in', serverIds)
+          .where('is_active', '=', 1)
+          .execute();
+        if (targets.length !== serverIds.length)
+          throw new NotFoundException('部分 AI 运维目标已移除或停用，请重新选择');
+        result.commandTargets = targets;
+        result.serverIds = serverIds;
+        result.projectId = requestedProjectId;
+        break;
+      }
     }
     if (result.serviceId) {
       const service = await db

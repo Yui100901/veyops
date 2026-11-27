@@ -34,7 +34,16 @@ async function main() {
       servers.find((server) => server.host === host && server.name === 'Flow V2 ' + host)?.id,
   );
   assert.ok(ids.every(Boolean), 'Expected three dedicated acceptance targets');
-  await call('PATCH', '/system', { maxConcurrentFlowsPerServer: 2 });
+  const previous = (await get('/system')).maxConcurrentFlowsPerServer;
+  await call('PATCH', '/system', { maxConcurrentFlowsPerServer: 5 });
+  try {
+    await verifySharedSlots({ call, post, get, ids });
+  } finally {
+    await call('PATCH', '/system', { maxConcurrentFlowsPerServer: previous });
+  }
+}
+
+async function verifySharedSlots({ call, post, get, ids }) {
   const project = await post('/projects', {
     name: '单机队列隔离验收',
     slug: 'flow-capacity-' + randomUUID().slice(0, 8),
@@ -42,7 +51,7 @@ async function main() {
   const projectPath = '/projects/' + project.id;
   const graph = projectPath + '/execution-graph';
   const config = await get(graph);
-  const chains = [ids[0], ids[0], ids[0], ids[1], ids[2]].map((serverId, i) => {
+  const chains = [ids[0], ids[0], ids[0]].map((serverId, i) => {
     const index = i + 1;
     const id = 'queue-' + index;
     const command = id + '-work';
@@ -89,9 +98,28 @@ async function main() {
     });
     runs.push(run.runId);
   }
-  let details;
+  const submit = async (name, serverIds) => {
+    const { targetHash } = await post('/commands/preview', { serverIds });
+    return (
+      await post('/commands/execute', {
+        name,
+        command: 'sleep 12',
+        confirmed: true,
+        expectedTargetHash: targetHash,
+        serverIds,
+      })
+    ).id;
+  };
+  const firstCommand = await submit('验收 · 第一个运维命令', [ids[0]]);
+  const secondCommand = await submit('验收 · 第二个运维命令', [ids[0]]);
+  const batch = await submit('验收 · 第三个运维命令', ids);
+  const tasks = [firstCommand, secondCommand, batch];
+  let details, operations;
   for (const until = Date.now() + 120000; Date.now() < until;) {
-    details = await Promise.all(runs.map((run) => get(graph + '/runs/' + run)));
+    [details, operations] = await Promise.all([
+      Promise.all(runs.map((run) => get(graph + '/runs/' + run))),
+      Promise.all(tasks.map((task) => get('/tasks/' + task))),
+    ]);
     assert.ok(
       details.every(({ status }) => ['RUNNING', 'QUEUED', 'WAITING', 'SUCCESS'].includes(status)),
       JSON.stringify(
@@ -101,11 +129,15 @@ async function main() {
         })),
       ),
     );
-    if (details.every(({ status }) => status === 'SUCCESS')) break;
+    assert.ok(
+      operations.every(({ status }) => ['PENDING', 'RUNNING', 'SUCCESS'].includes(status)),
+      JSON.stringify(operations),
+    );
+    if ([...details, ...operations].every(({ status }) => status === 'SUCCESS')) break;
     await delay(1200);
   }
-  assert.ok(details.every(({ status }) => status === 'SUCCESS'));
-  const actions = details.map(({ nodes, simplified }) => {
+  assert.ok([...details, ...operations].every(({ status }) => status === 'SUCCESS'));
+  const flows = details.map(({ nodes, simplified }) => {
     const node = nodes.find(({ type }) => type === 'SHELL');
     return {
       startedAt: node.startedAt,
@@ -113,20 +145,30 @@ async function main() {
       serverId: simplified.serverId,
     };
   });
+  const commandTargets = await Promise.all(tasks.map((task) => get('/tasks/' + task + '/targets')));
   assert.deepEqual(
-    actions.map(({ serverId }) => serverId),
-    [ids[0], ids[0], ids[0], ids[1], ids[2]],
+    flows.map(({ serverId }) => serverId),
+    [ids[0], ids[0], ids[0]],
   );
-  const [a1, a2, a3, b, c] = actions;
-  assert.ok(a1.startedAt <= a2.startedAt);
-  assert.ok(a2.startedAt < a1.finishedAt, 'A allows two simultaneous runs');
-  assert.ok(a3.startedAt >= Math.min(a1.finishedAt, a2.finishedAt), 'Third run on A queues');
+  const firstFive = [...flows, commandTargets[0][0], commandTargets[1][0]];
+  const firstSlotRelease = Math.min(...firstFive.map(({ finishedAt }) => finishedAt));
   assert.ok(
-    Math.max(b.startedAt, c.startedAt) < Math.min(a1.finishedAt, a2.finishedAt),
-    'B and C start independently of A',
+    Math.max(...firstFive.map(({ startedAt }) => startedAt)) < firstSlotRelease,
+    'A runs three flows and two commands at once',
+  );
+  const last = commandTargets[2].find(({ serverId }) => serverId === ids[0]);
+  assert.ok(last.startedAt >= firstSlotRelease, 'Sixth task on A waits for a shared slot');
+  assert.ok(
+    commandTargets[2].filter(({ serverId }) => serverId !== ids[0]).length === 2 &&
+      commandTargets[2]
+        .filter(({ serverId }) => serverId !== ids[0])
+        .every(({ startedAt }) => startedAt < firstSlotRelease),
+    'B and C start even when the same command is waiting for A',
   );
   await call('DELETE', projectPath);
-  console.log(JSON.stringify({ maxConcurrentFlowsPerServer: 2, runs, actions }));
+  console.log(
+    JSON.stringify({ maxConcurrentFlowsPerServer: 5, runs, tasks, flows, commandTargets }),
+  );
 }
 
 main().catch((error) => {

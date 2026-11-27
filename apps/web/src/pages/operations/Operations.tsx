@@ -37,6 +37,7 @@ import { graphWorkbenchPath } from '../execution-graph/graph-workbench-context';
 import { ContextAIButton } from '../ai/AI';
 import { FailureHandling } from '../delivery/FailureHandling';
 import { RunArtifacts } from '../delivery/Delivery';
+import { InteractiveCommandInput } from './InteractiveCommandInput';
 import type { DeliveryLogSelection, DeliveryTaskStep } from '../delivery/DeliveryTaskStages';
 import './task-center.css';
 
@@ -238,6 +239,7 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
   if (!task.data)
     return <ErrorBanner error={task.error || '找不到这个任务。'} retry={task.reload} />;
   const value = task.data;
+  const serverNames = new Map(targets.data?.map(({ serverId, serverName }) => [serverId, serverName]));
   const scope = readDeliveryScope(new URLSearchParams(search));
   const deliveryScope = {
     serviceId: value.serviceId,
@@ -493,6 +495,10 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
           )}
         </Section>
       )}
+      {value.interactive && activeTask(value.status) &&
+        (user.role === 'ADMIN' || (user.role === 'OPERATOR' && value.createdBy === user.id)) && (
+          <InteractiveCommandInput key={id} taskId={id} targets={targets.data ?? []} />
+        )}
       <div className="task-layout">
         <Section
           title="目标执行结果"
@@ -589,7 +595,11 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
             {logs.data.content
               ? value.pipelineGraph
                 ? renderTaskLog(logs.data.content, steps.data, selectedStepId, logMarker)
-                : logs.data.content
+                : value.interactive
+                  ? logs.data.content.replace(/\[([a-f0-9-]{36})\] /gi, (label, serverId: string) =>
+                      serverNames.has(serverId) ? `[${serverNames.get(serverId)}] ` : label,
+                    )
+                  : logs.data.content
               : activeTask(value.status)
                 ? '等待 Worker 输出日志…'
                 : '这个任务暂无日志。'}

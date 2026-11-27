@@ -41,4 +41,10 @@ export class ExecutionOptionsDto extends TargetSelectionDto {
 export class ExecuteCommandDto extends ExecutionOptionsDto {
   @IsOptional() @IsString() @Length(1, 120) name?: string;
   @IsString() @Length(1, 65536) command!: string;
+  @IsOptional() @IsBoolean() interactive?: boolean;
+}
+
+export class InteractiveCommandInputDto {
+  @IsString() @Length(1, 4096) input!: string;
+  @IsOptional() @IsArray() @ArrayMaxSize(100) @IsString({ each: true }) targetIds?: string[];
 }

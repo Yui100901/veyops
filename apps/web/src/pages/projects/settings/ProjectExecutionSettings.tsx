@@ -9,7 +9,7 @@ import type {
 } from '../../../models';
 
 const labels = {
-  defaultMaxParallelTargets: '批量运维并发',
+  defaultMaxParallelTargets: '单批运维并行目标数',
   targetWorkspaceRoot: '目标端工作根目录',
   logRetentionDays: '任务日志保留天数',
 };

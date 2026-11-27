@@ -8,6 +8,7 @@ const contextFields: Record<AiContextKind, ContextField[]> = {
   PIPELINE: ['pipelineId'],
   TASK: ['taskId'],
   OPERATION_PLAN: ['operationPlanId', 'version'],
+  COMMAND_TARGETS: ['serverIds'],
 };
 
 export interface ResolvedAiContext {
@@ -17,6 +18,7 @@ export interface ResolvedAiContext {
   repositoryId?: string;
   sourceRepositoryIds?: string[];
   serverIds?: string[];
+  commandTargets?: { id: string; name: string }[];
 }
 
 export function normalizeAiContext(input: AiContextDto): AiContextDto {
@@ -27,6 +29,8 @@ export function normalizeAiContext(input: AiContextDto): AiContextDto {
       ([key, value]) => key !== 'kind' && value != null && !fields.includes(key as ContextField),
     ) ||
     (input.kind !== 'OPERATION_PLAN' && !input[fields[0]]) ||
+    (input.kind === 'COMMAND_TARGETS' &&
+      (!Array.isArray(input.serverIds) || !input.serverIds.length)) ||
     (input.version != null &&
       (!input.operationPlanId || !Number.isSafeInteger(input.version) || input.version < 1))
   )
@@ -36,7 +40,13 @@ export function normalizeAiContext(input: AiContextDto): AiContextDto {
     ...Object.fromEntries(
       fields.flatMap((key) => {
         const value = input[key];
-        return value ? [[key, typeof value === 'string' ? value.toLowerCase() : value]] : [];
+        if (!value) return [];
+        const normalized = Array.isArray(value)
+          ? [...new Set(value.map((entry) => entry.toLowerCase()))].sort()
+          : typeof value === 'string'
+            ? value.toLowerCase()
+            : value;
+        return [[key, normalized]];
       }),
     ),
   };
@@ -70,6 +80,7 @@ const contextualTools: Record<AiContextKind, string[]> = {
   ],
   TASK: ['get_task', 'diagnose_deployment'],
   OPERATION_PLAN: ['get_operation_plan', 'draft_operation_plan'],
+  COMMAND_TARGETS: ['inspect_servers', 'initialize_component', 'execute_command'],
 };
 
 export function aiContextAllows(kind: AiContextKind, tool: string) {
@@ -97,6 +108,17 @@ export function scopeAiToolArguments(
   const { input } = context;
   if (!aiContextAllows(input.kind, name)) throw new ForbiddenException('AI 操作超出当前页面的范围');
   const scoped = { ...args };
+  if (input.kind === 'COMMAND_TARGETS') {
+    const selected = new Set(context.serverIds);
+    const requested = args.serverIds ?? context.serverIds;
+    if (
+      !Array.isArray(requested) ||
+      !requested.length ||
+      requested.some((id) => typeof id !== 'string' || !selected.has(id.toLowerCase()))
+    )
+      throw new ForbiddenException('AI 操作目标超出当前选择的服务器');
+    scoped.serverIds = requested.map((id: string) => id.toLowerCase());
+  }
   if (name === 'get_project' || name === 'list_execution_flows' || name === 'run_execution_flow')
     pinAiContextField(scoped, 'projectId', context.projectId);
   if (name === 'get_task' || name === 'diagnose_deployment')

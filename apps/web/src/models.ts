@@ -264,6 +264,7 @@ export interface DeliveryStepNode {
   type: DeliveryStepType;
 }
 export interface Task {
+  interactive?: boolean;
   id: string;
   canReuseCommand?: boolean;
   flowRunId?: string;

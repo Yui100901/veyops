@@ -38,7 +38,8 @@ import type { SourceReviewProof } from '../deployments/source-review.service';
 import { lockProjectGraph, requireProject } from '../projects/project-guards';
 import { runResourceReferences } from '../projects/project-resource-references';
 import { unavailableReference } from '../projects/project-resource-protection';
-import { SystemSettingsService } from '../system/system-settings.service';
+import { defaultServerConcurrency, SystemSettingsService } from '../system/system-settings.service';
+import { canAdmitServerWork, nextServerWorkOrder } from '../tasks/server-execution-queue';
 import {
   confirmDeploymentMembers,
   directDeploymentSelection,
@@ -2687,17 +2688,13 @@ export class GraphRunnerService implements OnModuleInit {
     const serverId = placement?.location === 'TARGET' && !values.parent_run_id
       ? placement.target.id
       : null;
-    const previous = serverId
-      ? await tx.selectFrom('execution_flow_runs').select('created_at')
-          .where('execution_server_id', '=', serverId)
-          .orderBy('created_at', 'desc').limit(1).executeTakeFirst()
-      : undefined;
+    const queuedAt = serverId ? await nextServerWorkOrder(tx, serverId) : Date.now();
     const row = await tx
       .insertInto('execution_flow_runs')
       .values({
         ...this.runValues(values),
         execution_server_id: serverId,
-        created_at: Math.max(Date.now(), previous ? previous.created_at + 1 : 0),
+        created_at: queuedAt,
       })
       .onConflict((c) => c.columns(['project_id', 'created_by', 'idempotency_key']).doNothing())
       .returningAll()
@@ -3329,20 +3326,9 @@ export class GraphRunnerService implements OnModuleInit {
     const serverId = run.execution_server_id;
     if (!serverId || run.execution_admitted_at !== null || run.status === 'CANCEL_REQUESTED')
       return true;
-    // Per-server admission is serialized across workers. SSH work runs outside this transaction.
-    await tx.updateTable('servers').set((eb) => ({ id: eb.ref('id') }))
-      .where('id', '=', serverId).execute();
-    const queue = tx.selectFrom('execution_flow_runs')
-      .where('execution_server_id', '=', serverId);
-    const earlier = await queue.select('id').where('status', '=', 'QUEUED')
-      .where('execution_admitted_at', 'is', null)
-      .orderBy('created_at').orderBy('id').executeTakeFirst();
-    if (earlier?.id !== run.id) return false;
-    const { total } = await queue.select((eb) => eb.fn.countAll<number>().as('total'))
-      .where('execution_admitted_at', 'is not', null)
-      .where('status', 'in', activeFlowStatuses).executeTakeFirstOrThrow();
-    const limit = this.settings ? (await this.settings.get(undefined, tx)).maxConcurrentFlowsPerServer : 3;
-    if (Number(total) >= limit) return false;
+    const limit = (await this.settings?.get(undefined, tx))?.maxConcurrentFlowsPerServer ??
+      defaultServerConcurrency;
+    if (!(await canAdmitServerWork(tx, serverId, 'FLOW', run.id, limit))) return false;
     await tx.updateTable('execution_flow_runs').set({ execution_admitted_at: Date.now() })
       .where('id', '=', run.id).execute();
     return true;

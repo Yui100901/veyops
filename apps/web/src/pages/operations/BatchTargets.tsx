@@ -343,7 +343,10 @@ export function BatchStrategy({
           <option value="SEQUENTIAL">顺序执行</option>
         </select>
       </Field>
-      <Field label="最大并发" hint={projectId ? '留空使用项目生效值。' : '留空使用系统默认值。'}>
+      <Field
+        label="本批同时执行的目标数"
+        hint={projectId ? '留空使用项目生效值。' : '留空使用系统默认值。'}
+      >
         <input
           type="number"
           min={1}

@@ -98,7 +98,9 @@ export class AiService {
     const projectId = context?.projectId ?? scopedProjectId;
     if (projectId && !context) await this.projects.get(projectId);
     const initialPolicy = await this.policy.snapshot(projectId);
-    this.policy.assertRead('list_projects', initialPolicy, projectId);
+    if (context?.input.kind === 'COMMAND_TARGETS')
+      this.policy.assertRead('inspect_servers', initialPolicy, projectId, context.serverIds);
+    else this.policy.assertRead('list_projects', initialPolicy, projectId);
     if (context?.repositoryId) this.policy.assertRepository(context.repositoryId, initialPolicy);
     for (const id of context?.sourceRepositoryIds ?? [])
       this.policy.assertRepository(id, initialPolicy);
@@ -190,7 +192,7 @@ export class AiService {
       const messages: AiWireMessage[] = [
         {
           role: 'system',
-          content: `${systemPrompt}\n当前权限模式：${mode}。当前项目：${projectId || '未指定'}。${context ? `页面已绑定资源：${JSON.stringify({ ...context.input, projectId, serviceId: context.serviceId })}。` : ''}最近提交的任务：${JSON.stringify(operations)}。本对话已提交的评审分支：${JSON.stringify(branches)}`,
+          content: `${systemPrompt}\n当前权限模式：${mode}。当前项目：${projectId || '未指定'}。${context ? `页面已绑定资源：${JSON.stringify({ ...context.input, projectId, serviceId: context.serviceId })}。` : ''}${context?.commandTargets ? `所选服务器：${JSON.stringify(context.commandTargets)}。磁盘及工具巡检使用 inspect_servers。Docker 等组件安装先巡检，再使用 initialize_component 提交审批。单次巡检和初始化至多选 10 台，目标较多时分批工具调用。` : ''}最近提交的任务：${JSON.stringify(operations)}。本对话已提交的评审分支：${JSON.stringify(branches)}`,
         },
         ...history
           .filter((m) => m.role === 'USER' || m.role === 'ASSISTANT')
@@ -265,6 +267,8 @@ export class AiService {
                   { ...prepared, projectId: prepared.projectId ?? projectId },
                   actionPolicy,
                 );
+                if (context?.input.kind === 'COMMAND_TARGETS' && decision === 'ALLOW')
+                  decision = 'REQUIRE_CONFIRM';
                 const key = JSON.stringify([prepared.action, prepared.payload]);
                 if (handled.has(key)) result = handled.get(key);
                 else {

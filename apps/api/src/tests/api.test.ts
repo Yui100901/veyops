@@ -414,7 +414,7 @@ async function checkApi(databaseUrl?: string) {
     const initialSettings = await viewer.get('/api/v1/system').expect(200);
     assert.equal(initialSettings.body.data.defaultBuildLocation, 'TARGET');
     assert.equal(initialSettings.body.data.defaultMaxParallelTargets, 3);
-    assert.equal(initialSettings.body.data.maxConcurrentFlowsPerServer, 3);
+    assert.equal(initialSettings.body.data.maxConcurrentFlowsPerServer, 10);
     assert.equal(initialSettings.body.data.logRetentionDays, 0);
     await viewer.patch('/api/v1/system').send({ logRetentionDays: 7 }).expect(403);
     await api.patch('/api/v1/system').send({ defaultMaxParallelTargets: 11 }).expect(400);

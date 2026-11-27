@@ -336,6 +336,7 @@ export interface TaskTargetsTable {
   id: string;
   task_id: string;
   server_id: Generated<string | null>;
+  execution_queued_at: Generated<number | null>;
   server_name_snapshot: string;
   release_scope_key: Generated<string | null>;
   host_snapshot: string;
@@ -959,6 +960,13 @@ export interface Database {
   pipeline_webhooks: PipelineWebhooksTable;
   tasks: TasksTable;
   task_targets: TaskTargetsTable;
+  interactive_command_inputs: {
+    id: string;
+    task_target_id: string;
+    sequence: number;
+    created_at: number;
+    encrypted_input: string;
+  };
   task_steps: TaskStepsTable;
   pipeline_runs: PipelineRunsTable;
   registries: RegistriesTable;

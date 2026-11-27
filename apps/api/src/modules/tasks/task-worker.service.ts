@@ -18,7 +18,12 @@ import { redactTaskLog, TaskLogService } from './task-log.service';
 import type { TaskHandler, TaskPayload, TaskRecord, TaskStatus } from './tasks.types';
 import { lockTaskLease, TaskLeaseUnavailableError } from './task-lease';
 import { graphTaskKeyPrefix } from '../execution-graphs/graph-run-lifecycle';
-import { SystemSettingsService } from '../system/system-settings.service';
+import { defaultServerConcurrency, SystemSettingsService } from '../system/system-settings.service';
+import {
+  isQueuedOperation,
+  operationTaskTypes,
+  readyOperationTasks,
+} from './server-execution-queue';
 import { ArtifactRetentionService } from '../artifacts/artifact-retention.service';
 import { OperationSchedulesService } from '../operation-schedules/operation-schedules.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -52,7 +57,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
     {
       running: Promise<void>;
       controller: AbortController;
-      graph: boolean;
+      shared: boolean;
     }
   >();
   private shutdownPromise?: Promise<void>;
@@ -184,7 +189,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       !this.stopping &&
       !this.sqliteLeaseLost &&
       claimed < CLAIM_BATCH_SIZE &&
-      [...this.activeJobs.values()].every((job) => job.graph);
+      [...this.activeJobs.values()].every((job) => job.shared);
       claimed++
     ) {
       const task = await this.claim(true, this.activeJobs.size > 0);
@@ -198,7 +203,9 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       this.activeJobs.set(task.id, {
         controller,
         running,
-        graph: task.idempotency_key?.startsWith(graphTaskKeyPrefix) === true,
+        shared:
+          task.idempotency_key?.startsWith(graphTaskKeyPrefix) === true ||
+          isQueuedOperation(task.task_type, task.idempotency_key),
       });
     }
   }
@@ -251,31 +258,47 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
       this.logger.warn('任务日志保留策略执行失败，下次周期将重试');
     }
   }
-  async claim(requireSqliteLease = false, parallelGraph = false) {
+  async claim(requireSqliteLease = false, parallelShared = false) {
     // The conditional UPDATE is atomic in both dialects. Remote work never holds a DB transaction.
-    const candidate = await this.database.db
+    const db = this.database.db;
+    const now = Date.now();
+    const limit =
+      (await this.settings?.get())?.maxConcurrentFlowsPerServer ?? defaultServerConcurrency;
+    const candidate = await db
       .selectFrom('tasks')
-      .select(['id', 'idempotency_key'])
+      .select('id')
       .where('status', '=', 'PENDING')
-      .where('available_at', '<=', Date.now())
-      .$if(parallelGraph, (query) =>
-        query.where('idempotency_key', 'like', graphTaskKeyPrefix + '%'),
+      .where('available_at', '<=', now)
+      .where((eb) =>
+        eb.or([
+          eb('task_type', 'not in', operationTaskTypes),
+          eb('idempotency_key', 'like', graphTaskKeyPrefix + '%'),
+          eb('id', 'in', readyOperationTasks(db, limit, now)),
+        ]),
+      )
+      .$if(parallelShared, (query) =>
+        query.where((eb) =>
+          eb.or([
+            eb('idempotency_key', 'like', graphTaskKeyPrefix + '%'),
+            eb('task_type', 'in', operationTaskTypes),
+          ]),
+        ),
       )
       .orderBy('priority', 'desc')
       .orderBy('created_at')
       .limit(1)
       .executeTakeFirst();
     if (!candidate) return undefined;
-    const now = Date.now();
+    const claimedAt = Date.now();
     let claim = this.database.db
       .updateTable('tasks')
       .set((eb) => ({
         status: 'RUNNING',
         lease_owner: this.owner,
-        lease_expires_at: now + TASK_LEASE_MS,
-        heartbeat_at: now,
-        started_at: now,
-        updated_at: now,
+        lease_expires_at: claimedAt + TASK_LEASE_MS,
+        heartbeat_at: claimedAt,
+        started_at: claimedAt,
+        updated_at: claimedAt,
         attempt_count: eb('attempt_count', '+', 1),
       }))
       .where('id', '=', candidate.id)
@@ -285,13 +308,18 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
         .selectFrom('tasks as active')
         .select('active.id')
         .where('active.status', 'in', ['RUNNING', 'CANCEL_REQUESTED']);
-      if (parallelGraph)
+      if (parallelShared)
         conflicts = conflicts.where((active) =>
           active.or([
             active('active.lease_owner', 'is', null),
             active('active.lease_owner', '!=', this.owner),
-            active('active.idempotency_key', 'is', null),
-            active('active.idempotency_key', 'not like', graphTaskKeyPrefix + '%'),
+            active.and([
+              active('active.task_type', 'not in', operationTaskTypes),
+              active.or([
+                active('active.idempotency_key', 'is', null),
+                active('active.idempotency_key', 'not like', graphTaskKeyPrefix + '%'),
+              ]),
+            ]),
           ]),
         );
       claim = claim.where((eb) =>
@@ -302,7 +330,7 @@ export class TaskWorkerService implements OnApplicationBootstrap, OnModuleDestro
               .select('key')
               .where('key', '=', WORKER_KEY)
               .where('value_json', '=', JSON.stringify(this.owner))
-              .where('updated_at', '>=', now - SQLITE_LEASE_MS),
+              .where('updated_at', '>=', claimedAt - SQLITE_LEASE_MS),
           ),
           eb.not(eb.exists(conflicts)),
         ]),

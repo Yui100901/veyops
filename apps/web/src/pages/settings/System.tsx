@@ -125,14 +125,14 @@ export function SystemPage({ user }: { user: User }) {
             <div className="setting-row">
               <span>
                 <Server size={17} />
-                批量运维并发
+                单批运维并行目标数
               </span>
               <strong>{value?.defaultMaxParallelTargets ?? '—'}</strong>
             </div>
             <div className="setting-row">
               <span>
                 <Workflow size={17} />
-                单台服务器执行流并发
+                单台服务器任务并发
               </span>
               <strong>{value?.maxConcurrentFlowsPerServer ?? '—'}</strong>
             </div>
@@ -266,8 +266,8 @@ function RuntimeDefaultsEditor({
       <Form onSubmit={save} onCancel={onClose} busy={saving} error={error}>
         <ExecutionSettingsFields values={settings} />
         <Field
-          label="单台服务器执行流并发"
-          hint="每台服务器分别计算。达到上限时，同一服务器的执行流按提交顺序等待。"
+          label="单台服务器任务并发"
+          hint="同一服务器的执行流、运维命令和交互会话共用此上限，达到上限后按提交顺序等待。"
         >
           <input
             type="number"
@@ -275,7 +275,7 @@ function RuntimeDefaultsEditor({
             min={1}
             max={10}
             required
-            defaultValue={settings.maxConcurrentFlowsPerServer ?? 3}
+            defaultValue={settings.maxConcurrentFlowsPerServer ?? 10}
           />
         </Field>
       </Form>

@@ -23,7 +23,7 @@ printf 'init=%s\\n' "$(cat /proc/1/comm 2>/dev/null)"
 for tool in apt-get systemctl git curl docker node npm corepack nginx java go rustc python3; do
   if command -v "$tool" >/dev/null 2>&1; then printf '%s=available\\n' "$tool"; fi
 done
-printf 'freeKiB=%s\\n' "$(df -Pk / | awk 'NR==2 { print $4 }')"
+df -Pk / | awk 'NR==2 { sub(/%$/, "", $5); printf "diskTotalKiB=%s\\ndiskUsedKiB=%s\\nfreeKiB=%s\\ndiskUsePercent=%s\\n", $2, $3, $4, $5 }'
 if command -v ps >/dev/null 2>&1 && ps -eo comm= | grep -Eq '^(apt|apt-get|dpkg|unattended-upgr)$'; then
   printf 'packageActivity=busy\\n'
 fi
@@ -61,6 +61,9 @@ const probeKeys = new Set([
   'rustc',
   'python3',
   'freeKiB',
+  'diskTotalKiB',
+  'diskUsedKiB',
+  'diskUsePercent',
   'packageActivity',
   'nodeVersion',
   'npmVersion',

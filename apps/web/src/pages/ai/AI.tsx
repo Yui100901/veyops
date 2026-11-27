@@ -82,7 +82,8 @@ export type AIContext =
   | { kind: 'REPOSITORY'; repositoryId: string; commitSha?: string; serviceId?: string }
   | { kind: 'SERVICE'; serviceId: string }
   | { kind: 'TASK'; taskId: string }
-  | { kind: 'OPERATION_PLAN'; operationPlanId: string; version: number };
+  | { kind: 'OPERATION_PLAN'; operationPlanId: string; version: number }
+  | { kind: 'COMMAND_TARGETS'; serverIds: string[] };
 interface Conversation {
   id: string;
   title: string;
@@ -1046,6 +1047,10 @@ const contextActions = {
     title: 'AI 运维方案',
     suggestion: '帮我整理一份运维方案草稿，并说明必要的前置检查。',
   },
+  COMMAND_TARGETS: {
+    title: 'AI 运维助手',
+    suggestion: '查询所选服务器的根分区占用率和剩余空间。',
+  },
 } satisfies Record<AIContext['kind'], { title: string; suggestion: string }>;
 
 function contextKey(context?: AIContext | null) {
@@ -1063,6 +1068,8 @@ function contextKey(context?: AIContext | null) {
       return `${context.kind}:${context.taskId}`;
     case 'OPERATION_PLAN':
       return `${context.kind}:${context.operationPlanId}:${context.version ?? ''}`;
+    case 'COMMAND_TARGETS':
+      return `${context.kind}:${[...context.serverIds].sort().join(',')}`;
     default:
       return '';
   }
@@ -1537,7 +1544,8 @@ export function AIPage({
               />
               <div>
                 <small>
-                  {context && currentMode && (projectId || context.kind === 'OPERATION_PLAN')
+                  {context && currentMode &&
+                  (projectId || context.kind === 'OPERATION_PLAN' || context.kind === 'COMMAND_TARGETS')
                     ? `执行权限 · ${currentMode.name}。`
                     : ''}
                   请勿在对话中粘贴密码或 API Key。变更请求按当前策略执行或等待审批。

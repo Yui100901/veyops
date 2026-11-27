@@ -42,6 +42,7 @@ import {
 } from './BatchTargets';
 import type { ExecutionOptions, TargetPreview, TargetSelection } from './BatchTargets';
 import { OperationSchedulesPage } from './OperationSchedules';
+import { TargetedOperationsAI } from './TargetedOperationsAI';
 
 interface CommandTemplate {
   id: string;
@@ -186,6 +187,7 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
     reuse?.selection,
   );
   const [command, setCommand] = useState(reuse?.command ?? '');
+  const [interactive, setInteractive] = useState(false);
   const [name, setName] = useState(reuse?.name ?? '');
   const [timeout, setTimeoutValue] = useState(reuse?.timeout ?? 300);
   const [options, setOptions] = useState<ExecutionOptions>(() =>
@@ -273,8 +275,9 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
         ...selection,
         ...options,
         maxParallel: options.strategy === 'SEQUENTIAL' ? 1 : options.maxParallel,
-        name: name.trim() || '临时命令',
-        command,
+        name: name.trim() || (interactive ? '交互命令' : '临时命令'),
+        command: interactive && !command.trim() ? '/bin/sh -i' : command,
+        ...(interactive && { interactive: true }),
         timeout,
         expectedTargetHash: preview.targetHash,
         confirmed: true,
@@ -328,7 +331,7 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
             </details>
           </div>
           <Section
-            title="临时命令"
+            title={interactive ? '一对多交互命令' : '临时命令'}
             subtitle="以服务器配置的 SSH 用户身份执行"
             action={
               canEdit && (
@@ -368,6 +371,15 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
               )
             }
           >
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={interactive}
+                disabled={!editing}
+                onChange={(event) => setInteractive(event.target.checked)}
+              />
+              启用交互模式
+            </label>
             <div className="command-editor">
               <textarea
                 aria-label="Shell 命令"
@@ -376,8 +388,8 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
                 disabled={!editing}
                 maxLength={65536}
                 spellCheck={false}
-                required
-                placeholder="uname -a && uptime"
+                required={!interactive}
+                placeholder={interactive ? '留空会启动 /bin/sh -i' : 'uname -a && uptime'}
               />
             </div>
             <div className="command-options">
@@ -395,7 +407,7 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
                   命令模板已保存
                 </p>
               )}
-              {canEdit && !preview && command.trim() && (
+              {canEdit && !interactive && !preview && command.trim() && (
                 <details>
                   <summary>保存为命令模板</summary>
                   <div className="row-actions">
@@ -420,7 +432,7 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
               <div className="row-actions">
                 <button
                   className="button primary"
-                  disabled={!editing || !hasTargets(selection) || !command.trim()}
+                  disabled={!editing || !hasTargets(selection) || (!interactive && !command.trim())}
                 >
                   <Play size={16} />
                   预览并执行
@@ -430,7 +442,10 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
           </Section>
         </form>
         {preview && (
-          <Section title="确认执行目标" subtitle={`将在 ${preview.count} 台服务器上运行上方命令`}>
+          <Section
+            title="确认执行目标"
+            subtitle={`将在 ${preview.count} 台服务器上${interactive ? '启动 SSH 交互会话' : '运行上方命令'}`}
+          >
             <div className="form-body">
               <ResolvedTargets preview={preview} />
               {(added.length > 0 ||
@@ -475,6 +490,15 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
               </div>
             </div>
           </Section>
+        )}
+        {canEdit && (
+          <TargetedOperationsAI
+            key={JSON.stringify(selection)}
+            user={user}
+            selection={selection}
+            projectId={projectId}
+            disabled={!editing || !hasTargets(selection)}
+          />
         )}
       </div>
       {reference && (
