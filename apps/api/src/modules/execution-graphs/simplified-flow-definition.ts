@@ -157,9 +157,6 @@ export class SimplifiedFinishImage {
 export class SimplifiedFinish {
   @ValidateIf((_o, v) => v !== undefined) @IsBoolean() saveWorkspace?: boolean;
   @ValidateIf((_o, v) => v !== undefined)
-  @IsIn(['PERSISTENT', 'RUN'])
-  retention?: 'PERSISTENT' | 'RUN';
-  @ValidateIf((_o, v) => v !== undefined)
   @IsArray()
   @ArrayMaxSize(20)
   @IsObject({ each: true })

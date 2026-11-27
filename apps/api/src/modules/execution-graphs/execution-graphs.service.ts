@@ -49,7 +49,10 @@ function readStoredDraft(json: string) {
           };
         }
       };
-      if (finish) Reflect.deleteProperty(finish, 'excludePaths');
+      if (finish) {
+        Reflect.deleteProperty(finish, 'excludePaths');
+        Reflect.deleteProperty(finish, 'retention');
+      }
       if (build) remove(build, ['buildImage'], 'build.buildImage');
       if (!start) continue;
       const legacyExecution = start.execution as HistoricalSimplifiedExecution | undefined;

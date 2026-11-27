@@ -754,26 +754,11 @@ export function SimplifiedEndSettings({
             canEdit={canEdit}
             change={(saveWorkspace) => change({ saveWorkspace })}
           />
-          {(saveWorkspace || requiresFileSnapshot) && (
-            <div className="form-grid">
-              {saveWorkspace ? (
-                <Field label="保留范围">
-                  <select
-                    value={finish.retention ?? 'PERSISTENT'}
-                    disabled={!canEdit}
-                    data-graph-node-field="finish.retention"
-                    onChange={(event) =>
-                      change({ retention: event.target.value as SimplifiedFinish['retention'] })
-                    }
-                  >
-                    <option value="PERSISTENT">登记并可历史重发</option>
-                    <option value="RUN">仅供本次运行</option>
-                  </select>
-                </Field>
-              ) : (
-                <p className="field-note">本次文件发布所需的执行目录会作为临时产物保留。</p>
-              )}
-            </div>
+          {saveWorkspace && (
+            <p className="field-note">执行目录会登记为目录产物，可在后续运行中使用。</p>
+          )}
+          {!saveWorkspace && requiresFileSnapshot && (
+            <p className="field-note">本次文件发布所需的执行目录会作为临时产物保留。</p>
           )}
           <SimplifiedImageSettings
             node={node}

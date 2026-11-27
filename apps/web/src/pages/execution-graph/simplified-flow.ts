@@ -53,7 +53,6 @@ export interface SimplifiedStart {
 
 export interface SimplifiedFinish {
   saveWorkspace?: boolean;
-  retention?: 'PERSISTENT' | 'RUN';
   images?: SimplifiedFinishImage[];
   requireRelease?: 'ACTIVATED' | 'HEALTHY';
 }

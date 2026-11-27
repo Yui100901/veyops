@@ -202,7 +202,7 @@
 | `START.start.environmentSetId`、`variables[]`、`dotenv` | 变量条目为 `{key,value?,credentialId?,allowOverride?}`，仓库变量文件为 `{sourceId,path}`。敏感值通过凭据引用。                                                                                                                            |
 | 功能节点                                                | 代码拉取使用 `checkout.fullClone`。构建使用 `build.repoPath`、`installCommand`、`buildCommand`、`dockerfilePath`。检查和 Shell 使用 `shell.directory`、`command`、`timeout`。文件部署使用 `deploy.method:"FILE"` 和选填的停止、启动命令。 |
 | 条件节点                                                | 用 `condition.parameterKey`、`branch.parameterKey` 或 `switch.parameterKey` 读取开始节点显式声明的普通变量。默认使用运行条件值。                                                                                                          |
-| `END.finish`                                            | `{saveWorkspace?,retention?:"PERSISTENT"\|"RUN",images?,requireRelease?:"ACTIVATED"\|"HEALTHY"}`。发布开始前登记并校验实际执行目录。结束阶段核对要求的发布状态。                                                                          |
+| `END.finish`                                            | `{saveWorkspace?,images?,requireRelease?:"ACTIVATED"\|"HEALTHY"}`。发布开始前登记并校验实际执行目录。结束阶段核对要求的发布状态。 |
 
 运行时 `inputs.parameters` 使用 `var:<key>` 或 `artifactId` 提供开始节点允许的参数。启动时选择模式通过 `inputs.serverIds` 提交所选服务器。`POST /flows/:flowId/preview-targets` 返回逐服务器预览和批次 `configurationHash`。带该摘要及 `idempotencyKey` 调用 `POST /flows/:flowId/run-targets` 后返回 `{runs:[{serverId,runId}]}`。固定多台模式须一起提交全部已固定的服务器，或省略 `inputs.serverIds` 以使用配置。每台服务器拥有独立运行记录和工作区。
 
@@ -212,7 +212,7 @@ Git 版本由发布版的开始节点固定，匹配的仓库推送和轮询采�
 
 纯构建使用 `inputs.parameters.workspaceArtifactId` 选择同项目的持久目录产物。存在拉取动作且未配置仓库时，该参数必填并限定手动运行。`GET /artifacts?projectId=:id&kind=DIRECTORY` 的 `workspaceReusable` 标记候选目录。预览和运行详情的 `simplified.workspaceSource` 区分 `NEW` 和 `HISTORICAL`，历史模式附带实例、来源运行和固定提交。本次执行使用新工作区，代码拉取记录 `checkoutSkipped: "HISTORICAL_WORKSPACE"`。
 
-目标端按 `<工作根目录>/<项目标识>/<执行 ID>` 创建工作区，默认工作根目录是 `~/.veyops/workspace`。`END.finish.saveWorkspace` 省略时默认直接保留实际使用的整个执行目录。`retention: "RUN"` 只保留本次临时快照。`saveWorkspace: false` 时，本次文件发布仍会固定临时实物。临时实例可在运行详情中识别，历史选择器仅提供持久实例。历史发布使用既有实例，本次另外生成的工作区按结束规则处理。
+目标端按 `<工作根目录>/<项目标识>/<执行 ID>` 创建工作区，默认工作根目录是 `~/.veyops/workspace`。`END.finish.saveWorkspace` 省略或为 `true` 时，保留实际使用的整个执行目录并允许后续运行引用。既有草稿在读取时移除旧保留范围，既有发布版本的新运行采用相同规则。`saveWorkspace: false` 时，本次文件发布仍会固定所需的临时实物。历史发布使用既有实例，本次另外生成的工作区按结束规则处理。
 
 `END.finish.images` 为 `{id,name,source,buildNodeId?,reference?,registryId?,composePath?}[]`。每条流内登记名称规范化为小写且唯一，`id` 用于稳定引用。`BUILT_IN` 采用 `BUILD.build.dockerfilePath` 构建出的实际 Image ID，存在多个 Dockerfile 构建节点时用 `buildNodeId` 指定来源。`WORKSPACE` 读取 `<name>:<VEYOPS_IMAGE_TAG>`，该保留变量由运行 ID 导出。`REGISTRY` 需要 `registryId` 和带固定 Digest 的完整 `reference`。`START.start.release.imageId` 选择单镜像，只有一项时可省略。本次多个内置构建镜像可用 `imageIds` 选择，并在 Compose 中用 `VEYOPS_IMAGE_<ID>` 引用各项。启用 `useUpstreamArtifact` 后，可用 `upstreamArtifactName` 选定上游持久产物，实际实例 ID 在触发时固定。
 

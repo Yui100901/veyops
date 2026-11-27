@@ -300,7 +300,6 @@ function expandSimplifiedTemplate(
     position: { x, y },
     finish: {
       saveWorkspace: true,
-      retention: 'PERSISTENT',
       ...(image && { images: [{ id: 'app', name: 'app', source: 'BUILT_IN' }] }),
       ...(requireRelease && { requireRelease }),
     },

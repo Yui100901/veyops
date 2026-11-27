@@ -153,6 +153,7 @@ test('SQLite FLOW_V2 pins the server, rejects split releases, and plans both Com
     const preview = await post(endpoint + '/preview', args);
     assert.equal(preview.simplified.location, 'TARGET');
     assert.equal(preview.simplified.serverId, a);
+    assert.equal(preview.simplified.workspaceRetention, 'OFF');
     assert.deepEqual(preview.simplified.release.serverIds, [a]);
     assert.deepEqual(preview.simplified.release.images, [
       { id: 'frontend', name: 'fixture/front' },
@@ -180,13 +181,28 @@ test('SQLite FLOW_V2 pins the server, rejects split releases, and plans both Com
     const oldStart = definition.flows[0].nodes.find(
       ({ id }: { id: string }) => id === 'start',
     ).start;
-    oldStart.release.targets = { serverIds: [b] };
+    const oldFinish = definition.flows[0].nodes.find(
+      ({ id }: { id: string }) => id === 'end',
+    ).finish;
     const replaceProjection = async () =>
       db
         .updateTable('execution_graph_versions')
         .set({ definition_json: JSON.stringify(definition) })
         .where('id', '=', published.id)
         .execute();
+    oldFinish.saveWorkspace = true;
+    oldFinish.retention = 'RUN';
+    await replaceProjection();
+    const reusable = await post(endpoint + '/preview', args);
+    assert.equal(reusable.simplified.workspaceRetention, 'PERSISTENT');
+    assert.equal(Object.hasOwn(reusable.simplified.finish, 'retention'), false);
+    const stored = await db
+      .selectFrom('execution_graph_versions')
+      .select('definition_json')
+      .where('id', '=', published.id)
+      .executeTakeFirstOrThrow();
+    assert.equal(stored.definition_json, JSON.stringify(definition));
+    oldStart.release.targets = { serverIds: [b] };
     await replaceProjection();
     const incompatible = (
       await api

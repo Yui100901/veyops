@@ -142,7 +142,8 @@ export type SimplifiedRunPlan = {
 
 export function workspaceRetention(finish: SimplifiedFinish, currentFileRelease: boolean) {
   if (finish.saveWorkspace === false) return currentFileRelease ? 'RUN' : 'OFF';
-  return finish.retention ?? 'PERSISTENT';
+  // Only snapshots confirmed before the setting was removed can still contain this key.
+  return Reflect.get(finish, 'retention') === 'RUN' ? 'RUN' : 'PERSISTENT';
 }
 
 export type SimplifiedSnapshotRequest = {
@@ -360,7 +361,8 @@ export class SimplifiedFlowRunService {
       ({ type, build }) => type === 'BUILD' && build?.dockerfilePath,
     );
     const finish: SimplifiedFinish = {
-      ...configuredFinish,
+      saveWorkspace: configuredFinish.saveWorkspace,
+      requireRelease: configuredFinish.requireRelease,
       images: configuredFinish.images?.map((image) => ({
         ...image,
         name: simplifiedImageName(image.name)!,

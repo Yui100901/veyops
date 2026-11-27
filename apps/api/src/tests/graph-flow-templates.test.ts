@@ -99,6 +99,7 @@ async function checkTemplates(databaseUrl?: string) {
     assert.equal(seed.nodes[0]?.start?.execution, undefined);
     assert.equal(seed.nodes[4]?.finish?.saveWorkspace, true);
     assert.equal(seed.nodes[4]?.finish?.requireRelease, 'ACTIVATED');
+    assert.equal(Object.hasOwn(seed.nodes[4]!.finish!, 'retention'), false);
     assert.ok(
       seed.nodes.every(({ inputs, outputs }) => inputs === undefined && outputs === undefined),
     );
@@ -222,6 +223,16 @@ async function checkTemplates(databaseUrl?: string) {
 
     const save = (canvas: GraphCanvas, expectedRevision: number) =>
       api.put(`${path}/draft`).send({ expectedRevision, definition: { canvas } });
+    const legacyDraft = structuredClone(draft.draft);
+    legacyDraft.canvas.nodes[4]!.finish!.retention = 'RUN';
+    legacyDraft.flows[0].nodes.at(-1)!.finish!.retention = 'RUN';
+    await db
+      .updateTable('execution_graphs')
+      .set({ draft_json: JSON.stringify(legacyDraft) })
+      .where('id', '=', draft.id)
+      .execute();
+    assert.deepEqual((await api.get(path).expect(200)).body.data, draft);
+    await save(legacyDraft.canvas, draft.revision).expect(400);
     const saved = (await save(seed, draft.revision).expect(200)).body.data;
     await save(seed, draft.revision).expect(409);
     const { issues } = (
