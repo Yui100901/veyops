@@ -51,6 +51,7 @@ import {
 import { GraphVersionTools } from './ExecutionGraphVersions';
 import { effectiveNodeType, graphNodeTypeLabel, isReleaseNode } from './execution-graph-definition';
 import { GraphResourceContext } from './graph-resource-context';
+import { ExecutionGraphAiDraft } from './editor/ExecutionGraphAiDraft';
 import type {
   GraphCanvas,
   GraphArtifactType,
@@ -838,6 +839,9 @@ function Workspace({
               close={() => setTemplateOpen(false)}
             />
           )}
+          {canEditDraft && (
+            <ExecutionGraphAiDraft project={project} canEdit={!busy} insert={insertTemplate} />
+          )}
           {canEditDraft && returnStart && (
             <div className="graph-fields graph-setup-return">
               <div className="heading-actions">
@@ -860,7 +864,6 @@ function Workspace({
             initialFieldId={linkedField}
             initialFieldLocation={linkedFieldLocation}
             insertedStartId={insertedStart}
-            insertAiDraft={canEditDraft ? insertTemplate : undefined}
             renderResources={(node, pair) => (
               <ExecutionGraphResourceLinks
                 node={node}

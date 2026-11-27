@@ -8,13 +8,14 @@ const projectId = '0d1c0206-da3a-49e9-9d2f-43a2de5f824e';
 const repositoryId = 'cb043719-f7a1-418a-9c4e-8f4c9adcdbf1';
 const serviceId = 'c4c92a33-ea48-460e-a2d2-764a1ae58219';
 const serverId = 'bf2bf2c4-a76d-4cbf-8087-5765bc44a9a5';
+const environmentSetId = 'e255e9c0-2d9e-4f44-8e08-bdb1e2e57d8b';
 const commitSha = 'a'.repeat(40);
 const repoSecret = 'example-fake-password-33';
 const files = [
   { path: 'DEPLOY.md', kind: 'deployment', content: `build and deploy\npassword=${repoSecret}` },
   { path: 'frontend/Dockerfile', kind: 'configuration', content: 'FROM busybox:1.36' },
   { path: 'frontend/index.html', kind: 'source', content: '<main>Frontend</main>' },
-  { path: 'backend/Dockerfile', kind: 'configuration', content: 'FROM busybox:1.36' },
+  { path: 'backend/Dockerfile', kind: 'configuration', content: 'FROM busybox:1.36\nEXPOSE 8080' },
   {
     path: 'compose.yaml',
     kind: 'configuration',
@@ -28,9 +29,24 @@ function fixture(recipe: unknown) {
   const argumentsForService = [
     {
       get: async () => ({
-        repositories: [{ id: repositoryId, cloneUrl: 'https://example.test/demo.git' }],
-        services: [{ id: serviceId, name: 'demo' }],
+        repositories: [
+          { id: repositoryId, name: 'demo', cloneUrl: 'https://example.test/demo.git' },
+        ],
+        services: [{ id: serviceId, name: 'demo', slug: 'demo' }],
       }),
+    },
+    {
+      db: {
+        selectFrom: () => {
+          const query = {
+            select: () => query,
+            where: () => query,
+            execute: async () => [{ name: 'fixture-host', osType: 'Debian' }],
+            executeTakeFirst: async () => ({ id: environmentSetId, name: 'test-env' }),
+          };
+          return query;
+        },
+      },
     },
     {
       readAnalysisContext: async (...args: unknown[]) => {
@@ -101,4 +117,40 @@ test('AI graph proposal rejects unknown repository selections and directories ou
     service.propose(projectId, { repositoryId }, 'operator'),
     /未生成可用的执行图/,
   );
+});
+
+test('AI draft attaches selected resource references and only proposes ports found in repository evidence', async () => {
+  const { service, calls } = fixture({
+    builds: [{ directory: 'backend', buildCommand: 'make build' }],
+    service: {
+      name: 'Backend',
+      slug: 'demo',
+      serviceType: 'API',
+      ports: [
+        { port: 8080, protocol: 'http', file: 'backend/Dockerfile' },
+        { port: 8443, protocol: 'https', file: 'backend/Dockerfile' },
+      ],
+    },
+  });
+  const proposal = await service.propose(
+    projectId,
+    {
+      repositoryId,
+      suggestService: true,
+      environmentSetId,
+      serverIds: [serverId, serverId],
+    },
+    'operator',
+  );
+  assert.deepEqual(proposal.proposedService?.ports, [
+    { port: 8080, protocol: 'http', file: 'backend/Dockerfile' },
+  ]);
+  assert.equal(proposal.proposedService?.slug, 'demo-2');
+  const start = proposal.canvas.nodes.find(({ id }) => id === proposal.startId)?.start;
+  assert.equal(start?.release?.serviceId, proposal.proposedService?.id);
+  assert.equal(start?.environmentSetId, environmentSetId);
+  assert.equal(start?.execution, undefined);
+  const payload = JSON.stringify(calls[1]?.[2]);
+  assert.match(payload, /fixture-host/);
+  assert.match(payload, /test-env/);
 });
