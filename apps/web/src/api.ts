@@ -294,62 +294,86 @@ export function useRoute() {
 }
 
 /** Read file logs by byte offset, rather than repeatedly fetching only the first chunk. */
-export function useTaskLogs(id: string) {
+export function useTaskLogs(
+  id: string | null,
+  { targetId, interval = 2000 }: { targetId?: string; interval?: number } = {},
+) {
+  const path =
+    id &&
+    `/tasks/${encodeURIComponent(id)}${targetId ? `/targets/${encodeURIComponent(targetId)}` : ''}/logs`;
   const [data, setData] = useState({ content: '', nextOffset: 0, truncated: false });
   const [error, setError] = useState('');
   const cursor = useRef(0);
   const epoch = useRef(0);
-  const pending = useRef(false);
-  const reload = useCallback(async () => {
-    if (pending.current) return;
-    pending.current = true;
+  const pending = useRef<Promise<void>>();
+  const reload = useCallback(() => {
+    if (!path) return;
+    if (pending.current) return pending.current;
     const current = epoch.current;
-    try {
-      let content = '';
-      let nextCursor = cursor.current;
-      for (let i = 0; i < 8; i++) {
-        const result = await api<{ content: string; nextOffset: number }>(
-          `/tasks/${id}/logs?offset=${nextCursor}`,
-        );
-        if (current !== epoch.current) return;
-        if (result.nextOffset <= nextCursor) break;
-        nextCursor = result.nextOffset;
-        content += result.content;
-        if (!result.content) break;
+    const work = (async () => {
+      try {
+        let content = '';
+        let nextCursor = cursor.current;
+        for (let i = 0; i < 8; i++) {
+          const result = await api<{ content: string; nextOffset: number }>(
+            `${path}?offset=${nextCursor}`,
+          );
+          if (current !== epoch.current) return;
+          if (result.nextOffset <= nextCursor) break;
+          nextCursor = result.nextOffset;
+          content += result.content;
+          if (!result.content) break;
+        }
+        if (current === epoch.current) {
+          // Commit the cursor with the visible content. A later chunk failing must not lose earlier chunks.
+          cursor.current = nextCursor;
+          setError('');
+          setData((previous) => {
+            const combined = previous.content + content;
+            return {
+              content: combined.slice(-2_000_000),
+              nextOffset: nextCursor,
+              truncated: previous.truncated || combined.length > 2_000_000,
+            };
+          });
+        }
+      } catch (err) {
+        if (current === epoch.current) setError(message(err));
       }
-      if (current === epoch.current) {
-        // Commit the cursor with the visible content. A later chunk failing must not lose earlier chunks.
-        cursor.current = nextCursor;
-        setError('');
-        setData((previous) => {
-          const combined = previous.content + content;
-          return {
-            content: combined.slice(-2_000_000),
-            nextOffset: nextCursor,
-            truncated: previous.truncated || combined.length > 2_000_000,
-          };
-        });
-      }
-    } catch (err) {
-      if (current === epoch.current) setError(message(err));
-    } finally {
-      if (current === epoch.current) pending.current = false;
-    }
-  }, [id]);
+    })().finally(() => {
+      if (pending.current === work) pending.current = undefined;
+    });
+    pending.current = work;
+    return work;
+  }, [path]);
   useEffect(() => {
     epoch.current++;
     cursor.current = 0;
-    pending.current = false;
+    pending.current = undefined;
     setData({ content: '', nextOffset: 0, truncated: false });
+    setError('');
     void reload();
-    const timer = window.setInterval(() => {
-      if (!document.hidden) void reload();
-    }, 2000);
     return () => {
       epoch.current++;
-      window.clearInterval(timer);
     };
   }, [reload]);
+  useEffect(() => {
+    if (!path) return;
+    if (!interval) {
+      let current = true;
+      // The last poll may have read before the terminal process flushed its final output.
+      void Promise.resolve(pending.current).then(() => {
+        if (current) return reload();
+      });
+      return () => {
+        current = false;
+      };
+    }
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void reload();
+    }, interval);
+    return () => window.clearInterval(timer);
+  }, [interval, path, reload]);
   return { data, error, reload };
 }
 
