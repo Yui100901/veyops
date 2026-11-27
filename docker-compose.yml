@@ -20,6 +20,7 @@ services:
       WORKER_CONCURRENCY: "1"
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       AI_PIPELINE_ANALYSIS: ${AI_PIPELINE_ANALYSIS:-false}
+      VEYOPS_AI_HTTP_ENDPOINTS: ${VEYOPS_AI_HTTP_ENDPOINTS:-}
       VEYOPS_AUTO_DELIVERY_TRIGGERS: ${VEYOPS_AUTO_DELIVERY_TRIGGERS:-}
     volumes: &veyops-volumes
       - veyops-data:/app/data

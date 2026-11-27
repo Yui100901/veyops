@@ -239,6 +239,24 @@ test('OpenAI compatibility normalizes roots and /v1, rejects embedded credential
     'password=[REDACTED] api_key=[REDACTED] [REDACTED]',
   );
 });
+test('AI permits plain HTTP only for loopback or the exact configured private endpoint', () => {
+  const before = process.env.VEYOPS_AI_HTTP_ENDPOINTS;
+  process.env.VEYOPS_AI_HTTP_ENDPOINTS =
+    ' http://192.168.40.50:8713/v1/ , http://public.example/v1 ';
+  try {
+    assert.equal(
+      completionUrl('http://192.168.40.50:8713/v1'),
+      'http://192.168.40.50:8713/v1/chat/completions',
+    );
+    assert.throws(() => completionUrl('http://192.168.40.51:8713/v1'));
+    assert.throws(() => completionUrl('http://192.168.40.50:8713/other'));
+    assert.throws(() => completionUrl('http://public.example/v1'));
+    assert.throws(() => completionUrl('http://169.254.169.254/latest'));
+  } finally {
+    if (before === undefined) delete process.env.VEYOPS_AI_HTTP_ENDPOINTS;
+    else process.env.VEYOPS_AI_HTTP_ENDPOINTS = before;
+  }
+});
 test('routes chat, repository analysis and failure diagnosis to configured providers and preserves explicit selection', async () => {
   const f = await fixture();
   const calls: string[] = [];

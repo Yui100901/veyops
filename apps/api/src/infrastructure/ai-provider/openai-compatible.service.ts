@@ -35,11 +35,21 @@ export function completionUrl(base: string): string {
     throw new BadRequestException('AI Base URL 无效');
   }
   const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
-  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && local))
-    throw new BadRequestException('AI Base URL 必须使用 HTTPS；本机测试可使用 HTTP');
   if (url.username || url.password || url.search || url.hash)
     throw new BadRequestException('AI Base URL 不得包含凭据、查询参数或片段');
-  return url.toString().replace(/\/+$/, '') + '/chat/completions';
+  const endpoint = url.href.replace(/\/+$/, '');
+  const privateIp =
+    /^(?:10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)$/.test(
+      url.hostname,
+    );
+  const allowedHttp =
+    privateIp &&
+    (process.env.VEYOPS_AI_HTTP_ENDPOINTS ?? '')
+      .split(',')
+      .some((entry) => entry.trim().replace(/\/+$/, '') === endpoint);
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && (local || allowedHttp)))
+    throw new BadRequestException('AI Base URL 必须使用 HTTPS，或为已放行的内网 HTTP 地址');
+  return endpoint + '/chat/completions';
 }
 export function sanitizeAiText(text: string, secrets: string[] = []): string {
   let output = text;

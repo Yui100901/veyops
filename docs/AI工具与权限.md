@@ -6,7 +6,7 @@ AI 使用 OpenAI 兼容的 `POST {baseUrl}/chat/completions`，可不配置。�
 
 管理员在系统设置中配置名称、Base URL、模型、API Key 和超时。Base URL 可以是 `https://api.deepseek.com` 或带 `/v1` 的兼容端点。模型名按配置原样发送。
 
-API Key 由统一凭据服务用 AES-256-GCM 加密，Provider 只保存凭据引用。列表、编辑与测试响应不回显密钥；留空编辑密钥表示保留当前凭据。可禁用 Provider，也可引用现有启用的 `API_KEY` 类型凭据。生产使用 HTTPS；仅本机测试可使用 HTTP。HTTP 重定向不跟随，避免向重定向站点发送密钥。
+API Key 由统一凭据服务用 AES-256-GCM 加密，Provider 只保存凭据引用。列表、编辑与测试响应不回显密钥，留空编辑密钥会保留当前凭据。可禁用 Provider，也可引用现有启用的 `API_KEY` 类型凭据。默认使用 HTTPS，本机环回地址支持 HTTP。内网服务只有 HTTP 时，在 API 与 Worker 的 `VEYOPS_AI_HTTP_ENDPOINTS` 中配置完整私有 IPv4 Base URL，例如 `http://192.168.1.20:8713/v1`。多个 URL 用逗号分隔，端口和路径都须与模型配置一致。客户端拒绝 HTTP 重定向，避免将密钥发送到重定向站点。
 
 DeepSeek 端点请求带 `thinking:{type:"disabled"}`，普通兼容 Provider 不附加该扩展参数。模型返回的推理字段不会展示或持久化。原始上游错误正文不回传，连接、超时与 HTTP 错误返回安全摘要。
 
