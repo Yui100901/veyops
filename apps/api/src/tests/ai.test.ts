@@ -1,7 +1,9 @@
 import 'reflect-metadata';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -30,6 +32,7 @@ import { CommandCenterService } from '../modules/command-center/command-center.s
 import { CurrentUser } from '../modules/auth/auth.decorators';
 import {
   AiDeploymentToolsService,
+  deploymentProbe,
   diagnoseDeploymentFailure,
   parseDeploymentProbe,
 } from '../modules/ai/ai-deployment-tools.service';
@@ -1124,6 +1127,40 @@ test('deployment diagnostics emit only allowlisted facts and fixed findings, nev
     'STATE_UNCERTAIN',
   );
 });
+
+const gitBash = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'Git', 'bin', 'bash.exe');
+const probeShell = process.platform === 'win32' ? gitBash : '/bin/sh';
+test(
+  'package preflight ignores the idle Debian shutdown watcher and detects actual upgrades',
+  {
+    skip: !existsSync(probeShell),
+  },
+  () => {
+    const watcher =
+      'unattended-upgr /usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal';
+    const run = (processes: string) =>
+      parseDeploymentProbe(
+        execFileSync(
+          probeShell,
+          [
+            '-c',
+            `processes=$1\nps() { printf '%s\\n' "$processes"; }\n${deploymentProbe}`,
+            'fixture',
+            processes,
+          ],
+          { encoding: 'utf8', windowsHide: true },
+        ),
+      );
+    assert.equal(run(watcher).packageActivity, undefined);
+    assert.equal(
+      run(`${watcher}\nunattended-upgr /usr/bin/python3 /usr/bin/unattended-upgrade`)
+        .packageActivity,
+      'busy',
+    );
+    assert.equal(run(`${watcher}\napt-get apt-get install docker.io`).packageActivity, 'busy');
+    assert.equal(run(`${watcher}\ndpkg /usr/bin/dpkg --configure -a`).packageActivity, 'busy');
+  },
+);
 
 test('AI confirms the review branch and PR separately and never writes in READ_ONLY', async () => {
   const f = await fixture();

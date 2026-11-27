@@ -24,7 +24,11 @@ for tool in apt-get systemctl git curl docker node npm corepack nginx java go ru
   if command -v "$tool" >/dev/null 2>&1; then printf '%s=available\\n' "$tool"; fi
 done
 df -Pk / | awk 'NR==2 { sub(/%$/, "", $5); printf "diskTotalKiB=%s\\ndiskUsedKiB=%s\\nfreeKiB=%s\\ndiskUsePercent=%s\\n", $2, $3, $4, $5 }'
-if command -v ps >/dev/null 2>&1 && ps -eo comm= | grep -Eq '^(apt|apt-get|dpkg|unattended-upgr)$'; then
+if command -v ps >/dev/null 2>&1 && ps -eo comm=,args= | awk '
+  $1 ~ /^(apt|apt-get|dpkg)$/ { busy = 1 }
+  $1 ~ /^unattended-upgr(ade)?$/ && $0 !~ /unattended-upgrade-shutdown[[:space:]]+--wait-for-signal([[:space:]]|$)/ { busy = 1 }
+  END { exit !busy }
+'; then
   printf 'packageActivity=busy\\n'
 fi
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
