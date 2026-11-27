@@ -1,4 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { version as appVersion } from '../../../package.json';
 import type { FormEvent, ReactNode } from 'react';
 import {
@@ -14,6 +15,8 @@ import {
   LoaderCircle,
   LogOut,
   Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
   Server,
   Settings2,
   ShieldCheck,
@@ -81,6 +84,7 @@ const navigation = [
   { path: '/servers', name: '服务器', icon: Server },
   { path: '/platform', name: '平台管理', icon: Settings2 },
 ];
+const sidebarPreference = 'veyops:sidebar-collapsed';
 
 const platformPages = [
   { path: '/overview', name: '平台概览', icon: LayoutDashboard },
@@ -451,6 +455,10 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [menu, setMenu] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem(sidebarPreference) === 'true',
+  );
+  const [navTooltip, setNavTooltip] = useState<{ name: string; left: number; top: number }>();
   const [loggingOut, setLoggingOut] = useState(false);
   const [breadcrumbProject, setBreadcrumbProject] = useState<ProjectDetail>();
   const route = useRoute();
@@ -481,8 +489,20 @@ export function App() {
   }, []);
   useEffect(() => {
     setMenu(false);
+    setNavTooltip(undefined);
     window.scrollTo(0, 0);
   }, [route]);
+  function toggleSidebar() {
+    const collapsed = !sidebarCollapsed;
+    setSidebarCollapsed(collapsed);
+    setNavTooltip(undefined);
+    localStorage.setItem(sidebarPreference, String(collapsed));
+  }
+  function showNavigationLabel(name: string, link: HTMLAnchorElement) {
+    if (!sidebarCollapsed) return;
+    const { right, top, height } = link.getBoundingClientRect();
+    setNavTooltip({ name, left: right + 12, top: top + height / 2 });
+  }
   async function logout() {
     setLoggingOut(true);
     setError('');
@@ -650,14 +670,27 @@ export function App() {
       </div>
     );
   return (
-    <div className="app-shell">
+    <div className={'app-shell' + (sidebarCollapsed ? ' sidebar-collapsed' : '')}>
       {menu && (
         <button className="sidebar-backdrop" aria-label="关闭菜单" onClick={() => setMenu(false)} />
       )}
       <aside id="workspace-sidebar" className={`sidebar ${menu ? 'open' : ''}`}>
-        <a href="#/" className="brand-link" aria-label="veyops 首页">
-          <Brand inverse />
-        </a>
+        <div className="sidebar-heading">
+          <a href="#/" className="brand-link" aria-label="veyops 首页">
+            <Brand inverse />
+          </a>
+          <button
+            type="button"
+            className="sidebar-collapse-button"
+            aria-controls="workspace-sidebar"
+            aria-expanded={!sidebarCollapsed}
+            aria-label={sidebarCollapsed ? '展开侧栏' : '收起侧栏'}
+            title={sidebarCollapsed ? '展开侧栏' : '收起侧栏'}
+            onClick={toggleSidebar}
+          >
+            {sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+          </button>
+        </div>
         <div className="workspace-switch">
           <span className="workspace-avatar">V</span>
           <span>
@@ -665,15 +698,23 @@ export function App() {
             <small>个人 / 单团队</small>
           </span>
         </div>
-        <nav className="nav-group" aria-label="主导航">
+        <nav className="nav-group" aria-label="主导航" onScroll={() => setNavTooltip(undefined)}>
           {navigation.map((item) => (
             <a
               href={`#${item.path}`}
               key={item.path}
               className={item === current ? 'active' : ''}
+              aria-label={item.name}
               aria-current={item === current ? 'page' : undefined}
+              onPointerEnter={(event) => showNavigationLabel(item.name, event.currentTarget)}
+              onPointerLeave={() => setNavTooltip(undefined)}
+              onFocus={(event) => showNavigationLabel(item.name, event.currentTarget)}
+              onBlur={() => setNavTooltip(undefined)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') setNavTooltip(undefined);
+              }}
             >
-              <item.icon size={18} />
+              <item.icon size={18} aria-hidden="true" />
               <span>{item.name}</span>
             </a>
           ))}
@@ -710,6 +751,17 @@ export function App() {
           </div>
         </div>
       </aside>
+      {navTooltip &&
+        createPortal(
+          <div
+            className="sidebar-nav-tooltip"
+            role="tooltip"
+            style={{ left: navTooltip.left, top: navTooltip.top }}
+          >
+            {navTooltip.name}
+          </div>,
+          document.body,
+        )}
       <div className="main-shell">
         <header className="topbar">
           <div className="topbar-path">

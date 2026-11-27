@@ -515,6 +515,83 @@ pre {
   flex-direction: column;
   z-index: 40;
 }
+.sidebar-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.sidebar-heading .brand-link {
+  padding-inline-end: 4px;
+}
+.sidebar-collapse-button {
+  display: grid;
+  place-items: center;
+  flex: 0 0 31px;
+  height: 31px;
+  padding: 0;
+  margin-inline-end: 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: #a8bbc8;
+  background: transparent;
+}
+.sidebar-collapse-button:hover,
+.sidebar-collapse-button:focus-visible {
+  color: #e5eff4;
+  background: #1b2c37;
+  border-color: #394d5a;
+}
+.sidebar-nav-tooltip {
+  position: fixed;
+  z-index: 60;
+  transform: translateY(-50%);
+  padding: 6px 10px;
+  border: 1px solid #354957;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px #111e2826;
+  color: #f1f7fa;
+  background: #1a2a35;
+  font-size: 13px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+@media (min-width: 901px) {
+  .app-shell.sidebar-collapsed {
+    --sidebar-width: 68px;
+  }
+  .sidebar-collapsed .sidebar-heading {
+    flex-direction: column;
+    gap: 5px;
+    margin-bottom: 14px;
+  }
+  .sidebar-collapsed .brand-link {
+    padding: 15px 0 3px;
+  }
+  .sidebar-collapsed .brand > span:last-child,
+  .sidebar-collapsed .workspace-switch,
+  .sidebar-collapsed .sidebar .nav-group a > span,
+  .sidebar-collapsed .local-label,
+  .sidebar-collapsed .user-card > div {
+    display: none;
+  }
+  .sidebar-collapsed .sidebar-collapse-button {
+    flex-basis: auto;
+    width: 31px;
+    margin: 0;
+  }
+  .sidebar-collapsed .sidebar .nav-group a {
+    justify-content: center;
+    padding-inline: 0;
+  }
+  .sidebar-collapsed .sidebar-bottom {
+    padding: 8px 12px 12px;
+  }
+  .sidebar-collapsed .user-card {
+    flex-direction: column;
+    gap: 6px;
+    padding: 6px 0 0;
+  }
+}
 .workspace-switch {
   display: flex;
   align-items: center;
@@ -2530,6 +2607,10 @@ tbody tr:hover {
   .sidebar.open {
     transform: translateX(0);
     visibility: visible;
+  }
+  .sidebar-collapse-button,
+  .sidebar-nav-tooltip {
+    display: none;
   }
   .sidebar-backdrop {
     position: fixed;
