@@ -10,6 +10,7 @@ import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 import type { ProcessOptions } from '../infrastructure/build-runner/process-runner.service';
+import type { SshOptions } from '../infrastructure/ssh/ssh.service';
 import { assertGraphCompose } from '../modules/pipelines/graph-compose';
 
 test('graph Compose requires every fixed image binding in its own service image field', () => {
@@ -135,9 +136,14 @@ async function checkDelivery(databaseUrl?: string) {
       execute: async (
         target: { id: string },
         command: string,
-        options?: { onData?: (chunk: string, stream?: 'stdout' | 'stderr') => void },
+        options?: SshOptions,
       ) => {
         remoteCommands.push({ serverId: target.id, command });
+        let stdout = '';
+        const emit = (chunk: string) => {
+          stdout += chunk;
+          options?.onData?.(chunk, 'stdout');
+        };
         if (
           target.id === failReleaseLockOnServer &&
           command.includes('mkdir -m 700 -- /var/tmp/.veyops-deployment-locks')
@@ -146,7 +152,7 @@ async function checkDelivery(databaseUrl?: string) {
         if (command.includes('VEYOPS_WORKSPACE=')) {
           const leaf = /mkdir -- '(veyops-[\w-]+)'/.exec(command)?.[1];
           assert.ok(leaf);
-          options?.onData?.(`VEYOPS_WORKSPACE=/home/fixture/.veyops/workspace/${leaf}\n`);
+          emit(`VEYOPS_WORKSPACE=/home/fixture/.veyops/workspace/${leaf}\n`);
         }
         if (failNextHealthCheck && command.includes('AUTO_HEALTH_CHECK')) {
           failNextHealthCheck = false;
@@ -157,43 +163,42 @@ async function checkDelivery(databaseUrl?: string) {
         const reading = /^readlink -- '([^']+)'$/.exec(command);
         if (reading) {
           const link = releaseLinks.get(`${target.id}:${reading[1]}`);
-          if (link) options?.onData?.(`${link}\n`);
-          return { exitCode: link ? 0 : 1 };
+          if (link) emit(`${link}\n`);
+          return { exitCode: link ? 0 : 1, ...(options?.captureStdout && { stdout }) };
         }
         if (command.includes('BUILD_FIXTURE') && target.id === failedBuildServer)
           return { exitCode: 77 };
         if (command.includes("printf 'VEYOPS_ARTIFACT"))
-          options?.onData?.(`VEYOPS_ARTIFACT:${checksum}:${archive.length}\n`);
+          emit(`VEYOPS_ARTIFACT:${checksum}:${archive.length}\n`);
         if (command.includes('measured=$(artifact_digest') && command.includes('workspace=')) {
           const instance = /instance=[^a-f0-9]*([a-f0-9-]{36})/.exec(command)?.[1];
           assert.ok(instance);
-          options?.onData?.(
+          emit(
             `/home/fixture/.veyops/artifacts/${instance}/payload\n${checksum}:${archive.length}\n`,
-            'stdout',
           );
         }
         if (command.includes(' push ')) {
           const tag = /:([^:']+)'$/.exec(command)?.[1];
-          options?.onData?.(`${tag}: digest: ${imageDigest} size: 321\n`);
+          emit(`${tag}: digest: ${imageDigest} size: 321\n`);
         }
         if (command.includes('config --images'))
-          options?.onData?.(`${/^VEYOPS_IMAGE='([^']+)'/.exec(command)?.[1]}\n`);
+          emit(`${/^VEYOPS_IMAGE='([^']+)'/.exec(command)?.[1]}\n`);
         if (command.includes('{{.ID}}'))
-          options?.onData?.(`fixture-engine-${target.id}\n`, 'stdout');
+          emit(`fixture-engine-${target.id}\n`);
         if (
           command.includes('image inspect --format') ||
           (command.includes('image') && command.includes('inspect') && command.includes('{{.Id}}'))
         ) {
           const platform = command.includes('{{.Architecture}}') ? ' linux/amd64' : '';
-          options?.onData?.(`${imageId}${platform}\n`, 'stdout');
+          emit(`${imageId}${platform}\n`);
         }
         if (command.includes("printf 'VEYOPS_COMPOSE_IMAGE_ID="))
-          options?.onData?.(`VEYOPS_COMPOSE_IMAGE_ID=${imageId}\n`);
+          emit(`VEYOPS_COMPOSE_IMAGE_ID=${imageId}\n`);
         if (registryPullFails && command.includes(' pull') && command.includes(imageDigest))
           return { exitCode: 1 };
         if (archivePlatformMismatch && command.includes('{{.Server.Os}}/{{.Server.Arch}}'))
           return { exitCode: 1 };
-        return { exitCode: 0 };
+        return { exitCode: 0, ...(options?.captureStdout && { stdout }) };
       },
       upload: async (target: { id: string }, source: string) => {
         assert.deepEqual(await readFile(source), archive);

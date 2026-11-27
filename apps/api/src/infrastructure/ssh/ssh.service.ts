@@ -23,6 +23,8 @@ export interface SshOptions {
   timeout: number;
   signal?: AbortSignal;
   onData?: (text: string, stream: 'stdout' | 'stderr') => void;
+  /** Internal protocol data only. The stream passed to onData is always redacted. */
+  captureStdout?: boolean;
   interactiveInput?: (write: (line: string) => Promise<void>, signal: AbortSignal) => Promise<void>;
   secrets?: string[];
   variables?: ExecutionVariables;
@@ -112,7 +114,7 @@ export class SshService {
     target: SshTarget,
     command: string,
     options: SshOptions,
-  ): Promise<{ exitCode: number; signal?: string }> {
+  ): Promise<{ exitCode: number; signal?: string; stdout?: string }> {
     if (!target.hostKeyFingerprint)
       throw new SshExecutionError('服务器尚未配置已确认的 SSH SHA256 主机指纹');
     if (options.signal?.aborted) throw new SshExecutionError('任务已取消', 'CANCELLED');
@@ -146,6 +148,7 @@ export class SshService {
       const inputChannel = new AbortController();
       let outputBytes = 0;
       const outputLimit = 5 * 1024 * 1024;
+      let stdout = options.captureStdout ? '' : undefined;
       const decoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') };
       const redactors = {
         stdout: new SecretRedactor(secretValues),
@@ -162,7 +165,9 @@ export class SshService {
           );
           return;
         }
-        const text = redactors[stream].write(decoders[stream].write(data));
+        const decoded = decoders[stream].write(data);
+        if (stream === 'stdout' && stdout !== undefined) stdout += decoded;
+        const text = redactors[stream].write(decoded);
         try {
           if (text) options.onData?.(text, stream);
         } catch {
@@ -173,7 +178,9 @@ export class SshService {
       };
       const flush = (): Error | undefined => {
         for (const stream of ['stdout', 'stderr'] as const) {
-          const text = redactors[stream].write(decoders[stream].end()) + redactors[stream].end();
+          const decoded = decoders[stream].end();
+          if (stream === 'stdout' && stdout !== undefined) stdout += decoded;
+          const text = redactors[stream].write(decoded) + redactors[stream].end();
           try {
             if (text) options.onData?.(text, stream);
           } catch {
@@ -203,7 +210,7 @@ export class SshService {
         channel?.close();
         client.end();
         if (finalError) reject(finalError);
-        else resolve(result ?? { exitCode: 0 });
+        else resolve({ ...(result ?? { exitCode: 0 }), ...(stdout !== undefined && { stdout }) });
       };
       const cancel = () =>
         finish(new SshExecutionError('任务取消；远程进程可能需要人工确认已停止', 'CANCELLED'));

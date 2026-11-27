@@ -126,7 +126,15 @@ function fixture(
   const ssh = {
     execute: async (_: SshTarget, command: string, options: SshOptions) => {
       commands.push(command);
-      return { exitCode: (await remote(command, options)) ?? 0 };
+      let stdout = '';
+      const exitCode = await remote(command, {
+        ...options,
+        onData: (text, stream) => {
+          if (stream !== 'stderr') stdout += text;
+          options.onData?.(text, stream);
+        },
+      });
+      return { exitCode: exitCode ?? 0, ...(options.captureStdout && { stdout }) };
     },
     uploadContent: async () => undefined,
     upload: async () => undefined,

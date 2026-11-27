@@ -573,22 +573,20 @@ export class BuildsService {
     timeout = 900,
     failureMessage = '远程步骤失败',
   ) {
-    let output = '';
     const result = await this.ssh.execute(target, command, {
       timeout,
       signal: session.context.signal,
       secrets: session.secrets,
-      onData: (text, stream) => {
-        if (stream !== 'stderr') output += text;
-        session.context.log(text, target.id);
-      },
+      captureStdout: true,
+      onData: (text) => session.context.log(text, target.id),
     });
     if (result.exitCode !== 0)
       throw new BuildCommandError(
         result.exitCode,
         `${failureMessage}（退出码 ${result.exitCode}）`,
       );
-    return output;
+    if (result.stdout === undefined) throw new Error('未收到 SSH 校验输出');
+    return result.stdout;
   }
   async remoteCheckout(
     target: SshTarget,

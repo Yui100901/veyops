@@ -32,7 +32,7 @@ import {
   ProcessExecutionError,
   ProcessRunnerService,
 } from '../infrastructure/build-runner/process-runner.service';
-import { SshService, SshTarget } from '../infrastructure/ssh/ssh.service';
+import { SshOptions, SshService, SshTarget } from '../infrastructure/ssh/ssh.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { DeploymentsService } from '../modules/deployments/deployments.service';
 import { PipelineDefinitionDto } from '../modules/pipelines/pipeline.dto';
@@ -767,18 +767,20 @@ for (const location of ['TARGET', 'MANAGER'] as const)
           execute: async (
             _target: SshTarget,
             command: string,
-            options: { onData?: (s: string) => void },
+            options: SshOptions,
           ) => {
             calls.push({ command });
+            let stdout = '';
             if (command.includes("printf 'VEYOPS_ARTIFACT"))
-              options.onData?.(`VEYOPS_ARTIFACT:${archiveChecksum}:${archiveContents.length}\n`);
+              stdout = `VEYOPS_ARTIFACT:${archiveChecksum}:${archiveContents.length}\n`;
             else if (command.includes('image inspect') && buildOnly)
-              options.onData?.(digest + '\n');
+              stdout = digest + '\n';
             else if (command.includes(' push ')) {
               const tag = /:([^:']+)'$/.exec(command)?.[1];
-              options.onData?.(`${tag}: digest: ${digest} size: 456\n`);
-            } else if (command.includes('config --images')) options.onData?.(image + '\n');
-            return { exitCode: 0 };
+              stdout = `${tag}: digest: ${digest} size: 456\n`;
+            } else if (command.includes('config --images')) stdout = image + '\n';
+            if (stdout) options.onData?.(stdout, 'stdout');
+            return { exitCode: 0, ...(options.captureStdout && { stdout }) };
           },
           uploadContent: async (_t: SshTarget, content: string, path: string) => {
             uploads.push({ path, content });

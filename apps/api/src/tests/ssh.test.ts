@@ -82,6 +82,16 @@ const server = new Server({ hostKeys: [hostKey] }, (connection) => {
           stream.end();
           return;
         }
+        if (info.command === 'compose-image-receipt') {
+          stream.write('branchpair/de');
+          stream.stderr.write('snapshot for dev\n');
+          setTimeout(() => {
+            stream.write('v:fixed\n');
+            stream.exit(0);
+            stream.end();
+          }, 10);
+          return;
+        }
         if (info.command.endsWith('\ncheck-graph-environment')) {
           let input = '';
           stream.on('data', (chunk: Buffer) => {
@@ -190,6 +200,25 @@ test('real SSH connection validates host key, authenticates and redacts streamed
   assert.equal(result.exitCode, 0);
   assert.equal(output, 'first [REDACTED] last\n');
   assert.equal(output.includes(password), false);
+});
+test('SSH capture preserves Compose identity while visible output redacts overlapping values', async () => {
+  const logs = { stdout: '', stderr: '' };
+  const result = await service().execute(target, 'compose-image-receipt', {
+    timeout: 5,
+    secrets: ['dev'],
+    captureStdout: true,
+    onData: (log, stream) => {
+      logs[stream] += log;
+    },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, 'branchpair/dev:fixed\n');
+  assert.deepEqual(logs, {
+    stdout: 'branchpair/[REDACTED]:fixed\n',
+    stderr: 'snapshot for [REDACTED]\n',
+  });
+  const normal = await service().execute(target, 'compose-image-receipt', { timeout: 5 });
+  assert.ok(!Object.hasOwn(normal, 'stdout'));
 });
 test('real SSH rejects a changed host key and a wrong password', async () => {
   const requestsBefore = authenticationRequests;
