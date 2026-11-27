@@ -65,9 +65,9 @@ function TerminalInput({
       <button
         type="button"
         className="terminal-input-action"
-        aria-label={masked ? '显示输入' : '隐藏输入及回显'}
+        aria-label={masked ? '显示输入' : '隐藏本地输入及回显'}
         aria-pressed={masked}
-        title={masked ? '显示输入' : '隐藏输入及回显'}
+        title={masked ? '显示输入' : '隐藏本地输入及回显'}
         disabled={disabled || busy}
         onClick={() => setMasked(!masked)}
       >
@@ -140,12 +140,10 @@ function TerminalPane({
               ? '等待 SSH 输出。'
               : '等待命令。')}
       </pre>
-      {echo && (
-        <div className="terminal-echo">
-          <span>回显</span>
-          <code dir="ltr">{echo}</code>
-        </div>
-      )}
+      <div className="terminal-echo">
+        <span>回显</span>
+        <code dir="ltr">{echo ?? '—'}</code>
+      </div>
       {logs.error && content && (
         <small className="terminal-log-note" role="status">
           {logs.error}
