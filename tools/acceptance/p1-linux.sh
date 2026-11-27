@@ -30,7 +30,11 @@ if ! git -C "$repo" diff --quiet "$revision" -- tools/acceptance/p1-linux.sh; th
   exit 2
 fi
 candidate=${VEYOPS_ACCEPT_RUNTIME_IMAGE:?Set VeyOps candidate image built from the specified revision}
-target_image=${VEYOPS_ACCEPT_ENGINE_IMAGE:-node:24-bookworm-slim}
+case "$mode" in
+  flow-v2|flow-v2-image|gitea-preview) default_target_image=$candidate ;;
+  *) default_target_image=node:24-bookworm-slim ;;
+esac
+target_image=${VEYOPS_ACCEPT_ENGINE_IMAGE:-$default_target_image}
 site_image=busybox:1.36
 postgres_image=${VEYOPS_ACCEPT_POSTGRES_IMAGE:-postgres:17-bookworm}
 for image in "$candidate" "$target_image" "$postgres_image"; do
@@ -174,7 +178,7 @@ done
 # Save before loading so a failed save cannot be masked by a pipeline.
 case "$mode" in
   flow-v2) ;;
-  gitea-preview) docker image save -o "$work/images.tar" "$site_image" ;;
+  flow-v2-image|gitea-preview) docker image save -o "$work/images.tar" "$site_image" ;;
   *) docker image save -o "$work/images.tar" "$site_image" "$target_image" ;;
 esac
 if [ "$mode" != flow-v2 ]; then

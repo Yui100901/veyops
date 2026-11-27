@@ -86,7 +86,11 @@ function configureTemplateEntries(canvas, start, release, composePath) {
   assert.ok(onlyBuild && onlyDeploy);
   const { sources, execution, variables } = start.start;
   onlyBuild.start = { sources, execution, variables, release: { serviceId: release.serviceId } };
-  onlyDeploy.start = { variables, release: { ...release, artifactSource: 'RUN_PARAMETER' } };
+  onlyDeploy.start = {
+    execution,
+    variables,
+    release: { ...release, artifactSource: 'RUN_PARAMETER' },
+  };
   const buildEnd = canvas.nodes.find(({ name }) => name === '构建结束');
   if (composePath) {
     assert.ok(buildEnd.finish.images.length);
@@ -103,7 +107,7 @@ function configureTemplateEntries(canvas, start, release, composePath) {
   const decision = approval && {
     releaseNodeId: canvas.nodes.find(({ operation }) => operation === 'DEPLOY_ARTIFACT').id,
     serviceId: release.serviceId,
-    serverIds: release.targets.serverIds,
+    serverIds: [execution.serverId],
   };
   return { onlyBuild, onlyDeploy, ...(decision && { decision }) };
 }
@@ -159,7 +163,8 @@ async function verifyFlowV2({ api, fixture, execute }) {
   const sourceTarget = fixture.serverIds['test-a'];
   const deliveryTarget = fixture.serverIds['test-b'];
   assert.ok(sourceTarget && deliveryTarget && sourceTarget !== deliveryTarget);
-  const activation = fixtureReleaseDirectory('test-b', project, service) + '/current';
+  const activation = fixtureReleaseDirectory('test-a', project, service) + '/current';
+  const otherActivation = fixtureReleaseDirectory('test-b', project, service) + '/current';
   const { canvas, startId } = await api.post(graph + '/draft/templates/expand', {
     templateId: 'COMPLETE_CI_CD',
     model: 'FLOW_V2',
@@ -173,10 +178,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
   const start = canvas.nodes.find(({ id }) => id === startId);
   const build = canvas.nodes.find(({ operation }) => operation === 'BUILD');
   const finish = canvas.nodes.find(({ type }) => type === 'END');
-  const release = {
-    serviceId: service.id,
-    targets: { serverIds: [deliveryTarget] },
-  };
+  const release = { serviceId: service.id };
   start.start = {
     sources: [
       {
@@ -185,7 +187,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
         ref: { kind: 'BRANCH', value: 'main' },
       },
     ],
-    execution: { location: 'TARGET', serverId: sourceTarget },
+    execution: { serverId: sourceTarget },
     variables: [{ key: 'FLOW_FIXTURE_ENV', value: 'flow-v2' }],
     release,
   };
@@ -204,6 +206,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
   delete finish.finish.saveWorkspace;
   delete finish.finish.retention;
   const { onlyBuild, onlyDeploy, decision } = configureTemplateEntries(canvas, start, release);
+  onlyDeploy.start.execution = { serverId: deliveryTarget };
   const version = await publish(api, graph, canvas);
   const built = await execute(
     startId,
@@ -243,13 +246,14 @@ async function verifyFlowV2({ api, fixture, execute }) {
   assert.equal(artifact.downloadAvailable, false);
   const initial = await verifyActivation(
     built,
-    deliveryTarget,
+    sourceTarget,
     artifact.id,
     source.sha,
     activation,
   );
 
   const builtOnly = await execute(onlyBuild.id, {}, { projectId: project.id, version });
+  assert.equal(builtOnly.detail.simplified.serverId, sourceTarget);
   assert.deepEqual(
     builtOnly.detail.nodes.map(({ type }) => type),
     ['START', 'CHECKOUT', 'CHECK', 'BUILD', 'END'],
@@ -259,19 +263,21 @@ async function verifyFlowV2({ api, fixture, execute }) {
   const deployedOnly = await execute(
     onlyDeploy.id,
     { artifactId: onlyBuildArtifact.id },
-    { projectId: project.id, version, decision },
+    { projectId: project.id, version, decision: { ...decision, serverIds: [deliveryTarget] } },
   );
   assert.deepEqual(
     deployedOnly.detail.nodes.map(({ type }) => type),
     ['START', 'APPROVAL', 'DEPLOY_ARTIFACT', 'HEALTH_CHECK', 'END'],
   );
   assert.equal(deployedOnly.detail.simplified.workspacePath, null);
+  assert.equal(deployedOnly.detail.simplified.serverId, deliveryTarget);
+  assert.equal(await readlink(activation), 'releases/' + initial.taskId);
   await verifyActivation(
     deployedOnly,
     deliveryTarget,
     onlyBuildArtifact.id,
     source.sha,
-    activation,
+    otherActivation,
   );
 
   for (const [name, serverId] of [
@@ -281,7 +287,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
     const historicalBuild = structuredClone(canvas);
     const historyStart = historicalBuild.nodes.find(({ id }) => id === onlyBuild.id);
     historyStart.start.sources = [];
-    historyStart.start.execution = { location: 'TARGET', serverId };
+    historyStart.start.execution = { serverId };
     const historicalVersion = await publish(api, graph, historicalBuild);
     const fromHistory = await execute(
       onlyBuild.id,
@@ -323,7 +329,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
   assert.equal(temporary.temporary, true);
   const transientRelease = await verifyActivation(
     transientRun,
-    deliveryTarget,
+    sourceTarget,
     temporary.id,
     source.sha,
     activation,
@@ -342,7 +348,10 @@ async function verifyFlowV2({ api, fixture, execute }) {
       id: replayStart,
       name: '历史产物重发',
       type: 'START',
-      start: { release: { ...release, artifactId: artifact.id } },
+      start: {
+        execution: { serverId: deliveryTarget },
+        release: { ...release, artifactId: artifact.id },
+      },
     },
     {
       id: replayDeploy,
@@ -375,7 +384,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
     deliveryTarget,
     artifact.id,
     source.sha,
-    activation,
+    otherActivation,
   );
   assert.notEqual(repeated.id, initial.id);
 
@@ -397,7 +406,7 @@ async function verifyFlowV2({ api, fixture, execute }) {
   );
   const mixedRelease = await verifyActivation(
     mixed,
-    deliveryTarget,
+    sourceTarget,
     artifact.id,
     source.sha,
     activation,
@@ -546,125 +555,6 @@ async function verifyNamedImageTrigger({
   assert.fail('The upstream image trigger did not complete');
 }
 
-async function verifyManagerImageArchive({
-  api,
-  graph,
-  canvas,
-  execute,
-  docker,
-  projectId,
-  sources,
-  release,
-  serverId,
-  directory,
-}) {
-  const { canvas: manager, startId } = await api.post(graph + '/draft/templates/expand', {
-    templateId: 'COMPLETE_CI_CD',
-    model: 'FLOW_V2',
-    artifactType: 'DOCKER_IMAGE',
-  });
-  const start = manager.nodes.find(({ id }) => id === startId);
-  const build = manager.nodes.find(({ operation }) => operation === 'BUILD');
-  start.start = {
-    sources,
-    execution: { location: 'MANAGER' },
-    release: {
-      ...start.start.release,
-      ...release,
-      compose: { path: sourceDirectory + '/compose.yaml' },
-    },
-  };
-  build.build = { repoPath: sourceDirectory, dockerfilePath: 'Dockerfile' };
-  const { onlyBuild, onlyDeploy, decision } = configureTemplateEntries(
-    manager,
-    start,
-    release,
-    sourceDirectory + '/compose.yaml',
-  );
-  start.name = '管理端构建并部署';
-  onlyBuild.name = '管理端仅构建';
-  onlyDeploy.name = '管理端仅部署';
-  canvas.nodes.push(...manager.nodes);
-  canvas.edges.push(...manager.edges);
-  canvas.endpoints.push(...manager.endpoints);
-  const version = await publish(api, graph, canvas);
-  const built = await execute(startId, {}, { projectId, version, decision });
-  assert.equal(built.detail.simplified.location, 'MANAGER');
-  const workspace = built.artifacts.find(({ kind }) => kind === 'DIRECTORY');
-  assert.ok(workspace);
-  assert.equal(workspace.physical.path, built.detail.simplified.workspacePath);
-  const exported = await api.request('GET', '/artifacts/' + workspace.id + '/download');
-  assert.equal(exported.status, 200);
-  const entries = execFileSync('tar', ['-tzf', '-'], {
-    input: Buffer.from(await exported.arrayBuffer()),
-    encoding: 'utf8',
-    timeout: 15_000,
-  })
-    .trim()
-    .split('\n');
-  assert.ok(entries.some((entry) => entry.endsWith(sourceDirectory + '/Dockerfile')));
-  assert.ok(
-    entries.every((entry) => !entry.split('/').some((part) => /^\.git$|^\.env\./.test(part))),
-  );
-  const image = built.artifacts.find(({ kind }) => kind === 'DOCKER_IMAGE');
-  assert.ok(image);
-  assert.equal(image.storageType, 'LOCAL_IMAGE');
-  assert.equal(image.imageTag, 'run-' + built.detail.id);
-  const archive = await api.request('GET', '/artifacts/' + image.id + '/download');
-  assert.equal(archive.status, 200);
-  const checksum = createHash('sha256')
-    .update(Buffer.from(await archive.arrayBuffer()))
-    .digest('hex');
-  assert.equal(checksum, image.checksum);
-  assert.equal(archive.headers.get('x-artifact-sha256'), checksum);
-  const activated = await verifyComposeActivation(built, image, serverId, directory, docker);
-
-  const onlyBuildRun = await execute(onlyBuild.id, {}, { projectId, version });
-  const builtImage = onlyBuildRun.artifacts.find(({ kind }) => kind === 'DOCKER_IMAGE');
-  assert.ok(builtImage);
-  assert.notEqual(image.id, builtImage.id);
-  assert.equal(await readlink(directory + '/current'), 'releases/' + activated.deployment.taskId);
-  const onlyDeployRun = await execute(
-    onlyDeploy.id,
-    { artifactId: builtImage.id },
-    { projectId, version, decision },
-  );
-  assert.equal(onlyDeployRun.detail.simplified.workspacePath, null);
-  await verifyComposeActivation(onlyDeployRun, builtImage, serverId, directory, docker);
-
-  const replay = 'manager-archive-replay';
-  const deploy = 'manager-archive-deploy';
-  const end = 'manager-archive-end';
-  canvas.nodes.push(
-    {
-      id: replay,
-      name: '重发管理端归档',
-      type: 'START',
-      start: { release: { ...release, artifactId: image.id } },
-    },
-    {
-      id: deploy,
-      name: '部署管理端镜像',
-      type: 'FUNCTION',
-      operation: 'DEPLOY_ARTIFACT',
-      deploy: { method: 'COMPOSE' },
-    },
-    { id: end, name: '核对激活', type: 'END', finish: { requireRelease: 'ACTIVATED' } },
-  );
-  canvas.edges.push({ from: replay, to: deploy }, { from: deploy, to: end });
-  canvas.endpoints.push({ startId: replay, endId: end });
-  const replayVersion = await publish(api, graph, canvas);
-  const replayed = await execute(replay, {}, { projectId, version: replayVersion });
-  const restored = await verifyComposeActivation(replayed, image, serverId, directory, docker);
-  assert.notEqual(restored.deployment.id, activated.deployment.id);
-  return {
-    runId: built.detail.id,
-    artifactId: image.id,
-    replayRunId: replayed.detail.id,
-    checksum,
-  };
-}
-
 async function verifyFlowV2Image({ api, fixture, execute, docker }) {
   const source = await repositoryFixture(true);
   const project = await api.post('/projects', {
@@ -686,10 +576,7 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
   const serverId = fixture.serverIds['test-a'];
   assert.ok(serverId);
   const directory = fixtureReleaseDirectory('test-a', project, service);
-  const release = {
-    serviceId: service.id,
-    targets: { serverIds: [serverId] },
-  };
+  const release = { serviceId: service.id };
   const { canvas, startId } = await api.post(graph + '/draft/templates/expand', {
     templateId: 'MINIMAL_CI_CD',
     model: 'FLOW_V2',
@@ -706,7 +593,7 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
         ref: { kind: 'BRANCH', value: 'main' },
       },
     ],
-    execution: { location: 'TARGET', serverId },
+    execution: { serverId },
     release: {
       ...release,
       compose: { path: sourceDirectory + '/compose.yaml' },
@@ -796,7 +683,7 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
       id: replay,
       type: 'START',
       name: '生产镜像重发',
-      start: { release: { ...release, artifactId: image.id } },
+      start: { execution: { serverId }, release: { ...release, artifactId: image.id } },
     },
     {
       id: deploy,
@@ -871,18 +758,6 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
     projectId: project.id,
     serverId,
   });
-  const manager = await verifyManagerImageArchive({
-    api,
-    graph,
-    canvas,
-    execute,
-    docker,
-    projectId: project.id,
-    sources: start.start.sources,
-    release,
-    serverId,
-    directory,
-  });
   return {
     projectId: project.id,
     serverId,
@@ -899,7 +774,6 @@ async function verifyFlowV2Image({ api, fixture, execute, docker }) {
     replayDeploymentId: restored.deployment.id,
     changedImageAttempt: refused,
     namedTrigger,
-    manager,
   };
 }
 
