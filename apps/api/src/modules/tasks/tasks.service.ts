@@ -666,6 +666,17 @@ export class TasksService {
   async logs(id: string, offset = 0) {
     return this.logStore.read((await this.row(id)).log_file_key, offset);
   }
+  async targetLogs(id: string, targetId: string, offset = 0) {
+    const task = await this.row(id);
+    const target = await this.database.db
+      .selectFrom('task_targets')
+      .select('server_id')
+      .where('task_id', '=', id)
+      .where('id', '=', targetId)
+      .executeTakeFirst();
+    if (!target) throw new NotFoundException('任务目标不存在');
+    return this.logStore.readTarget(task.log_file_key, target.server_id, offset);
+  }
   async recentLog(id: string) {
     return this.logStore.tail((await this.row(id)).log_file_key);
   }
@@ -704,6 +715,8 @@ export class TasksService {
   context(task: Selectable<TasksTable>, signal: AbortSignal): TaskExecutionContext {
     const owner = task.lease_owner!;
     const queued = isQueuedOperation(task.task_type, task.idempotency_key);
+    const interactive =
+      task.task_type === 'COMMAND' && (JSON.parse(task.payload_json) as TaskPayload).interactive;
     const tryStartTarget = (serverId: string) =>
       this.database.db.transaction().execute(async (tx) => {
         if (signal.aborted || !(await lockTaskLease(tx, task.id, owner)))
@@ -733,6 +746,7 @@ export class TasksService {
       leaseOwner: owner,
       ...(queued && { tryStartTarget }),
       log: (text, serverId) => {
+        if (interactive && serverId) this.logStore.appendTarget(task.log_file_key!, serverId, text);
         this.logStore.append(
           task.id,
           task.log_file_key!,

@@ -16,6 +16,7 @@ import type { Database } from '../../core/database/schema';
 import {
   missingLogFile,
   pruneTaskLogs,
+  targetLogDirectory,
   type LogRetentionPolicies,
   type LogRetentionResult,
 } from './task-log-retention';
@@ -75,13 +76,27 @@ export class TaskLogService {
     return file;
   }
   append(taskId: string, key: string, text: string): number {
-    const file = this.path(key);
-    mkdirSync(dirname(file), { recursive: true });
-    // Defense in depth for common credential assignments; SSH output is also stream-redacted.
-    const scrubbed = redactTaskLog(text);
-    appendFileSync(file, scrubbed, { encoding: 'utf8', mode: 0o600 });
+    const file = this.write(key, text);
     this.changes.next({ taskId });
     return statSync(file).size;
+  }
+  appendTarget(key: string, serverId: string, text: string) {
+    this.write(this.targetKey(key, serverId), text);
+  }
+  readTarget(key: string | null, serverId: string | null, offset = 0) {
+    return this.read(key && serverId ? this.targetKey(key, serverId) : null, offset);
+  }
+  private targetKey(key: string, serverId: string) {
+    if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(serverId))
+      throw new Error('Invalid log server ID');
+    return `${targetLogDirectory(key)}/${serverId}.log`;
+  }
+  private write(key: string, text: string) {
+    const file = this.path(key);
+    mkdirSync(dirname(file), { recursive: true });
+    // SSH output is also stream-redacted before it reaches either log.
+    appendFileSync(file, redactTaskLog(text), { encoding: 'utf8', mode: 0o600 });
+    return file;
   }
   read(key: string | null, offset = 0): { content: string; nextOffset: number } {
     return this.readChunk(key, () => offset) ?? { content: '', nextOffset: offset };

@@ -298,6 +298,7 @@
 | GET  | /tasks/:id/command-reuse        | 管理员或原执行者可读取临时命令及上次确认的目标选择，用于重新预览和确认                   |
 | GET  | /tasks/:id/steps                | 每目标步骤记录                                                                           |
 | GET  | /tasks/:id/logs?offset=0        | `{content,nextOffset}`；偏移单位字节，单次最多256 KiB                                    |
+| GET  | /tasks/:id/targets/:targetId/logs?offset=0 | 交互命令的单目标输出。`targetId` 为任务内目标 ID，响应仍为 `{content,nextOffset}`。 |
 | GET  | /tasks/:id/logs/stream?offset=0 | SSE，事件 `{content,nextOffset,status}`，id为偏移；支持Last-Event-ID                     |
 | POST | /tasks/:id/cancel               | PENDING直接取消；RUNNING请求取消；终态拒绝                                               |
 

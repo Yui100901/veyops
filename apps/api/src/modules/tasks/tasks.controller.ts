@@ -66,6 +66,13 @@ export class TasksController {
   @Get(':id/logs') logs(@Param('id') id: string, @Query('offset') offset?: string) {
     return this.tasks.logs(id, this.offset(offset));
   }
+  @Get(':id/targets/:targetId/logs') targetLogs(
+    @Param('id') id: string,
+    @Param('targetId') targetId: string,
+    @Query('offset') offset?: string,
+  ) {
+    return this.tasks.targetLogs(id, targetId, this.offset(offset));
+  }
   @Post(':id/cancel') @Roles('ADMIN', 'OPERATOR') async cancel(
     @Param('id') id: string,
     @Req() req: { user: { id: string } },

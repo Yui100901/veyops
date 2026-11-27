@@ -1,4 +1,4 @@
-import { lstatSync, realpathSync, unlinkSync } from 'node:fs';
+import { lstatSync, readdirSync, realpathSync, rmdirSync, unlinkSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { sql, type Kysely } from 'kysely';
 import type { Database } from '../../core/database/schema';
@@ -31,6 +31,32 @@ export interface LogRetentionResult {
 const taskIdFormat = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const logKeyFormat = /^logs\/(\d{4})\/(0[1-9]|1[0-2])\/[a-f0-9-]+\.log$/;
 
+export function targetLogDirectory(logKey: string): string {
+  return logKey + '.targets';
+}
+
+function removeOwnedTargetLogs(path: string) {
+  const directory = targetLogDirectory(path);
+  const dir = lstatSync(directory, { throwIfNoEntry: false });
+  if (!dir) return true;
+  if (!dir.isDirectory() || dir.isSymbolicLink() || relative(directory, realpathSync(directory)))
+    return false;
+  const entries = readdirSync(directory);
+  const files = entries.map((entry) => join(directory, entry));
+  if (entries.some((entry) => !entry.endsWith('.log') || !taskIdFormat.test(entry.slice(0, -4))))
+    return false;
+  if (
+    files.some((file) => {
+      const entry = lstatSync(file);
+      return !entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1;
+    })
+  )
+    return false;
+  for (const file of files) unlinkSync(file);
+  rmdirSync(directory);
+  return true;
+}
+
 function removeOwnedLog(root: string, id: string, key: string, expectedKey: string) {
   const logParts = logKeyFormat.exec(key);
   if (!logParts || key !== expectedKey || !taskIdFormat.test(id)) return 'skipped';
@@ -44,9 +70,16 @@ function removeOwnedLog(root: string, id: string, key: string, expectedKey: stri
   }
   const path = join(directory, `${id}.log`);
   const file = lstatSync(path, { throwIfNoEntry: false });
+  if (
+    file &&
+    (!file.isFile() ||
+      file.isSymbolicLink() ||
+      file.nlink !== 1 ||
+      relative(path, realpathSync(path)) !== '')
+  )
+    return 'skipped';
+  if (!removeOwnedTargetLogs(path)) return 'skipped';
   if (!file) return 'missing';
-  if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1) return 'skipped';
-  if (relative(path, realpathSync(path)) !== '') return 'skipped';
   unlinkSync(path);
   return 'removed';
 }

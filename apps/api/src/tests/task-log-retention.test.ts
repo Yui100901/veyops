@@ -95,8 +95,20 @@ async function testRetention(database: Kysely<Database>) {
   mkdirSync(dirname(linkedMonth), { recursive: true });
   symlinkSync(external, linkedMonth, 'junction');
   try {
+    const interactiveServer = randomUUID();
+    const otherServer = randomUUID();
     for (const row of [expired, boundary, active, unfinished, leased])
       logs.append(row.id, String(row.log_file_key), 'fixture log');
+    logs.appendTarget(String(expired.log_file_key), interactiveServer, '回显 password=value\n');
+    logs.appendTarget(String(expired.log_file_key), otherServer, 'other target\n');
+    logs.appendTarget(String(active.log_file_key), interactiveServer, 'active target\n');
+    const first = logs.readTarget(String(expired.log_file_key), interactiveServer);
+    assert.equal(first.content, '回显 password=[REDACTED]\n');
+    assert.equal(first.nextOffset, Buffer.byteLength(first.content));
+    assert.equal(
+      logs.readTarget(String(expired.log_file_key), otherServer).content,
+      'other target\n',
+    );
     const rows = [
       expired,
       boundary,
@@ -131,6 +143,11 @@ async function testRetention(database: Kysely<Database>) {
     assert.equal(readFileSync(artifactPath, 'utf8'), 'artifact');
     assert.equal(readFileSync(escapedFile, 'utf8'), 'must stay');
     assert.equal(existsSync(logs.path(String(expired.log_file_key))), false);
+    assert.equal(existsSync(logs.path(String(expired.log_file_key) + '.targets')), false);
+    assert.equal(
+      logs.readTarget(String(active.log_file_key), interactiveServer).content,
+      'active target\n',
+    );
     assert.deepEqual(logs.read(String(expired.log_file_key), 11), { content: '', nextOffset: 11 });
     assert.deepEqual(logs.read(null, 11), { content: '', nextOffset: 11 });
     assert.equal(logs.tail(String(expired.log_file_key)), '');
