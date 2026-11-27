@@ -86,7 +86,7 @@ export function TasksPage() {
       <PageHeader
         eyebrow="EXECUTION HISTORY"
         title="任务中心"
-        description="查看执行流、临时命令和运维方案的运行进度。"
+        description="查看执行流、命令和运维方案的运行进度。"
         action={
           <>
             <a className="button secondary" href="#/operations/schedules">
@@ -144,7 +144,7 @@ export function TasksPage() {
           <Empty
             icon={<ListTodo size={25} />}
             title="还没有执行任务"
-            description="运行项目执行流、临时命令或运维方案后，可以在这里查看。"
+            description="运行项目执行流、命令或运维方案后，可以在这里查看。"
             action={
               <a className="button primary" href="#/operations">
                 <Terminal size={16} />
@@ -239,7 +239,9 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
   if (!task.data)
     return <ErrorBanner error={task.error || '找不到这个任务。'} retry={task.reload} />;
   const value = task.data;
-  const serverNames = new Map(targets.data?.map(({ serverId, serverName }) => [serverId, serverName]));
+  const serverNames = new Map(
+    targets.data?.map(({ serverId, serverName }) => [serverId, serverName]),
+  );
   const scope = readDeliveryScope(new URLSearchParams(search));
   const deliveryScope = {
     serviceId: value.serviceId,
@@ -321,11 +323,13 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
                 className="button secondary"
                 href={
                   canReuseCommand
-                    ? `#/operations/commands?reuse=${encodeURIComponent(id)}`
-                    : '#/operations/commands'
+                    ? `#/operations/tasks?reuse=${encodeURIComponent(id)}`
+                    : value.interactive
+                      ? '#/operations/commands'
+                      : '#/operations/tasks'
                 }
               >
-                {canReuseCommand ? '沿用目标和命令' : '查看临时命令'}
+                {canReuseCommand ? '沿用目标和命令' : '返回运维命令'}
               </a>
             )}
             {value.type === 'OPERATION_PLAN' && (
@@ -495,7 +499,8 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
           )}
         </Section>
       )}
-      {value.interactive && activeTask(value.status) &&
+      {value.interactive &&
+        activeTask(value.status) &&
         (user.role === 'ADMIN' || (user.role === 'OPERATOR' && value.createdBy === user.id)) && (
           <InteractiveCommandInput key={id} taskId={id} targets={targets.data ?? []} />
         )}
@@ -596,8 +601,10 @@ export function TaskPage({ id, user, search }: { id: string; user: User; search?
               ? value.pipelineGraph
                 ? renderTaskLog(logs.data.content, steps.data, selectedStepId, logMarker)
                 : value.interactive
-                  ? logs.data.content.replace(/\[([a-f0-9-]{36})\] /gi, (label, serverId: string) =>
-                      serverNames.has(serverId) ? `[${serverNames.get(serverId)}] ` : label,
+                  ? logs.data.content.replace(
+                      /\[([a-f0-9-]{36})\] /gi,
+                      (label, serverId: string) =>
+                        serverNames.has(serverId) ? `[${serverNames.get(serverId)}] ` : label,
                     )
                   : logs.data.content
               : activeTask(value.status)

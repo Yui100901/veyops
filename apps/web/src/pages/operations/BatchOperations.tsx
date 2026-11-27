@@ -43,6 +43,7 @@ import {
 import type { ExecutionOptions, TargetPreview, TargetSelection } from './BatchTargets';
 import { OperationSchedulesPage } from './OperationSchedules';
 import { TargetedOperationsAI } from './TargetedOperationsAI';
+import { TerminalCommands } from './TerminalCommands';
 
 interface CommandTemplate {
   id: string;
@@ -90,7 +91,7 @@ const planSteps = [
 ] as const;
 
 function hasTargets(selection: TargetSelection) {
-  return Object.values(selection).some((entries: string[]) => entries.length > 0);
+  return Boolean(selection.serverIds?.length || selection.groupIds?.length);
 }
 
 function operationParameters(form: FormData, definitions: OperationParameter[]) {
@@ -132,11 +133,13 @@ function ParameterField({ parameter }: { parameter: OperationParameter }) {
 }
 
 export function OperationsCenterPage({ tab, user }: { tab: OperationsTab; user: User }) {
+  const reuseId = new URLSearchParams(useRoute().split('?')[1]).get('reuse');
+  const activeTab = tab === 'commands' && reuseId ? 'tasks' : tab;
   return (
     <>
       <PageHeader
         title="运维命令"
-        description="选择服务器和执行范围，预览命令或方案，并在任务中心查看逐台执行结果。"
+        description="在终端执行命令，或提交脚本和运维方案到任务中心。"
         action={
           <a href="#/tasks" className="button secondary">
             查看执行记录
@@ -148,26 +151,27 @@ export function OperationsCenterPage({ tab, user }: { tab: OperationsTab; user: 
           <a
             key={key}
             href={`#/operations/${key}`}
-            className={key === tab ? 'active' : ''}
-            aria-current={key === tab ? 'page' : undefined}
+            className={key === activeTab ? 'active' : ''}
+            aria-current={key === activeTab ? 'page' : undefined}
           >
             {operationsTabs[key]}
           </a>
         ))}
       </nav>
-      {tab === 'commands' ? (
-        <CommandWorkspace user={user} />
-      ) : tab === 'schedules' ? (
+      {activeTab === 'commands' ? (
+        <TerminalCommands user={user} />
+      ) : activeTab === 'tasks' ? (
+        <CommandWorkspace user={user} reuseId={reuseId} />
+      ) : activeTab === 'schedules' ? (
         <OperationSchedulesPage user={user} />
       ) : (
-        <ReusableOperations key={tab} mode={tab} user={user} />
+        <ReusableOperations key={activeTab} mode={activeTab} user={user} />
       )}
     </>
   );
 }
 
-function CommandWorkspace({ user }: { user: User }) {
-  const reuseId = new URLSearchParams(useRoute().split('?')[1]).get('reuse');
+function CommandWorkspace({ user, reuseId }: { user: User; reuseId: string | null }) {
   const reusable = useResource<CommandReuse>(
     reuseId && user.role !== 'VIEWER'
       ? `/tasks/${encodeURIComponent(reuseId)}/command-reuse`
@@ -177,17 +181,23 @@ function CommandWorkspace({ user }: { user: User }) {
   return (
     <>
       <ErrorBanner error={reusable.error} retry={reusable.reload} />
-      <CommandsPage key={reuseId ?? 'new'} user={user} reuse={reusable.data ?? undefined} />
+      <CommandTaskPage key={reuseId ?? 'new'} user={user} reuse={reusable.data ?? undefined} />
     </>
   );
 }
 
-function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
-  const { selection, setSelection, projectId, environmentProjects } = useBatchSelection(
-    reuse?.selection,
+function CommandTaskPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
+  const source = reuse?.selection;
+  const previousSelector = Boolean(
+    source?.deploymentTargetIds?.length ||
+    source?.tags?.length ||
+    source?.projectIds?.length ||
+    source?.environmentIds?.length,
+  );
+  const { selection, setSelection } = useBatchSelection(
+    previousSelector ? { serverIds: reuse?.previousTargets.map(({ id }) => id) } : source,
   );
   const [command, setCommand] = useState(reuse?.command ?? '');
-  const [interactive, setInteractive] = useState(false);
   const [name, setName] = useState(reuse?.name ?? '');
   const [timeout, setTimeoutValue] = useState(reuse?.timeout ?? 300);
   const [options, setOptions] = useState<ExecutionOptions>(() =>
@@ -275,9 +285,8 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
         ...selection,
         ...options,
         maxParallel: options.strategy === 'SEQUENTIAL' ? 1 : options.maxParallel,
-        name: name.trim() || (interactive ? '交互命令' : '临时命令'),
-        command: interactive && !command.trim() ? '/bin/sh -i' : command,
-        ...(interactive && { interactive: true }),
+        name: name.trim() || '执行命令任务',
+        command,
         timeout,
         expectedTargetHash: preview.targetHash,
         confirmed: true,
@@ -300,7 +309,7 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
       <div hidden={Boolean(reference)}>
         <form className="command-layout" onSubmit={prepare}>
           <div>
-            <Section title="执行目标" subtitle="可组合多种条件，预览会合并重复的服务器。">
+            <Section title="执行目标" body="compact">
               <BatchTargetPicker
                 selection={selection}
                 onChange={setSelection}
@@ -310,12 +319,7 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
             <details className="command-advanced panel">
               <summary>并发、失败策略和超时</summary>
               <div className="form-body">
-                <BatchStrategy
-                  projectId={projectId}
-                  options={options}
-                  onChange={setOptions}
-                  disabled={!editing}
-                />
+                <BatchStrategy options={options} onChange={setOptions} disabled={!editing} />
                 <Field label="单目标超时（秒）">
                   <input
                     type="number"
@@ -331,8 +335,9 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
             </details>
           </div>
           <Section
-            title={interactive ? '一对多交互命令' : '临时命令'}
-            subtitle="以服务器配置的 SSH 用户身份执行"
+            title="执行任务"
+            subtitle="编写脚本，或选择命令模板与运维方案。"
+            className="operations-task-command"
             action={
               canEdit && (
                 <select
@@ -371,15 +376,6 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
               )
             }
           >
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={interactive}
-                disabled={!editing}
-                onChange={(event) => setInteractive(event.target.checked)}
-              />
-              启用交互模式
-            </label>
             <div className="command-editor">
               <textarea
                 aria-label="Shell 命令"
@@ -388,8 +384,9 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
                 disabled={!editing}
                 maxLength={65536}
                 spellCheck={false}
-                required={!interactive}
-                placeholder={interactive ? '留空会启动 /bin/sh -i' : 'uname -a && uptime'}
+                rows={4}
+                required
+                placeholder="uname -a && uptime"
               />
             </div>
             <div className="command-options">
@@ -407,7 +404,7 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
                   命令模板已保存
                 </p>
               )}
-              {canEdit && !interactive && !preview && command.trim() && (
+              {canEdit && !preview && command.trim() && (
                 <details>
                   <summary>保存为命令模板</summary>
                   <div className="row-actions">
@@ -432,7 +429,7 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
               <div className="row-actions">
                 <button
                   className="button primary"
-                  disabled={!editing || !hasTargets(selection) || (!interactive && !command.trim())}
+                  disabled={!editing || !hasTargets(selection) || !command.trim()}
                 >
                   <Play size={16} />
                   预览并执行
@@ -442,10 +439,7 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
           </Section>
         </form>
         {preview && (
-          <Section
-            title="确认执行目标"
-            subtitle={`将在 ${preview.count} 台服务器上${interactive ? '启动 SSH 交互会话' : '运行上方命令'}`}
-          >
+          <Section title="确认执行目标" subtitle={`将在 ${preview.count} 台服务器上运行上方命令`}>
             <div className="form-body">
               <ResolvedTargets preview={preview} />
               {(added.length > 0 ||
@@ -496,7 +490,6 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
             key={JSON.stringify(selection)}
             user={user}
             selection={selection}
-            projectId={projectId}
             disabled={!editing || !hasTargets(selection)}
           />
         )}
@@ -508,7 +501,6 @@ function CommandsPage({ user, reuse }: { user: User; reuse?: CommandReuse }) {
           entry={reference}
           canRun={canEdit}
           initialSelection={selection}
-          initialEnvironmentProjects={environmentProjects}
           initialOptions={options}
           onClose={() => setReference(undefined)}
         />
@@ -656,7 +648,6 @@ function OperationRun({
   entry,
   canRun,
   initialSelection = {},
-  initialEnvironmentProjects,
   initialOptions = defaultExecutionOptions,
   onClose,
 }: {
@@ -665,17 +656,13 @@ function OperationRun({
   canRun: boolean;
   user: User;
   initialSelection?: TargetSelection;
-  initialEnvironmentProjects?: Record<string, string>;
   initialOptions?: ExecutionOptions;
   onClose: () => void;
 }) {
   const base = `${endpoint}/${entry.id}`;
   const history = useResource<(PlanVersion | TemplateVersion)[]>(`${base}/versions`);
   const [versionNumber, setVersionNumber] = useState(entry.currentVersion);
-  const { selection, setSelection, projectId } = useBatchSelection(
-    initialSelection,
-    initialEnvironmentProjects,
-  );
+  const { selection, setSelection } = useBatchSelection(initialSelection);
   const [options, setOptions] = useState(initialOptions);
   const [review, setReview] = useState<{
     preview: TargetPreview;
@@ -783,7 +770,6 @@ function OperationRun({
                 />
                 <h3 className="field-title">执行策略</h3>
                 <BatchStrategy
-                  projectId={projectId}
                   options={options}
                   onChange={setOptions}
                   disabled={busy || Boolean(review)}

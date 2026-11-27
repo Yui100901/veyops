@@ -1,5 +1,6 @@
 export const operationsTabs = {
-  commands: '临时命令',
+  commands: '执行命令',
+  tasks: '执行任务',
   templates: '命令模板',
   plans: '运维方案',
   schedules: '定时运维',

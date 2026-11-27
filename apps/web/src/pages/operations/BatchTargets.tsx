@@ -1,9 +1,9 @@
 import { useExecutionDefaults } from '../projects/settings/useExecutionDefaults';
 import { useState } from 'react';
 import { Server as ServerIcon } from 'lucide-react';
-import { useResource } from '../../api';
-import { ErrorBanner, Field, Loading, Status } from '../../components';
-import type { Environment, ProjectDetail, Server, ServerGroup } from '../../models';
+import { Field, Status } from '../../components';
+import type { Server } from '../../models';
+export { BatchTargetPicker, useBatchTargetResources } from './CompactTargetPicker';
 
 export interface TargetSelection {
   serverIds?: string[];
@@ -14,30 +14,12 @@ export interface TargetSelection {
   environmentIds?: string[];
 }
 
-type EnvironmentProjects = Record<string, string>;
-
-// Keep ownership alongside the form selection. Only target IDs belong in execution requests.
-export function useBatchSelection(initial: TargetSelection = {}, owners: EnvironmentProjects = {}) {
-  const [selection, setTargets] = useState(initial);
-  const [environmentProjects, setOwners] = useState(owners);
-  function setSelection(targets: TargetSelection, additionalOwners?: EnvironmentProjects) {
-    if (additionalOwners) setOwners((previous) => ({ ...previous, ...additionalOwners }));
-    setTargets(targets);
-  }
-  const projects = [...new Set(selection.projectIds)];
-  const environments = [...new Set(selection.environmentIds)];
-  let projectId: string | undefined;
-  if (
-    !selection.serverIds?.length &&
-    !selection.groupIds?.length &&
-    !selection.tags?.length &&
-    !selection.deploymentTargetIds?.length
-  ) {
-    if (projects.length === 1 && !environments.length) projectId = projects[0];
-    if (!projects.length && environments.length === 1)
-      projectId = environmentProjects[environments[0]];
-  }
-  return { selection, setSelection, projectId, environmentProjects };
+export function useBatchSelection(initial: TargetSelection = {}) {
+  const [selection, setSelection] = useState<TargetSelection>(() => ({
+    serverIds: initial.serverIds ?? [],
+    groupIds: initial.groupIds ?? [],
+  }));
+  return { selection, setSelection };
 }
 
 export interface TargetPreview {
@@ -149,157 +131,6 @@ export function TargetOptions({
         <p className="field-note">暂无可选{label}</p>
       )}
     </details>
-  );
-}
-
-function EnvironmentTargetOptions({
-  projects,
-  selected,
-  onChange,
-  disabled,
-}: {
-  projects: NamedTarget[];
-  selected: string[];
-  onChange: (ids: string[], owners: EnvironmentProjects) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <details className="version-entry">
-      <summary>环境 · 已选 {selected.length}</summary>
-      {projects.length ? (
-        projects.map((project) => (
-          <ProjectEnvironmentOptions
-            key={project.id}
-            project={project}
-            selected={selected}
-            onChange={onChange}
-            disabled={disabled}
-          />
-        ))
-      ) : (
-        <p className="field-note">暂无可选项目环境</p>
-      )}
-    </details>
-  );
-}
-
-function ProjectEnvironmentOptions({
-  project,
-  selected,
-  onChange,
-  disabled,
-}: {
-  project: NamedTarget;
-  selected: string[];
-  onChange: (ids: string[], owners: EnvironmentProjects) => void;
-  disabled?: boolean;
-}) {
-  const [path, setPath] = useState<string | null>(null);
-  const detail = useResource<ProjectDetail>(path);
-  const environments: Environment[] = detail.data?.environments ?? [];
-  return (
-    <div>
-      <button
-        type="button"
-        className="text-button"
-        onClick={() => setPath(path ? null : `/projects/${project.id}`)}
-        aria-expanded={Boolean(path)}
-      >
-        {project.name}
-      </button>
-      {path &&
-        (detail.loading ? (
-          <Loading />
-        ) : detail.error ? (
-          <ErrorBanner error={detail.error} retry={detail.reload} />
-        ) : (
-          <TargetOptions
-            label="项目环境"
-            options={environments}
-            selected={selected.filter((id) => environments.some((item) => item.id === id))}
-            disabled={disabled}
-            onChange={(ids) =>
-              onChange(
-                [...selected.filter((id) => !environments.some((item) => item.id === id)), ...ids],
-                Object.fromEntries(ids.map((id) => [id, project.id])),
-              )
-            }
-          />
-        ))}
-    </div>
-  );
-}
-
-export function BatchTargetPicker({
-  selection,
-  onChange,
-  disabled,
-}: {
-  selection: TargetSelection;
-  onChange: (selection: TargetSelection, owners?: EnvironmentProjects) => void;
-  disabled?: boolean;
-}) {
-  const servers = useResource<Server[]>('/servers');
-  const groups = useResource<ServerGroup[]>('/server-groups');
-  const legacyTargetIds = selection.deploymentTargetIds ?? [];
-  const deployments = useResource<NamedTarget[]>(
-    legacyTargetIds.length ? '/deployment-targets' : null,
-  );
-  const projects = useResource<NamedTarget[]>('/projects');
-  const tagOptions = [...new Set(servers.data?.flatMap((server) => server.tags))].sort();
-  const optionSets = [
-    { key: 'groupIds', label: '服务器分组', options: groups.data ?? [] },
-    {
-      key: 'tags',
-      label: '服务器标签',
-      options: tagOptions.map((tag) => ({ id: tag, name: tag })),
-    },
-    { key: 'projectIds', label: '项目', options: projects.data ?? [] },
-  ] as const;
-  return (
-    <>
-      <ErrorBanner error={servers.error || groups.error || projects.error} />
-      {servers.loading ? (
-        <Loading />
-      ) : (
-        <ServerPicker
-          servers={servers.data ?? []}
-          selected={selection.serverIds ?? []}
-          disabled={disabled}
-          setSelected={(serverIds) => onChange({ ...selection, serverIds })}
-        />
-      )}
-      <div className="batch-selector-options">
-        {optionSets.map(({ key, label, options }) => (
-          <TargetOptions
-            key={key}
-            label={label}
-            options={options}
-            selected={selection[key] ?? []}
-            disabled={disabled}
-            onChange={(ids) => onChange({ ...selection, [key]: ids })}
-          />
-        ))}
-        {legacyTargetIds.length > 0 && (
-          <TargetOptions
-            label="历史选择"
-            options={legacyTargetIds.map((id) => ({
-              id,
-              name: deployments.data?.find((item) => item.id === id)?.name ?? id,
-            }))}
-            selected={legacyTargetIds}
-            disabled={disabled}
-            onChange={(deploymentTargetIds) => onChange({ ...selection, deploymentTargetIds })}
-          />
-        )}
-        <EnvironmentTargetOptions
-          projects={projects.data ?? []}
-          selected={selection.environmentIds ?? []}
-          disabled={disabled}
-          onChange={(environmentIds, owners) => onChange({ ...selection, environmentIds }, owners)}
-        />
-      </div>
-    </>
   );
 }
 

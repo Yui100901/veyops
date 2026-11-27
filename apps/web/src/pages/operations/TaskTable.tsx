@@ -5,7 +5,7 @@ import type { Task } from '../../models';
 import { executionFlowTaskPath } from '../execution-graph/graph-workbench-context';
 
 const taskTypeNames: Record<string, string> = {
-  COMMAND: '临时命令',
+  COMMAND: '命令任务',
   OPERATION_PLAN: '运维方案',
   PIPELINE: '构建与部署',
   GRAPH_CHECKOUT: '执行图源码拉取',
@@ -13,6 +13,7 @@ const taskTypeNames: Record<string, string> = {
 };
 
 export function taskTypeLabel(task: Task) {
+  if (task.type === 'COMMAND' && task.interactive) return '交互命令';
   if (task.executionMode === 'DEPLOY_ARTIFACT') return '产物部署';
   if (task.type !== 'PIPELINE') return taskTypeNames[task.type] ?? task.type;
   if (task.deliveryStage === 'BUILD' && task.deployAfterBuild) return '构建阶段';
