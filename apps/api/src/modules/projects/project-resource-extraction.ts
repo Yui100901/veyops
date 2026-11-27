@@ -313,6 +313,9 @@ function simplifiedNodeReferences(source: ReferenceSource, node: GraphNode) {
       ? []
       : [
           ...referenceRows(field('start.execution.serverId'), 'SERVER', execution?.serverId),
+          ...(execution?.serverIds ?? []).flatMap((id) =>
+            referenceRows(field('start.execution.serverId'), 'SERVER', id),
+          ),
           ...referenceRows(field('start.execution.groupId'), 'SERVER_GROUP', execution?.groupId),
         ]),
     ...referenceRows(field('start.environmentSetId'), 'ENVIRONMENT_SET', config?.environmentSetId),

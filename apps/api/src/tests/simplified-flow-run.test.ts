@@ -5,6 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { ConflictException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
@@ -28,6 +29,8 @@ test('SQLite FLOW_V2 pins the server, rejects split releases, and plans both Com
   const { RepositoryMetadataService } =
     await import('../modules/projects/repository-metadata.service.js');
   const { PipelinesService } = await import('../modules/pipelines/pipelines.service.js');
+  const { SimplifiedFlowRunService } =
+    await import('../modules/execution-graphs/simplified-flow-run.service.js');
   const app = (
     await Test.createTestingModule({ imports: [AppModule] }).compile()
   ).createNestApplication<NestExpressApplication>({ logger: false });
@@ -199,6 +202,110 @@ test('SQLite FLOW_V2 pins the server, rejects split releases, and plans both Com
     await api
       .post(root + endpoint + '/preview')
       .send(args)
+      .expect(400);
+
+    delete canvas.nodes[0]!.start!.execution;
+    const runtimeDraft = (
+      await api
+        .put(root + graph + '/draft')
+        .send({
+          expectedRevision: saved.revision,
+          definition: { canvas },
+        })
+        .expect(200)
+    ).body.data;
+    const runtimeRelease = await post(graph + '/publish', {
+      expectedRevision: runtimeDraft.revision,
+    });
+    const runtimeVersion = runtimeRelease.publishedVersion;
+    const defaults = await post(endpoint + '/run-defaults', {
+      version: runtimeVersion,
+      idempotencyKey: randomUUID(),
+    });
+    assert.equal(defaults.outcome, 'NEEDS_CONFIRMATION');
+    const parameters = { version: runtimeVersion, inputs: { serverIds: [b, a] } };
+    const batch = await post(endpoint + '/preview-targets', parameters);
+    assert.deepEqual(
+      batch.targets.map(
+        ({
+          serverId,
+          preview,
+        }: {
+          serverId: string;
+          preview: { simplified: { serverId: string; release: { serverIds: string[] } } };
+        }) => [serverId, preview.simplified.serverId, preview.simplified.release.serverIds],
+      ),
+      [a, b].sort().map((id) => [id, id, [id]]),
+    );
+    const startBatch = {
+      ...parameters,
+      expectedConfigurationHash: batch.configurationHash,
+      idempotencyKey: randomUUID(),
+    };
+    const planner = app.get(SimplifiedFlowRunService);
+    const confirm = planner.confirm.bind(planner);
+    const failed = t.mock.method(
+      planner,
+      'confirm',
+      async (...params: Parameters<typeof confirm>) => {
+        const placement = params[1].placement;
+        if (placement.location === 'TARGET' && placement.target.id === [a, b].sort().at(-1))
+          throw new ConflictException('测试目标已变化');
+        return confirm(...params);
+      },
+    );
+    await api
+      .post(root + endpoint + '/run-targets')
+      .send(startBatch)
+      .expect(409);
+    const queued = () =>
+      db
+        .selectFrom('execution_flow_runs')
+        .select(['id', 'execution_server_id'])
+        .where('project_id', '=', project.id)
+        .where('version', '=', runtimeVersion)
+        .execute();
+    assert.deepEqual(await queued(), []);
+    failed.mock.restore();
+
+    const started = await post(endpoint + '/run-targets', startBatch);
+    assert.deepEqual(await post(endpoint + '/run-targets', startBatch), started);
+    assert.deepEqual(
+      (await queued()).map((row) => [row.execution_server_id, row.id]).sort(),
+      started.runs.map(({ serverId, runId }: { serverId: string; runId: string }) => [
+        serverId,
+        runId,
+      ]),
+    );
+    await api
+      .post(root + endpoint + '/run-targets')
+      .send({ ...startBatch, inputs: { serverIds: [a] } })
+      .expect(409);
+
+    canvas.nodes[0]!.start!.execution = { serverIds: [a, b] };
+    const fixedDraft = await api
+      .put(root + graph + '/draft')
+      .send({
+        expectedRevision: runtimeDraft.revision,
+        definition: { canvas },
+      })
+      .expect(200);
+    const fixedRelease = await post(graph + '/publish', {
+      expectedRevision: fixedDraft.body.data.revision,
+    });
+    const fixedArgs = { version: fixedRelease.publishedVersion };
+    const fixedBatch = await post(endpoint + '/preview-targets', fixedArgs);
+    assert.deepEqual(
+      fixedBatch.targets.map(({ serverId }: { serverId: string }) => serverId),
+      [a, b].sort(),
+    );
+    await api
+      .post(root + endpoint + '/preview-targets')
+      .send({ ...fixedArgs, inputs: { serverIds: [a] } })
+      .expect(400);
+    await api
+      .post(root + endpoint + '/preview')
+      .send({ ...fixedArgs, inputs: { serverIds: [a] } })
       .expect(400);
   } finally {
     await app.close();

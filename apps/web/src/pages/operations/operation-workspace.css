@@ -91,5 +91,16 @@
 }
 
 .operations-task-command .command-options {
+  display: grid;
+  gap: 12px;
   padding: 14px 16px;
+}
+
+.task-plan-fields {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
 }

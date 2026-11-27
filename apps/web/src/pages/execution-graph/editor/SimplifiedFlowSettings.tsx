@@ -1,8 +1,13 @@
 import { Plus, Trash2 } from 'lucide-react';
 import { useId, useState } from 'react';
 import { useResource } from '../../../api';
-import { ErrorBanner, Field } from '../../../components';
-import type { ProjectDetail, ProjectExecutionSettings, Server } from '../../../models';
+import { Field } from '../../../components';
+import type { ProjectDetail, ProjectExecutionSettings } from '../../../models';
+import {
+  BatchTargetPicker,
+  resolveSelectedServerIds,
+  useBatchTargetResources,
+} from '../../operations/CompactTargetPicker';
 import { effectiveNodeType, graphKey, isReleaseNode } from '../execution-graph-definition';
 import type { GraphField, GraphNode } from '../execution-graph-definition';
 import {
@@ -112,7 +117,8 @@ export function SimplifiedStartSettings({
   const start = node.start ?? {};
   const patchStart = (next: Partial<SimplifiedStart>) => patch({ start: { ...start, ...next } });
   const sources = start.sources ?? [];
-  const serverId = start.execution?.serverId;
+  const fixedExecution =
+    start.execution?.serverIds !== undefined || Boolean(start.execution?.serverId);
   const legacyExecution = !canEdit
     ? (start.execution as { location?: string; groupId?: string } | undefined)
     : undefined;
@@ -141,7 +147,7 @@ export function SimplifiedStartSettings({
   const composeRelease = releaseAction?.deploy?.method === 'COMPOSE';
   const images = flowNodes.find(({ type }) => type === 'END')?.finish?.images ?? [];
   const historical = artifactMode !== 'CURRENT';
-  const servers = useResource<Server[]>('/servers');
+  const targets = useBatchTargetResources(fixedExecution);
   const runtime = useResource<ProjectExecutionSettings>(
     producesFiles ? '/projects/' + project.id + '/execution-settings' : null,
   );
@@ -200,41 +206,35 @@ export function SimplifiedStartSettings({
   return (
     <>
       <div className="graph-fields" data-graph-node-field="start.execution">
-        <Field
-          label="执行服务器"
-          hint={releaseAction ? '这条执行流的所有操作都使用此服务器。' : undefined}
-        >
+        <Field label="执行服务器" hint="可以选择多台。每台服务器各自运行一次完整执行流。">
           <select
             data-graph-node-field="start.execution.serverId"
-            value={serverId ?? ''}
+            value={fixedExecution ? 'FIXED' : 'RUNTIME'}
             disabled={!canEdit}
             onChange={(event) =>
               patchStart({
-                execution: event.target.value ? { serverId: event.target.value } : undefined,
+                execution: event.target.value === 'FIXED' ? { serverIds: [] } : undefined,
               })
             }
           >
-            <option value="">
-              {legacyExecution?.location === 'MANAGER'
-                ? '旧版管理端执行'
-                : legacyExecution?.groupId
-                  ? '旧版服务器分组'
-                  : '选择一台服务器'}
-            </option>
-            {serverId && !servers.data?.some(({ id }) => id === serverId) && (
-              <option value={serverId} disabled>
-                服务器 {serverId}
-              </option>
-            )}
-            {servers.data?.map(({ id, name, host, port }) => (
-              <option key={id} value={id}>
-                {name} · {host}
-                {port !== 22 ? ':' + port : ''}
-              </option>
-            ))}
+            <option value="RUNTIME">运行时选择</option>
+            <option value="FIXED">固定服务器</option>
           </select>
         </Field>
-        <ErrorBanner error={servers.error} retry={servers.reload} />
+        {fixedExecution && (
+          <BatchTargetPicker
+            resources={targets}
+            selection={selectedTargets ?? {}}
+            disabled={!canEdit}
+            onChange={(selection) =>
+              patchStart({
+                execution: {
+                  serverIds: [...resolveSelectedServerIds(selection, targets.groups.data ?? [])],
+                },
+              })
+            }
+          />
+        )}
         {producesFiles && legacyExecution?.location !== 'MANAGER' && (
           <p className="field-note graph-workspace-path">
             工作区 · <code>{projectWorkspace}/&lt;执行 ID&gt;</code>

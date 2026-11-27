@@ -50,6 +50,16 @@ export class SimplifiedSource {
 
 export class SimplifiedExecution {
   @ValidateIf((_o, v) => v !== undefined) @IsUUID() serverId?: string;
+  @ValidateIf((_o, v) => v !== undefined)
+  @IsArray()
+  @ArrayMaxSize(100)
+  @ArrayUnique()
+  @IsUUID(undefined, { each: true })
+  serverIds?: string[];
+}
+
+export function fixedFlowServerIds(execution?: SimplifiedExecution) {
+  return execution?.serverIds ?? (execution?.serverId ? [execution.serverId] : []);
 }
 
 export type HistoricalSimplifiedExecution = SimplifiedExecution & {
@@ -524,8 +534,10 @@ export function validateSimplifiedFlow(flow: GraphFlow, ordered: GraphNode[]) {
         report('start.release.imageIds', '文件发布无需选择本次镜像');
     }
   }
-  if (!config.execution?.serverId)
-    report('start.execution.serverId', '请选择此执行流唯一的执行服务器');
+  if (config.execution?.serverId && config.execution.serverIds)
+    report('start.execution.serverId', '请使用一组固定执行服务器');
+  if (config.execution?.serverIds?.length === 0)
+    report('start.execution.serverId', '请至少选择一台固定执行服务器');
   if (activeFinish.requireRelease && !deploys.length)
     nodeIssue(finish, 'finish.requireRelease', '核对发布结果需要受管发布动作', flow.id);
 

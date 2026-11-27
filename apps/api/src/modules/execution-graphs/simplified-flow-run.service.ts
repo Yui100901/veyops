@@ -71,6 +71,7 @@ import {
   type GraphGateScope,
 } from './graph-release-gates';
 import {
+  fixedFlowServerIds,
   simplifiedEffectiveFinish,
   simplifiedComposeImageVariable,
   simplifiedImageName,
@@ -219,6 +220,7 @@ export class SimplifiedFlowRunService {
     input: GraphInputsDto,
     trigger?: Record<string, unknown>,
     automation?: GraphAutomation,
+    batchServerId?: string,
   ) {
     const start = flow.nodes.find(({ type }) => type === 'START')!;
     const {
@@ -255,6 +257,41 @@ export class SimplifiedFlowRunService {
         nodeName: start.name,
         flowId: flow.id,
       });
+    const hasWorkspaceActions = simplifiedUsesWorkspace(flow.nodes);
+    const previousTargets = legacyRelease?.targets;
+    const previousServerId =
+      previousTargets?.serverIds?.length === 1 && !previousTargets.groupIds?.length
+        ? previousTargets.serverIds[0]
+        : undefined;
+    const fixed = [...fixedFlowServerIds(execution)];
+    if (!fixed.length && !hasWorkspaceActions && previousServerId) fixed.push(previousServerId);
+    const selected = batchServerId ? [batchServerId] : input.serverIds;
+    const serverId = selected?.[0] ?? (fixed.length === 1 ? fixed[0] : undefined);
+    if (
+      legacyExecution?.location === 'MANAGER' ||
+      legacyExecution?.groupId ||
+      (previousTargets && previousServerId !== serverId)
+    ) {
+      throw issue(
+        'BUILD_TARGET',
+        'start.execution.serverId',
+        '请选择唯一的执行服务器并重新发布执行流。跨服务器交付请拆成两条依赖链。',
+      );
+    }
+    if (automation && fixed.length !== 1)
+      throw issue('BUILD_TARGET', 'start.execution.serverId', '自动触发需要固定一台执行服务器');
+    if (
+      !serverId ||
+      (fixed.length > 1 && !batchServerId) ||
+      (selected && selected.length !== 1) ||
+      (fixed.length > 0 && !fixed.includes(serverId))
+    )
+      throw issue(
+        'BUILD_TARGET',
+        'start.execution.serverId',
+        fixed.length > 1 ? '请按服务器预览已配置的执行目标' : '请从可用的执行服务器中选择本次目标',
+      );
+    const buildSelection = directDeploymentSelection({ serverIds: [serverId] }, 1)!;
     const requiresArtifact = release?.artifactSource === 'RUN_PARAMETER';
     const allowed = new Set([
       ...variables
@@ -275,7 +312,8 @@ export class SimplifiedFlowRunService {
     if (
       Object.keys(overrides).some((key) => !allowed.has(key)) ||
       Object.entries(input).some(
-        ([key, value]) => value !== undefined && !['value', 'parameters'].includes(key),
+        ([key, value]) =>
+          value !== undefined && !['value', 'parameters', 'serverIds'].includes(key),
       )
     )
       throw issue('CONFIGURATION', 'start', '请使用开始节点允许临时覆盖的运行参数');
@@ -391,26 +429,6 @@ export class SimplifiedFlowRunService {
       .where('id', '=', projectId)
       .where('deleted_at', 'is', null)
       .executeTakeFirstOrThrow();
-    const hasWorkspaceActions = simplifiedUsesWorkspace(flow.nodes);
-    const previousTargets = legacyRelease?.targets;
-    const previousServerId =
-      previousTargets?.serverIds?.length === 1 && !previousTargets.groupIds?.length
-        ? previousTargets.serverIds[0]
-        : undefined;
-    const serverId = execution?.serverId ?? (!hasWorkspaceActions ? previousServerId : undefined);
-    if (
-      !serverId ||
-      legacyExecution?.location === 'MANAGER' ||
-      legacyExecution?.groupId ||
-      (previousTargets && previousServerId !== serverId)
-    ) {
-      throw issue(
-        'BUILD_TARGET',
-        'start.execution.serverId',
-        '请选择唯一的执行服务器并重新发布执行流。跨服务器交付请拆成两条依赖链。',
-      );
-    }
-    const buildSelection = directDeploymentSelection({ serverIds: [serverId] }, 1)!;
     let placement: FlowWorkspacePlacement;
     try {
       const ids = await selectedServerIds(this.database.db, buildSelection);

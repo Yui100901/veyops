@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Play } from 'lucide-react';
-import { ApiError, message, post, useResource, type ExecutionPlanIssue } from '../../../api';
+import { ApiError, message, post, type ExecutionPlanIssue } from '../../../api';
 import { ErrorBanner, Field } from '../../../components';
-import type { ProjectDetail, Server } from '../../../models';
+import type { ProjectDetail } from '../../../models';
+import {
+  BatchTargetPicker,
+  resolveSelectedServerIds,
+  useBatchTargetResources,
+} from '../../operations/CompactTargetPicker';
 import {
   GraphFieldValue,
   useProjectEnvironmentSets,
@@ -35,7 +40,12 @@ import {
 
 export { ExecutionGraphHistory } from './ExecutionGraphHistory';
 
-type Inputs = { parameters: Record<string, unknown>; value?: string };
+type Inputs = { parameters: Record<string, unknown>; value?: string; serverIds?: string[] };
+type TargetBatchPreview = {
+  configurationHash: string;
+  targets: { serverId: string; preview: Preview }[];
+};
+type TargetBatchRun = { runId: string; serverId: string };
 type ParameterEdits = Record<string, { schema: string; value: unknown }>;
 export type GraphRunDrafts = Map<string, ParameterEdits>;
 
@@ -130,8 +140,12 @@ export function ExecutionGraphStart({
   const fields = simplifiedRuntimeInputs(flow);
   const workspaceField = fields.find(({ id }) => id === simplifiedWorkspaceArtifactField);
   const entryFields = fields.filter(({ id }) => id !== simplifiedWorkspaceArtifactField);
-  const serverId = start?.execution?.serverId;
-  const servers = useResource<Server[]>(workspaceField && serverId ? '/servers' : null);
+  const fixedTargets = simplifiedTarget(start);
+  const targets = useBatchTargetResources();
+  const [runServerIds, setRunServerIds] = useState<string[]>([]);
+  const targetIds = fixedTargets?.serverIds ?? runServerIds;
+  const targetName = (id: string) =>
+    targets.servers.data?.find((server) => server.id === id)?.name ?? id;
   const runtimePresets = Object.fromEntries(
     fields.flatMap(({ id }) =>
       initialInputs && Object.hasOwn(initialInputs, id) ? [[id, initialInputs[id]]] : [],
@@ -171,10 +185,16 @@ export function ExecutionGraphStart({
   const fieldRefs = useRef(new Map<string, HTMLElement>());
   const scope: FieldScope = {
     serviceId: start?.release?.serviceId,
-    targets: simplifiedTarget(start),
+    targets: targetIds.length ? { serverIds: targetIds } : undefined,
     deliveryMethod: flow.nodes.find(isReleaseNode)?.deploy?.method,
   };
-  const [preview, setPreview] = useState<Preview>();
+  const [singlePreview, setPreview] = useState<Preview>();
+  const [batchPreview, setBatchPreview] = useState<TargetBatchPreview>();
+  const [previewServer, setPreviewServer] = useState('');
+  const [batchRuns, setBatchRuns] = useState<TargetBatchRun[]>();
+  const preview =
+    batchPreview?.targets.find(({ serverId }) => serverId === previewServer)?.preview ??
+    singlePreview;
   const [revision, setRevision] = useState<{ previous: Preview; sections: string[] }>();
   const key = useRef('');
   const defaultsKey = useRef<{ version: number; value: string } | undefined>(undefined);
@@ -193,6 +213,7 @@ export function ExecutionGraphStart({
     if (!focusFieldId) return;
     if (focusFieldId === simplifiedWorkspaceArtifactField) setWorkspaceMode('HISTORICAL');
     setPreview(undefined);
+    setBatchPreview(undefined);
     setRevision(undefined);
     const frame = window.requestAnimationFrame(() =>
       focusRunField(fieldRefs.current.get(focusFieldId)),
@@ -201,6 +222,7 @@ export function ExecutionGraphStart({
   }, [focusFieldId]);
   const base = path + '/flows/' + encodeURIComponent(flow.id);
   const useDefaults =
+    fixedTargets?.serverIds.length === 1 &&
     !historicalWorkspace &&
     !start?.release?.useUpstreamArtifact &&
     start?.release?.artifactSource !== 'RUN_PARAMETER' &&
@@ -253,12 +275,27 @@ export function ExecutionGraphStart({
     setPlanIssue(undefined);
     try {
       if (!preview) {
-        const checked = await post<Preview>(base + '/preview', {
+        if (targetIds.length > 1) {
+          const checked = await post<TargetBatchPreview>(base + '/preview-targets', {
+            version,
+            inputs: runtimeInputs(),
+          });
+          setPreviewServer(checked.targets[0]!.serverId);
+          setBatchPreview(checked);
+        } else {
+          setPreview(await post<Preview>(base + '/preview', { version, inputs: runtimeInputs() }));
+        }
+        key.current = graphKey('run');
+      } else if (batchPreview) {
+        const { runs } = await post<{ runs: TargetBatchRun[] }>(base + '/run-targets', {
           version,
           inputs: runtimeInputs(),
+          expectedConfigurationHash: batchPreview.configurationHash,
+          idempotencyKey: key.current,
         });
-        key.current = graphKey('run');
-        setPreview(checked);
+        drafts?.delete(draftKey);
+        setBatchRuns(runs);
+        setBatchPreview(undefined);
       } else {
         const run = await post<GraphRun>(base + '/run', {
           version,
@@ -275,12 +312,14 @@ export function ExecutionGraphStart({
       if (apiError?.planIssue) {
         setPlanIssue(apiError.planIssue);
         setPreview(undefined);
+        setBatchPreview(undefined);
         setRevision(undefined);
       } else {
         setError(message(err));
         if (preview && apiError && [400, 409].includes(apiError.status)) {
           setRevision({ previous: preview, sections: apiError.changes });
           setPreview(undefined);
+          setBatchPreview(undefined);
         }
       }
     } finally {
@@ -292,6 +331,7 @@ export function ExecutionGraphStart({
     const condition = parameters[simplifiedConditionField];
     return {
       value: typeof condition === 'string' && condition !== '' ? condition : undefined,
+      serverIds: fixedTargets ? undefined : runServerIds,
       parameters: Object.fromEntries(
         fields.flatMap((field) => {
           const edit = edits[field.id];
@@ -320,10 +360,36 @@ export function ExecutionGraphStart({
   }
   function openParameter(fieldId: string) {
     setPreview(undefined);
+    setBatchPreview(undefined);
     setRevision(undefined);
     if (fieldId === simplifiedWorkspaceArtifactField) setWorkspaceMode('HISTORICAL');
     window.requestAnimationFrame(() => focusRunField(fieldRefs.current.get(fieldId)));
   }
+  if (batchRuns)
+    return (
+      <section className="graph-fields">
+        <h3>已为 {batchRuns.length} 台服务器创建运行记录</h3>
+        <div className="heading-actions">
+          {batchRuns.map(({ runId, serverId }) => (
+            <button
+              key={runId}
+              type="button"
+              className="button secondary"
+              onClick={() => onRun(runId)}
+            >
+              查看 {targetName(serverId)}
+            </button>
+          ))}
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => setBatchRuns(undefined)}
+          >
+            返回运行参数
+          </button>
+        </div>
+      </section>
+    );
   return (
     <form
       className="graph-run-form"
@@ -352,15 +418,27 @@ export function ExecutionGraphStart({
         disabled={busy || Boolean(preview || revision)}
         hidden={Boolean(preview || revision)}
       >
+        <div className="graph-fields">
+          <strong>执行服务器</strong>
+          {fixedTargets ? (
+            <p className="field-note">{targetIds.map(targetName).join('、')}</p>
+          ) : (
+            <BatchTargetPicker
+              resources={targets}
+              selection={{ serverIds: runServerIds }}
+              onChange={(selection) => {
+                setRunServerIds([
+                  ...resolveSelectedServerIds(selection, targets.groups.data ?? []),
+                ]);
+                setPlanIssue(undefined);
+                setError('');
+              }}
+            />
+          )}
+          {targetIds.length > 1 && <p className="field-note">每台服务器各运行一次完整执行流。</p>}
+        </div>
         {workspaceField && (
           <div className="workspace-history-setup">
-            <div className="workspace-history-heading">
-              <strong>执行服务器</strong>
-              <span className="field-note">
-                {servers.data?.find(({ id }) => id === serverId)?.name ??
-                  (serverId ? '目标端' : '尚未配置')}
-              </span>
-            </div>
             {!workspaceField.required && (
               <Field label="工作区来源">
                 <select
@@ -454,6 +532,20 @@ export function ExecutionGraphStart({
           <strong>
             {flow.name} · v{preview.version}
           </strong>
+          {batchPreview && (
+            <Field label="核对各服务器的执行计划">
+              <select
+                value={previewServer}
+                onChange={(event) => setPreviewServer(event.target.value)}
+              >
+                {batchPreview.targets.map(({ serverId }) => (
+                  <option key={serverId} value={serverId}>
+                    {targetName(serverId)}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
           <ul className="graph-edge-list">
             {preview.nodes.map((node) => (
               <li key={node.nodeId}>
@@ -557,6 +649,7 @@ export function ExecutionGraphStart({
             disabled={busy}
             onClick={() => {
               setPreview(undefined);
+              setBatchPreview(undefined);
               setRevision(undefined);
               setError('');
               setPlanIssue(undefined);
@@ -580,12 +673,21 @@ export function ExecutionGraphStart({
           className={`button ${useDefaults ? 'secondary' : 'primary'}`}
           disabled={
             busy ||
+            !targetIds.length ||
             (!preview && historicalWorkspace && !parameters[simplifiedWorkspaceArtifactField]) ||
             Boolean(start?.release?.useUpstreamArtifact && !start.release.allowArtifactOverride)
           }
         >
           <Play size={15} />
-          {busy ? '处理中…' : preview ? '确认启动' : revision ? '重新预览' : '预览运行'}
+          {busy
+            ? '处理中…'
+            : batchPreview
+              ? `确认启动 ${batchPreview.targets.length} 台服务器`
+              : preview
+                ? '确认启动'
+                : revision
+                  ? '重新预览'
+                  : '预览运行'}
         </button>
       </div>
     </form>

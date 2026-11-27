@@ -18,6 +18,7 @@ import { GraphCompileError, type GraphDiagnostic } from './graph-fields';
 import { expandGraphTemplate, type ExpandGraphTemplateDto } from './graph-flow-templates';
 import { GraphTriggersService } from './graph-triggers.service';
 import {
+  fixedFlowServerIds,
   type HistoricalSimplifiedExecution,
   type HistoricalSimplifiedRelease,
   validateSimplifiedSourceDirectories,
@@ -157,19 +158,19 @@ export class ExecutionGraphsService {
     const simplifiedFlows = definition.flows.filter(({ model }) => model === 'FLOW_V2');
     for (const flow of simplifiedFlows) {
       const start = flow.nodes.find(({ type }) => type === 'START')!;
-      const serverId = start.start?.execution?.serverId;
-      const ready =
-        serverId &&
-        (await tx
-          .selectFrom('servers as server')
-          .innerJoin('credentials as ssh', 'ssh.id', 'server.credential_id')
-          .select('server.host_key_fingerprint as fingerprint')
-          .where('server.id', '=', serverId)
-          .where('server.is_active', '=', 1)
-          .where('ssh.status', '=', 'ACTIVE')
-          .where('ssh.type', 'in', ['SSH_PASSWORD', 'SSH_KEY'])
-          .executeTakeFirst());
-      if (!ready || !ready.fingerprint)
+      const serverIds = fixedFlowServerIds(start.start?.execution);
+      if (!serverIds.length) continue;
+      const ready = await tx
+        .selectFrom('servers as server')
+        .innerJoin('credentials as ssh', 'ssh.id', 'server.credential_id')
+        .select('server.host_key_fingerprint as fingerprint')
+        .where('server.id', 'in', serverIds)
+        .where('server.is_active', '=', 1)
+        .where('server.host_key_fingerprint', 'is not', null)
+        .where('ssh.status', '=', 'ACTIVE')
+        .where('ssh.type', 'in', ['SSH_PASSWORD', 'SSH_KEY'])
+        .execute();
+      if (ready.length !== serverIds.length || ready.some(({ fingerprint }) => !fingerprint))
         throw new GraphCompileError({
           flowId: flow.id,
           nodeId: start.id,

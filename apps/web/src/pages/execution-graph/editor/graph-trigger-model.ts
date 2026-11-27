@@ -139,6 +139,7 @@ export interface TriggerFlow {
   sources?: SimplifiedSource[];
   useUpstreamArtifact?: boolean;
   requiresHistoryDirectory?: boolean;
+  fixedExecutionServerCount?: number;
   requiredArtifact?: {
     field: GraphField;
     serviceId?: string;
@@ -182,6 +183,7 @@ export function triggerFlows(definition: GraphDocument['draft']): TriggerFlow[] 
         ...(model === simplifiedModel && {
           sources: start?.start?.sources ?? [],
           useUpstreamArtifact: start?.start?.release?.useUpstreamArtifact,
+          fixedExecutionServerCount: simplifiedTarget(start?.start)?.serverIds.length ?? 0,
           requiredArtifact: requiredArtifact(start, nodes),
           requiresHistoryDirectory: simplifiedWorkspaceInput({ id, name, model, nodes, edges: [] })
             ?.required,
@@ -205,6 +207,7 @@ export function triggerFlows(definition: GraphDocument['draft']): TriggerFlow[] 
         ...(model === simplifiedModel && {
           sources: start.start?.sources ?? [],
           useUpstreamArtifact: start.start?.release?.useUpstreamArtifact,
+          fixedExecutionServerCount: simplifiedTarget(start.start)?.serverIds.length ?? 0,
           requiredArtifact: requiredArtifact(start, flowNodes),
           requiresHistoryDirectory: simplifiedWorkspaceInput({
             id: start.id,

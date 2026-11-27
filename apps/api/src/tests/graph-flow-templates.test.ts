@@ -302,12 +302,11 @@ async function checkTemplates(databaseUrl?: string) {
     const buildOnlyId = ready.endpoints[1]!.startId;
     const withoutTarget = structuredClone(ready);
     delete withoutTarget.nodes.find(({ id }) => id === buildOnlyId)!.start!.execution;
-    const missingTargetCheck = await api
+    const runtimeTargetCheck = await api
       .post(`${path}/validate`)
       .send({ definition: { canvas: withoutTarget } })
       .expect(201);
-    assert.equal(missingTargetCheck.body.data.issues[0].flowId, buildOnlyId);
-    assert.equal(missingTargetCheck.body.data.issues[0].fieldId, 'start.execution.serverId');
+    assert.deepEqual(runtimeTargetCheck.body.data.issues, []);
     assert.equal(
       (await save(withoutTarget, saved.revision).expect(200)).body.data.draft.canvas.nodes.find(
         ({ id }: { id: string }) => id === buildOnlyId,

@@ -9,6 +9,7 @@ import {
 import {
   producesWorkspace,
   simplifiedSourceDirectory,
+  simplifiedTarget,
   type SimplifiedRelease,
   type SimplifiedStart,
 } from '../simplified-flow';
@@ -90,12 +91,18 @@ export function SimplifiedEntryCopy({
         Boolean(draft.sources?.some(({ repositoryId }) => repositoryId)),
         { sources: start.sources, dotenv: start.dotenv },
       );
-    if (start.execution?.serverId)
+    const targets = simplifiedTarget(start);
+    const draftTargets = simplifiedTarget(draft);
+    if (targets)
       add(
         'execution',
         '执行服务器',
-        Boolean(draft.execution?.serverId && draft.execution.serverId !== start.execution.serverId),
-        { execution: { serverId: start.execution.serverId } },
+        Boolean(
+          draftTargets &&
+          (draftTargets.serverIds.length !== targets.serverIds.length ||
+            draftTargets.serverIds.some((id) => !targets.serverIds.includes(id))),
+        ),
+        { execution: targets },
       );
     if (start.environmentSetId)
       add('environmentSet', '项目变量集合', Boolean(draft.environmentSetId), {

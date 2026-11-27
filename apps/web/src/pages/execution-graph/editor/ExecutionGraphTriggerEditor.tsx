@@ -112,6 +112,14 @@ export function ExecutionGraphTriggerEditor({
 
   async function act(action: 'check' | 'save' | 'enable') {
     if (busy || !valid) return;
+    if (
+      start?.fixedExecutionServerCount !== undefined &&
+      start.fixedExecutionServerCount !== 1 &&
+      (action !== 'save' || rule?.enabled)
+    ) {
+      setError('请先在开始节点配置一台固定的执行服务器，再启用自动触发。');
+      return;
+    }
     if (start?.requiresHistoryDirectory && (action !== 'save' || rule?.enabled)) {
       setError('此入口需要在运行时手动选择历史目录。配置源码后可启用自动触发。');
       return;
@@ -180,6 +188,9 @@ export function ExecutionGraphTriggerEditor({
   return (
     <form className="graph-properties graph-trigger-editor" onSubmit={submit}>
       <h4>{rule ? '编辑触发规则' : '添加触发规则'}</h4>
+      {start?.fixedExecutionServerCount !== undefined && start.fixedExecutionServerCount !== 1 && (
+        <p className="field-note">自动触发需要在开始节点配置一台固定的执行服务器。</p>
+      )}
       {start?.requiresHistoryDirectory && (
         <p className="field-note">此入口需要在运行时手动选择历史目录。配置源码后可启用自动触发。</p>
       )}

@@ -4,6 +4,7 @@ import type { GraphPane, GraphWorkbenchScope } from './graph-workbench-context';
 import { graphWorkbenchPath } from './graph-workbench-context';
 import { projectResourcePath } from '../projects/project-workspace-route';
 import { serverResourceHref } from '../infrastructure/server-resource-route';
+import { simplifiedTarget } from './simplified-flow';
 
 export function ExecutionGraphResourceLinks({
   node,
@@ -108,7 +109,7 @@ export function ExecutionGraphResourceLinks({
   if (node.type === 'START') {
     add('services', node.start?.release?.serviceId ?? flow?.serviceId);
     for (const source of node.start?.sources ?? []) add('repositories', source.repositoryId);
-    add('servers', node.start?.execution?.serverId);
+    for (const serverId of simplifiedTarget(node.start)?.serverIds ?? []) add('servers', serverId);
     add('environment-sets', node.start?.environmentSetId);
     if (node.environmentSet?.mode === 'FIXED')
       add('environment-sets', node.environmentSet.environmentSetId);

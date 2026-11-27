@@ -82,6 +82,16 @@ export class GraphRunnerController {
     return this.runner.preview(projectId, flowId, body);
   }
 
+  @Post('flows/:flowId/preview-targets')
+  @Roles('ADMIN', 'OPERATOR')
+  previewTargets(
+    @Param('id', ParseUUIDPipe) projectId: string,
+    @Param('flowId') flowId: string,
+    @Body() body: GraphPreviewDto,
+  ) {
+    return this.runner.previewTargets(projectId, flowId, body);
+  }
+
   @Post('flows/:flowId/run')
   @Roles('ADMIN', 'OPERATOR')
   run(
@@ -91,6 +101,17 @@ export class GraphRunnerController {
     @Req() req: AuthRequest,
   ) {
     return this.runner.run(projectId, flowId, body, req.user.id);
+  }
+
+  @Post('flows/:flowId/run-targets')
+  @Roles('ADMIN', 'OPERATOR')
+  runTargets(
+    @Param('id', ParseUUIDPipe) projectId: string,
+    @Param('flowId') flowId: string,
+    @Body() body: GraphRunDto,
+    @Req() req: AuthRequest,
+  ) {
+    return this.runner.runTargets(projectId, flowId, body, req.user.id);
   }
 
   @Post('flows/:flowId/run-defaults')

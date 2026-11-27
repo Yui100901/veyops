@@ -155,7 +155,11 @@ import {
   type SimplifiedSnapshotRequest,
   workspaceRetention,
 } from './simplified-flow-run.service';
-import { simplifiedEffectiveFinish, simplifiedUsesWorkspace } from './simplified-flow-definition';
+import {
+  fixedFlowServerIds,
+  simplifiedEffectiveFinish,
+  simplifiedUsesWorkspace,
+} from './simplified-flow-definition';
 import {
   activeFlowStatuses,
   branchMatch,
@@ -454,6 +458,7 @@ interface PlanContext {
   authorizePlan?: GraphPlanAuthorizer;
   definitionOverride?: { graphId: string; definition: GraphDefinition };
   pendingArtifactParameters?: ReadonlySet<string>;
+  batchServerId?: string;
 }
 
 function digest(value: unknown) {
@@ -1505,6 +1510,7 @@ export class GraphRunnerService implements OnModuleInit {
     trigger?: Values,
     automation?: GraphAutomation,
     authorizePlan?: GraphPlanAuthorizer,
+    batchServerId?: string,
   ) {
     if (!this.simplifiedRuns) throw new ConflictException('运行工作区服务不可用');
     if (automation) assertAutomaticGraphFlow(definition, flow.id, automation.kind);
@@ -1515,6 +1521,7 @@ export class GraphRunnerService implements OnModuleInit {
       request.inputs ?? {},
       trigger,
       automation,
+      batchServerId,
     );
     const target = plan.placement.location === 'TARGET' ? plan.placement.target : undefined;
     const release = plan.release;
@@ -1744,6 +1751,7 @@ export class GraphRunnerService implements OnModuleInit {
       authorizePlan,
       definitionOverride,
       pendingArtifactParameters,
+      batchServerId,
     }: PlanContext = {},
   ) {
     await requireProject(this.database.db, projectId);
@@ -1761,6 +1769,7 @@ export class GraphRunnerService implements OnModuleInit {
         trigger,
         automation,
         authorizePlan,
+        batchServerId,
       );
     if (!rootId && !automation) {
       assertRuntimeParameterOverrides(flow, request.inputs?.parameters);
@@ -2665,6 +2674,147 @@ export class GraphRunnerService implements OnModuleInit {
   ) {
     return (await this.prepare(projectId, flowId, request, context)).preview;
   }
+
+  private async targetBatchIds(projectId: string, flowId: string, request: GraphPreviewDto) {
+    await requireProject(this.database.db, projectId);
+    const { definition } = await this.published(projectId, request.version);
+    const flow = this.currentFlow(definition, flowId);
+    const start = flow.nodes.find(({ type }) => type === 'START');
+    const fixed = fixedFlowServerIds(start?.start?.execution);
+    const selected = request.inputs?.serverIds;
+    if (!fixed.length && !selected?.length)
+      throw new ExecutionPlanIssueError({
+        code: 'BUILD_TARGET',
+        fieldId: 'start.execution.serverId',
+        nodeId: start?.id,
+        flowId,
+        message: '请选择至少一台执行服务器',
+      });
+    if (fixed.length && selected && !sameIds(selected, fixed))
+      throw new BadRequestException('本次运行需要使用执行流中配置的全部服务器');
+    return [...(fixed.length ? fixed : selected!)].sort();
+  }
+
+  private async prepareTargetBatch(
+    projectId: string,
+    flowId: string,
+    request: GraphPreviewDto,
+    serverIds: string[],
+  ) {
+    const prepared = [];
+    for (const serverId of serverIds) {
+      prepared.push({
+        serverId,
+        plan: await this.prepare(
+          projectId,
+          flowId,
+          { version: request.version, inputs: { ...request.inputs, serverIds: undefined } },
+          { batchServerId: serverId },
+        ),
+      });
+    }
+    const sourceRevisions = new Set(
+      prepared.map(({ plan }) =>
+        digest(
+          plan.simplified?.sources.map(({ id, source }) => [
+            id,
+            source.repositoryId,
+            source.commitSha,
+          ]),
+        ),
+      ),
+    );
+    if (sourceRevisions.size > 1)
+      throw new ConflictException('预览期间源码提交已变化，请重新预览全部服务器');
+    const configurationHash = digest(
+      prepared.map(({ serverId, plan }) => [serverId, plan.preview.configurationHash]),
+    );
+    return { prepared, configurationHash };
+  }
+
+  async previewTargets(projectId: string, flowId: string, request: GraphPreviewDto) {
+    const serverIds = await this.targetBatchIds(projectId, flowId, request);
+    const { prepared, configurationHash } = await this.prepareTargetBatch(
+      projectId,
+      flowId,
+      request,
+      serverIds,
+    );
+    return {
+      configurationHash,
+      targets: prepared.map(({ serverId, plan }) => ({ serverId, preview: plan.preview })),
+    };
+  }
+
+  async runTargets(projectId: string, flowId: string, request: GraphRunDto, userId: string) {
+    const db = this.database.db;
+    const serverIds = await this.targetBatchIds(projectId, flowId, request);
+    const requestHash = digest([
+      'TARGET_BATCH',
+      flowId,
+      request.version,
+      { ...request.inputs, serverIds },
+      request.expectedConfigurationHash,
+    ]);
+    const keys = serverIds.map(
+      (serverId, index) =>
+        'targets-' + digest([request.idempotencyKey, index === 0 ? null : serverId]),
+    );
+    const stored = async (database: Kysely<Database>) => {
+      const rows = await database
+        .selectFrom('execution_flow_runs')
+        .select(['id', 'request_hash', 'idempotency_key'])
+        .where('project_id', '=', projectId)
+        .where('created_by', '=', userId)
+        .where('idempotency_key', 'in', keys)
+        .execute();
+      if (!rows.length) return undefined;
+      for (const row of rows) checkRequest(row, requestHash);
+      if (rows.length !== keys.length) throw new ConflictException('批量运行记录不完整');
+      return keys.map((key) => rows.find((row) => row.idempotency_key === key)!.id);
+    };
+    let runIds = await stored(db);
+    if (!runIds) {
+      const { prepared, configurationHash } = await this.prepareTargetBatch(
+        projectId,
+        flowId,
+        request,
+        serverIds,
+      );
+      if (request.expectedConfigurationHash !== configurationHash)
+        throw new ConflictException('有服务器的实际执行配置已变化，请重新预览');
+      runIds = await db.transaction().execute(async (tx) => {
+        await lockProjectGraph(tx);
+        await this.lockProject(tx, projectId);
+        const existing = await stored(tx);
+        if (existing) return existing;
+        const inserted: string[] = [];
+        for (const [index, { plan }] of prepared.entries()) {
+          const row = await this.insertConfirmedRun(
+            tx,
+            projectId,
+            flowId,
+            { version: request.version, idempotencyKey: keys[index]! },
+            userId,
+            requestHash,
+            plan,
+          );
+          if (!row) throw new ConflictException('批量运行标识已被使用');
+          inserted.push(row.id);
+        }
+        return inserted;
+      });
+    }
+    for (const id of runIds) {
+      await this.advance(id).catch((error: unknown) =>
+        this.logger.warn(
+          `已加入队列的执行流 ${id} 将由调度器重试: ${redactTaskLog(String(error))}`,
+        ),
+      );
+    }
+    return { runs: runIds.map((runId, index) => ({ runId, serverId: serverIds[index]! })) };
+  }
+
   private async lockProject(tx: Transaction<Database>, projectId: string) {
     const active = await tx
       .updateTable('projects')
@@ -2790,6 +2940,16 @@ export class GraphRunnerService implements OnModuleInit {
       return { outcome: 'STARTED' as const, runId: previous.id, version: previous.version };
     }
     await this.confirmLatestVersion(db, projectId, request.version);
+    const { definition } = await this.published(projectId, request.version);
+    const flow = this.currentFlow(definition, flowId);
+    const start = flow.nodes.find(({ type }) => type === 'START');
+    if (fixedFlowServerIds(start?.start?.execution).length !== 1)
+      return {
+        outcome: 'NEEDS_CONFIRMATION' as const,
+        version: request.version,
+        nodeId: start?.id,
+        reason: '请先确认本次运行的执行服务器',
+      };
     const preview = await this.preview(projectId, flowId, { version: request.version });
     const gate = preview.gates.find(
       ({ kind }) => kind === 'APPROVAL' || kind === 'SOURCE_REVIEW' || kind === 'ROLLBACK_ARTIFACT',
@@ -2856,20 +3016,7 @@ export class GraphRunnerService implements OnModuleInit {
       if (!control) await this.advance(old.id);
       return this.get(projectId, old.id);
     }
-    const {
-      preview,
-      flow,
-      plans,
-      inputs,
-      children,
-      environmentSets,
-      environmentSet,
-      frozenEnvironment,
-      checkoutProvenance,
-      parameterSources,
-      credentials,
-      simplified,
-    } = await this.prepare(projectId, flowId, request, {
+    const prepared = await this.prepare(projectId, flowId, request, {
       trigger: origin?.metadata,
       automation: origin?.authorization,
       authorizePlan: control?.authorizePlan,
@@ -2881,6 +3028,7 @@ export class GraphRunnerService implements OnModuleInit {
         });
       throw error;
     });
+    const { preview } = prepared;
     if (request.expectedConfigurationHash !== preview.configurationHash)
       throw new ConflictException({
         message: '版本、运行参数或实际执行配置已变化，请重新预览',
@@ -2901,146 +3049,17 @@ export class GraphRunnerService implements OnModuleInit {
     const row = await db.transaction().execute(async (tx) => {
       await lockProjectGraph(tx);
       await this.lockProject(tx, projectId);
-      const confirmed = await this.published(projectId, request.version, tx, true);
-      if (simplified) {
-        const referenced = [
-          simplified.release?.artifactId,
-          simplified.workspaceSource?.artifactId,
-        ].filter((id): id is string => Boolean(id));
-        if (referenced.length) await lockAvailableArtifacts(tx, referenced);
-        await this.simplifiedRuns!.confirm(tx, simplified, projectId);
-      }
-      for (const previous of environmentSets) {
-        const latest = await resolveEnvironmentSet(tx, projectId, previous.id).catch(
-          (error: unknown) => {
-            if (!(error instanceof HttpException)) throw error;
-            throw new ConflictException('变量集合已变化，请重新预览');
-          },
-        );
-        if (digest(latest) !== digest(previous))
-          throw new ConflictException('变量集合已变化，请重新预览');
-      }
-      // V2 plans also freeze encrypted values resolved from project variable collections.
-      const confirmedCredentialTypes = simplified
-        ? [...variableCredentialTypes, variableCredentialType]
-        : variableCredentialTypes;
-      for (const [credentialId, nonce] of Object.entries(credentials)) {
-        const active = await tx
-          .selectFrom('credentials')
-          .select('id')
-          .where('id', '=', credentialId)
-          .where('nonce', '=', nonce)
-          .where('status', '=', 'ACTIVE')
-          .where('type', 'in', confirmedCredentialTypes)
-          .executeTakeFirst();
-        if (!active) throw new ConflictException('节点引用的凭据已变化，请重新预览');
-      }
-      if (
-        simplified ||
-        confirmed.definition.flows.some(({ nodes }) =>
-          nodes.some((node) => isDelivery(node) || graphArtifactDeclarations(node)?.length),
-        )
-      )
-        await ensureGraphDeliveryEnvironment(tx, projectId);
-      if (
-        simplified ||
-        confirmed.definition.flows.some(({ nodes }) =>
-          nodes.some((node) => node.type === 'BUILD' || graphArtifactDeclarations(node)?.length),
-        )
-      ) {
-        await ensureGraphUnscopedArtifactService(tx, projectId);
-      }
-      const validateTargets = async (plan: Delivery | GraphNodePlan) => {
-        if (!('pipelineId' in plan)) {
-          if (plan.type === 'SHELL' || plan.type === 'CHECK') {
-            if (plan.serverId && plan.targetSelection)
-              await confirmDeploymentMembers(tx, plan.targetSelection, [plan.serverId]);
-            if (plan.artifact?.instances?.length)
-              await lockAvailableArtifacts(tx, plan.artifact.instances);
-          }
-          return;
-        }
-        if (plan.configuration?.targetSelection)
-          await confirmDeploymentMembers(tx, plan.configuration.targetSelection, plan.serverIds);
-        if (plan.artifactIds.length) await lockAvailableArtifacts(tx, plan.artifactIds);
-        for (const alternative of plan.alternatives ?? []) await validateTargets(alternative);
-      };
-      const validateChildTargets = async (child: PreparedChild) => {
-        for (const plan of Object.values(child.plans)) await validateTargets(plan);
-        for (const nested of Object.values(child.children)) await validateChildTargets(nested);
-      };
-      for (const plan of Object.values(plans)) await validateTargets(plan);
-      for (const child of Object.values(children)) await validateChildTargets(child);
-      const references = runResourceReferences(
-        confirmed.definition,
-        {
-          sourceId: preview.graphId,
-          version: request.version,
-          flowId,
-          state: 'PENDING',
-        },
-        {
-          inputs,
-          environmentSet,
-          frozenEnvironment,
-          credentials,
-          deliveries: plans,
-          children,
-          simplified,
-        },
-      );
-      if (
-        await unavailableReference(
-          tx,
-          projectId,
-          references.filter(
-            (reference) =>
-              reference.resourceType !== 'SERVICE' ||
-              reference.resourceId !== graphUnscopedArtifactService(projectId).id,
-          ),
-        )
-      )
-        throw new ConflictException('计划引用的资源已变化，请重新预览');
-      await origin?.beforeInsert?.(tx);
-      await control?.beforeInsert?.(tx);
-      const inserted = await this.insertRun(
+      return this.insertConfirmedRun(
         tx,
-        {
-          id: randomUUID(),
-          project_id: projectId,
-          graph_id: preview.graphId,
-          version: request.version,
-          flow_id: flowId,
-          flow_name: flow.name,
-          created_by: userId,
-          parent_run_id: null,
-          trigger_type: origin?.triggerType ?? null,
-          idempotency_key: request.idempotencyKey,
-          request_hash: requestHash,
-          configuration_hash: preview.configurationHash,
-          inputs_json: JSON.stringify({
-            inputs,
-            environmentSet,
-            frozenEnvironment,
-            checkoutProvenance,
-            parameterSources,
-            credentials,
-            simplified,
-            deliveries: plans,
-            children,
-            trigger: origin?.metadata,
-            automation: origin?.authorization,
-          }),
-        },
-        flow,
-        inputs,
-        plans,
+        projectId,
+        flowId,
+        request,
+        userId,
+        requestHash,
+        prepared,
+        origin,
+        control,
       );
-      if (inserted) {
-        await origin?.afterInsert?.(tx, inserted.id);
-        await control?.afterInsert?.(tx, inserted.id);
-      }
-      return inserted;
     });
     if (!row) {
       const stored = (await previous())!;
@@ -3051,6 +3070,173 @@ export class GraphRunnerService implements OnModuleInit {
     }
     await this.advance(row.id);
     return this.get(projectId, row.id);
+  }
+
+  private async insertConfirmedRun(
+    tx: Transaction<Database>,
+    projectId: string,
+    flowId: string,
+    request: Pick<GraphRunDto, 'version' | 'idempotencyKey'>,
+    userId: string,
+    requestHash: string,
+    prepared: Awaited<ReturnType<GraphRunnerService['prepare']>>,
+    origin?: AutomaticRunOrigin,
+    control?: GraphRunControl,
+  ) {
+    const {
+      preview,
+      flow,
+      plans,
+      inputs,
+      children,
+      environmentSets,
+      environmentSet,
+      frozenEnvironment,
+      checkoutProvenance,
+      parameterSources,
+      credentials,
+      simplified,
+    } = prepared;
+    const confirmed = await this.published(projectId, request.version, tx, true);
+    if (simplified) {
+      const referenced = [
+        simplified.release?.artifactId,
+        simplified.workspaceSource?.artifactId,
+      ].filter((id): id is string => Boolean(id));
+      if (referenced.length) await lockAvailableArtifacts(tx, referenced);
+      await this.simplifiedRuns!.confirm(tx, simplified, projectId);
+    }
+    for (const previous of environmentSets) {
+      const latest = await resolveEnvironmentSet(tx, projectId, previous.id).catch(
+        (error: unknown) => {
+          if (!(error instanceof HttpException)) throw error;
+          throw new ConflictException('变量集合已变化，请重新预览');
+        },
+      );
+      if (digest(latest) !== digest(previous))
+        throw new ConflictException('变量集合已变化，请重新预览');
+    }
+    // V2 plans also freeze encrypted values resolved from project variable collections.
+    const confirmedCredentialTypes = simplified
+      ? [...variableCredentialTypes, variableCredentialType]
+      : variableCredentialTypes;
+    for (const [credentialId, nonce] of Object.entries(credentials)) {
+      const active = await tx
+        .selectFrom('credentials')
+        .select('id')
+        .where('id', '=', credentialId)
+        .where('nonce', '=', nonce)
+        .where('status', '=', 'ACTIVE')
+        .where('type', 'in', confirmedCredentialTypes)
+        .executeTakeFirst();
+      if (!active) throw new ConflictException('节点引用的凭据已变化，请重新预览');
+    }
+    if (
+      simplified ||
+      confirmed.definition.flows.some(({ nodes }) =>
+        nodes.some((node) => isDelivery(node) || graphArtifactDeclarations(node)?.length),
+      )
+    )
+      await ensureGraphDeliveryEnvironment(tx, projectId);
+    if (
+      simplified ||
+      confirmed.definition.flows.some(({ nodes }) =>
+        nodes.some((node) => node.type === 'BUILD' || graphArtifactDeclarations(node)?.length),
+      )
+    ) {
+      await ensureGraphUnscopedArtifactService(tx, projectId);
+    }
+    const validateTargets = async (plan: Delivery | GraphNodePlan) => {
+      if (!('pipelineId' in plan)) {
+        if (plan.type === 'SHELL' || plan.type === 'CHECK') {
+          if (plan.serverId && plan.targetSelection)
+            await confirmDeploymentMembers(tx, plan.targetSelection, [plan.serverId]);
+          if (plan.artifact?.instances?.length)
+            await lockAvailableArtifacts(tx, plan.artifact.instances);
+        }
+        return;
+      }
+      if (plan.configuration?.targetSelection)
+        await confirmDeploymentMembers(tx, plan.configuration.targetSelection, plan.serverIds);
+      if (plan.artifactIds.length) await lockAvailableArtifacts(tx, plan.artifactIds);
+      for (const alternative of plan.alternatives ?? []) await validateTargets(alternative);
+    };
+    const validateChildTargets = async (child: PreparedChild) => {
+      for (const plan of Object.values(child.plans)) await validateTargets(plan);
+      for (const nested of Object.values(child.children)) await validateChildTargets(nested);
+    };
+    for (const plan of Object.values(plans)) await validateTargets(plan);
+    for (const child of Object.values(children)) await validateChildTargets(child);
+    const references = runResourceReferences(
+      confirmed.definition,
+      {
+        sourceId: preview.graphId,
+        version: request.version,
+        flowId,
+        state: 'PENDING',
+      },
+      {
+        inputs,
+        environmentSet,
+        frozenEnvironment,
+        credentials,
+        deliveries: plans,
+        children,
+        simplified,
+      },
+    );
+    if (
+      await unavailableReference(
+        tx,
+        projectId,
+        references.filter(
+          (reference) =>
+            reference.resourceType !== 'SERVICE' ||
+            reference.resourceId !== graphUnscopedArtifactService(projectId).id,
+        ),
+      )
+    )
+      throw new ConflictException('计划引用的资源已变化，请重新预览');
+    await origin?.beforeInsert?.(tx);
+    await control?.beforeInsert?.(tx);
+    const inserted = await this.insertRun(
+      tx,
+      {
+        id: randomUUID(),
+        project_id: projectId,
+        graph_id: preview.graphId,
+        version: request.version,
+        flow_id: flowId,
+        flow_name: flow.name,
+        created_by: userId,
+        parent_run_id: null,
+        trigger_type: origin?.triggerType ?? null,
+        idempotency_key: request.idempotencyKey,
+        request_hash: requestHash,
+        configuration_hash: preview.configurationHash,
+        inputs_json: JSON.stringify({
+          inputs,
+          environmentSet,
+          frozenEnvironment,
+          checkoutProvenance,
+          parameterSources,
+          credentials,
+          simplified,
+          deliveries: plans,
+          children,
+          trigger: origin?.metadata,
+          automation: origin?.authorization,
+        }),
+      },
+      flow,
+      inputs,
+      plans,
+    );
+    if (inserted) {
+      await origin?.afterInsert?.(tx, inserted.id);
+      await control?.afterInsert?.(tx, inserted.id);
+    }
+    return inserted;
   }
 
   private lockRun(tx: Transaction<Database>, id: string) {

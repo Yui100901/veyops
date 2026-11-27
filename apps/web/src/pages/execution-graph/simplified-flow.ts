@@ -20,6 +20,7 @@ export interface SimplifiedSource {
 
 export interface SimplifiedExecution {
   serverId?: string;
+  serverIds?: string[];
 }
 
 export interface SimplifiedRelease {
@@ -68,8 +69,9 @@ export interface SimplifiedFinishImage {
 }
 
 export function simplifiedTarget(start?: SimplifiedStart) {
-  const serverId = start?.execution?.serverId;
-  return serverId ? { serverIds: [serverId] } : undefined;
+  const execution = start?.execution;
+  const serverIds = execution?.serverIds ?? (execution?.serverId ? [execution.serverId] : []);
+  return serverIds.length ? { serverIds } : undefined;
 }
 
 export function simplifiedComposeImageVariable(id: string) {
