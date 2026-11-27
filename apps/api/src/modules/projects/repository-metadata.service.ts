@@ -157,6 +157,7 @@ function analysisFileKind(path: string): AnalysisFileKind | undefined {
   )
     return 'configuration';
   if (
+    name === 'index.html' ||
     /^(?:main|index|app|server|application|__main__|asgi|wsgi|manage|program)\.(?:ts|tsx|js|mjs|cjs|py|go|rs|php|rb|cs)$/.test(
       name,
     ) ||

@@ -860,6 +860,7 @@ function Workspace({
             initialFieldId={linkedField}
             initialFieldLocation={linkedFieldLocation}
             insertedStartId={insertedStart}
+            insertAiDraft={canEditDraft ? insertTemplate : undefined}
             renderResources={(node, pair) => (
               <ExecutionGraphResourceLinks
                 node={node}

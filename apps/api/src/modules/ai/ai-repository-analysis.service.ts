@@ -50,7 +50,7 @@ interface ModelDraft {
   detectedServices?: unknown;
 }
 
-function sanitizeRepositoryEvidence(text: string, apiKey: string): string {
+export function sanitizeRepositoryEvidence(text: string, apiKey: string): string {
   return sanitizeAiText(
     text
       .replace(

@@ -17,11 +17,12 @@ import { AiRepositoryAnalysisService } from './ai-repository-analysis.service';
 import { AiDeploymentToolsService } from './ai-deployment-tools.service';
 import { AiSourceChangeService } from './ai-source-change.service';
 import { AiGraphActionsService } from './ai-graph-actions.service';
+import { AiExecutionGraphDraftController, AiExecutionGraphDraftService } from './ai-execution-graph-draft';
 import { OperationPlansModule } from '../operation-plans/operation-plans.module';
 @Global()
 @Module({
   imports: [CommandCenterModule, OperationPlansModule],
-  controllers: [AiController, AiFailureHandlingController],
+  controllers: [AiController, AiFailureHandlingController, AiExecutionGraphDraftController],
   providers: [
     AiRepository,
     AiFailureGuard,
@@ -38,6 +39,7 @@ import { OperationPlansModule } from '../operation-plans/operation-plans.module'
     AiDeploymentToolsService,
     AiSourceChangeService,
     AiGraphActionsService,
+    AiExecutionGraphDraftService,
   ],
   exports: [AiProvidersService, AiService, PipelineAnalysisService, AiFailureHandlingService],
 })

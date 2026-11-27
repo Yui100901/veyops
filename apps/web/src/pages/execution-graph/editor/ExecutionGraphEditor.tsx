@@ -5,6 +5,7 @@ import { useResource, type GraphIssueLocation } from '../../../api';
 import { Confirm, ErrorBanner, Field } from '../../../components';
 import type { ProjectDetail, Server } from '../../../models';
 import { graphDragType, NodeMap } from './ExecutionGraphCanvas';
+import { ExecutionGraphAiDraft } from './ExecutionGraphAiDraft';
 import { upstreamTriggerLinks, type TriggerRule } from './graph-trigger-model';
 import { ExecutionGraphInputSummary } from './ExecutionGraphInputSummary';
 import { ExecutionGraphStartSettings, isStartBusinessField } from './ExecutionGraphStartSettings';
@@ -36,6 +37,7 @@ import type {
   GraphEdge,
   GraphEndpoint,
   GraphField,
+  GraphFlowExpansion,
   GraphIssue,
   GraphNode,
   GraphOperation,
@@ -137,6 +139,7 @@ export function ProjectGraphEditor({
   initialFieldId,
   initialFieldLocation,
   insertedStartId,
+  insertAiDraft,
 }: {
   canvas: GraphCanvas;
   project: ProjectDetail;
@@ -150,6 +153,7 @@ export function ProjectGraphEditor({
   initialFieldId?: string;
   initialFieldLocation?: GraphIssueLocation;
   insertedStartId?: string;
+  insertAiDraft?: (proposal: GraphFlowExpansion) => void;
 }) {
   const defaultEntry = canvas.model === simplifiedModel ? canvas.endpoints[0]?.startId : undefined;
   const initialSelection = initialNodeId ?? initialFlowId ?? defaultEntry;
@@ -1344,6 +1348,9 @@ export function ProjectGraphEditor({
                       patch={patch}
                       flowNodes={canvas.nodes.filter(({ id }) => inspectedStartScope?.has(id))}
                     />
+                    {insertAiDraft && (
+                      <ExecutionGraphAiDraft project={project} node={inspected} canEdit={canEdit} insert={insertAiDraft} />
+                    )}
                     {canEdit && (
                       <SimplifiedEntryCopy
                         key={inspected.id}
